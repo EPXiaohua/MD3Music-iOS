@@ -23,14 +23,14 @@ class LyricsPipService {
 
   bool _handlerRegistered = false;
   bool _active = false;
-  /// 歌词会话代际：每次整包歌词下发（切歌/新歌词就绪）+1，随 setLyrics/
-  /// setLine/update 一起发给原生。原生只接受 generation 不小于当前值的更新，
-  /// 迟到的旧歌消息直接丢弃，封死快速切歌时的乱序竞态。stop 时归零，
-  /// 与原生端 didStop 的重置对称，下次开启两端从 0 重新对齐。
-  int _generation = 0;
 
-  /// PiP 窗口是否激活（start 成功置位；用户从 PiP 窗口关闭时由原生
-  /// 'state' 回调复位）。按钮激活态以它为准。
+  /// 最近一次用户开关意图（toggle 翻转）。快速连点时每次都把最终意图发给
+  /// 原生，由原生状态机收敛；按钮激活态 [_active] 严格跟原生 didStart/didStop
+  /// 的 'state' 回调走，不做乐观置位。
+  bool _desiredActive = false;
+
+  /// PiP 窗口是否激活。严格由原生 didStart/didStop 的 'state' 回调驱动
+  /// （含用户从 PiP 窗口关闭/系统手势划掉小窗），按钮激活态以它为准。
   bool get active => _active;
 
   /// PiP 激活态变化回调（由 DesktopLyricService 注入，刷新按钮高亮）。
@@ -51,30 +51,38 @@ class LyricsPipService {
     return null;
   }
 
-  /// 开关 PiP 悬浮窗，返回切换后的激活态（设备/系统不支持时保持 false）。
+  /// 开关 PiP 悬浮窗，返回当前激活态。激活态由原生回调驱动，快速连点时
+  /// 这里只负责翻转并下发最终意图（原生状态机收敛）；设备/系统不支持时
+  /// 意图回退并保持 false。
   Future<bool> toggle() async {
-    if (_active) {
+    _desiredActive = !_desiredActive;
+    if (_desiredActive) {
+      final ok = await start();
+      if (!ok) _desiredActive = false;
+    } else {
       await stop();
-      return _active;
     }
-    return start();
+    return _active;
   }
 
-  /// 启动 PiP 悬浮窗。乐观置位：窗口真正出现/启动失败由原生 'state'
-  /// 回调校正（PictureInPictureControllerDelegate didStart/didStop）。
+  /// 启动 PiP 悬浮窗（下发开启意图）。原生 startPictureInPicture 是异步
+  /// 指令，这里不乐观置位 [_active]；激活成功/失败由原生 'state' 回调
+  /// （didStart/didStop/failedToStart）驱动。返回 false 表示请求被拒
+  /// （设备/系统不支持或通道异常）。
   Future<bool> start() async {
     if (!Platform.isIOS) return false;
     _ensureHandler();
     try {
       final ok = await _channel.invokeMethod<bool>('start');
-      if (ok == true) _setActive(true);
-      return _active;
+      return ok == true;
     } catch (e) {
       debugPrint('[LyricsPip] start failed: $e');
       return false;
     }
   }
 
+  /// 关闭 PiP 悬浮窗（下发关闭意图）。激活态同样由原生 'state' 回调复位，
+  /// 这里不本地置位（与原生状态机保持单一事实源）。
   Future<void> stop() async {
     if (!Platform.isIOS) return;
     try {
@@ -82,8 +90,6 @@ class LyricsPipService {
     } catch (e) {
       debugPrint('[LyricsPip] stop failed: $e');
     }
-    _generation = 0;
-    _setActive(false);
   }
 
   /// 整包歌词下发（切歌/解析完成时调用）。[lines] 为解析后的统一歌词模型，
@@ -92,10 +98,8 @@ class LyricsPipService {
   Future<void> setLyrics(List<LyricLine> lines) async {
     if (!Platform.isIOS || !_active) return;
     _ensureHandler();
-    final gen = ++_generation;
     try {
       await _channel.invokeMethod('setLyrics', <String, dynamic>{
-        'generation': gen,
         'lines': lines
             .map(
               (l) => <String, dynamic>{
@@ -125,7 +129,6 @@ class LyricsPipService {
     if (!Platform.isIOS || !_active) return;
     try {
       await _channel.invokeMethod('setLine', <String, dynamic>{
-        'generation': _generation,
         'text': text,
         'lineStart': lineStart,
         'placeholder': placeholder,
@@ -147,7 +150,6 @@ class LyricsPipService {
     if (!Platform.isIOS || !_active) return;
     try {
       await _channel.invokeMethod('update', <String, dynamic>{
-        'generation': _generation,
         'position': positionMs,
         'playing': playing,
       });

@@ -338,32 +338,34 @@ class DesktopLyricService {
   /// iOS PiP 悬浮窗是否激活（其它平台恒 false，Android 零开销）。
   bool get _pipActive => Platform.isIOS && LyricsPipService.instance.active;
 
-  /// PiP 激活态变化：按需启停 tick（激活→运转；关闭→其它协议也未启用则停）
-  /// 并刷新按钮高亮。
+  /// PiP 激活态变化（原生 didStart/didStop 回调驱动，含快速连点收敛后的
+  /// 最终态、从 PiP 小窗关闭/系统手势划掉）。激活时补推整包歌词 + 当前行 +
+  /// 进度让首帧就位——start 是异步指令，只有真正激活后推送才被原生接受；
+  /// 同时按需启停 tick 并刷新按钮高亮。
   void _onPipActiveChanged() {
-    _updateTicker();
-    _notify();
-  }
-
-  /// iOS 分支：开关 PiP 悬浮歌词（full_player / full_player_am / mini_player
-  /// 的桌面歌词按钮共用）。启动成功后补推整包歌词 + 当前行 + 进度，
-  /// 让 PiP 首帧就位（不等下一个 tick）。
-  Future<void> _toggleIosPipFloatingLyric() async {
-    final active = await LyricsPipService.instance.toggle();
-    if (active) {
+    if (_pipActive) {
       _bindProvidersFromContext();
       _pushPipLyricsFull();
       _pushPipLine(_currentLineIndex);
       final player = _player;
       if (player != null) {
-        await LyricsPipService.instance.update(
+        // ignore: discarded_futures
+        LyricsPipService.instance.update(
           positionMs: player.position.inMilliseconds,
           playing: player.isPlaying,
         );
       }
-      _updateTicker();
     }
+    _updateTicker();
     _notify();
+  }
+
+  /// iOS 分支：开关 PiP 悬浮歌词（full_player / full_player_am / mini_player
+  /// 的桌面歌词按钮共用）。只转发开关意图；激活态严格由原生 didStart/didStop
+  /// 回调驱动（快速连点由原生状态机收敛），激活后的歌词补推在
+  /// [_onPipActiveChanged] 里做。
+  Future<void> _toggleIosPipFloatingLyric() async {
+    await LyricsPipService.instance.toggle();
   }
 
   /// 整包歌词推给 PiP（切歌/解析完成时）：原生用行尾时间画进度条总长。
@@ -926,9 +928,6 @@ class DesktopLyricService {
       _lyricNextRetryAt = null;
       _pushPlaying(_player!.isPlaying);
       _pushLyric('歌词加载中...', '', placeholder: '歌词加载中...');
-      // iOS PiP：切歌瞬间整包推空列表（generation 前进 → 原生清空当前行并
-      // 画一帧空条），避免旧歌词在小窗上残留到新歌占位/首行到达。
-      _pushPipLyricsFull();
       // SuperLyric：切歌时立即更新 title/artist（清空上一首歌词）
       if (_superLyricEnabled) {
         _pushSuperLyricLine(null);

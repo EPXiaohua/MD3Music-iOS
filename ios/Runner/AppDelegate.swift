@@ -554,12 +554,17 @@ final class LyricsPipManager: NSObject {
   private var delegateHolder: AnyObject?
   /// 启动重试（等 isPictureInPicturePossible，参照工程 requestPiPStartWhenReady）
   private var startRetry: DispatchWorkItem?
-  private var wantsActive = false
-  /// 歌词会话代际（与 Dart LyricsPipService._generation 对齐）：Dart 每次整包
-  /// 下发（切歌/新歌词就绪）+1。只接受 generation >= 当前值的更新，迟到的旧歌
-  /// setLyrics/setLine/update 直接丢弃，封死快速切歌时的乱序竞态。
-  /// 停止（didStop / stop / 点按关闭）时归零，下次开启从 0 重新对齐。
-  private var generation = 0
+  /// PiP 开关状态机：startPictureInPicture / stopPictureInPicture 都是异步
+  /// 指令，快速连点开关时上一个操作未完成又收到反向指令，会让 controller
+  /// 状态失步（永远起不来或关不掉）。状态只由 delegate 终态回调（didStart /
+  /// didStop / failedToStart）推进；请求到达时若操作在途，仅记录 pendingIntent，
+  /// 回调到达后收敛执行，保证最终状态与最后一次用户意图一致。
+  private enum PipState { case idle, starting, started, stopping }
+  private var state: PipState = .idle
+  /// 在途时收到的最后一次用户意图（true=想开，false=想关）；nil=无待收敛意图
+  private var pendingIntent: Bool?
+  /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
+  private var awaitingStartCallback = false
   /// 单行细条尺寸（pt）：对标 GlobalRefresh-PiP 的条状悬浮窗观感
   private static let barSize = CGSize(width: 300, height: 22)
 
@@ -611,18 +616,6 @@ final class LyricsPipManager: NSObject {
   // MARK: setLyrics（整包歌词下发，切歌/解析完成时一次）
 
   private func setLyrics(_ args: [String: Any]) {
-    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
-    guard gen >= generation else {
-      NSLog("[MD3Music] lyrics pip drop stale setLyrics gen=\(gen) current=\(generation)")
-      return
-    }
-    generation = gen
-    // 切歌瞬间清空当前行：先画一帧空条（背景 + 进度条归零），旧歌词不在
-    // 原生自推进渲染下残留到新歌占位/首行到达。
-    lineText = ""
-    lineWords = []
-    lineStartMs = -1
-    placeholder = ""
     var parsed: [(start: Int, duration: Int, text: String, translation: String?)] = []
     if let rawLines = args["lines"] as? [[String: Any]] {
       for raw in rawLines {
@@ -641,8 +634,6 @@ final class LyricsPipManager: NSObject {
   // MARK: setLine（当前行 + 逐字时间轴 + 进度校准）
 
   private func setLine(_ args: [String: Any]) {
-    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
-    guard gen >= generation else { return }
     lineText = args["text"] as? String ?? ""
     lineStartMs = (args["lineStart"] as? NSNumber)?.intValue ?? -1
     placeholder = args["placeholder"] as? String ?? ""
@@ -666,8 +657,6 @@ final class LyricsPipManager: NSObject {
   // MARK: update（进度/播放状态校准，间奏与进度条推进用）
 
   private func update(_ args: [String: Any]) {
-    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
-    guard gen >= generation else { return }
     anchorPositionMs = (args["position"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
@@ -698,10 +687,8 @@ final class LyricsPipManager: NSObject {
         details: nil))
       return
     }
-    wantsActive = true
     buildInfrastructureIfNeeded()
     guard sourceView != nil, pipController != nil else {
-      wantsActive = false
       result(FlutterError(
         code: "unavailable",
         message: "No root view controller to host PiP source view",
@@ -711,12 +698,98 @@ final class LyricsPipManager: NSObject {
     // PiP 需要活跃的音频会话（本 app 音频会话由 Dart audio_session 配置为
     // .playback，这里只确保激活态，不改 category 以免与 just_audio 冲突）。
     try? AVAudioSession.sharedInstance().setActive(true)
-    restoreBarForOpening()
-    // 按参照工程重试启动：等源视图进层级 + isPictureInPicturePossible
-    scheduleStartAttempt(attempt: 0)
+    requestStart()
     NSLog("[MD3Music] lyrics pip (videoCall) start requested")
-    // 乐观返回；最终激活态由 delegate didStart/didStop -> 'state' 回调校正
+    // 已受理；真实激活态由 didStart/didStop -> 'state' 回调回报（不乐观置位）
     result(true)
+  }
+
+  // MARK: 开关状态机（start/stop 均为异步指令，快速连点时在途操作未完成
+  // 又收到反向指令会让 controller 状态失步；请求只记录意图，终态回调收敛）
+
+  /// 用户请求开启。操作在途时只记录意图，等 didStart/didStop 到达后收敛。
+  private func requestStart() {
+    switch state {
+    case .started:
+      notifyState(active: true)
+    case .starting, .stopping:
+      pendingIntent = true
+    case .idle:
+      state = .starting
+      pendingIntent = true
+      restoreBarForOpening()
+      // 按参照工程重试启动：等源视图进层级 + isPictureInPicturePossible
+      scheduleStartAttempt(attempt: 0)
+    }
+  }
+
+  /// 用户请求关闭（Dart stop 与点按小窗共用入口）。
+  private func requestStop() {
+    switch state {
+    case .idle:
+      notifyState(active: false)
+    case .starting:
+      startRetry?.cancel()
+      pendingIntent = false
+      if !awaitingStartCallback {
+        // startPictureInPicture 还没真正发出：直接回 idle，不等回调
+        state = .idle
+        pendingIntent = nil
+        notifyState(active: false)
+      }
+      // 已发出：didStart/failed 到达后由 handleDidStart 收敛执行 stop
+    case .started:
+      state = .stopping
+      pendingIntent = false
+      hideBarForClosing()
+      pipController?.stopPictureInPicture()
+    case .stopping:
+      pendingIntent = false
+    }
+  }
+
+  /// didStart：进入 started。若在途期间用户已改为要关，立即收敛执行 stop，
+  /// 不向 Dart 回报 active:true（最终意图是关）。
+  private func handleDidStart() {
+    state = .started
+    awaitingStartCallback = false
+    if pendingIntent == false {
+      pendingIntent = nil
+      state = .stopping
+      hideBarForClosing()
+      pipController?.stopPictureInPicture()
+      return
+    }
+    pendingIntent = nil
+    restoreBarForOpening()
+    barView?.setNeedsDisplay()
+    barView?.startAnimating()
+    notifyState(active: true)
+  }
+
+  /// didStop（含用户用系统手势划掉小窗）：回 idle。若在途期间用户已改为
+  /// 要开，立即收敛执行 start。
+  private func handleDidStop() {
+    state = .idle
+    awaitingStartCallback = false
+    barView?.stopAnimating()
+    restoreBarForOpening()
+    let wantStart = pendingIntent == true
+    pendingIntent = nil
+    if wantStart {
+      requestStart()
+    } else {
+      notifyState(active: false)
+    }
+  }
+
+  /// 启动失败：回 idle 并回报关闭态（真实失败不自动重试，用户可再点）。
+  private func handleStartFailed() {
+    state = .idle
+    awaitingStartCallback = false
+    pendingIntent = nil
+    barView?.stopAnimating()
+    notifyState(active: false)
   }
 
   /// 构建 VideoCall 式 PiP 基础设施（幂等）。参照 GlobalRefresh-PiP 的 setupPip：
@@ -762,25 +835,17 @@ final class LyricsPipManager: NSObject {
     let controller = AVPictureInPictureController(contentSource: contentSource)
     let lifecycle = LyricsPipLifecycleDelegate()
     lifecycle.onStarted = { [weak self] in
-      self?.restoreBarForOpening()
-      self?.barView?.setNeedsDisplay()
-      self?.barView?.startAnimating()
-      self?.notifyState(active: true)
+      self?.handleDidStart()
     }
     lifecycle.onWillStop = { [weak self] in
       self?.barView?.stopAnimating()
     }
     lifecycle.onStopped = { [weak self] in
-      self?.barView?.stopAnimating()
-      self?.restoreBarForOpening()
-      self?.generation = 0
-      self?.notifyState(active: false)
+      self?.handleDidStop()
     }
     lifecycle.onFailed = { [weak self] message in
       NSLog("[MD3Music] lyrics pip failed to start: \(message)")
-      self?.wantsActive = false
-      self?.barView?.stopAnimating()
-      self?.notifyState(active: false)
+      self?.handleStartFailed()
     }
     delegateHolder = lifecycle
     controller.delegate = lifecycle
@@ -816,11 +881,12 @@ final class LyricsPipManager: NSObject {
     guard #available(iOS 15.0, *) else { return }
     startRetry?.cancel()
     let work = DispatchWorkItem { [weak self] in
-      guard let self = self, self.wantsActive else { return }
+      guard let self = self, self.state == .starting, self.pendingIntent == true else { return }
       guard let source = self.sourceView, let controller = self.pipController else { return }
       guard !controller.isPictureInPictureActive else { return }
       let sourceReady = !source.bounds.isEmpty && source.window != nil
       if sourceReady && controller.isPictureInPicturePossible {
+        self.awaitingStartCallback = true
         controller.startPictureInPicture()
         return
       }
@@ -829,7 +895,8 @@ final class LyricsPipManager: NSObject {
       } else {
         NSLog(
           "[MD3Music] lyrics pip start gave up: possible=\(controller.isPictureInPicturePossible), sourceReady=\(sourceReady)")
-        self.wantsActive = false
+        self.state = .idle
+        self.pendingIntent = nil
         self.notifyState(active: false)
       }
     }
@@ -839,35 +906,14 @@ final class LyricsPipManager: NSObject {
   }
 
   private func stop(result: @escaping FlutterResult) {
-    wantsActive = false
-    startRetry?.cancel()
-    startRetry = nil
-    generation = 0
-    if #available(iOS 15.0, *) {
-      if let controller = pipController, controller.isPictureInPictureActive {
-        hideBarForClosing()
-        controller.stopPictureInPicture()
-      } else {
-        hideBarForClosing()
-        notifyState(active: false)
-      }
-    }
+    requestStop()
     result(nil)
   }
 
-  /// 点击小窗关闭（无系统控件，参照工程 handlePiPContentTap 的交互）
+  /// 点击小窗关闭（无系统控件，参照工程 handlePiPContentTap 的交互）。
+  /// 与 Dart 侧 stop 共用状态机入口，避免与在途 start/stop 竞争。
   private func closeFromTap() {
-    wantsActive = false
-    startRetry?.cancel()
-    startRetry = nil
-    generation = 0
-    if #available(iOS 15.0, *),
-      let controller = pipController, controller.isPictureInPictureActive {
-      hideBarForClosing()
-      controller.stopPictureInPicture()
-      return
-    }
-    notifyState(active: false)
+    requestStop()
   }
 
   /// 关闭前把内容与源视图藏起来（参照工程 hidePiPContentForClosing /
