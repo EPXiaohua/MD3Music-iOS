@@ -926,6 +926,9 @@ class DesktopLyricService {
       _lyricNextRetryAt = null;
       _pushPlaying(_player!.isPlaying);
       _pushLyric('歌词加载中...', '', placeholder: '歌词加载中...');
+      // iOS PiP：切歌瞬间整包推空列表（generation 前进 → 原生清空当前行并
+      // 画一帧空条），避免旧歌词在小窗上残留到新歌占位/首行到达。
+      _pushPipLyricsFull();
       // SuperLyric：切歌时立即更新 title/artist（清空上一首歌词）
       if (_superLyricEnabled) {
         _pushSuperLyricLine(null);

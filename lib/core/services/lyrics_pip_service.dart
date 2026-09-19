@@ -23,6 +23,11 @@ class LyricsPipService {
 
   bool _handlerRegistered = false;
   bool _active = false;
+  /// 歌词会话代际：每次整包歌词下发（切歌/新歌词就绪）+1，随 setLyrics/
+  /// setLine/update 一起发给原生。原生只接受 generation 不小于当前值的更新，
+  /// 迟到的旧歌消息直接丢弃，封死快速切歌时的乱序竞态。stop 时归零，
+  /// 与原生端 didStop 的重置对称，下次开启两端从 0 重新对齐。
+  int _generation = 0;
 
   /// PiP 窗口是否激活（start 成功置位；用户从 PiP 窗口关闭时由原生
   /// 'state' 回调复位）。按钮激活态以它为准。
@@ -77,6 +82,7 @@ class LyricsPipService {
     } catch (e) {
       debugPrint('[LyricsPip] stop failed: $e');
     }
+    _generation = 0;
     _setActive(false);
   }
 
@@ -86,8 +92,10 @@ class LyricsPipService {
   Future<void> setLyrics(List<LyricLine> lines) async {
     if (!Platform.isIOS || !_active) return;
     _ensureHandler();
+    final gen = ++_generation;
     try {
       await _channel.invokeMethod('setLyrics', <String, dynamic>{
+        'generation': gen,
         'lines': lines
             .map(
               (l) => <String, dynamic>{
@@ -117,6 +125,7 @@ class LyricsPipService {
     if (!Platform.isIOS || !_active) return;
     try {
       await _channel.invokeMethod('setLine', <String, dynamic>{
+        'generation': _generation,
         'text': text,
         'lineStart': lineStart,
         'placeholder': placeholder,
@@ -138,6 +147,7 @@ class LyricsPipService {
     if (!Platform.isIOS || !_active) return;
     try {
       await _channel.invokeMethod('update', <String, dynamic>{
+        'generation': _generation,
         'position': positionMs,
         'playing': playing,
       });

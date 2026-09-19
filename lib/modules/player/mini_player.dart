@@ -57,6 +57,10 @@ class _MiniPlayerState extends State<MiniPlayer>
   // 避免启动期 ticker 不稳使淡入卡在半透明导致内容发灰
   bool _contentShownOnce = false;
 
+  // 桌面歌词状态监听：iOS 从 PiP 小窗点按/手势关闭时无任何点击事件流经本页，
+  // 必须靠 DesktopLyricService 的通知重建，歌词按钮高亮才能复位
+  late final VoidCallback _onDesktopLyricChanged;
+
   // 拖动触发阈值
   static const double _velocityThreshold = 400.0; // px/s
   static const double _distanceRatio = 0.25; // 屏宽比例
@@ -64,6 +68,11 @@ class _MiniPlayerState extends State<MiniPlayer>
   @override
   void initState() {
     super.initState();
+    // 桌面歌词状态变化时刷新 UI（同步歌词按钮 icon，含 PiP 内关闭的回传）
+    _onDesktopLyricChanged = () {
+      if (mounted) setState(() {});
+    };
+    DesktopLyricService.instance.addListener(_onDesktopLyricChanged);
     _snapController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 250),
@@ -93,6 +102,7 @@ class _MiniPlayerState extends State<MiniPlayer>
 
   @override
   void dispose() {
+    DesktopLyricService.instance.removeListener(_onDesktopLyricChanged);
     _snapController.dispose();
     _entranceController.dispose();
     super.dispose();

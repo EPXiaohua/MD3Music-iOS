@@ -555,6 +555,11 @@ final class LyricsPipManager: NSObject {
   /// 启动重试（等 isPictureInPicturePossible，参照工程 requestPiPStartWhenReady）
   private var startRetry: DispatchWorkItem?
   private var wantsActive = false
+  /// 歌词会话代际（与 Dart LyricsPipService._generation 对齐）：Dart 每次整包
+  /// 下发（切歌/新歌词就绪）+1。只接受 generation >= 当前值的更新，迟到的旧歌
+  /// setLyrics/setLine/update 直接丢弃，封死快速切歌时的乱序竞态。
+  /// 停止（didStop / stop / 点按关闭）时归零，下次开启从 0 重新对齐。
+  private var generation = 0
   /// 单行细条尺寸（pt）：对标 GlobalRefresh-PiP 的条状悬浮窗观感
   private static let barSize = CGSize(width: 300, height: 22)
 
@@ -606,6 +611,18 @@ final class LyricsPipManager: NSObject {
   // MARK: setLyrics（整包歌词下发，切歌/解析完成时一次）
 
   private func setLyrics(_ args: [String: Any]) {
+    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
+    guard gen >= generation else {
+      NSLog("[MD3Music] lyrics pip drop stale setLyrics gen=\(gen) current=\(generation)")
+      return
+    }
+    generation = gen
+    // 切歌瞬间清空当前行：先画一帧空条（背景 + 进度条归零），旧歌词不在
+    // 原生自推进渲染下残留到新歌占位/首行到达。
+    lineText = ""
+    lineWords = []
+    lineStartMs = -1
+    placeholder = ""
     var parsed: [(start: Int, duration: Int, text: String, translation: String?)] = []
     if let rawLines = args["lines"] as? [[String: Any]] {
       for raw in rawLines {
@@ -624,6 +641,8 @@ final class LyricsPipManager: NSObject {
   // MARK: setLine（当前行 + 逐字时间轴 + 进度校准）
 
   private func setLine(_ args: [String: Any]) {
+    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
+    guard gen >= generation else { return }
     lineText = args["text"] as? String ?? ""
     lineStartMs = (args["lineStart"] as? NSNumber)?.intValue ?? -1
     placeholder = args["placeholder"] as? String ?? ""
@@ -647,6 +666,8 @@ final class LyricsPipManager: NSObject {
   // MARK: update（进度/播放状态校准，间奏与进度条推进用）
 
   private func update(_ args: [String: Any]) {
+    let gen = (args["generation"] as? NSNumber)?.intValue ?? 0
+    guard gen >= generation else { return }
     anchorPositionMs = (args["position"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
@@ -752,6 +773,7 @@ final class LyricsPipManager: NSObject {
     lifecycle.onStopped = { [weak self] in
       self?.barView?.stopAnimating()
       self?.restoreBarForOpening()
+      self?.generation = 0
       self?.notifyState(active: false)
     }
     lifecycle.onFailed = { [weak self] message in
@@ -820,6 +842,7 @@ final class LyricsPipManager: NSObject {
     wantsActive = false
     startRetry?.cancel()
     startRetry = nil
+    generation = 0
     if #available(iOS 15.0, *) {
       if let controller = pipController, controller.isPictureInPictureActive {
         hideBarForClosing()
@@ -837,6 +860,7 @@ final class LyricsPipManager: NSObject {
     wantsActive = false
     startRetry?.cancel()
     startRetry = nil
+    generation = 0
     if #available(iOS 15.0, *),
       let controller = pipController, controller.isPictureInPictureActive {
       hideBarForClosing()
