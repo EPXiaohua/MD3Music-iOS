@@ -452,8 +452,8 @@ final class NowPlayingManager {
 
 // MARK: - iOS 歌词悬浮窗（系统画中画 · VideoCall 式，无系统控件）
 
-/// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource，对标
-/// GlobalRefresh-PiP 的真机验证方案）。
+/// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource，参照
+/// github.com/CaiWanFeng/PiP 项目）。
 ///
 /// 与 Android 的 FloatingLyricService 悬浮窗路径互不影响：本类只在 iOS Runner
 /// 内编译，channel 也只由 iOS 端注册。Dart 端对应 lib/core/services/lyrics_pip_service.dart。
@@ -565,7 +565,7 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 单行细条尺寸（pt）：对标 GlobalRefresh-PiP 的条状悬浮窗观感
+  /// 单行细条尺寸（pt）
   private static let barSize = CGSize(width: 300, height: 22)
 
   private override init() {}
@@ -792,7 +792,7 @@ final class LyricsPipManager: NSObject {
     notifyState(active: false)
   }
 
-  /// 构建 VideoCall 式 PiP 基础设施（幂等）。参照 GlobalRefresh-PiP 的 setupPip：
+  /// 构建 VideoCall 式 PiP 基础设施（幂等）。
   /// 源视图（宽高比锚点）+ AVPictureInPictureVideoCallViewController（自绘内容）
   /// + ContentSource(activeVideoCallSourceView:contentViewController:)。
   @available(iOS 15.0, *)

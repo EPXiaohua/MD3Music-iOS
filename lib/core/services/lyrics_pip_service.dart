@@ -8,7 +8,7 @@ import '../../widgets/apple_lyrics/models/lyric_line.dart';
 /// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource）桥接。
 ///
 /// 单行细条状悬浮条（300x22pt），无系统播放控件，点击小窗直接关闭；
-/// 逐字卡拉OK渲染在原生端完成（参照 GlobalRefresh-PiP 的真机验证方案）。
+/// 逐字卡拉OK渲染在原生端完成（参照 github.com/CaiWanFeng/PiP 项目）。
 /// 仅 iOS 激活；其它平台全部 no-op（Android 悬浮歌词走 FloatingLyricService，
 /// 由 DesktopLyricService 原路径负责，互不影响）。
 /// Swift 端实现见 ios/Runner/AppDelegate.swift 的 LyricsPipManager。
