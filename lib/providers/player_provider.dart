@@ -20,7 +20,6 @@ import '../core/services/listen_report_service.dart';
 import '../core/services/playback_duration_tracker.dart';
 import '../core/services/media_notification_service.dart';
 import '../core/services/now_playing_service.dart';
-import '../core/services/lyrics_pip_service.dart';
 import '../core/services/wakelock_service.dart';
 import '../core/services/media_store_service.dart';
 import '../core/services/usb_audio_service.dart';
@@ -473,8 +472,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 否则锁屏显示后进后台播放会被打断。仅 iOS 生效，Android 全 no-op。
       NowPlayingService.instance.onCommand = _handleNowPlayingCommand;
       await NowPlayingService.instance.init();
-      // iOS PiP 悬浮歌词：窗口内播放/暂停按钮 → 切换播放（与锁屏命令同一套）
-      LyricsPipService.instance.onPipPlayPause = _handlePipPlayPause;
       // USB 独占关闭后自动恢复 delegate 输出：旧 usb HAL 输出流被独占 force
       // disconnect 杀死，只有重建 AudioTrack（复刻"暂停→重播"）才能重新出声。
       UsbAudioService.instance.onExclusiveDisabled =
@@ -3533,16 +3530,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         if (positionMs != null) {
           seek(Duration(milliseconds: positionMs));
         }
-    }
-  }
-
-  /// iOS PiP 窗口内播放/暂停按钮 → 切换播放（与锁屏远程命令同一套 resume/pause）。
-  void _handlePipPlayPause(bool playing) {
-    if (!Platform.isIOS) return;
-    if (playing) {
-      resume();
-    } else {
-      pause();
     }
   }
 

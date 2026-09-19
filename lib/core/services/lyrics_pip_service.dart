@@ -5,9 +5,10 @@ import 'package:flutter/services.dart';
 
 import '../../widgets/apple_lyrics/models/lyric_line.dart';
 
-/// iOS 歌词悬浮窗：系统 Picture-in-Picture（AVSampleBufferDisplayLayer）桥接。
+/// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource）桥接。
 ///
-/// 单行细条状悬浮条（300x22pt），逐字卡拉OK渲染在原生端完成。
+/// 单行细条状悬浮条（300x22pt），无系统播放控件，点击小窗直接关闭；
+/// 逐字卡拉OK渲染在原生端完成（参照 GlobalRefresh-PiP 的真机验证方案）。
 /// 仅 iOS 激活；其它平台全部 no-op（Android 悬浮歌词走 FloatingLyricService，
 /// 由 DesktopLyricService 原路径负责，互不影响）。
 /// Swift 端实现见 ios/Runner/AppDelegate.swift 的 LyricsPipManager。
@@ -27,10 +28,6 @@ class LyricsPipService {
   /// 'state' 回调复位）。按钮激活态以它为准。
   bool get active => _active;
 
-  /// PiP 窗口内播放/暂停按钮回调（由 PlayerProvider 注入）。
-  /// [playing]：用户在 PiP 窗口按下的目标状态（true=播放 / false=暂停）。
-  void Function(bool playing)? onPipPlayPause;
-
   /// PiP 激活态变化回调（由 DesktopLyricService 注入，刷新按钮高亮）。
   void Function()? onActiveChanged;
 
@@ -41,13 +38,8 @@ class LyricsPipService {
   }
 
   Future<dynamic> _handleMethodCall(MethodCall call) async {
-    final args = call.arguments;
-    if (call.method == 'command') {
-      if (args is Map && args['action'] == 'pipPlayPause') {
-        final playing = args['playing'];
-        if (playing is bool) onPipPlayPause?.call(playing);
-      }
-    } else if (call.method == 'state') {
+    if (call.method == 'state') {
+      final args = call.arguments;
       final isActive = args is Map ? args['active'] == true : false;
       _setActive(isActive);
     }
