@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -21,6 +22,7 @@ import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import 'media_notification_service.dart';
 import 'lyric_info_json_builder.dart';
+import 'lyrics_pip_service.dart';
 
 /// 解析歌词文本，超过 32KB 时移入 isolate。
 ///
@@ -63,6 +65,8 @@ class DesktopLyricService {
   DesktopLyricService._() {
     // AM 歌词偏好变化（字号/行距/字重/字体/副行/动态取色）→ 锁屏歌词跟随重推
     LyricPreferences.instance.addListener(_onLyricPrefsChangedForLockScreen);
+    // iOS PiP 悬浮窗激活态变化（含用户从 PiP 窗口关闭）→ 刷新按钮高亮/停 tick
+    LyricsPipService.instance.onActiveChanged = _onPipActiveChanged;
   }
 
   PlayerProvider? _player;
@@ -73,7 +77,13 @@ class DesktopLyricService {
   final SettingsRepository _settings = SettingsRepository();
 
   bool _enabled = false;
-  bool get enabled => _enabled;
+
+  /// 悬浮歌词开关态。iOS 上 PiP 悬浮窗与 Android FloatingLyricService 是两条
+  /// 独立路径：iOS 返回 LyricsPipService 的激活态，mini_player / full_player /
+  /// full_player_am 的桌面歌词按钮高亮随之同步（含用户从 PiP 窗口关闭时）；
+  /// Android 行为不变。
+  bool get enabled =>
+      Platform.isIOS ? LyricsPipService.instance.active : _enabled;
 
   // 蓝牙歌词开关：独立于悬浮窗。ColorOS SystemUI 与 AVRCP 共用 MediaSession，
   // 4.0 接入后原生端必须保持稳定 title/artist，因此不再用该通道改写会话身份。
@@ -305,10 +315,106 @@ class DesktopLyricService {
 
   /// 切换桌面歌词开关（mini_player / 通知栏按钮通用）
   Future<void> toggle() async {
+    // iOS：悬浮歌词走系统画中画（LyricsPipManager），不弹悬浮窗权限；
+    // Android 保持原 FloatingLyricService 路径，一行不改。
+    if (Platform.isIOS) {
+      await _toggleIosPipFloatingLyric();
+      return;
+    }
     if (_enabled) {
       await disable();
     } else {
       await enable();
+    }
+  }
+
+  // —— iOS PiP 悬浮歌词（单行细条，300x22pt）：复用本服务歌词拉取/tick 管线 ——
+
+  // PiP 推送去重状态：行下标 / 占位文案 变化才重推 setLine；进度 500ms 节流
+  int _pipPushedLineIndex = -2;
+  String _pipPushedPlaceholder = '';
+  int _pipProgressPushMs = 0;
+
+  /// iOS PiP 悬浮窗是否激活（其它平台恒 false，Android 零开销）。
+  bool get _pipActive => Platform.isIOS && LyricsPipService.instance.active;
+
+  /// PiP 激活态变化：按需启停 tick（激活→运转；关闭→其它协议也未启用则停）
+  /// 并刷新按钮高亮。
+  void _onPipActiveChanged() {
+    _updateTicker();
+    _notify();
+  }
+
+  /// iOS 分支：开关 PiP 悬浮歌词（full_player / full_player_am / mini_player
+  /// 的桌面歌词按钮共用）。启动成功后补推整包歌词 + 当前行 + 进度，
+  /// 让 PiP 首帧就位（不等下一个 tick）。
+  Future<void> _toggleIosPipFloatingLyric() async {
+    final active = await LyricsPipService.instance.toggle();
+    if (active) {
+      _bindProvidersFromContext();
+      _pushPipLyricsFull();
+      _pushPipLine(_currentLineIndex);
+      final player = _player;
+      if (player != null) {
+        await LyricsPipService.instance.update(
+          positionMs: player.position.inMilliseconds,
+          playing: player.isPlaying,
+        );
+      }
+      _updateTicker();
+    }
+    _notify();
+  }
+
+  /// 整包歌词推给 PiP（切歌/解析完成时）：原生用行尾时间画进度条总长。
+  void _pushPipLyricsFull() {
+    if (!_pipActive) return;
+    _pipPushedLineIndex = -2; // 强制下个 tick 重推当前行
+    LyricsPipService.instance.setLyrics(_lines);
+  }
+
+  /// 歌词未就绪时 PiP 条上显示的占位文案。
+  String get _pipPlaceholder {
+    if (_awaitingLyric) return '歌词加载中...';
+    if (_lyricNextRetryAt != null) return '歌词加载失败';
+    return '暂无歌词';
+  }
+
+  /// 推送当前行（text + 逐字时间轴 + 进度锚点）给 PiP。
+  void _pushPipLine(int index) {
+    final player = _player;
+    final line = index >= 0 && index < _lines.length ? _lines[index] : null;
+    LyricsPipService.instance.setLine(
+      text: line?.text ?? '',
+      lineStart: line?.startTime ?? -1,
+      words: line?.words ?? const [],
+      placeholder: _lines.isEmpty ? _pipPlaceholder : '',
+      positionMs: player?.position.inMilliseconds ?? 0,
+      playing: player?.isPlaying ?? false,
+    );
+  }
+
+  /// 每 tick 的 PiP 推送入口：行/占位变化 → setLine；否则 500ms 节流进度校准。
+  void _pipTick(int newIndex) {
+    final placeholderNow = _lines.isEmpty ? _pipPlaceholder : '';
+    if (newIndex != _pipPushedLineIndex ||
+        placeholderNow != _pipPushedPlaceholder) {
+      _pipPushedLineIndex = newIndex;
+      _pipPushedPlaceholder = placeholderNow;
+      _pushPipLine(newIndex);
+      _pipProgressPushMs = DateTime.now().millisecondsSinceEpoch;
+      return;
+    }
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _pipProgressPushMs >= 500) {
+      _pipProgressPushMs = nowMs;
+      final player = _player;
+      if (player != null) {
+        LyricsPipService.instance.update(
+          positionMs: player.position.inMilliseconds,
+          playing: player.isPlaying,
+        );
+      }
     }
   }
 
@@ -598,13 +704,15 @@ class DesktopLyricService {
     }
   }
 
-  /// 定时器是否需要运行：悬浮窗、蓝牙歌词、LyricInfo、SuperLyric 或锁屏歌词任一开启即需运行
+  /// 定时器是否需要运行：悬浮窗、蓝牙歌词、LyricInfo、SuperLyric、锁屏歌词
+  /// 或 iOS PiP 悬浮歌词任一开启即需运行
   bool _shouldTick() =>
       _enabled ||
       _bluetoothLyricEnabled ||
       _lyricInfoEnabled ||
       _superLyricEnabled ||
-      _lockScreenLyricEnabled;
+      _lockScreenLyricEnabled ||
+      _pipActive;
 
   /// 根据开关状态启停定时器（250ms tick：逐行歌词足够检测切行）
   void _updateTicker() {
@@ -764,9 +872,10 @@ class DesktopLyricService {
 
   void _onTick() {
     if (!_shouldTick()) return;
-    // 熄屏且未开锁屏歌词：悬浮窗不可见，tick 纯耗电，直接休眠
+    // 熄屏且未开锁屏歌词：Android 悬浮窗不可见，tick 纯耗电，直接休眠。
+    // iOS PiP 悬浮歌词在熄屏/锁屏时仍可见（系统 PiP 窗口常显），不能休眠。
     // （点亮屏幕时由 screenStateChanged 回调补一拍对齐漂移）
-    if (!_screenOn && !_lockScreenLyricEnabled) {
+    if (!_screenOn && !_lockScreenLyricEnabled && !_pipActive) {
       _cancelLineTimer();
       return;
     }
@@ -861,6 +970,12 @@ class DesktopLyricService {
       _pushProgress(pos, dur);
     }
 
+    // iOS PiP 悬浮歌词：行/占位变化推送 + 进度校准。放在 _lines.isEmpty
+    // 早退之前——切歌清空行列表后 PiP 条才能及时切到占位文案。
+    if (_pipActive) {
+      _pipTick(_lines.isEmpty ? -1 : _findLineIndex(posMs));
+    }
+
     // Find current line
     if (_lines.isEmpty) return;
     final newIndex = _findLineIndex(posMs);
@@ -929,6 +1044,7 @@ class DesktopLyricService {
             // isolate 解析期间可能已切歌：迟到结果直接丢弃
             if (!_isCurrentLyricRequest(token, requestedSongId)) return;
             _lines = lines;
+            _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
             if (_lines.isEmpty) _pushLyric('暂无歌词', '', placeholder: '暂无歌词');
             _markLockLyricLoaded(_lines.isEmpty ? '暂无歌词' : '');
             return;
@@ -1005,6 +1121,7 @@ class DesktopLyricService {
     // isolate 解析期间可能已切歌：迟到结果直接丢弃
     if (!_isCurrentLyricRequest(token, requestedSongId)) return;
     _lines = lines;
+    _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
     if (_lines.isEmpty) _pushLyric('暂无歌词', '', placeholder: '暂无歌词');
     _markLockLyricLoaded(_lines.isEmpty ? '暂无歌词' : '');
   }
