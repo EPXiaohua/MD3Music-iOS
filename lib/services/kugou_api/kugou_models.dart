@@ -642,22 +642,6 @@ class KugouSongDetail {
   }
 }
 
-/// 把酷狗返回的 http:// 资源链接升级为 https://。
-///
-/// 诊断日志（iOS 5.6.5+41）证实：上游返回的播放/封面链接是 http://（部分还是
-/// host:port 形式的备份 CDN），用户网络环境对明文 HTTP 直连酷狗 CDN 会
-/// Connection refused (-1004) / 超时，而 HTTPS 一切正常——这正是"前台后台都没网"
-/// 的根因（本地 Rust 服务器经 HTTPS 请求上游始终正常，见同日志 URL 刷新成功）。
-/// 显式非 443 端口在升级时去掉：备份 CDN 的高位端口没有 TLS 监听。
-String? kugouUrlToHttps(String? url) {
-  if (url == null || !url.startsWith('http://')) return url;
-  final upgraded = 'https://${url.substring('http://'.length)}';
-  return upgraded.replaceFirstMapped(
-    RegExp(r'^(https://[^/]+):\d+'),
-    (m) => m.group(1)!,
-  );
-}
-
 class KugouPlayUrl {
   final String url;
   final int fileSize;
@@ -695,9 +679,6 @@ class KugouPlayUrl {
     } else {
       url = rawUrl.toString();
     }
-    // 播放链接 http → https：见 [kugouUrlToHttps] 注释。所有播放 URL 都经过
-    // 本构造函数（/song/url、/song/url/new、试听兜底），在此统一升级即可。
-    url = kugouUrlToHttps(url) ?? url;
     // 检测是否为试听片段：fail_process 含 'buy' 说明该音质需要购买/VIP；
     // fileSize 小于 200KB 且歌曲正常时长 3-5 分钟，大概率是 30s 试听。
     final failProcess = json['fail_process'];

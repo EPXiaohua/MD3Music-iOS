@@ -1356,11 +1356,6 @@ class _MainLayoutState extends State<_MainLayout>
       // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
       // ignore: discarded_futures
       KugouApiServer.stop();
-    } else if (state == AppLifecycleState.resumed) {
-      // iOS 回前台自检：后台被挂起/回收后本地 API 服务器可能已死（表现为
-      // "没网"）。ensureRunning 内部仅 iOS 生效，且运行正常时零开销。
-      // ignore: discarded_futures
-      KugouApiServer.ensureRunning();
     }
   }
 

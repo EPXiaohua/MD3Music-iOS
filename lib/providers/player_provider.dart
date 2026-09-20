@@ -2250,11 +2250,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         if (data is Map<String, dynamic>) {
           final rawUrl = data['url'];
           if (rawUrl is String && rawUrl.isNotEmpty) {
-            return kugouUrlToHttps(rawUrl) ?? rawUrl;
+            return rawUrl;
           }
           if (rawUrl is List && rawUrl.isNotEmpty) {
-            return kugouUrlToHttps(rawUrl.first.toString()) ??
-                rawUrl.first.toString();
+            return rawUrl.first.toString();
           }
         }
       }
@@ -3662,9 +3661,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     bool isFavorited, {
     String? artUrlOverride,
   }) {
-    // http → https 升级：http 封面在部分网络环境加载失败/超时（见
-    // kugouUrlToHttps 注释）。file:// 本地路径不受影响，原样返回。
-    final artUrl = kugouUrlToHttps(artUrlOverride ?? song.artworkUri);
+    final artUrl = artUrlOverride ?? song.artworkUri;
     // 封面链路日志：记录最终下发给原生的封面源（便于区分是否走本地缓存/在线 URL）
     debugPrint(
       '[PlayerProvider] 下发通知封面 artUrl=$artUrl '

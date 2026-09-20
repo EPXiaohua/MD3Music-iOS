@@ -25,6 +25,7 @@ typedef StopServer = void Function();
 class KugouApiServer {
   static const _channel = MethodChannel('com.md3music.md3music/kugou_api');
   static bool _started = false;
+
   /// P0: 启动中/已完成 Future，供并发调用去重（main() 与播放前兜底）。
   static Future<void>? _startFuture;
   static DynamicLibrary? _lib;
@@ -57,8 +58,10 @@ class KugouApiServer {
           // 桌面没有 MethodChannel 兜底，FFI 失败即彻底失败。最常见原因是
           // 原生库没有跟 exe 放在一起（需先跑
           // kugou_api_server/rust/build_desktop.ps1 产出 dll）。
-          print('dart:ffi start failed and no fallback on this platform '
-              '(missing ${_libraryName()}?): $e');
+          print(
+            'dart:ffi start failed and no fallback on this platform '
+            '(missing ${_libraryName()}?): $e',
+          );
         }
       }
 
@@ -110,12 +113,15 @@ class KugouApiServer {
 
   static Future<void> _startViaFfi() async {
     final lib = _loadLib();
-    final startServer = lib
-        .lookupFunction<StartServerNative, StartServer>('start_server');
-    _stopServerFn ??=
-        lib.lookupFunction<StopServerNative, StopServer>('stop_server');
-    _isRunningFn ??=
-        lib.lookupFunction<IsRunningNative, IsRunning>('is_server_running');
+    final startServer = lib.lookupFunction<StartServerNative, StartServer>(
+      'start_server',
+    );
+    _stopServerFn ??= lib.lookupFunction<StopServerNative, StopServer>(
+      'stop_server',
+    );
+    _isRunningFn ??= lib.lookupFunction<IsRunningNative, IsRunning>(
+      'is_server_running',
+    );
 
     // 用 path_provider 获取 filesDir，避免硬编码包名路径
     final appDir = await getApplicationSupportDirectory();
@@ -152,8 +158,11 @@ class KugouApiServer {
   static Future<void> _waitForReady(int port) async {
     for (int i = 0; i < 30; i++) {
       try {
-        final socket = await Socket.connect('127.0.0.1', port,
-            timeout: const Duration(seconds: 1));
+        final socket = await Socket.connect(
+          '127.0.0.1',
+          port,
+          timeout: const Duration(seconds: 1),
+        );
         await socket.close();
         print('Local API server is ready on port $port');
         // P0: 通知 KugouApiClient 服务器已就绪（runApp 不等待服务器启动，
@@ -175,8 +184,9 @@ class KugouApiServer {
     // 优先用 FFI 查询（不依赖 JNI 符号）
     try {
       final lib = _loadLib();
-      _isRunningFn ??=
-          lib.lookupFunction<IsRunningNative, IsRunning>('is_server_running');
+      _isRunningFn ??= lib.lookupFunction<IsRunningNative, IsRunning>(
+        'is_server_running',
+      );
       return _isRunningFn!() == 1;
     } catch (_) {
       // FFI 不可用再试 MethodChannel
@@ -188,19 +198,6 @@ class KugouApiServer {
     }
   }
 
-  /// 回前台自检（iOS）：后台被挂起/回收后本地服务器线程可能已死（表现为
-  /// "没网"，所有请求连接被拒）。回前台时校验运行状态，死了就重启。
-  /// 仅 iOS 需要：Android 有进程级前台服务与 _ensureApiServerReady 兜底。
-  static Future<void> ensureRunning() async {
-    if (kIsWeb || !Platform.isIOS) return;
-    if (!_started) return; // 从未启动成功过：交给播放前兜底路径处理
-    if (await isRunning()) return;
-    print('KugouApiServer not running after resume, restarting...');
-    _started = false;
-    _startFuture = null;
-    await start();
-  }
-
   /// 显式停止本地 API 服务器，释放端口，避免下一次冷启动时端口冲突。
   /// Android 直接划掉应用时进程会被系统 kill，线程随之终止；这里保证温和退出
   /// （确认退出 / Activity 销毁）场景能确定性关停。
@@ -210,8 +207,9 @@ class KugouApiServer {
     // 优先用 FFI 停止（不依赖 JNI 符号）
     try {
       final lib = _loadLib();
-      _stopServerFn ??=
-          lib.lookupFunction<StopServerNative, StopServer>('stop_server');
+      _stopServerFn ??= lib.lookupFunction<StopServerNative, StopServer>(
+        'stop_server',
+      );
       _stopServerFn!();
       print('KugouApiServer stopped via FFI');
       return;

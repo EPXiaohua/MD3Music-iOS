@@ -5,7 +5,6 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../core/services/local_artwork_cache.dart';
-import '../services/kugou_api/kugou_models.dart';
 
 /// 播放器专用封面图组件，支持所有 artworkUri 类型。
 ///
@@ -93,9 +92,7 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    // http → https 升级：http 封面在部分网络环境加载失败/超时（见
-    // kugouUrlToHttps 注释），本地类型原样返回。
-    final uri = kugouUrlToHttps(widget.artworkUri);
+    final uri = widget.artworkUri;
     final bg = widget.backgroundColor ?? cs.surfaceContainerHighest;
     final icon = widget.iconColor ?? cs.onSurfaceVariant;
     final iSize = widget.iconSize ?? 48;
@@ -208,9 +205,8 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
 /// 用于播放器切歌前预加载下一首封面，减少切换白屏。
 /// 仅对 http(s):// 有效，本地封面无需预加载。
 void preloadPlayerArtwork(String? url) {
-  final upgraded = kugouUrlToHttps(url);
-  if (upgraded == null || upgraded.isEmpty) return;
-  if (upgraded.startsWith('http://') || upgraded.startsWith('https://')) {
-    CachedNetworkImageProvider(upgraded).resolve(const ImageConfiguration());
+  if (url == null || url.isEmpty) return;
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    CachedNetworkImageProvider(url).resolve(const ImageConfiguration());
   }
 }

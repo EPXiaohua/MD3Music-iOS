@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
-import '../services/kugou_api/kugou_models.dart';
 import 'local_artwork_image.dart';
 
 /// 智能封面图组件：根据 artworkUri 类型选择不同的加载策略。
@@ -90,9 +89,7 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    // http → https 升级：http 封面在部分网络环境加载失败/超时（见
-    // kugouUrlToHttps 注释），本地类型（local:// / content:// / file://）原样返回。
-    final uri = kugouUrlToHttps(widget.artworkUri);
+    final uri = widget.artworkUri;
     // 缩略图解码：列表项封面仅显示 ~52px，但在线封面 URL 是 400×400 原图
     // （kugou_provider._stripArtworkUrl 把 {size} 替换为 400）。不带 cacheWidth
     // 会全尺寸解码（内存/解码时间浪费 ~6.6 倍），且 400×400 位图 ~640KB/张
