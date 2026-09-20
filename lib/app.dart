@@ -1360,9 +1360,16 @@ class _MainLayoutState extends State<_MainLayout>
     // 当系统即将销毁应用进程时（包含后台划掉 / 系统回收），Flutter 会先收到 detached。
     // 此时同步触发 API 服务器关停：若进程随之被 kill 也无副作用；若进程仍存活则释放端口。
     if (state == AppLifecycleState.detached) {
-      // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
-      // ignore: discarded_futures
-      KugouApiServer.stop();
+      // iOS 跳过显式 stop：iOS scene 生命周期的后台时序里，detached 可能在
+      // 进程仍存活时误触发——此时停掉本地服务器，回前台后所有请求连接被拒
+      // 且无恢复路径，正是「锁屏回来服务器停摆」的来源之一。进程真被 kill
+      // 时服务器线程与监听 socket 随进程销毁，无需温和关停；端口随机分配，
+      // 也不存在下次启动冲突。仅 Android 保留关停（其 detached 只在真销毁时到）。
+      if (!Platform.isIOS) {
+        // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
+        // ignore: discarded_futures
+        KugouApiServer.stop();
+      }
     }
   }
 

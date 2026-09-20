@@ -2649,8 +2649,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 冷启动时 main() 中的 KugouApiServer.start() 可能因 MethodChannel 尚未注册
   /// 而失败（MissingPluginException），导致后续所有 API 请求因连接被拒绝而失败。
   /// 此方法在播放流程中做二次兜底：探测端口，若不通则重新尝试启动。
+  ///
+  /// Android：前台服务保活下服务器极少死，此处主要防冷启动失败。
+  /// iOS：锁屏后无活跃音频会话时进程被挂起（后台时序里 detached 还可能
+  /// 误触发 stop()），回前台后端口不通——播放前必须探测并重启，否则表现
+  /// 为「锁屏回来后音乐播不了，而已加载的 MV 等正常」。
   Future<void> _ensureApiServerReady() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (kIsWeb) return;
     final port = KugouApiServer.currentPort;
     if (port <= 0) {
       await KugouApiServer.start();
@@ -2669,7 +2674,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 端口不通，尝试重新启动
     }
     try {
-      await KugouApiServer.start();
+      // 注意不能只调 start()：_started/RUNNING 标志仍为 true 时 start()
+      // 直接返回旧端口不重新 bind，必须 restart() 先停后起才能自愈。
+      await KugouApiServer.restart();
     } catch (_) {}
   }
 
