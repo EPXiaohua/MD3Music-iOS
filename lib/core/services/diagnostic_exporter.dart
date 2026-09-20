@@ -362,6 +362,8 @@ class DiagnosticExporter {
       // Windows 桌面（私有版）等非 Android 平台
       osVersion = Platform.operatingSystemVersion;
       deviceModel = Platform.operatingSystem;
+      // iOS 端 Skia 渲染器已移除，Impeller 是唯一引擎（设置页同款判定）
+      if (Platform.isIOS) renderEngine = 'impeller';
     }
 
     bool serverRunning = false;

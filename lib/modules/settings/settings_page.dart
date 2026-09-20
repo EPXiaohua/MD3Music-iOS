@@ -1998,13 +1998,21 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 从原生侧读取当前构建实际生效的渲染引擎（'skia' | 'impeller'）。
   Future<String> _readCurrentRenderEngine() async {
-    try {
-      const channel = MethodChannel('com.md3music.md3music/render_engine');
-      final v = await channel.invokeMethod<String>('getCurrent');
-      return v == 'impeller' ? 'impeller' : 'skia';
-    } catch (_) {
-      return 'skia';
+    // iOS：该 Flutter 版本的 iOS 端 Skia 渲染器已移除，Impeller 是唯一引擎
+    // （Android manifest 的 EnableImpeller=false 固定开关只对 Android 生效，
+    // iOS 的 render_engine channel 无原生实现，不能落到 'skia' 兜底）。
+    if (Platform.isIOS) return 'impeller';
+    if (Platform.isAndroid) {
+      try {
+        const channel = MethodChannel('com.md3music.md3music/render_engine');
+        final v = await channel.invokeMethod<String>('getCurrent');
+        return v == 'impeller' ? 'impeller' : 'skia';
+      } catch (_) {
+        return 'skia';
+      }
     }
+    // 桌面端（Windows/macOS/Linux）当前仍为 Skia
+    return 'skia';
   }
 
   /// 播放 section。
@@ -2726,7 +2734,7 @@ class _SettingsPageState extends State<SettingsPage>
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
           child: Text(
-            '渲染引擎在应用构建时确定，运行中无法切换。\n· Skia 版：兼容性优先，适用于 32 位/老旧设备\n· Impeller 版：图形更流畅，适用于新设备\n如需切换，请安装对应构建版本。',
+            '渲染引擎在应用构建时确定，运行中无法切换。\n· Skia 版：兼容性优先，适用于 32 位/老旧设备\n· Impeller 版：图形更流畅，适用于新设备；iOS 端固定为 Impeller（系统默认，不可配置）\n如需切换，请安装对应构建版本。',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
                   color: colorScheme.onSurfaceVariant,
                 ),
