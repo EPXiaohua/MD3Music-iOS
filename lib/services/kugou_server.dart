@@ -188,6 +188,19 @@ class KugouApiServer {
     }
   }
 
+  /// 回前台自检（iOS）：后台被挂起/回收后本地服务器线程可能已死（表现为
+  /// "没网"，所有请求连接被拒）。回前台时校验运行状态，死了就重启。
+  /// 仅 iOS 需要：Android 有进程级前台服务与 _ensureApiServerReady 兜底。
+  static Future<void> ensureRunning() async {
+    if (kIsWeb || !Platform.isIOS) return;
+    if (!_started) return; // 从未启动成功过：交给播放前兜底路径处理
+    if (await isRunning()) return;
+    print('KugouApiServer not running after resume, restarting...');
+    _started = false;
+    _startFuture = null;
+    await start();
+  }
+
   /// 显式停止本地 API 服务器，释放端口，避免下一次冷启动时端口冲突。
   /// Android 直接划掉应用时进程会被系统 kill，线程随之终止；这里保证温和退出
   /// （确认退出 / Activity 销毁）场景能确定性关停。
