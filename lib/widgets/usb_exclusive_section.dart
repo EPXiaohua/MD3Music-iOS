@@ -52,6 +52,9 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   /// 从音频文件头解析的原始位深（FLAC/WAV），null=未知（有损格式不显示位深）。
   int? _headerBitDepth;
 
+  /// 从音频文件头解析的源格式（iOS 无 ExoPlayer TrackGroup 时的兜底数据源）。
+  Map<String, int?>? _headerInfo;
+
   /// 已拉取源格式的歌曲 id（去重，切歌才重新请求）。
   String? _sourceSongId;
 
@@ -117,6 +120,16 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
           await AudioFormatUtils.parseAudioBitDepth(song?.url, song?.localPath);
       if (mounted) {
         setState(() => _headerBitDepth = headerBits);
+      }
+    } catch (_) {
+      // 文件头解析失败静默处理
+    }
+    try {
+      // 平台无关兜底：iOS 无 TrackGroup/原生 USB 状态，采样率/声道从文件头解析
+      final info =
+          await AudioFormatUtils.parseAudioSourceInfo(song?.url, song?.localPath);
+      if (mounted) {
+        setState(() => _headerInfo = info);
       }
     } catch (_) {
       // 文件头解析失败静默处理
@@ -190,8 +203,14 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     // 源文件：歌曲原始格式（TrackGroup 采样率/声道 + 文件头位深 + codec 名）
     final src = _sourceFormat;
     final hasSrc = src != null && src['hasData'] == true;
-    final srcRate = hasSrc ? ((src['sampleRate'] as num?)?.toInt() ?? 0) : 0;
-    final srcCh = hasSrc ? ((src['channelCount'] as num?)?.toInt() ?? 0) : 0;
+    final hdr = _headerInfo;
+    // TrackGroup 缺失（iOS）时用文件头解析兜底
+    final srcRate = hasSrc
+        ? ((src['sampleRate'] as num?)?.toInt() ?? 0)
+        : (hdr?['sampleRate'] ?? 0);
+    final srcCh = hasSrc
+        ? ((src['channelCount'] as num?)?.toInt() ?? 0)
+        : (hdr?['channels'] ?? 0);
     final srcCodec = hasSrc ? src['codec'] as String? : null;
     // FLAC 扩展 extractor 会在 extractor 层直接解码为 raw PCM（2026-09-14 定位），
     // 此时 TrackGroup 的 mime 是 audio/raw（解码后 PCM，不含容器/位深信息）。

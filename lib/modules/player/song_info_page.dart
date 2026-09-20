@@ -34,6 +34,9 @@ class _SongInfoPageState extends State<SongInfoPage> {
   /// 从音频文件头解析的原始位深（FLAC/WAV），null=未知。
   int? _headerBitDepth;
 
+  /// 从音频文件头解析的源格式（iOS 无 ExoPlayer TrackGroup 时的兜底数据源）。
+  Map<String, int?>? _headerInfo;
+
   /// 文件大小（字节），null=暂无数据。获取成功后不再重复请求（文件大小恒定）。
   int? _fileSizeBytes;
   bool _fileSizeResolved = false;
@@ -104,13 +107,17 @@ class _SongInfoPageState extends State<SongInfoPage> {
       if (await f.exists()) return await f.length();
     }
     // 3) 网络歌曲：HEAD 请求拿 Content-Length（文件真实大小）
-    if (url != null && (url.startsWith('http://') || url.startsWith('https://'))) {
+    if (url != null &&
+        (url.startsWith('http://') || url.startsWith('https://'))) {
       try {
         final resp = await http
             .head(Uri.parse(url))
             .timeout(const Duration(seconds: 4));
         final len = int.tryParse(resp.headers['content-length'] ?? '');
-        if (resp.statusCode >= 200 && resp.statusCode < 300 && len != null && len > 0) {
+        if (resp.statusCode >= 200 &&
+            resp.statusCode < 300 &&
+            len != null &&
+            len > 0) {
           return len;
         }
       } catch (_) {}
@@ -125,19 +132,29 @@ class _SongInfoPageState extends State<SongInfoPage> {
     return null;
   }
 
-  /// 从 ExoPlayer TrackGroup 读取源格式 + 解析音频文件头位深（歌曲原始属性）。
+  /// 从 ExoPlayer TrackGroup 读取源格式 + 解析音频文件头（位深与完整源格式）。
   Future<void> _refreshSourceFormat() async {
     final player = context.read<PlayerProvider>().audioService?.player;
     final song = context.read<PlayerProvider>().currentSong;
     Map<String, dynamic>? fmt;
     if (player != null) {
-      fmt = await player.getSourceFormat();
+      try {
+        fmt = await player.getSourceFormat();
+      } catch (_) {
+        // 源格式仅用于展示，失败静默（iOS 端 just_audio 无此实现，必然失败）
+      }
     }
     final headerBits = await _parseHeaderBitDepth(song?.url, song?.localPath);
+    // 平台无关兜底：iOS 无 TrackGroup/原生 USB 状态，采样率/声道/码率从文件头解析
+    final headerInfo = await AudioFormatUtils.parseAudioSourceInfo(
+      song?.url,
+      song?.localPath,
+    );
     if (mounted) {
       setState(() {
         _sourceFormat = fmt;
         _headerBitDepth = headerBits;
+        _headerInfo = headerInfo;
       });
     }
   }
@@ -157,7 +174,7 @@ class _SongInfoPageState extends State<SongInfoPage> {
     // 切歌后异步拉取源格式（以歌曲 id 去重，避免重复请求）
     if (song?.id != _sourceSongId) {
       _sourceSongId = song?.id;
-      _fileSizeBytes = null;  // 换歌重置
+      _fileSizeBytes = null; // 换歌重置
       _fileSizeResolved = false;
       _refreshSourceFormat();
     }
@@ -187,8 +204,8 @@ class _SongInfoPageState extends State<SongInfoPage> {
       child: Text(
         title,
         style: Theme.of(context).textTheme.titleSmall?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-            ),
+          color: Theme.of(context).colorScheme.primary,
+        ),
       ),
     );
   }
@@ -205,7 +222,10 @@ class _SongInfoPageState extends State<SongInfoPage> {
   }
 
   Widget _buildSongHeader(
-      Song? song, ColorScheme colorScheme, TextTheme textTheme) {
+    Song? song,
+    ColorScheme colorScheme,
+    TextTheme textTheme,
+  ) {
     // 去掉文件名后缀：仅当标题以音频扩展名结尾才剥离，避免误伤合法带点的标题
     final title = _stripAudioExtension(song?.title ?? '未在播放');
     final artist = song?.artist ?? '—';
@@ -232,16 +252,21 @@ class _SongInfoPageState extends State<SongInfoPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title,
-                    style: textTheme.titleMedium,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis),
+                Text(
+                  title,
+                  style: textTheme.titleMedium,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
                 const SizedBox(height: 2),
-                Text(artist,
-                    style: textTheme.bodySmall
-                        ?.copyWith(color: colorScheme.onSurfaceVariant),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis),
+                Text(
+                  artist,
+                  style: textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ],
             ),
           ),
@@ -252,29 +277,42 @@ class _SongInfoPageState extends State<SongInfoPage> {
 
   Widget _buildFormatCard(ColorScheme colorScheme) {
     final textTheme = Theme.of(context).textTheme;
+    final song = context.read<PlayerProvider>().currentSong;
     final src = _sourceFormat;
     final hasSrc = src != null && (src['hasData'] == true);
+    // 文件头解析（iOS 无 TrackGroup 时的唯一源格式来源）
+    final hdr = _headerInfo;
+    final hdrRate = hdr?['sampleRate'] ?? 0;
+    final hdrCh = hdr?['channels'] ?? 0;
+    final hdrBits = hdr?['bits'] ?? 0;
+    final hdrBitrate = hdr?['bitrate'] ?? 0;
 
     // 源格式（歌曲原始属性，来自 ExoPlayer TrackGroup）
     final srcRate = hasSrc ? ((src['sampleRate'] as num?)?.toInt() ?? 0) : 0;
     final srcCh = hasSrc ? ((src['channelCount'] as num?)?.toInt() ?? 0) : 0;
     final srcPcmEnc = hasSrc ? ((src['pcmEncoding'] as num?)?.toInt() ?? 0) : 0;
     // 位深权威来源：音频文件头解析（FLAC/WAV 原始位深）
-    final srcBits = _headerBitDepth ?? 0;
+    final srcBits = _headerBitDepth ?? hdrBits;
 
     // 回退：解码输出格式（未拿到源格式时）
     final decRate = (_status['lastSampleRate'] as num?)?.toInt() ?? 0;
     final decCh = (_status['lastChannelCount'] as num?)?.toInt() ?? 0;
     final decEnc = (_status['lastEncoding'] as num?)?.toInt() ?? 2;
 
-    final hasData = hasSrc || decRate > 0;
-    final rate = srcRate > 0 ? srcRate : decRate;
-    final ch = srcCh > 0 ? srcCh : decCh;
+    final hasData = hasSrc || decRate > 0 || hdrRate > 0 || hdrCh > 0;
+    final rate = srcRate > 0 ? srcRate : (hdrRate > 0 ? hdrRate : decRate);
+    final ch = srcCh > 0 ? srcCh : (hdrCh > 0 ? hdrCh : decCh);
 
     // 位深优先级：源 bitsPerSample > 源 pcmEncoding > 解码输出
     final bits = srcBits > 0
         ? srcBits
         : (srcPcmEnc > 0 ? _encodingBits(srcPcmEnc) : _encodingBits(decEnc));
+
+    // 编码名：扩展名推断（TrackGroup codec 不可用时恒可得）
+    final codec = AudioFormatUtils.codecLabelFromPath(
+      song?.url,
+      song?.localPath,
+    );
 
     // USB 实际输出位深（独占开启时有效）
     final dacBits = (_status['dacBitDepth'] as num?)?.toInt() ?? 0;
@@ -292,19 +330,22 @@ class _SongInfoPageState extends State<SongInfoPage> {
       ),
       child: Column(
         children: [
+          if (codec != null) _buildFormatRow('编码', codec),
           _buildFormatRow('采样频率', hasData ? _formatRate(rate) : '—'),
           _buildFormatRow('位深', hasData ? '$bits-bit' : '—'),
+          if (hdrBitrate > 0) _buildFormatRow('码率', '$hdrBitrate kbps'),
           if (!exclusiveEnabled)
             _buildFormatRow(
               '解码输出',
               hasData
                   ? (decRate > 0
-                      ? '${_formatRate(decRate)} · ${_encodingBits(decEnc)}-bit'
-                      : '${_encodingBits(decEnc)}-bit')
+                        ? '${_formatRate(decRate)} · ${_encodingBits(decEnc)}-bit'
+                        : '${_encodingBits(decEnc)}-bit')
                   : '—',
             ),
           if (dacBits > 0) _buildFormatRow('USB 输出', '$dacBits-bit(USB输出)'),
-          if (fileSize != null) _buildFormatRow('文件大小', _formatFileSize(fileSize)),
+          if (fileSize != null)
+            _buildFormatRow('文件大小', _formatFileSize(fileSize)),
           _buildFormatRow('声道', hasData ? _formatChannels(ch) : '—'),
           if (!hasData)
             Padding(
@@ -313,8 +354,9 @@ class _SongInfoPageState extends State<SongInfoPage> {
                 alignment: Alignment.centerLeft,
                 child: Text(
                   '播放歌曲后自动显示音频格式',
-                  style: textTheme.bodySmall
-                      ?.copyWith(color: colorScheme.onSurfaceVariant),
+                  style: textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
             ),
@@ -330,13 +372,19 @@ class _SongInfoPageState extends State<SongInfoPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       child: Row(
         children: [
-          Text(label,
-              style: textTheme.bodyMedium
-                  ?.copyWith(color: colorScheme.onSurfaceVariant)),
+          Text(
+            label,
+            style: textTheme.bodyMedium?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
           const Spacer(),
-          Text(value,
-              style: textTheme.bodyMedium
-                  ?.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
+          Text(
+            value,
+            style: textTheme.bodyMedium?.copyWith(
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
         ],
       ),
     );
