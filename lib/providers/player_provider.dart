@@ -2336,10 +2336,18 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _rateCheckPos = Duration.zero;
     _rateCheckTime = DateTime.now();
     _rateCheckSeenPlay = false;
+    // 播放链接 http→https 升级（仅此一处，封面等资源不动）：API 返回的播放
+    // 链接多为 http://，明文 HTTP 直连 CDN 在部分网络环境 -1004 连不上
+    // （诊断日志 20260921_022129）。升级后加载失败时回退原始链接重试一次，
+    // 兼容仅支持 http 的 CDN / 网络（上次一刀切升级无回退，个别环境全挂）。
+    final upgradedUrl = kugouPlayUrlHttpsUpgrade(url);
+    final String loadUrl = upgradedUrl ?? url;
+    final String? httpFallback = upgradedUrl == null ? null : url;
     // 诊断日志：setUrl
     // ignore: avoid_print
     print(
-      '[D切歌] setUrl → ${url.substring(0, url.length < 60 ? url.length : 60)}',
+      '[D切歌] setUrl → ${loadUrl.substring(0, loadUrl.length < 60 ? loadUrl.length : 60)}'
+      '${httpFallback != null ? ' (http 回退可用)' : ''}',
     );
     // 换源回退抑制：setUrl 之后播放器位置会从 0 重新计数，直到下面 seek 落地。
     // 这段窗口里发布 0 会让进度条闪回 0:00、歌词滚回开头（见 [_updatePosition]）。
@@ -2348,11 +2356,23 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (gateRewind) _positionRewindGate.arm(seekTo);
     try {
       // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-      await _audioService.setUrl(
-        url,
-        loudnessLufs: _currentSong?.loudnessLufs,
-        loudnessPeakDb: _currentSong?.loudnessPeakDb,
-      );
+      try {
+        await _audioService.setUrl(
+          loadUrl,
+          loudnessLufs: _currentSong?.loudnessLufs,
+          loudnessPeakDb: _currentSong?.loudnessPeakDb,
+        );
+      } catch (e) {
+        // https 升级链接加载失败：回退原始 http 链接重试一次；无回退则原样抛出
+        if (httpFallback == null) rethrow;
+        // ignore: avoid_print
+        print('[D切歌] https 加载失败，回退原始链接重试: $e');
+        await _audioService.setUrl(
+          httpFallback,
+          loudnessLufs: _currentSong?.loudnessLufs,
+          loudnessPeakDb: _currentSong?.loudnessPeakDb,
+        );
+      }
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
         final state = _audioService.player.playerState;

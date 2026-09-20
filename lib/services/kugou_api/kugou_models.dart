@@ -642,6 +642,22 @@ class KugouSongDetail {
   }
 }
 
+/// 把酷狗播放链接 http:// 升级为 https://（仅播放链接使用，封面等资源不动）。
+///
+/// 诊断日志（iOS 5.6.5+41，20260921_022129）证实：API 返回的播放链接多为
+/// http://（部分是 host:port 形式的备份 CDN），AVPlayer 明文 HTTP 直连酷狗
+/// CDN 会 -1004 "Could not connect to the server"（本地服务器走 HTTPS 请求
+/// 上游始终正常）。显式非 443 端口在升级时去掉：备份 CDN 的高位端口没有
+/// TLS 监听。非 http 链接返回 null，调用方直接使用原链接。
+String? kugouPlayUrlHttpsUpgrade(String url) {
+  if (!url.startsWith('http://')) return null;
+  final upgraded = 'https://${url.substring('http://'.length)}';
+  return upgraded.replaceFirstMapped(
+    RegExp(r'^(https://[^/]+):\d+'),
+    (m) => m.group(1)!,
+  );
+}
+
 class KugouPlayUrl {
   final String url;
   final int fileSize;
