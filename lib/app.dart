@@ -1357,25 +1357,12 @@ class _MainLayoutState extends State<_MainLayout>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 回前台自检（iOS）：后台无活跃音频会话时进程被挂起/回收，本地 API
-    // 服务器线程随之冻结或死亡（表现为"API 服务突然停摆"）。ensureRunning
-    // 内部做 TCP 探测、仅 iOS 生效，运行正常时零开销。
-    if (state == AppLifecycleState.resumed) {
-      // ignore: discarded_futures
-      KugouApiServer.ensureRunning();
-    }
     // 当系统即将销毁应用进程时（包含后台划掉 / 系统回收），Flutter 会先收到 detached。
     // 此时同步触发 API 服务器关停：若进程随之被 kill 也无副作用；若进程仍存活则释放端口。
     if (state == AppLifecycleState.detached) {
-      // iOS 跳过显式 stop：detached 在 iOS 上可能在进程仍存活的时序里触发
-      // （后台引擎回收等），一旦误停本地服务器，回前台后所有请求连接被拒，
-      // 且无任何恢复路径——正是"突然停摆"的来源之一。进程真被 kill 时线程
-      // 与监听 socket 随进程销毁，无需温和关停；端口也是随机分配，无冲突。
-      if (!Platform.isIOS) {
-        // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
-        // ignore: discarded_futures
-        KugouApiServer.stop();
-      }
+      // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
+      // ignore: discarded_futures
+      KugouApiServer.stop();
     }
   }
 

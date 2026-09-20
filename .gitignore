@@ -55,9 +55,6 @@ app.*.map.json
 # Project archive snapshot
 /md3Music-rust-local-force.zip
 
-# App 内导出的诊断报告（含设备/日志，不入库）
-/MD3Music_diagnostics_*.zip
-
 # 上游版本源码 dump（仅本地参考，不入库）
 /md3Music-5.5.0/
 /md3Music-5.6.0/

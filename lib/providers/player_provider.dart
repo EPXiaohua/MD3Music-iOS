@@ -39,7 +39,6 @@ import 'favorites_provider.dart';
 import 'kugou_provider.dart';
 import 'position_rewind_gate.dart';
 import '../services/kugou_api/kugou_api_client.dart';
-import '../services/kugou_api/kugou_endpoints.dart';
 import '../services/kugou_api/kugou_models.dart';
 
 enum AppLoopMode { off, one, all }
@@ -2337,10 +2336,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _rateCheckPos = Duration.zero;
     _rateCheckTime = DateTime.now();
     _rateCheckSeenPlay = false;
-    // 诊断日志：setUrl。用 debugPrint（print 不进诊断日志文件）：直连 CDN
-    // 失败排障必须能看到实际下发的 host/协议/端口（主 CDN 还是 host:port
-    // 备份 CDN、http 还是 https），否则无法区分故障源。
-    debugPrint(
+    // 诊断日志：setUrl
+    // ignore: avoid_print
+    print(
       '[D切歌] setUrl → ${url.substring(0, url.length < 60 ? url.length : 60)}',
     );
     // 换源回退抑制：setUrl 之后播放器位置会从 0 重新计数，直到下面 seek 落地。
@@ -2350,28 +2348,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (gateRewind) _positionRewindGate.arm(seekTo);
     try {
       // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-      try {
-        await _audioService.setUrl(
-          url,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
-      } catch (e) {
-        // 直连 CDN 失败（诊断日志实锤 -1004：部分网络环境设备直连酷狗 CDN
-        // 不通，DNS/IPv6/运营商路由问题），改走本地服务器音频代理流式转发
-        // 重试一次——本地服务器进程的上游连接始终正常。代理同样透传 Range，
-        // 进度拖动不受影响。端口为 0（服务器未启动）时无可兜底，原样抛出。
-        final int port = KugouApiServer.currentPort;
-        if (port == 0) rethrow;
-        final proxyUrl =
-            '${KugouEndpoints.baseUrl}/audio/proxy?url=${Uri.encodeComponent(url)}';
-        debugPrint('[D切歌] 直连失败，走本地音频代理重试: $e');
-        await _audioService.setUrl(
-          proxyUrl,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
-      }
+      await _audioService.setUrl(
+        url,
+        loudnessLufs: _currentSong?.loudnessLufs,
+        loudnessPeakDb: _currentSong?.loudnessPeakDb,
+      );
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
         final state = _audioService.player.playerState;
@@ -2402,14 +2383,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (playAfter) {
         await _audioService.play();
       }
-    } catch (e) {
-      // 装载失败进诊断日志：错误码（如 -1004 连不上 CDN）+ 出错的 URL 一起
-      // 记录，否则异常只会以 Zone 未捕获形式出现，无 URL 上下文无法定位是
-      // 哪个 CDN host 连不上。记录后原样抛出，交由上层重试/切歌逻辑处理。
-      debugPrint(
-        '[D切歌] setUrl 失败 err=$e url=${url.substring(0, url.length < 60 ? url.length : 60)}',
-      );
-      rethrow;
     } finally {
       // 装载结束（含异常）一定释放闸门，防止位置被永久抑制；
       // 若已在上面的 seek 分支释放则此处为幂等空操作。
@@ -2675,10 +2648,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   ///
   /// 冷启动时 main() 中的 KugouApiServer.start() 可能因 MethodChannel 尚未注册
   /// 而失败（MissingPluginException），导致后续所有 API 请求因连接被拒绝而失败。
-  /// 此方法在播放流程中做二次兜底：TCP 探测端口，不通则真实重启。
-  /// Android（前台服务保活）与 iOS（后台挂起后服务器死亡）都需要这条兜底。
+  /// 此方法在播放流程中做二次兜底：探测端口，若不通则重新尝试启动。
   Future<void> _ensureApiServerReady() async {
-    if (kIsWeb) return;
+    if (kIsWeb || !Platform.isAndroid) return;
     final port = KugouApiServer.currentPort;
     if (port <= 0) {
       await KugouApiServer.start();
@@ -2694,11 +2666,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       await socket.close();
       return; // 服务器已就绪
     } catch (_) {
-      // 端口不通，重启。注意不能只调 start()：_started 为 true 时 start()
-      // 直接返回（no-op），必须走 restart() 先停后起，才能自愈僵死状态。
+      // 端口不通，尝试重新启动
     }
     try {
-      await KugouApiServer.restart();
+      await KugouApiServer.start();
     } catch (_) {}
   }
 
