@@ -500,13 +500,14 @@ class _AppViewState extends State<_AppView> {
     );
     return withTransparentSurfaces.copyWith(
       appBarTheme: withTransparentSurfaces.appBarTheme.copyWith(
-        titleTextStyle:
-            withTransparentSurfaces.appBarTheme.titleTextStyle?.copyWith(
-          shadows: shadows,
-        ),
+        titleTextStyle: withTransparentSurfaces.appBarTheme.titleTextStyle
+            ?.copyWith(shadows: shadows),
       ),
       textTheme: AppTheme.applyTextShadows(base.textTheme, shadows),
-      primaryTextTheme: AppTheme.applyTextShadows(base.primaryTextTheme, shadows),
+      primaryTextTheme: AppTheme.applyTextShadows(
+        base.primaryTextTheme,
+        shadows,
+      ),
       // 实色表面：把 Flutter 的 M3 默认值（都从 textTheme 兜底取）在这里钉死，
       // 取的是 base 里还没加阴影的那份文字层级。
       dialogTheme: base.dialogTheme.copyWith(
@@ -519,11 +520,13 @@ class _AppViewState extends State<_AppView> {
         textStyle: base.popupMenuTheme.textStyle ?? base.textTheme.labelLarge,
       ),
       snackBarTheme: base.snackBarTheme.copyWith(
-        contentTextStyle: base.snackBarTheme.contentTextStyle ??
+        contentTextStyle:
+            base.snackBarTheme.contentTextStyle ??
             base.textTheme.bodyMedium?.copyWith(color: cs.onInverseSurface),
       ),
       tooltipTheme: base.tooltipTheme.copyWith(
-        textStyle: base.tooltipTheme.textStyle ??
+        textStyle:
+            base.tooltipTheme.textStyle ??
             base.textTheme.bodySmall?.copyWith(color: cs.onInverseSurface),
       ),
     );
@@ -1116,13 +1119,17 @@ class _MainLayoutState extends State<_MainLayout>
     _exitScale = Tween<double>(begin: 1.0, end: 0.1).animate(
       CurvedAnimation(parent: _exitController, curve: Curves.easeInOutCubic),
     );
-    _exitOpacity = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(parent: _exitController, curve: Curves.easeIn),
-    );
+    _exitOpacity = Tween<double>(
+      begin: 1.0,
+      end: 0.0,
+    ).animate(CurvedAnimation(parent: _exitController, curve: Curves.easeIn));
     _exitOffset = Tween<Offset>(begin: Offset.zero, end: const Offset(0.7, 0.7))
         .animate(
-      CurvedAnimation(parent: _exitController, curve: Curves.easeInOutCubic),
-    );
+          CurvedAnimation(
+            parent: _exitController,
+            curve: Curves.easeInOutCubic,
+          ),
+        );
     // 未登录时尝试播放联网歌曲,弹出登录提示
     context.read<PlayerProvider>().onLoginRequired = _showLoginRequiredDialog;
     // 监听应用生命周期：detached（进程被系统销毁前的最后窗口）时尝试关停本地 API 服务器
@@ -1267,9 +1274,9 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// LaunchPad 点击隐藏 tab：以二级页面路由打开对应功能页（不切换主 tab）。
   void _openTabAsPage(String tabId) {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => _pageForTabAsRoute(tabId)),
-    );
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => _pageForTabAsRoute(tabId)));
   }
 
   /// tabId → 可作为二级路由打开的页面（复用主 tab 页面，去掉主 tab 专属参数）。
@@ -1350,12 +1357,25 @@ class _MainLayoutState extends State<_MainLayout>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 回前台自检（iOS）：后台无活跃音频会话时进程被挂起/回收，本地 API
+    // 服务器线程随之冻结或死亡（表现为"API 服务突然停摆"）。ensureRunning
+    // 内部做 TCP 探测、仅 iOS 生效，运行正常时零开销。
+    if (state == AppLifecycleState.resumed) {
+      // ignore: discarded_futures
+      KugouApiServer.ensureRunning();
+    }
     // 当系统即将销毁应用进程时（包含后台划掉 / 系统回收），Flutter 会先收到 detached。
     // 此时同步触发 API 服务器关停：若进程随之被 kill 也无副作用；若进程仍存活则释放端口。
     if (state == AppLifecycleState.detached) {
-      // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
-      // ignore: discarded_futures
-      KugouApiServer.stop();
+      // iOS 跳过显式 stop：detached 在 iOS 上可能在进程仍存活的时序里触发
+      // （后台引擎回收等），一旦误停本地服务器，回前台后所有请求连接被拒，
+      // 且无任何恢复路径——正是"突然停摆"的来源之一。进程真被 kill 时线程
+      // 与监听 socket 随进程销毁，无需温和关停；端口也是随机分配，无冲突。
+      if (!Platform.isIOS) {
+        // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
+        // ignore: discarded_futures
+        KugouApiServer.stop();
+      }
     }
   }
 
@@ -1382,7 +1402,9 @@ class _MainLayoutState extends State<_MainLayout>
       barrierDismissible: false,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('词幕连接失败'),
-        content: const Text('多次尝试连接词幕服务失败，请确认已开启词幕（Lyricon），检查设备上的词幕服务是否正常运行后重试。'),
+        content: const Text(
+          '多次尝试连接词幕服务失败，请确认已开启词幕（Lyricon），检查设备上的词幕服务是否正常运行后重试。',
+        ),
         actions: [
           TextButton(
             onPressed: () {
@@ -1505,37 +1527,34 @@ class _MainLayoutState extends State<_MainLayout>
               child: Transform.scale(
                 scale: _exitScale.value,
                 alignment: Alignment.topLeft,
-                child: Opacity(
-                  opacity: _exitOpacity.value,
-                  child: child,
-                ),
+                child: Opacity(opacity: _exitOpacity.value, child: child),
               ),
             );
           },
           child: ResponsiveScaffold(
-              destinations: destinations,
-              railDestinations: railDestinations,
-              drawerDestinations: drawerDestinations,
-              selectedIndex: _selectedIndex,
-              onDestinationSelected: (index) {
-                // 守卫：FullPlayer 在栈顶时（展开进度 > 0.5），忽略 tab 切换，
-                // 避免与 FullPlayer 动画叠加导致状态混乱。
-                if (isFullPlayerOnTop) {
-                  return;
-                }
-                setState(() {
-                  _previousSelectedIndex = _selectedIndex;
-                  _selectedIndex = index;
-                });
-              },
-              hideNavigation: immersive,
-              body: _buildBody(context, visibleTabs, immersive),
-              compactBody: _buildBody(context, visibleTabs, immersive),
-              mediumBody: _buildBody(context, visibleTabs, immersive),
-              expandedBody: _buildBody(context, visibleTabs, immersive),
-            ),
+            destinations: destinations,
+            railDestinations: railDestinations,
+            drawerDestinations: drawerDestinations,
+            selectedIndex: _selectedIndex,
+            onDestinationSelected: (index) {
+              // 守卫：FullPlayer 在栈顶时（展开进度 > 0.5），忽略 tab 切换，
+              // 避免与 FullPlayer 动画叠加导致状态混乱。
+              if (isFullPlayerOnTop) {
+                return;
+              }
+              setState(() {
+                _previousSelectedIndex = _selectedIndex;
+                _selectedIndex = index;
+              });
+            },
+            hideNavigation: immersive,
+            body: _buildBody(context, visibleTabs, immersive),
+            compactBody: _buildBody(context, visibleTabs, immersive),
+            mediumBody: _buildBody(context, visibleTabs, immersive),
+            expandedBody: _buildBody(context, visibleTabs, immersive),
           ),
         ),
+      ),
     );
   }
 
@@ -1584,8 +1603,9 @@ class _MainLayoutState extends State<_MainLayout>
         // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
         ValueListenableBuilder<bool>(
           valueListenable: KugouApiClient.localServerAvailable,
-          builder: (context, available, _) =>
-              available ? const SizedBox.shrink() : const _LocalServerDownBanner(),
+          builder: (context, available, _) => available
+              ? const SizedBox.shrink()
+              : const _LocalServerDownBanner(),
         ),
         Expanded(
           child: AnimatedSwitcher(
@@ -1662,13 +1682,10 @@ class _MainLayoutState extends State<_MainLayout>
     _exitPressed = true;
     _showDoubleBackToast();
     _exitResetTimer?.cancel();
-    _exitResetTimer = Timer(
-      const Duration(seconds: 3),
-      () {
-        _exitPressed = false;
-        _exitResetTimer = null;
-      },
-    );
+    _exitResetTimer = Timer(const Duration(seconds: 3), () {
+      _exitPressed = false;
+      _exitResetTimer = null;
+    });
   }
 
   /// 显示「再按一次返回桌面」提示（系统原生 Toast，非 SnackBar/弹窗）。
@@ -1683,13 +1700,13 @@ class _MainLayoutState extends State<_MainLayout>
   Future<void> _doExit() async {
     if (_isExiting) return;
     try {
-      const MethodChannel('com.md3music.md3music/task')
-          .invokeMethod('moveToBack');
+      const MethodChannel(
+        'com.md3music.md3music/task',
+      ).invokeMethod('moveToBack');
     } catch (_) {
       SystemNavigator.pop();
     }
   }
-
 }
 
 /// 本地 API 服务器未启动提示条（所有 tab 顶部）。

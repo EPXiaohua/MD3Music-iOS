@@ -198,6 +198,37 @@ class KugouApiServer {
     }
   }
 
+  /// 回前台自检（iOS）：App 退后台若无活跃音频会话，进程会被挂起/回收，
+  /// 本地服务器线程随之冻结或死亡（表现为"API 服务突然停摆"，所有请求连接
+  /// 被拒）。回前台时对端口做真实 TCP 探测（比 is_running 标志更可靠：能
+  /// 覆盖"标志仍为 true 但监听 socket 已失效"的僵死态），不通则重启。
+  /// 仅 iOS 需要：Android 有前台服务保活 + 播放前 _ensureApiServerReady 兜底。
+  static Future<void> ensureRunning() async {
+    if (kIsWeb || !Platform.isIOS) return;
+    if (!_started) return; // 从未启动成功过：交给播放前兜底路径处理
+    final port = currentPort;
+    var alive = false;
+    if (port > 0) {
+      try {
+        final socket = await Socket.connect(
+          '127.0.0.1',
+          port,
+          timeout: const Duration(milliseconds: 800),
+        );
+        socket.destroy();
+        alive = true;
+      } catch (_) {}
+    }
+    if (alive) return;
+    print('KugouApiServer not responding after resume, restarting...');
+    // 必须先 stop 再 start：Rust 侧 RUNNING 标志若仍为 true，start() 会
+    // 提前返回旧端口而不重新 bind，僵死状态无法自愈。
+    await stop();
+    _started = false;
+    _startFuture = null;
+    await start();
+  }
+
   /// 显式停止本地 API 服务器，释放端口，避免下一次冷启动时端口冲突。
   /// Android 直接划掉应用时进程会被系统 kill，线程随之终止；这里保证温和退出
   /// （确认退出 / Activity 销毁）场景能确定性关停。

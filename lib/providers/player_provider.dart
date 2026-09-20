@@ -2648,9 +2648,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   ///
   /// 冷启动时 main() 中的 KugouApiServer.start() 可能因 MethodChannel 尚未注册
   /// 而失败（MissingPluginException），导致后续所有 API 请求因连接被拒绝而失败。
-  /// 此方法在播放流程中做二次兜底：探测端口，若不通则重新尝试启动。
+  /// 此方法在播放流程中做二次兜底：TCP 探测端口，不通则真实重启。
+  /// Android（前台服务保活）与 iOS（后台挂起后服务器死亡）都需要这条兜底。
   Future<void> _ensureApiServerReady() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (kIsWeb) return;
     final port = KugouApiServer.currentPort;
     if (port <= 0) {
       await KugouApiServer.start();
@@ -2666,10 +2667,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       await socket.close();
       return; // 服务器已就绪
     } catch (_) {
-      // 端口不通，尝试重新启动
+      // 端口不通，重启。注意不能只调 start()：_started 为 true 时 start()
+      // 直接返回（no-op），必须走 restart() 先停后起，才能自愈僵死状态。
     }
     try {
-      await KugouApiServer.start();
+      await KugouApiServer.restart();
     } catch (_) {}
   }
 
