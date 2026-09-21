@@ -94,19 +94,32 @@ let eqTapUnprepare: MTAudioProcessingTapUnprepareCallback = { tap in
     }
 }
 
-let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, bufferListInOut, _, _ in
+let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, bufferListInOut, numberFramesOut, flagsOut in
     // 拉源 PCM（PostEffects 标志下为解码后 float32，多数场景非交织）。
-    // flags/timeRange 不需要传 nil；帧数用本地变量接收，不依赖 SDK 对
-    // flagsOut 参数的指针类型 audit（Xcode 26 上该处类型 audit 与文档不符，
-    // 传 flags 指针会报 CMItemCount 类型不匹配）
+    // Xcode 26 SDK 签名变更：process 回调删除了 bufferListOut（输出 = 原地
+    // 处理 bufferListInOut），第 5/6 参为 numberFramesOut/flagsOut。
+    // numberFramesOut 必须回写实际输出帧数——否则渲染器读到未初始化值，
+    // 把本次输出当 0 帧填充 → 整条播放链静音（与 EQ 开关无关）。
     var framesOut: CMItemCount = numberFrames
+    var sourceFlags: MTAudioProcessingTapFlags = 0
     let status = MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut,
-                                                    nil, nil, &framesOut)
+                                                    &sourceFlags, nil, &framesOut)
     guard status == noErr else { return }
+    numberFramesOut.pointee = framesOut
+    flagsOut.pointee = sourceFlags
     let frames = Int(framesOut)
 
     guard let storage = Optional(MTAudioProcessingTapGetStorage(tap)) else { return }
     let state = Unmanaged<EqTapState>.fromOpaque(storage).takeUnretainedValue()
+
+    // 流不连续（seek/换源）时重置滤波器状态，避免残留旧音频的滤波记忆
+    if sourceFlags & kMTAudioProcessingTapFlag_StartOfStream != 0 {
+        for c in state.channels.indices {
+            for b in state.channels[c].indices {
+                state.channels[c][b].reset()
+            }
+        }
+    }
 
     // 有增益变更/采样率变化时重算系数（gain==0 的段直接跳过 = 完美直通）
     state.syncCoeffsIfNeeded()
