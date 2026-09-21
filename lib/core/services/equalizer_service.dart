@@ -100,12 +100,16 @@ class EqualizerService extends ChangeNotifier {
 
       // 会话集合变化：辅播放器首次创建（crossfade 预加载时）会多出一个会话，
       // 播放器平台重新激活会换掉旧 id —— 新增的要绑，消失的要释放。
-      _sessionIdsSub?.cancel();
-      _sessionIdsSub =
-          AudioService().androidAudioSessionIdsStream.listen((ids) {
-        _releaseVanishedSessions(ids);
-        if (_boundSessions.isNotEmpty && !_isBinding) tryBind();
-      });
+      // 仅 Android 订阅：iOS 走软件 EQ 伪会话（id=0），androidAudioSessionIds
+      // 流在 iOS 可能推空列表，会把伪会话误释放。
+      if (!kIsWeb && Platform.isAndroid) {
+        _sessionIdsSub?.cancel();
+        _sessionIdsSub =
+            AudioService().androidAudioSessionIdsStream.listen((ids) {
+          _releaseVanishedSessions(ids);
+          if (_boundSessions.isNotEmpty && !_isBinding) tryBind();
+        });
+      }
 
       notifyListeners();
     } catch (e) {
@@ -145,9 +149,25 @@ class EqualizerService extends ChangeNotifier {
 
   /// 为当前所有已就绪的 audio session 各绑定一个原生 Equalizer 实例。
   /// 返回 true 表示至少有一个会话已绑定。
+  ///
+  /// Android：系统 audiofx.Equalizer 按音频会话绑定；iOS：软件 EQ
+  /// （AVPlayer MTAudioProcessingTap，见 ios/Runner/AudioEqualizer.swift），
+  /// 单实例，绑定到伪会话 id=0（原生忽略该参数，返回合成频段信息）。
   Future<bool> tryBind() async {
-    if (kIsWeb || !Platform.isAndroid) return false;
+    if (kIsWeb) return false;
     if (_isBinding) return _isBound;
+
+    if (Platform.isIOS) {
+      if (_boundSessions.contains(0)) return _isBound;
+      _isBinding = true;
+      notifyListeners();
+      await _bindSession(0);
+      _isBinding = false;
+      notifyListeners();
+      return _isBound;
+    }
+
+    if (!Platform.isAndroid) return false;
 
     final pending = AudioService()
         .androidAudioSessionIds

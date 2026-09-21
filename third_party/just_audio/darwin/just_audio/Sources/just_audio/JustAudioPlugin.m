@@ -14,6 +14,15 @@
               binaryMessenger:[registrar messenger]];
     JustAudioPlugin* instance = [[JustAudioPlugin alloc] initWithRegistrar:registrar];
     [registrar addMethodCallDelegate:instance channel:channel];
+
+    // 反射调用宿主 App 的 Runner.AudioEqualizer.bootstrapWithBinaryMessenger:
+    // （插件与 App 分属不同 framework 模块，无法直接 import；插件注册早于
+    // 任何播放，保证均衡器在首个 AVPlayerItem 创建前完成观察者安装）
+    Class eqClass = NSClassFromString(@"Runner.AudioEqualizer");
+    SEL sel = NSSelectorFromString(@"bootstrapWithBinaryMessenger:");
+    if (eqClass && [eqClass respondsToSelector:sel]) {
+        [eqClass performSelector:sel withObject:[registrar messenger]];
+    }
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {

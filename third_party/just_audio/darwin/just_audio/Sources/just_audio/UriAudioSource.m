@@ -90,6 +90,10 @@
         }
     }
 
+    // 通知宿主 App（如 iOS 均衡器 AudioEqualizer）附加 AVAudioMix tap。
+    // playerItem 与 crossfade 的 playerItem2 都走 createPlayerItem，全覆盖。
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"JustAudioPlayerItemCreated" object:item];
+
     return item;
 }
 
