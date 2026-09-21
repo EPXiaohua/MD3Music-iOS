@@ -59,18 +59,17 @@ struct BiquadState {
 // MARK: - tap 回调（C 函数指针，不能捕获上下文）
 
 let eqTapInit: MTAudioProcessingTapInitCallback = { _, clientInfo, tapStorageOut in
-    tapStorageOut?.pointee = clientInfo
+    tapStorageOut.pointee = clientInfo
 }
 
 let eqTapFinalize: MTAudioProcessingTapFinalizeCallback = { tap in
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    guard storage != nil else { return }
+    // Optional(...) 包装兼容 SDK optional / non-optional 两种返回 audit
+    guard let storage = Optional(MTAudioProcessingTapGetStorage(tap)) else { return }
     Unmanaged<EqTapState>.fromOpaque(storage).release()
 }
 
 let eqTapPrepare: MTAudioProcessingTapPrepareCallback = { tap, _, processingFormat in
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    guard storage != nil else { return }
+    guard let storage = Optional(MTAudioProcessingTapGetStorage(tap)) else { return }
     let state = Unmanaged<EqTapState>.fromOpaque(storage).takeUnretainedValue()
     // prepare 第三参本身就是 ASBD 指针（此前误当 CMFormatDescription 又调
     // CMAudioFormatDescriptionGetStreamBasicDescription，CI 上编译失败）
@@ -86,8 +85,7 @@ let eqTapPrepare: MTAudioProcessingTapPrepareCallback = { tap, _, processingForm
 }
 
 let eqTapUnprepare: MTAudioProcessingTapUnprepareCallback = { tap in
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    guard storage != nil else { return }
+    guard let storage = Optional(MTAudioProcessingTapGetStorage(tap)) else { return }
     let state = Unmanaged<EqTapState>.fromOpaque(storage).takeUnretainedValue()
     for ch in state.channels.indices {
         for b in state.channels[ch].indices {
@@ -107,8 +105,7 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     guard status == noErr else { return }
     let frames = Int(framesOut)
 
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    guard storage != nil else { return }
+    guard let storage = Optional(MTAudioProcessingTapGetStorage(tap)) else { return }
     let state = Unmanaged<EqTapState>.fromOpaque(storage).takeUnretainedValue()
 
     // 有增益变更/采样率变化时重算系数（gain==0 的段直接跳过 = 完美直通）
@@ -122,9 +119,11 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
         for (c, buf) in buffers.enumerated() {
             guard c < state.channelCount, c < state.channels.count,
                   let data = buf.mData else { continue }
-            let samples = data.bindMemory(to: Float.self, capacity: buf.mDataByteSize / 4)
+            // mDataByteSize 是 UInt32，参与帧数运算需转 Int
+            let sampleCount = Int(buf.mDataByteSize) / 4
+            let samples = data.bindMemory(to: Float.self, capacity: sampleCount)
             var filters = state.channels[c]
-            for i in 0..<min(frames, buf.mDataByteSize / 4) {
+            for i in 0..<min(frames, sampleCount) {
                 var s = Double(samples[i])
                 for bi in state.activeBands {
                     s = filters[bi].apply(s)
@@ -139,7 +138,7 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
             guard let data = buf.mData else { continue }
             let ch = Int(buf.mNumberChannels)
             guard ch > 0, state.channelCount > 0 else { continue }
-            let total = buf.mDataByteSize / 4
+            let total = Int(buf.mDataByteSize) / 4
             let samples = data.bindMemory(to: Float.self, capacity: total)
             for c in 0..<min(ch, state.channelCount) {
                 var filters = state.channels[c]
@@ -339,7 +338,7 @@ final class EqTapState {
 
         let state = EqTapState()
         // C struct 无默认构造，必须用 memberwise init（字段 init 是关键字需反引号）
-        let callbacks = MTAudioProcessingTapCallbacks(
+        var callbacks = MTAudioProcessingTapCallbacks(
             version: 0,
             clientInfo: Unmanaged.passRetained(state).toOpaque(),
             `init`: eqTapInit,
@@ -349,10 +348,11 @@ final class EqTapState {
             process: eqTapProcess)
 
         var tapOut: MTAudioProcessingTap?
-        // CF_OPTIONS 枚举常量导入 Swift 后去掉 k 前缀 → .postEffects
-        let status = MTAudioProcessingTapCreationWithCallbacks(
+        // Xcode 26 SDK 将 MTAudioProcessingTapCreationWithCallbacks 更名为
+        // MTAudioProcessingTapCreate（旧名在新 Swift overlay 中已移除）
+        let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault, &callbacks,
-            .postEffects, &tapOut)
+            kMTAudioProcessingTapCreationFlag_PostEffects, &tapOut)
         guard status == noErr, let tap = tapOut else {
             // 创建失败：释放保留的 state 防泄漏
             Unmanaged.passRetained(state).release()
