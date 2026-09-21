@@ -140,6 +140,101 @@ fn run_loop(server: Server, data_dir: String) {
     }
 }
 
+/// 音频代理共享客户端（连接池）。
+static PROXY_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn proxy_agent() -> &'static ureq::Agent {
+    PROXY_AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+}
+
+/// 音频代理：GET /audio/proxy?url=<CDN 地址>。
+///
+/// 背景（iOS 诊断日志实锤，2026-09-22）：暂停→锁屏挂起→回前台后，AVPlayer
+/// 的媒体数据通道（mediaserverd）整体失效，连任何外部 CDN 都报 -1004，而
+/// app 进程内网络（Dio/歌词/API）全部正常，刷新 URL 也无效——坏的不是一个
+/// 连接而是整条通道。本地回环 127.0.0.1 不经 mediaserverd 外部网络，播放器
+/// 改走本代理后由服务器进程流式转发 CDN 数据即可恢复播放。透传 Range 请求
+/// 与 206 响应，进度拖动/分段缓冲不受影响。仍限制目标必须为 *.kugou.com，
+/// 避免被滥用为开放代理。
+fn handle_audio_proxy(
+    request: Request,
+    query: &str,
+    cors_headers: Vec<(String, String)>,
+) -> Result<(), String> {
+    // 提取并解码 url= 参数（保留 '+'：URL 中的 '+' 是合法字符而非空格）
+    let target = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("url="))
+        .map(percent_decode_preserve_plus)
+        .unwrap_or_default();
+
+    let respond_error = |request: Request, status: u16, msg: &str| -> Result<(), String> {
+        let body = json_stringify(&json!({ "error": msg }));
+        let mut resp = Response::from_data(body.into_bytes()).with_status_code(status);
+        for (k, v) in &cors_headers {
+            resp = resp.with_header(make_header(k, v)?);
+        }
+        request.respond(resp).map_err(|e| e.to_string())
+    };
+
+    let host = match target.split_once("://") {
+        Some((_, rest)) => rest.split('/').next().unwrap_or_default().to_string(),
+        None => return respond_error(request, 400, "missing or invalid 'url' parameter"),
+    };
+    // 去掉可选的 :port 后做后缀校验（host:port 备份 CDN 也要放行）
+    let host_no_port = host.split(':').next().unwrap_or_default();
+    if host_no_port != "kugou.com" && !host_no_port.ends_with(".kugou.com") {
+        return respond_error(request, 403, "only *.kugou.com targets are allowed");
+    }
+
+    let mut req = proxy_agent()
+        .get(&target)
+        .set("User-Agent", "Mozilla/5.0 (KMD3Music local proxy)");
+    // 透传 Range：播放器拖动进度/预缓冲都依赖 Range 分段请求
+    if let Some(range) = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().to_string().eq_ignore_ascii_case("range"))
+        .map(|h| h.value.as_str().to_string())
+    {
+        req = req.set("Range", &range);
+    }
+
+    let upstream = match req.call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) => {
+            // 上游拒绝（如链接 token 过期 403）：透传状态码给调用方
+            return respond_error(request, code, "upstream rejected the request");
+        }
+        Err(e) => return respond_error(request, 502, &format!("upstream error: {}", e)),
+    };
+
+    // 先取元数据再消费响应体（into_reader 会消耗 Response）
+    let status = upstream.status();
+    let content_length = upstream
+        .header("content-length")
+        .and_then(|v| v.parse::<usize>().ok());
+    let passthrough: Vec<(&str, String)> = ["content-type", "content-range", "accept-ranges"]
+        .iter()
+        .filter_map(|name| upstream.header(name).map(|v| (*name, v.to_string())))
+        .collect();
+
+    let mut resp: Response<Box<dyn std::io::Read + Send + Sync>> = Response::new(
+        tiny_http::StatusCode(status),
+        Vec::new(),
+        upstream.into_reader(),
+        content_length,
+        None,
+    );
+    for (name, v) in passthrough {
+        resp = resp.with_header(make_header(name, &v)?);
+    }
+    for (k, v) in &cors_headers {
+        resp = resp.with_header(make_header(k, v)?);
+    }
+    request.respond(resp).map_err(|e| e.to_string())
+}
+
 struct Req {
     /// originalUrl = path + query.
     original_url: String,
@@ -191,18 +286,9 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // ---- audio proxy disabled (safety) ----
-    if url.starts_with("/audio/proxy") {
-        let body = json_stringify(&json!({
-            "error": "Audio proxy is disabled. Use the URL from /song/url directly.",
-            "reason": "Server traffic limit exceeded. Clients must play audio directly from CDN.",
-        }));
-        let mut resp = Response::from_data(body.into_bytes()).with_status_code(403);
-        for (k, v) in &cors_headers {
-            resp = resp.with_header(make_header(k, v)?);
-        }
-        request.respond(resp).map_err(|e| e.to_string())?;
-        return Ok(());
+    // ---- audio proxy（本地兜底流式代理）----
+    if path == "/audio/proxy" {
+        return handle_audio_proxy(request, &_query_part, cors_headers);
     }
 
     // ---- body parse ----

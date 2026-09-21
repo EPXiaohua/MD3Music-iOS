@@ -39,6 +39,7 @@ import 'favorites_provider.dart';
 import 'kugou_provider.dart';
 import 'position_rewind_gate.dart';
 import '../services/kugou_api/kugou_api_client.dart';
+import '../services/kugou_api/kugou_endpoints.dart';
 import '../services/kugou_api/kugou_models.dart';
 
 enum AppLoopMode { off, one, all }
@@ -2365,11 +2366,30 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (gateRewind) _positionRewindGate.arm(seekTo);
     try {
       // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-      await _audioService.setUrl(
-        url,
-        loudnessLufs: _currentSong?.loudnessLufs,
-        loudnessPeakDb: _currentSong?.loudnessPeakDb,
-      );
+      try {
+        await _audioService.setUrl(
+          url,
+          loudnessLufs: _currentSong?.loudnessLufs,
+          loudnessPeakDb: _currentSong?.loudnessPeakDb,
+        );
+      } catch (e) {
+        // 直连 CDN 失败（iOS 诊断日志实锤 -1004：暂停锁屏挂起恢复后 AVPlayer
+        // 的 mediaserverd 媒体通道整体失效，连任何外部地址都失败，刷新 URL
+        // 也无效），改走本地服务器音频代理流式转发重试——本地回环 127.0.0.1
+        // 不经 mediaserverd 外部网络，服务器进程的上游连接始终正常。代理同样
+        // 透传 Range，进度拖动不受影响。端口为 0（服务器未启动）时无可兜底，
+        // 原样抛出。
+        final int port = KugouApiServer.currentPort;
+        if (port == 0 || url.contains('/audio/proxy')) rethrow;
+        final proxyUrl =
+            '${KugouEndpoints.baseUrl}/audio/proxy?url=${Uri.encodeComponent(url)}';
+        debugPrint('[D切歌] 直连失败，走本地音频代理重试: $e');
+        await _audioService.setUrl(
+          proxyUrl,
+          loudnessLufs: _currentSong?.loudnessLufs,
+          loudnessPeakDb: _currentSong?.loudnessPeakDb,
+        );
+      }
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
         final state = _audioService.player.playerState;
