@@ -355,7 +355,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   }
 
   Future<void> _tryStartSpectrum({bool isPlaying = false}) async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isIOS) return;
     if (_spectrumStarted) return;
     // 未在播放时不启动（PCM 截取在 AudioSink 层，播放才会产生数据）
     if (!isPlaying) return;
@@ -421,8 +421,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 但用户若在设置里把「设备类型」手动选成平板，isPadLayout 仍会返回 true，
     // 那会让 tab 结构删掉封面 tab —— 而面板走的是 compact 分支、没有左栏封面，
     // 封面会彻底不可达。所以这里显式短路。
-    final isWideLayout =
-        !widget.dockMode && (deviceIsPad || width >= 600);
+    final isWideLayout = !widget.dockMode && (deviceIsPad || width >= 600);
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     final isLocalSong = song != null && !song.isOnline;
@@ -1585,10 +1584,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉
                     // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
                     // 但仍是注册了手势识别器）。
-                    onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
-                    onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
-                    onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
-                    onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
+                    onVerticalDragStart: widget.dockMode
+                        ? null
+                        : _onTopBarDragStart,
+                    onVerticalDragUpdate: widget.dockMode
+                        ? null
+                        : _onTopBarDragUpdate,
+                    onVerticalDragEnd: widget.dockMode
+                        ? null
+                        : _onTopBarDragEnd,
+                    onVerticalDragCancel: widget.dockMode
+                        ? null
+                        : _onTopBarDragCancel,
                     // Selector 让 _buildArtworkView 仅在 currentSong / isPlaying 变化时重建，
                     // 不再每 200ms 因 position 变化重建（封面 AnimatedScale 是隐式动画，需要 isPlaying 触发）
                     child:
@@ -1596,8 +1603,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                           PlayerProvider,
                           ({String? songId, bool isPlaying})
                         >(
-                          selector: (_, p) =>
-                              (songId: p.currentSong?.id, isPlaying: p.isPlaying),
+                          selector: (_, p) => (
+                            songId: p.currentSong?.id,
+                            isPlaying: p.isPlaying,
+                          ),
                           builder: (context, _, __) => _buildArtworkView(
                             playerProvider,
                             currentSong,
@@ -1757,10 +1766,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                               child: GestureDetector(
                                 behavior: HitTestBehavior.opaque,
                                 // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
-                                onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
-                                onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
-                                onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
-                                onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
+                                onVerticalDragStart: widget.dockMode
+                                    ? null
+                                    : _onTopBarDragStart,
+                                onVerticalDragUpdate: widget.dockMode
+                                    ? null
+                                    : _onTopBarDragUpdate,
+                                onVerticalDragEnd: widget.dockMode
+                                    ? null
+                                    : _onTopBarDragEnd,
+                                onVerticalDragCancel: widget.dockMode
+                                    ? null
+                                    : _onTopBarDragCancel,
                                 child: _wrapArtworkZenPress(
                                   child: AnimatedScale(
                                     // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -1834,8 +1851,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                           positionListenable:
                                               playerProvider.positionNotifier,
                                           isPlaying: playerProvider.isPlaying,
-                                  playbackNotReady:
-                                      playerProvider.isPlaybackNotReady,
+                                          playbackNotReady:
+                                              playerProvider.isPlaybackNotReady,
                                           forceDarkBackground: true,
                                           // 本地歌曲 + LRC 逐行歌词：禁用间奏点（节奏点）
                                           enableInterludeDots:
@@ -1947,10 +1964,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                 child: GestureDetector(
                                   behavior: HitTestBehavior.opaque,
                                   // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
-                                  onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
-                                  onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
-                                  onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
-                                  onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
+                                  onVerticalDragStart: widget.dockMode
+                                      ? null
+                                      : _onTopBarDragStart,
+                                  onVerticalDragUpdate: widget.dockMode
+                                      ? null
+                                      : _onTopBarDragUpdate,
+                                  onVerticalDragEnd: widget.dockMode
+                                      ? null
+                                      : _onTopBarDragEnd,
+                                  onVerticalDragCancel: widget.dockMode
+                                      ? null
+                                      : _onTopBarDragCancel,
                                   child: _wrapArtworkZenPress(
                                     child: AnimatedScale(
                                       // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -2019,8 +2044,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                           positionListenable:
                                               playerProvider.positionNotifier,
                                           isPlaying: playerProvider.isPlaying,
-                                  playbackNotReady:
-                                      playerProvider.isPlaybackNotReady,
+                                          playbackNotReady:
+                                              playerProvider.isPlaybackNotReady,
                                           forceDarkBackground: true,
                                           // 本地歌曲 + LRC 逐行歌词：禁用间奏点（节奏点）
                                           enableInterludeDots:
@@ -2103,7 +2128,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               )
             else
               IconButton(
-                icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+                icon: const Icon(
+                  Icons.keyboard_arrow_down,
+                  color: Colors.white,
+                ),
                 onPressed: _collapseByButton,
               ),
             const Spacer(),
@@ -2229,7 +2257,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                     artworkUri: currentSong.artworkUri,
                                     fallbackFilePath: currentSong.localPath,
                                     isPlaying: playerProvider.isPlaying,
-                                    bandCount: SpectrumService.instance.bandCount,
+                                    bandCount:
+                                        SpectrumService.instance.bandCount,
                                     style: _spectrumStyle,
                                     barColor: _spectrumColor,
                                     opacity: _spectrumOpacity,
@@ -3272,8 +3301,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     );
                   },
                 ),
-                // 音乐频谱环绕：仅 Android 显示
-                if (Platform.isAndroid)
+                // 音乐频谱环绕：Android / iOS 均支持
+                if (Platform.isAndroid || Platform.isIOS)
                   SwitchListTile(
                     title: const Text('音乐频谱环绕'),
                     subtitle: Text(

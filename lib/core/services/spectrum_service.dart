@@ -72,8 +72,8 @@ class SpectrumService {
 
   /// 启动频谱采集。返回 true 表示服务已运行（真实或模拟模式）。
   Future<bool> start([int? audioSessionId]) async {
-    if (!Platform.isAndroid) {
-      // 非 Android 平台直接用模拟模式
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      // 其他平台直接用模拟模式
       _startSimulated();
       return true;
     }
@@ -182,7 +182,7 @@ class SpectrumService {
     _fallbackTimer?.cancel();
     _fallbackTimer = null;
     _stopSimulated();
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       try {
         await _channel.invokeMethod<bool>('stop');
       } catch (_) {}

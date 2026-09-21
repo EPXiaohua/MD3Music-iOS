@@ -128,6 +128,8 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     guard frames > 0 else { return }
 
     let buffers = UnsafeMutableAudioBufferListPointer(bufferListInOut)
+    // 频谱采样：取 EQ 处理前的原始信号（无论 EQ 开关都工作，对齐 Android PCM 截取语义）
+    AudioEqualizer.spectrumFeed(buffers)
     if state.nonInterleaved {
         for (c, buf) in buffers.enumerated() {
             guard c < state.channelCount, c < state.channels.count,
@@ -248,6 +250,170 @@ final class EqTapState {
     private var observer: NSObjectProtocol?
     private var prepared = false
 
+    // MARK: - 频谱捕获（音乐频谱可视化，协议对齐 Android SpectrumPlugin）
+
+    /// 频谱通道：解码后 PCM → 1024 点 FFT → 40 段归一化幅值 → Dart "onFft"
+    static let spectrumChannelName = "com.md3music.md3music/spectrum"
+    static let fftSize = 1024
+    static let spectrumBandCount = 40
+    /// 发射节流：约 20fps（对齐 Android MIN_EMIT_INTERVAL_MS）
+    static let spectrumEmitIntervalMs: UInt64 = 45
+
+    /// 保护 FFT 工作缓冲（crossfade 时双 tap 在不同渲染线程并发 process）
+    static var spectrumLock = os_unfair_lock()
+    static var spectrumChannel: FlutterMethodChannel?
+    static var spectrumCaptureEnabled = false
+    // 以下仅在音频线程访问（spectrumFeed 持锁期间）
+    static var pcmSamples = [Float](repeating: 0, count: fftSize)
+    static var pcmWritePos = 0
+    static var pcmFilled = 0
+    static var lastEmitMs: UInt64 = 0
+    static var fftReal = [Float](repeating: 0, count: fftSize)
+    static var fftImag = [Float](repeating: 0, count: fftSize)
+    static var fftMags = [Double](repeating: 0, count: spectrumBandCount)
+
+    /// 注册频谱 MethodChannel（bootstrap 时调用，主线程）。
+    /// 协议对齐 Android SpectrumPlugin：start/stop 由 Dart 驱动，原生主动推 onFft。
+    static func setupSpectrumChannel(_ messenger: FlutterBinaryMessenger) {
+        let ch = FlutterMethodChannel(name: spectrumChannelName, binaryMessenger: messenger)
+        ch.setMethodCallHandler { call, result in
+            switch call.method {
+            case "start":
+                os_unfair_lock_lock(&spectrumLock)
+                pcmWritePos = 0
+                pcmFilled = 0
+                lastEmitMs = 0
+                os_unfair_lock_unlock(&spectrumLock)
+                spectrumCaptureEnabled = true
+                result(true)
+            case "stop":
+                spectrumCaptureEnabled = false
+                os_unfair_lock_lock(&spectrumLock)
+                pcmFilled = 0
+                os_unfair_lock_unlock(&spectrumLock)
+                result(true)
+            default:
+                result(FlutterMethodNotImplemented)
+            }
+        }
+        spectrumChannel = ch
+    }
+
+    /// 音频线程调用：采样左声道写入环形缓冲；攒满 1024 点且距上次发射 ≥45ms
+    /// 时做 FFT，把 40 段幅值 post 到主线程推送 Dart。
+    static func spectrumFeed(_ buffers: UnsafeMutableAudioBufferListPointer) {
+        guard spectrumCaptureEnabled, spectrumChannel != nil else { return }
+        os_unfair_lock_lock(&spectrumLock)
+        defer { os_unfair_lock_unlock(&spectrumLock) }
+
+        // 只采左声道：非交织取第一个 buffer，交织按帧步进取第一样本
+        for buf in buffers {
+            guard let data = buf.mData else { continue }
+            let total = Int(buf.mDataByteSize) / 4
+            let ch = Int(buf.mNumberChannels)
+            let samples = data.bindMemory(to: Float.self, capacity: max(1, total))
+            if ch > 1 {
+                var i = 0
+                while i < total {
+                    let v = samples[i]
+                    if v.isFinite { pcmPush(v) }
+                    i += ch
+                }
+            } else {
+                for i in 0..<total {
+                    let v = samples[i]
+                    if v.isFinite { pcmPush(v) }
+                }
+            }
+            break
+        }
+
+        guard pcmFilled >= fftSize else { return }
+        let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        guard nowMs - lastEmitMs >= spectrumEmitIntervalMs else { return }
+        lastEmitMs = nowMs
+
+        let bands = computeSpectrumBandsLocked()
+        pcmFilled -= fftSize
+        // 实时音频线程不做 IPC：算完 post 主线程再走 MethodChannel
+        DispatchQueue.main.async {
+            spectrumChannel?.invokeMethod("onFft", arguments: bands)
+        }
+    }
+
+    @inline(__always)
+    private static func pcmPush(_ v: Float) {
+        pcmSamples[pcmWritePos] = v
+        pcmWritePos = (pcmWritePos + 1) % fftSize
+        if pcmFilled < fftSize { pcmFilled += 1 }
+    }
+
+    /// 需持有 spectrumLock 调用：环形缓冲最近 1024 点 → FFT → 前 40 bin 归一化
+    /// （跳过 DC 从 bin1 开始，与 Android computeBandsFromPcm 视觉对齐）
+    private static func computeSpectrumBandsLocked() -> [Double] {
+        let start = pcmWritePos
+        for i in 0..<fftSize {
+            fftReal[i] = pcmSamples[(start + i) % fftSize]
+            fftImag[i] = 0
+        }
+        fftRadix2(&fftReal, &fftImag)
+
+        let usable = min(fftSize / 2, spectrumBandCount)
+        var maxMag = 1.0
+        for i in 0..<usable {
+            let re = Double(fftReal[i + 1]), im = Double(fftImag[i + 1])
+            let mag = (re * re + im * im).squareRoot()
+            fftMags[i] = mag
+            if mag > maxMag { maxMag = mag }
+        }
+        var bands = [Double](repeating: 0, count: spectrumBandCount)
+        for i in 0..<usable {
+            bands[i] = min(max(fftMags[i] / maxMag, 0.0), 1.0)
+        }
+        return bands
+    }
+
+    /// 原地基 2 迭代 FFT（移植自 Android SpectrumPlugin.fftRadix2，长度须为 2 的幂）
+    private static func fftRadix2(_ re: inout [Float], _ im: inout [Float]) {
+        let n = re.count
+        // 位反转
+        var j = 0
+        for i in 0..<(n - 1) {
+            if i < j {
+                re.swapAt(i, j)
+                im.swapAt(i, j)
+            }
+            var m = n >> 1
+            while j >= m { j -= m; m >>= 1 }
+            j += m
+        }
+        // 蝶形运算
+        var len = 2
+        while len <= n {
+            let ang = -2.0 * Double.pi / Double(len)
+            let wRe = Float(cos(ang)), wIm = Float(sin(ang))
+            var i = 0
+            while i < n {
+                var curRe: Float = 1.0, curIm: Float = 0.0
+                let half = len / 2
+                for k in 0..<half {
+                    let uRe = re[i + k], uIm = im[i + k]
+                    let vRe = re[i + k + half] * curRe - im[i + k + half] * curIm
+                    let vIm = re[i + k + half] * curIm + im[i + k + half] * curRe
+                    re[i + k] = uRe + vRe
+                    im[i + k] = uIm + vIm
+                    re[i + k + half] = uRe - vRe
+                    im[i + k + half] = uIm - vIm
+                    let nRe = curRe * wRe - curIm * wIm
+                    curIm = curRe * wIm + curIm * wRe
+                    curRe = nRe
+                }
+                i += len
+            }
+            len <<= 1
+        }
+    }
+
     private override init() {
         super.init()
     }
@@ -262,6 +428,9 @@ final class EqTapState {
             shared.handle(call: call, result: result)
         }
         shared.channel = ch
+
+        // 频谱可视化通道（与 Dart SpectrumService / Android SpectrumPlugin 同名协议）
+        AudioEqualizer.setupSpectrumChannel(messenger)
 
         // 对每个新创建的 AVPlayerItem 附加 tap
         shared.observer = NotificationCenter.default.addObserver(

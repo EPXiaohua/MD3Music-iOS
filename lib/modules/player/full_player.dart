@@ -641,8 +641,9 @@ class _FullPlayerState extends State<FullPlayer>
   /// 尝试启动 SpectrumService。
   /// Visualizer 需要 AudioFlinger 有活跃音频轨道才能初始化，
   /// 因此仅在播放时调用。Kotlin 端先尝试特定 sessionId，失败回退到 0。
+  /// iOS 走 EQ tap 的 PCM 截取 FFT（AudioEqualizer.spectrumFeed）。
   Future<void> _tryStartSpectrum({bool isPlaying = false}) async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isIOS) return;
     if (_spectrumStarted) return;
     // 未在播放时不启动（PCM 截取在 AudioSink 层，播放才会产生数据）
     if (!isPlaying) return;
@@ -2950,8 +2951,8 @@ class _FullPlayerState extends State<FullPlayer>
                     Navigator.pop(sheetContext);
                   },
                 ),
-                // 音乐频谱环绕：仅 Android 显示
-                if (Platform.isAndroid)
+                // 音乐频谱环绕：Android / iOS 均支持
+                if (Platform.isAndroid || Platform.isIOS)
                   SwitchListTile(
                     title: const Text('音乐频谱环绕'),
                     subtitle: Text(
