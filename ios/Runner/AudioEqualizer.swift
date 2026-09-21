@@ -58,8 +58,8 @@ struct BiquadState {
 
 // MARK: - tap 回调（C 函数指针，不能捕获上下文）
 
-let eqTapInit: MTAudioProcessingTapInitCallback = { tap, clientInfo, tapStorageOut in
-    tapStorageOut.pointee = clientInfo
+let eqTapInit: MTAudioProcessingTapInitCallback = { _, clientInfo, tapStorageOut in
+    tapStorageOut?.pointee = clientInfo
 }
 
 let eqTapFinalize: MTAudioProcessingTapFinalizeCallback = { tap in
@@ -68,20 +68,20 @@ let eqTapFinalize: MTAudioProcessingTapFinalizeCallback = { tap in
     Unmanaged<EqTapState>.fromOpaque(storage).release()
 }
 
-let eqTapPrepare: MTAudioProcessingTapPrepareCallback = { tap, _, formatDesc in
+let eqTapPrepare: MTAudioProcessingTapPrepareCallback = { tap, _, processingFormat in
     let storage = MTAudioProcessingTapGetStorage(tap)
     guard storage != nil else { return }
     let state = Unmanaged<EqTapState>.fromOpaque(storage).takeUnretainedValue()
-    if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-        let asbd = asbdPtr.pointee
-        state.sampleRate = asbd.mSampleRate
-        state.channelCount = Int(asbd.mChannelsPerFrame)
-        state.nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-        state.float32 = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-            && asbd.mBitsPerChannel == 32
-        state.channels = Array(repeating: Array(repeating: BiquadState(), count: AudioEqualizer.bandFreqs.count),
-                               count: max(1, state.channelCount))
-    }
+    // prepare 第三参本身就是 ASBD 指针（此前误当 CMFormatDescription 又调
+    // CMAudioFormatDescriptionGetStreamBasicDescription，CI 上编译失败）
+    let asbd = processingFormat.pointee
+    state.sampleRate = asbd.mSampleRate
+    state.channelCount = Int(asbd.mChannelsPerFrame)
+    state.nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+    state.float32 = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        && asbd.mBitsPerChannel == 32
+    state.channels = Array(repeating: Array(repeating: BiquadState(), count: AudioEqualizer.bandFreqs.count),
+                           count: max(1, state.channelCount))
     state.lastAppliedVersion = -1 // 强制按新采样率重算系数
 }
 
@@ -96,12 +96,16 @@ let eqTapUnprepare: MTAudioProcessingTapUnprepareCallback = { tap in
     }
 }
 
-let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, bufferListInOut, _, numberFramesOut in
-    // 拉源 PCM（PostEffects 标志下为解码后 float32，多数场景非交织）
-    var sourceFlags: MTAudioProcessingTapFlags = 0
+let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, bufferListInOut, _, _ in
+    // 拉源 PCM（PostEffects 标志下为解码后 float32，多数场景非交织）。
+    // flags/timeRange 不需要传 nil；帧数用本地变量接收，不依赖 SDK 对
+    // flagsOut 参数的指针类型 audit（Xcode 26 上该处类型 audit 与文档不符，
+    // 传 flags 指针会报 CMItemCount 类型不匹配）
+    var framesOut: CMItemCount = numberFrames
     let status = MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut,
-                                                    &sourceFlags, nil, numberFramesOut)
+                                                    nil, nil, &framesOut)
     guard status == noErr else { return }
+    let frames = Int(framesOut)
 
     let storage = MTAudioProcessingTapGetStorage(tap)
     guard storage != nil else { return }
@@ -111,7 +115,6 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     state.syncCoeffsIfNeeded()
 
     guard state.float32, !state.activeBands.isEmpty, state.channelCount > 0 else { return }
-    let frames = Int(numberFramesOut.pointee)
     guard frames > 0 else { return }
 
     let buffers = UnsafeMutableAudioBufferListPointer(bufferListInOut)
@@ -310,11 +313,12 @@ final class EqTapState {
         guard item.audioMix == nil else { return }
         let asset = item.asset
         if #available(iOS 15.0, *) {
-            asset.loadTracks(withMediaType: .audio) { tracks in
+            asset.loadTracks(withMediaType: .audio) { tracks, _ in
                 DispatchQueue.main.async {
                     // item 可能已被切歌释放
-                    guard item.audioMix == nil else { return }
-                    self.installTap(item: item, tracks: tracks)
+                    guard item.audioMix == nil,
+                          let track = tracks?.first else { return }
+                    self.installTap(item: item, track: track)
                 }
             }
         } else {
@@ -324,28 +328,31 @@ final class EqTapState {
                 guard item.status == .readyToPlay else { return }
                 token?.invalidate()
                 guard item.audioMix == nil else { return }
-                self.installTap(item: item, tracks: item.asset.tracks(withMediaType: .audio))
+                self.installTap(item: item,
+                                track: item.asset.tracks(withMediaType: .audio).first)
             }
         }
     }
 
-    private func installTap(item: AVPlayerItem, tracks: [AVAssetTrack]) {
-        guard let track = tracks.first, item.audioMix == nil else { return }
+    private func installTap(item: AVPlayerItem, track: AVAssetTrack?) {
+        guard let track = track, item.audioMix == nil else { return }
 
         let state = EqTapState()
-        var callbacks = MTAudioProcessingTapCallbacks()
-        callbacks.version = 0
-        callbacks.clientInfo = Unmanaged.passRetained(state).toOpaque()
-        callbacks.`init` = eqTapInit
-        callbacks.finalize = eqTapFinalize
-        callbacks.prepare = eqTapPrepare
-        callbacks.unprepare = eqTapUnprepare
-        callbacks.process = eqTapProcess
+        // C struct 无默认构造，必须用 memberwise init（字段 init 是关键字需反引号）
+        let callbacks = MTAudioProcessingTapCallbacks(
+            version: 0,
+            clientInfo: Unmanaged.passRetained(state).toOpaque(),
+            `init`: eqTapInit,
+            finalize: eqTapFinalize,
+            prepare: eqTapPrepare,
+            unprepare: eqTapUnprepare,
+            process: eqTapProcess)
 
         var tapOut: MTAudioProcessingTap?
+        // CF_OPTIONS 枚举常量导入 Swift 后去掉 k 前缀 → .postEffects
         let status = MTAudioProcessingTapCreationWithCallbacks(
             kCFAllocatorDefault, &callbacks,
-            UInt32(kMTAudioProcessingTapCreationFlag_PostEffects), &tapOut)
+            .postEffects, &tapOut)
         guard status == noErr, let tap = tapOut else {
             // 创建失败：释放保留的 state 防泄漏
             Unmanaged.passRetained(state).release()
