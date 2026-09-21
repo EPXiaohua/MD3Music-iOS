@@ -184,11 +184,22 @@ fn handle_audio_proxy(
     // 去掉可选的 :port 后做后缀校验（host:port 备份 CDN 也要放行）
     let host_no_port = host.split(':').next().unwrap_or_default();
     if host_no_port != "kugou.com" && !host_no_port.ends_with(".kugou.com") {
-        return respond_error(request, 403, "only *.kugou.com targets are allowed");
+        // host 带进错误体：真机上诊断日志能看到被拒的目标域名，便于扩白名单
+        return respond_error(
+            request,
+            403,
+            &format!("only *.kugou.com targets are allowed (got: {})", host_no_port),
+        );
     }
 
     let mut req = proxy_agent()
         .get(&target)
+        // 必须 identity：ureq 开了 gzip feature 时会自动带 Accept-Encoding:
+        // gzip 并透明解压响应体，而我们把上游压缩后的 Content-Length 原样
+        // 透传给播放器——解压后字节数 > Content-Length，AVPlayer 收到长度
+        // 不匹配的流直接报 -11828 "Cannot Open"（2026-09-22 iOS 诊断实锤）。
+        // 强制 identity 后 CDN 返回原始字节，长度头始终准确。
+        .set("Accept-Encoding", "identity")
         .set("User-Agent", "Mozilla/5.0 (KMD3Music local proxy)");
     // 透传 Range：播放器拖动进度/预缓冲都依赖 Range 分段请求
     if let Some(range) = request
@@ -211,9 +222,24 @@ fn handle_audio_proxy(
 
     // 先取元数据再消费响应体（into_reader 会消耗 Response）
     let status = upstream.status();
-    let content_length = upstream
-        .header("content-length")
-        .and_then(|v| v.parse::<usize>().ok());
+    // 关键：ureq 开 gzip feature 时若上游真返回了 gzip，into_reader() 拿到的
+    // 是已解压的字节流，而 content-length 头是压缩后的长度——透传会导致
+    // tiny_http 按压缩长度截断解压流，播放器收到残缺数据报 -11828。因此仅在
+    // 上游无 gzip 编码（流即原始字节，长度准确）时才透传 content-length；
+    // 有 gzip 时省略长度让 tiny_http 走 chunked，长度永远自洽。
+    let upstream_gzipped = upstream
+        .header("content-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("gzip"))
+        .unwrap_or(false);
+    let content_length = if upstream_gzipped {
+        None
+    } else {
+        upstream
+            .header("content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+    };
+    // 注意：不透传 content-encoding——响应体已解压为原始字节，声明 gzip 会
+    // 让播放器再次解压导致损坏。
     let passthrough: Vec<(&str, String)> = ["content-type", "content-range", "accept-ranges"]
         .iter()
         .filter_map(|name| upstream.header(name).map(|v| (*name, v.to_string())))

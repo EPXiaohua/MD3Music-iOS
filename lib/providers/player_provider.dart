@@ -2383,6 +2383,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         final proxyUrl =
             '${KugouEndpoints.baseUrl}/audio/proxy?url=${Uri.encodeComponent(url)}';
         debugPrint('[D切歌] 直连失败，走本地音频代理重试: $e');
+        debugPrint('[D切歌] 代理URL: $proxyUrl');
         try {
           await load(proxyUrl);
         } catch (e2) {
