@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:just_audio/just_audio.dart';
@@ -216,7 +217,7 @@ class AudioService {
     _mainPlayer = _createPlayer(enhancer: _mainEnhancer);
     _activePlayer = _mainPlayer;
     _bindActiveStreams();
-    _watchSessionIds(_mainPlayer);
+    _mainSessionIdSub = _watchSessionIds(_mainPlayer);
     _restoreVolumeNormalizationFromPrefs();
   }
 
@@ -279,9 +280,11 @@ class AudioService {
       );
 
   /// 主播放器：始终存在，是音频焦点与 MediaSession 的持有者。
+  /// 非 final：iOS 挂起恢复后 AVPlayer 实例可能整体死亡（对任何 URL 含本地
+  /// 回环 setUrl 都秒抛 -1004），需经 [recreateMainPlayerForRecovery] 重建。
   // 音量均衡放大用 LoudnessEnhancer（先声明，供主播放器创建时注入）。
   final AndroidLoudnessEnhancer _mainEnhancer = AndroidLoudnessEnhancer();
-  late final AudioPlayer _mainPlayer;
+  late AudioPlayer _mainPlayer;
 
   /// 辅播放器：首次交叉淡化时才创建（未开启该功能的用户零开销）。
   AudioPlayer? _auxPlayer;
@@ -388,6 +391,10 @@ class AudioService {
       p.playerStateStream.listen(_playerStateCtl.add, onError: ignoreError),
       p.sequenceStateStream.listen(_sequenceStateCtl.add, onError: ignoreError),
       p.speedStream.listen(_speedCtl.add, onError: ignoreError),
+      // errorStream 也必须转发：iOS 挂起恢复会重建主播放器（见
+      // recreateMainPlayerForRecovery），上层若直接订阅旧 player 实例的
+      // errorStream，重建后新播放器的错误（如 -1004）将收不到。
+      p.errorStream.listen(_errorCtl.add, onError: ignoreError),
     ]);
   }
 
@@ -414,6 +421,12 @@ class AudioService {
   Stream<SequenceState?> get sequenceStateStream => _sequenceStateCtl.stream;
 
   Stream<double> get speedStream => _speedCtl.stream;
+
+  /// 转发当前活动播放器的致命错误（PlayerException）。
+  /// 这是一个不随播放器实例重建而变的稳定流：iOS 挂起恢复重建主播放器后，
+  /// 新实例的错误仍会到这里，上层应订阅本流而非 `player.errorStream`。
+  Stream<PlayerException> get errorStream => _errorCtl.stream;
+  final _errorCtl = StreamController<PlayerException>.broadcast();
 
   bool get playing => _activePlayer.playing;
 
@@ -449,13 +462,19 @@ class AudioService {
 
   final List<StreamSubscription<int?>> _sessionIdSubs = [];
 
-  void _watchSessionIds(AudioPlayer p) {
-    _sessionIdSubs.add(p.androidAudioSessionIdStream.listen(
+  /// 主播放器的 session id 订阅，重建主播放器时需单独取消（aux 的留在
+  /// [_sessionIdSubs] 不受影响）。
+  StreamSubscription<int?>? _mainSessionIdSub;
+
+  StreamSubscription<int?> _watchSessionIds(AudioPlayer p) {
+    final sub = p.androidAudioSessionIdStream.listen(
       (_) {
         if (!_sessionIdsCtl.isClosed) _sessionIdsCtl.add(androidAudioSessionIds);
       },
       onError: (Object _) {},
-    ));
+    );
+    _sessionIdSubs.add(sub);
+    return sub;
   }
 
   /// 是否完全忽略音频焦点：开启后不响应任何中断事件
@@ -994,6 +1013,79 @@ class AudioService {
   }
 
 
+  /// iOS 专用：销毁并重建底层主 AVPlayer。
+  ///
+  /// 触发背景（诊断日志实锤）：暂停→锁屏（app 被挂起）→解锁后点播放，
+  /// AVPlayer 在 mediaserverd 侧的媒体通道已被系统整体回收，旧 AVPlayer
+  /// 实例对**任何** URL（包括 http://127.0.0.1 本地音频代理）调用 setUrl
+  /// 都会在几十毫秒内秒抛 NSURLError -1004——换 URL、刷新 URL 均无效，
+  /// 因为坏的是 player 实例本身而非某个连接。唯一恢复手段是释放旧实例、
+  /// 新建 AVPlayer。
+  ///
+  /// 对外的 broadcast stream（position/playing/playerState…）在重建前后
+  /// 不变，上层 PlayerProvider 的订阅无感知；EQ tap / 频谱会随新歌的
+  /// AVPlayerItem 通知自动重挂；AVAudioSession 是进程级单例，不受
+  /// AVPlayer 释放影响。仅 iOS 调用；交叉淡化进行中放弃（避免破坏双路）。
+  /// 返回是否成功重建。
+  Future<bool> recreateMainPlayerForRecovery() async {
+    if (!Platform.isIOS) return false;
+    if (_crossfading) return false;
+    // 并发去重：errorStream 自愈链路与用户点歌主流程可能同时检测到 -1004
+    // 而各自触发重建，若并发执行，后一个会 dispose 掉前一个刚建好的新实例。
+    // 合并为同一次重建。
+    final inflight = _recreateFuture;
+    if (inflight != null) return inflight;
+    final fut = _doRecreateMainPlayer();
+    _recreateFuture = fut;
+    try {
+      return await fut;
+    } finally {
+      _recreateFuture = null;
+    }
+  }
+
+  Future<bool>? _recreateFuture;
+
+  Future<bool> _doRecreateMainPlayer() async {
+    try {
+      abortCrossfade();
+      for (final sub in _activeSubs) {
+        // ignore: discarded_futures
+        sub.cancel();
+      }
+      _activeSubs.clear();
+      final mainSub = _mainSessionIdSub;
+      if (mainSub != null) {
+        await mainSub.cancel();
+        _sessionIdSubs.remove(mainSub);
+        _mainSessionIdSub = null;
+      }
+
+      final old = _mainPlayer;
+      final fresh = _createPlayer(enhancer: _mainEnhancer);
+      _mainPlayer = fresh;
+      _activePlayer = fresh;
+      // 新实例就位后再释放旧实例，避免任何窗口期 _activePlayer 悬空。
+      // ignore: discarded_futures
+      old.dispose();
+
+      _bindActiveStreams();
+      _mainSessionIdSub = _watchSessionIds(fresh);
+      try {
+        fresh.setIgnoreAudioFocus(_ignoreAudioFocus);
+        await fresh.setVolume(_userVolume);
+      } catch (_) {}
+      await _applyNormalizationGainActive();
+      // ignore: avoid_print
+      print('[AudioService] iOS 主 AVPlayer 已重建（挂起恢复自愈）');
+      return true;
+    } catch (e) {
+      // ignore: avoid_print
+      print('[AudioService] iOS 重建主 AVPlayer 失败: $e');
+      return false;
+    }
+  }
+
   Future<void> dispose() async {
     abortCrossfade();
     await _media3FocusSub?.cancel();
@@ -1007,6 +1099,7 @@ class AudioService {
     _sessionIdSubs.clear();
     await _sessionIdsCtl.close();
     await _crossfadingCtl.close();
+    await _errorCtl.close();
     await _auxPlayer?.dispose();
     await _mainPlayer.dispose();
   }

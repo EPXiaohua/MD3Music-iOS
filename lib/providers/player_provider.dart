@@ -971,7 +971,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // ExoPlayer/播放器错误进诊断日志（app.log 随诊断报告导出）；
       // 192k 等超能力格式的 renderer 停喂/error 状态定位依赖此日志
       try {
-        _playerErrorSubscription = _audioService.player.errorStream.listen((e) {
+        _playerErrorSubscription = _audioService.errorStream.listen((e) {
           // just_audio 0.10.x：code=10000000（kInterruptedErrorCode）表示「本次 load 被
           // 下一次 setUrl 抢占而中止」，属良性信号，不是解码失败 —— 快速切歌时会高频出现。
           // 保留日志但显式标注，避免在诊断导出里被误读成 32bit/格式解码失败。
@@ -2365,30 +2365,40 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     final bool gateRewind = seekTo != null && seekTo > Duration.zero;
     if (gateRewind) _positionRewindGate.arm(seekTo);
     try {
+      Future<void> load(String u) => _audioService.setUrl(
+        u,
+        loudnessLufs: _currentSong?.loudnessLufs,
+        loudnessPeakDb: _currentSong?.loudnessPeakDb,
+      );
       // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
       try {
-        await _audioService.setUrl(
-          url,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
+        await load(url);
       } catch (e) {
-        // 直连 CDN 失败（iOS 诊断日志实锤 -1004：暂停锁屏挂起恢复后 AVPlayer
-        // 的 mediaserverd 媒体通道整体失效，连任何外部地址都失败，刷新 URL
-        // 也无效），改走本地服务器音频代理流式转发重试——本地回环 127.0.0.1
-        // 不经 mediaserverd 外部网络，服务器进程的上游连接始终正常。代理同样
-        // 透传 Range，进度拖动不受影响。端口为 0（服务器未启动）时无可兜底，
-        // 原样抛出。
+        // 直连 CDN 失败（iOS 暂停锁屏挂起恢复后 AVPlayer 媒体通道失效，直连
+        // CDN 报 -1004），先改走本地服务器音频代理流式转发重试——本地回环
+        // 127.0.0.1 由服务器进程上游拉取 CDN 数据。端口为 0（服务器未启动）
+        // 或本身已是代理 URL 时无可兜底，原样抛出。
         final int port = KugouApiServer.currentPort;
         if (port == 0 || url.contains('/audio/proxy')) rethrow;
         final proxyUrl =
             '${KugouEndpoints.baseUrl}/audio/proxy?url=${Uri.encodeComponent(url)}';
         debugPrint('[D切歌] 直连失败，走本地音频代理重试: $e');
-        await _audioService.setUrl(
-          proxyUrl,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
+        try {
+          await load(proxyUrl);
+        } catch (e2) {
+          // 诊断日志实锤：挂起恢复后旧 AVPlayer 实例已整体死亡，对任何 URL
+          // （含 127.0.0.1 代理）setUrl 都在 ~60ms 内秒抛 -1004，换 URL
+          // 无效。只能销毁重建底层 AVPlayer，再用代理 URL 装载。
+          if (!Platform.isIOS) rethrow;
+          debugPrint(
+            '[D切歌] 本地代理仍秒失败，判定 AVPlayer 已随挂起死亡，'
+            '重建播放器后重试: $e2',
+          );
+          final dynamic recreated = await _audioService
+              .recreateMainPlayerForRecovery();
+          if (recreated != true) rethrow;
+          await load(proxyUrl);
+        }
       }
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
