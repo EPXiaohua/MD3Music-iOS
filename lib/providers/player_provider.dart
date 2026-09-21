@@ -978,6 +978,23 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           debugPrint(
             '[UsbDiag] player error: code=${e.code} message="${e.message}"$tag',
           );
+          // iOS：暂停→锁屏挂起→回前台点播放后，AVPlayer 的网络栈可能整体失效，
+          // 直连 CDN 报 NSURLError 连接类错误（-1004 等），而同时段歌词/封面/API
+          // 请求全部正常，Dio 直连 CDN 预取也成功——即设备网络无恙，是 AVPlayer
+          // 自身的连接池死了，仅等速率检测（要求 position 前进）永远等不到。
+          // 复用 CdnStall 链路（刷新 URL→断点续播→重试耗尽降级音质）自动恢复。
+          // Android 的 ExoPlayer 错误码体系不同且实测无此问题，不介入。
+          const iosConnectErrors = {
+            -1001, // time out
+            -1003, // cannot find host
+            -1004, // cannot connect to host（实测主发码）
+            -1005, // network connection lost
+            -1007, // too many redirects
+            -1009, // not connected to internet
+          };
+          if (Platform.isIOS && iosConnectErrors.contains(e.code)) {
+            _handleCdnStall();
+          }
         });
       } catch (_) {
         // 动态类型模块无 player/errorStream 时忽略
