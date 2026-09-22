@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:just_audio/just_audio.dart';
@@ -607,6 +608,26 @@ class AudioService {
     // 用户主动播放：清除中断暂停标记（避免后续无关 GAIN 误恢复）
     _pausedByInterruption = false;
     await _activePlayer.play();
+  }
+
+  /// iOS：重新激活 audio session，重建 AVPlayer 与 mediaserverd 的 XPC 连接。
+  ///
+  /// 场景：暂停后锁屏 → 进程被系统挂起 → 回前台后 AVPlayer 的媒体通道整体
+  /// 失效，对任何 URL setUrl 都秒抛连接类错误（-1004 等）。显式激活一次
+  /// audio session 即可重建与媒体服务守护进程的连接，播放器实例无需重建。
+  ///
+  /// 仅 iOS 调用：Android 音频焦点由 Media3 的 AudioFocusManager 唯一持有
+  /// （fork 关闭了 audio_session 的焦点请求），此处 setActive(true) 会与
+  /// Media3 内斗导致播放反复暂停。
+  Future<void> reactivateAudioSession() async {
+    if (!Platform.isIOS) return;
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[AudioFocus] reactivate audio session failed: $e');
+    }
   }
 
   Future<void> pause() async {
