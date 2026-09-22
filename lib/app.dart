@@ -255,17 +255,20 @@ class _AppViewState extends State<_AppView> {
     );
   }
 
-  /// 根据 ShortcutConfigProvider 当前配置，整体替换 Android 桌面快捷方式列表。
+  /// 根据 ShortcutConfigProvider 当前配置，整体替换桌面快捷方式列表
+  /// （Android App Shortcut / iOS Quick Actions）。
   /// type 统一为 `action_open_<tabId>`，由 main.dart handleShortcut 路由到对应页。
   void _applyDesktopShortcuts() {
     final config = context.read<ShortcutConfigProvider>();
     const quickActions = QuickActions();
+    // iconResource 是 Android drawable 名，iOS 的模板图标走资源目录，
+    // 传错名字会导致图标缺失，这里 iOS 置空（仅显示文字）
     quickActions.setShortcutItems([
       for (final s in config.visibleShortcuts)
         ShortcutItem(
           type: 'action_open_${s.id}',
           localizedTitle: s.label,
-          icon: s.iconResource,
+          icon: Platform.isAndroid ? s.iconResource : null,
         ),
     ]);
   }
@@ -1225,10 +1228,12 @@ class _MainLayoutState extends State<_MainLayout>
     // 会话态。首帧后执行（等 Provider 挂载），恢复失败静默跳过。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(ltProvider.restoreCurrentSessionIfAny(
-        player: playerProvider,
-        account: context.read<KugouProvider>(),
-      ));
+      unawaited(
+        ltProvider.restoreCurrentSessionIfAny(
+          player: playerProvider,
+          account: context.read<KugouProvider>(),
+        ),
+      );
     });
     // 监听应用生命周期：detached（进程被系统销毁前的最后窗口）时尝试关停本地 API 服务器
     WidgetsBinding.instance.addObserver(this);
@@ -1653,8 +1658,10 @@ class _MainLayoutState extends State<_MainLayout>
   /// 中央按钮 / 广场横幅的 resumeRoomPlayback。
   void _forwardSeekToRoom(int positionMs) {
     final session = context.read<ListenTogetherProvider>().session;
-    debugPrint('[ListenTogether] 用户 seek 通告: ${positionMs}ms '
-        'session=${session == null ? "null" : (session.isOwner ? "房主" : (session.playbackDetached ? "已脱离" : "跟随中"))}');
+    debugPrint(
+      '[ListenTogether] 用户 seek 通告: ${positionMs}ms '
+      'session=${session == null ? "null" : (session.isOwner ? "房主" : (session.playbackDetached ? "已脱离" : "跟随中"))}',
+    );
     if (session == null) return;
     if (session.isOwner) {
       session.ownerSeek(positionMs);

@@ -135,9 +135,11 @@ Future<(bool, bool)> runBootstrap() async {
     unawaited(KugouApiServer.start().catchError((_) {}));
   }
 
-  // 注册 Android 长按应用图标 Shortcut 回调。
+  // 注册长按应用图标 Shortcut 回调（Android App Shortcut / iOS Quick Actions）。
   // initialize 必须在 runApp 之前调用，以便冷启动时能接收到 shortcut 触发。
-  if (!kIsWeb && Platform.isAndroid) {
+  // iOS 侧为 quick_actions 1.2.x 的 UIScene 链路（FlutterSceneDelegate 自动
+  // 转发到插件），不注册回调则点快捷菜单会静默失效。
+  if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
     const quickActions = QuickActions();
     quickActions.initialize((shortcutType) {
       // 应用已就绪时直接处理；否则暂存，由 _AppView 在首帧处理
