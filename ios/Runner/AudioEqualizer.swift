@@ -124,12 +124,17 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     // 有增益变更/采样率变化时重算系数（gain==0 的段直接跳过 = 完美直通）
     state.syncCoeffsIfNeeded()
 
-    guard state.float32, !state.activeBands.isEmpty, state.channelCount > 0 else { return }
+    // 频谱采样：取 EQ 处理前的原始信号。必须放在 activeBands guard 之前——
+    // EQ 关闭时 activeBands 为空，若在 guard 之后这里永远执行不到，
+    // Dart 端 1.5s 收不到 FFT 会误降级模拟模式（"设备不支持频谱"toast 根因）
+    guard state.float32, state.channelCount > 0 else { return }
     guard frames > 0 else { return }
 
     let buffers = UnsafeMutableAudioBufferListPointer(bufferListInOut)
-    // 频谱采样：取 EQ 处理前的原始信号（无论 EQ 开关都工作，对齐 Android PCM 截取语义）
     AudioEqualizer.spectrumFeed(buffers)
+
+    // EQ 关闭（无活动频段）时跳过滤波处理，tap 仅承担频谱采样职责
+    guard !state.activeBands.isEmpty else { return }
     if state.nonInterleaved {
         for (c, buf) in buffers.enumerated() {
             guard c < state.channelCount, c < state.channels.count,

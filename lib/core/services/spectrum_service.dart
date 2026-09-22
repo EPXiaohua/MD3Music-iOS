@@ -99,15 +99,19 @@ class SpectrumService {
     _running = true;
 
     if (nativeOk) {
-      // 原生启动成功，等 1.5 秒看是否有 FFT 回调；无回调则降级到模拟模式
-      _fallbackTimer?.cancel();
-      _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
-        if (_running && !_receivedFft) {
-          // 1.5 秒内无 FFT 回调，降级到模拟模式
-          _startSimulated();
-        }
-      });
-    } else {
+      // iOS 不降级模拟：FFT 数据依赖 AVPlayerItem 的 tap 异步挂载（切歌/起播
+      // 后可能延迟 1~2s），期间静默等待即可；模拟降级会在 EQ 关闭等场景下
+      // 误报"设备不支持频谱"。模拟模式仅保留给 Android Visualizer 不可用的场景。
+      if (!Platform.isIOS) {
+        _fallbackTimer?.cancel();
+        _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
+          if (_running && !_receivedFft) {
+            // 1.5 秒内无 FFT 回调，降级到模拟模式
+            _startSimulated();
+          }
+        });
+      }
+    } else if (!Platform.isIOS) {
       // 原生启动失败（如 HyperOS error -3），直接用模拟模式
       _startSimulated();
     }
@@ -159,7 +163,8 @@ class SpectrumService {
         // sin 波动 + 随机噪声 + 频段衰减
         final phase = _phases[i % _phases.length];
         final decay = _decays[i % _decays.length];
-        final wave = (math.sin((_simulateTime * 2.0 + phase) * 2 * math.pi) + 1) / 2;
+        final wave =
+            (math.sin((_simulateTime * 2.0 + phase) * 2 * math.pi) + 1) / 2;
         final noise = _rng.nextDouble() * 0.3;
         bands[i] = (wave * decay * 0.7 + noise * decay * 0.3).clamp(0.05, 1.0);
       }
