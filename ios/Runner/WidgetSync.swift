@@ -203,10 +203,24 @@ final class WidgetSync {
 
   /// 把待处理命令转发给 Dart 执行（播放/暂停、下一首）。
   private func forwardPendingCommand() {
-    guard let defaults = groupDefaults,
+    // channel 未就绪时不能先删命令（invokeMethod 会丢）——留给下次回前台转发
+    guard channel != nil, let defaults = groupDefaults,
       let action = defaults.string(forKey: Self.commandKey)
     else { return }
     defaults.removeObject(forKey: Self.commandKey)
     channel?.invokeMethod("widgetCommand", arguments: ["action": action])
+  }
+
+  // MARK: - 小组件 URL scheme（iOS 15/16 无 AppIntent 的按钮路径）
+
+  /// 处理小组件按钮经 `md3music://widget/<action>` 打开 app 的命令。
+  /// 命令落 App Group 后走与 AppIntent 相同的转发链路：channel 就绪立即
+  /// 转发，否则由 scene didActivate（Flutter 引擎就绪后）补发。
+  func handleWidgetURL(_ url: URL) {
+    guard url.scheme == "md3music", url.host == "widget" else { return }
+    let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    guard action == "play_pause" || action == "next" else { return }
+    Self.writeCommand(action)
+    forwardPendingCommand()
   }
 }

@@ -10,5 +10,15 @@ class SceneDelegate: FlutterSceneDelegate {
   ) {
     super.scene(scene, willConnectTo: session, options: connectionOptions)
     (UIApplication.shared.delegate as? AppDelegate)?.configureChannelsIfPossible()
+    // 冷启动经小组件 URL 打开：connectionOptions 里携带 URL
+    connectionOptions.urlContexts.forEach {
+      WidgetSync.shared.handleWidgetURL($0.url)
+    }
+  }
+
+  /// 热路径：app 在后台/前台时点小组件按钮 → URL scheme 打开 app
+  override func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+    super.scene(scene, openURLContexts: URLContexts)
+    URLContexts.forEach { WidgetSync.shared.handleWidgetURL($0.url) }
   }
 }

@@ -14,8 +14,10 @@
 //  (now - updatedAt)），无需依赖系统刷新预算；暂停时静止。
 //
 //  交互：iOS 17+ 播放/暂停、下一首按钮走 AppIntent——把命令写入 App Group
-//  并打开 app，由主 app 回前台后转发给 Dart 执行；iOS 15/16 点击整个
-//  widget 打开 app。
+//  并打开 app，由主 app 回前台后转发给 Dart 执行；iOS 16 按钮用 Link 经
+//  `md3music://widget/<action>` URL scheme 打开 app 携带命令（iOS 15 点整
+//  个 widget 走 widgetURL 兜底）；主 app 由 SceneDelegate 接收 URL 后同样
+//  经 WidgetSync 转发给 Dart。
 //
 
 import WidgetKit
@@ -189,6 +191,9 @@ struct MD3MusicWidgetView: View {
       }
     }
     .widgetBackground(s.panelBg)
+    // 兜底：iOS 15/16 点击非按钮区域打开 app（按钮区域 Link 优先）；
+    // iOS 17+ 按钮走 AppIntent，其余区域同样能打开 app
+    .widgetURL(URL(string: "md3music://widget/open"))
   }
 
   /// 小号：封面在上、信息在中、进度条在下，整体居中。
@@ -229,8 +234,9 @@ struct MD3MusicWidgetView: View {
       }
       progressView(s, inset: 10)
       HStack(spacing: 10) {
-        // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
-        // 点击 widget 整体打开 app
+        // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 用 Link 携带
+        // URL scheme 命令打开 app（Link 仅 iOS 16 生效，iOS 15 整组件
+        // 点按走 widgetURL 兜底打开 app）
         if #available(iOSApplicationExtension 17.0, *) {
           Button(intent: PlayPauseIntent()) {
             controlCircle(
@@ -245,12 +251,16 @@ struct MD3MusicWidgetView: View {
           }
           .buttonStyle(.plain)
         } else {
-          controlCircle(
-            systemName: s.isPlaying ? "pause.fill" : "play.fill",
-            tint: s.primary, icon: s.onPrimary)
-          controlCircle(
-            systemName: "forward.fill", tint: s.surfaceHigh,
-            icon: s.onSurface)
+          Link(destination: URL(string: "md3music://widget/play_pause")!) {
+            controlCircle(
+              systemName: s.isPlaying ? "pause.fill" : "play.fill",
+              tint: s.primary, icon: s.onPrimary)
+          }
+          Link(destination: URL(string: "md3music://widget/next")!) {
+            controlCircle(
+              systemName: "forward.fill", tint: s.surfaceHigh,
+              icon: s.onSurface)
+          }
         }
         Spacer()
       }
