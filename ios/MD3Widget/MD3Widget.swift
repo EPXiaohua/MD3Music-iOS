@@ -255,7 +255,7 @@ struct MD3MusicWidgetView: View {
         Spacer()
       }
     }
-    .padding(.horizontal, 10)
+    .padding(.horizontal, 30)
     .padding(.vertical, 10)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
