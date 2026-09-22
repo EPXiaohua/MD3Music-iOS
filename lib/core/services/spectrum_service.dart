@@ -99,17 +99,21 @@ class SpectrumService {
     _running = true;
 
     if (nativeOk) {
-      // 原生启动成功，等 1.5 秒看是否有 FFT 回调；无回调则降级到模拟模式。
-      // iOS 保留降级兜底：极少数系统/格式下 tap 可能挂不上收不到数据，
-      // 此时模拟模式保证频谱功能可见。正常设备走真实频谱（tap 挂载延迟
-      // 1~2s 内不会误触发，因为降级判定看的是 onFft 是否真的到达）。
-      _fallbackTimer?.cancel();
-      _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
-        if (_running && !_receivedFft) {
-          // 1.5 秒内无 FFT 回调，降级到模拟模式
-          _startSimulated();
-        }
-      });
+      if (Platform.isAndroid) {
+        // Android：等 1.5 秒看是否有 FFT 回调；无回调则降级到模拟模式
+        //（Visualizer 在部分 ROM 不可用，如 HyperOS error -3）。
+        _fallbackTimer?.cancel();
+        _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
+          if (_running && !_receivedFft) {
+            // 1.5 秒内无 FFT 回调，降级到模拟模式
+            _startSimulated();
+          }
+        });
+      }
+      // iOS 不设降级计时器：MTAudioProcessingTap 自 iOS 6 起全版本支持，
+      // 不存在"设备不支持"的场景。播放失败/缓冲/暂停期间没有 PCM 流经 tap，
+      // FFT 自然不到达——此时频谱保持静止即可；旧逻辑在 1.5s 无数据时
+      // 误降级模拟并弹"设备不支持"，网络差导致播放失败时必然触发。
     } else {
       // 原生启动失败（如 HyperOS error -3），直接用模拟模式
       _startSimulated();
