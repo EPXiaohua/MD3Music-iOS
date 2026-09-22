@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:just_audio/just_audio.dart';
@@ -282,7 +281,10 @@ class AudioService {
   /// 主播放器：始终存在，是音频焦点与 MediaSession 的持有者。
   // 音量均衡放大用 LoudnessEnhancer（先声明，供主播放器创建时注入）。
   final AndroidLoudnessEnhancer _mainEnhancer = AndroidLoudnessEnhancer();
-  late final AudioPlayer _mainPlayer;
+  // 非 final：iOS 挂起恢复后 AVPlayer 实例死亡需要整体重建
+  // （rebuildMainPlayer 重新赋值。曾误声明 late final 导致重建时抛
+  // LateInitializationError，恢复链路从未执行到第三次 setUrl）。
+  late AudioPlayer _mainPlayer;
 
   /// 辅播放器：首次交叉淡化时才创建（未开启该功能的用户零开销）。
   AudioPlayer? _auxPlayer;
@@ -610,31 +612,12 @@ class AudioService {
     await _activePlayer.play();
   }
 
-  /// iOS：重新激活 audio session，重建 AVPlayer 与 mediaserverd 的 XPC 连接。
+  /// iOS：销毁重建主播放器实例——挂起后 AVPlayer 媒体通道死亡的确定性修复。
   ///
-  /// 场景：暂停后锁屏 → 进程被系统挂起 → 回前台后 AVPlayer 的媒体通道整体
-  /// 失效，对任何 URL setUrl 都秒抛连接类错误（-1004 等）。显式激活一次
-  /// audio session 即可重建与媒体服务守护进程的连接，播放器实例无需重建。
-  ///
-  /// 仅 iOS 调用：Android 音频焦点由 Media3 的 AudioFocusManager 唯一持有
-  /// （fork 关闭了 audio_session 的焦点请求），此处 setActive(true) 会与
-  /// Media3 内斗导致播放反复暂停。
-  Future<void> reactivateAudioSession() async {
-    if (!Platform.isIOS) return;
-    try {
-      final session = await AudioSession.instance;
-      await session.setActive(true);
-    } catch (e) {
-      // ignore: avoid_print
-      print('[AudioFocus] reactivate audio session failed: $e');
-    }
-  }
-
-  /// iOS：销毁重建主播放器实例——挂起后 AVPlayer 媒体通道死亡的终极修复。
-  ///
-  /// 实测（诊断日志 2026-09-22）：暂停后锁屏挂起 → 回前台对任何 URL setUrl
-  /// 秒抛 -1004，重激活 audio session 后重试仍 -1004（66ms 内）——播放器
-  /// 实例内部的媒体加载通道已死，只有销毁重建 AVPlayer 才能恢复。
+  /// 场景：暂停后锁屏 → 进程被系统挂起 → 回前台后 AVPlayer 内部的媒体加载
+  /// 通道死亡，对任何 URL setUrl 都秒抛 -1004。诊断日志（2026-09-22）实锤
+  /// 重激活 audio session 无法恢复（重试仍 -1004），唯一可靠修复是销毁
+  /// 重建播放器实例。
   ///
   /// 对外 stream 经 [_bindActiveStreams] 重绑到新实例（与交叉淡化角色互换
   /// 同一机制）；焦点事件与 sessionId 订阅一并重绑。旧实例上的 EQ tap /
@@ -663,8 +646,7 @@ class AudioService {
     }
     _sessionIdSubs.clear();
     _watchSessionIds(_mainPlayer);
-    // 旧实例最后销毁：销毁会触发原生释放，若仍在播放会立即断声——本方法
-    // 仅在暂停态（挂起恢复）下调用，不受影响
+    // 旧实例最后销毁：本方法仅在暂停态（挂起恢复）下调用，断声无影响
     try {
       await old.dispose();
     } catch (e) {

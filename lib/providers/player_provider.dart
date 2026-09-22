@@ -2346,48 +2346,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 有明确 seek 目标时开启闸门，装载全程丢弃小于目标的采样，seek 后回填目标值。
     final bool gateRewind = seekTo != null && seekTo > Duration.zero;
     if (gateRewind) _positionRewindGate.arm(seekTo);
+    // 内层 try：iOS 挂起恢复自愈（setUrl 秒抛 -1004 时重建播放器再试）；
+    // 重试仍失败才跳出外层，走统一错误上报。
     try {
-      // 内层 try：iOS 挂起恢复后的 setUrl 自愈重试；重试仍失败才跳出外层
-      try {
-        // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-        await _audioService.setUrl(
-          url,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
-      } catch (e) {
-        if (!Platform.isIOS) rethrow;
-        // iOS：暂停后锁屏挂起会杀死 AVPlayer 与 mediaserverd 的 XPC 连接，
-        // 回前台后对任何 URL setUrl 都秒抛连接类错误（-1004 等）。自愈分
-        // 两级（诊断日志实锤 2026-09-22）：
-        // 1) 重激活 audio session 后重试——轻症（通道可重建）时生效；
-        // 2) 仍失败说明播放器实例已死，销毁重建 AVPlayer 后再试一次。
-        //    （回前台 resumed 已做过一次 session 自愈，这里覆盖时序窗口）
-        debugPrint('[D切歌] iOS setUrl 失败，重激活 audio session 后重试: $e');
-        try {
-          await _audioService.reactivateAudioSession();
-        } catch (_) {}
-        try {
-          await _audioService.setUrl(
-            url,
-            loudnessLufs: _currentSong?.loudnessLufs,
-            loudnessPeakDb: _currentSong?.loudnessPeakDb,
-          );
-        } catch (e2) {
-          debugPrint('[D切歌] iOS 重激活后仍失败，重建播放器实例: $e2');
-          try {
-            await _audioService.rebuildMainPlayer();
-          } catch (e3) {
-            debugPrint('[D切歌] iOS 重建播放器失败: $e3');
-            rethrow;
-          }
-          await _audioService.setUrl(
-            url,
-            loudnessLufs: _currentSong?.loudnessLufs,
-            loudnessPeakDb: _currentSong?.loudnessPeakDb,
-          );
-        }
-      }
+      // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
+      await _loadUrlWithSuspendRecovery(url);
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
         final state = _audioService.player.playerState;
@@ -2422,6 +2385,37 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 装载结束（含异常）一定释放闸门，防止位置被永久抑制；
       // 若已在上面的 seek 分支释放则此处为幂等空操作。
       _positionRewindGate.disarm();
+    }
+  }
+
+  /// setUrl 装载 + iOS 挂起恢复自愈。
+  ///
+  /// 场景：暂停后锁屏 → iOS 把进程挂起 → AVPlayer 内部的媒体加载通道死亡
+  /// → 回前台切歌对任何 URL setUrl 秒抛 -1004（诊断日志 2026-09-22 实锤，
+  /// 且重激活 audio session 无法恢复）。修复：失败时销毁重建播放器实例
+  /// （[AudioService.rebuildMainPlayer]），再用原 URL 装载一次；仍失败才
+  /// 向上报错。仅 iOS 生效，Android 的 ExoPlayer 无此问题。
+  Future<void> _loadUrlWithSuspendRecovery(String url) async {
+    try {
+      await _audioService.setUrl(
+        url,
+        loudnessLufs: _currentSong?.loudnessLufs,
+        loudnessPeakDb: _currentSong?.loudnessPeakDb,
+      );
+    } catch (e) {
+      if (!Platform.isIOS) rethrow;
+      debugPrint('[D切歌] iOS setUrl 失败（挂起后媒体通道死亡），重建播放器: $e');
+      try {
+        await _audioService.rebuildMainPlayer();
+      } catch (e2) {
+        debugPrint('[D切歌] iOS 重建播放器失败: $e2');
+        rethrow;
+      }
+      await _audioService.setUrl(
+        url,
+        loudnessLufs: _currentSong?.loudnessLufs,
+        loudnessPeakDb: _currentSong?.loudnessPeakDb,
+      );
     }
   }
 
@@ -2685,12 +2679,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 而失败（MissingPluginException），导致后续所有 API 请求因连接被拒绝而失败。
   /// 此方法在播放流程中做二次兜底：探测端口，若不通则重新尝试启动。
   ///
-  /// 仅 Android 使用：前台服务保活下服务器极少死，此处主要防冷启动失败。
-  /// iOS 不走播放路径重启——服务器失效的正确修复时机是回前台自愈
-  /// （[_recoverIosAfterResume]），在播放路径上重启既无法恢复已死的
-  /// AVPlayer 媒体通道，也会拖慢点播响应。
+  /// Android：前台服务保活下服务器极少死，此处主要防冷启动失败。
+  /// iOS：锁屏后无活跃音频会话时进程被挂起（后台时序里 detached 还可能
+  /// 误触发 stop()），回前台后端口不通——播放前必须探测并重启，否则表现
+  /// 为「锁屏回来后音乐播不了，而已加载的 MV 等正常」。
   Future<void> _ensureApiServerReady() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (kIsWeb) return;
     final port = KugouApiServer.currentPort;
     if (port <= 0) {
       await KugouApiServer.start();
@@ -4020,46 +4014,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     } else if (state == AppLifecycleState.resumed) {
       // 回到前台：停止兜底定时器，立即重试一次失败的当前歌曲
       _stopRetryFailedTimer();
-      // iOS：暂停后锁屏会把进程整体挂起——AVPlayer 与 mediaserverd 的 XPC
-      // 连接、本地 API 服务器监听都可能失效。回前台第一时间自愈（先于任何
-      // 播放/API 请求，用户无感），否则切歌 setUrl 秒抛 -1004、API 请求
-      // 连接被拒，表现为「暂停锁屏回来切歌失败」。
-      if (Platform.isIOS) {
-        // ignore: discarded_futures
-        _recoverIosAfterResume();
-      }
       _retryFailedPlayback();
-    }
-  }
-
-  /// iOS 回前台自愈（[didChangeAppLifecycleState] resumed 时触发）。
-  ///
-  /// 1) 重新激活 audio session：重建 AVPlayer 与 mediaserverd 的 XPC 连接，
-  ///    修复挂起后的「任何 URL 都 -1004」。
-  /// 2) 探测本地 API 服务器端口：不通则重启（进程挂起期间监听 socket 可能
-  ///    随媒体通道一起失效；restart 先停后起，保证 Rust 内部状态干净）。
-  ///
-  /// 与播放前兜底的区别：这里在回前台时机执行，先于用户操作，无感完成；
-  /// 播放路径上不再做任何服务器重启。
-  Future<void> _recoverIosAfterResume() async {
-    // 1) audio session 重新激活
-    try {
-      await _audioService?.reactivateAudioSession();
-    } catch (_) {}
-    // 2) 本地 API 服务器探测自愈
-    final port = KugouApiServer.currentPort;
-    if (port <= 0) return; // 服务器从未启动过，交由常规启动链路处理
-    try {
-      final socket = await Socket.connect(
-        '127.0.0.1',
-        port,
-        timeout: const Duration(milliseconds: 500),
-      );
-      await socket.close();
-    } catch (_) {
-      try {
-        await KugouApiServer.restart();
-      } catch (_) {}
     }
   }
 
