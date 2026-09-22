@@ -4,7 +4,7 @@
 /// 3. 静态模式（无 positionListenable）行为不回归
 library;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';

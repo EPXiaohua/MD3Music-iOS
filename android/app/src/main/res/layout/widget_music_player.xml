@@ -110,11 +110,11 @@
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"
                     android:scaleType="fitXY"
-                    android:src="@drawable/widget_fm_bg_circle"
-                    android:contentDescription="@null" />
+                android:src="@drawable/music_btn_circle_play"
+                android:contentDescription="@null" />
 
-                <ImageView
-                    android:id="@+id/music_btn_play_icon"
+            <ImageView
+                android:id="@+id/music_btn_play_icon"
                     android:layout_width="20dp"
                     android:layout_height="20dp"
                     android:layout_gravity="center"
@@ -135,11 +135,11 @@
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"
                     android:scaleType="fitXY"
-                    android:src="@drawable/widget_fm_bg_circle"
-                    android:contentDescription="@null" />
+                android:src="@drawable/music_btn_circle_next"
+                android:contentDescription="@null" />
 
-                <ImageView
-                    android:id="@+id/music_btn_next_icon"
+            <ImageView
+                android:id="@+id/music_btn_next_icon"
                     android:layout_width="20dp"
                     android:layout_height="20dp"
                     android:layout_gravity="center"

@@ -110,4 +110,125 @@ void main() {
       expect(a3.avatar, isNull);
     });
   });
+
+  /// /search 接口返回的是「搜索形态」记录：SingerId 为数组、歌手在 Singers
+  /// 数组里、封面在 Image / trans_param.union_cover、专辑在 AlbumID/AlbumName。
+  /// 这些用例的字段形状取自真机实测响应（tmp/search.json），不是构造的。
+  group('KugouSongDetail.fromJson 搜索形态', () {
+    test('SingerId 为数组时取首个 id 作为 artistId', () {
+      final d = KugouSongDetail.fromJson({
+        'FileHash': 'FF3BA0A7AD50D5BEBB2ED7907F15608C',
+        'SongName': '桃花诺',
+        'SingerName': 'G.E.M.邓紫棋',
+        'SingerId': [4490],
+        'Singers': [
+          {'name': 'G.E.M.邓紫棋', 'id': 4490, 'ip_id': 0},
+        ],
+        'AlbumID': '2681514',
+        'AlbumName': '桃花诺',
+      });
+
+      expect(d.artistId, '4490');
+      expect(d.artistName, 'G.E.M.邓紫棋');
+      expect(d.albumId, '2681514');
+      expect(d.albumName, '桃花诺');
+    });
+
+    test('合唱曲目 SingerId 多元素时取首个 id（与 Singers 顺序一致）', () {
+      final d = KugouSongDetail.fromJson({
+        'FileHash': '6BDE4FD59A63A21F5DA182C29FBA25B4',
+        'SongName': '桃花诺 (Live)',
+        'SingerName': '罗云熙、黄霄雲',
+        'SingerId': [184908, 194052],
+        'Singers': [
+          {'name': '罗云熙', 'id': 184908, 'ip_id': 0},
+          {'name': '黄霄雲', 'id': 194052, 'ip_id': 0},
+        ],
+        'AlbumID': '198053621',
+        'AlbumName': '天赐的声音第七季 第4期',
+      });
+
+      expect(d.artistId, '184908');
+      expect(d.artistName, '罗云熙、黄霄雲');
+      expect(d.albumId, '198053621');
+    });
+
+    test('SingerId 为标量字符串时仍能解析（不回归其他接口形态）', () {
+      final d = KugouSongDetail.fromJson({
+        'hash': 'ABC',
+        'songname': '某歌',
+        'SingerId': '4490',
+      });
+
+      expect(d.artistId, '4490');
+    });
+
+    test('SingerId 为空数组时回退到其他候选键，不返回空串 id', () {
+      final d = KugouSongDetail.fromJson({
+        'hash': 'ABC',
+        'songname': '某歌',
+        'SingerId': <dynamic>[],
+        'artist_id': '777',
+      });
+
+      expect(d.artistId, '777');
+    });
+
+    test('Image 作为封面来源，{size} 占位符替换为 400', () {
+      final d = KugouSongDetail.fromJson({
+        'FileHash': 'FF3BA0A7AD50D5BEBB2ED7907F15608C',
+        'SongName': '桃花诺',
+        'Image':
+            'http://imge.kugou.com/stdmusic/{size}/20200909/20200909124212131553.jpg',
+      });
+
+      expect(
+        d.artworkUri,
+        'http://imge.kugou.com/stdmusic/400/20200909/20200909124212131553.jpg',
+      );
+    });
+
+    test('trans_param.union_cover 作为封面兜底来源', () {
+      final d = KugouSongDetail.fromJson({
+        'FileHash': 'FF3BA0A7AD50D5BEBB2ED7907F15608C',
+        'SongName': '桃花诺',
+        'trans_param': {
+          'union_cover':
+              'http://imge.kugou.com/stdmusic/{size}/20230226/20230226114315528773.jpg',
+        },
+      });
+
+      expect(
+        d.artworkUri,
+        'http://imge.kugou.com/stdmusic/400/20230226/20230226114315528773.jpg',
+      );
+    });
+
+    test('toSong() 带出 artistId/albumId/封面，供详情页跳转使用', () {
+      final d = KugouSongDetail.fromJson({
+        'FileHash': 'FF3BA0A7AD50D5BEBB2ED7907F15608C',
+        'FileName': 'G.E.M.邓紫棋 - 桃花诺',
+        'SongName': '桃花诺',
+        'SingerName': 'G.E.M.邓紫棋',
+        'SingerId': [4490],
+        'Singers': [
+          {'name': 'G.E.M.邓紫棋', 'id': 4490, 'ip_id': 0},
+        ],
+        'AlbumID': '2681514',
+        'AlbumName': '桃花诺',
+        'Image':
+            'http://imge.kugou.com/stdmusic/{size}/20200909/20200909124212131553.jpg',
+      });
+
+      final song = d.toSong();
+      expect(song.artistId, '4490');
+      expect(song.albumId, '2681514');
+      expect(song.artist, 'G.E.M.邓紫棋');
+      expect(song.title, '桃花诺');
+      expect(
+        song.artworkUri,
+        'http://imge.kugou.com/stdmusic/400/20200909/20200909124212131553.jpg',
+      );
+    });
+  });
 }

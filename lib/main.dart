@@ -1,5 +1,5 @@
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:intl/date_symbol_data_local.dart';
@@ -19,6 +19,7 @@ import 'core/services/media_notification_service.dart';
 import 'core/services/usb_audio_service.dart';
 import 'core/services/wakelock_service.dart';
 import 'data/repositories/settings_repository.dart';
+import 'modules/update/update_check_service.dart';
 import 'modules/onboarding/user_agreement_page.dart';
 import 'services/kugou_server.dart';
 import 'utils/landscape_immersive.dart';
@@ -157,6 +158,13 @@ Future<(bool, bool)> runBootstrap() async {
 
   // 检测是否需要展示用户协议（首次启动）
   final needsUserAgreement = !(await isUserAgreementAccepted());
+
+  // 启动后静默检查 GitHub Release：发现新版本仅 toast 提醒。
+  // 首次启动引导 / 用户协议未确认时抑制，避免与首启流程争夺注意力。
+  // 内部仅在 Android 生效、延迟 8s 后执行、12 小时内不重复请求；可在设置中关闭。
+  UpdateCheckService.instance.scheduleStartupCheck(
+    suppress: needsOnboarding || needsUserAgreement,
+  );
 
   return (needsOnboarding, needsUserAgreement);
 }

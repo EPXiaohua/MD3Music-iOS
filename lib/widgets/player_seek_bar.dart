@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' show FontFeature, lerpDouble;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 /// 播放器进度条 —— 一条最细的轨道 + 下方一行时间。
@@ -37,6 +37,8 @@ class PlayerSeekBar extends StatefulWidget {
     this.climaxStart,
     this.climaxEnd,
     this.height = 38,
+    this.enabled = true,
+    this.onDisabledTap,
     this.onSeekStart,
     this.onSeekEnd,
   });
@@ -67,6 +69,16 @@ class PlayerSeekBar extends StatefulWidget {
   final double? climaxEnd;
 
   final double height;
+
+  /// 是否允许点按/拖动跳转。
+  ///
+  /// false 时进度条退化为**只读指示器**：轨道、时间与自驱动照常刷新，但不响应
+  /// 点按与拖动，也不会调用 [onSeekStart] / [onSeekEnd]。用于一起听听众端——
+  /// 成员拖动会被远端纠偏立刻拉回，此时给不出「拖不动」的结果才是对的。
+  final bool enabled;
+
+  /// 只读态（[enabled] 为 false）下被点按或起拖时的回调，用于说明为什么拖不动。
+  final VoidCallback? onDisabledTap;
 
   /// 开始拖动（用于暂停播放避免与 seek 抢位）
   final VoidCallback? onSeekStart;
@@ -276,14 +288,21 @@ class _PlayerSeekBarState extends State<PlayerSeekBar>
         _trackWidth = constraints.maxWidth;
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
+          // 只读态：不接任何跳转手势，改为把点按/起拖转成提示回调，
+          // 否则用户只会看到「这条不能拖」而不知道原因（详见 [enabled]）。
           // 点按轨道任意位置即跳转（按下就进入膨胀态，松手落定）
-          onTapDown: (d) => _startDrag(d.localPosition.dx),
-          onTapUp: (_) => _endDrag(),
-          onTapCancel: _endDrag,
-          onHorizontalDragStart: (d) => _startDrag(d.localPosition.dx),
-          onHorizontalDragUpdate: (d) => _updateDrag(d.localPosition.dx),
-          onHorizontalDragEnd: (_) => _endDrag(),
-          onHorizontalDragCancel: _endDrag,
+          onTapDown: widget.enabled ? (d) => _startDrag(d.localPosition.dx) : null,
+          onTapUp: widget.enabled ? (_) => _endDrag() : null,
+          onTapCancel: widget.enabled ? _endDrag : null,
+          onHorizontalDragStart: widget.enabled
+              ? (d) => _startDrag(d.localPosition.dx)
+              : (_) => widget.onDisabledTap?.call(),
+          onHorizontalDragUpdate: widget.enabled
+              ? (d) => _updateDrag(d.localPosition.dx)
+              : null,
+          onHorizontalDragEnd: widget.enabled ? (_) => _endDrag() : null,
+          onHorizontalDragCancel: widget.enabled ? _endDrag : null,
+          onTap: widget.enabled ? null : widget.onDisabledTap,
           child: SizedBox(
             height: widget.height,
             child: RepaintBoundary(

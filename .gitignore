@@ -59,3 +59,15 @@ app.*.map.json
 /md3Music-5.5.0/
 /md3Music-5.6.0/
 /md3Music-5.6.5/
+/md3Music-5.7.0/
+
+# Gradle / Kotlin 构建缓存（任何位置）
+**/.gradle/
+**/.kotlin/
+/android/build/
+/android/local.properties
+# Flutter 工具生成，不入库
+/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+
+# Trae 工作区数据
+.trae/

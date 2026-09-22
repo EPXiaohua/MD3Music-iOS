@@ -35,6 +35,12 @@ extension PlayerTabLayoutX on PlayerTabLayout {
   /// 歌词 tab 下标。顺序固定 [播放列表, 封面?, 歌词, 评论?]，故无封面 tab 时为 1。
   int get lyricsIndex => hasCover ? 2 : 1;
 
+  /// 评论 tab 下标（评论恒为最后一个 tab）。评论 tab 不存在时为 -1。
+  ///
+  /// 长按底部评论段要切到评论 tab，消费方不得用 `length - 1` 自己反推：
+  /// 评论 tab 不存在时那个式子会指到歌词 tab。
+  int get commentsIndex => hasComments ? length - 1 : -1;
+
   /// 结构变化后应落在的下标。
   ///
   /// - 新结构无封面 tab（进入横屏/平板）：一律落到歌词 tab，沿用历史行为

@@ -1,6 +1,6 @@
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// 「显示大小」全局缩放：语义等同安卓系统设置里的「显示大小」。
 ///

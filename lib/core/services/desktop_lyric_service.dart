@@ -676,6 +676,38 @@ class DesktopLyricService {
     }
   }
 
+  /// 歌曲元数据（标题/歌手/封面）晚到并被回写后，让各推送渠道立即刷新。
+  ///
+  /// 场景：一起听跟随端起播时只有 hash 身份，`RoomSong.toSong()` 把空标题
+  /// 兜底成「未知歌曲」，各渠道先把它推了出去；随后元数据富化回写当前歌
+  /// （`PlayerProvider.updateCurrentSongMetadata`，**id 保持不变**），
+  /// 但各渠道都按 song.id 去重 → 真实标题永远推不出去。
+  ///
+  /// 因此这里在元数据变化时**显式**补推一次，而不是放宽各渠道的去重键：
+  /// 去重本意是防高频 tick 重复推送，放宽会破坏该保护。
+  ///
+  /// 覆盖三条「不重推就永远停在占位标题」的渠道：
+  /// - SuperLyric：重推当前行（含 title/artist）
+  /// - LyricInfo：复位 once-per-song 标志后重建整首 JSON（含 songName）
+  /// - 锁屏歌词：整包重推（含 title/artist）
+  /// 注：Lyricon 由 `PlayerProvider._handleLyriconSongChange` 的元数据签名处理。
+  Future<void> notifySongMetadataChanged() async {
+    if (_superLyricEnabled) {
+      if (_currentLineIndex >= 0 && _currentLineIndex < _lines.length) {
+        await _pushSuperLyricLine(_lines[_currentLineIndex]);
+      } else {
+        await _pushSuperLyricLine(null);
+      }
+    }
+    if (_lyricInfoEnabled) {
+      _lyricInfoPushed = false;
+      _maybePushLyricInfo();
+    }
+    if (_lockScreenLyricEnabled) {
+      _pushLockScreenFullData();
+    }
+  }
+
   /// 设置共用的推送偏好（翻译/罗马音/优先翻译），并让过滤立即生效：
   /// - SuperLyric：重推当前行
   /// - LyricInfo：重建并重推整首歌词 JSON
@@ -1054,7 +1086,10 @@ class DesktopLyricService {
         }
       }
 
-      final searchName = song.artist != '未知艺术家'
+      // 用 isUnknownArtist 而非比较单一字面量：一起听跟随端的占位值是
+      // 「未知歌手」、本地侧是「未知艺术家」，只比一个会漏判，
+      // 导致把「未知歌曲 未知歌手」当检索词去搜。
+      final searchName = !isUnknownArtist(song.artist)
           ? '${song.title} ${song.artist}'
           : song.title;
       final lyric = await _kugou!.getLyric(

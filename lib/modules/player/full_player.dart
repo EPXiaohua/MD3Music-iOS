@@ -1,7 +1,7 @@
 import 'dart:io' show Platform;
 
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -10,6 +10,7 @@ import 'package:provider/provider.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/services/audio_service.dart';
 import '../../core/services/desktop_lyric_service.dart';
+import '../../core/services/dynamic_cover_service.dart';
 import '../../core/services/equalizer_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/services/spectrum_service.dart';
@@ -24,6 +25,7 @@ import '../../data/repositories/settings_repository.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../coverflow/coverflow_page.dart';
+import '../listen_together/widgets/listen_together_pill.dart';
 import '../settings/equalizer_settings_page.dart';
 import '../sound/sounds_page.dart';
 import 'artist_photo_background.dart';
@@ -31,12 +33,15 @@ import 'mv_player_page.dart';
 import 'song_info_page.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/kugou_provider.dart';
+import '../../providers/listen_together_provider.dart';
 import '../../providers/local_favorites_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/comment_display_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../services/kugou_api/comment_reply_target.dart';
+import 'comment_compose_sheet.dart';
 import 'comments_view.dart';
 import 'lyrics_view.dart';
 import 'player_tab_layout.dart';
@@ -44,10 +49,12 @@ import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../utils/landscape_immersive.dart';
 import '../../utils/playlist_order_utils.dart';
+import '../../widgets/md3_lyric_preferences.dart';
 import '../../widgets/md3_lyric_preferences_panel.dart';
 import '../../widgets/ai_recommend_sheet.dart';
 import '../../widgets/md3e_transport_row.dart';
 import '../../widgets/menu_action_cell.dart';
+import '../../widgets/dynamic_cover_view.dart';
 import '../../widgets/player_artwork_image.dart';
 import '../../widgets/player_seek_bar.dart';
 import '../../widgets/player_tab_strip.dart';
@@ -113,8 +120,18 @@ class _FullPlayerState extends State<FullPlayer>
     with TickerProviderStateMixin, WidgetsBindingObserver {
   late TabController _tabController;
   String _lyrics = '';
+  List<LyricLine> _lyricMetadata = const [];
+  bool _hasTranslation = false;
+  bool _hasRoma = false;
   bool _isLoadingLyrics = false;
   String? _lastSongId;
+
+  /// 歌词已获取时歌曲的元数据键（id:秒时长:albumAudioId）。
+  /// 一起听跟随端起播时只有 hash 身份（时长 0、无 albumAudioId），
+  /// 富化回写保持 id 不变——仅按 id 判重会让歌词永远停在「未知歌曲」占位；
+  /// 元数据键变化（补齐时长/专辑 id）后强制重取一次（对齐 EchoMusic
+  /// lastForcedLyricMetadataKey）。
+  String _lastLyricMetadataKey = '';
 
   // 导航条拖动切换：拖动时上方页面跟随，松手吸附到最近 tab
   double _tabDragBtnW = 0;
@@ -175,6 +192,15 @@ class _FullPlayerState extends State<FullPlayer>
   bool _zenMode = false;
   // 长按封面进入 Zen 模式开关（设置→播放，默认开启；关闭后禁用长按）
   bool _zenLongPressEnabled = true;
+  // 专辑动态封面开关（设置页「播放页样式」与播放页「界面设置」共用；默认开启）
+  bool _dynamicCoverEnabled = true;
+  /// 播放页「界面设置」里「当前歌曲动态封面」的展示值（null = 检测中）
+  ///
+  /// 刻意**不在 dispose() 里销毁**：二级菜单挂在根 Navigator 上，可能比本 State
+  /// 活得更久（如车机模式切换导致播放器被销毁时菜单仍开着），销毁后菜单关闭时
+  /// `removeListener` 会命中「used after being disposed」断言。不销毁则菜单关闭后
+  /// notifier 与监听者一起变成垃圾被回收。
+  final ValueNotifier<String?> _dyCoverStatus = ValueNotifier<String?>(null);
   late final AnimationController _zenController;
   late final Animation<double> _zenAnimation;
 
@@ -550,6 +576,7 @@ class _FullPlayerState extends State<FullPlayer>
       vsync: this,
       initialIndex: 1,
     );
+
     // 桌面歌词状态变化时刷新 UI（同步歌词按钮 icon）
     _onDesktopLyricChanged = () {
       if (mounted) setState(() {});
@@ -589,7 +616,63 @@ class _FullPlayerState extends State<FullPlayer>
       context.read<PlayerProvider>().addListener(_onPlayerSongChanged);
       _loadSpectrumSetting();
       _loadZenPressSetting();
+      _loadDynamicCoverSetting();
     });
+  }
+
+  /// 从设置加载「专辑动态封面」开关（默认开启）。
+  Future<void> _loadDynamicCoverSetting() async {
+    final enabled = await SettingsRepository().getDynamicAlbumCover();
+    if (!mounted || enabled == _dynamicCoverEnabled) return;
+    setState(() => _dynamicCoverEnabled = enabled);
+  }
+
+  /// 刷新「界面设置」菜单里的动态封面开关与当前歌曲状态。
+  ///
+  /// 顺带重读开关值（用户可能刚在设置页改过），保证菜单与设置一致；
+  /// 状态优先用 [DynamicCoverService.lastKnownResult] 即时展示，
+  /// 未探测过才发一次请求，失败时显示「未获取到」而不是「无」。
+  Future<void> _refreshDyCoverMenuState() async {
+    final player = context.read<PlayerProvider>();
+    final song = player.currentSong;
+    final isOnline = song is Song && song.isOnline;
+    final albumAudioId = (song is Song ? song.albumAudioId : null) ?? '';
+
+    await _loadDynamicCoverSetting();
+    if (!mounted) return;
+
+    if (!isOnline || albumAudioId.isEmpty) {
+      _dyCoverStatus.value = dyCoverStatusText(
+        isOnline: false,
+        albumAudioId: '',
+        known: null,
+      );
+      return;
+    }
+
+    final known = DynamicCoverService.instance.lastKnownResult(albumAudioId);
+    if (known != null) {
+      _dyCoverStatus.value = dyCoverStatusText(
+        isOnline: true,
+        albumAudioId: albumAudioId,
+        known: known,
+      );
+      return;
+    }
+
+    _dyCoverStatus.value = dyCoverStatusText(
+      isOnline: true,
+      albumAudioId: albumAudioId,
+      known: null,
+      probing: true,
+    );
+    await DynamicCoverService.instance.hasDynamicCover(albumAudioId);
+    if (!mounted) return;
+    _dyCoverStatus.value = dyCoverStatusText(
+      isOnline: true,
+      albumAudioId: albumAudioId,
+      known: DynamicCoverService.instance.lastKnownResult(albumAudioId),
+    );
   }
 
   /// 从设置加载「长按封面进入 Zen 模式」开关。
@@ -817,6 +900,9 @@ class _FullPlayerState extends State<FullPlayer>
     // 切歌可能在本地/在线之间切换 → 评论 tab 有无随之变化；
     // 设置页改「关闭本地音乐评论区」也会经 PlayerProvider 通知走到这里。
     _syncTabLayout();
+    // 设置页可能改过动态封面开关 → 切歌时同步一次（幂等，值未变不触发重建）
+    // ignore: discarded_futures
+    _loadDynamicCoverSetting();
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     if (song != null && song.id != _lastSongId) {
@@ -840,6 +926,18 @@ class _FullPlayerState extends State<FullPlayer>
       if (idx > 0) _preloadArtwork(playlist[idx - 1].artworkUri);
       if (idx < playlist.length - 1)
         _preloadArtwork(playlist[idx + 1].artworkUri);
+    }
+    // 元数据补齐后的歌词强制重取：键含时长与专辑 id，富化回写（id 不变）
+    // 也会触发；首取时键未登记，靠首个 _fetchLyrics 调用处同步登记
+    if (song != null) {
+      final metadataKey =
+          '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
+      if (song.id == _lastSongId &&
+          _lastLyricMetadataKey.isNotEmpty &&
+          metadataKey != _lastLyricMetadataKey) {
+        _fetchLyrics(song);
+      }
+      if (song.id == _lastSongId) _lastLyricMetadataKey = metadataKey;
     }
     // 频谱启动：开启频谱且播放中时才启动（Visualizer(0) 需要活跃音频轨道）
     if (_spectrumEnabled && player.isPlaying && !_spectrumStarted) {
@@ -1095,6 +1193,12 @@ class _FullPlayerState extends State<FullPlayer>
   }
 
   Future<void> _fetchLyrics(dynamic song) async {
+    // 同步登记元数据键（含时长与专辑 id）：防止切歌分支绕过监听里的
+    // 键比对判定，同键不重取；取词失败时键已登记、与原 id 判重语义一致
+    if (song != null) {
+      _lastLyricMetadataKey =
+          '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
+    }
     final songId = song.id as String;
     if (songId == _lastSongId) return;
     _lastSongId = songId;
@@ -1102,12 +1206,17 @@ class _FullPlayerState extends State<FullPlayer>
     setState(() {
       _isLoadingLyrics = true;
       _lyrics = '';
+      _lyricMetadata = const [];
+      _hasTranslation = false;
+      _hasRoma = false;
     });
 
     try {
       String lyricText = '';
+      String? translationText;
+      String? romaText;
 
-      // 本地歌曲优先读取内嵌歌词（ID3 USLT / Vorbis LYRICS / MP4 ©lyr）
+      // 本地歌曲优先读取内嵌歌词（ID3 USLT / SYLT / Vorbis LYRICS / MP4 ©lyr）
       if (song is Song && !song.isOnline) {
         final localPath = song.localPath;
         if (localPath != null && localPath.isNotEmpty) {
@@ -1141,16 +1250,30 @@ class _FullPlayerState extends State<FullPlayer>
               lyric?.displayLrcLyric ??
               lyric?.displayLyric ??
               '';
+          translationText = lyric?.translatedContent;
+          romaText = lyric?.romaContent;
         }
       }
 
       if (mounted) {
+        final parsedLyrics = LyricParserChain.parse(
+          lyricText,
+          translationText: translationText,
+          romaText: romaText,
+        );
         setState(() {
           _isLoadingLyrics = false;
           // MD3 渲染器（LyricsView）内置的 LRC/KRC 正则无法解析 TTML 与
           // 增强型 LRC（尖括号逐字）。统一用 LyricParserChain 解析得到主歌词行，
           // 再序列化为标准 LRC 文本交给 LyricsView（保持其滚动/换行/点击逻辑不变）。
           _lyrics = _toLyricsViewText(lyricText);
+          _lyricMetadata = parsedLyrics;
+          _hasTranslation = parsedLyrics.any(
+            (line) => line.translation != null && line.translation!.isNotEmpty,
+          );
+          _hasRoma = parsedLyrics.any(
+            (line) => line.roma != null && line.roma!.isNotEmpty,
+          );
         });
       }
     } catch (e) {
@@ -1158,6 +1281,9 @@ class _FullPlayerState extends State<FullPlayer>
         setState(() {
           _isLoadingLyrics = false;
           _lyrics = '';
+          _lyricMetadata = const [];
+          _hasTranslation = false;
+          _hasRoma = false;
         });
       }
     }
@@ -1166,17 +1292,27 @@ class _FullPlayerState extends State<FullPlayer>
   /// 把原始歌词文本转换为 LyricsView 能识别的标准 LRC 行文本。
   ///
   /// LyricsView 内置的 LRC/KRC 正则无法解析 TTML（XML）与增强型 LRC（尖括号
-  /// `<mm:ss.xx>` 逐字）。这里用 LyricParserChain 统一解析，仅取主歌词行
+  /// `<mm:ss.xx>` / `<offset,duration,...>` 逐字）。这里用 LyricParserChain
+  /// 统一解析，仅取主歌词行
   /// （text + 行起始时间），序列化为 `[mm:ss.fff]主歌词` 文本交给 LyricsView，
   /// 保留其滚动、换行、点击跳转逻辑不变。
   /// 若 LyricsView 本身已能解析（普通 LRC / KRC），直接原样返回，避免任何行为变化。
   String _toLyricsViewText(String raw) {
     if (raw.trim().isEmpty) return raw;
     final format = LyricParserChain.detectFormat(raw);
-    // 增强型 LRC：行首 `[mm:ss]` 会误判为 lrc，但其尖括号 `<mm:ss.xx>` 逐字
-    // 时间戳 LyricsView 无法解析，仍需走统一解析转换为普通 LRC。
+    // 增强型 LRC：行首 `[mm:ss]` 会误判为 lrc，但其尖括号逐字时间戳无法由
+    // LyricsView 直接处理。MD3 不需要逐字动态效果，因此先剥离内层标签，
+    // 保留行首时间戳并转换为普通 LRC。
     if (_isEnhancedLrcText(raw)) {
-      return _serializeLines(LyricParserChain.parse(raw));
+      final normalized = raw.replaceAll(_inlineLyricTagRegex, '');
+      return _serializeLines(LyricParserChain.parse(normalized));
+    }
+    // 个别本地文件把 KRC 的 `<offset,duration,...>` 标签嵌在 LRC 行中。
+    // 这种混合格式会被自动检测为 LRC，必须先移除内层标签，否则它们会
+    // 被 LyricsView 当成正文显示。
+    if (format == LyricFormat.lrc && _krcWordTagRegex.hasMatch(raw)) {
+      final normalized = raw.replaceAll(_krcWordTagRegex, '');
+      return _serializeLines(LyricParserChain.parse(normalized));
     }
     // 普通 LRC / KRC 由 LyricsView 原生支持，原样透传
     if (format == LyricFormat.lrc || format == LyricFormat.krc) {
@@ -1185,9 +1321,14 @@ class _FullPlayerState extends State<FullPlayer>
     return _serializeLines(LyricParserChain.parse(raw));
   }
 
-  /// 检测文本是否为增强型 LRC（含尖括号逐字时间戳 `<mm:ss.xx>`）。
+  /// 增强型 LRC 的内层逐字时间标签，允许一位到三位分钟数。
   static final RegExp _angleTimeRegex =
-      RegExp(r'<\d{2}:\d{2}\.\d{2,3}>');
+      RegExp(r'<\d{1,3}:\d{2}\.\d{2,3}>');
+  static final RegExp _krcWordTagRegex =
+      RegExp(r'<-?\d+(?:,-?\d+)+>');
+  static final RegExp _inlineLyricTagRegex = RegExp(
+    r'<(?:\d{1,3}:\d{2}\.\d{2,3}|-?\d+(?:,-?\d+)+)>',
+  );
   static bool _isEnhancedLrcText(String raw) => _angleTimeRegex.hasMatch(raw);
 
   /// 把解析后的主歌词行序列化为 LyricsView 可识别的 `[mm:ss.fff]主歌词` 文本。
@@ -1313,6 +1454,9 @@ class _FullPlayerState extends State<FullPlayer>
         },
         child: Scaffold(
           backgroundColor: colorScheme.surface,
+          // 键盘弹出时不重排整页：评论托盘自己处理输入框抬升，
+          // 底部传输栏/导航条保持原位（否则打字时会被顶上去）
+          resizeToAvoidBottomInset: false,
           body: Stack(
             fit: StackFit.expand,
             children: [
@@ -1410,33 +1554,40 @@ class _FullPlayerState extends State<FullPlayer>
                 GestureDetector(
                   onTap: () => _tabController.animateTo(1),
                   behavior: HitTestBehavior.translucent,
-                  child: _isLoadingLyrics
-                      ? Center(
-                          child: M3ELoadingIndicator(
-                            color: colorScheme.primary,
+                  child: _wrapMd3LyricsWithAuxToggle(
+                    _isLoadingLyrics
+                        ? Center(
+                            child: M3ELoadingIndicator(
+                              color: colorScheme.primary,
+                            ),
+                          )
+                        // P0: 歌词时间只订阅 positionNotifier（高频 200ms），
+                        // 不再因 positionStream 触发整页重建
+                        : RepaintBoundary(
+                            child: LyricsView(
+                              lyrics: _lyrics,
+                              parsedLyrics: _lyricMetadata,
+                              position: Duration.zero,
+                              positionListenable:
+                                  playerProvider.positionNotifier,
+                              adaptPosition: (position) =>
+                                  _adjustedLyricPosition(position, currentSong),
+                              doubleTapToJump: lyricDoubleTap,
+                              onSeek: (duration) {
+                                playerProvider.seek(duration);
+                              },
+                            ),
                           ),
-                        )
-                      // P0: 歌词时间只订阅 positionNotifier（高频 200ms），
-                      // 不再因 positionStream 触发整页重建
-                      : RepaintBoundary(
-                          child: LyricsView(
-                            lyrics: _lyrics,
-                            position: Duration.zero,
-                            positionListenable: playerProvider.positionNotifier,
-                            adaptPosition: (position) =>
-                                _adjustedLyricPosition(position, currentSong),
-                            doubleTapToJump: lyricDoubleTap,
-                            onSeek: (duration) {
-                              playerProvider.seek(duration);
-                            },
-                          ),
-                        ),
+                  ),
                 ),
                 // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
                 if (_tabLayout.hasComments)
                   CommentsView(
                     songHash: currentSong.id,
                     albumAudioId: currentSong.albumAudioId,
+                    // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                    showComposer: false,
+                    onReplyComment: _openComposeSheet,
                   ),
               ],
             ),
@@ -1595,35 +1746,41 @@ class _FullPlayerState extends State<FullPlayer>
                           children: [
                             // 播放列表面板（index 0，最左侧，与 AM 一致）
                             const PlayerPlaylistView(useAmColors: false),
-                            _isLoadingLyrics
-                                ? Center(
-                                    child: M3ELoadingIndicator(
-                                      color: colorScheme.primary,
+                            _wrapMd3LyricsWithAuxToggle(
+                              _isLoadingLyrics
+                                  ? Center(
+                                      child: M3ELoadingIndicator(
+                                        color: colorScheme.primary,
+                                      ),
+                                    )
+                                  // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
+                                  : RepaintBoundary(
+                                      child: LyricsView(
+                                        lyrics: _lyrics,
+                                        parsedLyrics: _lyricMetadata,
+                                        position: Duration.zero,
+                                        positionListenable: playerProvider
+                                            .positionNotifier,
+                                        adaptPosition: (position) =>
+                                            _adjustedLyricPosition(
+                                              position,
+                                              currentSong,
+                                            ),
+                                        doubleTapToJump: lyricDoubleTap,
+                                        onSeek: (duration) {
+                                          playerProvider.seek(duration);
+                                        },
+                                      ),
                                     ),
-                                  )
-                                // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
-                                : RepaintBoundary(
-                                    child: LyricsView(
-                                      lyrics: _lyrics,
-                                      position: Duration.zero,
-                                      positionListenable: playerProvider
-                                          .positionNotifier,
-                                      adaptPosition: (position) =>
-                                          _adjustedLyricPosition(
-                                            position,
-                                            currentSong,
-                                          ),
-                                      doubleTapToJump: lyricDoubleTap,
-                                      onSeek: (duration) {
-                                        playerProvider.seek(duration);
-                                      },
-                                    ),
-                                  ),
+                            ),
                             // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
                             if (_tabLayout.hasComments)
                               CommentsView(
                                 songHash: currentSong.id,
                                 albumAudioId: currentSong.albumAudioId,
+                                // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                showComposer: false,
+                                onReplyComment: _openComposeSheet,
                               ),
                           ],
                         ),
@@ -1783,35 +1940,41 @@ class _FullPlayerState extends State<FullPlayer>
                           children: [
                             // 播放列表面板（index 0，最左侧，与 AM 一致）
                             const PlayerPlaylistView(useAmColors: false),
-                            _isLoadingLyrics
-                                ? Center(
-                                    child: M3ELoadingIndicator(
-                                      color: colorScheme.primary,
+                            _wrapMd3LyricsWithAuxToggle(
+                              _isLoadingLyrics
+                                  ? Center(
+                                      child: M3ELoadingIndicator(
+                                        color: colorScheme.primary,
+                                      ),
+                                    )
+                                  // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
+                                  : RepaintBoundary(
+                                      child: LyricsView(
+                                        lyrics: _lyrics,
+                                        parsedLyrics: _lyricMetadata,
+                                        position: Duration.zero,
+                                        positionListenable: playerProvider
+                                            .positionNotifier,
+                                        adaptPosition: (position) =>
+                                            _adjustedLyricPosition(
+                                              position,
+                                              currentSong,
+                                            ),
+                                        doubleTapToJump: lyricDoubleTap,
+                                        onSeek: (duration) {
+                                          playerProvider.seek(duration);
+                                        },
+                                      ),
                                     ),
-                                  )
-                                // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
-                                : RepaintBoundary(
-                                    child: LyricsView(
-                                      lyrics: _lyrics,
-                                      position: Duration.zero,
-                                      positionListenable: playerProvider
-                                          .positionNotifier,
-                                      adaptPosition: (position) =>
-                                          _adjustedLyricPosition(
-                                            position,
-                                            currentSong,
-                                          ),
-                                      doubleTapToJump: lyricDoubleTap,
-                                      onSeek: (duration) {
-                                        playerProvider.seek(duration);
-                                      },
-                                    ),
-                                  ),
+                            ),
                             // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
                             if (_tabLayout.hasComments)
                               CommentsView(
                                 songHash: currentSong.id,
                                 albumAudioId: currentSong.albumAudioId,
+                                // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                showComposer: false,
+                                onReplyComment: _openComposeSheet,
                               ),
                           ],
                         ),
@@ -1872,6 +2035,8 @@ class _FullPlayerState extends State<FullPlayer>
                 onPressed: _collapseByButton,
               ),
             const Spacer(),
+            // 一起听胶囊：在房间中时显示人数（1/5），点击进入/返回房间页
+            const ListenTogetherPill(),
             // MD3E v2: 顶部栏右侧 FLAC 质量徽章，点击复用 _showQualityDialog
             _buildQualityPill(playerProvider),
             // 睡眠药丸：只订阅剩余时间独立通道，每秒走字不再触发整页重建
@@ -1958,11 +2123,25 @@ class _FullPlayerState extends State<FullPlayer>
     }
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
-      child: _buildCrossfadeArtwork(
-        currentSong.artworkUri,
-        colorScheme,
-        iconSize: iconSize,
-        fallbackFilePath: currentSong.localPath,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 静态封面（原有淡入淡出逻辑保持不变）
+          _buildCrossfadeArtwork(
+            currentSong.artworkUri,
+            colorScheme,
+            iconSize: iconSize,
+            fallbackFilePath: currentSong.localPath,
+          ),
+          // 动态封面层：视频就绪后淡入覆盖；无动态封面 / 开关关闭 /
+          // 网络不满足 / 加载失败时该层为空，静态封面完全不受影响。
+          // 频谱模式（style 0/1）在上方已提前 return SpectrumArtwork，不会走到这里。
+          if (currentSong is Song && currentSong.isOnline)
+            DynamicCoverView(
+              song: currentSong,
+              enabled: _dynamicCoverEnabled,
+            ),
+        ],
       ),
     );
   }
@@ -2185,6 +2364,8 @@ class _FullPlayerState extends State<FullPlayer>
     ColorScheme colorScheme,
   ) {
     final song = playerProvider.currentSong;
+    // 一起听听众端：进度条可拖动，拖动即进入脱离态（本地自由播放），
+    // 恢复跟随走房间页中央按钮 / 广场横幅（见 RoomSession.detachBySeek）。
     return PlayerSeekBar(
       position: position,
       duration: duration,
@@ -2205,7 +2386,9 @@ class _FullPlayerState extends State<FullPlayer>
       },
       onSeekEnd: (value) async {
         AppHaptics.tick();
-        await playerProvider.seek(value);
+        // forceNotify：松手是用户显式动作，远端纠偏的抑制窗口不得吞掉通告
+        // （否则听众的「拖动即脱离」会被静默吞掉并被纠偏拉回）
+        await playerProvider.seek(value, forceNotify: true);
         if (_wasPlayingBeforeDrag) {
           playerProvider.resume();
         }
@@ -2398,9 +2581,24 @@ class _FullPlayerState extends State<FullPlayer>
           onLongPress: _toggleDesktopLyric,
         ),
         if (_tabLayout.hasComments)
-          const PlayerTabItem(icon: Icons.comment_outlined),
+          PlayerTabItem(
+            icon: Icons.comment_outlined,
+            // 长按评论段：切到评论 tab 并拉起输入框（界面上没有常驻入口）
+            onLongPress: () => _openComposeSheet(),
+          ),
       ],
     );
+  }
+
+  /// 长按评论段：弹出仅含输入框的评论托盘（主题色设计，不显示评论列表）。
+  ///
+  /// [replyTo] 非空表示由评论项「回复」进入，发送的是该评论下的楼层回复。
+  /// 播放器内不驻留任何输入控件。
+  void _openComposeSheet([CommentReplyTarget? target]) {
+    HapticFeedback.lightImpact();
+    final song = context.read<PlayerProvider>().currentSong;
+    if (song == null) return;
+    showCommentComposeSheet(context, song: song, target: target);
   }
 
   /// 长按歌词段：开关桌面歌词，并同步通知栏的「桌面歌词」按钮状态。
@@ -2813,6 +3011,7 @@ class _FullPlayerState extends State<FullPlayer>
                             icon: Icons.graphic_eq,
                             label: '均衡器',
                             active: eq.enabled,
+                            enabled: !eq.systemEffectsDisabled,
                             onTap: () {
                               Navigator.pop(sheetContext);
                               _pageNavigator(rootContext)?.push(
@@ -2824,16 +3023,23 @@ class _FullPlayerState extends State<FullPlayer>
                           );
                         },
                       ),
-                      MenuActionCell(
-                        icon: Icons.spatial_audio_off,
-                        label: '音效',
-                        active: false,
-                        onTap: () {
-                          Navigator.pop(sheetContext);
-                          _pageNavigator(rootContext)?.push(
-                            MaterialPageRoute(
-                              builder: (_) => const SoundsPage(),
-                            ),
+                      ListenableBuilder(
+                        listenable: EqualizerService.instance,
+                        builder: (context, _) {
+                          final eq = EqualizerService.instance;
+                          return MenuActionCell(
+                            icon: Icons.spatial_audio_off,
+                            label: '音效',
+                            active: false,
+                            enabled: !eq.systemEffectsDisabled,
+                            onTap: () {
+                              Navigator.pop(sheetContext);
+                              _pageNavigator(rootContext)?.push(
+                                MaterialPageRoute(
+                                  builder: (_) => const SoundsPage(),
+                                ),
+                              );
+                            },
                           );
                         },
                       ),
@@ -2871,6 +3077,9 @@ class _FullPlayerState extends State<FullPlayer>
                   trailing: const Icon(Icons.chevron_right),
                   onTap: () {
                     Navigator.pop(sheetContext);
+                    // 打开二级菜单前刷新动态封面开关与当前歌曲状态
+                    // ignore: discarded_futures
+                    _refreshDyCoverMenuState();
                     _showMoreSettingsSheet(rootContext);
                   },
                 ),
@@ -2968,6 +3177,36 @@ class _FullPlayerState extends State<FullPlayer>
                       _toggleSpectrum();
                     },
                   ),
+                // 专辑动态封面：开关（与设置页「播放页样式」联动，关闭即时生效）
+                // + 当前歌曲是否有动态封面的状态
+                ValueListenableBuilder<String?>(
+                  valueListenable: _dyCoverStatus,
+                  builder: (context, status, _) => Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SwitchListTile(
+                        title: const Text('专辑动态封面'),
+                        subtitle: const Text('封面播放专辑动态封面短视频'),
+                        value: _dynamicCoverEnabled,
+                        onChanged: (v) {
+                          HapticFeedback.lightImpact();
+                          setState(() => _dynamicCoverEnabled = v);
+                          // ignore: discarded_futures
+                          SettingsRepository().setDynamicAlbumCover(v);
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.album_outlined),
+                        title: const Text('当前歌曲动态封面'),
+                        trailing: Text(
+                          status ?? '检测中…',
+                          style: Theme.of(sheetContext).textTheme.bodyMedium
+                              ?.copyWith(color: colorScheme.primary),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
           ),
@@ -3373,6 +3612,89 @@ class _FullPlayerState extends State<FullPlayer>
       isScrollControlled: true,
       builder: (context) => const DlnaCastSheet(),
     );
+  }
+
+  Widget _wrapMd3LyricsWithAuxToggle(Widget child) {
+    return Stack(
+      children: [
+        Positioned.fill(child: child),
+        Positioned(
+          right: 8,
+          bottom: 4,
+          child: ListenableBuilder(
+            listenable: Md3LyricPreferences.instance,
+            builder: (context, _) {
+              if (_zenMode || (!_hasTranslation && !_hasRoma)) {
+                return const SizedBox.shrink();
+              }
+              final prefs = Md3LyricPreferences.instance;
+              final mode = _effectiveMd3DisplayMode(prefs);
+              final on = prefs.showAuxiliary;
+              return InkWell(
+                onTap: () => prefs.setShowAuxiliary(!on),
+                onLongPress: _switchMd3LyricSubLineMode,
+                customBorder: const CircleBorder(),
+                child: SizedBox(
+                  width: 48,
+                  height: 48,
+                  child: Center(
+                    child: Icon(
+                      mode == Md3LyricDisplayMode.roma
+                          ? Icons.abc
+                          : Icons.translate,
+                      size: 20,
+                      color: on
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant
+                                .withValues(alpha: 0.45),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Md3LyricDisplayMode _effectiveMd3DisplayMode(
+    Md3LyricPreferences prefs,
+  ) {
+    final preferred = prefs.displayMode;
+    if (preferred == Md3LyricDisplayMode.translation && _hasTranslation) {
+      return preferred;
+    }
+    if (preferred == Md3LyricDisplayMode.roma && _hasRoma) {
+      return preferred;
+    }
+    return _hasTranslation
+        ? Md3LyricDisplayMode.translation
+        : Md3LyricDisplayMode.roma;
+  }
+
+  void _switchMd3LyricSubLineMode() {
+    HapticFeedback.lightImpact();
+    final prefs = Md3LyricPreferences.instance;
+    final current = _effectiveMd3DisplayMode(prefs);
+    final next = current == Md3LyricDisplayMode.translation
+        ? Md3LyricDisplayMode.roma
+        : Md3LyricDisplayMode.translation;
+    if (next == Md3LyricDisplayMode.roma && !_hasRoma) {
+      showToast('当前歌曲暂无罗马音');
+      return;
+    }
+    if (next == Md3LyricDisplayMode.translation && !_hasTranslation) {
+      showToast('当前歌曲暂无翻译');
+      return;
+    }
+    if (!prefs.showAuxiliary) {
+      prefs.setShowAuxiliary(true);
+    }
+    prefs.setDisplayMode(next);
+    showToast(next == Md3LyricDisplayMode.roma ? '已切换到罗马音' : '已切换到翻译');
   }
 
   /// 弹出 MD3 风格播放页的歌词显示设置面板（字号/行间距/字体）。

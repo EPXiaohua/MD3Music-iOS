@@ -6,7 +6,7 @@
 /// 3. 重绘通过 ValueNotifier 驱动（不依赖 setState）
 library;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/playing_spectrum_indicator.dart';
 

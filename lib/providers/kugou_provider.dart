@@ -160,7 +160,7 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? _fmData;
   Map<String, dynamic>? _sheetData;
   Map<String, dynamic>? _everydayHistory;
-  Map<String, dynamic>? _topAlbumData;
+  List<KugouAlbumBrief> _topAlbums = [];
   Map<String, dynamic>? _topSongData;
   KugouUserVipDetail? _vipInfo;
   KugouGradeInfo? _gradeInfo;
@@ -340,7 +340,7 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? get fmData => _fmData;
   Map<String, dynamic>? get sheetData => _sheetData;
   Map<String, dynamic>? get everydayHistory => _everydayHistory;
-  Map<String, dynamic>? get topAlbumData => _topAlbumData;
+  List<KugouAlbumBrief> get topAlbums => _topAlbums;
   Map<String, dynamic>? get topSongData => _topSongData;
   KugouUserVipDetail? get vipInfo => _vipInfo;
   KugouGradeInfo? get gradeInfo => _gradeInfo;
@@ -2094,11 +2094,31 @@ class KugouProvider extends ChangeNotifier {
 
   // ==================== Top (排行) ====================
 
-  Future<void> getTopAlbum({int page = 1}) async {
+  Future<void> getTopAlbum({int page = 1, bool forceRefresh = false}) async {
+    if (!forceRefresh && _isDataFresh('topAlbum')) return;
     try {
       final r = await _apiClient.getTopAlbum(page: page);
       if (r != null) {
-        _topAlbumData = r;
+        final data = r['data'] as Map<String, dynamic>? ?? r;
+        // 上游真实结构（2026-09-19 真机取证）：分语种桶 chn/eur/jpn/kor，
+        // 每桶 3 条、不受 pagesize 影响；无统一 list 字段，故按桶合并。
+        // list/albums/info 作为兜底链保留，防上游改版回统一列表。
+        final primary = data['list'] ?? data['albums'] ?? data['info'];
+        final List<dynamic> list;
+        if (primary is List && primary.isNotEmpty) {
+          list = primary;
+        } else {
+          list = [
+            for (final key in const ['chn', 'eur', 'jpn', 'kor'])
+              if (data[key] is List) ...(data[key] as List),
+          ];
+        }
+        _topAlbums = list
+            .whereType<Map<String, dynamic>>()
+            .map(KugouAlbumBrief.fromJson)
+            .where((a) => a.id.isNotEmpty && a.name.isNotEmpty)
+            .toList();
+        _dataTimestamps['topAlbum'] = DateTime.now();
         notifyListeners();
       }
     } catch (_) {}

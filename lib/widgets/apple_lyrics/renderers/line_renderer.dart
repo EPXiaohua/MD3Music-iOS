@@ -209,7 +209,7 @@ class LineRenderer {
   ///
   /// [isActive] 为 true 时整行高亮（alpha 目标 dynamicBrightAlpha），
   /// 为 false 时整行 SOLID 暗态（alpha 目标 dynamicDarkAlpha）。
-  /// [scale] 是行缩放，0.97（inactive）~1.0（active）。
+  /// [scale] 是行缩放，0.850（inactive）~1.0（active）。
   /// [blurFade] 控制非当前行透明度：1.0=透明（模糊图片覆盖），0.0=正常显示。
   /// [blurActive] 是否启用高斯模糊：false 时不降低非当前行透明度。
   ///

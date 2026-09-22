@@ -1,5 +1,14 @@
+import 'dart:async';
+import 'dart:io' show Directory;
+
 import 'package:chewie/chewie.dart';
-import 'package:flutter/material.dart';
+// chewie 未公开导出 PlayerNotifier（只在内部子树提供）。页面按钮组要与进度条
+// 同步显隐，必须拿到这个 notifier —— 详见 _buildControlsBridge 的注释。
+// 刻意引用内部路径：公开 API 拿不到该状态，重复实现计时器会与进度条漂移。
+// ignore: implementation_imports
+import 'package:chewie/src/notifiers/player_notifier.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
@@ -14,7 +23,19 @@ import '../../data/repositories/settings_repository.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/dlna_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
+import '../../utils/landscape_immersive.dart';
 import 'dlna_cast_sheet.dart';
+
+import 'package:canvas_danmaku/canvas_danmaku.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../../core/danmaku/danmaku_entry.dart';
+import '../../core/danmaku/danmaku_render_mapping.dart';
+import '../../core/danmaku/danmaku_source.dart';
+import '../../core/danmaku/local_danmaku_store.dart';
+import '../../core/danmaku/video_barrage_mapper.dart';
+import '../../widgets/danmaku/mv_danmaku_layer.dart';
+import 'widgets/mv_danmaku_input_bar.dart';
 
 /// MV 播放页：展示歌曲 MV 视频，支持清晰度切换。
 ///
@@ -57,15 +78,51 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   bool _disposed = false;
 
   /// 当前设备是否支持画中画（Android 8.0+），决定是否显示画中画按钮。
-  bool _pipSupported = false;
+  /// 设备是否支持画中画（浮层按钮需响应式，故用 ValueNotifier）。
+  final ValueNotifier<bool> _pipSupported = ValueNotifier<bool>(false);
 
   /// 设置开关：是否按 Home 自动进入画中画（默认关闭，手动按钮不受影响）。
   bool _autoPipEnabled = false;
 
-  /// Chewie 的 GlobalKey：横竖屏切换时页面在 Row/ListView 两套布局间切换，
-  /// 会导致 Chewie Element 重建、内建全屏状态（_isFullScreen）被重置，
-  /// 全屏返回箭头因此失效。GlobalKey 保证重挂载时复用同一 State。
-  final GlobalKey _chewieKey = GlobalKey();
+  /// 当前 MV 的弹幕列表。**只在加载完成时赋值一次** ——
+  /// 用户新发送的弹幕直接投给渲染器，不回写此列表，避免时间轴重建导致炸屏。
+  List<DanmakuEntry> _danmakuEntries = const [];
+
+  /// 弹幕开关（读取自设置，默认关闭）。
+  /// 弹幕开关（浮层按钮需响应式，故用 ValueNotifier）。
+  final ValueNotifier<bool> _danmakuEnabled = ValueNotifier<bool>(false);
+
+  /// 弹幕总透明度（读取自设置，默认 1.0）。
+  double _danmakuOpacity = 1.0;
+
+  /// 本地弹幕仓储，用于持久化用户发送的弹幕。
+  LocalDanmakuStore? _danmakuStore;
+
+  /// 弹幕渲染器，页面直接投递「自己刚发送」的弹幕。
+  DanmakuController<String>? _danmakuController;
+
+  /// 当前视频的弹幕 key，用于本地弹幕分区（优先 videoId，回退 hash / songId）。
+  String? _danmakuKey;
+
+  /// 本地弹幕 id 自增序号：同毫秒内连续发送两条弹幕时保证 id 唯一。
+  int _danmakuSeq = 0;
+
+  /// 页面级全屏状态。
+  ///
+  /// 不用 Chewie 内置全屏：它把播放器 push 进独立路由，弹幕层不会跟进去，
+  /// 真机表现为「全屏看不到弹幕」。自建全屏让视频与弹幕层始终同子树。
+  /// 页面级全屏状态（浮层按钮需响应式，故用 ValueNotifier）。
+  final ValueNotifier<bool> _isFullscreen = ValueNotifier<bool>(false);
+
+  /// 浮层按钮组「已挂载」一次性日志标记（见 [_buildControlsBridge]）。
+  bool _overlayMountedLogged = false;
+
+  /// Chewie 控件是否已隐藏（由 [_buildControlsBridge] 从 Chewie 内部桥接出来）。
+  /// 页面按钮组据此与进度条同步显隐。
+  final ValueNotifier<bool> _controlsHidden = ValueNotifier<bool>(false);
+
+  /// 弹幕远端发送在途中：用于禁用发送按钮防连点。
+  bool _danmakuSending = false;
 
   @override
   void initState() {
@@ -83,7 +140,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     PipService.instance.isPipMode.addListener(_onPipModeChanged);
     PipService.instance.isSupported().then((supported) {
       if (!mounted) return;
-      setState(() => _pipSupported = supported);
+      setState(() => _pipSupported.value = supported);
     });
     // 读取「自动画中画」开关：决定按 Home 是否自动进入（默认关闭）
     SettingsRepository().getAutoPipEnabled().then((enabled) {
@@ -93,6 +150,15 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     });
     // USB 独占开启时 MV 无系统音频：若开启「播放 MV 时自动关闭独占」则进入即关闭
     _maybeAutoDisableUsbExclusive();
+    // 读取弹幕开关与透明度：默认关闭 / 1.0（与官方 App 一致）
+    SettingsRepository().getMvDanmakuEnabled().then((enabled) {
+      if (!mounted) return;
+      setState(() => _danmakuEnabled.value = enabled);
+    });
+    SettingsRepository().getMvDanmakuOpacity().then((opacity) {
+      if (!mounted) return;
+      setState(() => _danmakuOpacity = opacity);
+    });
     _loadMv();
   }
 
@@ -120,6 +186,16 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     PipService.instance.isPipMode.removeListener(_onPipModeChanged);
     PipService.instance.setVideoActive(false);
     WakelockService.instance.setVideoPlaying(false);
+    // 全屏状态下直接退出页面：必须清沉浸标志、恢复旋转与系统栏，否则会残留
+    if (_isFullscreen.value) {
+      SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      kPlayerLandscapeImmersiveActive.value = false;
+      restoreSystemUi();
+    }
+    _danmakuEnabled.dispose();
+    _isFullscreen.dispose();
+    _pipSupported.dispose();
+    _controlsHidden.dispose();
     _chewieController?.dispose();
     _controller?.dispose();
     // 恢复背景音频（仅当进入前正在播放）
@@ -167,9 +243,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     final aspectRatio = controller?.value.aspectRatio;
     PipService.instance.setVideoActive(
       _autoPipEnabled && playing,
-      aspectRatio: (aspectRatio != null && aspectRatio > 0)
-          ? aspectRatio
-          : null,
+      aspectRatio: (aspectRatio != null && aspectRatio > 0) ? aspectRatio : null,
     );
   }
 
@@ -199,6 +273,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     // 直接播放模式：已有播放地址（场景音乐视频等），无需 MV 查询链
     final direct = widget.directVideoUrl;
     if (direct != null && direct.isNotEmpty) {
+      // 直链场景没有 mvId，用歌曲身份做 key（Song.id 非空，见 data/models/song.dart:28）。
+      // 不能用 URL 做 key：酷狗视频 URL 带时效签名参数，每次请求都不同，
+      // 即使 hash 稳定也永远无法跨会话命中。
+      await _loadDanmaku('song:${widget.song.id}');
       await _initVideoController(direct, autoPlay: true);
       return;
     }
@@ -258,14 +336,216 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       return;
     }
 
-    // 4. 初始化视频控制器
+    // 4. 加载本地弹幕（优先用 videoId 分区，无 videoId 时回退视频 hash），
+    //    再初始化视频控制器
+    await _loadDanmaku(
+      (mvId != null && mvId.isNotEmpty) ? 'mv:$mvId' : 'hash:$firstHash',
+    );
     await _initVideoController(url, autoPlay: true);
   }
 
-  Future<void> _initVideoController(
-    String url, {
-    required bool autoPlay,
-  }) async {
+  /// 加载当前 MV 的本地弹幕。弹幕加载失败不得影响播放。
+  ///
+  /// [key] 必须是**内容身份**（`mv:<videoId>` / `hash:<hash>` / `song:<songId>`），
+  /// 不能用播放 URL —— 酷狗视频 URL 带时效签名参数，每次请求都不同。
+  Future<void> _loadDanmaku(String key) async {
+    _danmakuKey = key;
+    try {
+      final supportDir = await getApplicationSupportDirectory();
+      final store = LocalDanmakuStore(
+        root: Directory('${supportDir.path}/danmaku'),
+      );
+      _danmakuStore = store;
+      final entries = await LocalDanmakuSource(store: store, key: key).load();
+      if (_disposed) return;
+      setState(() => _danmakuEntries = entries);
+    } catch (e) {
+      debugPrint('[MvDanmaku] 加载本地弹幕失败：$e');
+    }
+  }
+
+  /// 发送一条弹幕：立即投给渲染器（不等时间轴），并异步落盘。
+  Future<void> _sendDanmaku(String text) async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    final position = controller.value.position;
+    _danmakuSeq++;
+    final entry = DanmakuEntry(
+      time: position,
+      text: text,
+      colorValue: 0xFFFFFF,
+      mode: DanmakuMode.scroll,
+      // 毫秒时间戳在同毫秒内会重复，叠加自增序号保证唯一
+      id: 'local-${DateTime.now().microsecondsSinceEpoch}-$_danmakuSeq',
+      selfSend: true,
+    );
+
+    // ① 立即显示：直接投递，绕开时间轴（本次播放立即可见）。
+    //    **不要调用 resume()**：暂停时发送的弹幕应冻结在原地，
+    //    播放/暂停统一由 MvDanmakuLayer._onFrame 按视频状态管理。
+    _danmakuController?.addDanmaku(toContentItem(entry));
+
+    // ② 落盘：下次进入该视频时由 MvDanmakuLayer 内的 DanmakuBuckets 正常回放
+    final store = _danmakuStore;
+    final key = _danmakuKey;
+    if (store != null && key != null) {
+      try {
+        await store.append(key, entry);
+      } catch (e) {
+        debugPrint('[MvDanmaku] 保存弹幕失败：$e');
+      }
+    }
+
+    // ③ 远端：登录态下同步发布到 MV 弹幕池（失败不回滚本地）
+    await _sendRemoteDanmaku(text);
+  }
+
+  /// 把弹幕同步发布到远端 MV 弹幕池。
+  ///
+  /// - 仅 `mv:` / `hash:` 两种 key 可发布（直链场景没有 video_id/hash）；
+  /// - 未登录直接提示返回，不发请求；
+  /// - **不自动重试**；在途时禁用发送按钮（`_danmakuSending`）；
+  /// - 失败只提示 + 打日志，本地已上屏的弹幕保持不变。
+  Future<void> _sendRemoteDanmaku(String text) async {
+    if (_danmakuSending) return;
+
+    final key = _danmakuKey;
+    String? videoId;
+    String? hash;
+    if (key != null && key.startsWith('mv:')) {
+      videoId = key.substring(3);
+    } else if (key != null && key.startsWith('hash:')) {
+      hash = key.substring(5);
+    } else {
+      // 直链场景（song:）没有 video_id/hash，仅本地可见
+      return;
+    }
+
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) {
+      if (mounted) showToast('发送弹幕需要先登录');
+      return;
+    }
+
+    if (mounted) setState(() => _danmakuSending = true);
+    try {
+      final res = await api.sendVideoBarrage(
+        content: text,
+        videoId: videoId,
+        hash: hash,
+        name: widget.song.displayName,
+      );
+      // 判据未经真实发布验证：上游业务错误会以 502 + 保留 JSON 返回，
+      // 因此必须看 status / err_code，而不是只看 null。
+      final ok = res != null && (res['status'] == 1 || res['err_code'] == 0);
+      debugPrint(
+        '[MvDanmaku] 远端发送${ok ? '成功' : '失败'} '
+        'status=${res?['status']} err_code=${res?['err_code'] ?? res?['error_code']}',
+      );
+      if (!ok && mounted) {
+        showToast('弹幕发送失败（已在本地显示）', long: true);
+      }
+    } catch (e) {
+      // 不重试：写操作重试可能重复发布
+      debugPrint('[MvDanmaku] 远端发送异常：$e');
+      if (mounted) showToast('弹幕发送失败（已在本地显示）', long: true);
+    } finally {
+      if (mounted) setState(() => _danmakuSending = false);
+    }
+  }
+
+  /// 页内切换弹幕开关：即时生效 + 持久化到设置页同一开关。
+  ///
+  /// 官方 App 的 MV 弹幕默认关闭，若只依赖设置页入口，用户在播放页会
+  /// 「找不到开启方式」（真实反馈）。因此播放页必须自带开关。
+  Future<void> _toggleDanmaku() async {
+    final next = !_danmakuEnabled.value;
+    setState(() => _danmakuEnabled.value = next);
+    try {
+      await SettingsRepository().setMvDanmakuEnabled(next);
+    } catch (e) {
+      debugPrint('[MvDanmaku] 保存弹幕开关失败：$e');
+    }
+    // 首次加载时弹幕若处于关闭态，远端弹幕会被跳过；此处开启后补拉一次
+    // （合并按文本去重，重复调用安全）。
+    if (next) unawaited(_loadRemoteDanmaku());
+  }
+
+  /// 加载远端官方 MV 弹幕（酷狗 MV 弹幕池）。**失败一律静默**，不影响播放。
+  ///
+  /// 上游弹幕池底层是评论池、条目没有时间字段，因此需要视频时长来合成时间轴：
+  /// 优先用 `/video/detail` 的时长，直链场景回退到视频控制器上报的时长。
+  /// 弹幕开关关闭时不发请求（省流量）。
+  Future<void> _loadRemoteDanmaku() async {
+    final key = _danmakuKey;
+    final controller = _controller;
+    if (key == null || controller == null) return;
+
+    try {
+      if (!await SettingsRepository().getMvDanmakuEnabled()) return;
+    } catch (_) {
+      return;
+    }
+
+    // 只有 mv:（videoId）与 hash: 两种 key 能查远端；直链场景（song:）没有 video_id/hash
+    String? videoId;
+    String? hash;
+    if (key.startsWith('mv:')) {
+      videoId = key.substring(3);
+    } else if (key.startsWith('hash:')) {
+      hash = key.substring(5);
+    } else {
+      return;
+    }
+    if ((videoId == null || videoId.isEmpty) && (hash == null || hash.isEmpty)) return;
+
+    final duration = _detail?.duration ?? controller.value.duration;
+    if (duration <= Duration.zero) {
+      debugPrint('[MvDanmaku] 远端弹幕跳过：无法确定视频时长');
+      return;
+    }
+
+    List<DanmakuEntry> remote = const [];
+    try {
+      remote = await KugouDanmakuSource(
+        idOrHash: videoId ?? hash!,
+        duration: duration,
+        fetch: (idOrHash, dur) async {
+          final raw = await KugouApiClient().getVideoBarrage(
+            videoId: videoId,
+            hash: hash,
+            pagesize: 100,
+          );
+          if (raw == null) return null;
+          return mapVideoBarrage(raw, videoDuration: dur);
+        },
+      ).load();
+    } catch (e) {
+      debugPrint('[MvDanmaku] 远端弹幕获取失败：$e');
+      return;
+    }
+    if (_disposed || remote.isEmpty) {
+      debugPrint('[MvDanmaku] 远端弹幕为空（${videoId ?? hash}）');
+      return;
+    }
+
+    // 合并本地 + 远端：按文本去重（同一文本保留自己发送的那条），按时间升序
+    final byText = <String, DanmakuEntry>{};
+    for (final entry in [...remote, ..._danmakuEntries]) {
+      final existing = byText[entry.text];
+      if (existing == null) {
+        byText[entry.text] = entry;
+      } else if (entry.selfSend && !existing.selfSend) {
+        byText[entry.text] = entry;
+      }
+    }
+    final merged = byText.values.toList()
+      ..sort((a, b) => a.time.compareTo(b.time));
+    debugPrint('[MvDanmaku] 远端弹幕 ${remote.length} 条，合并后 ${merged.length} 条');
+    setState(() => _danmakuEntries = merged);
+  }
+
+  Future<void> _initVideoController(String url, {required bool autoPlay}) async {
     _currentVideoUrl = url;
     try {
       final controller = VideoPlayerController.networkUrl(Uri.parse(url));
@@ -280,6 +560,12 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         looping: false,
         showControls: true,
         showOptions: false,
+        // 关闭 Chewie 内置全屏：它会把播放器 push 进**独立路由**，
+        // 而弹幕层是页面 Stack 的兄弟节点、不会跟进去 → 全屏看不到弹幕。
+        // 改用页面级自建全屏（见 _buildFullscreenBody）。
+        allowFullScreen: false,
+        // 显隐桥接：把 Chewie 内部 hideStuff 传出给页面按钮组（见 _buildControlsBridge）
+        overlay: _buildControlsBridge(),
       );
       setState(() {
         _controller = controller;
@@ -288,6 +574,8 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       });
       controller.addListener(_onVideoStateChanged);
       _onVideoStateChanged();
+      // 远端官方弹幕：控制器就绪后拉一次（失败静默，不影响播放）
+      unawaited(_loadRemoteDanmaku());
     } catch (e) {
       if (_disposed) return;
       setState(() {
@@ -341,6 +629,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         looping: false,
         showControls: true,
         showOptions: false,
+        // 同 _initVideoController：全屏改由页面自建（弹幕层需在同一棵子树内）
+        allowFullScreen: false,
+        // 切清晰度会重建控制器，桥接与按钮组行为与初次加载一致
+        overlay: _buildControlsBridge(),
       );
       if (_disposed) {
         controller.dispose();
@@ -368,39 +660,51 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     if (_qualities.isEmpty) return;
     showModalBottomSheet(
       context: context,
+      // 横屏可用高度很小：默认的半屏上限装不下「标题 + 多档清晰度」，
+      // Column 会报 bottom overflowed。因此放开高度限制 + 内容可滚动 + 限高。
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text('清晰度', style: Theme.of(ctx).textTheme.titleMedium),
-              ),
-            ),
-            const Divider(height: 1),
-            ...List.generate(_qualities.length, (i) {
-              final q = _qualities[i];
-              final selected = i == _currentQualityIndex;
-              return ListTile(
-                leading: Icon(
-                  selected ? Icons.check_circle : Icons.movie_outlined,
-                  color: selected
-                      ? Theme.of(ctx).colorScheme.primary
-                      : Theme.of(ctx).colorScheme.onSurfaceVariant,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(ctx).height * 0.8,
+          ),
+          child: ListView(
+            shrinkWrap: true,
+            padding: EdgeInsets.zero,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '清晰度',
+                    style: Theme.of(ctx).textTheme.titleMedium,
+                  ),
                 ),
-                title: Text(q.quality),
-                subtitle: Text(q.resolutionLabel),
-                selected: selected,
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _switchQuality(i);
-                },
-              );
-            }),
-            const SizedBox(height: 8),
-          ],
+              ),
+              const Divider(height: 1),
+              ...List.generate(_qualities.length, (i) {
+                final q = _qualities[i];
+                final selected = i == _currentQualityIndex;
+                return ListTile(
+                  leading: Icon(
+                    selected ? Icons.check_circle : Icons.movie_outlined,
+                    color: selected
+                        ? Theme.of(ctx).colorScheme.primary
+                        : Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+                  title: Text(q.quality),
+                  subtitle: Text(q.resolutionLabel),
+                  selected: selected,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _switchQuality(i);
+                  },
+                );
+              }),
+              const SizedBox(height: 8),
+            ],
+          ),
         ),
       ),
     );
@@ -411,6 +715,17 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     // 画中画模式：只渲染纯视频（隐藏 AppBar 与其余 UI），窗口比例即视频比例
     if (PipService.instance.isPipMode.value) {
       return _buildPipBody();
+    }
+    // 页面级全屏：只渲染视频 + 弹幕层（弹幕在同一棵子树内，全屏可见）
+    if (_isFullscreen.value) {
+      // 全屏时系统返回键**先退出全屏**，而不是直接 pop 掉整个 MV 播放页
+      return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) _exitFullscreen(fromBack: true);
+        },
+        child: _buildFullscreenBody(),
+      );
     }
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
@@ -438,10 +753,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         children: [
           const M3ELoadingIndicator(),
           const SizedBox(height: 16),
-          Text(
-            '正在加载 MV...',
-            style: TextStyle(color: colorScheme.onSurfaceVariant),
-          ),
+          Text('正在加载 MV...', style: TextStyle(color: colorScheme.onSurfaceVariant)),
         ],
       ),
     );
@@ -454,19 +766,13 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              Icons.music_off_outlined,
-              size: 64,
-              color: colorScheme.onSurfaceVariant,
-            ),
+            Icon(Icons.music_off_outlined, size: 64, color: colorScheme.onSurfaceVariant),
             const SizedBox(height: 16),
             Text('该歌曲暂无 MV', style: textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               '没有找到这首歌的 MV 资源',
-              style: textTheme.bodySmall?.copyWith(
-                color: colorScheme.onSurfaceVariant,
-              ),
+              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
             ),
           ],
         ),
@@ -488,9 +794,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             Text(
               _errorMessage,
               textAlign: TextAlign.center,
-              style: textTheme.bodySmall?.copyWith(
-                color: colorScheme.onSurfaceVariant,
-              ),
+              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
             ),
             const SizedBox(height: 16),
             FilledButton.tonalIcon(
@@ -519,22 +823,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    final videoPlayer = Container(
-      color: Colors.black,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          _chewieController != null
-              ? Chewie(key: _chewieKey, controller: _chewieController!)
-              : const Center(
-                  child: M3ECircularProgressIndicator(color: Colors.white),
-                ),
-          // 画中画按钮：仅支持的设备、视频就绪且非画中画状态时显示（右上角）
-          if (_pipSupported && _chewieController != null)
-            Positioned(top: 12, right: 12, child: _buildPipButton()),
-        ],
-      ),
-    );
+    final videoPlayer = _buildVideoStack();
 
     // 横屏：左 70% 视频 + 右 30% 清晰度&信息
     if (isLandscape) {
@@ -545,6 +834,12 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             flex: 3,
             child: ListView(
               children: [
+                MvDanmakuInputBar(
+                  enabled: _danmakuEnabled.value,
+                  sending: _danmakuSending,
+                  onSubmit: _sendDanmaku,
+                  onEnable: _toggleDanmaku,
+                ),
                 _buildQualityBar(colorScheme, textTheme),
                 _buildCastButton(colorScheme, textTheme),
                 const Divider(height: 1),
@@ -560,11 +855,208 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     return ListView(
       children: [
         AspectRatio(aspectRatio: 16 / 9, child: videoPlayer),
+        MvDanmakuInputBar(
+          enabled: _danmakuEnabled.value,
+          sending: _danmakuSending,
+          onSubmit: _sendDanmaku,
+          onEnable: _toggleDanmaku,
+        ),
         _buildQualityBar(colorScheme, textTheme),
         _buildCastButton(colorScheme, textTheme),
         const Divider(height: 1),
         _buildInfoSection(colorScheme, textTheme),
       ],
+    );
+  }
+
+  /// 视频区：Chewie（内含控件）+ 弹幕层 + 右上角按钮组。
+  ///
+  /// 按钮组留在**页面 Stack 的最上层**（而不是 Chewie 的 `overlay` 槽位）：
+  /// Chewie 的 Stack 次序是 `video → overlay → 黑色浮层 → 控件层`，
+  /// 而 `MaterialControls` 顶层是全区域 `GestureDetector(onTap:)` ——
+  /// 放在 overlay 里的按钮会被控件层赢走手势，表现为「按钮点不到」。
+  /// 显隐则通过 [_buildControlsBridge] 把 Chewie 内部状态桥接出来驱动。
+  Widget _buildVideoStack() {
+    return Container(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          _chewieController != null
+              ? Chewie(controller: _chewieController!)
+              : const Center(child: M3ECircularProgressIndicator(color: Colors.white)),
+          // 弹幕层：位于 Chewie 之上、手势透传（IgnorePointer 在层内）。
+          // key 绑定 controller 实例 —— 切换清晰度会重建控制器，必须随之重建，
+          // 否则 Ticker 会继续读已 dispose 的控制器。
+          if (_controller != null && _chewieController != null)
+            MvDanmakuLayer(
+              key: ObjectKey(_controller),
+              controller: _controller!,
+              entries: _danmakuEntries,
+              enabled: _danmakuEnabled.value,
+              opacity: _danmakuOpacity,
+              onControllerCreated: (c) => _danmakuController = c,
+            ),
+          // 右上角按钮组：弹幕开关 / 全屏 / （非全屏时）画中画
+          if (_chewieController != null)
+            ListenableBuilder(
+              listenable: Listenable.merge([
+                _danmakuEnabled,
+                _isFullscreen,
+                _pipSupported,
+                _controlsHidden,
+              ]),
+              builder: (context, _) {
+                if (!_overlayMountedLogged) {
+                  _overlayMountedLogged = true;
+                  // 一次性取证日志：确认按钮组已挂载（与控件显隐桥接联动）
+                  debugPrint('[MvDanmaku] 浮层按钮组已挂载（与进度条同步显隐）');
+                }
+                final hidden = _controlsHidden.value;
+                return Positioned(
+                  top: 12,
+                  right: 12,
+                  child: IgnorePointer(
+                    // 控件隐藏时同步放行手势，避免按钮区域挡住视频的播放/暂停点击
+                    ignoring: hidden,
+                    child: AnimatedOpacity(
+                      opacity: hidden ? 0 : 1,
+                      duration: const Duration(milliseconds: 250),
+                      child: Row(
+                        children: [
+                          _buildDanmakuToggleButton(),
+                          const SizedBox(width: 8),
+                          _buildFullscreenButton(fullscreen: _isFullscreen.value),
+                          // 画中画与全屏互斥，全屏时收起点
+                          if (!_isFullscreen.value && _pipSupported.value) ...[
+                            const SizedBox(width: 8),
+                            _buildPipButton(),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 把 Chewie 内部的控件显隐状态桥接到 [_controlsHidden]。
+  ///
+  /// 为什么需要桥接：显隐由 Chewie 内部的 `PlayerNotifier.hideStuff` 驱动，该
+  /// provider 只在 **Chewie 子树内**提供 —— 页面读不到；而按钮又必须留在页面
+  /// Stack 才能被点击（见 [_buildVideoStack]）。因此用一个零尺寸的桥接 widget
+  /// 挂在 Chewie 的 `overlay` 槽位里，把状态传出。
+  ///
+  /// 依赖说明：`PlayerNotifier` 未被 chewie 公开导出，这里按 1.13.1 的内部路径
+  /// 引用。升级 chewie 后若此 import 报错，说明上游改了内部结构 —— 届时需改为
+  /// 「`customControls` + 自建计时器」方案，或等上游导出该 notifier。
+  Widget _buildControlsBridge() {
+    return Consumer<PlayerNotifier>(
+      builder: (context, notifier, _) {
+        final hidden = notifier.hideStuff;
+        if (hidden != _controlsHidden.value) {
+          // 必须延到帧末：build 期间直接改 ValueNotifier 会让依赖者在本帧
+          // 已构建的情况下被标记重建，触发 markNeedsBuild during build 异常。
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _controlsHidden.value = hidden;
+          });
+        }
+        return const SizedBox.shrink();
+      },
+    );
+  }
+
+  /// 全屏按钮：进入 / 退出页面级自建全屏。
+  Widget _buildFullscreenButton({required bool fullscreen}) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.6),
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: IconButton(
+        icon: Icon(
+          fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+          color: Colors.white,
+          size: 20,
+        ),
+        tooltip: fullscreen ? '退出全屏' : '全屏',
+        onPressed: _toggleFullscreen,
+      ),
+    );
+  }
+
+  /// 进入 / 退出页面级全屏。
+  ///
+  /// **不使用 Chewie 内置全屏**：它会把播放器 `Navigator.push` 进一个独立路由
+  /// （chewie 1.13.1 `chewie_player.dart` 的 `onEnterFullScreen`），而弹幕层是
+  /// 页面 Stack 的兄弟节点、不会跟进去 → 真机表现为「全屏看不到弹幕」。
+  /// 系统栏处理对齐 Chewie 的原行为：进入隐藏、退出恢复。
+  /// 进入 / 退出页面级全屏（全屏按钮入口）。
+  void _toggleFullscreen() {
+    if (_isFullscreen.value) {
+      _exitFullscreen(fromBack: false);
+    } else {
+      _enterFullscreen();
+    }
+  }
+
+  /// 进入全屏：按视频比例自动横屏 + 隐藏系统栏。
+  void _enterFullscreen() {
+    setState(() => _isFullscreen.value = true);
+    // 视频为**横屏比例**时自动切横屏（对齐 Chewie onEnterFullScreen 的默认行为：
+    // 宽 > 高则强制 landscape）。竖屏比例视频不强转，避免把竖版 MV 拉成横屏。
+    final size = _controller?.value.size;
+    if (size != null && size.width > size.height) {
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      debugPrint(
+        '[MvDanmaku] 全屏：视频为横屏比例 '
+        '(${size.width.toInt()}x${size.height.toInt()})，自动横屏',
+      );
+    }
+    // 必须同时置「播放器沉浸生效中」标志：app.dart 的 _SystemUiUpdater 会在
+    // 每次 rebuild 时把系统栏设回 edgeToEdge（除非该标志为真）—— 只调
+    // setEnabledSystemUIMode 会被立刻覆盖，真机症状正是「全屏状态栏没隐藏」。
+    // 该标志语义为「播放器沉浸生效中」（Zen 与横屏沉浸共用），此处借用同一契约。
+    kPlayerLandscapeImmersiveActive.value = true;
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    debugPrint('[MvDanmaku] 全屏=true');
+  }
+
+  /// 退出全屏：恢复旋转、沉浸标志与系统栏。
+  ///
+  /// [fromBack] 仅用于日志区分入口（系统返回键 / 全屏按钮）。
+  void _exitFullscreen({required bool fromBack}) {
+    if (!_isFullscreen.value) return;
+    setState(() => _isFullscreen.value = false);
+    // 恢复自由旋转：项目全局未锁定方向（全仓无其它 setPreferredOrientations），
+    // 因此恢复为「全部方向」即回到进入前的状态
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    kPlayerLandscapeImmersiveActive.value = false;
+    // 项目统一的退出恢复：先 manual 显式 show 再交给 _SystemUiUpdater 设 edgeToEdge
+    restoreSystemUi();
+    debugPrint('[MvDanmaku] 全屏=false${fromBack ? '（返回键）' : ''}');
+  }
+
+  /// 页面级全屏布局：黑底 + 居中视频（含弹幕层），系统栏已隐藏。
+  Widget _buildFullscreenBody() {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return const ColoredBox(color: Colors.black);
+    }
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: AspectRatio(
+          aspectRatio: controller.value.aspectRatio,
+          child: _buildVideoStack(),
+        ),
+      ),
     );
   }
 
@@ -581,6 +1073,27 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
           aspectRatio: controller.value.aspectRatio,
           child: VideoPlayer(controller),
         ),
+      ),
+    );
+  }
+
+  /// 弹幕开关按钮：播放页内即时切换（与设置页「显示 MV 弹幕」同源）。
+  ///
+  /// 与画中画按钮同样式（半透明圆底、白色图标），位于视频右上角。
+  Widget _buildDanmakuToggleButton() {
+    final on = _danmakuEnabled.value;
+    return Material(
+      color: Colors.black.withValues(alpha: 0.6),
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: IconButton(
+        icon: Icon(
+          on ? Icons.subtitles : Icons.subtitles_off_outlined,
+          color: Colors.white,
+          size: 20,
+        ),
+        tooltip: on ? '关闭弹幕' : '开启弹幕',
+        onPressed: _toggleDanmaku,
       ),
     );
   }
@@ -641,11 +1154,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
-          Icon(
-            Icons.high_quality_outlined,
-            size: 20,
-            color: colorScheme.onSurfaceVariant,
-          ),
+          Icon(Icons.high_quality_outlined, size: 20, color: colorScheme.onSurfaceVariant),
           const SizedBox(width: 8),
           Text('清晰度', style: textTheme.labelLarge),
           const Spacer(),
@@ -693,15 +1202,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             runSpacing: 8,
             children: [
               if (detail?.duration != null)
-                _infoChip(
-                  Icons.timer_outlined,
-                  _formatDuration(detail!.duration!),
-                ),
+                _infoChip(Icons.timer_outlined, _formatDuration(detail!.duration!)),
               if (detail?.playCountLabel.isNotEmpty == true)
-                _infoChip(
-                  Icons.play_circle_outline,
-                  '播放 ${detail!.playCountLabel}',
-                ),
+                _infoChip(Icons.play_circle_outline, '播放 ${detail!.playCountLabel}'),
               if (song.album.isNotEmpty)
                 _infoChip(Icons.album_outlined, song.album),
             ],
@@ -712,9 +1215,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             const SizedBox(height: 4),
             Text(
               detail.desc!,
-              style: textTheme.bodyMedium?.copyWith(
-                color: colorScheme.onSurfaceVariant,
-              ),
+              style: textTheme.bodyMedium?.copyWith(color: colorScheme.onSurfaceVariant),
             ),
           ],
         ],

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../../core/services/custom_font_loader.dart';
 import '../../../core/utils/app_toast.dart';

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../data/repositories/settings_repository.dart';
 import 'audio_service.dart';
 
 /// 均衡器服务：通过 Android 原生 Equalizer API 实现音频均衡器。
@@ -41,6 +42,7 @@ class EqualizerService extends ChangeNotifier {
   };
 
   bool _enabled = false;
+  bool _systemEffectsDisabled = false;
   bool _isBound = false;
   bool _isBinding = false;
 
@@ -52,7 +54,8 @@ class EqualizerService extends ChangeNotifier {
   List<String> _systemPresets = [];
   String _currentPreset = '正常';
 
-  bool get enabled => _enabled;
+  bool get enabled => _enabled && !_systemEffectsDisabled;
+  bool get systemEffectsDisabled => _systemEffectsDisabled;
   bool get isBound => _isBound;
   bool get isBinding => _isBinding;
   int get bandCount => _bandCount;
@@ -85,6 +88,8 @@ class EqualizerService extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _enabled = prefs.getBool('eq_enabled') ?? false;
       _currentPreset = prefs.getString('eq_preset') ?? '正常';
+      _systemEffectsDisabled =
+          await SettingsRepository().getDisableSystemAudioEffects();
 
       // 恢复保存的频段增益（mB），实际频段数在绑定后才知道
       // 先读取已保存的值，绑定后按实际频段数应用
@@ -155,6 +160,8 @@ class EqualizerService extends ChangeNotifier {
   /// 单实例，绑定到伪会话 id=0（原生忽略该参数，返回合成频段信息）。
   Future<bool> tryBind() async {
     if (kIsWeb) return false;
+    // 上游 5.7.0 新增“禁用系统音效”开关，仅约束 Android 系统EQ，不影响 iOS 软件EQ
+    if (Platform.isAndroid && _systemEffectsDisabled) return false;
     if (_isBinding) return _isBound;
 
     if (Platform.isIOS) {
@@ -190,12 +197,19 @@ class EqualizerService extends ChangeNotifier {
   /// 绑定单个会话。第一个成功绑定的会话负责读回频段信息、预设表并应用已保存设置；
   /// 之后加入的会话由原生侧照镜像自动初始化（见 EqualizerPlugin.applyMirroredState）。
   Future<bool> _bindSession(int sessionId) async {
+    if (_systemEffectsDisabled) return false;
     final isFirst = _boundSessions.isEmpty;
     try {
       final result = await _channel.invokeMethod<Map>('init', {
         'audioSessionId': sessionId,
       });
       if (result == null) return false;
+      if (_systemEffectsDisabled) {
+        try {
+          await _channel.invokeMethod('release', {'audioSessionId': sessionId});
+        } catch (_) {}
+        return false;
+      }
       _boundSessions.add(sessionId);
       _isBound = true;
 
@@ -274,6 +288,22 @@ class EqualizerService extends ChangeNotifier {
     }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('eq_enabled', value);
+    notifyListeners();
+  }
+
+  /// 禁用/恢复本应用挂载的 Android 系统音效链。
+  ///
+  /// 该开关不改变均衡器本身的用户配置；禁用期间只释放已绑定的原生
+  /// Equalizer，恢复后会重新绑定当前播放会话并应用原配置。
+  Future<void> setSystemEffectsDisabled(bool value) async {
+    if (_systemEffectsDisabled == value) return;
+    _systemEffectsDisabled = value;
+    if (value) {
+      await unbind();
+    } else {
+      await tryBind();
+    }
+    await SettingsRepository().setDisableSystemAudioEffects(value);
     notifyListeners();
   }
 

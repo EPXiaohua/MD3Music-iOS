@@ -39,6 +39,11 @@ class MusicWidgetProvider : AppWidgetProvider() {
         const val EXTRA_POSITION = "widget_position"
         const val EXTRA_DURATION = "widget_duration"
 
+        /// 文本随行标志：updateAllWidgets(true) 携带最新文本/进度；
+        /// notifyArtworkChanged(false) 不携带——处理时现读 companion 缓存，
+        /// 消除「后台线程烤入过期播放态后到覆盖」的竞态（暂停后图标回退）
+        const val EXTRA_HAS_TEXT = "widget_has_text"
+
         // 动态取色 extras（与 PersonalFmWidgetProvider 同一套 color_ 前缀协议）
         private const val COLOR_PREFIX = "color_"
         private val COLOR_KEYS = arrayOf(
@@ -78,6 +83,7 @@ class MusicWidgetProvider : AppWidgetProvider() {
         ) {
             val intent = Intent(context, MusicWidgetProvider::class.java).apply {
                 action = ACTION_UPDATE_WIDGET
+                putExtra(EXTRA_HAS_TEXT, true)
                 putExtra(EXTRA_TITLE, title)
                 putExtra(EXTRA_ARTIST, artist)
                 putExtra(EXTRA_IS_PLAYING, isPlaying)
@@ -97,12 +103,9 @@ class MusicWidgetProvider : AppWidgetProvider() {
         fun notifyArtworkChanged(context: Context) {
             val intent = Intent(context, MusicWidgetProvider::class.java).apply {
                 action = ACTION_UPDATE_WIDGET
-                // 复用上次缓存的文本状态，仅更新封面
-                putExtra(EXTRA_TITLE, lastTitle)
-                putExtra(EXTRA_ARTIST, lastArtist)
-                putExtra(EXTRA_IS_PLAYING, lastPlaying)
-                putExtra(EXTRA_POSITION, lastPosition)
-                putExtra(EXTRA_DURATION, lastDuration)
+                // 不携带文本/进度：onReceive 处理时现读 companion 缓存（主线程
+                // 按序处理，拿到的是已处理完文本广播后的最新值）
+                putExtra(EXTRA_HAS_TEXT, false)
             }
             try {
                 context.sendBroadcast(intent)
@@ -224,11 +227,22 @@ class MusicWidgetProvider : AppWidgetProvider() {
             val views = RemoteViews(context.packageName, R.layout.widget_music_player)
             val density = context.resources.displayMetrics.density
 
-            val title = dataIntent?.getStringExtra(EXTRA_TITLE) ?: lastTitle
-            val artist = dataIntent?.getStringExtra(EXTRA_ARTIST) ?: lastArtist
-            val isPlaying = dataIntent?.getBooleanExtra(EXTRA_IS_PLAYING, lastPlaying) ?: lastPlaying
-            val position = dataIntent?.getLongExtra(EXTRA_POSITION, lastPosition) ?: lastPosition
-            val duration = dataIntent?.getLongExtra(EXTRA_DURATION, lastDuration) ?: lastDuration
+            // 文本/进度来源：文本广播（has_text=true）用 Intent 值；封面广播
+            // 现读 companion 缓存（主线程按序处理，必为已处理的最新值）
+            val fromIntent = dataIntent?.getBooleanExtra(EXTRA_HAS_TEXT, true) ?: true
+            val title = if (fromIntent) dataIntent?.getStringExtra(EXTRA_TITLE) ?: lastTitle
+                        else lastTitle
+            val artist = if (fromIntent) dataIntent?.getStringExtra(EXTRA_ARTIST) ?: lastArtist
+                         else lastArtist
+            val isPlaying = if (fromIntent)
+                dataIntent?.getBooleanExtra(EXTRA_IS_PLAYING, lastPlaying) ?: lastPlaying
+            else lastPlaying
+            val position = if (fromIntent)
+                dataIntent?.getLongExtra(EXTRA_POSITION, lastPosition) ?: lastPosition
+            else lastPosition
+            val duration = if (fromIntent)
+                dataIntent?.getLongExtra(EXTRA_DURATION, lastDuration) ?: lastDuration
+            else lastDuration
 
             // 缓存文本状态，供封面更新时复用
             lastTitle = title

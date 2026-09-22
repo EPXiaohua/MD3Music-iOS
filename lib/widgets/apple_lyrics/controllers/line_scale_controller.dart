@@ -8,7 +8,7 @@ import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
 /// 用 [Spring] 驱动单行的 `scale` 值，使当前行与非当前行之间通过弹簧平滑过渡。
 ///
 /// 设计要点：
-/// - 当前行 `scale = 1.0`，非当前行 `scale = 0.97`（`enableScale=true` 时）。
+/// - 当前行 `scale = 1.0`，非当前行 `scale = 0.850`（`enableScale=true` 时）。
 /// - 背景行（人声）：当前 `bgScale = 1.0`，非当前 `bgScale = 0.75`。
 /// - 主行与背景行使用不同的弹簧参数，背景行更轻更快。
 /// - 缩放基准点默认 `left`，对唱行为 `right`（影响视觉缩放方向）。
@@ -105,7 +105,7 @@ class LineScaleController {
 
   /// 复位到非当前行缩放（inactiveScale）。
   ///
-  /// 供行切换时调用：新当前行先落到 0.97，再由 [setLineState] 的目标
+  /// 供行切换时调用：新当前行先落到 0.850，再由 [setLineState] 的目标
   /// 弹回 1.0，产生"切到下一句时的弹性放大"过渡（AMLL 行缩放）。
   void resetToInactive() {
     _scaleSpring.setPosition(LyricLayout.inactiveScale, 0);

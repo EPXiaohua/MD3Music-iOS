@@ -114,7 +114,14 @@ class PlayerStateRepository {
         })
         .whereType<Song>()
         .toList();
-    if (playlist == null || playlist.isEmpty) return null;
+    // 队列本体缺失/为空但当前歌存在：降级为「单曲队列」恢复，而不是整块放弃。
+    // 队列写入失败（如整表替换入口漏落盘的历史数据）时，至少把当前歌与进度
+    // 找回来，而不是让冷启动回到完全空白的播放器。
+    // 不会误恢复「用户主动删空的队列」：删空路径会一并移除 player_current_song
+    // （saveCursor(currentSong: null) 直接删除该键），此处已提前 return null。
+    final effectivePlaylist = (playlist == null || playlist.isEmpty)
+        ? <Song>[currentSong]
+        : playlist;
 
     final currentIndex = prefs.getInt(_keyCurrentIndex) ?? 0;
     final positionMs = prefs.getInt(_keyPosition) ?? 0;
@@ -123,8 +130,8 @@ class PlayerStateRepository {
 
     return PlayerState(
       currentSong: currentSong,
-      playlist: playlist,
-      currentIndex: currentIndex.clamp(0, playlist.length - 1),
+      playlist: effectivePlaylist,
+      currentIndex: currentIndex.clamp(0, effectivePlaylist.length - 1),
       position: Duration(milliseconds: positionMs),
       loopMode: loopMode,
       shuffleEnabled: shuffleEnabled,

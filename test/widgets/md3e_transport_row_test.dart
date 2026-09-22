@@ -10,7 +10,7 @@
 // - 切歌动画完成后按钮身份正确（不再错位）：
 //   settledToNext 后 _prevLeft 触发 onPrevious、_playLeft 触发 onPlayPause、_nextLeft 触发 onNext
 //   settledToPrev 后 _prevLeft 触发 onPrevious、_playLeft 触发 onPlayPause、_nextLeft 触发 onNext
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/md3e_transport_row.dart';
 

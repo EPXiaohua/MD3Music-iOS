@@ -205,6 +205,18 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // ---- 专辑动态封面媒体代理（仅回环；流式转发，不缓冲、不进 apicache、不落盘）----
+    // 必须在 apicache 与模块 dispatch 之前特判：
+    // ① 模块框架把响应整块缓冲（Response::from_data）后还会写入 120s 内存缓存，
+    //    10MB 级 mp4 走模块表会造成内存尖峰与无意义的缓存占用；
+    // ② 媒体需要流式转发（Response::new + reader），模块返回类型不支持。
+    // 安全：仅接受 album_audio_id（服务端自行解析 CDN 直链），不接受任意 URL，
+    // 故不构成通用转发/SSRF 面；服务器本身只监听 127.0.0.1。
+    // 并发：run_loop 每请求独立线程，长时流式不会阻塞其它 API 请求。
+    if path == "/album/dycover/media" {
+        return crate::modules::dycover::handle_media_proxy(request, &url);
+    }
+
     // ---- body parse ----
     let mut body_bytes: Vec<u8> = Vec::new();
     {

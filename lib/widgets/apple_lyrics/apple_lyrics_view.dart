@@ -17,7 +17,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../../core/utils/app_haptics.dart';
@@ -1019,8 +1019,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 返回是否有任一行仍在运动（供重绘门控与收敛判定）。
   ///
   /// 相比旧的单实例 LineScaleController 只服务当前行，这里每行都有自己的弹簧：
-  /// - 进场行（非当前 0.97 → 当前）：target 变 activeScale，从 0.97 平滑放大到 1.0；
-  /// - 离场行（当前 1.0 → 非当前）：target 变 inactiveScale，从 1.0 平滑缩到 0.97，
+  /// - 进场行（非当前 0.850 → 当前）：target 变 activeScale，从 0.850 平滑放大到 1.0；
+  /// - 离场行（当前 1.0 → 非当前）：target 变 inactiveScale，从 1.0 平滑缩到 0.850，
   ///   补上原来"当前行缩小时硬切"的连贯动画。
   /// 只推进视口附近行（与 renderer/偏移同范围）。
   bool _tickPerLineScales(double dt) {
@@ -1497,7 +1497,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     }
     _scrollController.tick(dt);
 
-    // 3. 推进每行独立的 scale 弹簧（离场缩 0.97 / 进场放 1.0，均连贯）
+    // 3. 推进每行独立的 scale 弹簧（离场缩 0.850 / 进场放 1.0，均连贯）
     // 返回是否有缩放动画仍在进行，供下方重绘门控与收敛判定使用。
     final bool anyScaleChanged = _tickPerLineScales(dt);
 
@@ -1667,7 +1667,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       final now = _lastElapsed.inMicroseconds / 1000.0;
       // 行切换时不再手动 reset scale：新当前行切换前作为非当前行已 settle 在
       // inactiveScale，_tickPerLineScales 下一帧检测到 target 变 activeScale，
-      // 会自然从 0.97 弹到 1.0；离场行 target 变 inactiveScale，从 1.0 平滑缩回。
+      // 会自然从 0.850 弹到 1.0；离场行 target 变 inactiveScale，从 1.0 平滑缩回。
       // 两侧的缩放都是每行独立弹簧的连贯过渡，无需在此瞬间赋值。
       // 上一当前行退场交接：启动清晰层淡出，与模糊图接管重叠，消除硬切。
       // KRC 行退场前由 WordRenderer 绘制，其 LineRenderer 实例那一帧根本没被
@@ -1724,8 +1724,18 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       // 旧实现 `spring.setPosition(offset, 0)` 是瞬时赋值，切换帧整块歌词
       // 会先向下抖最多一个行距的固定比例、再逐行弹回，形成"两段动画 + 瞬移"。
       // 上一轮残留的弹簧值原样保留，释放时叠加进新起点，保证连续。
-      for (int i = startI; i < endI; i++) {
-        _delayStartTimes[i] = now;
+      // 「错峰从当前行开始」开启时：错峰起点 = 当前行再往上一行（上一行
+      // delay=0 领头回位，当前行带一步延迟跟随），其上方行立即释放（-1），
+      // 不参与「按住等错峰」，随全局滚动同步回位。首行时起点即当前行。
+      if (LyricPreferences.instance.staggerFromCurrentLine) {
+        final int staggerStartLine = math.max(0, _currentLineIndex - 1);
+        for (int i = startI; i < endI; i++) {
+          _delayStartTimes[i] = i < staggerStartLine ? -1 : now;
+        }
+      } else {
+        for (int i = startI; i < endI; i++) {
+          _delayStartTimes[i] = now;
+        }
       }
       // 清除起点以下(视口外/限幅外)与过旧的延迟记录
       _delayStartTimes.removeWhere((k, _) => k < startI);
@@ -1747,6 +1757,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     final double cascadeMaxDelay = LyricPreferences.instance.cascadeMaxDelayMs;
     final double cascadeBaseStep = LyricPreferences.instance.cascadeBaseStepMs;
     final double cascadeDecay = LyricPreferences.instance.cascadeStepDecay;
+    final bool staggerFromCurrent =
+        LyricPreferences.instance.staggerFromCurrentLine;
+    // 错峰起点行：开启 = 当前行再往上一行（上一行领头回位）；关闭 = 视口
+    // 顶部行（此时累加不受起点门控，见下方 delayMs 累加条件）。
+    final int staggerStartLine =
+        staggerFromCurrent ? math.max(0, _currentLineIndex - 1) : _cascadeTopLine;
     double delayMs = 0;
     double baseStepMs = cascadeBaseStep;
     final double posYNow = _scrollController.posY;
@@ -1776,7 +1792,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       // 为下一行累加本轮步长；且越过当前行后，步长对本轮下一次使用递减。
       // AMLL 语义：先累加本行（当前行用未衰减步长），再衰减供下一行使用
       // （baseDelay *= 1/1.05），实现"越过当前行后先密后疏、总延迟收敛"。
-      delayMs += baseStepMs;
+      // 「错峰从当前行开始」开启时：起点行（当前行-1）之前的行不累加延迟
+      // ——起点行 delay=0，当前行带一步延迟，向下逐行递增（上方行即使有
+      // 残留登记也早已释放，累加值无效）。
+      if (!staggerFromCurrent || i >= staggerStartLine) {
+        delayMs += baseStepMs;
+      }
       if (i >= _currentLineIndex) {
         baseStepMs *= cascadeDecay;
       }
@@ -2858,7 +2879,7 @@ class _LyricsPainter extends CustomPainter {
   /// 每行当前的 scale 弹簧位置（由 _onTick 的 per-line scale 推进循环填充）。
   ///
   /// 每行独立持有 scale 弹簧后，离场行（当前行 → 非当前行）从 1.0 平滑缩到
-  /// inactiveScale，进场行从 0.97 平滑放大到 1.0——补上原来"缩小硬切"的观感。
+  /// inactiveScale，进场行从 0.850 平滑放大到 1.0——补上原来"缩小硬切"的观感。
   List<double> perLineScales;
   EmphasizeEffect emphasizeEffect;
   InterludeDots interludeDots;
@@ -3099,13 +3120,13 @@ class _LyricsPainter extends CustomPainter {
       }
 
       // 形变 scale 与 alpha scale 分开取：
-      // - 形变（canvas.scale）用弹簧值，切行时产生 0.97→1.0 的弹性放大；
+      // - 形变（canvas.scale）用弹簧值，切行时产生 0.850→1.0 的弹性放大；
       // - alpha 用稳态值（当前行恒为 activeScale），使 factor=1、
       //   dynamicDarkAlpha=0.4 —— 新当前行从 0.4 起淡入，而不是被弹簧
       //   在起点处压到 0.2 再慢慢亮起来。
       // 与 _onTick 步骤 4 传给 renderer 的 scale 口径保持一致。
       // 形变 scale 用每行自己的弹簧位置（perLineScales），这样离场行从 1.0
-      // 平滑缩到 inactiveScale、进场行从 0.97 平滑放大到 1.0，都不再硬切。
+      // 平滑缩到 inactiveScale、进场行从 0.850 平滑放大到 1.0，都不再硬切。
       final double scale =
           i < perLineScales.length ? perLineScales[i] : LyricLayout.inactiveScale;
       final double alphaScale = isActive

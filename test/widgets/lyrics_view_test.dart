@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -96,5 +96,31 @@ void main() {
       reason: '行距 0.8 时长行行高 $longHeight 不应低于两行文本高 $minTwoLines'
           '（负留白会把容器缩矮裁切英文）',
     );
+  });
+
+  testWidgets('增强型 LRC 只显示歌词正文，不显示尖括号时间标签', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 300,
+            child: LyricsView(
+              lyrics: '[00:00.00]<00:00.00>第一<00:00.50>句<00:01.00>\n'
+                  '[00:02.00]<0,500,0>第二<500,500,0>句',
+              position: Duration.zero,
+              onSeek: (_) {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('第一句'), findsOneWidget);
+    expect(find.text('第二句'), findsOneWidget);
+    expect(find.textContaining('<00:'), findsNothing);
+    expect(find.textContaining('<0,'), findsNothing);
   });
 }

@@ -67,14 +67,20 @@ class AudioService {
     String url, {
     double? loudnessLufs,
     double? loudnessPeakDb,
+    Duration? initialPosition,
   }) async {
     final blobUrl = await _fetchAudioBlob(url);
-    await _player.setUrl(blobUrl);
+    // 与 io 端同口径：定位交给平台层，避免「加载后 seek」的竞态
+    await _player.setUrl(
+      blobUrl,
+      initialPosition: initialPosition ?? Duration.zero,
+    );
   }
 
   Future<void> setPlaylist(
     List<UriAudioSource> sources, {
     int startIndex = 0,
+    Duration? initialPosition,
   }) async {
     _playlistSource.clear();
     if (sources.isNotEmpty) {
@@ -97,7 +103,7 @@ class AudioService {
     await _player.setAudioSource(
       _playlistSource,
       initialIndex: safeStartIndex,
-      initialPosition: Duration.zero,
+      initialPosition: initialPosition ?? Duration.zero,
     );
   }
 

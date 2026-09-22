@@ -35,7 +35,7 @@ class WordRenderer {
   /// 当前是否为当前行（GRADIENT 模式）。默认 false（SOLID）。
   bool _isActive = false;
 
-  /// 当前行缩放，0.97（inactive）~1.0（active）。默认 inactive。
+  /// 当前行缩放，0.850（inactive）~1.0（active）。默认 inactive。
   double _scale = LyricLayout.inactiveScale;
 
   /// 当前绑定的 LyricLine。用于检测 line 切换并重置 alpha map。
@@ -91,8 +91,14 @@ class WordRenderer {
   /// 已播字回到 0，未播字保持 0，当前字上浮。
   List<double> _wordYOffsets = const <double>[];
 
-  /// AMLL 上浮最大幅度（px）：当前字最大上浮 -3px。
-  static const double _maxLiftPx = -3.0;
+  /// 已播字上浮幅度（px，向上为负）。
+  ///
+  /// 由用户在设置页"歌词动画 → 已播字上浮高度"调节
+  /// （[LyricPreferences.liftHeightPx]，默认 3.0）。0 = 完全不上浮。
+  ///
+  /// 每帧在 [tick] 内读取一次并缓存到局部变量，避免在 per-word 循环里重复
+  /// 访问单例；偏好变化会在下一帧自然生效，无需重置绑定缓存。
+  static double get _maxLiftPx => -LyricPreferences.instance.liftHeightPx;
 
   /// AMLL 上浮 ATTACK 速度：当前字上浮指数衰减系数。
   static const double _liftAttackSpeed = 30.0;
@@ -317,6 +323,10 @@ class WordRenderer {
   @visibleForTesting
   List<double> get wordWidthsRef => _wordWidths;
 
+  /// 每个 word 的当前 Y 偏移（上浮量，向上为负，供测试断言）。
+  @visibleForTesting
+  List<double> get wordYOffsetsRef => _wordYOffsets;
+
   /// 转发 [alphaAtX] 供测试断言绘制 alpha 的连续性。
   @visibleForTesting
   double debugAlphaAtX(
@@ -325,7 +335,7 @@ class WordRenderer {
 
   /// 当前 scale 对应的 factor（0~1）。
   ///
-  /// 公式：`factor = clamp01((scale - 0.97) / 0.03)`
+  /// 公式：`factor = clamp01((scale - inactiveScale) / (activeScale - inactiveScale))`
   double get factor {
     final raw = (_scale - LyricLayout.inactiveScale) /
         (LyricLayout.activeScale - LyricLayout.inactiveScale);
@@ -355,7 +365,7 @@ class WordRenderer {
   ///
   /// [isActive] 为 true 时启用 GRADIENT 模式（已播亮 / 未播暗），
   /// 为 false 时启用 SOLID 模式（整行均匀暗）。
-  /// [scale] 是行缩放，0.97（inactive）~1.0（active）。
+  /// [scale] 是行缩放，0.850（inactive）~1.0（active）。
   /// [blurFade] 控制非当前行透明度：1.0=透明（模糊图片覆盖），0.0=正常显示。
   /// [blurActive] 是否启用高斯模糊：false 时不降低非当前行透明度。
   void setLineState({required bool isActive, required double scale, double blurFade = 1.0, bool blurActive = true, int? activeColorValue}) {
@@ -427,6 +437,9 @@ class WordRenderer {
     final double alphaReleaseDecay = 1.0 - exp(-LyricLayout.releaseSpeed * dt);
     final double liftAttackDecay = 1.0 - exp(-_liftAttackSpeed * dt);
     final double liftReleaseDecay = 1.0 - exp(-_liftReleaseSpeed * dt);
+
+    // 已播字上浮幅度：每帧读一次偏好（见 [_maxLiftPx] 的说明）
+    final double maxLiftPx = _maxLiftPx;
 
     // === 非当前行快速路径 ===
     // 非当前行：所有 word alpha 目标 = dark，Y offset 目标 = 0，emphasis = idle
@@ -577,11 +590,11 @@ class WordRenderer {
       // === Y 偏移动画（上浮特效）===
       final double targetY;
       if (i < currentWordIdx) {
-        targetY = _maxLiftPx;
+        targetY = maxLiftPx;
       } else if (i == currentWordIdx) {
         // smoothstep 缓动（仅 3 次乘法 + 1 次加法，开销极低）
         final double eased = intraWordProgress * intraWordProgress * (3 - 2 * intraWordProgress);
-        targetY = _maxLiftPx * eased;
+        targetY = maxLiftPx * eased;
       } else {
         targetY = 0;
       }

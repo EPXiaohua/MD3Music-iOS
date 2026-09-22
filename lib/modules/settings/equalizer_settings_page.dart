@@ -2,7 +2,7 @@ import 'dart:io' show Platform;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 

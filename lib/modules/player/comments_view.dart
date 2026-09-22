@@ -1,10 +1,20 @@
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
+import '../../services/kugou_api/comment_reply_target.dart';
+import '../../services/kugou_api/comment_send_result.dart';
+import '../../services/kugou_api/comment_sort.dart';
+import '../../widgets/comment_composer.dart';
+import '../../widgets/comment_image_grid.dart';
+import '../../widgets/comment_image_viewer.dart';
+import '../../widgets/keyboard_expand_sheet.dart';
+import '../login/login_page.dart';
 import '../../providers/comment_display_provider.dart';
 import '../../providers/kugou_provider.dart';
 import '../../services/kugou_api/comment_thread.dart';
@@ -24,12 +34,12 @@ void showSongCommentsSheet(BuildContext context, Song song) {
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
     ),
-    builder: (sheetCtx) => DraggableScrollableSheet(
+    builder: (sheetCtx) => KeyboardExpandScrollableSheet(
       initialChildSize: 0.8,
       minChildSize: 0.4,
-      // 允许拖到最顶部（全屏高度），配合 useSafeArea 顶部避开状态栏
+      // 允许拖到最顶部（全屏高度），配合 useSafeArea 顶部避开状态栏；
+      // 键盘弹出时也展开到这个高度，避免打字时列表被托盘比例限制成一条缝
       maxChildSize: 1.0,
-      expand: false,
       builder: (innerCtx, scrollController) => Column(
         children: [
           Container(
@@ -118,6 +128,17 @@ class CommentsView extends StatefulWidget {
   /// 用于让面板高度可随列表滚动交互式缩放。为空时内部自建。
   final ScrollController? scrollController;
 
+  /// 是否显示底部评论输入框（默认 true，评论弹层用）。
+  ///
+  /// 全屏播放器的评论 tab 传 false：输入不在播放器里进行——长按底部评论段弹出
+  /// 评论托盘，托盘里的 [CommentsView] 输入框是常驻的（也是主题色设计）。
+  final bool showComposer;
+
+  /// [showComposer] 为 false 时，点评论项「回复」的回调（播放器弹出仅含输入框
+  /// 的托盘，[target] 为被回复的那条评论；传 null 表示发顶层评论）。
+  /// 与 [showComposer] 都缺省时「回复」入口不显示。
+  final void Function(CommentReplyTarget? target)? onReplyComment;
+
   const CommentsView({
     super.key,
     required this.songHash,
@@ -125,6 +146,8 @@ class CommentsView extends StatefulWidget {
     this.artworkUri,
     this.isAmStyle = false,
     this.scrollController,
+    this.showComposer = true,
+    this.onReplyComment,
   });
 
   @override
@@ -137,21 +160,47 @@ class _CommentsViewState extends State<CommentsView> {
   static const int _floorPageSize = 50;
 
   late final ScrollController _scrollController;
-  List<KugouComment> _comments = [];
-  List<KugouComment> _hotComments = [];
   bool _isLoading = false;
   bool _isLoadingMore = false;
   String? _error;
-  int _currentPage = 1;
-  bool _hasMore = true;
 
   /// 评论区 id，「最热」接口必需，只能从 /comment/music 的响应里取。
   String _childrenId = '';
 
-  /// 主评论列表是否走「最热」接口。拿不到评论区 id 或该接口失败时为 false，
-  /// 此时退回 /comment/music 的默认顺序，翻页也必须继续用同一个接口，
-  /// 否则两种排序的分页会混在一起。
-  bool _useTopliked = false;
+  /// 当前回复目标（非空即输入框处于回复模式）。
+  /// 同时表达「楼层根评论」（tid）与「被回复的那条回复」（pid，楼中楼）。
+  CommentReplyTarget? _replyTarget;
+
+  /// 评论发送在途：禁用输入框，防止连点造成重复公开评论。
+  bool _sendingComment = false;
+
+  /// 评论排序方式（默认最热）。切换后重新拉取第一页。
+  CommentSortMode _sortMode = CommentSortMode.hottest;
+
+  /// 「最热」模式的主列表：原生 topliked 各页（全局点赞降序）。
+  ///
+  /// 每种排序各自缓存主列表与分页进度，切换排序只是换个现成的列表，
+  /// **不重新请求**——之前的生硬感来自切换时的整页重拉。
+  final List<KugouComment> _toplikedList = [];
+  int _toplikedPage = 1;
+  bool _toplikedHasMore = true;
+
+  /// 「最新/最早」模式的主列表：cmtlist 各页。两种时间排序共用同一份数据，
+  /// 展示顺序由排序方式决定；「歌手评论」栏也来自它的 star_cmts。
+  final List<KugouComment> _recentList = [];
+  int _recentPage = 1;
+  bool _recentHasMore = true;
+
+  /// 当前排序模式的主列表。
+  List<KugouComment> get _activeList =>
+      _sortMode == CommentSortMode.hottest ? _toplikedList : _recentList;
+
+  /// 当前排序模式是否还有下一页。
+  bool get _activeHasMore =>
+      _sortMode == CommentSortMode.hottest ? _toplikedHasMore : _recentHasMore;
+
+  /// 「歌手评论」栏（/comment/music 的 star_cmts/歌手评论），所有排序模式共用。
+  List<KugouComment> _hotComments = [];
 
   /// 长评论展开状态
   final Set<String> _expandedContents = {};
@@ -195,11 +244,13 @@ class _CommentsViewState extends State<CommentsView> {
   void didUpdateWidget(covariant CommentsView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.songHash != widget.songHash) {
-      _currentPage = 1;
-      _hasMore = true;
       _childrenId = '';
-      _useTopliked = false;
-      _comments.clear();
+      _toplikedList.clear();
+      _toplikedPage = 1;
+      _toplikedHasMore = true;
+      _recentList.clear();
+      _recentPage = 1;
+      _recentHasMore = true;
       _hotComments.clear();
       _expandedContents.clear();
       _floorStates.clear();
@@ -216,13 +267,15 @@ class _CommentsViewState extends State<CommentsView> {
     }
   }
 
-  Future<void> _fetchComments() async {
+  Future<void> _fetchComments({bool silent = false}) async {
     if (widget.songHash.isEmpty) return;
 
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
+    if (!silent) {
+      setState(() {
+        _isLoading = true;
+        _error = null;
+      });
+    }
 
     final kugouProvider = context.read<KugouProvider>();
     final result = await kugouProvider.getComments(
@@ -231,67 +284,84 @@ class _CommentsViewState extends State<CommentsView> {
       page: 1,
     );
 
+    // 静默刷新失败（拿不到数据）时保留现有列表，不切错误页
+    if (silent && result == null) return;
+
     // 这一次 /comment/music 请求同时提供两样只有它才有的东西：歌手评论/精彩评论，
-    // 以及「最热」接口必需的评论区 id。拿到 id 后再取按点赞降序的全局排名。
-    final childrenId = result?.childrenId ?? '';
-    final hot = childrenId.isEmpty
-        ? null
-        : await KugouApiClient().getToplikedComments(childrenId, page: 1);
+    // 以及「最热」接口必需的评论区 id。
+    _childrenId = result?.childrenId ?? '';
 
     if (mounted) {
       setState(() {
         _isLoading = false;
-        _childrenId = childrenId;
-        // 「最热」拿不到时退回 cmtlist 的默认顺序，而不是对单页假排序：
-        // 单页只是 4000+ 条里任意的 30 条，按点赞重排它并不等于热度排序。
-        _useTopliked = hot != null && hot.comments.isNotEmpty;
+        // 时间排序（最新/最早）的主列表：cmtlist 第一页
         if (result != null) {
-          _comments = _useTopliked
-              ? sortCommentsByHotness(hot!.comments)
-              : result.comments;
+          _recentList
+            ..clear()
+            ..addAll(result.comments);
+          _recentPage = 1;
+          _recentHasMore = result.comments.length >= 20;
           _hotComments = result.hotComments;
-          _currentPage = 1;
-          _hasMore = _comments.length >= 20;
-        } else {
-          _comments = [];
-          _hotComments = [];
-          _hasMore = false;
         }
-        _error = kugouProvider.error;
+        _error = result == null ? kugouProvider.error : kugouProvider.error;
+      });
+    }
+    if (result == null || _childrenId.isEmpty) return;
+
+    // 「最热」主列表独立拉取：两个数据源各自缓存，切换排序零请求零等待
+    final hot = await KugouApiClient().getToplikedComments(_childrenId, page: 1);
+    if (mounted && hot != null) {
+      setState(() {
+        _toplikedList
+          ..clear()
+          ..addAll(sortCommentsByHotness(hot.comments));
+        _toplikedPage = 1;
+        _toplikedHasMore = hot.comments.length >= 20;
       });
     }
   }
 
   Future<void> _loadMore() async {
-    if (_isLoadingMore || !_hasMore || _isLoading) return;
+    if (_isLoadingMore || _isLoading) return;
+    if (!_activeHasMore) return;
 
     setState(() => _isLoadingMore = true);
 
-    final kugouProvider = context.read<KugouProvider>();
-    final page = _currentPage + 1;
-    final result = _useTopliked
-        ? await KugouApiClient().getToplikedComments(_childrenId, page: page)
-        : await kugouProvider.getComments(
-            widget.songHash,
-            albumAudioId: widget.albumAudioId,
-            page: page,
-          );
+    if (_sortMode == CommentSortMode.hottest) {
+      final result = await KugouApiClient()
+          .getToplikedComments(_childrenId, page: _toplikedPage + 1);
+      if (mounted) {
+        setState(() {
+          _isLoadingMore = false;
+          if (result != null && result.comments.isNotEmpty) {
+            // 「最热」接口跨页整体降序，逐页稳定重排只修正页内的个别倒挂
+            // （高热度歌曲的排名快照会滞后于实时点赞数），不会打乱已读的顺序。
+            _toplikedList.addAll(sortCommentsByHotness(result.comments));
+            _toplikedPage++;
+            _toplikedHasMore = result.comments.length >= 20;
+          } else {
+            _toplikedHasMore = false;
+          }
+        });
+      }
+      return;
+    }
 
+    final kugouProvider = context.read<KugouProvider>();
+    final result = await kugouProvider.getComments(
+      widget.songHash,
+      albumAudioId: widget.albumAudioId,
+      page: _recentPage + 1,
+    );
     if (mounted) {
       setState(() {
         _isLoadingMore = false;
         if (result != null && result.comments.isNotEmpty) {
-          // 「最热」接口跨页整体降序，逐页稳定重排只修正页内的个别倒挂
-          // （高热度歌曲的排名快照会滞后于实时点赞数），不会打乱已读的顺序。
-          _comments.addAll(
-            _useTopliked
-                ? sortCommentsByHotness(result.comments)
-                : result.comments,
-          );
-          _currentPage++;
-          _hasMore = result.comments.length >= 20;
+          _recentList.addAll(result.comments);
+          _recentPage++;
+          _recentHasMore = result.comments.length >= 20;
         } else {
-          _hasMore = false;
+          _recentHasMore = false;
         }
       });
     }
@@ -322,6 +392,7 @@ class _CommentsViewState extends State<CommentsView> {
   Future<void> _fetchFloorReplies(
     KugouComment comment, {
     bool reset = false,
+    bool silent = false,
   }) async {
     final state = _getFloorState(comment.id);
     if (state.loading) return;
@@ -334,7 +405,7 @@ class _CommentsViewState extends State<CommentsView> {
       state.message = '';
     }
 
-    setState(() => state.loading = true);
+    if (!silent) setState(() => state.loading = true);
 
     final specialId = comment.specialId ?? '';
     final tid = comment.tid ?? comment.id;
@@ -379,7 +450,9 @@ class _CommentsViewState extends State<CommentsView> {
       state.message = '加载失败，点击重试';
     } finally {
       state.initialized = true;
-      if (mounted) setState(() => state.loading = false);
+      if (mounted) {
+        if (!silent) setState(() => state.loading = false);
+      }
     }
   }
 
@@ -413,6 +486,84 @@ class _CommentsViewState extends State<CommentsView> {
     }
   }
 
+  /// 提交评论：无回复目标 → 歌曲顶层评论；有 → 该评论下的楼层回复。
+  ///
+  /// 成功不重试、不自动重发；失败保留输入内容由用户手动决定是否再发。
+  Future<bool> _submitComment(String text) async {
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) {
+      if (mounted) await _promptLogin();
+      return false;
+    }
+
+    final target = _replyTarget;
+    setState(() => _sendingComment = true);
+    try {
+      final CommentSendResult result;
+      if (target == null) {
+        result = await api.sendSongComment(
+          content: text,
+          mixsongid: widget.albumAudioId,
+          specialId: _childrenId.isEmpty ? null : _childrenId,
+        );
+      } else {
+        final args = buildFloorReplyArgs(
+          target,
+          fallbackSpecialId: _childrenId.isEmpty ? null : _childrenId,
+        );
+        result = await api.sendFloorReply(
+          specialId: args.specialId,
+          tid: args.tid,
+          content: text,
+          resourceType: 'song',
+          code: target.top.code,
+          pid: args.pid,
+          mixsongid: target.top.mixSongId ?? widget.albumAudioId,
+          replyUserName: args.replyUserName,
+          replyContent: args.replyContent,
+        );
+      }
+
+      if (!mounted) return result.ok;
+      if (result.ok) {
+        setState(() => _replyTarget = null);
+        if (target == null) {
+          await _fetchComments(silent: true);
+        } else {
+          // 回复成功后把该楼层展开并重新拉取，便于立刻看到自己的回复
+          _getFloorState(target.top.id).expanded = true;
+          await _fetchFloorReplies(target.top, reset: true, silent: true);
+        }
+        if (mounted) showToast('评论已提交，审核通过后展示');
+      } else {
+        showToast(result.message, long: true);
+      }
+      return result.ok;
+    } finally {
+      if (mounted) setState(() => _sendingComment = false);
+    }
+  }
+
+  /// 未登录时引导登录（与 channel_page 的既有交互保持一致）。
+  Future<void> _promptLogin() async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('请先登录'),
+        content: const Text('发表评论需要登录账号，是否前往登录？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('去登录')),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+    );
+    if (mounted) setState(() {});
+  }
+
   /// 计算评论项顶部相对视口顶部的偏移（负数表示在视口上方）。
   double? _commentTopInViewport(String commentId) {
     final rb = _keyForComment(commentId).currentContext?.findRenderObject();
@@ -420,6 +571,78 @@ class _CommentsViewState extends State<CommentsView> {
     final viewport = RenderAbstractViewport.of(rb) as RenderBox;
     final viewportTop = viewport.localToGlobal(Offset.zero).dy;
     return rb.localToGlobal(Offset.zero).dy - viewportTop;
+  }
+
+  /// 切换排序：各排序的主列表与分页进度都已缓存，切换是即时操作
+  /// （零请求、无淡出淡入）。首次进入某排序的数据在初始加载时就已就绪。
+  void _onSortModeChanged(CommentSortMode mode) {
+    if (mode == _sortMode) return;
+    HapticFeedback.selectionClick();
+    setState(() => _sortMode = mode);
+  }
+
+  /// 排序选择器（m3e_core 分段按钮）+ 右侧「评论」入口。
+  Widget _buildSortSelector() {
+    // 播放器评论 tab 没有内联输入框：右侧提供显式的「评论」入口
+    final showComposeButton = !widget.showComposer && widget.onReplyComment != null;
+    // AM 皮肤浮在模糊封面上，跟随主题的分组底色会很突兀，
+    // 改成半透明白色：选中段更亮、未选中段更淡
+    final groupDecoration = widget.isAmStyle
+        ? M3EToggleButtonDecoration(
+            backgroundColor: WidgetStateProperty.resolveWith(
+              (states) => states.contains(WidgetState.selected)
+                  ? const Color(0x2EFFFFFF)
+                  : const Color(0x14FFFFFF),
+            ),
+            foregroundColor: WidgetStateProperty.resolveWith(
+              (states) => states.contains(WidgetState.selected)
+                  ? Colors.white
+                  : const Color(0xB3FFFFFF),
+            ),
+          )
+        : null;
+    final buttonDecoration = widget.isAmStyle
+        ? M3EButtonDecoration(
+            backgroundColor: WidgetStateProperty.resolveWith(
+              (states) => states.contains(WidgetState.pressed)
+                  ? const Color(0x2EFFFFFF)
+                  : const Color(0x1FFFFFFF),
+            ),
+            foregroundColor: WidgetStateProperty.all(Colors.white),
+          )
+        : null;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Row(
+        children: [
+          M3EToggleButtonGroup(
+            decoration: groupDecoration,
+            actions: const [
+              M3EToggleButtonGroupAction(label: Text('最热')),
+              M3EToggleButtonGroupAction(label: Text('最新')),
+              M3EToggleButtonGroupAction(label: Text('最早')),
+            ],
+            size: M3EButtonSize.xs,
+            density: M3EButtonGroupDensity.compact,
+            selectedIndex: _sortMode.index,
+            onSelectedIndexChanged: (index) {
+              if (index == null) return;
+              _onSortModeChanged(CommentSortMode.values[index]);
+            },
+          ),
+          const Spacer(),
+          if (showComposeButton)
+            M3EFilledButton.icon(
+              onPressed: () => widget.onReplyComment?.call(null),
+              icon: const Icon(Icons.edit_outlined, size: 14),
+              label: const Text('评论'),
+              size: M3EButtonSize.xs,
+              decoration: buttonDecoration,
+              semanticLabel: '写评论',
+            ),
+        ],
+      ),
+    );
   }
 
   /// 收起楼中楼后把视口自然滚动回楼主评论位置。
@@ -488,6 +711,20 @@ class _CommentsViewState extends State<CommentsView> {
 
   @override
   Widget build(BuildContext context) {
+    // 排序选择器/评论按钮常驻在外层：切换排序时列表淡出淡入，
+    // 但入口控件不能跟着消失。
+    return Column(
+      children: [
+        _buildSortSelector(),
+        Expanded(
+          child: _buildBody(),
+        ),
+      ],
+    );
+  }
+
+  /// 评论区主体（加载/错误/空态与列表）。
+  Widget _buildBody() {
     final display = context.watch<CommentDisplayProvider>();
     final commentFontSize = display.commentFontSize;
     final replyFontSize = display.commentReplyFontSize;
@@ -543,7 +780,7 @@ class _CommentsViewState extends State<CommentsView> {
       );
     }
 
-    if (_comments.isEmpty && _hotComments.isEmpty) {
+    if (_activeList.isEmpty && _hotComments.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -566,8 +803,17 @@ class _CommentsViewState extends State<CommentsView> {
     // 只来自 /comment/music 的 star_cmts/hot_list，不一定包含它（可能为空）。
     // 统一在此把主列表里的歌手评论补进「歌手评论」栏（按 id 去重），
     // 并从主列表移除，避免歌手评论重复或「歌手评论」栏空着。
-    final hotFromComments = _comments.where((c) => c.isStar).toList();
-    final regularComments = _comments.where((c) => !c.isStar).toList();
+    final hotFromComments = _activeList.where((c) => c.isStar).toList();
+    // 「最热」= 原生 topliked 的点赞序；时间模式客户端按时间排
+    final regularComments = _sortMode == CommentSortMode.hottest
+        ? _activeList.where((c) => !c.isStar).toList()
+        : sortCommentsForDisplay(
+            _activeList.where((c) => !c.isStar).toList(), _sortMode);
+    final mainSectionLabel = switch (_sortMode) {
+      CommentSortMode.hottest => '最热评论',
+      CommentSortMode.timeDesc => '最新评论',
+      CommentSortMode.timeAsc => '最早评论',
+    };
     final starFromHot = _hotComments.where((c) => c.isStar).toSet();
     final singerComments = <KugouComment>[
       ..._hotComments,
@@ -584,69 +830,92 @@ class _CommentsViewState extends State<CommentsView> {
       }
     }
     if (regularComments.isNotEmpty) {
-      displayItems.add(
-        _CommentDisplayItem.header(_useTopliked ? '最热评论' : '最新评论'),
-      );
+      displayItems.add(_CommentDisplayItem.header(mainSectionLabel));
       for (final c in regularComments) {
         displayItems.add(_CommentDisplayItem.comment(c));
       }
     }
 
-    return ShaderMask(
-      shaderCallback: (Rect bounds) {
-        const double fadeHeight = 24.0;
-        final double fadeRatio = (fadeHeight / bounds.height).clamp(0.0, 0.5);
-        return LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: const [
-            Colors.transparent,
-            Colors.black,
-            Colors.black,
-            Colors.transparent,
-          ],
-          stops: [0.0, fadeRatio, 1.0 - fadeRatio, 1.0],
-        ).createShader(bounds);
-      },
-      blendMode: BlendMode.dstIn,
-      child: ListView.builder(
-        controller: _scrollController,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        itemCount: displayItems.length + (_hasMore ? 1 : 0),
-        itemBuilder: (context, index) {
-          if (index == displayItems.length) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: _isLoadingMore
-                    ? M3ELoadingIndicator(
-                        constraints: BoxConstraints.tightFor(width: 24, height: 24),
-                        color: indicatorColor)
-                    : TextButton(
-                        onPressed: _loadMore,
-                        style: TextButton.styleFrom(
-                          foregroundColor: primaryTextColor,
+    return Stack(
+      children: [
+        Column(
+          children: [
+            Expanded(
+              child: ShaderMask(
+                shaderCallback: (Rect bounds) {
+                  const double fadeHeight = 24.0;
+                  final double fadeRatio = (fadeHeight / bounds.height).clamp(0.0, 0.5);
+                  return LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: const [
+                      Colors.transparent,
+                      Colors.black,
+                      Colors.black,
+                      Colors.transparent,
+                    ],
+                    stops: [0.0, fadeRatio, 1.0 - fadeRatio, 1.0],
+                  ).createShader(bounds);
+                },
+                blendMode: BlendMode.dstIn,
+                child: ListView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  itemCount: displayItems.length + (_activeHasMore ? 1 : 0),
+                  itemBuilder: (context, index) {
+                    if (index == displayItems.length) {
+                      return Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: _isLoadingMore
+                              ? M3ELoadingIndicator(
+                                  constraints: BoxConstraints.tightFor(width: 24, height: 24),
+                                  color: indicatorColor)
+                              : TextButton(
+                                  onPressed: _loadMore,
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: primaryTextColor,
+                                  ),
+                                  child: const Text('加载更多'),
+                                ),
                         ),
-                        child: const Text('加载更多'),
-                      ),
-              ),
-            );
-          }
+                      );
+                    }
 
-          final item = displayItems[index];
-          if (item.isHeader) {
-            return _buildSectionHeader(item.headerTitle!, primaryTextColor);
-          }
-          return _buildCommentItem(
-            item.comment!,
-            primaryTextColor,
-            secondaryTextColor,
-            usernameColor,
-            commentFontSize,
-            replyFontSize,
-          );
-        },
-      ),
+                    final item = displayItems[index];
+                    if (item.isHeader) {
+                      return _buildSectionHeader(item.headerTitle!, primaryTextColor);
+                    }
+                    return _buildCommentItem(
+                      item.comment!,
+                      primaryTextColor,
+                      secondaryTextColor,
+                      usernameColor,
+                      commentFontSize,
+                      replyFontSize,
+                    );
+                  },
+                ),
+              ),
+            ),
+            // 输入框内联在列表下方并常驻（showComposer=false 时整块不存在）
+            if (widget.showComposer) _buildComposer(),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 评论输入框。半透明背景能透出播放器的模糊封面（用户要求的观感）。
+  Widget _buildComposer() {
+    return CommentComposer(
+      sending: _sendingComment,
+      // 评论弹层不会随键盘上移，输入框必须自己避让，否则被输入法遮挡
+      avoidKeyboard: true,
+      replyToName: _replyTarget?.displayName,
+      onCancelReply: () => setState(() => _replyTarget = null),
+      isAmStyle: widget.isAmStyle,
+      onSubmit: _submitComment,
     );
   }
 
@@ -728,6 +997,17 @@ class _CommentsViewState extends State<CommentsView> {
                     commentFontSize,
                   ),
                 ),
+                if (comment.images.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  CommentImageGrid(
+                    images: comment.images,
+                    onTapImage: (index) => showCommentImageViewer(
+                      context,
+                      images: comment.images,
+                      initialIndex: index,
+                    ),
+                  ),
+                ],
                 // 点赞 + 回复
                 const SizedBox(height: 6),
                 Row(
@@ -774,6 +1054,35 @@ class _CommentsViewState extends State<CommentsView> {
                         ),
                       ),
                     ],
+                    if (widget.showComposer || widget.onReplyComment != null)
+                      const SizedBox(width: 16),
+                    if (widget.showComposer || widget.onReplyComment != null)
+                      GestureDetector(
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        final target = CommentReplyTarget(top: comment);
+                        if (widget.showComposer) {
+                          // 托盘/弹层里输入框常驻：就地进入回复模式
+                          setState(() => _replyTarget = target);
+                        } else {
+                          // 播放器评论 tab 没有输入框：弹出仅输入框的托盘去回复
+                          widget.onReplyComment?.call(target);
+                        }
+                      },
+                      child: Row(
+                        children: [
+                          Icon(Icons.reply, size: 14, color: usernameColor),
+                          const SizedBox(width: 4),
+                          Text(
+                            '回复',
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelSmall
+                                ?.copyWith(color: usernameColor),
+                          ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
                 // 楼层评论（带展开动画）
@@ -976,6 +1285,7 @@ class _CommentsViewState extends State<CommentsView> {
           // 回复列表：按 pid 嵌套，同层按时间倒序（新的在前）
           for (final node in buildReplyTree(state.replies))
             _buildFloorReplyItem(
+              comment,
               node,
               primaryTextColor,
               secondaryTextColor,
@@ -1048,6 +1358,7 @@ class _CommentsViewState extends State<CommentsView> {
   static const int _maxReplyIndentDepth = 4;
 
   Widget _buildFloorReplyItem(
+    KugouComment top,
     CommentReplyNode node,
     Color primaryTextColor,
     Color secondaryTextColor,
@@ -1105,6 +1416,47 @@ class _CommentsViewState extends State<CommentsView> {
                     color: primaryTextColor,
                     height: 1.3,
                     fontSize: fontSize,
+                  ),
+                ),
+                if (reply.images.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  CommentImageGrid(
+                    images: reply.images,
+                    onTapImage: (index) => showCommentImageViewer(
+                      context,
+                      images: reply.images,
+                      initialIndex: index,
+                    ),
+                  ),
+                ],
+                // 楼中楼：回复某条具体回复（pid=该回复，is_t=0）
+                const SizedBox(height: 2),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    final target = CommentReplyTarget(top: top, reply: reply);
+                    if (widget.showComposer) {
+                      // 托盘/弹层里输入框常驻：就地进入回复模式
+                      setState(() => _replyTarget = target);
+                    } else {
+                      // 播放器评论 tab 没有输入框：弹出仅输入框的托盘去回复
+                      widget.onReplyComment?.call(target);
+                    }
+                  },
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.reply, size: 12, color: usernameColor),
+                      const SizedBox(width: 3),
+                      Text(
+                        '回复',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: usernameColor,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],

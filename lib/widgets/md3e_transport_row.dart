@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// 上一曲/暂停/下一曲三按钮联合动画控件。
 ///

@@ -1168,7 +1168,21 @@ class AudioPlayer {
   /// nothing if activation of the audio session fails for any reason.
   Future<void> play() async {
     if (_disposed) return;
-    if (playing) return;
+    if (playing) {
+      // 换源时 just_audio 的 Dart 状态可能仍为 true，但 Android 原生层
+      // 会在 load() 内部 stop() 后短暂丢失 playWhenReady。原先这里直接
+      // return，导致后续的 play 请求被吞掉：进度计时继续走，AudioTrack
+      // 却没有真正恢复输出，用户只能手动暂停再播放才能修复。
+      // 已经是播放态时补发一次平台 play：原生仍在播放时会立即返回，
+      // 原生状态丢失时则把 playWhenReady 拉回 true。
+      if (_active && _playlist.children.isNotEmpty) {
+        // 不等待平台 play 的完成回调：该回调按 just_audio 约定会一直等到
+        // 当前歌曲暂停/结束，若在自动切歌链路中等待会阻塞 completed → next。
+        // ignore: discarded_futures
+        _sendPlayRequest(await _platform, null);
+      }
+      return;
+    }
     _playInterrupted = false;
     // Broadcast to clients immediately, but revert to false if we fail to
     // activate the audio session. This allows setAudioSource to be aware of a

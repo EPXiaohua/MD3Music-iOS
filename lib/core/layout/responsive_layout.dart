@@ -1,6 +1,8 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
+
+import 'bottom_chrome_scope.dart';
 
 import '../../providers/device_provider.dart';
 import '../../providers/theme_provider.dart';
@@ -149,12 +151,17 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold> {
     final isLandscape =
         MediaQuery.orientationOf(context) == Orientation.landscape;
 
+    // 竖屏且底部导航栏可见时，body 之下还压着 NavigationBar：告知子树
+    //（MiniPlayer）无需再为屏幕底部留白、也无需加宽左右内边距。横屏走侧栏、
+    // 或导航栏被隐藏（沉浸浏览）时，body 的最底部就是屏幕最底部，需要防护。
+    final hasBottomChrome = !isLandscape && !widget.hideNavigation;
+
     // 横屏（手机/平板）使用侧边导航栏，导航项垂直居中；
     // 竖屏（手机/平板）使用底部导航栏。
-    if (isLandscape) {
-      return _buildRailLayout();
-    }
-    return _buildCompactLayout();
+    return BottomChromeScope(
+      hasBottomChrome: hasBottomChrome,
+      child: isLandscape ? _buildRailLayout() : _buildCompactLayout(),
+    );
   }
 
   Widget _buildCompactLayout() {

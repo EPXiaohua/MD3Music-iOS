@@ -1,3 +1,29 @@
+/// 元数据缺失时使用的占位值。
+///
+/// **为什么需要统一常量**：项目里有两条产生占位值的路径，字面量曾经不一致——
+/// - 在线侧（`KugouSongDetail.toSong` / `RoomSong.toSong`）：`未知歌手`
+/// - 本地侧（`local_music_repository` / `audio_scanner`）：`未知艺术家`
+///
+/// 消费方若只比较其中一个，另一条路径就会漏判。实例：歌词检索词守卫曾写
+/// `song.artist != '未知艺术家'`，但一起听跟随端的值是 `未知歌手` → 守卫恒真
+/// → 检索词退化成「未知歌曲 未知歌手」，歌词匹配质量下降。
+///
+/// 因此判断「歌手是否未知」一律用 [isUnknownArtist]，不要直接比较字面量。
+const String kUnknownSongTitle = '未知歌曲';
+const String kUnknownArtistPlaceholder = '未知歌手';
+const String kUnknownArtistPlaceholderLocal = '未知艺术家';
+
+/// 判断歌手名是否为占位值（同时覆盖在线侧与本地侧两种写法）。
+///
+/// 空串也算未知：部分接口返回空字符串而非占位文本。
+bool isUnknownArtist(String? artist) {
+  if (artist == null) return true;
+  final v = artist.trim();
+  return v.isEmpty ||
+      v == kUnknownArtistPlaceholder ||
+      v == kUnknownArtistPlaceholderLocal;
+}
+
 class Song {
   final String id;
   final String title;

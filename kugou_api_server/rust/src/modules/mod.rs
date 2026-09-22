@@ -13,8 +13,11 @@ pub mod audio_match;
 pub mod audio_more;
 pub mod comment_more;
 pub mod comment_music;
+pub mod comment_send;
 pub mod everyday;
+pub mod effects;
 pub mod extras;
+pub mod dycover;
 pub mod fm;
 pub mod get_model;
 pub mod images;
@@ -22,6 +25,7 @@ pub mod import_playlist;
 pub mod ip;
 pub mod ip_more;
 pub mod listen_report;
+pub mod listen_together;
 pub mod login;
 pub mod longaudio;
 pub mod lyric;
@@ -44,6 +48,7 @@ pub mod top;
 pub mod user;
 pub mod verify;
 pub mod video;
+pub mod video_barrage;
 pub mod youth;
 pub mod yueku;
 
@@ -84,6 +89,10 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/login", login::handle_login));
     routes.push(("/get/verify/info", verify::handle_get_verify_info));
     routes.push(("/get/model", get_model::handle));
+    routes.push(("/effects/brand/detail", effects::handle_brand_detail));
+    routes.push(("/effects/brand", effects::handle_brand));
+    routes.push(("/effects/match", effects::handle_match));
+    routes.push(("/effects/artist", effects::handle_artist));
     routes.push(("/import/playlist", import_playlist::handle));
     routes.push(("/verify/user/info", verify::handle_verify_user_info));
     routes.push(("/ai/recommend", extras::handle_ai_recommend));
@@ -114,6 +123,12 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/user/cloud/del", user::handle_cloud_del));
     routes.push(("/user/cloud/url", user::handle_cloud_url));
     routes.push(("/user/cloud", user::handle_cloud));
+    // 一起听：5 条路由均以 operation 区分领域内操作。
+    routes.push(("/listen/together/room", listen_together::handle_room));
+    routes.push(("/listen/together/music", listen_together::handle_music));
+    routes.push(("/listen/together/study", listen_together::handle_study));
+    routes.push(("/listen/together/chat", listen_together::handle_chat));
+    routes.push(("/listen/together/discovery", listen_together::handle_discovery));
     routes.push(("/youth/channel/song/detail", youth::handle_channel_song_detail));
     routes.push(("/youth/channel/song", youth::handle_channel_song));
     routes.push(("/youth/channel/similar", youth::handle_channel_similar));
@@ -160,10 +175,21 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/video/url", video::handle_url));
     routes.push(("/video/privilege", video::handle_privilege));
     routes.push(("/video/detail", video::handle_detail));
+    // MV 弹幕发送：必须注册在 /video/barrage 之前（已实现）。
+    // 本项目路由是路径段前缀匹配，/video/barrage 会命中 /video/barrage/send，
+    // 顺序反了会把发送请求送进列表 handler。
+    routes.push(("/video/barrage/send", video_barrage::handle_send));
+    routes.push(("/video/barrage", video_barrage::handle));
     routes.push(("/yueku/banner", yueku::handle_banner));
     routes.push(("/yueku/fm", fm::handle_yueku_fm));
     routes.push(("/yueku", yueku::handle_yueku));
     routes.push(("/register/dev", register_dev::handle));
+    // 写接口：必须排在 /comment/floor、/comment/playlist、/comment/album、/comment/music
+    // 之前——prefix_match 是路径段前缀匹配，短前缀先命中会把 POST 当查询接口转发。
+    routes.push(("/comment/music/send", comment_send::handle_music_send));
+    routes.push(("/comment/floor/send", comment_send::handle_floor_send));
+    routes.push(("/comment/playlist/send", comment_send::handle_playlist_send));
+    routes.push(("/comment/album/send", comment_send::handle_album_send));
     routes.push(("/comment/music/hotword", comment_more::handle_music_hotword));
     routes.push(("/comment/music/classify", comment_more::handle_music_classify));
     routes.push(("/comment/music/topliked", comment_more::handle_music_topliked));
@@ -213,6 +239,7 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/album/detail", album::handle_album_detail));
     routes.push(("/album/songs", album::handle_album_songs));
     routes.push(("/album/shop", album::handle_album_shop));
+    routes.push(("/album/dycover", dycover::handle_dycover));
     routes.push(("/album", album::handle_album));
     routes.push(("/captcha/sent", misc::handle_captcha_sent));
     routes.push(("/favorite/count", misc::handle_favorite_count));

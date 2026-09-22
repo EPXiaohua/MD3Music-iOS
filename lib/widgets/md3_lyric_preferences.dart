@@ -13,6 +13,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// `fontSource.index` 的原生契约（0=system 1=bundled 2=custom），行为等同 system。
 enum Md3LyricFontSource { system, bundled, custom }
 
+/// MD3 歌词副行显示模式：翻译或罗马音。
+enum Md3LyricDisplayMode { translation, roma }
+
 /// MD3 风格播放页的歌词显示偏好（字号 + 行间距 + 字体）。
 ///
 /// 与 `LyricPreferences`（Apple Music 风格播放页）完全独立的另一份配置：
@@ -70,6 +73,8 @@ class Md3LyricPreferences extends ChangeNotifier {
   static const String _keyFontWeight = 'md3_lyric_font_weight';
   static const String _keyFontSource = 'md3_lyric_font_source';
   static const String _keyCustomFontPath = 'md3_lyric_custom_font_path';
+  static const String _keyShowAuxiliary = 'md3_lyric_show_auxiliary';
+  static const String _keyDisplayMode = 'md3_lyric_display_mode';
 
   // ============== 当前值 ==============
 
@@ -77,6 +82,8 @@ class Md3LyricPreferences extends ChangeNotifier {
   double _lineSpacing = defaultLineSpacing;
   int _fontWeight = defaultFontWeight;
   Md3LyricFontSource _fontSource = Md3LyricFontSource.system;
+  bool _showAuxiliary = true;
+  Md3LyricDisplayMode _displayMode = Md3LyricDisplayMode.translation;
   String? _customFontPath;
   // 运行时加载成功后填充的 family（仅 custom 模式且加载成功时非 null）
   String? _loadedCustomFontFamily;
@@ -95,6 +102,8 @@ class Md3LyricPreferences extends ChangeNotifier {
   FontWeight get otherFontWeight =>
       FontWeight((_fontWeight - 200).clamp(minFontWeight, maxFontWeight));
   Md3LyricFontSource get fontSource => _fontSource;
+  bool get showAuxiliary => _showAuxiliary;
+  Md3LyricDisplayMode get displayMode => _displayMode;
   String? get customFontPath => _customFontPath;
 
   /// 当前生效的 fontFamily（传给 TextPainter 的 TextStyle）：
@@ -127,6 +136,8 @@ class Md3LyricPreferences extends ChangeNotifier {
         (prefs.getInt(_keyFontWeight) ?? defaultFontWeight)
             .clamp(minFontWeight, maxFontWeight);
     _fontSource = _fontSourceFromName(prefs.getString(_keyFontSource));
+    _showAuxiliary = prefs.getBool(_keyShowAuxiliary) ?? true;
+    _displayMode = _displayModeFromName(prefs.getString(_keyDisplayMode));
     _customFontPath = prefs.getString(_keyCustomFontPath);
     _loaded = true;
     notifyListeners();
@@ -175,6 +186,24 @@ class Md3LyricPreferences extends ChangeNotifier {
     await prefs.setString(_keyFontSource, source.name);
   }
 
+  /// 设置副歌词显示开关并持久化。
+  Future<void> setShowAuxiliary(bool enabled) async {
+    if (_showAuxiliary == enabled) return;
+    _showAuxiliary = enabled;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyShowAuxiliary, enabled);
+  }
+
+  /// 设置副歌词模式并持久化。
+  Future<void> setDisplayMode(Md3LyricDisplayMode mode) async {
+    if (_displayMode == mode) return;
+    _displayMode = mode;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyDisplayMode, mode.name);
+  }
+
   /// 设置自定义字体文件路径并立即尝试加载注册。
   Future<void> setCustomFontPath(String? path) async {
     if (_customFontPath == path) return;
@@ -196,6 +225,8 @@ class Md3LyricPreferences extends ChangeNotifier {
     _lineSpacing = defaultLineSpacing;
     _fontWeight = defaultFontWeight;
     _fontSource = Md3LyricFontSource.system;
+    _showAuxiliary = true;
+    _displayMode = Md3LyricDisplayMode.translation;
     _customFontPath = null;
     _loadedCustomFontFamily = null;
     notifyListeners();
@@ -204,6 +235,8 @@ class Md3LyricPreferences extends ChangeNotifier {
     await prefs.setDouble(_keyLineSpacing, _lineSpacing);
     await prefs.remove(_keyFontWeight);
     await prefs.remove(_keyFontSource);
+    await prefs.remove(_keyShowAuxiliary);
+    await prefs.remove(_keyDisplayMode);
     await prefs.remove(_keyCustomFontPath);
   }
 
@@ -249,5 +282,11 @@ class Md3LyricPreferences extends ChangeNotifier {
         // 'bundled' 与未知值一并归入 system（bundled 字体已不再打包）
         return Md3LyricFontSource.system;
     }
+  }
+
+  static Md3LyricDisplayMode _displayModeFromName(String? name) {
+    return name == Md3LyricDisplayMode.roma.name
+        ? Md3LyricDisplayMode.roma
+        : Md3LyricDisplayMode.translation;
   }
 }

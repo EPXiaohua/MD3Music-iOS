@@ -1,8 +1,11 @@
+import 'dart:math' as math;
+
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/layout/bottom_chrome_scope.dart';
 import '../../core/services/desktop_lyric_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/theme/motion_constants.dart';
@@ -18,6 +21,74 @@ import 'full_player_route.dart';
 /// 全局开关：MiniPlayer 是否支持水平滑动切歌（设置页可切换，默认开启）。
 /// 用全局 ValueNotifier 而非 State 局部状态，保证各页面 MiniPlayer 实例
 /// 在设置变更后实时响应。
+/// MiniPlayer 内容行的基础左右内边距（dp）。
+///
+/// 有底部导航栏、无需圆角防护时使用；也作为圆角反解值的下限。
+const double kMiniPlayerBaseSideInset = 4.0;
+
+/// 底部净空下限（dp）。
+///
+/// 冷启动 / 配置变更期间系统 inset 存在瞬时归零窗口（真机实测观测到
+/// `padding.bottom=0` 而 `systemGestureInsets.bottom=20`），只靠 inset 会让
+/// 迷你条在过渡帧抖动，故钉一个不依赖 inset 的下限。
+const double kMiniPlayerMinBottomClearance = 12.0;
+
+/// 圆角反解出的左右内边距上限（dp），防止异常大的上报值把内容挤成一条。
+const double kMiniPlayerMaxHorizontalClearance = 24.0;
+
+/// `MediaQueryData.displayCornerRadii` 不可用时（Android < 12 或厂商未上报）
+/// 采用的保守下屏角半径（dp）。
+const double kMiniPlayerFallbackCornerRadius = 28.0;
+
+/// MiniPlayer 在「自身即屏幕最底部」时的圆角防护留白。
+///
+/// - [bottom]：底部净空（dp），`max(系统底部 inset, 下限)`；
+/// - [horizontal]：内容行左右内边距（dp），使该高度处圆角吃掉的水平宽度
+///   不侵入内容，下限为基础值 [kMiniPlayerBaseSideInset]。
+typedef MiniPlayerCornerClearance = ({double bottom, double horizontal});
+
+/// 计算 MiniPlayer **自身就是屏幕最底部元素** 时所需的圆角防护留白。
+///
+/// 几何：半径 [radius] 的屏幕圆角，在距屏底 `height` 处吃掉的水平宽度为
+/// `radius - √(radius² - (radius - height)²)`（圆心在距屏边 radius 处，屏幕
+/// 区域在该圆内）。把该宽度作为左右内边距，内容就完全落在圆角之外。
+///
+/// 底部净空只取 `max(viewPadding.bottom, 下限)`、**不**再由圆角反解：本机实测
+/// 圆角 58dp，若把防护全部压在底部需 36.8dp，迷你条会从 50dp 涨到 87dp 过厚。
+/// 改为「底部托底 + 左右反解」后本机为 底 20 / 左右 15，条高 70dp。
+///
+/// 注：`DisplayScaleScope` 不缩放 `displayCornerRadii`（见 `ui_density.dart:59-61`
+/// 的说明，属刻意接受），非 1.0 显示档下半径相对偏大 → 略微多留，属保守侧。
+MiniPlayerCornerClearance resolveMiniPlayerCornerClearance(MediaQueryData mq) {
+  final bottom = math.max(mq.viewPadding.bottom, kMiniPlayerMinBottomClearance);
+  final radius = _bottomCornerRadius(mq.displayCornerRadii);
+  final eaten =
+      radius <= 0 ? 0.0 : _cornerEatenWidth(radius: radius, height: bottom);
+  final horizontal = math.min(
+    math.max(kMiniPlayerBaseSideInset, eaten.ceilToDouble()),
+    kMiniPlayerMaxHorizontalClearance,
+  );
+  return (bottom: bottom, horizontal: horizontal);
+}
+
+/// 取左右下角中更大的圆角半径；未上报时用 [kMiniPlayerFallbackCornerRadius]。
+double _bottomCornerRadius(BorderRadius? radii) {
+  if (radii == null) return kMiniPlayerFallbackCornerRadius;
+  return math.max(
+    math.max(radii.bottomLeft.x, radii.bottomLeft.y),
+    math.max(radii.bottomRight.x, radii.bottomRight.y),
+  );
+}
+
+/// 圆角在距屏底 [height] 处吃掉的水平宽度（推导见
+/// [resolveMiniPlayerCornerClearance]）。
+double _cornerEatenWidth({required double radius, required double height}) {
+  final inner = radius - height;
+  // 内容底边已在圆角弧之上，圆角吃不到
+  if (inner <= 0) return 0.0;
+  return radius - math.sqrt(radius * radius - inner * inner);
+}
+
 final ValueNotifier<bool> miniPlayerSwipeSwitchEnabled =
     ValueNotifier<bool>(true);
 
@@ -445,6 +516,19 @@ class _MiniPlayerState extends State<MiniPlayer>
     );
   }
 
+  /// 当前实例需要的底部净空与左右内边距（dp）。
+  ///
+  /// 判定口径见 [BottomChromeScope]：有底部 chrome 时保持原行为（底部补
+  /// `padding.bottom`、左右 4dp），否则按 [resolveMiniPlayerCornerClearance]
+  /// 同时防圆角与系统手势条。
+  MiniPlayerCornerClearance _clearance(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    if (BottomChromeScope.hasBottomChromeOf(context)) {
+      return (bottom: mq.padding.bottom, horizontal: kMiniPlayerBaseSideInset);
+    }
+    return resolveMiniPlayerCornerClearance(mq);
+  }
+
   Widget _buildContent(
     BuildContext context,
     PlayerProvider playerProvider,
@@ -452,21 +536,25 @@ class _MiniPlayerState extends State<MiniPlayer>
     ColorScheme colorScheme,
     bool useBackgroundImage,
   ) {
+    final clearance = _clearance(context);
     return Container(
       // Container 在外提供整体背景色：
       // 默认使用 surfaceContainerHigh 比 NavigationBar 的 surface 更深，
       // 形成明确的层级关系（mini player 浮于内容之上，NavigationBar 之下）
       // 启用自定义背景时改用半透明 surface，透出底层背景图。
-      // 颜色会自然填充 SafeArea 在底部留出的系统手势条区域
+      // 颜色会自然填充底部净空（圆角防护 + 系统手势条）区域
       decoration: BoxDecoration(
         color: useBackgroundImage
             ? colorScheme.surface.withValues(alpha: 0.2)
             : colorScheme.surfaceContainerHigh,
       ),
-      child: SafeArea(
-        // 仅吸收底部系统手势条/Home Indicator 高度
-        top: false,
-        bottom: true,
+      child: Padding(
+        // 底部净空：自身即屏幕最底部时（二级路由 / 横屏侧栏 / 导航栏隐藏），
+        // 同时防住屏幕圆角裁切与系统手势条；下方还压着 NavigationBar 时沿用
+        // 原 SafeArea(bottom: true) 口径（Scaffold 已移除 body 的 bottom
+        // padding，实测为 0，两者等价）。
+        // 背景色画在外层 Container 上，留白区同样被填充，不会露出白边。
+        padding: EdgeInsets.only(bottom: clearance.bottom),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -488,8 +576,12 @@ class _MiniPlayerState extends State<MiniPlayer>
               },
             ),
             Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              // 左右内边距在「自身即屏幕最底部」时按圆角反解值加宽
+              //（本机 R=58 / 底部 20dp → 15dp），有导航栏时为 4dp。
+              padding: EdgeInsets.symmetric(
+                horizontal: clearance.horizontal,
+                vertical: 2,
+              ),
               child: Row(
                 children: [
                   // —— 滑动区：封面 + 歌曲信息，跟随手指平移 + 切歌过渡 ——

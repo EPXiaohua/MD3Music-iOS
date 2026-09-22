@@ -213,6 +213,7 @@ class KugouAlbumBrief {
   final String? artistName;
   final String? globalCollectionId;
   final String? numericId;
+  final int? year;
 
   const KugouAlbumBrief({
     required this.id,
@@ -221,9 +222,43 @@ class KugouAlbumBrief {
     this.artistName,
     this.globalCollectionId,
     this.numericId,
+    this.year,
   });
 
+  /// 兼容新碟上架测试与 UI 层对 `artist` 字段名的访问（与 artistName 等价）。
+  String get artist => artistName ?? '';
+
   factory KugouAlbumBrief.fromJson(Map<String, dynamic> json) {
+    final rawCover = _resolveArtworkUri(
+      json['imgurl'] ??
+          json['cover_url'] ??
+          json['img'] ??
+          json['pic'] ??
+          json['ImgUrl'] ??
+          json['cover'] ??
+          json['sizable_cover'] ??
+          json['album_cover'],
+    );
+
+    // 年份：优先 publish_time（秒级时间戳），否则从日期字符串取前 4 位。
+    // publishtime 是 mobile_newalbum_sp 的真实字段（"YYYY-MM-DD HH:MM:SS"）。
+    int? year;
+    final publishTime = json['publish_time'];
+    if (publishTime is num && publishTime > 0) {
+      year = DateTime.fromMillisecondsSinceEpoch(publishTime.toInt() * 1000).year;
+    } else {
+      final publishDate = _cleanName(
+        json['publish_date'] ??
+            json['publishtime'] ??
+            json['pub_time'] ??
+            json['publishDate'],
+      );
+      if (publishDate.length >= 4) {
+        final y = int.tryParse(publishDate.substring(0, 4));
+        if (y != null) year = y;
+      }
+    }
+
     return KugouAlbumBrief(
       id: _str(
         json['albumid'] ??
@@ -237,25 +272,23 @@ class KugouAlbumBrief {
             json['AlbumName'] ??
             json['albumname'] ??
             json['name'] ??
+            json['title'] ??
             '',
       ),
-      coverUrl: _resolveArtworkUri(
-        json['imgurl'] ??
-            json['cover_url'] ??
-            json['img'] ??
-            json['pic'] ??
-            json['ImgUrl'],
-      ),
+      coverUrl: rawCover,
       artistName: _cleanName(
         json['singername'] ??
             json['artist_name'] ??
             json['SingerName'] ??
-            json['author_name'],
+            json['author_name'] ??
+            json['singer'] ??
+            json['artist'],
       ),
       globalCollectionId: _strNull(json['global_collection_id'] ?? json['gid']),
       numericId: _strNull(
         json['albumid'] ?? json['album_id'] ?? json['AlbumID'],
       ),
+      year: year,
     );
   }
 
@@ -267,6 +300,7 @@ class KugouAlbumBrief {
       artworkUri: coverUrl,
       songCount: 0,
       globalCollectionId: globalCollectionId,
+      year: year,
     );
   }
 }
@@ -429,10 +463,35 @@ class KugouSongDetail {
   }
 
   factory KugouSongDetail.fromJson(Map<String, dynamic> json) {
-    // 处理 singerinfo / authors 数组格式
+    // /audio 等接口把封面、专辑、hash 家族等字段藏在嵌套结构里
+    // （audio_info.hash_128/hash_flac/img、album_info.sizable_cover/id、
+    // song_info、base），顶层只有 hash 与名称。对齐 EchoMusic
+    // mergeNestedSongRecord：嵌套对象浅展开为顶层字段的**兜底**（顶层优先，
+    // 防止 album_info.name 覆盖歌曲名）。展开后 hash_128/hash_320/hash_flac、
+    // sizable_cover 等顶层候选键即可直接命中——之前富化 cover=false、
+    // artistId/albumId 全空、搜索兜底 hash 匹配不上，都是缺这层展开。
+    final merged = <String, dynamic>{};
+    for (final k in const [
+      'album_info',
+      'albuminfo',
+      'audio',
+      'audio_info',
+      'song_info',
+      'base',
+    ]) {
+      final nested = json[k];
+      if (nested is Map) {
+        nested.forEach((key, value) {
+          merged.putIfAbsent(key.toString(), () => value);
+        });
+      }
+    }
+    merged.addAll(json);
+    final json2 = merged;
+    // 处理 singerinfo / authors / Singers 数组格式
     String? artistName;
     String? artistIdFromSingerInfo;
-    final singerinfo = json['singerinfo'];
+    final singerinfo = json2['singerinfo'];
     if (singerinfo is List && singerinfo.isNotEmpty) {
       final names = <String>[];
       for (final s in singerinfo) {
@@ -444,9 +503,25 @@ class KugouSongDetail {
       }
       if (names.isNotEmpty) artistName = names.join('、');
     }
+    // /search 返回 Singers 数组（元素为 {name, id}），与 singerinfo 同构。
+    // 该接口没有 singerinfo/authors，只有 Singers + 标量 SingerName。
+    if (artistName == null || artistName.isEmpty) {
+      final singers = json2['Singers'] ?? json2['singers'];
+      if (singers is List && singers.isNotEmpty) {
+        final names = <String>[];
+        for (final s in singers) {
+          if (s is Map) {
+            final n = s['name']?.toString();
+            if (n != null && n.isNotEmpty) names.add(n);
+            artistIdFromSingerInfo ??= s['id']?.toString();
+          }
+        }
+        if (names.isNotEmpty) artistName = names.join('、');
+      }
+    }
     // kmr/v2 API 返回 authors 数组，兼容处理
     if (artistName == null || artistName.isEmpty) {
-      final authors = json['authors'];
+      final authors = json2['authors'];
       if (authors is List && authors.isNotEmpty) {
         artistName = authors
             .map((a) => (a is Map ? a['author_name']?.toString() : '') ?? '')
@@ -458,72 +533,103 @@ class KugouSongDetail {
       }
     }
 
+    // SingerId / AuthorID 在 /search 等接口中是数组（如 [4490]），
+    // 在另一些接口中是标量字符串。两种形态都要能取出首个非空 id。
+    String? firstIdOf(dynamic value) {
+      if (value is List) {
+        for (final e in value) {
+          final s = e?.toString();
+          if (s != null && s.isNotEmpty) return s;
+        }
+        return null;
+      }
+      return _strNull(value);
+    }
+
+    // /audio 等基础接口只返回 audio_name（「歌手 - 歌名」合并格式）：
+    // 歌名候选键全部落空时拆出歌手与歌名，避免富化拿到空标题整串歌名
+    var songName = _str(
+      json2['songname'] ??
+          json2['SongName'] ??
+          json2['name'] ??
+          json2['ori_audio_name'] ??
+          json2['FileName'] ??
+          json2['filename'] ??
+          json2['base']?['audio_name'] ??
+          '',
+    );
+    var resolvedArtistName =
+        artistName ??
+        _strNull(
+          json2['author_name'] ??
+              json2['SingerName'] ??
+              json2['artist_name'] ??
+              json2['singername'],
+        );
+    if (songName.isEmpty) {
+      final mergedName = _str(json2['audio_name'] ?? '');
+      if (mergedName.isNotEmpty) {
+        final sep = mergedName.indexOf(' - ');
+        if (sep > 0) {
+          resolvedArtistName ??= mergedName.substring(0, sep);
+          songName = mergedName.substring(sep + 3);
+        } else {
+          songName = mergedName;
+        }
+      }
+    }
+
     return KugouSongDetail(
       hash: _str(
-        json['hash'] ??
-            json['FileHash'] ??
-            json['Hash128'] ??
-            json['SQFileHash'] ??
-            json['HQFileHash'] ??
-            json['sd_hash'] ??
-            json['trans_param']?['ogg_128_hash'] ??
-            json['audio_info']?['hash'] ??
+        json2['hash'] ??
+            json2['FileHash'] ??
+            json2['Hash128'] ??
+            json2['SQFileHash'] ??
+            json2['HQFileHash'] ??
+            json2['sd_hash'] ??
+            json2['trans_param']?['ogg_128_hash'] ??
+            json2['audio_info']?['hash'] ??
             '',
       ),
       albumId: _strNull(
-        json['album_id'] ??
-            json['AlbumID'] ??
-            json['albumid'] ??
-            json['base']?['album_id'],
+        json2['album_id'] ??
+            json2['AlbumID'] ??
+            json2['albumid'] ??
+            json2['album_info']?['id'] ??
+            json2['base']?['album_id'],
       ),
       albumName: _strNull(
-        json['album_name'] ??
-            json['AlbumName'] ??
-            json['albumname'] ??
-            json['albuminfo']?['name'] ??
-            json['album_info']?['album_name'],
+        json2['album_name'] ??
+            json2['AlbumName'] ??
+            json2['albumname'] ??
+            json2['albuminfo']?['name'] ??
+            json2['album_info']?['album_name'],
       ),
       artistId: _strNull(
         artistIdFromSingerInfo ??
-            json['SingerId'] ??
-            json['singerid'] ??
-            json['SingerID'] ??
-            json['AuthorID'] ??
-            json['artist_id'],
+            firstIdOf(json2['SingerId']) ??
+            firstIdOf(json2['singerid']) ??
+            firstIdOf(json2['SingerID']) ??
+            firstIdOf(json2['AuthorID']) ??
+            firstIdOf(json2['artist_id']),
       ),
-      artistName:
-          artistName ??
-          _strNull(
-            json['author_name'] ??
-                json['SingerName'] ??
-                json['artist_name'] ??
-                json['singername'],
-          ),
-      songName: _str(
-        json['songname'] ??
-            json['SongName'] ??
-            json['name'] ??
-            json['ori_audio_name'] ??
-            json['FileName'] ??
-            json['filename'] ??
-            json['base']?['audio_name'] ??
-            '',
-      ),
+      songName: songName,
+      artistName: resolvedArtistName,
       // 不同时长字段单位不统一：部分接口（如搜索）返回毫秒，部分返回秒。
       // 统一归一化：原始值 > 10000 视为毫秒，除以 1000。
       duration: _normalizeDuration(
         _parseInt(
-          json['time_length'] ??
-              json['HQDuration'] ??
-              json['Duration'] ??
-              json['duration'] ??
-              json['audio_info']?['duration'] ??
-              json['SuperDuration'] ??
-              json['timelength'] ??
+          json2['time_length'] ??
+              json2['HQDuration'] ??
+              json2['Duration'] ??
+              json2['duration'] ??
+              json2['audio_info']?['duration'] ??
+              json2['SuperDuration'] ??
+              json2['timelength'] ??
               (() {
-                final tl = json['timelen'];
+                final tl = json2['timelen'];
                 if (tl != null) return (tl as int) ~/ 1000;
-                final ai = json['audio_info'] as Map<String, dynamic>?;
+                final ai = json2['audio_info'] as Map<String, dynamic>?;
                 if (ai != null) {
                   // 频道音乐故事接口：audio_info 内时长字段为 timelength（毫秒，
                   // 可能为字符串类型）
@@ -546,59 +652,63 @@ class KugouSongDetail {
         ),
       ),
       sqHash: _strNull(
-        json['hash_flac'] ??
-            json['SQHash'] ??
-            json['sq_hash'] ??
-            json['SQFileHash'],
+        json2['hash_flac'] ??
+            json2['SQHash'] ??
+            json2['sq_hash'] ??
+            json2['SQFileHash'],
       ),
       hqHash: _strNull(
-        json['hash_320'] ??
-            json['HQHash'] ??
-            json['hq_hash'] ??
-            json['HQFileHash'],
+        json2['hash_320'] ??
+            json2['HQHash'] ??
+            json2['hq_hash'] ??
+            json2['HQFileHash'],
       ),
       hash320: _strNull(
-        json['hash_320'] ??
-            json['320Hash'] ??
-            json['Hash320'] ??
-            json['trans_param']?['ogg_320_hash'],
+        json2['hash_320'] ??
+            json2['320Hash'] ??
+            json2['Hash320'] ??
+            json2['trans_param']?['ogg_320_hash'],
       ),
       hash128: _strNull(
-        json['hash_128'] ??
-            json['128Hash'] ??
-            json['Hash128'] ??
-            json['trans_param']?['ogg_128_hash'],
+        json2['hash_128'] ??
+            json2['128Hash'] ??
+            json2['Hash128'] ??
+            json2['trans_param']?['ogg_128_hash'],
       ),
-      lyrics: _strNull(json['lyrics'] ?? json['Lyrics'] ?? json['Lyric']),
+      lyrics: _strNull(json2['lyrics'] ?? json2['Lyrics'] ?? json2['Lyric']),
       albumAudioId: _strNull(
-        json['album_audio_id'] ??
-            json['AlbumAudioID'] ??
-            json['MixSongID'] ??
-            json['mixsongid'] ??
-            json['add_mixsongid'] ??
-            json['Audioid'] ??
-            json['audio_id'],
+        json2['album_audio_id'] ??
+            json2['AlbumAudioID'] ??
+            json2['MixSongID'] ??
+            json2['mixsongid'] ??
+            json2['add_mixsongid'] ??
+            json2['Audioid'] ??
+            json2['audio_id'],
       ),
       artworkUri: _resolveArtworkUri(
-        json['sizable_cover'] ??
-            json['Image'] ??
-            json['ImgUrl'] ??
-            json['img'] ??
-            json['pic'] ??
-            json['cover'] ??
-            json['trans_param']?['union_cover'] ??
-            json['album_info']?['sizable_cover'] ??
-            json['album_info']?['cover'],
+        json2['sizable_cover'] ??
+            json2['album_sizable_cover'] ??
+            json2['Image'] ??
+            json2['ImgUrl'] ??
+            json2['img'] ??
+            json2['pic'] ??
+            json2['cover'] ??
+            json2['cover_pic'] ??
+            json2['union_cover'] ??
+            json2['trans_param']?['union_cover'] ??
+            json2['audio_info']?['img'] ??
+            json2['album_info']?['sizable_cover'] ??
+            json2['album_info']?['cover'],
       ),
       fileName: _strNull(
-        json['filename'] ?? json['FileName'] ?? json['ori_audio_name'],
+        json2['filename'] ?? json2['FileName'] ?? json2['ori_audio_name'],
       ),
-      privilege: _parseInt(json['privilege'] ?? 0),
-      albumAudioId2: _strNull(json['album_audio_id']),
+      privilege: _parseInt(json2['privilege'] ?? 0),
+      albumAudioId2: _strNull(json2['album_audio_id']),
       songId: _strNull(
-        json['songid'] ?? json['song_id'] ?? json['SongId'] ?? json['SongID'],
+        json2['songid'] ?? json2['song_id'] ?? json2['SongId'] ?? json2['SongID'],
       ),
-      fileId: _parseInt(json['fileid'] ?? json['file_id']),
+      fileId: _parseInt(json2['fileid'] ?? json2['file_id']),
     );
   }
 
@@ -913,6 +1023,43 @@ class KugouCommentList {
   }
 }
 
+/// 评论附带图片（上游评论项的 `images` 数组元素）。
+///
+/// 上游形如 `{"url": "...", "width": 2040, "height": 1530, "mark": 1, "label": "..."}`。
+/// **URL 保持原样**：`webimg.bssdl.kugou.com` 没有有效 https 证书，
+/// 统一改写 https 会导致图片加载失败；`network_security_config.xml` 已对
+/// `kugou.com` 子域放行明文，http 与 https 都能直连。
+class CommentImage {
+  final String url;
+  final int width;
+  final int height;
+
+  const CommentImage({required this.url, this.width = 0, this.height = 0});
+
+  /// 宽高比；尺寸缺失或非法时回退 1.0，避免除零与布局塌陷。
+  double get aspectRatio =>
+      (width > 0 && height > 0) ? width / height : 1.0;
+
+  /// 解析上游 images 数组，跳过无效项（无 url / 非 Map）。
+  static List<CommentImage> listFromJson(dynamic raw) {
+    if (raw is! List) return const [];
+    final out = <CommentImage>[];
+    for (final e in raw) {
+      if (e is! Map) continue;
+      final url = _str(e['url'] ?? e['img'] ?? e['pic'] ?? '');
+      if (url.isEmpty) continue;
+      out.add(
+        CommentImage(
+          url: url,
+          width: _parseInt(e['width'] ?? 0),
+          height: _parseInt(e['height'] ?? 0),
+        ),
+      );
+    }
+    return out;
+  }
+}
+
 class KugouComment {
   final String id;
   final String username;
@@ -936,6 +1083,12 @@ class KugouComment {
   final String? code;
   final String? mixSongId;
 
+  /// 作者 uid。楼中楼回复要把它作为「被回复者」写进 extdata.puser_id。
+  final String? userId;
+
+  /// 评论附带图片（可能多张）。
+  final List<CommentImage> images;
+
   const KugouComment({
     required this.id,
     required this.username,
@@ -951,6 +1104,8 @@ class KugouComment {
     this.tid,
     this.code,
     this.mixSongId,
+    this.userId,
+    this.images = const [],
   });
 
   factory KugouComment.fromJson(
@@ -1037,6 +1192,8 @@ class KugouComment {
         _zeroAsNull(json['tid']) ?? json['id'] ?? json['comment_id'],
       ),
       code: _strNull(json['code']),
+      userId: _strNull(json['user_id'] ?? json['userid']),
+      images: CommentImage.listFromJson(json['images']),
       mixSongId: _strNull(
         json['mixsongid'] ?? json['audio_id'] ?? json['album_audio_id'],
       ),

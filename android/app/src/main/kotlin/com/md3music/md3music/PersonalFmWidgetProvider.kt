@@ -370,13 +370,20 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
                 applyNext(context, views, density, 3, lastNextHash3, lastNextCover3, maxSlots)
 
                 // 档位按钮：显示当前档位图标（surfaceHigh 底 + onSurfaceVariant 图标，
-                // 与发现页抽屉收起态一致），点击循环切换下一档位
-                val stationIcons = intArrayOf(
-                    R.drawable.ic_favorite_on, R.drawable.ic_wg_explore, R.drawable.ic_wg_diamond
-                )
-                views.setImageViewResource(R.id.fm_station_icon, stationIcons[lastStationIndex])
+                // 与发现页抽屉收起态一致），点击循环切换下一档位。
+                // 三档图标叠放 + 可见性切换，不用 setImageViewResource 换资源：
+                // MIUI 桌面对「同视图换资源 + setColorFilter 交替」会丢失着色，图标退回
+                // 固有白色（浅色面板上白压白不可见）。叠放方案见 2×2 封面小部件同款修法。
                 views.setInt(R.id.fm_station_bg, "setColorFilter", c("surfaceHigh"))
-                views.setInt(R.id.fm_station_icon, "setColorFilter", c("onSurfaceVariant"))
+                for (iconId in stationIconIds) {
+                    views.setInt(iconId, "setColorFilter", c("onSurfaceVariant"))
+                }
+                for ((index, iconId) in stationIconIds.withIndex()) {
+                    views.setViewVisibility(
+                        iconId,
+                        if (index == lastStationIndex) View.VISIBLE else View.GONE
+                    )
+                }
 
                 bindRadioClicks(context, views)
             }
@@ -462,6 +469,15 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
         intArrayOf(R.id.fm_next_note1, R.id.fm_next_note2, R.id.fm_next_note3)
     private val nextBgIds =
         intArrayOf(R.id.fm_next_bg1, R.id.fm_next_bg2, R.id.fm_next_bg3)
+
+    // 档位图标叠放槽位：下标即档位（0 红心 / 1 探索 / 2 小众）。
+    // 三档共用同一 tint（onSurfaceVariant），故可安全同数组批量着色。
+    private val stationIconIds =
+        intArrayOf(
+            R.id.fm_station_icon_favorite,
+            R.id.fm_station_icon_explore,
+            R.id.fm_station_icon_diamond,
+        )
 
     /**
      * 按实例宽度计算预告封面槽位数。

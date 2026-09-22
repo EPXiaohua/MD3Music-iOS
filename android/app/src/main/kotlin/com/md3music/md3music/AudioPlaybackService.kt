@@ -1934,7 +1934,10 @@ class AudioPlaybackService : Service() {
                         lastArtThumb = resizeBitmap(displayBitmap, 256)
                         // 同步封面到桌面小组件（与通知栏/MediaSession 一致）
                         MusicWidgetProvider.cachedArtwork = resizeBitmap(displayBitmap, 200)
+                        // 2×2 封面小部件：全幅背景需要更高分辨率，单独缓存 400px
+                        CoverPlayerWidgetProvider.cachedArtwork = resizeBitmap(displayBitmap, 400)
                         MusicWidgetProvider.notifyArtworkChanged(this@AudioPlaybackService)
+                        CoverPlayerWidgetProvider.notifyArtworkChanged(this@AudioPlaybackService)
 
                         // 封面同步注入 just_audio 的媒体3 会话（该会话无封面，播放中会被 SystemUI
                         // 提为控制中心顶层）。用官方 replaceMediaItem 同 uri 替换当前 MediaItem，
@@ -1985,7 +1988,7 @@ class AudioPlaybackService : Service() {
 
     /// 方案B阶段4：把当前桌面歌词/收藏状态推给媒体3会话，渲染为通知栏自定义按钮。
     /// 图标资源在 app 模块（R.drawable），fork 仅持有 command/回调，不依赖资源。
-    /// 阶段6：下一首已改回 media3 原生按钮，这里保留 翻译(可选)/桌面歌词/收藏。
+    /// 阶段6：下一首已改回 media3 原生按钮，这里保留 收藏/桌面歌词/翻译(可选)。
     /// 翻译按钮仅在 hasLyricTranslation 时发布（ColorOS Bridge 消费）；占位图标必须是
     /// 包内有效资源（CustomAction.Builder 需要有效 iconResId，SystemUI 建立 Action 时
     /// 先解析该资源）。Bridge 识别 Action 后会换成自己的标准翻译图标。

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// 「我的收藏」页顶部离线模式提示横幅。
 ///

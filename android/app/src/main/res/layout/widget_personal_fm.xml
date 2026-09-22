@@ -298,16 +298,42 @@
                                     android:layout_width="match_parent"
                                     android:layout_height="match_parent"
                                     android:scaleType="fitXY"
-                                    android:src="@drawable/widget_fm_bg_circle"
+                                    android:src="@drawable/fm_circle_station"
                                     android:contentDescription="@null" />
 
+                                <!-- 档位图标：三档叠放 + setViewVisibility 切换。
+                                     不用 setImageViewResource 换资源——MIUI 桌面对
+                                     「同视图换资源 + setColorFilter 交替」的视图状态簿记
+                                     会错乱，着色丢失后退回固有白色（浅色面板上不可见），
+                                     与 2×2 封面小部件 cover_icon_play/pause 同一坑。
+                                     默认可见项与旧布局默认 src 一致（explore）。 -->
                                 <ImageView
-                                    android:id="@+id/fm_station_icon"
+                                    android:id="@+id/fm_station_icon_favorite"
+                                    android:layout_width="20dp"
+                                    android:layout_height="20dp"
+                                    android:layout_gravity="center"
+                                    android:scaleType="fitCenter"
+                                    android:src="@drawable/fm_station_ic_favorite"
+                                    android:visibility="gone"
+                                    android:contentDescription="@string/fm_station_desc" />
+
+                                <ImageView
+                                    android:id="@+id/fm_station_icon_explore"
                                     android:layout_width="20dp"
                                     android:layout_height="20dp"
                                     android:layout_gravity="center"
                                     android:scaleType="fitCenter"
                                     android:src="@drawable/ic_wg_explore"
+                                    android:contentDescription="@string/fm_station_desc" />
+
+                                <ImageView
+                                    android:id="@+id/fm_station_icon_diamond"
+                                    android:layout_width="20dp"
+                                    android:layout_height="20dp"
+                                    android:layout_gravity="center"
+                                    android:scaleType="fitCenter"
+                                    android:src="@drawable/ic_wg_diamond"
+                                    android:visibility="gone"
                                     android:contentDescription="@string/fm_station_desc" />
                             </FrameLayout>
                         </LinearLayout>

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 /// 修复 [M3EPullToRefreshIndicator] 松手后"闪回"的下拉刷新包装器。

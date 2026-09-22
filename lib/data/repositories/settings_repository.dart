@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/services/audio_service_io.dart';
@@ -21,10 +21,20 @@ class SettingsRepository {
   static const String _keyGridColumns = 'grid_columns';
   // MV 画中画：按 Home 自动进入画中画（默认关闭，手动按钮不受影响）
   static const String _keyAutoPip = 'settings_auto_pip';
+  static const String _keyMvDanmakuEnabled = 'settings_mv_danmaku_enabled';
+  static const String _keyMvDanmakuOpacity = 'settings_mv_danmaku_opacity';
   /// 上传听歌时长（听歌等级累计上报）开关。默认关闭：不上传任何听歌时长数据。
   static const String _keyUploadListeningDuration = 'settings_upload_listening_duration';
   // 逐字歌词时间偏移（ms，默认 0；仅在线音乐生效，正值 = 歌词延后显示）
   static const String _keyLyricTimeOffset = 'lyric_time_offset_ms';
+  /// 新版本提醒开关：启动时检查 GitHub Release，发现新版本 toast 提醒。默认开启。
+  static const String _keyUpdateReminderEnabled =
+      'settings_update_reminder_enabled';
+  /// 上次网络检查的时间戳（ms）。属于记账状态而非用户设置，故不加 settings_ 前缀。
+  static const String _keyUpdateLastCheckMs = 'update_last_check_ms';
+  /// 上次已提醒过的版本号（形如 5.6.5），用于同一版本只提醒一次。同上，不加前缀。
+  static const String _keyUpdateLastNotifiedVersion =
+      'update_last_notified_version';
 
   /// 签到日历键：登录时按账号隔离（`settings_signed_days_$userid`），
   /// 未登录（游客）用全局键。
@@ -118,6 +128,39 @@ class SettingsRepository {
     await prefs.setBool(_keyAutoPlay, autoPlay);
   }
 
+  /// 新版本提醒开关（默认开启）。关闭后启动时不再查询 Release。
+  Future<bool> getUpdateReminderEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyUpdateReminderEnabled) ?? true;
+  }
+
+  Future<void> setUpdateReminderEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyUpdateReminderEnabled, enabled);
+  }
+
+  /// 上次成功发起 Release 检查的时间戳（ms）；未检查过返回 0。
+  Future<int> getUpdateLastCheckMs() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_keyUpdateLastCheckMs) ?? 0;
+  }
+
+  Future<void> setUpdateLastCheckMs(int milliseconds) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_keyUpdateLastCheckMs, milliseconds);
+  }
+
+  /// 上次已提醒的新版本号（形如 5.6.5）；未提醒过返回空串。
+  Future<String> getUpdateLastNotifiedVersion() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_keyUpdateLastNotifiedVersion) ?? '';
+  }
+
+  Future<void> setUpdateLastNotifiedVersion(String version) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyUpdateLastNotifiedVersion, version);
+  }
+
   Future<bool> getShowLyrics() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getBool(_keyShowLyrics) ?? true;
@@ -147,6 +190,29 @@ class SettingsRepository {
   Future<void> setAutoPipEnabled(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyAutoPip, value);
+  }
+
+  /// MV 弹幕开关。默认关闭 —— 与酷狗官方 App 的 MV 弹幕默认行为一致。
+  Future<bool> getMvDanmakuEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyMvDanmakuEnabled) ?? false;
+  }
+
+  Future<void> setMvDanmakuEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyMvDanmakuEnabled, value);
+  }
+
+  /// MV 弹幕总透明度（PiliPlus `danmakuOpacity` 的对应物）。
+  /// 合法区间 [0.1, 1.0]，越界读回/写入一律钳制。
+  Future<double> getMvDanmakuOpacity() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getDouble(_keyMvDanmakuOpacity)?.clamp(0.1, 1.0) ?? 1.0;
+  }
+
+  Future<void> setMvDanmakuOpacity(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keyMvDanmakuOpacity, value.clamp(0.1, 1.0));
   }
 
   /// 上传听歌时长（听歌等级累计上报）开关，默认关闭。
@@ -450,6 +516,21 @@ class SettingsRepository {
   Future<void> setUiScale(double scale) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_keyUiScale, scale);
+  }
+
+  // ===== 系统音效 =====
+  static const String _keyDisableSystemAudioEffects =
+      'settings_disable_system_audio_effects';
+
+  /// 是否禁用本应用挂载的 Android 系统音效链，默认关闭。
+  Future<bool> getDisableSystemAudioEffects() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyDisableSystemAudioEffects) ?? false;
+  }
+
+  Future<void> setDisableSystemAudioEffects(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyDisableSystemAudioEffects, value);
   }
 
   // ===== 暂停淡入淡出 =====
@@ -893,6 +974,22 @@ class SettingsRepository {
     await prefs.setBool(_keyShowQualityDowngradeToast, value);
   }
 
+  // ===== 记忆播放状态 =====
+  static const String _keyRestoreMemory = 'settings_restore_memory';
+
+  /// 「记忆播放状态」开关，默认开启。
+  /// 开启时冷启动恢复上次播放的歌曲与进度；关闭后不恢复、
+  /// 不再写入持久化播放状态，并清除已保存的数据（见 PlayerProvider）。
+  Future<bool> getRestoreMemoryEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyRestoreMemory) ?? true;
+  }
+
+  Future<void> setRestoreMemoryEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyRestoreMemory, value);
+  }
+
   // ===== 本地音乐评论区 =====
   static const String _keyCloseLocalMusicComments =
       'settings_close_local_music_comments';
@@ -907,6 +1004,34 @@ class SettingsRepository {
   Future<void> setCloseLocalMusicComments(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyCloseLocalMusicComments, value);
+  }
+
+  // ===== 专辑动态封面 =====
+  static const String _keyDynamicAlbumCover = 'settings_dynamic_album_cover';
+  static const String _keyDynamicAlbumCoverOnMobile =
+      'settings_dynamic_album_cover_on_mobile';
+
+  /// 全屏播放器专辑动态封面开关，默认开启。
+  Future<bool> getDynamicAlbumCover() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyDynamicAlbumCover) ?? true;
+  }
+
+  Future<void> setDynamicAlbumCover(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyDynamicAlbumCover, value);
+  }
+
+  /// 移动网络下是否也加载动态封面，默认关闭（单首视频约 9.5MB；
+  /// 公开构建每次播放都会重新拉流，流量开销更明显）。
+  Future<bool> getDynamicAlbumCoverOnMobile() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyDynamicAlbumCoverOnMobile) ?? false;
+  }
+
+  Future<void> setDynamicAlbumCoverOnMobile(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyDynamicAlbumCoverOnMobile, value);
   }
 
   // ===== 车机模式 =====

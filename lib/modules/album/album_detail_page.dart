@@ -1,5 +1,5 @@
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
@@ -13,6 +13,7 @@ import '../../providers/playlist_collection_notifier.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/keyboard_expand_sheet.dart';
 import '../../widgets/playlist_comments_view.dart';
 import '../../widgets/song_list_item.dart';
 import '../player/mini_player.dart';
@@ -359,11 +360,11 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
-      builder: (context) => DraggableScrollableSheet(
+      builder: (context) => KeyboardExpandScrollableSheet(
         initialChildSize: 0.5,
         minChildSize: 0.3,
+        // 键盘弹出时也展开到这个高度，否则打字时列表被托盘比例限制成一条缝
         maxChildSize: 0.95,
-        expand: false,
         builder: (context, scrollController) {
           final colorScheme = Theme.of(context).colorScheme;
           return Container(

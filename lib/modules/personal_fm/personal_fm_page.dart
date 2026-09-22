@@ -1,4 +1,6 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
@@ -6,6 +8,7 @@ import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
+import 'personal_fm_page_preferences.dart';
 
 class PersonalFmPage extends StatefulWidget {
   const PersonalFmPage({super.key});
@@ -20,6 +23,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
   bool _isAppending = false;
   String _selectedMode = 'normal';
   int _selectedSongPoolId = 0;
+  bool _strategyTouched = false;
   final int _visibleSideCount = 3;
   late AnimationController _vinylRotationController;
   late AnimationController _slideController;
@@ -53,6 +57,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
       vsync: this,
       duration: const Duration(milliseconds: 300),
     );
+    unawaited(_restoreStrategy());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _player = Provider.of<PlayerProvider>(context, listen: false)
@@ -61,6 +66,39 @@ class _PersonalFmPageState extends State<PersonalFmPage>
   }
 
   PlayerProvider? _player;
+
+  Future<void> _restoreStrategy() async {
+    final selection = await PersonalFmPagePreferences.load();
+    if (!mounted || _strategyTouched) return;
+
+    final modeIsValid = _modeOptions.any(
+      (option) => option['value'] == selection.mode,
+    );
+    final songPoolIsValid = _songPoolOptions.any(
+      (option) => option['value'] == selection.songPoolId,
+    );
+    if (!modeIsValid && !songPoolIsValid) return;
+
+    setState(() {
+      if (modeIsValid) _selectedMode = selection.mode;
+      if (songPoolIsValid) _selectedSongPoolId = selection.songPoolId;
+    });
+  }
+
+  void _selectStrategy({String? mode, int? songPoolId}) {
+    _strategyTouched = true;
+    setState(() {
+      if (mode != null) _selectedMode = mode;
+      if (songPoolId != null) _selectedSongPoolId = songPoolId;
+    });
+    unawaited(
+      PersonalFmPagePreferences.save(
+        mode: _selectedMode,
+        songPoolId: _selectedSongPoolId,
+      ),
+    );
+    unawaited(_loadPersonalFm());
+  }
 
   int _lastPrefetchIndex = -1;
 
@@ -267,7 +305,10 @@ class _PersonalFmPageState extends State<PersonalFmPage>
     if (_isLoading) return;
     setState(() => _isLoading = true);
     try {
-      await Provider.of<KugouProvider>(context, listen: false).getPersonalFm();
+      await Provider.of<KugouProvider>(context, listen: false).getPersonalFm(
+        mode: _selectedMode,
+        songPoolId: _selectedSongPoolId,
+      );
     } catch (e) {
     } finally {
       if (mounted) {
@@ -478,8 +519,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
           return Expanded(
             child: InkWell(
               onTap: () {
-                setState(() => _selectedSongPoolId = option['value']);
-                _loadPersonalFm();
+                _selectStrategy(songPoolId: option['value'] as int);
               },
               borderRadius: BorderRadius.circular(999),
               child: Container(
@@ -748,8 +788,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
             final isActive = _selectedMode == option['value'];
             return InkWell(
               onTap: () {
-                setState(() => _selectedMode = option['value']);
-                _loadPersonalFm();
+                _selectStrategy(mode: option['value'] as String);
               },
               borderRadius: BorderRadius.circular(999),
               child: Container(

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../services/kugou_api/kugou_api_client.dart';
@@ -54,6 +55,19 @@ class HistoryRepository {
     _timesCache = null;
     _cachedSuffix = null;
     return false;
+  }
+
+  /// 仅测试用：清空内存缓存与防抖计时器，避免单例状态跨用例串味。
+  @visibleForTesting
+  static void debugResetForTest() {
+    final self = HistoryRepository._instance;
+    self._flushTimer?.cancel();
+    self._flushTimer = null;
+    self._flushSuffix = null;
+    self._cachedSuffix = null;
+    self._historyCache = null;
+    self._countsCache = null;
+    self._timesCache = null;
   }
 
   /// 取内存缓存或从磁盘加载（加载结果同时填充缓存）。
@@ -126,6 +140,25 @@ class HistoryRepository {
     await _loadCounts(prefs);
     await _loadTimes(prefs);
     _applyHistoryInMemory(song);
+    _scheduleFlush();
+  }
+
+  /// 就地修正一条已存在的历史记录（元数据晚到时就地补全）。
+  ///
+  /// 与 [addHistory] 的区别是语义：这是**修正**而非**新增**——
+  /// 不改变条目在列表中的位置，也不累加播放计数与最近播放时间。
+  /// 一起听跟随端起播瞬间只有 hash 身份，标题是「未知歌曲」，
+  /// 富化拿到真实元数据后靠这个方法把历史刷成正常展示。
+  ///
+  /// id 不存在时是 no-op（历史可能已被淘汰或清空）。
+  Future<void> replaceHistoryEntry(Song song) async {
+    final prefs = await SharedPreferences.getInstance();
+    // _loadHistory 会做账号隔离校验（_cacheValid）：登录态变化时旧缓存已作废，
+    // 这里必须让它决定是否重载，不能直接读 _historyCache。
+    final history = await _loadHistory(prefs);
+    final idx = history.indexWhere((s) => s.id == song.id);
+    if (idx < 0) return;
+    history[idx] = song;
     _scheduleFlush();
   }
 

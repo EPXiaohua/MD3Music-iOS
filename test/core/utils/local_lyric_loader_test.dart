@@ -76,6 +76,15 @@ void main() {
     // 必须是完整 XML，而非被 `=` 截断成 `<?xml version`
     expect(result, lyrics);
   });
+
+  test('L7. MP3 内嵌 SYLT 同步歌词转换为普通 LRC', () {
+    final f = File('${tempDir.path}${Platform.pathSeparator}song.mp3');
+    f.writeAsBytesSync(_buildMp3WithSylt());
+
+    final result = LocalLyricLoader.loadForAudio(f.path);
+
+    expect(result, '[00:01.000]第一句\n[00:02.500]第二句');
+  });
 }
 
 /// 构造含 LYRICS 标签的最小 FLAC 二进制（fLaC + STREAMINFO + VORBIS_COMMENT）。
@@ -107,3 +116,50 @@ void _appendFlacBlock(List<int> out, int type, bool isLast, List<int> data) {
 
 List<int> _u32le(int v) =>
     [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF];
+
+List<int> _buildMp3WithSylt() {
+  final payload = <int>[
+    3, // UTF-8
+    ...utf8.encode('eng'),
+    2, // 时间戳单位：毫秒
+    1, // 内容类型：歌词
+    0, // 空描述
+  ];
+  _appendSyltEntry(payload, '第一句', 1000);
+  _appendSyltEntry(payload, '第二句', 2500);
+
+  final frame = <int>[
+    ...'SYLT'.codeUnits,
+    ..._synchsafe(payload.length),
+    0,
+    0,
+    ...payload,
+  ];
+  final header = <int>[
+    ...'ID3'.codeUnits,
+    4,
+    0,
+    0,
+    ..._synchsafe(frame.length),
+  ];
+  return [...header, ...frame];
+}
+
+void _appendSyltEntry(List<int> payload, String text, int timestamp) {
+  payload
+    ..addAll(utf8.encode(text))
+    ..add(0)
+    ..addAll([
+      (timestamp >> 24) & 0xFF,
+      (timestamp >> 16) & 0xFF,
+      (timestamp >> 8) & 0xFF,
+      timestamp & 0xFF,
+    ]);
+}
+
+List<int> _synchsafe(int value) => [
+  (value >> 21) & 0x7F,
+  (value >> 14) & 0x7F,
+  (value >> 7) & 0x7F,
+  value & 0x7F,
+];

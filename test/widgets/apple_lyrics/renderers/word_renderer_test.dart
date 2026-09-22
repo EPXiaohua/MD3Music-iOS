@@ -4,9 +4,11 @@ import 'dart:ui' as ui;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/apple_lyrics/renderers/emphasize_effect.dart';
 import 'package:md3music/widgets/apple_lyrics/renderers/word_renderer.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// WordRenderer 单元测试
 ///
@@ -542,6 +544,46 @@ void main() {
       final ui.Offset fixed =
           MatrixUtils.transformPoint(m, ui.Offset(50, anchorY));
       expect(fixed.dy, closeTo(anchorY, 1e-6), reason: '锚线是不动点');
+    });
+  });
+
+  group('已播字上浮高度跟随偏好', () {
+    // 本组会写入偏好，故独立准备 mock prefs 与回滚，避免污染同文件其他用例。
+    setUp(() {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => LyricPreferences.instance.reset());
+    });
+
+    test('默认 3.0px：已播字 Y 偏移收敛到 -3.0，未播字保持 0', () async {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      // 固定在第 3 个字（index=2）的演唱中：index 0/1 为已播字，index 3 为未播字
+      for (int i = 0; i < 300; i++) {
+        renderer.tick(0.016, 2500);
+      }
+      expect(renderer.wordYOffsetsRef[0], closeTo(-3.0, 0.01));
+      expect(renderer.wordYOffsetsRef[1], closeTo(-3.0, 0.01));
+      expect(renderer.wordYOffsetsRef[3], closeTo(0.0, 0.01));
+    });
+
+    test('改到 8.0px 后已播字 Y 偏移收敛到 -8.0', () async {
+      await LyricPreferences.instance.setLiftHeightPx(8.0);
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      for (int i = 0; i < 300; i++) {
+        renderer.tick(0.016, 2500);
+      }
+      expect(renderer.wordYOffsetsRef[0], closeTo(-8.0, 0.01));
+    });
+
+    test('设为 0 时已播字不再上浮', () async {
+      await LyricPreferences.instance.setLiftHeightPx(0.0);
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      for (int i = 0; i < 300; i++) {
+        renderer.tick(0.016, 2500);
+      }
+      expect(renderer.wordYOffsetsRef[0], closeTo(0.0, 0.01));
     });
   });
 }

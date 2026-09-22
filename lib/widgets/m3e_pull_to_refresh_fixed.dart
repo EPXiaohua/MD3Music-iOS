@@ -1,9 +1,9 @@
 import 'dart:math' as math;
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:motor/motor.dart';
 
-/// 本地 fork 版 [M3EPullToRefreshIndicator]（m3e_core 0.1.6 原样复制 +
+/// 本地 fork 版 [M3EPullToRefreshIndicator]（m3e_core 1.1.4 原样复制 +
 /// 一处修复），供收藏页歌单 tab 等对 touch 通知链敏感的场景使用。
 ///
 /// **修复点**：`_handleScrollNotification` 的 [OverscrollNotification] /
@@ -15,7 +15,7 @@ import 'package:motor/motor.dart';
 /// 无反应"。修复为：`dragDetails == null` 时**忽略该通知、保持拖拽状态**
 /// （松手仍由 [ScrollEndNotification] 判定），距离正常累积。
 ///
-/// 其余代码与 m3e_core 0.1.6 完全一致；依赖（[M3EContainedLoadingIndicator]、
+/// 其余代码与 m3e_core 1.1.4 完全一致；依赖（[M3EContainedLoadingIndicator]、
 /// [M3EMotion]、[Shapes]、[M3EHapticFeedback]、[M3EPullToRefreshStyle]、
 /// [M3EPullToRefreshController]、applyHaptic）均从 `package:m3e_core` 引入。
 class M3EPullToRefreshIndicator extends StatefulWidget {
@@ -401,10 +401,13 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
 
     Widget containerWidget = headerChild;
     if (style?.elevation != null && style!.elevation! > 0) {
+      // 与 m3e_core 1.1.4 对齐：未提供 borderRadius 时用全圆角兜底
+      final effectiveRadius =
+          style.borderRadius ?? BorderRadius.circular(9999.0);
       containerWidget = Material(
         elevation: style.elevation!,
         color: Colors.transparent,
-        borderRadius: style.borderRadius,
+        borderRadius: effectiveRadius,
         child: containerWidget,
       );
     }

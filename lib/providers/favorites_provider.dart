@@ -71,6 +71,50 @@ class FavoritesProvider extends ChangeNotifier {
     return null;
   }
 
+  List<Song>? _cloudFavoriteSongs;
+
+  /// 云端「我喜欢」歌单的完整歌曲列表（点歌/加歌选择器用）。
+  ///
+  /// [_syncFavoritesFromKugou] 只同步收藏 **id 集合**，[_favorites] 只含
+  /// App 内点红心的歌——直接用它会让「我喜欢」来源只显示本地红心的几首。
+  /// 这里按需拉取云端整表（listid 分页接口，与收藏页同口径）并缓存，
+  /// 会话内复用；红心增删后下次进入选择器前可置空缓存重新拉取。
+  Future<List<Song>> loadCloudFavoriteSongs() async {
+    if (_cloudFavoriteSongs != null) return _cloudFavoriteSongs!;
+    final playlist = await _getMyFavoritePlaylist();
+    if (playlist == null) return const [];
+    final api = KugouApiClient();
+    final songs = <Song>[];
+    final listid = playlist.listId;
+    if (listid.isNotEmpty) {
+      const int pageSize = 200;
+      for (int page = 1; page <= 50; page++) {
+        final r = await api.getPlaylistSongsByListid(
+          listid: listid,
+          page: page,
+          pagesize: pageSize,
+        );
+        if (r == null || r.songs.isEmpty) break;
+        songs.addAll(r.songs.map((s) => s.toSong()));
+        if (r.songs.length < pageSize) break;
+      }
+    } else {
+      // 回退：用 globalCollectionId 接口（与 _syncFavoritesFromKugou 同路径）
+      final gid = playlist.globalCollectionId ?? playlist.id;
+      if (gid.isNotEmpty) {
+        final result = await api.getPlaylistSongs(gid, pagesize: 500);
+        songs.addAll(
+            (result?.songs ?? const <KugouSongDetail>[]).map((s) => s.toSong()));
+      }
+    }
+    _cloudFavoriteSongs = songs;
+    notifyListeners();
+    return songs;
+  }
+
+  /// 红心变动后使云端整表缓存失效（下次加载选择器时重新拉取）。
+  void invalidateCloudFavoriteSongs() => _cloudFavoriteSongs = null;
+
   Future<void> _syncFavoritesFromKugou() async {
     try {
       final playlist = await _getMyFavoritePlaylist();
@@ -142,10 +186,12 @@ class FavoritesProvider extends ChangeNotifier {
       _favoriteIds.remove(song.id);
       _favorites.removeWhere((s) => s.id == song.id);
       await _repository.removeFavorite(song.id);
+      invalidateCloudFavoriteSongs();
     } else {
       _favoriteIds.add(song.id);
       _favorites.insert(0, song);
       await _repository.addFavorite(song);
+      invalidateCloudFavoriteSongs();
 
       if (isLoggedIn) {
         final data =
@@ -166,6 +212,7 @@ class FavoritesProvider extends ChangeNotifier {
     await _repository.removeFavorite(songId);
     _favoriteIds.remove(songId);
     _favorites.removeWhere((s) => s.id == songId);
+    invalidateCloudFavoriteSongs();
     notifyListeners();
   }
 

@@ -751,3 +751,26 @@ fn transport_error_with(msg: String) -> ModuleResponse {
         headers: HashMap::new(),
     }
 }
+
+/// 打开一个**不缓冲**的上游响应，交给调用方流式转发。
+///
+/// 与 `raw_get` / `raw_request` 的区别：这里不 `read_to_end`，避免 10MB 级
+/// 媒体在内存里驻留（上游缓冲 + tiny_http 响应体各一份）。
+/// 返回 `(状态码, Content-Length, Content-Type, reader)`。
+pub fn open_stream(
+    url: &str,
+) -> Result<(u16, Option<u64>, String, Box<dyn Read + Send + Sync + 'static>), String> {
+    let resp = agent().get(url).call().map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("status {}", status));
+    }
+    let len = resp
+        .header("Content-Length")
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let ct = resp
+        .header("Content-Type")
+        .unwrap_or("video/mp4")
+        .to_string();
+    Ok((status, len, ct, resp.into_reader()))
+}

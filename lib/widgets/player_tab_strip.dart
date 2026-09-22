@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// 播放器底部导航条的一个目标。
 class PlayerTabItem {

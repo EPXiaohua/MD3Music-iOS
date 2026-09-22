@@ -1,9 +1,11 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/utils/app_toast.dart';
 import '../../data/models/music_folder.dart';
 import '../../data/models/song.dart';
 import '../../providers/library_provider.dart';
+import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/app_animation.dart';
 import '../../widgets/song_list_item.dart';
@@ -59,6 +61,14 @@ class FolderSongsPage extends StatelessWidget {
 
   const FolderSongsPage({super.key, required this.folder});
 
+  /// 一起听房主在房间里：本地音乐不能本地起播（与 SongsPage 同口径）。
+  bool _blockedByRoomOwnership(BuildContext context) {
+    final session = context.read<ListenTogetherProvider>().session;
+    if (session == null || !session.isOwner) return false;
+    showToast('当前是「一起听」房主，房间里只能播放房间歌单中的在线歌曲', long: true);
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     final library = context.read<LibraryProvider>();
@@ -101,6 +111,7 @@ class FolderSongsPage extends StatelessWidget {
                         icon: const Icon(Icons.shuffle),
                         tooltip: '随机播放',
                         onPressed: () {
+                          if (_blockedByRoomOwnership(context)) return;
                           final shuffled = List<Song>.from(songs)..shuffle();
                           context.read<PlayerProvider>().playPlaylist(shuffled, 0);
                         },
@@ -115,6 +126,7 @@ class FolderSongsPage extends StatelessWidget {
                       return SongListItem(
                         song: songs[index],
                         onTap: () {
+                          if (_blockedByRoomOwnership(context)) return;
                           context
                               .read<PlayerProvider>()
                               .playPlaylist(songs, index);

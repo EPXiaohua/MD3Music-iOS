@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/theme/app_theme.dart';
 import 'package:md3music/data/models/song.dart';
@@ -104,10 +104,10 @@ class _FakePlayer extends PlayerProvider {
   }
 
   @override
-  Future<void> resume() async => resumeCalls++;
+  Future<void> resume({bool notifyRoom = true}) async => resumeCalls++;
 
   @override
-  Future<void> pause() async => pauseCalls++;
+  Future<void> pause({bool notifyRoom = true}) async => pauseCalls++;
 
   @override
   Future<void> playOnlinePlaylist(List<Song> songs, int startIndex) async {

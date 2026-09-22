@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// SharedPreferences 持久化 key：标记用户是否已完成引导。
 const String kOnboardingCompletedKey = 'onboarding_completed';

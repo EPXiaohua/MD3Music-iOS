@@ -1,5 +1,5 @@
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -25,6 +25,8 @@ class KugouSoundItem {
   final String? soundUrl;
   final int userCount;
   final int vpfSize;
+  final String sourceLabel;
+  final bool isFree;
 
   const KugouSoundItem({
     required this.id,
@@ -39,6 +41,8 @@ class KugouSoundItem {
     this.soundUrl,
     this.userCount = 0,
     this.vpfSize = 0,
+    this.sourceLabel = '社区',
+    this.isFree = true,
   });
 
   bool get isOfficial => classify == 2;
@@ -46,11 +50,25 @@ class KugouSoundItem {
   /// 是否带音效文件（会员专属音效不下发此字段）。
   bool get available => soundUrl != null && soundUrl!.isNotEmpty;
 
-  static KugouSoundItem? fromJson(dynamic json) {
+  static KugouSoundItem? fromJson(
+    dynamic json, {
+    String source = '社区',
+    String? fallbackTag,
+  }) {
     if (json is! Map) return null;
     String str(String key) {
       final v = json[key];
       return v == null ? '' : v.toString();
+    }
+
+    final nested = json['sound'];
+    final soundMap = nested is Map ? nested : null;
+    String value(String key) {
+      final rawTop = json[key];
+      final top = rawTop is Map || rawTop is List ? '' : str(key);
+      if (top.isNotEmpty) return top;
+      final inner = soundMap?[key];
+      return inner == null ? '' : inner.toString();
     }
 
     final labels = <String>[];
@@ -60,21 +78,51 @@ class KugouSoundItem {
         if (l != null && l.toString().isNotEmpty) labels.add(l.toString());
       }
     }
+    final id =
+        int.tryParse(value('id')) ??
+        int.tryParse(str('model_id')) ??
+        int.tryParse(str('brand_id')) ??
+        0;
+    final name = value('name').isNotEmpty ? value('name') : str('model');
+    final soundUrl = value('sound');
+    final privilege = int.tryParse(value('privilege'));
+    final unlocked = int.tryParse(str('is_unlocked'));
+    final free =
+        (privilege == null || privilege == 0) &&
+        (unlocked == null || unlocked != 0) &&
+        soundUrl.isNotEmpty;
+    final icon = value('icon_url').isNotEmpty
+        ? value('icon_url')
+        : (str('model_icon').isNotEmpty ? str('model_icon') : str('logo'));
     return KugouSoundItem(
-      id: int.tryParse(str('id')) ?? 0,
-      name: str('name'),
-      classify: int.tryParse(str('classify')) ?? 3,
-      tagName: str('tag_name'),
-      author: str('author'),
+      id: id,
+      name: name,
+      classify: int.tryParse(str('classify')) ?? (source == '明星' ? 1 : 3),
+      tagName: str('tag_name').isNotEmpty
+          ? str('tag_name')
+          : (fallbackTag ?? source),
+      author: str('author').isNotEmpty ? str('author') : str('brand_name'),
       authorHeader: str('author_header').isEmpty ? null : str('author_header'),
-      intro: str('intro'),
+      intro: str('intro').isNotEmpty ? str('intro') : str('model'),
       labels: labels,
-      iconUrl: str('icon_url').isEmpty ? null : str('icon_url'),
-      soundUrl: str('sound').isEmpty ? null : str('sound'),
+      iconUrl: icon.isEmpty ? null : icon,
+      soundUrl: soundUrl.isEmpty ? null : soundUrl,
       userCount: int.tryParse(str('user_count')) ?? 0,
       vpfSize: int.tryParse(str('vpfsize')) ?? 0,
+      sourceLabel: source,
+      isFree: free,
     );
   }
+}
+
+enum _SoundCatalog { community, artist, earphone }
+
+class _EffectBrand {
+  final int id;
+  final String name;
+  final String? logo;
+
+  const _EffectBrand({required this.id, required this.name, this.logo});
 }
 
 /// 使用人数格式化：95439187 → "9543.9万"，120000000 → "1.2亿"。
@@ -106,6 +154,9 @@ class _SoundsPageState extends State<SoundsPage> {
   int _sort = 3; // 固定最热排序
   int? _classify; // null=全部 2=蝰蛇官方 3=社区
   String? _tag; // null=全部分类
+  _SoundCatalog _catalog = _SoundCatalog.community;
+  List<_EffectBrand> _brands = [];
+  int? _selectedBrandId;
 
   List<KugouSoundItem> _items = [];
   int _page = 1;
@@ -162,11 +213,89 @@ class _SoundsPageState extends State<SoundsPage> {
     if (resp == null || resp['status'] != 1) return [];
     final data = resp['data'];
     if (data is! List) return [];
+    return _parseList(data);
+  }
+
+  List<KugouSoundItem> _parseList(List<dynamic> data, {String? source}) {
     final out = <KugouSoundItem>[];
     for (final e in data) {
-      final item = KugouSoundItem.fromJson(e);
-      // 过滤会员专属（无音效文件）与无效条目
-      if (item != null && item.id > 0 && item.available) out.add(item);
+      final item = KugouSoundItem.fromJson(e, source: source ?? _catalogLabel);
+      // 过滤会员专属、仅 VPF 配置以及无效条目。
+      if (item != null && item.id > 0 && item.available && item.isFree) {
+        out.add(item);
+      }
+    }
+    return out;
+  }
+
+  String get _catalogLabel {
+    switch (_catalog) {
+      case _SoundCatalog.community:
+        return '社区';
+      case _SoundCatalog.artist:
+        return '明星';
+      case _SoundCatalog.earphone:
+        return '耳机';
+    }
+  }
+
+  List<_EffectBrand> _parseBrands(Map<String, dynamic>? resp) {
+    final data = resp?['data'];
+    final values = <dynamic>[];
+    if (data is Map) {
+      final hot = data['hot_list'];
+      if (hot is List) values.addAll(hot);
+      for (final entry in data.entries) {
+        if (entry.key != 'hot_list' && entry.value is List) {
+          values.addAll(entry.value as List);
+        }
+      }
+    } else if (data is List) {
+      values.addAll(data);
+    }
+    final seen = <int>{};
+    final result = <_EffectBrand>[];
+    for (final raw in values) {
+      if (raw is! Map) continue;
+      final id = int.tryParse('${raw['brand_id'] ?? raw['id'] ?? ''}') ?? 0;
+      final name = '${raw['brand'] ?? raw['brand_name'] ?? raw['name'] ?? ''}';
+      if (id > 0 && name.isNotEmpty && seen.add(id)) {
+        result.add(
+          _EffectBrand(
+            id: id,
+            name: name,
+            logo: '${raw['logo'] ?? ''}'.trim().isEmpty
+                ? null
+                : '${raw['logo']}',
+          ),
+        );
+      }
+    }
+    return result;
+  }
+
+  List<KugouSoundItem> _parseNestedBrandItems(
+    Map<String, dynamic>? resp, {
+    required String source,
+  }) {
+    final data = resp?['data'];
+    if (data is! Map || data['list'] is! List) return [];
+    return _parseList(data['list'] as List<dynamic>, source: source);
+  }
+
+  List<KugouSoundItem> _parseMatchedItems(Map<String, dynamic>? resp) {
+    final common = resp?['data'];
+    if (common is! Map) return [];
+    final out = <KugouSoundItem>[];
+    for (final key in ['common', 'earphone', 'brand']) {
+      final item = common[key];
+      final parsed = KugouSoundItem.fromJson(item, source: '耳机');
+      if (parsed != null &&
+          parsed.id > 0 &&
+          parsed.available &&
+          parsed.isFree) {
+        out.add(parsed);
+      }
     }
     return out;
   }
@@ -176,22 +305,127 @@ class _SoundsPageState extends State<SoundsPage> {
       _loading = true;
       _page = 1;
       _hasMore = true;
+      _selectedBrandId = null;
     });
-    final resp = await _api.getSoundModel(sort: _sort, page: 1, pagesize: 30);
-    final list = _parseItems(resp);
+    List<KugouSoundItem> list = [];
+    List<_EffectBrand> brands = [];
+    bool hasMore = true;
+    if (_catalog == _SoundCatalog.community) {
+      list = _parseItems(
+        await _api.getSoundModel(sort: _sort, page: 1, pagesize: 30),
+      );
+    } else if (_catalog == _SoundCatalog.artist) {
+      list = _parseItems(await _api.getArtistEffects(page: 1, pagesize: 30));
+    } else if (_catalog == _SoundCatalog.earphone) {
+      final responses = await Future.wait([
+        _api.getEffectBrands(pagesize: 100),
+        _api.getEffectMatch(),
+      ]);
+      brands = _parseBrands(responses[0]);
+      list = await _loadAllEarphoneItems(brands, responses[1]);
+      hasMore = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      _items = list;
+      _brands = brands;
+      _loading = false;
+      _hasMore = hasMore && list.length >= 30;
+    });
+  }
+
+  /// “全部”耳机分类：汇总所有品牌下发的免费音效，并按音效 ID 去重。
+  Future<List<KugouSoundItem>> _loadAllEarphoneItems(
+    List<_EffectBrand> brands,
+    Map<String, dynamic>? matched,
+  ) async {
+    final responses = <Map<String, dynamic>?>[];
+    // 分批请求，避免首次打开“全部”时同时建立几十个连接。
+    for (var i = 0; i < brands.length; i += 8) {
+      final batch = brands.skip(i).take(8);
+      responses.addAll(
+        await Future.wait(
+          batch.map(
+            (brand) => _api.getEffectBrandDetail(
+              brandId: brand.id,
+              page: 1,
+              pagesize: 1000,
+            ),
+          ),
+        ),
+      );
+    }
+    final items = _parseMatchedItems(matched);
+    for (final response in responses) {
+      items.addAll(_parseNestedBrandItems(response, source: '耳机'));
+    }
+    final known = <int>{};
+    return items.where((item) => known.add(item.id)).toList();
+  }
+
+  Future<void> _switchCatalog(_SoundCatalog catalog) async {
+    if (_catalog == catalog) return;
+    setState(() {
+      _catalog = catalog;
+      _classify = null;
+      _tag = null;
+      _items = [];
+      _brands = [];
+      _selectedBrandId = null;
+    });
+    await _refresh();
+  }
+
+  Future<void> _selectBrand(int? brandId) async {
+    setState(() {
+      _selectedBrandId = brandId;
+      _loading = true;
+      _page = 1;
+      _hasMore = true;
+    });
+    final list = brandId == null
+        ? await _loadAllEarphoneItems(_brands, await _api.getEffectMatch())
+        : _parseNestedBrandItems(
+            await _api.getEffectBrandDetail(
+              brandId: brandId,
+              page: 1,
+              pagesize: 30,
+            ),
+            source: '耳机',
+          );
     if (!mounted) return;
     setState(() {
       _items = list;
       _loading = false;
-      _hasMore = list.length >= 30;
+      _hasMore = brandId != null && list.length >= 30;
     });
   }
 
   Future<void> _loadMore() async {
+    if (_catalog == _SoundCatalog.earphone && _selectedBrandId == null) {
+      return;
+    }
     setState(() => _loadingMore = true);
     final next = _page + 1;
-    final resp = await _api.getSoundModel(sort: _sort, page: next, pagesize: 30);
-    final list = _parseItems(resp);
+    final resp = switch (_catalog) {
+      _SoundCatalog.community => await _api.getSoundModel(
+        sort: _sort,
+        page: next,
+        pagesize: 30,
+      ),
+      _SoundCatalog.artist => await _api.getArtistEffects(
+        page: next,
+        pagesize: 30,
+      ),
+      _SoundCatalog.earphone => await _api.getEffectBrandDetail(
+        brandId: _selectedBrandId!,
+        page: next,
+        pagesize: 30,
+      ),
+    };
+    final list = _catalog == _SoundCatalog.earphone
+        ? _parseNestedBrandItems(resp, source: '耳机')
+        : _parseItems(resp);
     if (!mounted) return;
     setState(() {
       _loadingMore = false;
@@ -217,11 +451,24 @@ class _SoundsPageState extends State<SoundsPage> {
     return list;
   }
 
+  List<String> get _availableTags {
+    final tags = _items
+        .where((item) => _classify == null || item.classify == _classify)
+        .map((item) => item.tagName)
+        .where((tag) => tag.isNotEmpty)
+        .toSet();
+    return [
+      ..._kTagOrder.where(tags.contains),
+      ...tags.where((tag) => !_kTagOrder.contains(tag)),
+    ];
+  }
+
   bool _matches(KugouSoundItem it, String kw) {
     final k = kw.toLowerCase();
-    final hay = '${it.name} ${it.author} ${it.tagName} '
-            '${it.labels.join(' ')} ${it.intro}'
-        .toLowerCase();
+    final hay =
+        '${it.name} ${it.author} ${it.tagName} '
+                '${it.labels.join(' ')} ${it.intro}'
+            .toLowerCase();
     return hay.contains(k);
   }
 
@@ -237,9 +484,15 @@ class _SoundsPageState extends State<SoundsPage> {
       _searchResults = [];
     });
     final results = <int, KugouSoundItem>{};
-    for (int p = 1; p <= 6; p++) {
-      final resp =
-          await _api.getSoundModel(sort: _sort, page: p, pagesize: 50);
+    if (_catalog == _SoundCatalog.earphone) {
+      for (final it in _items) {
+        if (_matches(it, keyword)) results.putIfAbsent(it.id, () => it);
+      }
+    }
+    for (int p = 1; p <= 6 && _catalog != _SoundCatalog.earphone; p++) {
+      final resp = _catalog == _SoundCatalog.artist
+          ? await _api.getArtistEffects(page: p, pagesize: 50)
+          : await _api.getSoundModel(sort: _sort, page: p, pagesize: 50);
       final list = _parseItems(resp);
       if (list.isEmpty) break;
       for (final it in list) {
@@ -362,9 +615,9 @@ class _SoundsPageState extends State<SoundsPage> {
       return Center(
         child: Text(
           '在热门/最新榜单中搜索音效',
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: cs.onSurfaceVariant,
-              ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
         ),
       );
     }
@@ -372,9 +625,9 @@ class _SoundsPageState extends State<SoundsPage> {
       return Center(
         child: Text(
           '未找到与「$_searchKeyword」相关的音效',
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: cs.onSurfaceVariant,
-              ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
         ),
       );
     }
@@ -385,18 +638,19 @@ class _SoundsPageState extends State<SoundsPage> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
           child: Text(
             '匹配到 ${_searchResults.length} 个音效',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: cs.onSurfaceVariant,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
           ),
         ),
-        for (final it in _searchResults) _SoundTile(
-          item: it,
-          applied: _appliedId == it.id,
-          onApply: () => _apply(it),
-          onUnapply: _unapply,
-          onTap: () => _showDetail(it),
-        ),
+        for (final it in _searchResults)
+          _SoundTile(
+            item: it,
+            applied: _appliedId == it.id,
+            onApply: () => _apply(it),
+            onUnapply: _unapply,
+            onTap: () => _showDetail(it),
+          ),
       ],
     );
   }
@@ -410,7 +664,9 @@ class _SoundsPageState extends State<SoundsPage> {
       controller: _scrollController,
       slivers: [
         SliverToBoxAdapter(child: _buildFilterPanel(cs)),
-        if (_tag == null && _classify == null)
+        if (_catalog == _SoundCatalog.community &&
+            _tag == null &&
+            _classify == null)
           ..._buildGroupedSlivers(list)
         else
           SliverList(
@@ -426,31 +682,29 @@ class _SoundsPageState extends State<SoundsPage> {
                   child: Center(child: M3ELoadingIndicator()),
                 )
               : (_hasMore
-                  ? const SizedBox(height: 24)
-                  : Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Center(
-                        child: Text(
-                          list.isEmpty ? '暂无音效' : '没有更多了',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
-                              ?.copyWith(color: cs.onSurfaceVariant),
+                    ? const SizedBox(height: 24)
+                    : Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Center(
+                          child: Text(
+                            list.isEmpty ? '暂无音效' : '没有更多了',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: cs.onSurfaceVariant),
+                          ),
                         ),
-                      ),
-                    )),
+                      )),
         ),
       ],
     );
   }
 
   Widget _tileFor(KugouSoundItem it) => _SoundTile(
-        item: it,
-        applied: _appliedId == it.id,
-        onApply: () => _apply(it),
-        onUnapply: _unapply,
-        onTap: () => _showDetail(it),
-      );
+    item: it,
+    applied: _appliedId == it.id,
+    onApply: () => _apply(it),
+    onUnapply: _unapply,
+    onTap: () => _showDetail(it),
+  );
 
   /// 全部分类时按分类分组展示，归类清晰。
   List<Widget> _buildGroupedSlivers(List<KugouSoundItem> list) {
@@ -472,16 +726,13 @@ class _SoundsPageState extends State<SoundsPage> {
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
             child: Row(
               children: [
-                Text(
-                  tag,
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
+                Text(tag, style: Theme.of(context).textTheme.titleSmall),
                 const SizedBox(width: 8),
                 Text(
                   '${items.length}',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ],
             ),
@@ -507,47 +758,118 @@ class _SoundsPageState extends State<SoundsPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SegmentedButton<int?>(
-            segments: const [
-              ButtonSegment(value: null, label: Text('全部')),
-              ButtonSegment(value: 2, label: Text('蝰蛇官方')),
-              ButtonSegment(value: 3, label: Text('社区')),
-            ],
-            selected: {_classify},
-            onSelectionChanged: (v) => setState(() => _classify = v.first),
-          ),
-          const SizedBox(height: 8),
           SizedBox(
             height: 40,
             child: ListView(
               scrollDirection: Axis.horizontal,
               children: [
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: FilterChip(
-                    label: const Text('全部分类'),
-                    selected: _tag == null,
-                    onSelected: (_) => setState(() => _tag = null),
-                  ),
-                ),
-                for (final t in _kTagOrder)
+                for (final entry in const [
+                  (_SoundCatalog.community, '社区/蝰蛇'),
+                  (_SoundCatalog.artist, '明星'),
+                  (_SoundCatalog.earphone, '耳机'),
+                ])
                   Padding(
                     padding: const EdgeInsets.only(right: 8),
-                    child: FilterChip(
-                      label: Text(t),
-                      selected: _tag == t,
-                      onSelected: (_) => setState(() => _tag = t),
+                    child: ChoiceChip(
+                      label: Text(entry.$2),
+                      selected: _catalog == entry.$1,
+                      onSelected: (_) => _switchCatalog(entry.$1),
                     ),
                   ),
               ],
             ),
           ),
+          if (_catalog == _SoundCatalog.earphone) ...[
+            const SizedBox(height: 8),
+            if (_brands.isEmpty)
+              Text(
+                '暂无品牌数据',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+              )
+            else
+              SizedBox(
+                height: 40,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: const Text('全部'),
+                        selected: _selectedBrandId == null,
+                        onSelected: (_) => _selectBrand(null),
+                      ),
+                    ),
+                    for (final brand in _brands)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: FilterChip(
+                          avatar: brand.logo == null
+                              ? null
+                              : CircleAvatar(
+                                  backgroundImage: CachedNetworkImageProvider(
+                                    brand.logo!,
+                                  ),
+                                ),
+                          label: Text(brand.name),
+                          selected: _selectedBrandId == brand.id,
+                          onSelected: (_) => _selectBrand(brand.id),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+          ],
+          if (_catalog == _SoundCatalog.community) ...[
+            const SizedBox(height: 8),
+            SegmentedButton<int?>(
+              segments: const [
+                ButtonSegment(value: null, label: Text('全部')),
+                ButtonSegment(value: 2, label: Text('蝰蛇官方')),
+                ButtonSegment(value: 3, label: Text('社区')),
+              ],
+              selected: {_classify},
+              onSelectionChanged: (v) => setState(() {
+                _classify = v.first;
+                _tag = null;
+              }),
+            ),
+          ],
+          const SizedBox(height: 8),
+          if (_catalog == _SoundCatalog.community)
+            SizedBox(
+              height: 40,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: FilterChip(
+                      label: const Text('全部分类'),
+                      selected: _tag == null,
+                      onSelected: (_) => setState(() => _tag = null),
+                    ),
+                  ),
+                  for (final t in _availableTags)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: Text(t),
+                        selected: _tag == t,
+                        onSelected: (_) => setState(() => _tag = t),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           const SizedBox(height: 4),
           Text(
-            '已过滤需会员的音效；应用即时生效并持久化，重启后自动恢复。',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: cs.onSurfaceVariant,
-                ),
+            '已过滤需会员或仅 VPF 的音效；应用即时生效并持久化，重启后自动恢复。',
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
           ),
         ],
       ),
@@ -574,22 +896,20 @@ class _SoundsPageState extends State<SoundsPage> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(item.name,
-                            style: Theme.of(context).textTheme.titleMedium),
+                        Text(
+                          item.name,
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
                         const SizedBox(height: 4),
                         Text(
-                          '${item.isOfficial ? '蝰蛇官方' : '社区'} · ${item.tagName} · ${item.author}',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          '${item.sourceLabel} · ${item.tagName} · ${item.author}',
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: cs.onSurfaceVariant),
                         ),
                         const SizedBox(height: 4),
                         Text(
                           '${_formatUserCount(item.userCount)}人使用',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: cs.onSurfaceVariant),
                         ),
                       ],
@@ -614,10 +934,7 @@ class _SoundsPageState extends State<SoundsPage> {
               ],
               if (item.intro.isNotEmpty) ...[
                 const SizedBox(height: 12),
-                Text(
-                  item.intro,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
+                Text(item.intro, style: Theme.of(context).textTheme.bodySmall),
               ],
               const SizedBox(height: 20),
               SizedBox(
@@ -665,7 +982,11 @@ class _SoundIcon extends StatelessWidget {
           color: cs.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(12),
         ),
-        child: Icon(Icons.spatial_audio_off, size: size * 0.5, color: cs.primary),
+        child: Icon(
+          Icons.spatial_audio_off,
+          size: size * 0.5,
+          color: cs.primary,
+        ),
       );
     }
     return ClipRRect(
@@ -677,8 +998,11 @@ class _SoundIcon extends StatelessWidget {
         fit: BoxFit.cover,
         errorWidget: (_, _, _) => Container(
           color: cs.surfaceContainerHighest,
-          child:
-              Icon(Icons.spatial_audio_off, size: size * 0.5, color: cs.primary),
+          child: Icon(
+            Icons.spatial_audio_off,
+            size: size * 0.5,
+            color: cs.primary,
+          ),
         ),
       ),
     );
@@ -730,7 +1054,9 @@ class _SoundTile extends StatelessWidget {
                         Container(
                           margin: const EdgeInsets.only(left: 6),
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
                           decoration: BoxDecoration(
                             color: cs.primaryContainer,
                             borderRadius: BorderRadius.circular(6),
@@ -747,12 +1073,12 @@ class _SoundTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    '${item.tagName} · ${item.author} · ${_formatUserCount(item.userCount)}人使用',
+                    '${item.sourceLabel} · ${item.tagName} · ${item.author} · ${_formatUserCount(item.userCount)}人使用',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: cs.onSurfaceVariant,
-                        ),
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
                   ),
                 ],
               ),

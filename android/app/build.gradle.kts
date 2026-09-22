@@ -117,6 +117,8 @@ dependencies {
     // media3-common 为单一 maven 源（fork 同版本 1.4.1），此处显式依赖以便编译期可见
     // （fork 用 implementation 隐藏了传递依赖）。session/exoplayer 仍是 fork 本地源码，勿加 maven。
     implementation("androidx.media3:media3-common:1.4.1")
+    // 2×2 封面小部件：从专辑封面位图提取主色（vibrant/dominant swatch）
+    implementation("androidx.palette:palette-ktx:1.0.0")
 
     // USB 独占数据路径（UsbDither / UsbAudioStream.writeRaw）的 JVM 单元测试
     testImplementation("junit:junit:4.13.2")

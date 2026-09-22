@@ -348,10 +348,12 @@ class AudioService {
   Future<void> _applyGain(double gainDb) async {
     final boost = gainDb > 0 ? gainDb : 0.0;
     _vnAttenLinear = gainDb < 0 ? math.pow(10, gainDb / 20).toDouble() : 1.0;
-    // effect 默认 disabled，需先 enable 才真正生效（未激活时仅记录标志，加载后应用）
+    // 没有正增益时不需要 LoudnessEnhancer。始终启用 0 dB enhancer 会让
+    // 小米等 ROM 把它加入音效链；反复切歌时可能与系统/用户均衡器叠加，
+    // 表现为音量突然变大。负增益已经折进播放器音量，同样保持 enhancer 关闭。
     try {
-      await _mainEnhancer.setEnabled(true);
       await _mainEnhancer.setTargetGain(boost);
+      await _mainEnhancer.setEnabled(_vnEnabled && boost > 0);
     } catch (e) {
       // ignore: avoid_print
       print('[音量均衡] enhancer apply failed: $e');
@@ -678,10 +680,17 @@ class AudioService {
     await _activePlayer.seek(position);
   }
 
+  /// 加载单源 URL。
+  ///
+  /// [initialPosition] 与 [setPlaylist] 同口径：交给平台层在 prepare 阶段
+  /// 一次性定位，**不存在 seek 竞态**。传 null/zero 表示从头播。
+  /// **不要**改成「加载后轮询等 ready 再 seek()」：`just_audio.seek()` 在
+  /// `ProcessingState.loading` 时静默丢弃，超时分支落在这个状态就会从头播。
   Future<void> setUrl(
     String url, {
     double? loudnessLufs,
     double? loudnessPeakDb,
+    Duration? initialPosition,
   }) async {
     abortCrossfade();
     // 音量均衡响度：歌曲未带响度时，回退查「url → 响度」缓存（KugouPlayUrl 解析时记录）
@@ -692,7 +701,11 @@ class AudioService {
     }
     _vnLufs = loudnessLufs;
     _vnPeakDb = loudnessPeakDb;
-    await _activePlayer.setUrl(url, headers: const {});
+    await _activePlayer.setUrl(
+      url,
+      headers: const {},
+      initialPosition: initialPosition ?? Duration.zero,
+    );
     await _applyNormalizationGainActive();
   }
 
@@ -705,9 +718,16 @@ class AudioService {
     await _activePlayer.setVolume(_userVolume * _vnAttenLinear);
   }
 
+  /// [initialPosition] 在平台层 prepare 时一次性定位，**不存在 seek 竞态**。
+  ///
+  /// 必须用它而不是「加载完再 `seek()`」：`just_audio.seek()` 在
+  /// `ProcessingState.loading` 时**直接 return 静默丢弃**（见 just_audio.dart
+  /// `seek()` 的 switch），因此依赖「等 ready 再 seek」的写法仍会偶发失效
+  /// （Media3 在未播放时不保证自行进入 ready）。见铁律 18。
   Future<void> setPlaylist(
     List<UriAudioSource> sources, {
     int startIndex = 0,
+    Duration? initialPosition,
   }) async {
     abortCrossfade();
     // 每次新建实例：一个 ConcatenatingAudioSource 不能同时 attach 到两个
@@ -720,7 +740,7 @@ class AudioService {
     await _activePlayer.setAudioSource(
       playlistSource,
       initialIndex: startIndex,
-      initialPosition: Duration.zero,
+      initialPosition: initialPosition ?? Duration.zero,
     );
   }
 
@@ -1040,7 +1060,7 @@ class AudioService {
       });
     }
     // ignore: discarded_futures
-    _activePlayer.setVolume(_userVolume);
+    _activePlayer.setVolume(_userVolume * _vnAttenLinear);
   }
 
   /// 回收淡出结束的播放器：pause + seek(0)，**绝不 stop()**。
@@ -1057,7 +1077,7 @@ class AudioService {
     } catch (_) {}
     // 恢复音量，供它下次作为淡入方使用
     try {
-      await p.setVolume(_userVolume);
+      await p.setVolume(_userVolume * _vnAttenLinear);
     } catch (_) {}
   }
 

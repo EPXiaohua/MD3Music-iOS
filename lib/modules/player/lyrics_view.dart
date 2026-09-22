@@ -1,12 +1,15 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
+import '../../widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/md3_lyric_preferences.dart';
 
 class LyricsView extends StatefulWidget {
   final String lyrics;
+  /// 已解析的结构化歌词，仅用于补充翻译/罗马音副行。
+  final List<LyricLine>? parsedLyrics;
   /// 静态初始位置（未提供 [positionListenable] 时使用）
   final Duration position;
   /// 播放位置 listenable：提供后内部订阅，仅当前行变化时重建歌词，
@@ -21,6 +24,7 @@ class LyricsView extends StatefulWidget {
   const LyricsView({
     super.key,
     required this.lyrics,
+    this.parsedLyrics,
     required this.position,
     required this.onSeek,
     this.positionListenable,
@@ -35,6 +39,8 @@ class LyricsView extends StatefulWidget {
 class LyricsViewState extends State<LyricsView> {
   final ScrollController _scrollController = ScrollController();
   List<_LyricLine> _parsedLyrics = [];
+  bool _hasTranslation = false;
+  bool _hasRoma = false;
   int _currentLineIndex = -1;
   bool _forceScroll = false;
   /// 内部生效的当前位置：由 [LyricsView.position] 或 [positionListenable] 提供
@@ -142,7 +148,12 @@ class LyricsViewState extends State<LyricsView> {
     if (widget.positionListenable == null) {
       _effPosition = widget.position;
     }
-    if (oldWidget.lyrics != widget.lyrics) {
+    final metadataChanged = !identical(
+          oldWidget.parsedLyrics,
+          widget.parsedLyrics,
+        ) &&
+        !listEquals(oldWidget.parsedLyrics, widget.parsedLyrics);
+    if (oldWidget.lyrics != widget.lyrics || metadataChanged) {
       _parseLyrics();
       _currentLineIndex = -1;
       _forceScroll = true;
@@ -179,6 +190,8 @@ class LyricsViewState extends State<LyricsView> {
   void _parseLyrics() {
     _layoutDirty = true;
     _parsedLyrics = [];
+    _hasTranslation = false;
+    _hasRoma = false;
     if (widget.lyrics.isEmpty) return;
 
     final lines = widget.lyrics.split('\n');
@@ -188,8 +201,14 @@ class LyricsViewState extends State<LyricsView> {
     final lrcTimestampRegex = RegExp(r'\[(\d{2}):(\d{2})\.(\d{2,3})\]');
     // KRC 行首: [start_ms,duration_ms]  后跟 <offset,duration[,property]>word
     final krcLineRegex = RegExp(r'^\[(\d+),(\d+)\](.*)$');
-    // KRC 词时间标签：<offset,duration> 或 <offset,duration,property>
-    final krcWordTag = RegExp(r'<(-?\d+),(-?\d+)(?:,-?\d+)?>');
+    // KRC 词时间标签：<offset,duration[,property...]>。
+    // 兼容本地文件中出现的多字段扩展标签，避免标签原样显示。
+    final krcWordTag = RegExp(r'<-?\d+(?:,-?\d+)+>');
+    // 增强型 LRC 逐字标签：<mm:ss.xx>。MD3 只显示普通行文本，
+    // 因此在保留行首时间戳的同时剥离内层逐字标签。
+    final inlineLyricTag = RegExp(
+      r'<(?:\d{1,3}:\d{2}\.\d{2,3}|-?\d+(?:,-?\d+)+)>',
+    );
     // LRC offset 标签: [offset:+/-xxx]
     final offsetRegex = RegExp(r'^\[offset:([+-]?\d+)\]');
 
@@ -256,7 +275,8 @@ class LyricsViewState extends State<LyricsView> {
         final millis = millisStr.length == 2
             ? int.parse(millisStr) * 10
             : int.parse(millisStr);
-        final text = lrcMatch.group(4)?.trim() ?? '';
+        final text =
+            lrcMatch.group(4)?.replaceAll(inlineLyricTag, '').trim() ?? '';
         _parsedLyrics.add(
           _LyricLine(
             timestamp: Duration(
@@ -290,12 +310,50 @@ class LyricsViewState extends State<LyricsView> {
           _parsedLyrics.last = _LyricLine(
             timestamp: _parsedLyrics.last.timestamp,
             text: '${_parsedLyrics.last.text}$stripped',
+            translation: _parsedLyrics.last.translation,
+            roma: _parsedLyrics.last.roma,
           );
         }
       }
     }
 
     _parsedLyrics.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    _mergeParsedMetadata();
+    _hasTranslation = _parsedLyrics.any(
+      (line) => line.translation != null && line.translation!.isNotEmpty,
+    );
+    _hasRoma = _parsedLyrics.any(
+      (line) => line.roma != null && line.roma!.isNotEmpty,
+    );
+  }
+
+  /// 将统一歌词模型中的翻译/罗马音合并到原有 MD3 主行。
+  ///
+  /// 主行仍由本文件原有的 LRC/KRC 解析器生成；结构化模型只按时间戳补充
+  /// 副行。相同时间戳按出现顺序匹配，轻微精度差异允许 500ms 容差。
+  void _mergeParsedMetadata() {
+    final metadata = widget.parsedLyrics;
+    if (metadata == null || metadata.isEmpty || _parsedLyrics.isEmpty) return;
+
+    final used = <int>{};
+    for (final line in _parsedLyrics) {
+      var bestIndex = -1;
+      var bestDelta = 501;
+      for (var i = 0; i < metadata.length; i++) {
+        if (used.contains(i)) continue;
+        final delta =
+            (metadata[i].startTime - line.timestamp.inMilliseconds).abs();
+        if (delta <= 500 && delta < bestDelta) {
+          bestIndex = i;
+          bestDelta = delta;
+        }
+      }
+      if (bestIndex < 0) continue;
+      used.add(bestIndex);
+      final source = metadata[bestIndex];
+      line.translation = source.translation;
+      line.roma = source.roma;
+    }
   }
 
   void _updateCurrentLine() {
@@ -374,11 +432,10 @@ class LyricsViewState extends State<LyricsView> {
     // 行间留白：把单行行距补足到 fontSize * lineSpacing（不足则为 0）
     final spacingExtra = fontSize * (_prefs.lineSpacing - wrapHeight);
     final safeSpacing = spacingExtra > 0 ? spacingExtra : 0.0;
-    final minRowHeight = fontSize * wrapHeight + safeSpacing;
     _lineHeights = List<double>.generate(n, (i) {
-      final text = _parsedLyrics[i].text;
-      // 空行显示 '...' 占位，按单行处理
-      if (text.isEmpty) return minRowHeight;
+      final text = _parsedLyrics[i].text.isEmpty
+          ? '...'
+          : _parsedLyrics[i].text;
       final painter = TextPainter(
         text: TextSpan(
           text: text,
@@ -396,7 +453,29 @@ class LyricsViewState extends State<LyricsView> {
         0,
         (sum, m) => sum + m.height,
       );
-      return blockHeight + safeSpacing;
+      final auxiliaryText = _selectedAuxiliaryText(_parsedLyrics[i]);
+      var auxiliaryHeight = 0.0;
+      if (auxiliaryText != null) {
+        final auxiliaryPainter = TextPainter(
+          text: TextSpan(
+            text: auxiliaryText,
+            style: TextStyle(
+              fontSize: _auxiliaryFontSize(fontSize),
+              height: _auxiliaryLineHeight,
+              fontWeight: _prefs.otherFontWeight,
+              fontFamily: fontFamily,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout(maxWidth: width);
+        auxiliaryHeight =
+            auxiliaryPainter.computeLineMetrics().fold<double>(
+              0,
+              (sum, m) => sum + m.height,
+            ) +
+            _auxiliaryFontSize(fontSize) * 0.25;
+      }
+      return blockHeight + auxiliaryHeight + safeSpacing;
     });
 
     _lineTopOffsets = List<double>.filled(n, 0);
@@ -419,6 +498,29 @@ class LyricsViewState extends State<LyricsView> {
 
   /// 换行内部行距下限（避免英文 descenders 被裁切）
   static const double _minWrapLineHeight = 1.4;
+
+  double _auxiliaryFontSize(double fontSize) {
+    final scaled = fontSize * 0.7;
+    return scaled > 12 ? scaled : 12;
+  }
+
+  static const double _auxiliaryLineHeight = 1.4;
+
+  String? _selectedAuxiliaryText(_LyricLine line) {
+    if (!_prefs.showAuxiliary) return null;
+    final preferred = _prefs.displayMode;
+    final mode = preferred == Md3LyricDisplayMode.translation
+        ? (_hasTranslation
+              ? Md3LyricDisplayMode.translation
+              : Md3LyricDisplayMode.roma)
+        : (_hasRoma
+              ? Md3LyricDisplayMode.roma
+              : Md3LyricDisplayMode.translation);
+    final text = mode == Md3LyricDisplayMode.translation
+        ? line.translation
+        : line.roma;
+    return text == null || text.isEmpty ? null : text;
+  }
 
   void _onLineTap(int index) {
     if (index < _parsedLyrics.length) {
@@ -478,6 +580,8 @@ class LyricsViewState extends State<LyricsView> {
               itemBuilder: (context, index) {
                 final isCurrent = index == _currentLineIndex;
                 final line = _parsedLyrics[index];
+                final auxiliaryText = _selectedAuxiliaryText(line);
+                final auxiliaryFontSize = _auxiliaryFontSize(fontSize);
 
                 return GestureDetector(
                   onTap: widget.doubleTapToJump
@@ -490,26 +594,54 @@ class LyricsViewState extends State<LyricsView> {
                     // 行高随换行自适应（1 行或 2 行），不再裁切长歌词
                     height: _lineHeights[index],
                     alignment: Alignment.center,
-                    child: AnimatedDefaultTextStyle(
-                      duration: const Duration(milliseconds: 200),
-                      curve: Curves.easeInOut,
-                      style: DefaultTextStyle.of(context).style.copyWith(
-                        fontSize: isCurrent ? fontSize : otherFontSize,
-                        fontWeight: isCurrent
-                            ? prefs.fontWeight
-                            : prefs.otherFontWeight,
-                        fontFamily: fontFamily,
-                        color: isCurrent
-                            ? colorScheme.primary
-                            : colorScheme.onSurfaceVariant,
-                        // 与 _ensureLayout 的测量保持一致（换行内部行距）
-                        height: _wrapLineHeight,
-                      ),
-                      child: Text(
-                        line.text.isEmpty ? '...' : line.text,
-                        textAlign: TextAlign.center,
-                        // 不截断：英文原词+翻译超长时完整换行显示
-                      ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AnimatedDefaultTextStyle(
+                          duration: const Duration(milliseconds: 200),
+                          curve: Curves.easeInOut,
+                          style: DefaultTextStyle.of(context).style.copyWith(
+                            fontSize: isCurrent ? fontSize : otherFontSize,
+                            fontWeight: isCurrent
+                                ? prefs.fontWeight
+                                : prefs.otherFontWeight,
+                            fontFamily: fontFamily,
+                            color: isCurrent
+                                ? colorScheme.primary
+                                : colorScheme.onSurfaceVariant,
+                            // 与 _ensureLayout 的测量保持一致（换行内部行距）
+                            height: _wrapLineHeight,
+                          ),
+                          child: Text(
+                            line.text.isEmpty ? '...' : line.text,
+                            textAlign: TextAlign.center,
+                            // 不截断：英文原词+翻译超长时完整换行显示
+                          ),
+                        ),
+                        if (auxiliaryText != null)
+                          Padding(
+                            padding: EdgeInsets.only(
+                              top: auxiliaryFontSize * 0.25,
+                            ),
+                            child: Text(
+                              auxiliaryText,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: auxiliaryFontSize,
+                                height: _auxiliaryLineHeight,
+                                fontWeight: prefs.otherFontWeight,
+                                fontFamily: fontFamily,
+                                color: isCurrent
+                                    ? colorScheme.primary.withValues(
+                                        alpha: 0.7,
+                                      )
+                                    : colorScheme.onSurfaceVariant.withValues(
+                                        alpha: 0.7,
+                                      ),
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                   ),
                 );
@@ -530,6 +662,13 @@ class LyricsViewState extends State<LyricsView> {
 class _LyricLine {
   final Duration timestamp;
   final String text;
+  String? translation;
+  String? roma;
 
-  _LyricLine({required this.timestamp, required this.text});
+  _LyricLine({
+    required this.timestamp,
+    required this.text,
+    this.translation,
+    this.roma,
+  });
 }

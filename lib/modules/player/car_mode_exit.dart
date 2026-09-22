@@ -3,7 +3,7 @@
 // 抽成顶层函数是因为 MD（FullPlayer）与 AM（AmStyleFullPlayer）是两份独立 State，
 // 都要提供同一个退出入口；文案与确认流程共用一份，避免两处各写一遍后逐渐分叉。
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 

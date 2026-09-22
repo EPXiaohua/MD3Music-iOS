@@ -339,7 +339,7 @@ class LyricLayout {
 
   /// 非当前行缩放（enableScale=true 时）。
   ///
-  /// 由用户在设置页调节（[LyricPreferences.inactiveScale]），默认 0.97。
+  /// 由用户在设置页调节（[LyricPreferences.inactiveScale]），默认 0.850。
   /// 清晰层非当前行与 AM 歌词模糊层共用此值：模糊图在离屏渲染时烘焙同一
   /// pivot+scale 变换，保证两层字形尺寸在任何取值下都严格一致。
   static double get inactiveScale => LyricPreferences.instance.inactiveScale;

@@ -14,7 +14,7 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
 > 由于私有库开发同步会覆盖公开库代码，公开库代码现由脚本全量推送至公开库 `rust-local-force` 分支。
 > **投屏功能声明**：投屏采用行业标准的通用传输协议（DLNA/AirPlay），仅用于在个人家庭网络内将音乐流转至用户本人合法拥有的播放设备，不涉及对音乐文件的再存储、分发或向公众传播。请勿用于公共场所播放或多人同步观看场景，否则由此引发的一切法律责任由使用者自行承担。
 
----
+***
 
 ## ✨ 功能特性
 
@@ -25,7 +25,7 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
 - **用户中心** — VIP 双签到、多账号管理、听歌等级/排行/识曲、收藏与播放历史、桌面小组件
 - **个性化** — MD3/AM 双风格、主题色与动态取色、深色模式、全局背景图、桌面歌词、主页 Tab 自定义、设置搜索
 
----
+***
 
 ## 🏗️ 架构说明
 
@@ -49,23 +49,23 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
 
 ### 核心特点
 
-- **嵌入式 Rust 服务器** — App 启动时通过 `libkugou_server.so`（JNI/MethodChannel）启动本地 tiny_http 服务器（`127.0.0.1`），所有酷狗 API 请求在本地处理
+- **嵌入式 Rust 服务器** — App 启动时通过 `libkugou_server.so`（JNI/MethodChannel）启动本地 tiny\_http 服务器（`127.0.0.1`），所有酷狗 API 请求在本地处理
 - **高性能低资源** — Rust 实现取代旧 Node.js 方案，内存占用更低，启动更快
 - **无需外部服务器** — 用户无需自行搭建 API 服务器
-- **多架构支持** — 支持 armeabi-v7a（32 位）、arm64-v8a（64 位）、x86、x86_64（模拟器）
+- **多架构支持** — 支持 armeabi-v7a（32 位）、arm64-v8a（64 位）、x86、x86\_64（模拟器）
 - **本地投屏支持** — 内置局域网 HTTP 服务器（支持 Range 请求），本地音乐也能投屏到 DLNA 设备
 
----
+***
 
 ## 🔄 CI/CD
 
 项目已配置 GitHub Actions 自动构建，推送 `v*` 标签即可触发：
 
-- 自动构建 3 个架构的 APK（arm64-v8a、armeabi-v7a、x86_64）
+- 自动构建 3 个架构的 APK（arm64-v8a、armeabi-v7a、x86\_64）
 - 自动创建 GitHub Release 并上传产物
 - 自动递增 versionCode 并生成 Changelog（优先使用 CHANGELOG.md 中对应版本说明）
 
----
+***
 
 ## 📷 界面预览
 
@@ -77,7 +77,6 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
   <img src="img/phone/md3/Screenshot_2026-08-31-23-36-24-517_com.md3music.md3music-edit.png" width="220" alt="手机 MD3 界面 3" />
 </p>
 
-
 ### 手机 · Apple Music 风格
 
 <p align="center">
@@ -85,7 +84,6 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
   <img src="img/phone/applemusic/Screenshot_2026-08-31-23-26-45-407_com.md3music.md3music-edit.png" width="220" alt="手机 Apple Music 风格 2" />
   <img src="img/phone/applemusic/Screenshot_2026-08-31-23-27-17-235_com.md3music.md3music-edit.png" width="220" alt="手机 Apple Music 风格 3" />
 </p>
-
 
 ### 手机 · 更多界面(夜间和横屏)
 
@@ -106,16 +104,12 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，采用 Ma
   <img src="img/pad/md3/mmexport1788192055275.jpg" width="500" alt="平板 MD3 界面 2" />
 </p>
 
-
-
 ### 平板 · Apple Music 风格(横屏 和 zen沉浸模式)
 
 <p align="center">
   <img src="img/pad/applemusic/mmexport1788192056938.jpg" width="500" alt="平板 Apple Music 风格 1" />
   <img src="img/pad/applemusic/mmexport1788192058255.jpg" width="500" alt="平板 Apple Music 风格 2" />
 </p>
-
-
 
 ### 🚀 快速开始
 
@@ -171,7 +165,7 @@ flutter build apk --release --split-per-abi
 # build/app/outputs/flutter-apk/app-x86_64-release.apk      (模拟器)
 ```
 
----
+***
 
 ## 📁 项目结构
 
@@ -242,53 +236,53 @@ md3Music/
 └── pubspec.yaml                # Flutter 配置
 ```
 
----
+***
 
 ## 🛠️ 技术栈
 
-| 类别 | 技术 |
-|------|------|
-| **UI 框架** | Flutter 3.12+ |
-| **状态管理** | Provider |
-| **动效** | m3e_core（M3 Expressive Motion） |
-| **音频播放** | just_audio + just_audio_background |
-| **音频焦点** | audio_session |
-| **网络请求** | Dio |
-| **本地存储** | SharedPreferences + SQLite |
-| **图片缓存** | cached_network_image |
-| **嵌入式服务器** | Rust（tiny_http + ureq） |
-| **加密** | rsa / aes / md-5 / sha1 / sha2 |
-| **元数据读写** | audio_metadata_reader + JAudioTagger (MP3/FLAC/M4A) |
-| **DLNA 投屏** | dlna_dart |
-| **MV 播放** | video_player + chewie |
-| **USB 独占输出** | 原生 JNI + CMake C++（usbdevfs） |
-| **取色** | palette_generator + dynamic_color + material_color_utilities |
-| **桌面歌词** | Lyricon Provider |
-| **听歌识曲** | record（录音）+ Rust PCM 预处理 |
-| **原生通知** | fluttertoast（Toast） |
-| **文件/权限** | permission_handler + path_provider |
-| **桌面快捷方式** | quick_actions |
-| **音频均衡器** | just_audio 平台均衡器 |
-| **音乐源** | 酷狗音乐 API |
+| 类别           | 技术                                                               |
+| ------------ | ---------------------------------------------------------------- |
+| **UI 框架**    | Flutter 3.12+                                                    |
+| **状态管理**     | Provider                                                         |
+| **动效**       | m3e\_core（M3 Expressive Motion）                                  |
+| **音频播放**     | just\_audio + just\_audio\_background                            |
+| **音频焦点**     | audio\_session                                                   |
+| **网络请求**     | Dio                                                              |
+| **本地存储**     | SharedPreferences + SQLite                                       |
+| **图片缓存**     | cached\_network\_image                                           |
+| **嵌入式服务器**   | Rust（tiny\_http + ureq）                                          |
+| **加密**       | rsa / aes / md-5 / sha1 / sha2                                   |
+| **元数据读写**    | audio\_metadata\_reader + JAudioTagger (MP3/FLAC/M4A)            |
+| **DLNA 投屏**  | dlna\_dart                                                       |
+| **MV 播放**    | video\_player + chewie                                           |
+| **USB 独占输出** | 原生 JNI + CMake C++（usbdevfs）                                     |
+| **取色**       | palette\_generator + dynamic\_color + material\_color\_utilities |
+| **桌面歌词**     | Lyricon Provider                                                 |
+| **听歌识曲**     | record（录音）+ Rust PCM 预处理                                         |
+| **原生通知**     | fluttertoast（Toast）                                              |
+| **文件/权限**    | permission\_handler + path\_provider                             |
+| **桌面快捷方式**   | quick\_actions                                                   |
+| **音频均衡器**    | just\_audio 平台均衡器                                                |
+| **音乐源**      | 酷狗音乐 API                                                         |
 
----
+***
 
 ## ⚙️ 配置说明
 
 ### 嵌入式服务器
 
-应用启动时自动启动本地 Rust 服务器（`libkugou_server.so`），监听 `127.0.0.1` 的**随机端口**（10000~60000，被占用自动更换），实际端口由服务器启动后回传给应用，无需任何配置。
+应用启动时自动启动本地 Rust 服务器（`libkugou_server.so`），监听 `127.0.0.1` 的**随机端口**（10000\~60000，被占用自动更换），实际端口由服务器启动后回传给应用，无需任何配置。
 
 ### 音质设置
 
-| 音质 | 格式 | 比特率 |
-|------|------|--------|
-| 标准 | MP3 | 128 kbps |
-| 高质 | MP3 | 320 kbps |
-| 无损 | FLAC | ~1000 kbps |
-| Hi-Res | FLAC/MKV | ~2000+ kbps |
+| 音质     | 格式       | 比特率          |
+| ------ | -------- | ------------ |
+| 标准     | MP3      | 128 kbps     |
+| 高质     | MP3      | 320 kbps     |
+| 无损     | FLAC     | \~1000 kbps  |
+| Hi-Res | FLAC/MKV | \~2000+ kbps |
 
----
+***
 
 ## 🛠️ 开发说明
 
@@ -296,14 +290,12 @@ md3Music/
 
 1. 修改 `kugou_api_server/rust/src/` 目录下的 Rust 源代码
 2. 主机编译验证：
-
    ```bash
    cd kugou_api_server/rust
    cargo build --release
    cargo test        # 运行测试
    cargo clippy      # 静态检查
    ```
-
 3. 安卓交叉编译（需要 NDK）：`./build_android.sh`
 4. 重新编译 App
 
@@ -320,7 +312,7 @@ cd kugou_api_server/rust
 cargo test          # 本地测试
 ```
 
----
+***
 
 ## 🔧 常见问题
 
@@ -340,7 +332,7 @@ A: 修改 `kugou_api_server/rust/src/` 下的 Rust 代码，运行 `cargo build 
 
 A: Rust 的 TLS 依赖（`ring` crate）需要交叉编译为 Android 平台的 `.so` 文件。NDK 提供了 `aarch64-linux-android-clang` 等交叉编译工具链。
 
----
+***
 
 ## 🤝 致谢
 
@@ -354,12 +346,12 @@ A: Rust 的 TLS 依赖（`ring` crate）需要交叉编译为 Android 平台的 
 - [Reorderable](https://github.com/Calvin-LL/Reorderable) — 播放列表面板长按拖拽排序
 - [MaterialKolor](https://github.com/jordond/MaterialKolor) — 莫奈取色 / Material Design 3 动态配色
 - [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) — API 代理服务
-- [tiny_http](https://github.com/tiny-http/tiny-http) — Rust HTTP 服务器
+- [tiny\_http](https://github.com/tiny-http/tiny-http) — Rust HTTP 服务器
 - [ureq](https://github.com/algesten/ureq) — Rust HTTP 客户端
 - [JAudioTagger](https://www.jthink.net/jaudiotagger/) — 音频元数据读写
 - [decent-player](https://github.com/Ma145/decent-player) — USB 独占音频输出（DAC 独占驱动 C++/Kotlin 移植自其 `decent-usb-audio-driver`）
 
----
+***
 
 ## 👥 贡献者
 
@@ -372,14 +364,15 @@ A: Rust 的 TLS 依赖（`ring` crate）需要交叉编译为 Android 平台的 
   <a href="https://github.com/LyonHyrik"><img src="https://avatars.githubusercontent.com/u/309263464?v=4&s=80" width="80" height="80" alt="LyonHyrik" title="LyonHyrik" /></a>
   <a href="https://github.com/Andrea-lyz"><img src="https://avatars.githubusercontent.com/u/52863141?v=4&s=80" width="80" height="80" alt="Andrea-lyz" title="Andrea-lyz" /></a>
   <a href="https://github.com/7tattoo"><img src="https://avatars.githubusercontent.com/u/122350933?v=4&s=80" width="80" height="80" alt="7tattoo" title="7tattoo" /></a>
+    <a href="https://github.com/sdawhk"><img src="https://avatars.githubusercontent.com/u/147570195?v=4" width="80" height="80" alt="7tattoo" title="7tattoo" /></a>
 </p>
 
----
+***
 
 ## 📄 许可证
 
 本项目采用 [GNU AGPL-3.0](LICENSE) 许可证。
 
----
+***
 
 **Made with ❤️ by zzyoxml**

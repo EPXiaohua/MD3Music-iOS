@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 import '../../widgets/m3e_pull_to_refresh_fixed.dart';
 import '../../widgets/md3_pull_to_refresh.dart';

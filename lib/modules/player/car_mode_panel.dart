@@ -3,7 +3,7 @@
 // 面板挂在 MaterialApp.builder 的根 Navigator **之外**（见 app.dart），
 // 这是硬要求：面板要同时覆盖所有 Navigator.push 出来的二级页面。
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../providers/car_mode_provider.dart';

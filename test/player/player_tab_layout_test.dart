@@ -28,6 +28,31 @@ void main() {
       expect(layout.lyricsIndex, 2);
     });
 
+    test('commentsIndex 指向评论 tab；无评论 tab 时为 -1（不能用 length-1 反推）', () {
+      final narrow = resolvePlayerTabLayout(
+        isWideLayout: false,
+        isLocalSong: false,
+        closeLocalMusicComments: true,
+      );
+      expect(narrow.commentsIndex, 3);
+      expect(narrow.commentsIndex, narrow.length - 1);
+
+      final wide = resolvePlayerTabLayout(
+        isWideLayout: true,
+        isLocalSong: false,
+        closeLocalMusicComments: true,
+      );
+      expect(wide.commentsIndex, 2);
+
+      final noComments = resolvePlayerTabLayout(
+        isWideLayout: false,
+        isLocalSong: true,
+        closeLocalMusicComments: true,
+      );
+      expect(noComments.commentsIndex, -1);
+      expect(noComments.length - 1, 2, reason: '此时 length-1 会指到歌词 tab');
+    });
+
     test('窄屏本地歌曲但关闭该开关：恢复评论 tab，共 4 个', () {
       final layout = resolvePlayerTabLayout(
         isWideLayout: false,

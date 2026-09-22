@@ -52,6 +52,10 @@ class KugouEndpoints {
   static const String commentPlaylist = '/comment/playlist';
   static const String commentAlbum = '/comment/album';
   static const String commentCount = '/comment/count';
+  static const String commentMusicSend = '/comment/music/send';
+  static const String commentFloorSend = '/comment/floor/send';
+  static const String commentPlaylistSend = '/comment/playlist/send';
+  static const String commentAlbumSend = '/comment/album/send';
 
   // Playlist
   static const String playlistDetail = '/playlist/detail';
@@ -166,6 +170,7 @@ class KugouEndpoints {
   static const String userDetail = '/user/detail';
   static const String userVipDetail = '/user/vip/detail';
   static const String userGradeInfo = '/user/grade/info';
+
   /// CSCC 真实播放事件上报（start/end），见 Rust `listen_report.rs`。
   static const String userListenReport = '/user/listen/report';
   static const String userPlaylist = '/user/playlist';
@@ -187,6 +192,10 @@ class KugouEndpoints {
   // Video
   static const String videoUrl = '/video/url';
   static const String videoDetail = '/video/detail';
+  /// MV 视频弹幕（底层为 MV 评论池，无需登录）。见 docs/2026-09-20-kugou-mv-barrage-endpoint.md
+  static const String videoBarrage = '/video/barrage';
+  /// 发送 MV 视频弹幕（需登录；底层为 MV 评论池）。**调用方不得自动重试**。
+  static const String videoBarrageSend = '/video/barrage/send';
   static const String videoPrivilege = '/video/privilege';
   static const String pcDiantai = '/pc/diantai';
 
@@ -221,6 +230,10 @@ class KugouEndpoints {
 
   // Sound (社区音效/蝰蛇音效)
   static const String soundModel = '/get/model';
+  static const String effectBrand = '/effects/brand';
+  static const String effectBrandDetail = '/effects/brand/detail';
+  static const String effectMatch = '/effects/match';
+  static const String effectArtist = '/effects/artist';
 
   // Import (外部歌单导入)
   static const String importPlaylist = '/import/playlist';
@@ -237,6 +250,17 @@ class KugouEndpoints {
   static const String albumDetail = '/album/detail';
   static const String albumSongs = '/album/songs';
   static const String albumShop = '/album/shop';
+  /// 专辑动态封面（短视频）元数据。
+  static const String albumDyCover = '/album/dycover';
+  /// 专辑动态封面媒体代理（本地回环流式转发 CDN mp4；仅接受 album_audio_id）。
+  static const String dyCoverMedia = '/album/dycover/media';
   static const String artistLists = '/artist/lists';
   static const String artistHonour = '/artist/honour';
+
+  // Listen Together（一起听 / 众乐房 / 自习室）
+  static const String listenTogetherRoom = '/listen/together/room';
+  static const String listenTogetherMusic = '/listen/together/music';
+  static const String listenTogetherStudy = '/listen/together/study';
+  static const String listenTogetherChat = '/listen/together/chat';
+  static const String listenTogetherDiscovery = '/listen/together/discovery';
 }

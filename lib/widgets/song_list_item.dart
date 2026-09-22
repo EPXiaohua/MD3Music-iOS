@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../core/services/lyrico_editor.dart';
@@ -69,6 +69,18 @@ class SongListItem extends StatelessWidget {
                   } else if (!r.launched) {
                     showToast('无法打开 Lyrico 编辑', long: true);
                   }
+                },
+              ),
+            if (song.isOnline)
+              ListTile(
+                leading: const Icon(Icons.music_video_outlined),
+                title: const Text('查看 MV'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
+                  );
                 },
               ),
             // 可选扩展：私有构建注入的额外菜单条目（默认无）
@@ -206,18 +218,6 @@ class SongListItem extends StatelessWidget {
                       ),
                     ),
                   ),
-                  if (song.isOnline)
-                    GestureDetector(
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
-                      ),
-                      behavior: HitTestBehavior.opaque,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
-                        child: Icon(Icons.music_video_outlined, size: 18, color: colorScheme.onSurfaceVariant),
-                      ),
-                    ),
                   GestureDetector(
                     onTap: () => _showMoreMenu(context),
                     behavior: HitTestBehavior.opaque,

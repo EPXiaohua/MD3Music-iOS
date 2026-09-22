@@ -8,7 +8,7 @@
 /// - 顶部 PopupMenuButton 提供示例数据一键加载
 library;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences_panel.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';

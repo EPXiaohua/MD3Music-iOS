@@ -848,6 +848,8 @@ class MainActivity : FlutterActivity() {
                     MusicWidgetProvider.updateAllWidgets(
                         this, title, artist, isPlaying, position, duration
                     )
+                    // 2×2 封面小部件：同一推送同步歌名/歌手/播放态（无进度条，忽略 position/duration）
+                    CoverPlayerWidgetProvider.updateAllWidgets(this, title, artist, isPlaying)
                     result.success(true)
                 }
                 // 私人FM小部件：快照 Map 原样交给 Provider 拍平成广播 extras
@@ -857,11 +859,13 @@ class MainActivity : FlutterActivity() {
                     PersonalFmWidgetProvider.updateAllWidgets(this, data)
                     result.success(true)
                 }
-                // 音乐播放器小部件：仅推送主题色（文本走原生缓存）
+                // 音乐播放器小部件：仅推送主题色（文本走原生缓存）。
+                // 2×2 封面小部件共用同一套 color_* 协议作为封面取色失败的兜底。
                 "updateMusicWidgetTheme" -> {
                     @Suppress("UNCHECKED_CAST")
                     val colors = call.arguments as? Map<String, Number> ?: emptyMap()
                     MusicWidgetProvider.updateTheme(this, colors)
+                    CoverPlayerWidgetProvider.updateTheme(this, colors)
                     result.success(true)
                 }
                 else -> result.notImplemented()

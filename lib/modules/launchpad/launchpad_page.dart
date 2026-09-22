@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../providers/tab_config_provider.dart';
@@ -249,6 +249,8 @@ IconData _launchPadTabIcon(String tabId) {
       return Icons.dynamic_feed;
     case 'brush':
       return Icons.swipe;
+    case 'listen_together':
+      return Icons.groups;
     case 'settings':
       return Icons.settings;
     default:

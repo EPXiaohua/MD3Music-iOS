@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// iOS 分组卡片风格共享工具（一级页面用）。
 ///

@@ -938,6 +938,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {
         currentIndex = initialIndex != null ? initialIndex : 0;
         transferredBytes = 0;  // 换歌重置传输统计（歌曲信息页实时码率）
+        // ExoPlayer.stop() 在部分 Android/厂商实现中会清掉 playWhenReady。
+        // 换源发生在自动续播时，Dart 层仍保持 playing=true；如果不保存这
+        // 个播放意图，新源会进入 READY 但停在 pwr=false，进度看似继续而无声。
+        final boolean shouldPlayWhenReady = player.getPlayWhenReady();
         switch (processingState) {
         case idle:
             break;
@@ -959,6 +963,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         player.setMediaSources(mediaSources, windowIndex, initialPosition);
         player.setShuffleOrder(shuffleOrder);
         player.prepare();
+        if (shouldPlayWhenReady) {
+            // prepare 后恢复，避免被 setMediaSources/stop 的内部状态覆盖。
+            player.setPlayWhenReady(true);
+        }
     }
 
     private void ensurePlayerInitialized() {
@@ -1528,9 +1536,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     /// 由 App 在元数据/开关变化时推送媒体3通知栏的自定义按钮（图标按开/关态切换）。
-    /// 阶段6：下一首已改回原生按钮，这里只保留桌面歌词/收藏两个自定义按钮。
-    /// hasTranslation=true 时在自定义布局首位插入 ColorOS 翻译切换按钮（仅 Bridge
-    /// 消费，播放器不处理其回调）；翻译图标缺省用模块自带（未新增 ic_translation）。
+    /// 阶段6：下一首已改回原生按钮，这里保留收藏/桌面歌词两个固定自定义按钮。
+    /// hasTranslation=true 时追加 ColorOS 翻译切换按钮（仅 Bridge 消费，播放器不处理
+    /// 其回调）；翻译图标缺省用模块自带（未新增 ic_translation）。
     public static void setActiveSessionCustomActions(
             boolean desktopLyricEnabled,
             boolean isFavorited,
@@ -1565,10 +1573,22 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             Handler handler = new Handler(p.getApplicationLooper());
             handler.post(() -> {
                 try {
-                    // MD3Music fork（阶段6）：下一首改回 media3 原生按钮（自动渲染），
-                    // 这里保留 翻译(可选)/桌面歌词/收藏 自定义按钮。翻译按钮放首位，
-                    // Bridge 识别后会在 OPlus Rule0 中 promote 并接管点击。
+                    // MD3Music fork（阶段6）：下一首改回 media3 原生按钮（自动渲染）。
+                    // 收藏放在自定义布局首位，确保 SystemUI 的有限按钮槽位优先显示
+                    // “我喜欢”；翻译仍保留在布局中，供 Bridge 按 command 识别并接管。
                     java.util.List<CommandButton> layout = new java.util.ArrayList<>(3);
+                    layout.add(new CommandButton.Builder()
+                            .setSessionCommand(CMD_TOGGLE_FAVORITE)
+                            .setDisplayName("收藏")
+                            .setIconResId(isFavorited ? favoriteOnIcon : favoriteOffIcon)
+                            .setEnabled(true)
+                            .build());
+                    layout.add(new CommandButton.Builder()
+                            .setSessionCommand(CMD_TOGGLE_DESKTOP_LYRIC)
+                            .setDisplayName("桌面歌词")
+                            .setIconResId(desktopLyricEnabled ? desktopLyricOnIcon : desktopLyricOffIcon)
+                            .setEnabled(true)
+                            .build());
                     if (hasTranslation) {
                         layout.add(new CommandButton.Builder()
                                 .setSessionCommand(CMD_TOGGLE_TRANSLATION)
@@ -1577,18 +1597,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                                 .setEnabled(true)
                                 .build());
                     }
-                    layout.add(new CommandButton.Builder()
-                            .setSessionCommand(CMD_TOGGLE_DESKTOP_LYRIC)
-                            .setDisplayName("桌面歌词")
-                            .setIconResId(desktopLyricEnabled ? desktopLyricOnIcon : desktopLyricOffIcon)
-                            .setEnabled(true)
-                            .build());
-                    layout.add(new CommandButton.Builder()
-                            .setSessionCommand(CMD_TOGGLE_FAVORITE)
-                            .setDisplayName("收藏")
-                            .setIconResId(isFavorited ? favoriteOnIcon : favoriteOffIcon)
-                            .setEnabled(true)
-                            .build());
                     mediaSession.setCustomLayout(layout);
                     // MD3Music fork: 自定义按钮 layout 变化不会自动重渲染 now playing 通知，
                     // 需让承载服务按最新 layout 强制刷新一次（见 MediaSessionService.refreshNotification）。

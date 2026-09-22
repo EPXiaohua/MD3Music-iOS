@@ -3,7 +3,7 @@ import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -12,6 +12,7 @@ import 'package:provider/provider.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/services/audio_service.dart';
 import '../../core/services/desktop_lyric_service.dart';
+import '../../core/services/dynamic_cover_service.dart';
 import '../../core/services/equalizer_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/services/spectrum_service.dart';
@@ -27,6 +28,7 @@ import '../../data/repositories/settings_repository.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../coverflow/coverflow_page.dart';
+import '../listen_together/widgets/listen_together_pill.dart';
 import '../settings/equalizer_settings_page.dart';
 import '../sound/sounds_page.dart';
 import 'mv_player_page.dart';
@@ -34,6 +36,7 @@ import 'song_info_page.dart';
 import 'am_transport_controls.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/kugou_provider.dart';
+import '../../providers/listen_together_provider.dart';
 import '../../providers/local_favorites_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
@@ -48,6 +51,7 @@ import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import '../../widgets/ai_recommend_sheet.dart';
 import '../../widgets/menu_action_cell.dart';
+import '../../widgets/dynamic_cover_view.dart';
 import '../../widgets/player_artwork_image.dart';
 import '../../widgets/player_seek_bar.dart';
 import '../../widgets/player_tab_strip.dart';
@@ -58,6 +62,8 @@ import '../../utils/landscape_immersive.dart';
 import '../../utils/playlist_order_utils.dart';
 import '../../widgets/player_playlist_view.dart';
 import 'car_mode_exit.dart';
+import '../../services/kugou_api/comment_reply_target.dart';
+import 'comment_compose_sheet.dart';
 import 'comments_view.dart';
 import 'dlna_cast_sheet.dart';
 import 'full_player_route.dart';
@@ -117,6 +123,7 @@ class AmStyleFullPlayer extends StatefulWidget {
 class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     with TickerProviderStateMixin, WidgetsBindingObserver {
   late TabController _tabController;
+
   // 导航条拖动切换：拖动时上方页面跟随，松手吸附到最近 tab
   double _tabDragBtnW = 0;
   double _tabDragDx = 0;
@@ -125,6 +132,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   List<LyricLine> _parsedLyrics = const [];
   bool _isLoadingLyrics = false;
   String? _lastSongId;
+
+  /// 歌词已获取时歌曲的元数据键（id:秒时长:albumAudioId）。
+  /// 一起听跟随端起播时只有 hash 身份（时长 0、无 albumAudioId），
+  /// 富化回写保持 id 不变——仅按 id 判重会让歌词永远停在「未知歌曲」占位；
+  /// 元数据键变化（补齐时长/专辑 id）后强制重取一次（对齐 EchoMusic
+  /// lastForcedLyricMetadataKey）。
+  String _lastLyricMetadataKey = '';
   // 当前歌词格式（KRC / LRC / plaintext），用于底部标注；null 表示尚未检测
   LyricFormat? _lyricFormat;
   // 当前歌曲是否有翻译/罗马音数据，用于 ActionBar 长按切换模式判断
@@ -188,6 +202,15 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   bool _zenMode = false;
   // 长按封面进入 Zen 模式开关（设置→播放，默认开启；关闭后禁用长按）
   bool _zenLongPressEnabled = true;
+  // 专辑动态封面开关（设置页「播放页样式」与播放页「界面设置」共用；默认开启）
+  bool _dynamicCoverEnabled = true;
+  /// 播放页「界面设置」里「当前歌曲动态封面」的展示值（null = 检测中）
+  ///
+  /// 刻意**不在 dispose() 里销毁**：二级菜单挂在根 Navigator 上，可能比本 State
+  /// 活得更久（如车机模式切换导致播放器被销毁时菜单仍开着），销毁后菜单关闭时
+  /// `removeListener` 会命中「used after being disposed」断言。不销毁则菜单关闭后
+  /// notifier 与监听者一起变成垃圾被回收。
+  final ValueNotifier<String?> _dyCoverStatus = ValueNotifier<String?>(null);
   late final AnimationController _zenController;
   late final Animation<double> _zenAnimation;
 
@@ -300,6 +323,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       context.read<PlayerProvider>().addListener(_onPlayerSongChanged);
       _loadSpectrumSetting();
       _loadZenPressSetting();
+      _loadDynamicCoverSetting();
     });
   }
 
@@ -308,6 +332,61 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     final enabled = await SettingsRepository().getZenCoverLongPress();
     if (!mounted) return;
     setState(() => _zenLongPressEnabled = enabled);
+  }
+
+  /// 从设置加载「专辑动态封面」开关（默认开启）。
+  Future<void> _loadDynamicCoverSetting() async {
+    final enabled = await SettingsRepository().getDynamicAlbumCover();
+    if (!mounted || enabled == _dynamicCoverEnabled) return;
+    setState(() => _dynamicCoverEnabled = enabled);
+  }
+
+  /// 刷新「界面设置」菜单里的动态封面开关与当前歌曲状态。
+  ///
+  /// 顺带重读开关值（用户可能刚在设置页改过），保证菜单与设置一致；
+  /// 状态优先用 [DynamicCoverService.lastKnownResult] 即时展示，
+  /// 未探测过才发一次请求，失败时显示「未获取到」而不是「无」。
+  Future<void> _refreshDyCoverMenuState() async {
+    final player = context.read<PlayerProvider>();
+    final song = player.currentSong;
+    final isOnline = song is Song && song.isOnline;
+    final albumAudioId = (song is Song ? song.albumAudioId : null) ?? '';
+
+    await _loadDynamicCoverSetting();
+    if (!mounted) return;
+
+    if (!isOnline || albumAudioId.isEmpty) {
+      _dyCoverStatus.value = dyCoverStatusText(
+        isOnline: false,
+        albumAudioId: '',
+        known: null,
+      );
+      return;
+    }
+
+    final known = DynamicCoverService.instance.lastKnownResult(albumAudioId);
+    if (known != null) {
+      _dyCoverStatus.value = dyCoverStatusText(
+        isOnline: true,
+        albumAudioId: albumAudioId,
+        known: known,
+      );
+      return;
+    }
+
+    _dyCoverStatus.value = dyCoverStatusText(
+      isOnline: true,
+      albumAudioId: albumAudioId,
+      known: null,
+      probing: true,
+    );
+    await DynamicCoverService.instance.hasDynamicCover(albumAudioId);
+    if (!mounted) return;
+    _dyCoverStatus.value = dyCoverStatusText(
+      isOnline: true,
+      albumAudioId: albumAudioId,
+      known: DynamicCoverService.instance.lastKnownResult(albumAudioId),
+    );
   }
 
   /// 从设置加载频谱开关状态
@@ -488,6 +567,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 切歌可能在本地/在线之间切换 → 评论 tab 有无随之变化；
     // 设置页改「关闭本地音乐评论区」也会经 PlayerProvider 通知走到这里。
     _syncTabLayout();
+    // 设置页可能改过动态封面开关 → 切歌时同步一次（幂等，值未变不触发重建）
+    // ignore: discarded_futures
+    _loadDynamicCoverSetting();
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     if (song != null && song.id != _lastSongId) {
@@ -510,6 +592,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       if (idx > 0) _preloadArtwork(playlist[idx - 1].artworkUri);
       if (idx < playlist.length - 1)
         _preloadArtwork(playlist[idx + 1].artworkUri);
+    }
+    // 元数据补齐后的歌词强制重取：键含时长与专辑 id，富化回写（id 不变）
+    // 也会触发；首取时键未登记，靠首个 _fetchLyrics 调用处同步登记
+    if (song != null) {
+      final metadataKey =
+          '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
+      if (song.id == _lastSongId &&
+          _lastLyricMetadataKey.isNotEmpty &&
+          metadataKey != _lastLyricMetadataKey) {
+        _fetchLyrics(song);
+      }
+      if (song.id == _lastSongId) _lastLyricMetadataKey = metadataKey;
     }
     // 频谱启停
     if (_spectrumEnabled && player.isPlaying && !_spectrumStarted) {
@@ -830,6 +924,12 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   }
 
   Future<void> _fetchLyrics(dynamic song) async {
+    // 同步登记元数据键（含时长与专辑 id）：防止切歌分支绕过监听里的
+    // 键比对判定，同键不重取；取词失败时键已登记、与原 id 判重语义一致
+    if (song != null) {
+      _lastLyricMetadataKey =
+          '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
+    }
     final songId = song.id as String;
     if (songId == _lastSongId) return;
     _lastSongId = songId;
@@ -848,7 +948,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       String? translationText;
       String? romaText;
 
-      // 本地歌曲优先读取内嵌歌词（ID3 USLT / Vorbis LYRICS / MP4 ©lyr）
+      // 本地歌曲优先读取内嵌歌词（ID3 USLT / SYLT / Vorbis LYRICS / MP4 ©lyr）
       if (song is Song && !song.isOnline) {
         final localPath = song.localPath;
         if (localPath != null && localPath.isNotEmpty) {
@@ -959,17 +1059,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         opacity: _spectrumOpacity,
       );
     }
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: Selector<PlayerProvider, (String?, String?)>(
-        selector: (_, p) =>
-            (p.currentSong?.artworkUri, p.currentSong?.localPath),
-        builder: (context, data, __) => _buildCrossfadeArtwork(
-          data.$1,
-          colorScheme,
-          iconSize: 48,
-          fallbackFilePath: data.$2,
-        ),
+    return Selector<PlayerProvider, (String?, String?)>(
+      selector: (_, p) =>
+          (p.currentSong?.artworkUri, p.currentSong?.localPath),
+      builder: (context, data, __) => _buildArtworkWithDynamicCover(
+        currentSong,
+        colorScheme,
+        // 必须用内层 Selector 的快照值，不能读 currentSong：同一首歌的封面
+        // 稍后被富化补齐时 songId 不变、外层 Selector 不重建，闭包里的
+        // currentSong 是过期实例，封面会刷不新。
+        artworkUri: data.$1,
+        fallbackFilePath: data.$2,
+        iconSize: 48,
       ),
     );
   }
@@ -1018,6 +1119,44 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
           ],
         );
       },
+    );
+  }
+
+  /// AM 播放器封面统一入口：静态封面 + 动态封面叠加。
+  ///
+  /// 3 处封面渲染点（横屏左栏、竖屏封面 tab 展开/非展开）都调用本函数，
+  /// 保证行为一致。`isPlaying` 由 [DynamicCoverView] 自己订阅，故此处不传。
+  ///
+  /// [artworkUri] / [fallbackFilePath] 必须由调用方传入**它原本使用的来源**：
+  /// 横屏左栏走内层 `Selector` 的 `(artworkUri, localPath)` 快照值，另外两处
+  /// 直接用 `currentSong` 的字段。若统一改成读 `currentSong`，遇到「同一首歌的
+  /// 封面稍后被富化补齐」（songId 不变 → 外层 Selector 不重建 → 闭包持有过期
+  /// 实例）时封面会刷不新。
+  Widget _buildArtworkWithDynamicCover(
+    dynamic currentSong,
+    ColorScheme colorScheme, {
+    required String? artworkUri,
+    required String? fallbackFilePath,
+    double iconSize = 48.0,
+  }) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          _buildCrossfadeArtwork(
+            artworkUri,
+            colorScheme,
+            iconSize: iconSize,
+            fallbackFilePath: fallbackFilePath,
+          ),
+          if (currentSong is Song && currentSong.isOnline)
+            DynamicCoverView(
+              song: currentSong,
+              enabled: _dynamicCoverEnabled,
+            ),
+        ],
+      ),
     );
   }
 
@@ -1483,6 +1622,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       child: Scaffold(
         backgroundColor: Colors.black,
         extendBody: true,
+        // 键盘弹出时不重排整页：评论托盘自己处理输入框抬升，
+        // 底部传输栏/导航条保持原位（否则打字时会被顶上去）
+        resizeToAvoidBottomInset: false,
         body: Stack(
           children: [
             // 1. 模糊封面背景层（Apple Music 风格，带淡入淡出）
@@ -1691,6 +1833,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                       albumAudioId: currentSong.albumAudioId,
                       artworkUri: currentSong.artworkUri,
                       isAmStyle: true,
+                      // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                      showComposer: false,
+                      onReplyComment: _openComposeSheet,
                     ),
                   ),
               ],
@@ -1878,6 +2023,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                   albumAudioId: currentSong.albumAudioId,
                                   artworkUri: currentSong.artworkUri,
                                   isAmStyle: true,
+                                  // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                  showComposer: false,
+                                  onReplyComment: _openComposeSheet,
                                 ),
                               ),
                           ],
@@ -2071,6 +2219,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                   albumAudioId: currentSong.albumAudioId,
                                   artworkUri: currentSong.artworkUri,
                                   isAmStyle: true,
+                                  // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                  showComposer: false,
+                                  onReplyComment: _openComposeSheet,
                                 ),
                               ),
                           ],
@@ -2135,6 +2286,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                 onPressed: _collapseByButton,
               ),
             const Spacer(),
+            // 一起听胶囊：在房间中时显示人数（1/5），点击进入/返回房间页
+            ListenTogetherPill(amStyle: true),
             // AM v2: 顶部栏右侧 FLAC 质量徽章，点击复用 _showQualityDialog，
             // 长按呼出 _showVolumeDialog（与 MD 风格统一）
             _buildQualityPill(playerProvider),
@@ -2263,14 +2416,12 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                     barColor: _spectrumColor,
                                     opacity: _spectrumOpacity,
                                   )
-                                : ClipRRect(
-                                    borderRadius: BorderRadius.circular(16),
-                                    child: _buildCrossfadeArtwork(
-                                      currentSong.artworkUri,
-                                      colorScheme,
-                                      iconSize: iconSize,
-                                      fallbackFilePath: currentSong.localPath,
-                                    ),
+                                : _buildArtworkWithDynamicCover(
+                                    currentSong,
+                                    colorScheme,
+                                    artworkUri: currentSong.artworkUri,
+                                    fallbackFilePath: currentSong.localPath,
+                                    iconSize: iconSize,
                                   ),
                           ),
                         ),
@@ -2294,14 +2445,12 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                         barColor: _spectrumColor,
                         opacity: _spectrumOpacity,
                       )
-                    : ClipRRect(
-                        borderRadius: BorderRadius.circular(16),
-                        child: _buildCrossfadeArtwork(
-                          currentSong.artworkUri,
-                          colorScheme,
-                          iconSize: iconSize,
-                          fallbackFilePath: currentSong.localPath,
-                        ),
+                    : _buildArtworkWithDynamicCover(
+                        currentSong,
+                        colorScheme,
+                        artworkUri: currentSong.artworkUri,
+                        fallbackFilePath: currentSong.localPath,
+                        iconSize: iconSize,
                       ),
               ),
             ),
@@ -2435,6 +2584,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     ColorScheme colorScheme,
   ) {
     final song = playerProvider.currentSong;
+    // 一起听听众端：进度条可拖动，拖动即进入脱离态（本地自由播放），
+    // 恢复跟随走房间页中央按钮 / 广场横幅（见 RoomSession.detachBySeek）。
     return PlayerSeekBar(
       position: position,
       duration: duration,
@@ -2454,7 +2605,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       },
       onSeekEnd: (value) async {
         AppHaptics.tick();
-        await playerProvider.seek(value);
+        // forceNotify：松手是用户显式动作，远端纠偏的抑制窗口不得吞掉通告
+        // （否则听众的「拖动即脱离」会被静默吞掉并被纠偏拉回）
+        await playerProvider.seek(value, forceNotify: true);
         if (_wasPlayingBeforeDrag) {
           playerProvider.resume();
         }
@@ -2643,9 +2796,24 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
           onLongPress: _toggleDesktopLyric,
         ),
         if (_tabLayout.hasComments)
-          const PlayerTabItem(icon: Icons.comment_outlined),
+          PlayerTabItem(
+            icon: Icons.comment_outlined,
+            // 长按评论段：切到评论 tab 并拉起输入框（界面上没有常驻入口）
+            onLongPress: () => _openComposeSheet(),
+          ),
       ],
     );
+  }
+
+  /// 长按评论段：弹出仅含输入框的评论托盘（主题色设计，不显示评论列表）。
+  ///
+  /// [replyTo] 非空表示由评论项「回复」进入，发送的是该评论下的楼层回复。
+  /// 播放器内不驻留任何输入控件。
+  void _openComposeSheet([CommentReplyTarget? target]) {
+    HapticFeedback.lightImpact();
+    final song = context.read<PlayerProvider>().currentSong;
+    if (song == null) return;
+    showCommentComposeSheet(context, song: song, target: target);
   }
 
   /// 长按歌词段：开关桌面歌词，并同步通知栏的「桌面歌词」按钮状态。
@@ -3152,6 +3320,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                             icon: Icons.graphic_eq,
                             label: '均衡器',
                             active: eq.enabled,
+                            enabled: !eq.systemEffectsDisabled,
                             onTap: () {
                               Navigator.pop(sheetContext);
                               _pageNavigator(rootContext)?.push(
@@ -3163,16 +3332,23 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                           );
                         },
                       ),
-                      MenuActionCell(
-                        icon: Icons.spatial_audio_off,
-                        label: '音效',
-                        active: false,
-                        onTap: () {
-                          Navigator.pop(sheetContext);
-                          _pageNavigator(rootContext)?.push(
-                            MaterialPageRoute(
-                              builder: (_) => const SoundsPage(),
-                            ),
+                      ListenableBuilder(
+                        listenable: EqualizerService.instance,
+                        builder: (context, _) {
+                          final eq = EqualizerService.instance;
+                          return MenuActionCell(
+                            icon: Icons.spatial_audio_off,
+                            label: '音效',
+                            active: false,
+                            enabled: !eq.systemEffectsDisabled,
+                            onTap: () {
+                              Navigator.pop(sheetContext);
+                              _pageNavigator(rootContext)?.push(
+                                MaterialPageRoute(
+                                  builder: (_) => const SoundsPage(),
+                                ),
+                              );
+                            },
                           );
                         },
                       ),
@@ -3210,6 +3386,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                   trailing: const Icon(Icons.chevron_right),
                   onTap: () {
                     Navigator.pop(sheetContext);
+                    // 打开二级菜单前刷新动态封面开关与当前歌曲状态
+                    // ignore: discarded_futures
+                    _refreshDyCoverMenuState();
                     _showMoreSettingsSheet(rootContext);
                   },
                 ),
@@ -3318,6 +3497,36 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                       _toggleSpectrum();
                     },
                   ),
+                // 专辑动态封面：开关（与设置页「播放页样式」联动，关闭即时生效）
+                // + 当前歌曲是否有动态封面的状态
+                ValueListenableBuilder<String?>(
+                  valueListenable: _dyCoverStatus,
+                  builder: (context, status, _) => Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SwitchListTile(
+                        title: const Text('专辑动态封面'),
+                        subtitle: const Text('封面播放专辑动态封面短视频'),
+                        value: _dynamicCoverEnabled,
+                        onChanged: (v) {
+                          HapticFeedback.lightImpact();
+                          setState(() => _dynamicCoverEnabled = v);
+                          // ignore: discarded_futures
+                          SettingsRepository().setDynamicAlbumCover(v);
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.album_outlined),
+                        title: const Text('当前歌曲动态封面'),
+                        trailing: Text(
+                          status ?? '检测中…',
+                          style: Theme.of(sheetContext).textTheme.bodyMedium
+                              ?.copyWith(color: colorScheme.primary),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
           ),

@@ -68,6 +68,15 @@ public final class NormalizationGainAudioSink extends ForwardingAudioSink {
         Log.i(TAG, "setNormalizationGainDb=" + gainDb + " linear=" + gain);
     }
 
+    /**
+     * 从全局实例表移除已释放的 sink，避免每次重建 ExoPlayer 后旧 sink 被静态表强引用。
+     */
+    @Override
+    public void release() {
+        INSTANCES.remove(this);
+        super.release();
+    }
+
     @Override
     public void configure(
             Format inputFormat, int specifiedBufferSize, @Nullable int[] outputChannels)

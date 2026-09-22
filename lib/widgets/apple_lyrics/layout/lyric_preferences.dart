@@ -106,8 +106,9 @@ class LyricPreferences extends ChangeNotifier {
 
   /// 非当前行缩放默认值。
   ///
-  /// 保持历史写死值 0.97，确保升级后视觉与改动前完全一致。
-  static const double defaultInactiveScale = 0.97;
+  /// 0.850：默认让背景行比当前行略小，突出当前行。仅对新安装用户生效，
+  /// 已持久化的旧值不会被覆盖。
+  static const double defaultInactiveScale = 0.850;
 
   /// 非当前行缩放滑块档位：0.80~1.00 共 40 档，步长 0.005。
   static const int inactiveScaleDivisions = 40;
@@ -157,6 +158,27 @@ class LyricPreferences extends ChangeNotifier {
   /// 级联衰减分母默认（x in 1/x）：每越过一行步长 × 1/x。
   static const double defaultCascadeDecayX = 1.1;
 
+  /// 已播字上浮高度最小值（px）。0 = 完全不上浮。
+  static const double minLiftHeightPx = 0.0;
+
+  /// 已播字上浮高度最大值（px）。
+  ///
+  /// 10px 已明显超过一行字高的十分之一量级，再大会让当前行"飘"离基线。
+  static const double maxLiftHeightPx = 10.0;
+
+  /// 已播字上浮高度默认值（px）。
+  ///
+  /// 保持历史写死值 3.0（AMLL：当前字最大上浮 -3px），确保升级后视觉不变。
+  /// 渲染侧取负值作为 Y 偏移（向上为负）。
+  static const double defaultLiftHeightPx = 3.0;
+
+  /// 级联错峰是否从当前行开始（默认 true）。
+  ///
+  /// - true：仅当前行及以下的行错峰跟随，当前行 delay=0，上方行不参与
+  ///   「按住等错峰」，随全局滚动同步回位；
+  /// - false：历史行为，从视口顶部行开始逐行累加错峰（上方行也错峰）。
+  static const bool defaultStaggerFromCurrentLine = true;
+
   // ============== 按设备类型的默认值（手机 / Pad） ==============
 
   /// 按设备类型的字号默认：手机 29px，Pad 40px。
@@ -197,6 +219,9 @@ class LyricPreferences extends ChangeNotifier {
   static const String _keyCascadeMaxDelayMs = 'lyric_cascade_max_delay_ms';
   static const String _keyCascadeBaseStepMs = 'lyric_cascade_base_step_ms';
   static const String _keyCascadeDecayX = 'lyric_cascade_decay_x';
+  static const String _keyLiftHeightPx = 'lyric_lift_height_px';
+  static const String _keyStaggerFromCurrentLine =
+      'lyric_stagger_from_current';
 
   // ============== 当前值 ==============
 
@@ -217,7 +242,7 @@ class LyricPreferences extends ChangeNotifier {
   bool _useDynamicLyricColor = true;
   // 辉光触发阈值系数（默认 1.2）：触发阈值 = 歌词字长中位数 × 该系数
   double _glowThresholdFactor = defaultGlowThresholdFactor;
-  // 非当前行缩放（默认 0.97）：清晰层非当前行与 AM 模糊层共用此值
+  // 非当前行缩放（默认 0.850）：清晰层非当前行与 AM 模糊层共用此值
   double _inactiveScale = defaultInactiveScale;
   // 当前行垂直锚位（默认 0.35）：当前行中心落在视口高度的该比例处
   double _alignPosition = defaultAlignPosition;
@@ -225,6 +250,10 @@ class LyricPreferences extends ChangeNotifier {
   double _cascadeMaxDelayMs = defaultCascadeMaxDelayMs;
   double _cascadeBaseStepMs = defaultCascadeBaseStepMs;
   double _cascadeDecayX = defaultCascadeDecayX;
+  // AM 歌词细节参数：已播字上浮高度（px）
+  double _liftHeightPx = defaultLiftHeightPx;
+  // 级联错峰起点：true = 从当前行开始（默认），false = 从视口顶部开始（历史行为）
+  bool _staggerFromCurrentLine = defaultStaggerFromCurrentLine;
   // 运行时加载成功后填充的 family（仅 custom 模式且加载成功时非 null）
   String? _loadedCustomFontFamily;
   bool _loaded = false;
@@ -280,6 +309,15 @@ class LyricPreferences extends ChangeNotifier {
 
   /// 级联衰减因子（已折算 1/x）。供推进循环直接用。
   double get cascadeStepDecay => 1.0 / _cascadeDecayX;
+
+  /// 已播字上浮高度（px，范围 [minLiftHeightPx]~[maxLiftHeightPx]）。
+  ///
+  /// 当前行中"已唱过"的字（word 索引小于当前演唱字）稳定停留在这个上浮量上，
+  /// 未唱字保持 0；渲染侧使用的 Y 偏移为其负值。
+  double get liftHeightPx => _liftHeightPx;
+
+  /// 级联错峰是否从当前行开始（默认 true）。
+  bool get staggerFromCurrentLine => _staggerFromCurrentLine;
 
   /// 当前生效的 fontFamily（传给 TextPainter 的 TextStyle）：
   /// - [LyricFontSource.system]：返回 null（让 Flutter 走系统字体链）
@@ -345,6 +383,12 @@ class LyricPreferences extends ChangeNotifier {
     _cascadeDecayX =
         (prefs.getDouble(_keyCascadeDecayX) ?? defaultCascadeDecayX)
             .clamp(minCascadeDecayX, maxCascadeDecayX);
+    _liftHeightPx =
+        (prefs.getDouble(_keyLiftHeightPx) ?? defaultLiftHeightPx)
+            .clamp(minLiftHeightPx, maxLiftHeightPx);
+    _staggerFromCurrentLine =
+        prefs.getBool(_keyStaggerFromCurrentLine) ??
+            defaultStaggerFromCurrentLine;
     _loaded = true;
     notifyListeners();
     // 若已配置自定义字体，立即尝试加载（Fire-and-forget，加载完成后会 notifyListeners）
@@ -510,6 +554,25 @@ class LyricPreferences extends ChangeNotifier {
     await prefs.setDouble(_keyCascadeDecayX, _cascadeDecayX);
   }
 
+  /// 设置已播字上浮高度（px）并持久化。
+  Future<void> setLiftHeightPx(double value) async {
+    final clamped = value.clamp(minLiftHeightPx, maxLiftHeightPx);
+    if (clamped == _liftHeightPx) return;
+    _liftHeightPx = clamped;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keyLiftHeightPx, _liftHeightPx);
+  }
+
+  /// 设置级联错峰起点（从当前行开始）并持久化。
+  Future<void> setStaggerFromCurrentLine(bool enabled) async {
+    if (_staggerFromCurrentLine == enabled) return;
+    _staggerFromCurrentLine = enabled;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyStaggerFromCurrentLine, enabled);
+  }
+
   /// 设置歌词翻译副行显示开关并持久化。
   Future<void> setShowTranslation(bool enabled) async {
     if (_showTranslation == enabled) return;
@@ -627,6 +690,8 @@ class LyricPreferences extends ChangeNotifier {
     _cascadeMaxDelayMs = defaultCascadeMaxDelayMs;
     _cascadeBaseStepMs = defaultCascadeBaseStepMs;
     _cascadeDecayX = defaultCascadeDecayX;
+    _liftHeightPx = defaultLiftHeightPx;
+    _staggerFromCurrentLine = defaultStaggerFromCurrentLine;
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_keyFontSize, _fontSize);
@@ -646,6 +711,8 @@ class LyricPreferences extends ChangeNotifier {
     await prefs.remove(_keyCascadeMaxDelayMs);
     await prefs.remove(_keyCascadeBaseStepMs);
     await prefs.remove(_keyCascadeDecayX);
+    await prefs.remove(_keyLiftHeightPx);
+    await prefs.remove(_keyStaggerFromCurrentLine);
     await prefs.remove(_keyFontSource);
     await prefs.remove(_keyCustomFontPath);
   }

@@ -1,8 +1,10 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
+import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/song_list_item.dart';
 
@@ -227,6 +229,18 @@ class _SongsPageState extends State<SongsPage> {
     );
   }
 
+  /// 一起听房主在房间里：本地音乐不能本地起播。
+  ///
+  /// 本地文件没有可上报上游的 hash，房主起播后成员跟着拿到无法解析的曲目。
+  /// 这里前置拦截并说明原因（[PlayerProvider.onRoomOwnerInterceptPlayback]
+  /// 是兜底，所有取本地文件的场景都会命中），提示比兜底的通用文案更具体。
+  bool _blockedByRoomOwnership() {
+    final session = context.read<ListenTogetherProvider>().session;
+    if (session == null || !session.isOwner) return false;
+    showToast('当前是「一起听」房主，房间里只能播放房间歌单中的在线歌曲', long: true);
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     final songs = _sortedSongs;
@@ -267,7 +281,7 @@ class _SongsPageState extends State<SongsPage> {
                 icon: const Icon(Icons.shuffle),
                 tooltip: '随机播放',
                 onPressed: () {
-                  if (songs.isNotEmpty) {
+                  if (songs.isNotEmpty && !_blockedByRoomOwnership()) {
                     final shuffled = List<Song>.from(songs)..shuffle();
                     context.read<PlayerProvider>().playPlaylist(shuffled, 0);
                   }
@@ -303,6 +317,7 @@ class _SongsPageState extends State<SongsPage> {
                 key: index == _targetScrollIndex ? _targetItemKey : null,
                 song: songs[index],
                 onTap: () {
+                  if (_blockedByRoomOwnership()) return;
                   context.read<PlayerProvider>().playPlaylist(songs, index);
                 },
                 onMoreTap: () {},
