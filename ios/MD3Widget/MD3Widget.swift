@@ -281,7 +281,7 @@ struct MD3MusicWidgetView: View {
   /// 单行文本，超宽省略号截断。
   private func plainText(
     _ text: String, fontSize: CGFloat, weight: Font.Weight, color: Color,
-    alignment: HorizontalAlignment
+    alignment: Alignment
   ) -> some View {
     Text(text)
       .font(.system(size: fontSize, weight: weight))
