@@ -581,7 +581,12 @@ class AudioPlayer {
 
   void _ensureAudioFocusSubscription() {
     final id = _id;
-    if (!_isAndroid() || id == null) return;
+    // MD3Music fork: iOS 也建立订阅——原生 AudioPlayer.m 监听
+    // AVAudioSessionInterruptionNotification 并经同名 channel 转发
+    // AUDIOFOCUS_* 常量，供上层同步"被抢占"时的 UI 暂停态。
+    if ((!_isAndroid() && !(kIsWeb ? false : Platform.isIOS)) || id == null) {
+      return;
+    }
     // idle 平台（未播放）没有 native 实现，订阅与补发都会 MissingPlugin；
     // 播放器真正激活（native 创建）后再订阅/补发。
     if (_platformValue is _IdleAudioPlayer) return;
@@ -1309,7 +1314,8 @@ class AudioPlayer {
     if (_id == null) return;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
-      await channel.invokeMethod('setForceWillPauseWhenDucked', {'force': force});
+      await channel
+          .invokeMethod('setForceWillPauseWhenDucked', {'force': force});
     } catch (e) {
       // ignore: avoid_print
       print('[AudioFocusFork] setForceWillPauseWhenDucked failed: $e');
@@ -1354,7 +1360,8 @@ class AudioPlayer {
     if (_id == null) return;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
-      await channel.invokeMethod('setForceKeepPlaying', {'keepPlaying': keepPlaying});
+      await channel
+          .invokeMethod('setForceKeepPlaying', {'keepPlaying': keepPlaying});
     } catch (e) {
       // ignore: avoid_print
       print('[AudioFocusFork] setForceKeepPlaying failed: $e');
@@ -1365,7 +1372,8 @@ class AudioPlayer {
   bool? _pendingForceKeepPlaying;
 
   /// 读取本曲累计传输字节与播放位置（歌曲信息页实时码率用）。仅 Android 有效。
-  Future<Map<String, dynamic>?> getTransferStats() async {    if (_disposed) return null;
+  Future<Map<String, dynamic>?> getTransferStats() async {
+    if (_disposed) return null;
     if (!_isAndroid()) return null;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');

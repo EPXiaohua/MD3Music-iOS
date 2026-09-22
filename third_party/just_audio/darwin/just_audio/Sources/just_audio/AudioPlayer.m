@@ -53,6 +53,13 @@
     NSDictionary<NSString *, NSObject *> *_icyMetadata;
     NSNumber *_errorCode;
     NSString *_errorMessage;
+    // MD3Music fork: 音频焦点中断转发（audioFocusChangeStream 的 iOS 事件源）。
+    // 其他 app 抢占播放时系统自动暂停 AVPlayer（锁屏控件同步暂停），但 Dart
+    // 侧收不到任何事件导致应用内 UI 不同步——监听 AVAudioSession 中断通知，
+    // 经 focus_events channel 转发 AUDIOFOCUS_* 常量（-1=LOSS, 1=GAIN,
+    // -2=TRANSIENT）与 Android Media3 同协议。
+    BetterEventChannel *_focusEventChannel;
+    BOOL _interruptedBySystem;
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation {
@@ -70,6 +77,16 @@
     _dataEventChannel = [[BetterEventChannel alloc]
         initWithName:[NSMutableString stringWithFormat:@"com.ryanheise.just_audio.data.%@", _playerId]
            messenger:[registrar messenger]];
+    // MD3Music fork: focus 事件 channel（与 Android 同名协议）+ AVAudioSession
+    // 中断监听。Dart 侧 _ensureAudioFocusSubscription 订阅该 channel。
+    _focusEventChannel = [[BetterEventChannel alloc]
+        initWithName:[NSMutableString stringWithFormat:@"com.ryanheise.just_audio.focus_events.%@", _playerId]
+           messenger:[registrar messenger]];
+    _interruptedBySystem = NO;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onAudioSessionInterruption:)
+                                                 name:AVAudioSessionInterruptionNotification
+                                               object:[AVAudioSession sharedInstance]];
     _index = 0;
     _processingState = psIdle;
     _loopMode = lmLoopOff;
@@ -746,6 +763,33 @@
 - (void)onItemStalled:(NSNotification *)notification {
     //IndexedPlayerItem *playerItem = (IndexedPlayerItem *)notification.object;
     //NSLog(@"onItemStalled");
+}
+
+// MD3Music fork: AVAudioSession 中断 → audioFocusChange 事件转发。
+// began 系统已强制暂停 AVPlayer，发 -1（LOSS）让 Dart 同步暂停态；
+// ended 时系统建议恢复（ShouldResume）则发 1（GAIN）由 Dart 按策略恢复，
+// 否则发 -2（TRANSIENT）保持暂停（Dart 侧 pause 为幂等空操作）。
+- (void)onAudioSessionInterruption:(NSNotification *)notification {
+    NSDictionary *info = notification.userInfo;
+    if (!info) return;
+    NSInteger type = [[info valueForKey:AVAudioSessionInterruptionTypeKey] integerValue];
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        _interruptedBySystem = YES;
+        [_focusEventChannel sendEvent:@(-1)];
+    } else if (type == AVAudioSessionInterruptionTypeEnded && _interruptedBySystem) {
+        _interruptedBySystem = NO;
+        NSUInteger options = [[info valueForKey:AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+        if (options & AVAudioSessionInterruptionOptionShouldResume) {
+            [_focusEventChannel sendEvent:@(1)];
+        } else {
+            [_focusEventChannel sendEvent:@(-2)];
+        }
+    }
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [_focusEventChannel dispose];
 }
 
 - (void)onFailToComplete:(NSNotification *)notification {
