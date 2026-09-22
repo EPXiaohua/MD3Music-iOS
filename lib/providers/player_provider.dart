@@ -39,7 +39,6 @@ import 'favorites_provider.dart';
 import 'kugou_provider.dart';
 import 'position_rewind_gate.dart';
 import '../services/kugou_api/kugou_api_client.dart';
-import '../services/kugou_api/kugou_endpoints.dart';
 import '../services/kugou_api/kugou_models.dart';
 
 enum AppLoopMode { off, one, all }
@@ -971,7 +970,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // ExoPlayer/播放器错误进诊断日志（app.log 随诊断报告导出）；
       // 192k 等超能力格式的 renderer 停喂/error 状态定位依赖此日志
       try {
-        _playerErrorSubscription = _audioService.errorStream.listen((e) {
+        _playerErrorSubscription = _audioService.player.errorStream.listen((e) {
           // just_audio 0.10.x：code=10000000（kInterruptedErrorCode）表示「本次 load 被
           // 下一次 setUrl 抢占而中止」，属良性信号，不是解码失败 —— 快速切歌时会高频出现。
           // 保留日志但显式标注，避免在诊断导出里被误读成 32bit/格式解码失败。
@@ -979,23 +978,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           debugPrint(
             '[UsbDiag] player error: code=${e.code} message="${e.message}"$tag',
           );
-          // iOS：暂停→锁屏挂起→回前台点播放后，AVPlayer 的网络栈可能整体失效，
-          // 直连 CDN 报 NSURLError 连接类错误（-1004 等），而同时段歌词/封面/API
-          // 请求全部正常，Dio 直连 CDN 预取也成功——即设备网络无恙，是 AVPlayer
-          // 自身的连接池死了，仅等速率检测（要求 position 前进）永远等不到。
-          // 复用 CdnStall 链路（刷新 URL→断点续播→重试耗尽降级音质）自动恢复。
-          // Android 的 ExoPlayer 错误码体系不同且实测无此问题，不介入。
-          const iosConnectErrors = {
-            -1001, // time out
-            -1003, // cannot find host
-            -1004, // cannot connect to host（实测主发码）
-            -1005, // network connection lost
-            -1007, // too many redirects
-            -1009, // not connected to internet
-          };
-          if (Platform.isIOS && iosConnectErrors.contains(e.code)) {
-            _handleCdnStall();
-          }
         });
       } catch (_) {
         // 动态类型模块无 player/errorStream 时忽略
@@ -2365,42 +2347,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     final bool gateRewind = seekTo != null && seekTo > Duration.zero;
     if (gateRewind) _positionRewindGate.arm(seekTo);
     try {
-      Future<void> load(String u) => _audioService.setUrl(
-        u,
+      // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
+      await _audioService.setUrl(
+        url,
         loudnessLufs: _currentSong?.loudnessLufs,
         loudnessPeakDb: _currentSong?.loudnessPeakDb,
       );
-      // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-      try {
-        await load(url);
-      } catch (e) {
-        // 直连 CDN 失败（iOS 暂停锁屏挂起恢复后 AVPlayer 媒体通道失效，直连
-        // CDN 报 -1004），先改走本地服务器音频代理流式转发重试——本地回环
-        // 127.0.0.1 由服务器进程上游拉取 CDN 数据。端口为 0（服务器未启动）
-        // 或本身已是代理 URL 时无可兜底，原样抛出。
-        final int port = KugouApiServer.currentPort;
-        if (port == 0 || url.contains('/audio/proxy')) rethrow;
-        final proxyUrl =
-            '${KugouEndpoints.baseUrl}/audio/proxy?url=${Uri.encodeComponent(url)}';
-        debugPrint('[D切歌] 直连失败，走本地音频代理重试: $e');
-        debugPrint('[D切歌] 代理URL: $proxyUrl');
-        try {
-          await load(proxyUrl);
-        } catch (e2) {
-          // 诊断日志实锤：挂起恢复后旧 AVPlayer 实例已整体死亡，对任何 URL
-          // （含 127.0.0.1 代理）setUrl 都在 ~60ms 内秒抛 -1004，换 URL
-          // 无效。只能销毁重建底层 AVPlayer，再用代理 URL 装载。
-          if (!Platform.isIOS) rethrow;
-          debugPrint(
-            '[D切歌] 本地代理仍秒失败，判定 AVPlayer 已随挂起死亡，'
-            '重建播放器后重试: $e2',
-          );
-          final dynamic recreated = await _audioService
-              .recreateMainPlayerForRecovery();
-          if (recreated != true) rethrow;
-          await load(proxyUrl);
-        }
-      }
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {
         final state = _audioService.player.playerState;
