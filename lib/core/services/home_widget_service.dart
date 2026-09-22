@@ -57,4 +57,20 @@ class HomeWidgetService {
       debugPrint('HomeWidgetService.updateMusicWidgetTheme error: $e');
     }
   }
+
+  /// 注册桌面小组件按钮命令回调（iOS 17 AppIntent：播放/暂停、下一首）。
+  ///
+  /// widget 按钮把命令写入 App Group 并打开 app，原生回前台时经
+  /// invokeMethod("widgetCommand") 转发到此处；[onCommand] 收到
+  /// "play_pause" / "next" 等动作后执行对应播放控制。
+  static void setCommandHandler(Future<void> Function(String action) onCommand) {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'widgetCommand') {
+        final args = call.arguments as Map?;
+        final action = args?['action'] as String?;
+        if (action != null) await onCommand(action);
+      }
+      return null;
+    });
+  }
 }

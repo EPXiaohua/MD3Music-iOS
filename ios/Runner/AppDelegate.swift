@@ -73,6 +73,9 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     NowPlayingManager.shared.attach(messenger: messenger)
 
+    // iOS 桌面小组件数据同步（与 Android 同名 channel，原生各自实现）
+    WidgetSync.shared.attach(messenger: messenger)
+
     // iOS 歌词悬浮窗（系统画中画）。Android 悬浮歌词走 FloatingLyricService，
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     LyricsPipManager.shared.attach(messenger: messenger)
@@ -324,6 +327,8 @@ final class NowPlayingManager {
   private var appliedArtUri: String?
   /// 封面下载请求序号：快速切歌时旧请求返回后按序号丢弃，避免串歌封面
   private var artworkRequestId = 0
+  /// 最近一次成功加载的封面（桌面小组件 WidgetSync 读取）
+  var lastArtworkImage: UIImage?
 
   private init() {}
 
@@ -417,6 +422,8 @@ final class NowPlayingManager {
           guard requestId == self.artworkRequestId else { return }
           guard let data = data, let image = UIImage(data: data) else { return }
           let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+          // 供桌面小组件（WidgetSync）取用当前封面
+          self.lastArtworkImage = image
           var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
           info[MPMediaItemPropertyArtwork] = artwork
           MPNowPlayingInfoCenter.default().nowPlayingInfo = info

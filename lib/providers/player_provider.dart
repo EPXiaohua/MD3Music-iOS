@@ -367,6 +367,19 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 事件到达时可能晚于状态恢复的 notifyListeners，这里补推当前歌曲，
     // 否则词幕不会自动连接显示（PlayerProvider 自己监听自己无法感知 Lyricon 启用）。
     LyriconProviderService.instance.addListener(_handleLyriconEnabledChanged);
+    // 桌面小组件按钮命令（iOS 17 AppIntent 经原生转发；Android AppWidget 走
+    // 原生广播直控播放器不经过这里）
+    HomeWidgetService.setCommandHandler(_handleWidgetCommand);
+  }
+
+  /// 执行桌面小组件按钮命令。
+  Future<void> _handleWidgetCommand(String action) async {
+    switch (action) {
+      case 'play_pause':
+        _isPlaying ? await pause() : await resume();
+      case 'next':
+        await next();
+    }
   }
 
   /// 推送当前「在线歌曲播放中」状态到听歌等级服务。
