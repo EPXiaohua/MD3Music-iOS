@@ -306,16 +306,12 @@ struct MD3MusicWidgetView: View {
             let cycle = 2 * pause + 2 * travel
             let t = context.date.timeIntervalSinceReferenceDate
               .truncatingRemainder(dividingBy: cycle)
-            let offset: CGFloat
-            if t < pause {
-              offset = 0
-            } else if t < pause + travel {
-              offset = min(CGFloat(t - pause) * speed, overflow)
-            } else if t < 2 * pause + travel {
-              offset = overflow
-            } else {
-              offset = max(overflow - CGFloat(t - 2 * pause - travel) * speed, 0)
-            }
+            let offset: CGFloat = {
+              if t < pause { return CGFloat(0) }
+              if t < pause + travel { return min(CGFloat(t - pause) * speed, overflow) }
+              if t < 2 * pause + travel { return overflow }
+              return max(overflow - CGFloat(t - 2 * pause - travel) * speed, 0)
+            }()
             Text(text)
               .font(.system(size: fontSize, weight: weight))
               .foregroundColor(color)
