@@ -20,6 +20,7 @@
 
 import WidgetKit
 import SwiftUI
+import AppIntents
 
 // MARK: - 数据模型
 
@@ -159,17 +160,28 @@ struct MD3MusicWidgetView: View {
         textBlock(s)
         progressView(s)
         HStack(spacing: 10) {
-          controlButton(
-            systemName: s.isPlaying ? "pause.fill" : "play.fill",
-            tint: s.primary, icon: s.onPrimary
-          ) {
-            PlayPauseIntent()
-          }
-          controlButton(
-            systemName: "forward.fill", tint: s.surfaceHigh,
-            icon: s.onSurface
-          ) {
-            NextIntent()
+          // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
+          // 点击 widget 整体打开 app
+          if #available(iOSApplicationExtension 17.0, *) {
+            Button(intent: PlayPauseIntent()) {
+              controlCircle(
+                systemName: s.isPlaying ? "pause.fill" : "play.fill",
+                tint: s.primary, icon: s.onPrimary)
+            }
+            .buttonStyle(.plain)
+            Button(intent: NextIntent()) {
+              controlCircle(
+                systemName: "forward.fill", tint: s.surfaceHigh,
+                icon: s.onSurface)
+            }
+            .buttonStyle(.plain)
+          } else {
+            controlCircle(
+              systemName: s.isPlaying ? "pause.fill" : "play.fill",
+              tint: s.primary, icon: s.onPrimary)
+            controlCircle(
+              systemName: "forward.fill", tint: s.surfaceHigh,
+              icon: s.onSurface)
           }
           Spacer()
         }
@@ -229,24 +241,15 @@ struct MD3MusicWidgetView: View {
     return CGFloat(min(max(s.livePositionMs, 0), s.durationMs)) / CGFloat(s.durationMs)
   }
 
-  /// 圆形控制按钮。iOS 17+ 绑定 AppIntent 真实控制播放；
-  /// iOS 15/16 退化为纯图标（点击 widget 整体打开 app）。
-  @ViewBuilder
-  private func controlButton(
-    systemName: String, tint: Color, icon: Color,
-    @ViewBuilder intent: () -> some View
-  ) -> some View {
-    let circle = Image(systemName: systemName)
+  /// 圆形控制按钮外观（不含交互）
+  private func controlCircle(systemName: String, tint: Color, icon: Color)
+    -> some View
+  {
+    Image(systemName: systemName)
       .font(.system(size: 13, weight: .semibold))
       .foregroundColor(icon)
       .frame(width: 30, height: 30)
       .background(Circle().fill(tint))
-    if #available(iOSApplicationExtension 17.0, *) {
-      Button(intent: intent()) { circle }
-        .buttonStyle(.plain)
-    } else {
-      circle
-    }
   }
 }
 
