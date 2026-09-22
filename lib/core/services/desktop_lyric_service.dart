@@ -365,26 +365,12 @@ class DesktopLyricService {
   /// 回调驱动（快速连点由原生状态机收敛），激活后的歌词补推在
   /// [_onPipActiveChanged] 里做。
   Future<void> _toggleIosPipFloatingLyric() async {
-    // VideoCall 式 contentSource（AVPictureInPictureController.ContentSource）
-    // 是 iOS 15+ API，低版本系统直接提示，不再走 toggle 静默失败。
-    // 注意：Platform.version 是 Dart VM 版本，不是系统版本——iOS 系统版本
-    // 用 operatingSystemVersion（kern.osproductversion，如 "16.6"）。
-    final osMajor =
-        int.tryParse(
-          RegExp(
-                r'^(\d+)',
-              ).firstMatch(Platform.operatingSystemVersion)?.group(1) ??
-              '',
-        ) ??
-        0;
-    if (osMajor < 15) {
-      showToast('歌词悬浮窗仅支持 iOS 15 及以上', long: true);
-      return;
-    }
     final pip = LyricsPipService.instance;
     final wasActive = pip.active;
     await pip.toggle();
-    // 开启请求被原生拒绝（设备不支持画中画等）→ 明确提示而不是静默无反馈
+    // 开启请求被原生拒绝（系统/设备不支持画中画等）→ 明确提示而不是静默
+    // 无反馈；不做 Dart 侧版本号解析（低版本 iOS 连 ContentSource API 都
+    // 不可用，start 必然失败，统一落到这里）
     if (!wasActive && !pip.active) {
       showToast('当前设备不支持歌词悬浮窗', long: true);
     }
