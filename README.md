@@ -408,7 +408,7 @@ A: Rust 的 TLS 依赖（`ring` crate）需要交叉编译为各平台产物：A
 
 ### iOS 移植使用
 
-- [nab138/isideload](https://github.com/nab138/isideload) — 免费云端签名侧载（App Group 兼容逻辑参考）
+- [nab138/isideload](https://github.com/nab138/iloader) — IPA签名侧载工具（App Group 兼容逻辑参考）
 
 ***
 
