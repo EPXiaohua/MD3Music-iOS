@@ -198,11 +198,11 @@ struct MD3MusicWidgetView: View {
       VStack(spacing: 2) {
         plainText(
           s.title.isEmpty ? "MD3Music" : s.title,
-          fontSize: 14, weight: .semibold, color: s.onSurface,
+          fontSize: 9, weight: .semibold, color: s.onSurface,
           alignment: .center)
         plainText(
           s.artist.isEmpty ? "未在播放" : s.artist,
-          fontSize: 12, weight: .regular, color: s.onSurfaceVariant,
+          fontSize: 7, weight: .regular, color: s.onSurfaceVariant,
           alignment: .center)
       }
       progressView(s)
@@ -211,12 +211,12 @@ struct MD3MusicWidgetView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// 中号：封面 + 标题/歌手 + 进度 + 播放/下一首按钮，左对齐。
+  /// 中号（参照设计图）：上排封面+歌曲信息，中间通栏进度条，底部播放/下一首按钮。
   private func mediumLayout(_ s: WidgetState) -> some View {
-    HStack(spacing: 12) {
-      coverView(s, size: 64)
-      VStack(alignment: .leading, spacing: 4) {
-        VStack(alignment: .leading, spacing: 2) {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(spacing: 12) {
+        coverView(s, size: 56)
+        VStack(alignment: .leading, spacing: 3) {
           plainText(
             s.title.isEmpty ? "MD3Music" : s.title,
             fontSize: 14, weight: .semibold, color: s.onSurface,
@@ -226,33 +226,33 @@ struct MD3MusicWidgetView: View {
             fontSize: 12, weight: .regular, color: s.onSurfaceVariant,
             alignment: .leading)
         }
-        progressView(s)
-        HStack(spacing: 10) {
-          // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
-          // 点击 widget 整体打开 app
-          if #available(iOSApplicationExtension 17.0, *) {
-            Button(intent: PlayPauseIntent()) {
-              controlCircle(
-                systemName: s.isPlaying ? "pause.fill" : "play.fill",
-                tint: s.primary, icon: s.onPrimary)
-            }
-            .buttonStyle(.plain)
-            Button(intent: NextIntent()) {
-              controlCircle(
-                systemName: "forward.fill", tint: s.surfaceHigh,
-                icon: s.onSurface)
-            }
-            .buttonStyle(.plain)
-          } else {
+      }
+      progressView(s)
+      HStack(spacing: 10) {
+        // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
+        // 点击 widget 整体打开 app
+        if #available(iOSApplicationExtension 17.0, *) {
+          Button(intent: PlayPauseIntent()) {
             controlCircle(
               systemName: s.isPlaying ? "pause.fill" : "play.fill",
               tint: s.primary, icon: s.onPrimary)
+          }
+          .buttonStyle(.plain)
+          Button(intent: NextIntent()) {
             controlCircle(
               systemName: "forward.fill", tint: s.surfaceHigh,
               icon: s.onSurface)
           }
-          Spacer()
+          .buttonStyle(.plain)
+        } else {
+          controlCircle(
+            systemName: s.isPlaying ? "pause.fill" : "play.fill",
+            tint: s.primary, icon: s.onPrimary)
+          controlCircle(
+            systemName: "forward.fill", tint: s.surfaceHigh,
+            icon: s.onSurface)
         }
+        Spacer()
       }
     }
     .padding(.horizontal, 14)
@@ -292,7 +292,8 @@ struct MD3MusicWidgetView: View {
       .frame(height: fontSize * 1.25)
   }
 
-  /// 细进度条：左右各留 2pt 内收避免贴/越组件边缘，填充宽度做 clamp 双保险。
+  /// 细进度条：左右各内收 11pt（较最初共缩 18pt）避免贴/越组件边缘，
+  /// 填充宽度做 clamp 双保险。
   private func progressView(_ s: WidgetState) -> some View {
     TimelineView(.periodic(from: .now, by: 1)) { _ in
       GeometryReader { geo in
@@ -305,7 +306,7 @@ struct MD3MusicWidgetView: View {
         }
       }
       .frame(height: 4)
-      .padding(.horizontal, 2)
+      .padding(.horizontal, 11)
       .animation(.linear(duration: 1), value: progressFraction(s))
     }
   }
