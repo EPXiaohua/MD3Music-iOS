@@ -99,19 +99,18 @@ class SpectrumService {
     _running = true;
 
     if (nativeOk) {
-      // iOS 不降级模拟：FFT 数据依赖 AVPlayerItem 的 tap 异步挂载（切歌/起播
-      // 后可能延迟 1~2s），期间静默等待即可；模拟降级会在 EQ 关闭等场景下
-      // 误报"设备不支持频谱"。模拟模式仅保留给 Android Visualizer 不可用的场景。
-      if (!Platform.isIOS) {
-        _fallbackTimer?.cancel();
-        _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
-          if (_running && !_receivedFft) {
-            // 1.5 秒内无 FFT 回调，降级到模拟模式
-            _startSimulated();
-          }
-        });
-      }
-    } else if (!Platform.isIOS) {
+      // 原生启动成功，等 1.5 秒看是否有 FFT 回调；无回调则降级到模拟模式。
+      // iOS 保留降级兜底：极少数系统/格式下 tap 可能挂不上收不到数据，
+      // 此时模拟模式保证频谱功能可见。正常设备走真实频谱（tap 挂载延迟
+      // 1~2s 内不会误触发，因为降级判定看的是 onFft 是否真的到达）。
+      _fallbackTimer?.cancel();
+      _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
+        if (_running && !_receivedFft) {
+          // 1.5 秒内无 FFT 回调，降级到模拟模式
+          _startSimulated();
+        }
+      });
+    } else {
       // 原生启动失败（如 HyperOS error -3），直接用模拟模式
       _startSimulated();
     }
