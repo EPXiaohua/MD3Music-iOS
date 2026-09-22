@@ -365,15 +365,7 @@ class DesktopLyricService {
   /// 回调驱动（快速连点由原生状态机收敛），激活后的歌词补推在
   /// [_onPipActiveChanged] 里做。
   Future<void> _toggleIosPipFloatingLyric() async {
-    final pip = LyricsPipService.instance;
-    final wasActive = pip.active;
-    await pip.toggle();
-    // 开启请求被原生拒绝（系统/设备不支持画中画等）→ 明确提示而不是静默
-    // 无反馈；不做 Dart 侧版本号解析（低版本 iOS 连 ContentSource API 都
-    // 不可用，start 必然失败，统一落到这里）
-    if (!wasActive && !pip.active) {
-      showToast('当前设备不支持歌词悬浮窗', long: true);
-    }
+    await LyricsPipService.instance.toggle();
   }
 
   /// 整包歌词推给 PiP（切歌/解析完成时）：原生用行尾时间画进度条总长。
