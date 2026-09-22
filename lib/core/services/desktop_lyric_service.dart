@@ -365,7 +365,20 @@ class DesktopLyricService {
   /// 回调驱动（快速连点由原生状态机收敛），激活后的歌词补推在
   /// [_onPipActiveChanged] 里做。
   Future<void> _toggleIosPipFloatingLyric() async {
-    await LyricsPipService.instance.toggle();
+    // VideoCall 式 contentSource（AVPictureInPictureController.ContentSource）
+    // 是 iOS 15+ API，低版本系统直接提示，不再走 toggle 静默失败
+    final major = int.tryParse(Platform.version.split('.').first) ?? 0;
+    if (major < 15) {
+      showToast('歌词悬浮窗仅支持 iOS 15 及以上', long: true);
+      return;
+    }
+    final pip = LyricsPipService.instance;
+    final wasActive = pip.active;
+    await pip.toggle();
+    // 开启请求被原生拒绝（设备不支持画中画等）→ 明确提示而不是静默无反馈
+    if (!wasActive && !pip.active) {
+      showToast('当前设备不支持歌词悬浮窗', long: true);
+    }
   }
 
   /// 整包歌词推给 PiP（切歌/解析完成时）：原生用行尾时间画进度条总长。
