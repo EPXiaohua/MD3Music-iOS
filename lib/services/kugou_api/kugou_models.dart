@@ -32,10 +32,7 @@ Future<void> warmLoudnessCache() async {
       final lufs = item['l'];
       if (url == null || url.isEmpty || lufs is! num) continue;
       final pk = item['p'];
-      kugouUrlLoudness[url] = (
-        lufs: lufs.toDouble(),
-        peak: pk is num ? pk.toDouble() : null,
-      );
+      kugouUrlLoudness[url] = (lufs: lufs.toDouble(), peak: pk is num ? pk.toDouble() : null);
     }
   } catch (_) {}
 }
@@ -651,13 +648,10 @@ class KugouPlayUrl {
   final int bitRate;
   final String quality;
   final bool isTrial;
-
   /// 音量均衡（响度归一）：集总响度（LUFS），无则 null。
   final double? volumeLufs;
-
   /// 真峰值（dBTP/dBFS），无则 null。
   final double? volumePeakDb;
-
   /// 上游响度增益（dB，仅诊断用），无则 null。
   final double? volumeGainDb;
 
@@ -675,7 +669,9 @@ class KugouPlayUrl {
   factory KugouPlayUrl.fromJson(Map<String, dynamic> json) {
     // 响度字段：读取嵌套 data 层（_extractData 已把 data 并到顶层或保留 data 层）。
     final data = json['data'];
-    final source = data is Map<String, dynamic> ? {...json, ...data} : json;
+    final source = data is Map<String, dynamic>
+        ? {...json, ...data}
+        : json;
     dynamic rawUrl = json['url'] ?? json['play_url'] ?? '';
     String url;
     if (rawUrl is List && rawUrl.isNotEmpty) {
@@ -693,8 +689,7 @@ class KugouPlayUrl {
           json['filesize'] ??
           0,
     );
-    final isTrial =
-        (failProcess is List && failProcess.contains('buy')) ||
+    final isTrial = (failProcess is List && failProcess.contains('buy')) ||
         (fileSize > 0 && fileSize < 200 * 1024);
     return KugouPlayUrl(
       url: url,
@@ -711,7 +706,7 @@ class KugouPlayUrl {
       volumeLufs: _optDouble(source['volume'] ?? source['volume_lufs']),
       volumePeakDb: _optDouble(source['volume_peak'] ?? source['volumePeak']),
       volumeGainDb: _optDouble(source['volume_gain'] ?? source['volumeGain']),
-    ).._rememberLoudness();
+    ).. _rememberLoudness();
   }
 
   /// 记录本次解析的响度到全局缓存（并持久化，跨会话供历史回放），播放链路回退使用。
@@ -1029,8 +1024,7 @@ class KugouComment {
       ),
       replyCount: _parseInt(json['reply_num'] ?? json['reply_count'] ?? 0),
       isHot: parseBool(json['is_hot'] ?? json['isHot'] ?? isHot),
-      isStar:
-          parseBool(json['is_star'] ?? json['isStar'] ?? isStar) ||
+      isStar: parseBool(json['is_star'] ?? json['isStar'] ?? isStar) ||
           isAuthorComment,
       parentId: _strNull(json['pid']),
       specialId: _strNull(
@@ -1958,10 +1952,7 @@ class KugouSceneVideo {
         json['pic'],
       ]),
       hash: _strNull(
-        json['sd_hash'] ??
-            json['qhd_hash'] ??
-            json['hash'] ??
-            json['video_hash'],
+        json['sd_hash'] ?? json['qhd_hash'] ?? json['hash'] ?? json['video_hash'],
       ),
       authorName: _strNull(
         (authorInfo is Map<String, dynamic> ? authorInfo['user_name'] : null) ??
@@ -2068,7 +2059,6 @@ class KugouLongAudioAlbum {
   final String? coverUrl;
   final String? author;
   final int audioCount;
-
   /// 专辑简介（详情页展示，可空）。
   final String? intro;
 
@@ -2092,9 +2082,14 @@ class KugouLongAudioAlbum {
             '',
       ),
       coverUrl: _resolveArtworkUri(
-        json['sizable_cover'] ?? json['img'] ?? json['imgurl'] ?? json['cover'],
+        json['sizable_cover'] ??
+            json['img'] ??
+            json['imgurl'] ??
+            json['cover'],
       ),
-      author: _strNull(json['author'] ?? json['author_name'] ?? json['singer']),
+      author: _strNull(
+        json['author'] ?? json['author_name'] ?? json['singer'],
+      ),
       audioCount: _parseInt(
         json['audio_count'] ??
             json['audiocount'] ??
@@ -2117,7 +2112,6 @@ class KugouLongAudioAudio {
   final String? artworkUri;
   final String? albumAudioId;
   final String? albumId;
-
   /// 是否限免可播：fail_process_128（默认 128k 播放音质）为 0；字段缺失时兜底 fail_process。
   /// 非 0（酷狗惯例 4）= 需购买/仅试听（付费章节）。
   final bool canPlay;
@@ -2200,14 +2194,20 @@ class KugouLoginAccount {
   final String? nickname;
   final String? avatar;
 
-  const KugouLoginAccount({required this.userid, this.nickname, this.avatar});
+  const KugouLoginAccount({
+    required this.userid,
+    this.nickname,
+    this.avatar,
+  });
 
   factory KugouLoginAccount.fromJson(Map<String, dynamic> json) {
     return KugouLoginAccount(
       userid: _str(
         json['userid'] ?? json['userId'] ?? json['id'] ?? json['user_id'],
       ),
-      nickname: _strNull(json['nickname'] ?? json['user_name'] ?? json['name']),
+      nickname: _strNull(
+        json['nickname'] ?? json['user_name'] ?? json['name'],
+      ),
       avatar: _resolveArtworkUri(
         json['avatar'] ?? json['pic'] ?? json['img'] ?? json['imgurl'],
       ),
