@@ -192,17 +192,18 @@ struct MD3MusicWidgetView: View {
   }
 
   /// 小号：封面在上、信息在中、进度条在下，整体居中。
-  /// 标题/歌手超宽时往左滚动（marquee）。
   private func smallLayout(_ s: WidgetState) -> some View {
     VStack(spacing: 7) {
       coverView(s, size: 78)
       VStack(spacing: 2) {
-        marqueeText(
+        plainText(
           s.title.isEmpty ? "MD3Music" : s.title,
-          fontSize: 14, weight: .semibold, color: s.onSurface)
-        marqueeText(
+          fontSize: 14, weight: .semibold, color: s.onSurface,
+          alignment: .center)
+        plainText(
           s.artist.isEmpty ? "未在播放" : s.artist,
-          fontSize: 12, weight: .regular, color: s.onSurfaceVariant)
+          fontSize: 12, weight: .regular, color: s.onSurfaceVariant,
+          alignment: .center)
       }
       progressView(s)
     }
@@ -210,19 +211,20 @@ struct MD3MusicWidgetView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// 中号：封面 + 标题/歌手 + 进度 + 播放/下一首按钮。
-  /// 标题/歌手超宽时往左滚动（marquee）。
+  /// 中号：封面 + 标题/歌手 + 进度 + 播放/下一首按钮，左对齐。
   private func mediumLayout(_ s: WidgetState) -> some View {
     HStack(spacing: 12) {
       coverView(s, size: 64)
       VStack(alignment: .leading, spacing: 4) {
         VStack(alignment: .leading, spacing: 2) {
-          marqueeText(
+          plainText(
             s.title.isEmpty ? "MD3Music" : s.title,
-            fontSize: 14, weight: .semibold, color: s.onSurface)
-          marqueeText(
+            fontSize: 14, weight: .semibold, color: s.onSurface,
+            alignment: .leading)
+          plainText(
             s.artist.isEmpty ? "未在播放" : s.artist,
-            fontSize: 12, weight: .regular, color: s.onSurfaceVariant)
+            fontSize: 12, weight: .regular, color: s.onSurfaceVariant,
+            alignment: .leading)
         }
         progressView(s)
         HStack(spacing: 10) {
@@ -276,83 +278,34 @@ struct MD3MusicWidgetView: View {
     .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
   }
 
-  /// 超宽文本往左滚动（marquee）。widget 是静态快照渲染，无法跑真动画，
-  /// 用 TimelineView 以 10fps 步进模拟匀速滚动：两端各停 1.5s，30pt/s 往返。
-  /// 文本宽度按字符宽度估算（CJK 全宽 / 拉丁 0.55 倍），保证单次渲染内自洽。
-  private func marqueeText(
-    _ text: String, fontSize: CGFloat, weight: Font.Weight, color: Color
+  /// 单行文本，超宽省略号截断。
+  private func plainText(
+    _ text: String, fontSize: CGFloat, weight: Font.Weight, color: Color,
+    alignment: HorizontalAlignment
   ) -> some View {
-    let textW = estimateWidth(text, fontSize: fontSize)
-    return Group {
-      if textW <= 0 {
-        // 空文本占位，保持行高
-        Text(" ").font(.system(size: fontSize)).frame(height: fontSize * 1.25)
-      } else if textW <= 150 {
-        // 未溢出：静态居中
-        Text(text)
-          .font(.system(size: fontSize, weight: weight))
-          .foregroundColor(color)
-          .lineLimit(1)
-          .frame(maxWidth: .infinity)
-          .frame(height: fontSize * 1.25)
-      } else {
-        TimelineView(.periodic(from: .now, by: 0.1)) { context in
-          GeometryReader { geo in
-            let available = max(geo.size.width, 1)
-            let overflow = max(textW - available, 0)
-            let speed: CGFloat = 30
-            let pause: Double = 1.5
-            let travel = overflow > 0 ? Double(overflow / speed) : 0
-            let cycle = 2 * pause + 2 * travel
-            let t = context.date.timeIntervalSinceReferenceDate
-              .truncatingRemainder(dividingBy: cycle)
-            let offset: CGFloat = {
-              if t < pause { return CGFloat(0) }
-              if t < pause + travel { return min(CGFloat(t - pause) * speed, overflow) }
-              if t < 2 * pause + travel { return overflow }
-              return max(overflow - CGFloat(t - 2 * pause - travel) * speed, 0)
-            }()
-            Text(text)
-              .font(.system(size: fontSize, weight: weight))
-              .foregroundColor(color)
-              .lineLimit(1)
-              .fixedSize()
-              .offset(x: -offset)
-              .frame(width: available, alignment: .leading)
-          }
-          .frame(height: fontSize * 1.25)
-          .clipped()
-        }
-      }
-    }
+    Text(text)
+      .font(.system(size: fontSize, weight: weight))
+      .foregroundColor(color)
+      .lineLimit(1)
+      .truncationMode(.tail)
+      .frame(maxWidth: .infinity, alignment: alignment)
+      .frame(height: fontSize * 1.25)
   }
 
-  /// 估算文本渲染宽度（CJK/全角按 fontSize，拉丁/数字按 0.55 倍）。
-  /// widget 快照渲染里拿不到精确测量，估算仅用于判断溢出与滚动距离。
-  private func estimateWidth(_ s: String, fontSize: CGFloat) -> CGFloat {
-    guard !s.isEmpty else { return 0 }
-    var w: CGFloat = 0
-    for ch in s.unicodeScalars {
-      if ch.value >= 0x1100 && (ch.value <= 0x115F || ch.value >= 0x2E80) {
-        w += fontSize
-      } else {
-        w += fontSize * 0.55
-      }
-    }
-    return w
-  }
-
+  /// 细进度条：左右各留 2pt 内收避免贴/越组件边缘，填充宽度做 clamp 双保险。
   private func progressView(_ s: WidgetState) -> some View {
     TimelineView(.periodic(from: .now, by: 1)) { _ in
       GeometryReader { geo in
+        let w = max(geo.size.width, 0)
         ZStack(alignment: .leading) {
           Capsule().fill(s.outlineVariant)
           Capsule()
             .fill(s.primary)
-            .frame(width: geo.size.width * progressFraction(s))
+            .frame(width: min(w * progressFraction(s), w))
         }
       }
       .frame(height: 4)
+      .padding(.horizontal, 2)
       .animation(.linear(duration: 1), value: progressFraction(s))
     }
   }
