@@ -369,10 +369,6 @@ A: 检查日志确认 Rust 服务器是否成功启动。Android 在 Logcat 中�
 
 A: 登录/注册/验证码已全部本地化：由嵌入式 Rust 服务器直连酷狗官方接口处理，不再依赖第三方云端。请确保设备可正常联网，并确认本地服务器已成功启动。
 
-**Q: iOS 免签安装后小组件不显示数据？**
-
-A: 免签工具会改写 App Group 标识，App 已内置运行时解析（读取签名 entitlements 中的实际 group），正常无需任何配置；若仍异常，尝试移除小组件后重新添加。
-
 **Q: 如何修改 API 服务器代码？**
 
 A: 修改 `kugou_api_server/rust/src/` 下的 Rust 代码，运行 `cargo build --release` 编译验证，Android 侧执行 `./build_android.sh` 交叉编译、iOS 侧执行 `./build_ios.sh`，再重新编译 App。
