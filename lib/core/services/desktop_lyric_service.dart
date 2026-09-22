@@ -366,9 +366,18 @@ class DesktopLyricService {
   /// [_onPipActiveChanged] 里做。
   Future<void> _toggleIosPipFloatingLyric() async {
     // VideoCall 式 contentSource（AVPictureInPictureController.ContentSource）
-    // 是 iOS 15+ API，低版本系统直接提示，不再走 toggle 静默失败
-    final major = int.tryParse(Platform.version.split('.').first) ?? 0;
-    if (major < 15) {
+    // 是 iOS 15+ API，低版本系统直接提示，不再走 toggle 静默失败。
+    // 注意：Platform.version 是 Dart VM 版本，不是系统版本——iOS 系统版本
+    // 用 operatingSystemVersion（kern.osproductversion，如 "16.6"）。
+    final osMajor =
+        int.tryParse(
+          RegExp(
+                r'^(\d+)',
+              ).firstMatch(Platform.operatingSystemVersion)?.group(1) ??
+              '',
+        ) ??
+        0;
+    if (osMajor < 15) {
       showToast('歌词悬浮窗仅支持 iOS 15 及以上', long: true);
       return;
     }
