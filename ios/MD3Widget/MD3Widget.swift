@@ -34,13 +34,36 @@ struct WidgetState {
   var updatedAt = Date()
   var colors: [String: Int] = [:]
   var coverImage: UIImage?
+  /// 自诊断：false = 签名缺少 App Group 权限（容器都打不开）
+  var appGroupAvailable = true
+  /// 自诊断：true = group 里根本没有 widget_state（app 侧没写入成功）
+  var hasState = false
 
+  /// App Group 数据可读性检查。
+  /// 侧载签名未注入 App Group entitlement 时 containerURL 返回 nil，
+  /// widget 永远读不到数据——用 UI 直接把原因显示出来，免去抓日志。
   static func load() -> WidgetState {
     var s = WidgetState()
-    guard let defaults = UserDefaults(suiteName: WidgetSyncBridge.appGroupId),
-      let data = defaults.data(forKey: "widget_state"),
+    guard let defaults = UserDefaults(suiteName: WidgetSyncBridge.appGroupId)
+    else {
+      s.appGroupAvailable = false
+      return s
+    }
+    guard let container = FileManager.default.containerURL(
+      forSecurityApplicationGroupIdentifier: WidgetSyncBridge.appGroupId)
+    else {
+      s.appGroupAvailable = false
+      return s
+    }
+    s.coverImage = UIImage(
+      contentsOfFile: container.appendingPathComponent("widget_cover.png").path)
+    guard let data = defaults.data(forKey: "widget_state"),
       let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else { return s }
+    else {
+      s.hasState = false
+      return s
+    }
+    s.hasState = true
     s.title = dict["title"] as? String ?? ""
     s.artist = dict["artist"] as? String ?? ""
     s.isPlaying = dict["isPlaying"] as? Bool ?? false
@@ -49,13 +72,6 @@ struct WidgetState {
     s.updatedAt = Date(
       timeIntervalSince1970: dict["updatedAt"] as? Double ?? 0)
     s.colors = dict["colors"] as? [String: Int] ?? [:]
-    if let container = FileManager.default.containerURL(
-      forSecurityApplicationGroupIdentifier: WidgetSyncBridge.appGroupId)
-    {
-      s.coverImage = UIImage(
-        contentsOfFile: container.appendingPathComponent("widget_cover.png")
-          .path)
-    }
     return s
   }
 
@@ -134,13 +150,39 @@ struct MD3MusicWidgetView: View {
   var body: some View {
     let s = entry.state
     Group {
-      if family == .systemMedium {
+      if !s.appGroupAvailable {
+        diagnosticView(
+          icon: "exclamationmark.triangle",
+          text: "签名缺少 App Group 权限，\n小组件无法读取播放状态",
+          s: s)
+      } else if !s.hasState {
+        diagnosticView(
+          icon: "music.note",
+          text: "打开应用播放音乐\n即可在此显示",
+          s: s)
+      } else if family == .systemMedium {
         mediumLayout(s)
       } else {
         smallLayout(s)
       }
     }
     .widgetBackground(s.panelBg)
+  }
+
+  /// 占位/错误提示视图（同时用于数据缺失与权限缺失两种状态）
+  private func diagnosticView(icon: String, text: String, s: WidgetState)
+    -> some View
+  {
+    VStack(spacing: 8) {
+      Image(systemName: icon)
+        .font(.system(size: 22, weight: .medium))
+        .foregroundColor(s.onSurfaceVariant)
+      Text(text)
+        .font(.system(size: 12))
+        .foregroundColor(s.onSurfaceVariant)
+        .multilineTextAlignment(.center)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   /// 小号：封面 + 标题/歌手 + 进度
