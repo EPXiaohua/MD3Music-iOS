@@ -194,18 +194,18 @@ struct MD3MusicWidgetView: View {
   /// 小号：封面在上、信息在中、进度条在下，整体居中。
   private func smallLayout(_ s: WidgetState) -> some View {
     VStack(spacing: 7) {
-      coverView(s, size: 78)
+      coverView(s, size: 70)
       VStack(spacing: 2) {
         plainText(
           s.title.isEmpty ? "MD3Music" : s.title,
-          fontSize: 9, weight: .semibold, color: s.onSurface,
+          fontSize: 11, weight: .semibold, color: s.onSurface,
           alignment: .center)
         plainText(
           s.artist.isEmpty ? "未在播放" : s.artist,
-          fontSize: 7, weight: .regular, color: s.onSurfaceVariant,
+          fontSize: 9, weight: .regular, color: s.onSurfaceVariant,
           alignment: .center)
       }
-      progressView(s)
+      progressView(s, inset: 16)
     }
     .padding(.horizontal, 10)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -227,7 +227,7 @@ struct MD3MusicWidgetView: View {
             alignment: .leading)
         }
       }
-      progressView(s)
+      progressView(s, inset: 10)
       HStack(spacing: 10) {
         // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
         // 点击 widget 整体打开 app
@@ -255,7 +255,7 @@ struct MD3MusicWidgetView: View {
         Spacer()
       }
     }
-    .padding(.horizontal, 14)
+    .padding(.horizontal, 20)
     .padding(.vertical, 10)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
@@ -292,9 +292,9 @@ struct MD3MusicWidgetView: View {
       .frame(height: fontSize * 1.25)
   }
 
-  /// 细进度条：左右各内收 11pt（较最初共缩 18pt）避免贴/越组件边缘，
-  /// 填充宽度做 clamp 双保险。
-  private func progressView(_ s: WidgetState) -> some View {
+  /// 细进度条：inset 为在布局容器内边距基础上额外左右内收的宽度，
+  /// 填充宽度做 clamp 双保险避免越界。
+  private func progressView(_ s: WidgetState, inset: CGFloat) -> some View {
     TimelineView(.periodic(from: .now, by: 1)) { _ in
       GeometryReader { geo in
         let w = max(geo.size.width, 0)
@@ -306,7 +306,7 @@ struct MD3MusicWidgetView: View {
         }
       }
       .frame(height: 4)
-      .padding(.horizontal, 11)
+      .padding(.horizontal, inset)
       .animation(.linear(duration: 1), value: progressFraction(s))
     }
   }
