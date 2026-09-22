@@ -44,13 +44,13 @@ struct WidgetState {
   /// widget 永远读不到数据——用 UI 直接把原因显示出来，免去抓日志。
   static func load() -> WidgetState {
     var s = WidgetState()
-    guard let defaults = UserDefaults(suiteName: WidgetSyncBridge.appGroupId)
-    else {
+    let groupId = WidgetSyncBridge.resolvedAppGroupId
+    guard let defaults = UserDefaults(suiteName: groupId) else {
       s.appGroupAvailable = false
       return s
     }
     guard let container = FileManager.default.containerURL(
-      forSecurityApplicationGroupIdentifier: WidgetSyncBridge.appGroupId)
+      forSecurityApplicationGroupIdentifier: groupId)
     else {
       s.appGroupAvailable = false
       return s
@@ -86,6 +86,53 @@ struct WidgetState {
 /// App Group 访问桥（extension 与 app 两侧共用常量）
 enum WidgetSyncBridge {
   static let appGroupId = "group.com.md3music.md3music"
+
+  // 免费签名工具（isideload 等）签发时 App Group id 会变成
+  // `group.<bundle>.<TEAM_ID>` 格式。与 app 侧 WidgetSync 相同的策略：
+  // 用私有 API SecTaskCopyValueForEntitlement 读自身签名的
+  // application-groups，找到第一个容器可访问的，失败回退声明 id。
+  private static var _resolved: String?
+
+  static var resolvedAppGroupId: String {
+    if let r = _resolved { return r }
+    let resolved = findUsableAppGroup() ?? appGroupId
+    _resolved = resolved
+    return resolved
+  }
+
+  private static func findUsableAppGroup() -> String? {
+    var candidates = signedAppGroups() ?? []
+    if !candidates.contains(appGroupId) { candidates.append(appGroupId) }
+    for g in candidates
+    where FileManager.default.containerURL(
+      forSecurityApplicationGroupIdentifier: g) != nil
+    {
+      return g
+    }
+    return nil
+  }
+
+  private static func signedAppGroups() -> [String]? {
+    guard
+      let security = dlopen(
+        "/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+      let createSym = dlsym(security, "SecTaskCreateFromSelf"),
+      let copySym = dlsym(security, "SecTaskCopyValueForEntitlement")
+    else { return nil }
+    typealias CreateFn = @convention(c) (CFAllocator?) -> OpaquePointer?
+    typealias CopyFn =
+      @convention(c) (OpaquePointer?, CFString, UnsafeMutableRawPointer?) ->
+      CFTypeRef?
+    guard
+      let task = unsafeBitCast(createSym, to: CreateFn.self)(nil)
+    else { return nil }
+    guard
+      let value = unsafeBitCast(copySym, to: CopyFn.self)(
+        task, "com.apple.security.application-groups" as CFString, nil)
+    else { return nil }
+    let list = (value as? [Any])?.compactMap { $0 as? String }
+    return (list?.isEmpty ?? true) ? nil : list
+  }
 }
 
 // MARK: - 颜色
@@ -338,7 +385,8 @@ struct NextIntent: AppIntent {
 extension WidgetSyncBridge {
   /// AppIntent 与 app 两侧共用：把命令写入 App Group 待 app 回前台消费
   static func writeCommand(_ action: String) {
-    UserDefaults(suiteName: appGroupId)?.set(action, forKey: "widget_command")
+    UserDefaults(suiteName: resolvedAppGroupId)?.set(
+      action, forKey: "widget_command")
   }
 }
 

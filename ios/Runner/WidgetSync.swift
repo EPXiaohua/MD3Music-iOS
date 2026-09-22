@@ -43,13 +43,66 @@ final class WidgetSync {
 
   private init() {}
 
+  // MARK: - App Group 自动发现
+  //
+  // 免费签名工具（isideload 等）会自动创建 `group.<bundle>.<TEAM_ID>` 格式的
+  // App Group 并用它签发 entitlements，与工程里声明的 appGroupId 不同。
+  // 这里通过私有 API SecTaskCopyValueForEntitlement 读取自身签名中的
+  // application-groups，逐个验证容器可访问后使用（不上架无审核顾虑），
+  // 全部失败再回退声明 id（正式签名 / TrollStore 场景）。
+
+  private static var _resolvedGroupId: String?
+
+  static var resolvedAppGroupId: String {
+    if let r = _resolvedGroupId { return r }
+    let resolved = findUsableAppGroup() ?? appGroupId
+    _resolvedGroupId = resolved
+    return resolved
+  }
+
+  /// 从签名 entitlements 列出的 group 中找第一个容器可访问的。
+  private static func findUsableAppGroup() -> String? {
+    var candidates = signedAppGroups() ?? []
+    if !candidates.contains(appGroupId) { candidates.append(appGroupId) }
+    for g in candidates
+    where FileManager.default.containerURL(
+      forSecurityApplicationGroupIdentifier: g) != nil
+    {
+      return g
+    }
+    return nil
+  }
+
+  /// 读自身签名 entitlements 的 com.apple.security.application-groups。
+  private static func signedAppGroups() -> [String]? {
+    guard
+      let security = dlopen(
+        "/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+      let createSym = dlsym(security, "SecTaskCreateFromSelf"),
+      let copySym = dlsym(security, "SecTaskCopyValueForEntitlement")
+    else { return nil }
+    typealias CreateFn = @convention(c) (CFAllocator?) -> OpaquePointer?
+    typealias CopyFn =
+      @convention(c) (OpaquePointer?, CFString, UnsafeMutableRawPointer?) ->
+      CFTypeRef?
+    guard
+      let task = unsafeBitCast(createSym, to: CreateFn.self)(nil)
+    else { return nil }
+    guard
+      let value = unsafeBitCast(copySym, to: CopyFn.self)(
+        task, "com.apple.security.application-groups" as CFString, nil)
+    else { return nil }
+    let list = (value as? [Any])?.compactMap { $0 as? String }
+    return (list?.isEmpty ?? true) ? nil : list
+  }
+
   private var groupDefaults: UserDefaults? {
-    UserDefaults(suiteName: Self.appGroupId)
+    UserDefaults(suiteName: Self.resolvedAppGroupId)
   }
 
   private var groupContainer: URL? {
     FileManager.default.containerURL(
-      forSecurityApplicationGroupIdentifier: Self.appGroupId)
+      forSecurityApplicationGroupIdentifier: Self.resolvedAppGroupId)
   }
 
   /// 注册 home_widget channel（幂等）。由 AppDelegate.configureChannelsIfPossible 调用。
@@ -140,7 +193,8 @@ final class WidgetSync {
 
   /// 由 MD3Widget 的 AppIntent 调用：记录命令（下一步由 app 回前台转发 Dart）。
   static func writeCommand(_ action: String) {
-    UserDefaults(suiteName: appGroupId)?.set(action, forKey: commandKey)
+    UserDefaults(suiteName: resolvedAppGroupId)?.set(
+      action, forKey: commandKey)
   }
 
   @objc private func onSceneDidActivate() {
