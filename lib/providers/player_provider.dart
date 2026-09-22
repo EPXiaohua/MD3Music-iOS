@@ -2358,18 +2358,35 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       } catch (e) {
         if (!Platform.isIOS) rethrow;
         // iOS：暂停后锁屏挂起会杀死 AVPlayer 与 mediaserverd 的 XPC 连接，
-        // 回前台后对任何 URL setUrl 都秒抛连接类错误（-1004 等）。重新激活
-        // audio session 重建连接后用原 URL 重试一次；仍失败才向上报错。
-        // （回前台 resumed 已做过一次自愈，这里覆盖自愈未完成/未生效时序）
+        // 回前台后对任何 URL setUrl 都秒抛连接类错误（-1004 等）。自愈分
+        // 两级（诊断日志实锤 2026-09-22）：
+        // 1) 重激活 audio session 后重试——轻症（通道可重建）时生效；
+        // 2) 仍失败说明播放器实例已死，销毁重建 AVPlayer 后再试一次。
+        //    （回前台 resumed 已做过一次 session 自愈，这里覆盖时序窗口）
         debugPrint('[D切歌] iOS setUrl 失败，重激活 audio session 后重试: $e');
         try {
           await _audioService.reactivateAudioSession();
         } catch (_) {}
-        await _audioService.setUrl(
-          url,
-          loudnessLufs: _currentSong?.loudnessLufs,
-          loudnessPeakDb: _currentSong?.loudnessPeakDb,
-        );
+        try {
+          await _audioService.setUrl(
+            url,
+            loudnessLufs: _currentSong?.loudnessLufs,
+            loudnessPeakDb: _currentSong?.loudnessPeakDb,
+          );
+        } catch (e2) {
+          debugPrint('[D切歌] iOS 重激活后仍失败，重建播放器实例: $e2');
+          try {
+            await _audioService.rebuildMainPlayer();
+          } catch (e3) {
+            debugPrint('[D切歌] iOS 重建播放器失败: $e3');
+            rethrow;
+          }
+          await _audioService.setUrl(
+            url,
+            loudnessLufs: _currentSong?.loudnessLufs,
+            loudnessPeakDb: _currentSong?.loudnessPeakDb,
+          );
+        }
       }
       final deadline = DateTime.now().add(const Duration(seconds: 10));
       while (DateTime.now().isBefore(deadline)) {

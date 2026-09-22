@@ -630,6 +630,51 @@ class AudioService {
     }
   }
 
+  /// iOS：销毁重建主播放器实例——挂起后 AVPlayer 媒体通道死亡的终极修复。
+  ///
+  /// 实测（诊断日志 2026-09-22）：暂停后锁屏挂起 → 回前台对任何 URL setUrl
+  /// 秒抛 -1004，重激活 audio session 后重试仍 -1004（66ms 内）——播放器
+  /// 实例内部的媒体加载通道已死，只有销毁重建 AVPlayer 才能恢复。
+  ///
+  /// 对外 stream 经 [_bindActiveStreams] 重绑到新实例（与交叉淡化角色互换
+  /// 同一机制）；焦点事件与 sessionId 订阅一并重绑。旧实例上的 EQ tap /
+  /// 频谱采样按 AVPlayerItem 挂载，新实例装载新 item 时由原生 itemCreated
+  /// 通知自动重挂，EQ/频谱参数为全局状态不受影响。
+  ///
+  /// 仅 iOS 调用；Android 的 ExoPlayer 无此问题。
+  Future<void> rebuildMainPlayer() async {
+    if (!Platform.isIOS) return;
+    // ignore: avoid_print
+    print('[AudioFocus] rebuildMainPlayer: recreating dead AVPlayer');
+    abortCrossfade();
+    final old = _mainPlayer;
+    _mainPlayer = _createPlayer(enhancer: _mainEnhancer);
+    _activePlayer = _mainPlayer;
+    _bindActiveStreams();
+    // 焦点事件订阅跟随新实例重绑（audioFocusChangeStream 为实例级流）
+    await _media3FocusSub?.cancel();
+    _media3FocusSub = _mainPlayer.audioFocusChangeStream.listen(
+      _handleMedia3FocusChange,
+    );
+    // sessionId 订阅重绑（iOS 上该流为空，保持与 Android 一致的绑定结构）
+    for (final sub in _sessionIdSubs) {
+      // ignore: discarded_futures
+      sub.cancel();
+    }
+    _sessionIdSubs.clear();
+    _watchSessionIds(_mainPlayer);
+    // 旧实例最后销毁：销毁会触发原生释放，若仍在播放会立即断声——本方法
+    // 仅在暂停态（挂起恢复）下调用，不受影响
+    try {
+      await old.dispose();
+    } catch (e) {
+      // ignore: avoid_print
+      print('[AudioFocus] old player dispose failed: $e');
+    }
+    // ignore: avoid_print
+    print('[AudioFocus] rebuildMainPlayer: done');
+  }
+
   Future<void> pause() async {
     // 用户主动暂停：清除中断暂停标记（中断引起的暂停不在 GAIN 时自动恢复）
     _pausedByInterruption = false;
