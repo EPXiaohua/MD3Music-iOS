@@ -34,36 +34,21 @@ struct WidgetState {
   var updatedAt = Date()
   var colors: [String: Int] = [:]
   var coverImage: UIImage?
-  /// 自诊断：false = 签名缺少 App Group 权限（容器都打不开）
-  var appGroupAvailable = true
-  /// 自诊断：true = group 里根本没有 widget_state（app 侧没写入成功）
-  var hasState = false
 
-  /// App Group 数据可读性检查。
-  /// 侧载签名未注入 App Group entitlement 时 containerURL 返回 nil，
-  /// widget 永远读不到数据——用 UI 直接把原因显示出来，免去抓日志。
+  /// 读取 App Group 里的播放状态；不可用时返回空 state（视图显示默认占位文案）。
   static func load() -> WidgetState {
     var s = WidgetState()
     let groupId = WidgetSyncBridge.resolvedAppGroupId
-    guard let defaults = UserDefaults(suiteName: groupId) else {
-      s.appGroupAvailable = false
-      return s
-    }
-    guard let container = FileManager.default.containerURL(
-      forSecurityApplicationGroupIdentifier: groupId)
-    else {
-      s.appGroupAvailable = false
-      return s
-    }
+    guard
+      let defaults = UserDefaults(suiteName: groupId),
+      let container = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: groupId)
+    else { return s }
     s.coverImage = UIImage(
       contentsOfFile: container.appendingPathComponent("widget_cover.png").path)
     guard let data = defaults.data(forKey: "widget_state"),
       let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else {
-      s.hasState = false
-      return s
-    }
-    s.hasState = true
+    else { return s }
     s.title = dict["title"] as? String ?? ""
     s.artist = dict["artist"] as? String ?? ""
     s.isPlaying = dict["isPlaying"] as? Bool ?? false
@@ -197,17 +182,7 @@ struct MD3MusicWidgetView: View {
   var body: some View {
     let s = entry.state
     Group {
-      if !s.appGroupAvailable {
-        diagnosticView(
-          icon: "exclamationmark.triangle",
-          text: "签名缺少 App Group 权限，\n小组件无法读取播放状态",
-          s: s)
-      } else if !s.hasState {
-        diagnosticView(
-          icon: "music.note",
-          text: "打开应用播放音乐\n即可在此显示",
-          s: s)
-      } else if family == .systemMedium {
+      if family == .systemMedium {
         mediumLayout(s)
       } else {
         smallLayout(s)
@@ -216,40 +191,39 @@ struct MD3MusicWidgetView: View {
     .widgetBackground(s.panelBg)
   }
 
-  /// 占位/错误提示视图（同时用于数据缺失与权限缺失两种状态）
-  private func diagnosticView(icon: String, text: String, s: WidgetState)
-    -> some View
-  {
-    VStack(spacing: 8) {
-      Image(systemName: icon)
-        .font(.system(size: 22, weight: .medium))
-        .foregroundColor(s.onSurfaceVariant)
-      Text(text)
-        .font(.system(size: 12))
-        .foregroundColor(s.onSurfaceVariant)
-        .multilineTextAlignment(.center)
+  /// 小号：封面在上、信息在中、进度条在下，整体居中。
+  /// 标题/歌手超宽时往左滚动（marquee）。
+  private func smallLayout(_ s: WidgetState) -> some View {
+    VStack(spacing: 7) {
+      coverView(s, size: 78)
+      VStack(spacing: 2) {
+        marqueeText(
+          s.title.isEmpty ? "MD3Music" : s.title,
+          fontSize: 14, weight: .semibold, color: s.onSurface)
+        marqueeText(
+          s.artist.isEmpty ? "未在播放" : s.artist,
+          fontSize: 12, weight: .regular, color: s.onSurfaceVariant)
+      }
+      progressView(s)
     }
+    .padding(.horizontal, 10)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// 小号：封面 + 标题/歌手 + 进度
-  private func smallLayout(_ s: WidgetState) -> some View {
-    HStack(spacing: 10) {
-      coverView(s, size: 52)
-      VStack(alignment: .leading, spacing: 3) {
-        textBlock(s)
-        progressView(s)
-      }
-    }
-    .padding(.horizontal, 4)
-  }
-
-  /// 中号：封面 + 标题/歌手 + 进度 + 播放/下一首按钮
+  /// 中号：封面 + 标题/歌手 + 进度 + 播放/下一首按钮。
+  /// 标题/歌手超宽时往左滚动（marquee）。
   private func mediumLayout(_ s: WidgetState) -> some View {
     HStack(spacing: 12) {
       coverView(s, size: 64)
       VStack(alignment: .leading, spacing: 4) {
-        textBlock(s)
+        VStack(alignment: .leading, spacing: 2) {
+          marqueeText(
+            s.title.isEmpty ? "MD3Music" : s.title,
+            fontSize: 14, weight: .semibold, color: s.onSurface)
+          marqueeText(
+            s.artist.isEmpty ? "未在播放" : s.artist,
+            fontSize: 12, weight: .regular, color: s.onSurfaceVariant)
+        }
         progressView(s)
         HStack(spacing: 10) {
           // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 纯图标，
@@ -279,7 +253,9 @@ struct MD3MusicWidgetView: View {
         }
       }
     }
-    .padding(.horizontal, 4)
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   private func coverView(_ s: WidgetState, size: CGFloat) -> some View {
@@ -300,17 +276,74 @@ struct MD3MusicWidgetView: View {
     .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
   }
 
-  private func textBlock(_ s: WidgetState) -> some View {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(s.title.isEmpty ? "MD3Music" : s.title)
-        .font(.system(size: 14, weight: .semibold))
-        .foregroundColor(s.onSurface)
-        .lineLimit(1)
-      Text(s.artist.isEmpty ? "未在播放" : s.artist)
-        .font(.system(size: 12))
-        .foregroundColor(s.onSurfaceVariant)
-        .lineLimit(1)
+  /// 超宽文本往左滚动（marquee）。widget 是静态快照渲染，无法跑真动画，
+  /// 用 TimelineView 以 10fps 步进模拟匀速滚动：两端各停 1.5s，30pt/s 往返。
+  /// 文本宽度按字符宽度估算（CJK 全宽 / 拉丁 0.55 倍），保证单次渲染内自洽。
+  private func marqueeText(
+    _ text: String, fontSize: CGFloat, weight: Font.Weight, color: Color
+  ) -> some View {
+    let textW = estimateWidth(text, fontSize: fontSize)
+    return Group {
+      if textW <= 0 {
+        // 空文本占位，保持行高
+        Text(" ").font(.system(size: fontSize)).frame(height: fontSize * 1.25)
+      } else if textW <= 150 {
+        // 未溢出：静态居中
+        Text(text)
+          .font(.system(size: fontSize, weight: weight))
+          .foregroundColor(color)
+          .lineLimit(1)
+          .frame(maxWidth: .infinity)
+          .frame(height: fontSize * 1.25)
+      } else {
+        TimelineView(.periodic(from: .now, by: 0.1)) { context in
+          GeometryReader { geo in
+            let available = max(geo.size.width, 1)
+            let overflow = max(textW - available, 0)
+            let speed: CGFloat = 30
+            let pause: Double = 1.5
+            let travel = overflow > 0 ? Double(overflow / speed) : 0
+            let cycle = 2 * pause + 2 * travel
+            let t = context.date.timeIntervalSinceReferenceDate
+              .truncatingRemainder(dividingBy: cycle)
+            let offset: CGFloat
+            if t < pause {
+              offset = 0
+            } else if t < pause + travel {
+              offset = min(CGFloat(t - pause) * speed, overflow)
+            } else if t < 2 * pause + travel {
+              offset = overflow
+            } else {
+              offset = max(overflow - CGFloat(t - 2 * pause - travel) * speed, 0)
+            }
+            Text(text)
+              .font(.system(size: fontSize, weight: weight))
+              .foregroundColor(color)
+              .lineLimit(1)
+              .fixedSize()
+              .offset(x: -offset)
+              .frame(width: available, alignment: .leading)
+          }
+          .frame(height: fontSize * 1.25)
+          .clipped()
+        }
+      }
     }
+  }
+
+  /// 估算文本渲染宽度（CJK/全角按 fontSize，拉丁/数字按 0.55 倍）。
+  /// widget 快照渲染里拿不到精确测量，估算仅用于判断溢出与滚动距离。
+  private func estimateWidth(_ s: String, fontSize: CGFloat) -> CGFloat {
+    guard !s.isEmpty else { return 0 }
+    var w: CGFloat = 0
+    for ch in s.unicodeScalars {
+      if ch.value >= 0x1100 && (ch.value <= 0x115F || ch.value >= 0x2E80) {
+        w += fontSize
+      } else {
+        w += fontSize * 0.55
+      }
+    }
+    return w
   }
 
   private func progressView(_ s: WidgetState) -> some View {
@@ -345,15 +378,17 @@ struct MD3MusicWidgetView: View {
   }
 }
 
-/// iOS 17 的 widget 必须声明 containerBackground，否则内容不可见；
-/// iOS 15/16 用普通 background。
+/// iOS 17 的 widget 必须声明 containerBackground（自动铺满，无白边）；
+/// iOS 15/16 没有 containerBackground，内容区外还有系统 content margin
+/// （约 16pt），background 只覆盖内容区导致四周露白——用负 padding 把
+/// 视图外扩抵消 margin，让背景铺满整个组件。
 private extension View {
   @ViewBuilder
   func widgetBackground(_ color: Color) -> some View {
     if #available(iOSApplicationExtension 17.0, *) {
       containerBackground(for: .widget) { color }
     } else {
-      background(color)
+      padding(-16).background(color)
     }
   }
 }
