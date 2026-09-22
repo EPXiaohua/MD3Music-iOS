@@ -203,7 +203,7 @@ flutter build apk --release --split-per-abi
 flutter build ipa --release --no-codesign
 ```
 
-> **iOS 免签侧载**：可使用 [isideload](https://github.com/nab138/isideload) 等免费签名工具安装未签名 ipa。App 已内置运行时 App Group 自动解析（兼容签名工具改写 group 标识），无需修改工程配置。
+> **iOS 免签侧载**：可使用 [isideload](https://github.com/nab138/iloader) 侧载工具安装未签名 ipa。App 已内置运行时 App Group 自动解析（兼容签名工具改写 group 标识），无需修改工程配置。
 
 ***
 
