@@ -700,6 +700,7 @@
 			};
 			WGT0000000000000000000020 /* Debug */ = {
 				isa = XCBuildConfiguration;
+				baseConfigurationReference = 9740EEB21CF90195004384FC /* Debug.xcconfig */;
 				buildSettings = {
 					CODE_SIGN_ENTITLEMENTS = MD3Widget/MD3Widget.entitlements;
 					CODE_SIGN_STYLE = Automatic;
@@ -723,6 +724,7 @@
 			};
 			WGT0000000000000000000021 /* Release */ = {
 				isa = XCBuildConfiguration;
+				baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
 				buildSettings = {
 					CODE_SIGN_ENTITLEMENTS = MD3Widget/MD3Widget.entitlements;
 					CODE_SIGN_STYLE = Automatic;
@@ -746,6 +748,7 @@
 			};
 			WGT0000000000000000000022 /* Profile */ = {
 				isa = XCBuildConfiguration;
+				baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
 				buildSettings = {
 					CODE_SIGN_ENTITLEMENTS = MD3Widget/MD3Widget.entitlements;
 					CODE_SIGN_STYLE = Automatic;
