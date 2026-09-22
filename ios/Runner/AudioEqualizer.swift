@@ -148,7 +148,10 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
                 for bi in state.activeBands {
                     s = filters[bi].apply(s)
                 }
-                samples[i] = Float(s)
+                // 限幅防削波：多频段增益叠加可能使样本超出 ±1.0，
+                // float32 直接溢出会 wrap 成爆音（Android 系统 Equalizer
+                // 在效果框架内部有限幅，tap 需自行保护）
+                samples[i] = Float(max(-1.0, min(1.0, s)))
             }
             state.channels[c] = filters
         }
@@ -167,7 +170,8 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
                     for bi in state.activeBands {
                         s = filters[bi].apply(s)
                     }
-                    samples[i] = Float(s)
+                    // 同上：限幅防削波
+                    samples[i] = Float(max(-1.0, min(1.0, s)))
                 }
                 state.channels[c] = filters
             }
@@ -237,12 +241,13 @@ final class EqTapState {
     static let channelName = "com.md3music.md3music/equalizer"
     static let itemCreatedNotification = Notification.Name("JustAudioPlayerItemCreated")
 
-    /// 10 段 ISO 倍频程中心频率（Hz）
-    static let bandFreqs: [Double] = [31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-    static let bandCount = 10
-    /// 增益范围 mB（与 Android 侧同单位：毫贝）
-    static let minLevel = -1200
-    static let maxLevel = 1200
+    /// 5 段中心频率（Hz），与 Android 系统 Equalizer 一致
+    /// （android.media.audiofx.Equalizer 设备典型值：60/230/910/3600/14000）
+    static let bandFreqs: [Double] = [60, 230, 910, 3600, 14000]
+    static let bandCount = 5
+    /// 增益范围 mB（与 Android 侧同单位：毫贝，同范围 ±1500 mB = ±15 dB）
+    static let minLevel = -1500
+    static let maxLevel = 1500
 
     /// 保护 enabled/gains/version；process 回调在音频线程也会短暂持锁
     var lock = os_unfair_lock()
