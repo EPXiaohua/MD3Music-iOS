@@ -93,6 +93,9 @@ private extension WidgetState {
   var onSurfaceVariant: Color {
     color("onSurfaceVariant", fallback: Color(UIColor.secondaryLabel))
   }
+  var surfaceHigh: Color {
+    color("surfaceHigh", fallback: Color(UIColor.secondarySystemBackground))
+  }
   var outlineVariant: Color {
     color("outlineVariant", fallback: Color(UIColor.systemFill))
   }
