@@ -45,14 +45,11 @@ final class WidgetSync {
 
   // MARK: - App Group 自动发现
   //
-  // 免费签名工具会改写 App Group 标识并重建签名 entitlements，各工具格式不同：
-  // - isideload：`group.<bundle_id>.<TEAM_ID>`（整体重建）
-  // - AltStore（AltSign）：原 group 标识尾部追加后缀 → `<原group>.<TEAM_ID>`，
-  //   且会附加它自己的 `group.com.rileytestut.AltStore.<TEAM_ID>` 用于通信
-  // 这里从签名 entitlements（SecTask 私有 API）与 embedded.mobileprovision
-  // （Apple 下发的权威列表）解析候选，按「派生自本应用 group」启发式排序，
-  // 并用容器实际写读探针验证——containerURL 对未授权 group 也可能返回非 nil，
-  // 不能作为唯一判据；全部失败回退声明 id（正式签名场景）。
+  // 免费签名工具（isideload 等）会自动创建 `group.<bundle>.<TEAM_ID>` 格式的
+  // App Group 并用它签发 entitlements，与工程里声明的 appGroupId 不同。
+  // 这里通过私有 API SecTaskCopyValueForEntitlement 读取自身签名中的
+  // application-groups，逐个验证容器可访问后使用（不上架无审核顾虑），
+  // 全部失败再回退声明 id（正式签名 / TrollStore 场景）。
 
   private static var _resolvedGroupId: String?
 
@@ -60,68 +57,20 @@ final class WidgetSync {
     if let r = _resolvedGroupId { return r }
     let resolved = findUsableAppGroup() ?? appGroupId
     _resolvedGroupId = resolved
-    if resolved != appGroupId {
-      NSLog("[WidgetSync] resolved App Group: \(resolved)")
-    }
     return resolved
   }
 
-  /// 从全部候选中找第一个容器真正可写的 group（候选已按优先级排好）。
+  /// 从签名 entitlements 列出的 group 中找第一个容器可访问的。
   private static func findUsableAppGroup() -> String? {
-    let signed = signedAppGroups() ?? []
-    let profiled = profileAppGroups() ?? []
-    var pool: [String] = []
-    func add(_ ids: [String]) {
-      for id in ids where !pool.contains(id) { pool.append(id) }
+    var candidates = signedAppGroups() ?? []
+    if !candidates.contains(appGroupId) { candidates.append(appGroupId) }
+    for g in candidates
+    where FileManager.default.containerURL(
+      forSecurityApplicationGroupIdentifier: g) != nil
+    {
+      return g
     }
-    // 优先与声明 id 同源（派生自 group.com.md3music.md3music）的候选，
-    // 防止误选签名工具附加的无关 group（如 AltStore 自身的通信 group）
-    let ours: (String) -> Bool = {
-      $0.hasPrefix(appGroupId) || $0.contains("md3music")
-    }
-    add(profiled.filter(ours))
-    add(signed.filter(ours))
-    add(profiled)
-    add(signed)
-    add([appGroupId])
-    return pool.first(where: isUsableAppGroup)
-  }
-
-  /// 容器写读探针：写入并读回一个小文件，确认沙盒真正放行。
-  private static func isUsableAppGroup(_ groupId: String) -> Bool {
-    guard
-      let container = FileManager.default.containerURL(
-        forSecurityApplicationGroupIdentifier: groupId)
-    else { return false }
-    let probe = container.appendingPathComponent(".md3_probe")
-    do {
-      try Data([0x31]).write(to: probe, options: .atomic)
-      let ok = (try? Data(contentsOf: probe)) == Data([0x31])
-      try? FileManager.default.removeItem(at: probe)
-      return ok
-    } catch {
-      return false
-    }
-  }
-
-  /// 解析 embedded.mobileprovision（CMS 包装的 XML plist）中的
-  /// Entitlements → application-groups。比签名 entitlements 更权威：
-  /// 这是 Apple 按实际注册的 App Group 下发的列表。
-  private static func profileAppGroups() -> [String]? {
-    guard
-      let url = Bundle.main.url(
-        forResource: "embedded", withExtension: "mobileprovision"),
-      let data = try? Data(contentsOf: url),
-      let start = data.range(of: Data("<?xml".utf8)),
-      let end = data.range(of: Data("</plist>".utf8), in: start.upperBound..<data.endIndex)
-    else { return nil }
-    let xml = data.subdata(in: start.lowerBound..<end.upperBound)
-    guard
-      let plist = try? PropertyListSerialization.propertyList(
-        from: xml, options: [], format: nil) as? [String: Any],
-      let entitlements = plist["Entitlements"] as? [String: Any]
-    else { return nil }
-    return entitlements["com.apple.security.application-groups"] as? [String]
+    return nil
   }
 
   /// 读自身签名 entitlements 的 com.apple.security.application-groups。
