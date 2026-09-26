@@ -55,6 +55,42 @@ jobs:
       - name: Build iOS (no codesign)
         run: flutter build ios --release --no-codesign
 
+      - name: Diagnose actool/icon build (results in job summary)
+        if: failure()
+        run: |
+          DEV_DIR="$(xcode-select -p)"
+          XC_APPS="$(dirname "$DEV_DIR")/Applications"
+          {
+            echo "## actool diagnostics"
+            echo ""
+            echo "xcode-select -p: \`$DEV_DIR\`"
+            echo ""
+            echo "### Xcode Contents/Applications"
+            echo '```'
+            ls -la "$XC_APPS" 2>&1
+            echo '```'
+            echo "### /Applications grep icon"
+            echo '```'
+            ls /Applications 2>/dev/null | grep -i -e icon -e composer || echo "(none)"
+            echo '```'
+            echo "### mdfind Icon Composer"
+            echo '```'
+            mdfind -name "Icon Composer" 2>&1 | head -20 || true
+            echo '```'
+            echo "### which icontool via xcrun"
+            echo '```'
+            xcrun -f icontool 2>&1 || true
+            echo '```'
+            echo "### actool test compile of AppIcon.icon"
+            echo '```'
+            xcrun actool "ios/Runner/AppIcon.icon" \
+              --compile /tmp/actool_test \
+              --app-icon AppIcon --include-all-app-icons \
+              --platform iphoneos --minimum-deployment-target 15.0 \
+              --target-device iphone 2>&1 | head -80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Package as unsigned ipa
         run: |
           cd build/ios/iphoneos
