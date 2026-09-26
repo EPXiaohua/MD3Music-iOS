@@ -3,14 +3,6 @@
     {
       "layers" : [
         {
-          "image-name" : "icon_background.svg",
-          "name" : "背景渐变"
-        }
-      ]
-    },
-    {
-      "layers" : [
-        {
           "image-name" : "icon_foreground.svg",
           "name" : "分组 3"
         }
@@ -23,6 +15,14 @@
         "enabled" : true,
         "value" : 0.5
       }
+    },
+    {
+      "layers" : [
+        {
+          "image-name" : "icon_background.svg",
+          "name" : "背景渐变"
+        }
+      ]
     }
   ],
   "supported-platforms" : {
