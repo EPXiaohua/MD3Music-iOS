@@ -16,6 +16,28 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Ensure Icon Composer (icontool) is inside Xcode
+        run: |
+          DEV_DIR="$(xcode-select -p)"
+          XC_APP_DIR="$(dirname "$DEV_DIR")/Applications"
+          ICON_APP="$XC_APP_DIR/Icon Composer.app"
+          echo "Developer dir: $DEV_DIR"
+          if [ ! -d "$ICON_APP" ]; then
+            for SRC in "/Applications/Icon Composer.app" "$HOME/Applications/Icon Composer.app"; do
+              if [ -d "$SRC" ]; then
+                echo "Found standalone Icon Composer at $SRC, copying into Xcode"
+                sudo cp -R "$SRC" "$ICON_APP"
+                break
+              fi
+            done
+          fi
+          if [ ! -d "$ICON_APP" ]; then
+            echo "::warning::Icon Composer.app not found; actool .icon build will fail"
+            ls /Applications/ || true
+            mdfind -name "Icon Composer" || true
+          fi
+          ls "$ICON_APP/Contents/MacOS/" || true
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 3.47.0
