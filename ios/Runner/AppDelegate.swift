@@ -538,11 +538,13 @@ final class NowPlayingManager {
 /// - 启动按参照工程重试：等源视图进层级 + isPictureInPicturePossible 后再
 ///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
 ///
-/// 渲染：PipLyricBarView.draw 里 NSString/UIFont 画单行细条（300x22pt）。
+/// 渲染：PipLyricBarView.draw 里 NSString/UIFont 画双行细条（300x44pt）——
+/// 主行当前句逐字卡拉OK，副行下一句整行渐变（对齐安卓 doubleLine 副行）。
 /// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
-/// 字按字内比例平滑过渡；超宽截断补省略号；底部细进度条。行进度原生自推进：
+/// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
 /// 以 Dart 最近推送的 positionMs 为锚点 + 本机单调时钟流逝推算，Dart tick 定期校准。
+/// 行超宽不截断：ping-pong 跑马灯滚动（两端停留、匀速滚动）展示全部文字。
 
 /// 单行卡拉OK条视图：挂在 PiP contentViewController 里，由系统合成进小窗。
 final class PipLyricBarView: UIView {
@@ -605,6 +607,8 @@ final class LyricsPipManager: NSObject {
   private var lineWords: [(text: String, start: Int, duration: Int)] = []
   /// 当前行 startMs：在整包 lines 里定位 index，供副行取下一句
   private var lineStartMs = -1
+  /// 副行文本（整包歌词里当前句的下一句，对齐安卓 doubleLine 副行）
+  private var nextLineText = ""
   /// 占位文案（歌词加载中.../暂无歌词/歌词加载失败），空 = 正常渲染行
   private var placeholder = ""
 
@@ -634,8 +638,8 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 单行细条尺寸（pt）
-  private static let barSize = CGSize(width: 300, height: 22)
+  /// 双行细条尺寸（pt）：主行当前句 + 副行下一句
+  private static let barSize = CGSize(width: 300, height: 44)
 
   private override init() {}
 
@@ -697,6 +701,7 @@ final class LyricsPipManager: NSObject {
     }
     parsed.sort { $0.start < $1.start }
     lines = parsed
+    recomputeNextLine()
     barView?.setNeedsDisplay()
   }
 
@@ -720,7 +725,21 @@ final class LyricsPipManager: NSObject {
     anchorPositionMs = (args["positionMs"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
+    recomputeNextLine()
     barView?.setNeedsDisplay()
+  }
+
+  /// 副行 = 整包歌词里当前句的下一句（安卓 FloatingLyricService 的
+  /// doubleLine 副行逻辑：lyricText2 显示 nextLyric，无下一句则隐藏）。
+  private func recomputeNextLine() {
+    guard lineStartMs >= 0, !lines.isEmpty,
+      let idx = lines.firstIndex(where: { $0.start == lineStartMs }),
+      idx + 1 < lines.count
+    else {
+      nextLineText = ""
+      return
+    }
+    nextLineText = lines[idx + 1].text
   }
 
   // MARK: update（进度/播放状态校准，间奏与进度条推进用）
@@ -1037,10 +1056,12 @@ final class LyricsPipManager: NSObject {
     ctx.setFillColor(UIColor.white.withAlphaComponent(0.85).cgColor)
     ctx.fill(CGRect(x: 0, y: height - barHeight, width: CGFloat(progress) * width, height: barHeight))
 
-    // 字号随条高自适应（22pt 条 ≈ 13.6pt 字）
-    let fontSize = min(max(height * 0.62, 10), 18)
+    // 字号随条高自适应：双行均分文本区（44pt 条 ≈ 14.6pt 字）
+    let textAreaHeight = height - barHeight
+    let rowHeight = textAreaHeight / 2
+    let fontSize = min(max(rowHeight * 0.72, 9), 16)
 
-    // 占位文案（歌词加载中/暂无歌词/歌词加载失败）
+    // 占位文案（歌词加载中/暂无歌词/歌词加载失败）：跨两行居中
     if !placeholder.isEmpty {
       let attrs: [NSAttributedString.Key: Any] = [
         .font: UIFont.systemFont(ofSize: fontSize, weight: .medium),
@@ -1049,7 +1070,7 @@ final class LyricsPipManager: NSObject {
       let text = placeholder as NSString
       let textSize = text.size(withAttributes: attrs)
       text.draw(
-        at: CGPoint(x: (width - textSize.width) / 2, y: (height - textSize.height) / 2),
+        at: CGPoint(x: (width - textSize.width) / 2, y: (textAreaHeight - textSize.height) / 2),
         withAttributes: attrs)
       return
     }
@@ -1063,26 +1084,33 @@ final class LyricsPipManager: NSObject {
       let hint = "♪"
       let hintSize = (hint as NSString).size(withAttributes: attrs)
       (hint as NSString).draw(
-        at: CGPoint(x: (width - hintSize.width) / 2, y: (height - hintSize.height) / 2),
+        at: CGPoint(x: (width - hintSize.width) / 2, y: (textAreaHeight - hintSize.height) / 2),
         withAttributes: attrs)
       return
     }
 
-    // —— 单行逐字卡拉OK：左侧起排，超宽截断加省略号，垂直居中 ——
+    // —— 双行逐字卡拉OK：主行当前句（逐字着色），副行下一句（整行青→紫
+    // 渐变，对齐安卓 doubleLine）；超宽不截断省略号，改为跑马灯滚动 ——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let horizontalPadding = max(6, width * 0.03)
     let maxWidth = width - horizontalPadding * 2
+    let now = CACurrentMediaTime()
+
     let glyphs = layoutBarGlyphs(
-      text: lineText, words: lineWords, positionMs: estimatedPositionMs,
-      maxWidth: maxWidth, font: font)
-    let textHeight = min(font.lineHeight, height - barHeight)
-    let y = (height - barHeight - textHeight) / 2
-    var x = horizontalPadding
-    for g in glyphs {
-      (g.text as NSString).draw(
-        at: CGPoint(x: x, y: y),
-        withAttributes: [.font: font, .foregroundColor: g.color])
-      x += g.width
+      text: lineText, words: lineWords, positionMs: estimatedPositionMs, font: font)
+    drawScrollingLine(
+      ctx: ctx, glyphs: glyphs, font: font,
+      rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+      maxWidth: maxWidth, padding: horizontalPadding, time: now, phaseOffset: 0)
+
+    if !nextLineText.isEmpty {
+      let nextGlyphs = gradientGlyphs(
+        layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: font))
+      drawScrollingLine(
+        ctx: ctx, glyphs: nextGlyphs, font: font,
+        rowCenterY: rowHeight * 1.5, rowHeight: rowHeight, width: width,
+        maxWidth: maxWidth, padding: horizontalPadding, time: now,
+        phaseOffset: 2.2)
     }
   }
 
@@ -1138,12 +1166,12 @@ final class LyricsPipManager: NSObject {
     return lerpColor(unplayed, sung, t)
   }
 
-  /// 单行条状布局：逐字测量宽度并上色，总宽超限时截断并补灰色省略号。
+  /// 全量逐字布局：逐字测量宽度并上色（不截断，超宽由 drawScrollingLine
+  /// 以跑马灯滚动呈现）。
   private func layoutBarGlyphs(
     text: String,
     words: [(text: String, start: Int, duration: Int)],
     positionMs: Double,
-    maxWidth: CGFloat,
     font: UIFont
   ) -> [(text: String, width: CGFloat, color: UIColor)] {
     var glyphs: [(text: String, width: CGFloat, color: UIColor)] = []
@@ -1162,19 +1190,71 @@ final class LyricsPipManager: NSObject {
           wordColor(index: i, word: w, wordCount: words.count, positionMs: positionMs)))
       }
     }
+    return glyphs
+  }
+
+  /// 整行字符按行内索引在 青→紫 间插值（副行用，对齐安卓渐变 shader 整行渲染）。
+  private func gradientGlyphs(
+    _ glyphs: [(text: String, width: CGFloat, color: UIColor)]
+  ) -> [(text: String, width: CGFloat, color: UIColor)] {
+    let n = glyphs.count
+    guard n > 0 else { return glyphs }
+    return glyphs.enumerated().map { i, g in
+      (g.text, g.width, sungColor(at: i, wordCount: n))
+    }
+  }
+
+  /// 单行绘制：总宽不超限时静态左起；超限时 ping-pong 跑马灯——开头停
+  /// 0.9s → 匀速滚出被挡住的部分（行尾贴右 padding）→ 末尾停 0.9s → 滚回。
+  /// [phaseOffset] 错开主/副行滚动相位，避免两行同步滚动显得机械。
+  private func drawScrollingLine(
+    ctx: CGContext,
+    glyphs: [(text: String, width: CGFloat, color: UIColor)],
+    font: UIFont,
+    rowCenterY: CGFloat,
+    rowHeight: CGFloat,
+    width: CGFloat,
+    maxWidth: CGFloat,
+    padding: CGFloat,
+    time: Double,
+    phaseOffset: Double
+  ) {
+    guard !glyphs.isEmpty else { return }
+    let textHeight = min(font.lineHeight, rowHeight)
+    let y = rowCenterY - textHeight / 2
     let total = glyphs.reduce(0) { $0 + $1.width }
-    if total <= maxWidth { return glyphs }
-    // 截断：给末尾省略号留位
-    let ellipsisW = ("…" as NSString).size(withAttributes: attrs).width
-    var out: [(text: String, width: CGFloat, color: UIColor)] = []
-    var x: CGFloat = 0
+    var x0 = padding
+    if total > maxWidth {
+      // 滚动区间：行首贴左 padding → 行尾贴右 padding
+      let range = total - maxWidth + padding
+      let speed = 22.0  // pt/s
+      let pause = 0.9  // 两端停留 s
+      let roll = max(range / speed, 0.5)
+      let period = (pause + roll) * 2
+      var phase = time.truncatingRemainder(dividingBy: period) + phaseOffset
+      if phase < 0 { phase += period }
+      let scroll: Double
+      if phase < pause {
+        scroll = 0
+      } else if phase < pause + roll {
+        scroll = (phase - pause) * speed
+      } else if phase < pause * 2 + roll {
+        scroll = range
+      } else {
+        scroll = range - (phase - pause * 2 - roll) * speed
+      }
+      x0 = padding - CGFloat(scroll)
+    }
+    var x = x0
     for g in glyphs {
-      if x + g.width > maxWidth - ellipsisW { break }
-      out.append(g)
+      // 视口剔除：左右不可见的字不绘制
+      if x + g.width > 0 && x < width {
+        (g.text as NSString).draw(
+          at: CGPoint(x: x, y: y),
+          withAttributes: [.font: font, .foregroundColor: g.color])
+      }
       x += g.width
     }
-    out.append(("…", ellipsisW, argbColor(Self.unplayedARGB)))
-    return out
   }
 }
 
