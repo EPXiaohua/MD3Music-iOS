@@ -545,7 +545,7 @@ final class NowPlayingManager {
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
 /// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
 /// 以 Dart 最近推送的 positionMs 为锚点 + 本机单调时钟流逝推算，Dart tick 定期校准。
-/// 行超宽不截断：ping-pong 跑马灯滚动（两端停留、匀速滚动）展示全部文字。
+/// 行超宽不省略号：着色前沿驱动 easeOut 向左滚动（单向不往返、换行复位贴左）。
 
 /// 单行卡拉OK条视图：挂在 PiP contentViewController 里，由系统合成进小窗。
 final class PipLyricBarView: UIView {
@@ -610,6 +610,12 @@ final class LyricsPipManager: NSObject {
   private var lineStartMs = -1
   /// 副行文本（整包歌词里当前句的下一句，对齐安卓 doubleLine 副行）
   private var nextLineText = ""
+  // 滚动状态：卡拉OK着色前沿驱动、easeOut 单向跟随（替代 ping-pong 往返）。
+  // 行首贴左静止，着色接近视口右缘前才开始向左滚出后续字；换行重置贴左。
+  private var scrollOffset: CGFloat = 0
+  private var scrollLastUptime: TimeInterval = 0
+  /// 滚动状态所属行（换行时重置回贴左）
+  private var scrollLineStartMs = -1
   /// 占位文案（歌词加载中.../暂无歌词/歌词加载失败），空 = 正常渲染行
   private var placeholder = ""
 
@@ -726,6 +732,12 @@ final class LyricsPipManager: NSObject {
     anchorPositionMs = (args["positionMs"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
+    if lineStartMs != scrollLineStartMs {
+      // 换行：滚动重置回贴左
+      scrollOffset = 0
+      scrollLastUptime = 0
+      scrollLineStartMs = lineStartMs
+    }
     recomputeNextLine()
     barView?.setNeedsDisplay()
   }
@@ -1091,29 +1103,31 @@ final class LyricsPipManager: NSObject {
     }
 
     // —— 双行逐字卡拉OK：主行当前句（逐字着色粗体），副行下一句（整行青→紫
-    // 渐变，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不截断省略号，
-    // 改为跑马灯滚动 ——
+    // 渐变，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不省略号，
+    // 着色前沿接近右缘时 easeOut 向左滚动露出后续字 ——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
     let maxWidth = width - horizontalPadding * 2
-    let now = CACurrentMediaTime()
 
     let glyphs = layoutBarGlyphs(
       text: lineText, words: lineWords, positionMs: estimatedPositionMs, font: font)
+    let scroll = updatedScrollOffset(
+      glyphs: glyphs, words: lineWords, maxWidth: maxWidth, padding: horizontalPadding)
     drawScrollingLine(
       ctx: ctx, glyphs: glyphs, font: font,
       rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
-      maxWidth: maxWidth, padding: horizontalPadding, time: now, phaseOffset: 0)
+      scrollOffset: scroll, padding: horizontalPadding)
 
     if !nextLineText.isEmpty {
       let nextGlyphs = gradientGlyphs(
         layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: nextFont))
+      // 副行跟随主行滚动，但最多滚到自身行尾可见即停
+      let nextMax = max(0, nextGlyphs.reduce(0) { $0 + $1.width } - maxWidth + horizontalPadding)
       drawScrollingLine(
         ctx: ctx, glyphs: nextGlyphs, font: nextFont,
         rowCenterY: rowHeight * 1.5, rowHeight: rowHeight, width: width,
-        maxWidth: maxWidth, padding: horizontalPadding, time: now,
-        phaseOffset: 2.2)
+        scrollOffset: min(scroll, nextMax), padding: horizontalPadding)
     }
   }
 
@@ -1207,9 +1221,51 @@ final class LyricsPipManager: NSObject {
     }
   }
 
-  /// 单行绘制：总宽不超限时静态左起；超限时 ping-pong 跑马灯——开头停
-  /// 0.9s → 匀速滚出被挡住的部分（行尾贴右 padding）→ 末尾停 0.9s → 滚回。
-  /// [phaseOffset] 错开主/副行滚动相位，避免两行同步滚动显得机械。
+  /// 着色前沿驱动的滚动偏移：行首贴左静止；当卡拉OK着色位置接近视口右缘
+  /// （超过 72% 宽度）时才向左滚动，让后续未唱的字进入视野，滚到行尾贴右
+  /// padding 为止。easeOut 平滑（指数趋近——先快后慢，即 (0,1,1,1) 缓动
+  /// 曲线的观感），单向跟随不往返；暂停时着色不动，滚动自然停止。
+  private func updatedScrollOffset(
+    glyphs: [(text: String, width: CGFloat, color: UIColor)],
+    words: [(text: String, start: Int, duration: Int)],
+    maxWidth: CGFloat,
+    padding: CGFloat
+  ) -> CGFloat {
+    let now = ProcessInfo.processInfo.systemUptime
+    defer { scrollLastUptime = now }
+    let total = glyphs.reduce(0) { $0 + $1.width }
+    let maxScroll = max(0, total - maxWidth + padding)
+    guard maxScroll > 0 else { return 0 }
+
+    // 着色前沿的累计宽度（含正在唱的字）
+    var cum: CGFloat = 0
+    if !words.isEmpty {
+      let pos = estimatedPositionMs
+      var idx = -1
+      for (i, w) in words.enumerated() where pos >= Double(w.start) { idx = i }
+      if idx >= 0 {
+        for i in 0...idx { cum += glyphs[i].width }
+      }
+    } else {
+      // LRC 无逐字：按行内播放比例估算着色位置
+      if lineStartMs >= 0,
+        let li = lines.firstIndex(where: { $0.start == lineStartMs })
+      {
+        let d = Double(max(lines[li].duration, 1))
+        let frac = min(max((estimatedPositionMs - Double(lineStartMs)) / d, 0), 1)
+        cum = CGFloat(frac) * total
+      }
+    }
+    // 目标：着色前沿保持在视口 72% 处，越唱越往左带
+    let keepAt = maxWidth * 0.72
+    let target = min(max(cum - keepAt, 0), maxScroll)
+    let dt = scrollLastUptime > 0 ? min(now - scrollLastUptime, 0.2) : 0.016
+    scrollOffset += (target - scrollOffset) * CGFloat(1 - exp(-6 * dt))
+    return scrollOffset
+  }
+
+  /// 单行绘制：x 起点 = padding - scrollOffset，行首贴左；滚出视口的字被
+  /// clipsToBounds 裁剪，左右不可见的字剔除不绘制。
   private func drawScrollingLine(
     ctx: CGContext,
     glyphs: [(text: String, width: CGFloat, color: UIColor)],
@@ -1217,40 +1273,14 @@ final class LyricsPipManager: NSObject {
     rowCenterY: CGFloat,
     rowHeight: CGFloat,
     width: CGFloat,
-    maxWidth: CGFloat,
-    padding: CGFloat,
-    time: Double,
-    phaseOffset: Double
+    scrollOffset: CGFloat,
+    padding: CGFloat
   ) {
     guard !glyphs.isEmpty else { return }
     let textHeight = min(font.lineHeight, rowHeight)
     let y = rowCenterY - textHeight / 2
-    let total = glyphs.reduce(0) { $0 + $1.width }
-    var x0 = padding
-    if total > maxWidth {
-      // 滚动区间：行首贴左 padding → 行尾贴右 padding
-      let range = total - maxWidth + padding
-      let speed = 22.0  // pt/s
-      let pause = 0.9  // 两端停留 s
-      let roll = max(range / speed, 0.5)
-      let period = (pause + roll) * 2
-      var phase = time.truncatingRemainder(dividingBy: period) + phaseOffset
-      if phase < 0 { phase += period }
-      let scroll: Double
-      if phase < pause {
-        scroll = 0
-      } else if phase < pause + roll {
-        scroll = (phase - pause) * speed
-      } else if phase < pause * 2 + roll {
-        scroll = range
-      } else {
-        scroll = range - (phase - pause * 2 - roll) * speed
-      }
-      x0 = padding - CGFloat(scroll)
-    }
-    var x = x0
+    var x = padding - scrollOffset
     for g in glyphs {
-      // 视口剔除：左右不可见的字不绘制
       if x + g.width > 0 && x < width {
         (g.text as NSString).draw(
           at: CGPoint(x: x, y: y),
