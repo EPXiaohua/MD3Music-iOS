@@ -1000,6 +1000,12 @@ final class LyricsPipManager: NSObject {
       NSLog("[MD3Music] lyrics pip failed to start: \(message)")
       self?.handleStartFailed()
     }
+    lifecycle.onRestore = { [weak self] in
+      guard let self else { return false }
+      let restore = self.restoreToApp
+      self.restoreToApp = false
+      return restore
+    }
     delegateHolder = lifecycle
     controller.delegate = lifecycle
     applyNoControlsStyle(to: controller)
@@ -1356,6 +1362,8 @@ private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureCont
   var onWillStop: () -> Void = {}
   var onStopped: () -> Void = {}
   var onFailed: (String) -> Void = { _ in }
+  /// PiP 停止时是否把 App 拉回前台（最大化按钮置位，由 manager 决定并消费）
+  var onRestore: () -> Bool = { false }
 
   func pictureInPictureControllerWillStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
@@ -1390,9 +1398,8 @@ private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureCont
     _ pictureInPictureController: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
   ) {
-    // 点空白区/关闭按钮：false（不回前台）；最大化按钮：true（系统拉回前台）。
-    // 系统手势划掉小窗时 restoreToApp 保持 false，同样不回前台。
-    completionHandler(restoreToApp)
-    restoreToApp = false
+    // 点关闭按钮：false（不回前台）；最大化按钮：true（系统拉回前台）。
+    // 系统手势划掉小窗时未置位，同样不回前台。
+    completionHandler(onRestore())
   }
 }
