@@ -539,8 +539,7 @@ final class NowPlayingManager {
 ///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
 ///
 /// 渲染：PipLyricBarView.draw 里 NSString/UIFont 画双行细条（300x44pt）——
-/// 主行当前句逐字卡拉OK（粗体），副行下一句整行渐变（细体，对齐安卓
-/// lyricText2 不设 DEFAULT_BOLD）。
+/// 主行当前句逐字卡拉OK（粗体），副行下一句整行灰未唱色（细体）。
 /// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
 /// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
@@ -1102,8 +1101,8 @@ final class LyricsPipManager: NSObject {
       return
     }
 
-    // —— 双行逐字卡拉OK：主行当前句（逐字着色粗体），副行下一句（整行青→紫
-    // 渐变，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不省略号，
+    // —— 双行逐字卡拉OK：主行当前句（逐字着色粗体），副行下一句（整行灰
+    // 未唱色，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不省略号，
     // 着色前沿接近右缘时 easeOut 向左滚动露出后续字 ——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
@@ -1120,7 +1119,7 @@ final class LyricsPipManager: NSObject {
       scrollOffset: scroll, padding: horizontalPadding)
 
     if !nextLineText.isEmpty {
-      let nextGlyphs = gradientGlyphs(
+      let nextGlyphs = grayGlyphs(
         layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: nextFont))
       // 副行跟随主行滚动，但最多滚到自身行尾可见即停
       let nextMax = max(0, nextGlyphs.reduce(0) { $0 + $1.width } - maxWidth + horizontalPadding)
@@ -1210,15 +1209,12 @@ final class LyricsPipManager: NSObject {
     return glyphs
   }
 
-  /// 整行字符按行内索引在 青→紫 间插值（副行用，对齐安卓渐变 shader 整行渲染）。
-  private func gradientGlyphs(
+  /// 副行整行灰色（未唱色 0xFF666666）：下一句尚未唱到，不给卡拉OK着色。
+  private func grayGlyphs(
     _ glyphs: [(text: String, width: CGFloat, color: UIColor)]
   ) -> [(text: String, width: CGFloat, color: UIColor)] {
-    let n = glyphs.count
-    guard n > 0 else { return glyphs }
-    return glyphs.enumerated().map { i, g in
-      (g.text, g.width, sungColor(at: i, wordCount: n))
-    }
+    let gray = argbColor(Self.unplayedARGB)
+    return glyphs.map { ($0.text, $0.width, gray) }
   }
 
   /// 着色前沿驱动的滚动偏移：行首贴左静止；当卡拉OK着色位置接近视口右缘
