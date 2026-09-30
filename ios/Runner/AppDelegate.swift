@@ -539,7 +539,8 @@ final class NowPlayingManager {
 ///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
 ///
 /// 渲染：PipLyricBarView.draw 里 NSString/UIFont 画双行细条（300x44pt）——
-/// 主行当前句逐字卡拉OK，副行下一句整行灰（未唱色）。
+/// 主行当前句逐字卡拉OK（粗体），副行下一句整行渐变（细体，对齐安卓
+/// lyricText2 不设 DEFAULT_BOLD）。
 /// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
 /// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
@@ -1089,9 +1090,11 @@ final class LyricsPipManager: NSObject {
       return
     }
 
-    // —— 双行逐字卡拉OK：主行当前句（逐字着色），副行下一句（整行灰未唱色）；
-    // 超宽不截断省略号，改为跑马灯滚动 ——
+    // —— 双行逐字卡拉OK：主行当前句（逐字着色粗体），副行下一句（整行青→紫
+    // 渐变，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不截断省略号，
+    // 改为跑马灯滚动 ——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+    let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
     let maxWidth = width - horizontalPadding * 2
     let now = CACurrentMediaTime()
@@ -1104,10 +1107,10 @@ final class LyricsPipManager: NSObject {
       maxWidth: maxWidth, padding: horizontalPadding, time: now, phaseOffset: 0)
 
     if !nextLineText.isEmpty {
-      let nextGlyphs = grayGlyphs(
-        layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: font))
+      let nextGlyphs = gradientGlyphs(
+        layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: nextFont))
       drawScrollingLine(
-        ctx: ctx, glyphs: nextGlyphs, font: font,
+        ctx: ctx, glyphs: nextGlyphs, font: nextFont,
         rowCenterY: rowHeight * 1.5, rowHeight: rowHeight, width: width,
         maxWidth: maxWidth, padding: horizontalPadding, time: now,
         phaseOffset: 2.2)
@@ -1193,12 +1196,15 @@ final class LyricsPipManager: NSObject {
     return glyphs
   }
 
-  /// 副行整行灰色（未唱色 0xFF666666）：副行尚未唱到，不给卡拉OK着色。
-  private func grayGlyphs(
+  /// 整行字符按行内索引在 青→紫 间插值（副行用，对齐安卓渐变 shader 整行渲染）。
+  private func gradientGlyphs(
     _ glyphs: [(text: String, width: CGFloat, color: UIColor)]
   ) -> [(text: String, width: CGFloat, color: UIColor)] {
-    let gray = argbColor(Self.unplayedARGB)
-    return glyphs.map { ($0.text, $0.width, gray) }
+    let n = glyphs.count
+    guard n > 0 else { return glyphs }
+    return glyphs.enumerated().map { i, g in
+      (g.text, g.width, sungColor(at: i, wordCount: n))
+    }
   }
 
   /// 单行绘制：总宽不超限时静态左起；超限时 ping-pong 跑马灯——开头停
