@@ -531,12 +531,10 @@ final class NowPlayingManager {
 /// - AVPictureInPictureVideoCallViewController 承载自绘歌词条视图，系统直接把
 ///   该视图合成进 PiP 小窗；PiP 激活期间 App 被系统视作前台，CADisplayLink
 ///   照常驱动，逐字卡拉OK平滑推进；
-/// - VideoCall 式小窗天然没有播放/进度等系统传输控件；controlsStyle KVC 按
-///   参照工程收紧（iOS16+ 用 2 / iOS15 用 1），requiresLinearPlayback 兜底；
-/// - 小窗交互：右侧竖排「最大化/关闭」两个圆钮（VideoCall PiP 的触摸会转发
-///   给 contentViewController，可直接命中）；空白区点击不响应（防误触）——
-///   点关闭仅关窗、不回前台（restoreUserInterface 回调返回 false）；点最大化
-///   stopPictureInPicture 后回调返回 true，由系统把 App 拉回前台；
+/// - VideoCall 式小窗天然没有播放/进度等系统传输控件，关闭/最大化交给窗口
+///   系统自带的关闭(X)/还原按钮（触摸小窗浮现）；requiresLinearPlayback 兜底；
+/// - 小窗交互：restoreUserInterface 回调返回 true，点系统关闭/还原按钮都把
+///   App 拉回前台（对齐悬浮读数参照工程）；
 /// - 启动按参照工程重试：等源视图进层级 + isPictureInPicturePossible 后再
 ///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
 ///
@@ -549,24 +547,17 @@ final class NowPlayingManager {
 /// 行超宽不省略号：着色前沿驱动 easeOut 向左滚动（单向不往返、换行复位贴左）。
 
 /// 单行卡拉OK条视图：挂在 PiP contentViewController 里，由系统合成进小窗。
+/// 关闭/最大化走 PiP 窗口系统自带按钮，此视图只负责渲染。
 final class PipLyricBarView: UIView {
   weak var renderer: LyricsPipManager?
-  /// 点击关闭按钮 → 关闭 PiP（不回前台）
-  var onTap: (() -> Void)?
-  /// 点击最大化按钮 → 关闭 PiP 并把 App 拉回前台
-  var onMaximize: (() -> Void)?
-  /// 右侧按钮列宽度（最大化/关闭两个圆钮的绘制与命中区）
-  static let buttonColumnWidth: CGFloat = 30
   private var displayLink: CADisplayLink?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     backgroundColor = .clear
     isOpaque = false
-    isUserInteractionEnabled = true
+    isUserInteractionEnabled = false
     clipsToBounds = true
-    addGestureRecognizer(
-      UITapGestureRecognizer(target: self, action: #selector(handleTap(_:))))
   }
 
   @available(*, unavailable)
@@ -591,53 +582,10 @@ final class PipLyricBarView: UIView {
     setNeedsDisplay()
   }
 
-  @objc private func handleTap(_ g: UITapGestureRecognizer) {
-    let p = g.location(in: self)
-    // 仅右侧按钮列响应：上半最大化、下半关闭；空白区不响应（防误触，
-    // 关闭/最大化只走显式按钮）
-    guard p.x >= bounds.width - Self.buttonColumnWidth else { return }
-    if p.y < bounds.height / 2 {
-      onMaximize?()
-    } else {
-      onTap?()
-    }
-  }
-
   override func draw(_ rect: CGRect) {
     // draw(_:) 的 context 已是 UIKit 左上原点坐标系，无需翻转
     guard let ctx = UIGraphicsGetCurrentContext() else { return }
     renderer?.drawBar(in: ctx, size: bounds.size)
-    drawButtons(in: rect)
-  }
-
-  /// 右侧竖排两个圆钮：上=最大化（上箭头）、下=关闭（X）。
-  /// VideoCall PiP 的触摸会转发给 contentViewController，点击可直接命中。
-  private func drawButtons(in rect: CGRect) {
-    let radius = min(11, rect.height * 0.24)
-    let cx = rect.width - Self.buttonColumnWidth / 2 - 2
-    UIColor(white: 0, alpha: 0.45).setFill()
-    UIColor.white.setStroke()
-    let arm = radius * 0.4
-    for (cy, maximize) in [(rect.height * 0.28, true), (rect.height * 0.72, false)] {
-      let circle = UIBezierPath(
-        arcCenter: CGPoint(x: cx, y: cy), radius: radius,
-        startAngle: 0, endAngle: 2 * CGFloat.pi, clockwise: true)
-      circle.fill()
-      let icon = UIBezierPath()
-      icon.lineWidth = 1.6
-      icon.lineCapStyle = .round
-      if maximize {
-        icon.move(to: CGPoint(x: cx - arm, y: cy + arm * 0.6))
-        icon.addLine(to: CGPoint(x: cx, y: cy - arm * 0.6))
-        icon.addLine(to: CGPoint(x: cx + arm, y: cy + arm * 0.6))
-      } else {
-        icon.move(to: CGPoint(x: cx - arm, y: cy - arm))
-        icon.addLine(to: CGPoint(x: cx + arm, y: cy + arm))
-        icon.move(to: CGPoint(x: cx + arm, y: cy - arm))
-        icon.addLine(to: CGPoint(x: cx - arm, y: cy + arm))
-      }
-      icon.stroke()
-    }
   }
 }
 
@@ -690,8 +638,6 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 本次 PiP 停止是否把 App 拉回前台（最大化按钮置位，restore 回调消费后复位）
-  private var restoreToApp = false
   /// 双行细条尺寸（pt）：主行当前句 + 副行下一句
   private static let barSize = CGSize(width: 300, height: 44)
 
@@ -871,10 +817,8 @@ final class LyricsPipManager: NSObject {
     }
   }
 
-  /// 用户请求关闭（Dart stop 与点按小窗共用入口）。restoreApp=true 时在
-  /// restoreUserInterface 回调返回 true，让系统把 App 拉回前台（最大化）。
-  private func requestStop(restoreApp: Bool = false) {
-    restoreToApp = restoreApp
+  /// 用户请求关闭（Dart stop 与点按小窗共用入口）。
+  private func requestStop() {
     switch state {
     case .idle:
       notifyState(active: false)
@@ -971,12 +915,6 @@ final class LyricsPipManager: NSObject {
     let bar = PipLyricBarView(frame: content.view.bounds)
     bar.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     bar.renderer = self
-    bar.onTap = { [weak self] in
-      self?.closeFromTap()
-    }
-    bar.onMaximize = { [weak self] in
-      self?.maximizeFromTap()
-    }
     content.view.addSubview(bar)
     barView = bar
     contentController = content
@@ -1000,15 +938,8 @@ final class LyricsPipManager: NSObject {
       NSLog("[MD3Music] lyrics pip failed to start: \(message)")
       self?.handleStartFailed()
     }
-    lifecycle.onRestore = { [weak self] in
-      guard let self else { return false }
-      let restore = self.restoreToApp
-      self.restoreToApp = false
-      return restore
-    }
     delegateHolder = lifecycle
     controller.delegate = lifecycle
-    applyNoControlsStyle(to: controller)
     controller.requiresLinearPlayback = true
     controller.canStartPictureInPictureAutomaticallyFromInline = false
     pipController = controller
@@ -1022,18 +953,8 @@ final class LyricsPipManager: NSObject {
     return keyWindow?.rootViewController
   }
 
-  /// 去掉小窗上的系统控件：controlsStyle KVC（参照工程同款，iOS16+ 用 2，
-  /// iOS15 用 1），requiresLinearPlayback 兜底禁用快进/快退。
-  private func applyNoControlsStyle(to controller: AVPictureInPictureController) {
-    let style: Int
-    if #available(iOS 16.0, *) {
-      style = 2
-    } else {
-      style = 1
-    }
-    controller.setValue(style, forKey: "controlsStyle")
-  }
-
+  /// requiresLinearPlayback 兜底禁用快进/快退（系统控件交给 PiP 窗口自带
+  /// 关闭/还原按钮）。
   /// 参照工程 requestPiPStartWhenReady：源视图进层级且 isPictureInPicturePossible
   /// 才 startPictureInPicture，最多 8 次（0.02/0.12s 间隔）。
   private func scheduleStartAttempt(attempt: Int) {
@@ -1067,18 +988,6 @@ final class LyricsPipManager: NSObject {
   private func stop(result: @escaping FlutterResult) {
     requestStop()
     result(nil)
-  }
-
-  /// 点击小窗空白区/关闭按钮（无系统控件）。与 Dart 侧 stop 共用状态机入口，
-  /// 避免与在途 start/stop 竞争。
-  private func closeFromTap() {
-    requestStop()
-  }
-
-  /// 点击最大化按钮：关闭小窗，restoreUserInterface 回调返回 true 让系统把
-  /// App 拉回前台。
-  private func maximizeFromTap() {
-    requestStop(restoreApp: true)
   }
 
   /// 关闭前把内容与源视图藏起来（参照工程 hidePiPContentForClosing /
@@ -1172,8 +1081,7 @@ final class LyricsPipManager: NSObject {
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
-    // 右侧按钮列（最大化/关闭圆钮）让位，歌词滚动/行尾停在按钮左侧
-    let maxWidth = width - horizontalPadding * 2 - PipLyricBarView.buttonColumnWidth
+    let maxWidth = width - horizontalPadding * 2
 
     let glyphs = layoutBarGlyphs(
       text: lineText, words: lineWords, positionMs: estimatedPositionMs, font: font)
@@ -1343,8 +1251,8 @@ final class LyricsPipManager: NSObject {
     let y = rowCenterY - textHeight / 2
     var x = padding - scrollOffset
     for g in glyphs {
-      // 视口剔除：左右不可见的字不绘制（右侧止于按钮列左缘）
-      if x + g.width > 0 && x < width - PipLyricBarView.buttonColumnWidth {
+      // 视口剔除：左右不可见的字不绘制
+      if x + g.width > 0 && x < width {
         (g.text as NSString).draw(
           at: CGPoint(x: x, y: y),
           withAttributes: [.font: font, .foregroundColor: g.color])
@@ -1362,8 +1270,6 @@ private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureCont
   var onWillStop: () -> Void = {}
   var onStopped: () -> Void = {}
   var onFailed: (String) -> Void = { _ in }
-  /// PiP 停止时是否把 App 拉回前台（最大化按钮置位，由 manager 决定并消费）
-  var onRestore: () -> Bool = { false }
 
   func pictureInPictureControllerWillStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
@@ -1398,8 +1304,8 @@ private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureCont
     _ pictureInPictureController: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
   ) {
-    // 点关闭按钮：false（不回前台）；最大化按钮：true（系统拉回前台）。
-    // 系统手势划掉小窗时未置位，同样不回前台。
-    completionHandler(onRestore())
+    // 小窗系统自带的关闭/还原按钮都走这里：返回 true 让系统把 App 拉回
+    // 前台（对齐悬浮读数参照工程——关闭与最大化均回到 App）。
+    completionHandler(true)
   }
 }
