@@ -534,9 +534,9 @@ final class NowPlayingManager {
 /// - VideoCall 式小窗天然没有播放/进度等系统传输控件；controlsStyle KVC 按
 ///   参照工程收紧（iOS16+ 用 2 / iOS15 用 1），requiresLinearPlayback 兜底；
 /// - 小窗交互：右侧竖排「最大化/关闭」两个圆钮（VideoCall PiP 的触摸会转发
-///   给 contentViewController，可直接命中）；点空白区关闭——restoreUserInterface
-///   回调返回 false 不回前台；点最大化 stopPictureInPicture 后回调返回 true，
-///   由系统把 App 拉回前台；
+///   给 contentViewController，可直接命中）；空白区点击不响应（防误触）——
+///   点关闭仅关窗、不回前台（restoreUserInterface 回调返回 false）；点最大化
+///   stopPictureInPicture 后回调返回 true，由系统把 App 拉回前台；
 /// - 启动按参照工程重试：等源视图进层级 + isPictureInPicturePossible 后再
 ///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
 ///
@@ -551,7 +551,7 @@ final class NowPlayingManager {
 /// 单行卡拉OK条视图：挂在 PiP contentViewController 里，由系统合成进小窗。
 final class PipLyricBarView: UIView {
   weak var renderer: LyricsPipManager?
-  /// 点击小窗空白区 → 关闭 PiP
+  /// 点击关闭按钮 → 关闭 PiP（不回前台）
   var onTap: (() -> Void)?
   /// 点击最大化按钮 → 关闭 PiP 并把 App 拉回前台
   var onMaximize: (() -> Void)?
@@ -593,16 +593,14 @@ final class PipLyricBarView: UIView {
 
   @objc private func handleTap(_ g: UITapGestureRecognizer) {
     let p = g.location(in: self)
-    // 右侧按钮列：上半最大化、下半关闭；其余区域按原逻辑关闭小窗
-    guard p.x < bounds.width - Self.buttonColumnWidth else {
-      if p.y < bounds.height / 2 {
-        onMaximize?()
-      } else {
-        onTap?()
-      }
-      return
+    // 仅右侧按钮列响应：上半最大化、下半关闭；空白区不响应（防误触，
+    // 关闭/最大化只走显式按钮）
+    guard p.x >= bounds.width - Self.buttonColumnWidth else { return }
+    if p.y < bounds.height / 2 {
+      onMaximize?()
+    } else {
+      onTap?()
     }
-    onTap?()
   }
 
   override func draw(_ rect: CGRect) {
