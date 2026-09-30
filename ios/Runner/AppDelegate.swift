@@ -519,75 +519,39 @@ final class NowPlayingManager {
   }
 }
 
-// MARK: - iOS 歌词悬浮窗（系统画中画 · VideoCall 式，无系统控件）
+// MARK: - iOS 歌词悬浮窗（系统画中画 · SampleBuffer 帧管线）
 
-/// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource，参照
-/// github.com/CaiWanFeng/PiP 项目）。
+/// iOS 歌词悬浮窗：系统画中画，SampleBuffer contentSource + 自绘帧管线。
 ///
 /// 与 Android 的 FloatingLyricService 悬浮窗路径互不影响：本类只在 iOS Runner
 /// 内编译，channel 也只由 iOS 端注册。Dart 端对应 lib/core/services/lyrics_pip_service.dart。
 ///
-/// 方案（与被撤实验 8cf877c 的 sample-buffer 帧管线本质不同——没有帧管线就没有黑屏）：
-/// - AVPictureInPictureVideoCallViewController 承载自绘歌词条视图，系统直接把
-///   该视图合成进 PiP 小窗；PiP 激活期间 App 被系统视作前台，CADisplayLink
-///   照常驱动，逐字卡拉OK平滑推进；
-/// - VideoCall 式小窗天然没有播放/进度等系统传输控件，关闭/最大化交给窗口
-///   系统自带的关闭(X)/还原按钮（触摸小窗浮现）；requiresLinearPlayback 兜底；
-/// - 小窗交互：restoreUserInterface 回调返回 true，点系统关闭/还原按钮都把
-///   App 拉回前台（对齐悬浮读数参照工程）；
-/// - 启动按参照工程重试：等源视图进层级 + isPictureInPicturePossible 后再
-///   startPictureInPicture（最多 8 次，0.02/0.12s 间隔）。
+/// 方案：
+/// - AVSampleBufferDisplayLayer 挂在离屏宿主视图上保持窗口层级，CVPixelBufferPool
+///   帧管线：每帧把歌词条画进 UIGraphicsImageRenderer 得到位图，blit 进
+///   CVPixelBuffer 后包成 CMSampleBuffer（hostTime PTS + DisplayImmediately）
+///   enqueue；iOS17+ 走 sampleBufferRenderer，failed 态先 flush 再入帧（failed
+///   的 renderer 会静默吞帧，表现为画面冻结）；
+/// - ContentSource(sampleBufferDisplayLayer:playbackDelegate:) 的小窗交互：
+///   点窗口浮现系统自带的关闭(X)/还原按钮；controlsStyle 私有样式去掉播放/
+///   跳过等传输控件，requiresLinearPlayback 兜底；
+/// - AVPictureInPictureSampleBufferPlaybackDelegate 按"只读仪表"语义实现：
+///   不响应播放/seek（setPlaying 空、timeRange 无限、isPlaybackPaused false、
+///   skipByInterval 直接 completion、不禁止后台音频——音乐是本 app 在放）；
+///   restoreUserInterface 回调返回 true，点系统关闭/还原按钮都把 App 拉回前台；
+/// - 帧驱动用主线程 Timer（50ms ≈ 20fps）而非 CADisplayLink：App 退后台
+///   （音频后台模式）时 displayLink 随屏幕刷新停摆，Timer 仍持续出帧；
+/// - 启动重试：等宿主视图进层级 + 已画出首帧（layer 无帧系统拒绝开窗）+
+///   isPictureInPicturePossible 后再 startPictureInPicture（最多 8 次，
+///   0.02/0.12s 间隔）。
 ///
-/// 渲染：PipLyricBarView.draw 里 NSString/UIFont 画双行细条（300x44pt）——
+/// 渲染：每帧 NSString/UIFont 画双行细条（300x44pt @2x 位图）——
 /// 主行当前句逐字卡拉OK（粗体），副行下一句整行灰未唱色（细体）。
 /// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
 /// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
 /// 以 Dart 最近推送的 positionMs 为锚点 + 本机单调时钟流逝推算，Dart tick 定期校准。
 /// 行超宽不省略号：着色前沿驱动 easeOut 向左滚动（单向不往返、换行复位贴左）。
-
-/// 单行卡拉OK条视图：挂在 PiP contentViewController 里，由系统合成进小窗。
-/// 关闭/最大化走 PiP 窗口系统自带按钮，此视图只负责渲染。
-final class PipLyricBarView: UIView {
-  weak var renderer: LyricsPipManager?
-  private var displayLink: CADisplayLink?
-
-  override init(frame: CGRect) {
-    super.init(frame: frame)
-    backgroundColor = .clear
-    isOpaque = false
-    isUserInteractionEnabled = false
-    clipsToBounds = true
-  }
-
-  @available(*, unavailable)
-  required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-  /// PiP 激活期间驱动重绘（~20fps 足够逐字卡拉OK平滑；VideoCall PiP 期间
-  /// displayLink 后台照常触发，这是参照工程时钟/跑马灯的驱动方式）
-  func startAnimating() {
-    stopAnimating()
-    let link = CADisplayLink(target: self, selector: #selector(handleTick))
-    link.preferredFramesPerSecond = 20
-    link.add(to: .main, forMode: .common)
-    displayLink = link
-  }
-
-  func stopAnimating() {
-    displayLink?.invalidate()
-    displayLink = nil
-  }
-
-  @objc private func handleTick() {
-    setNeedsDisplay()
-  }
-
-  override func draw(_ rect: CGRect) {
-    // draw(_:) 的 context 已是 UIKit 左上原点坐标系，无需翻转
-    guard let ctx = UIGraphicsGetCurrentContext() else { return }
-    renderer?.drawBar(in: ctx, size: bounds.size)
-  }
-}
 
 final class LyricsPipManager: NSObject {
   static let shared = LyricsPipManager()
@@ -617,15 +581,21 @@ final class LyricsPipManager: NSObject {
   private var anchorUptime: TimeInterval = 0
   private var playing = false
 
+  /// SampleBuffer 帧管线显示层（挂离屏宿主视图，保持窗口层级）
+  private let sampleLayer = AVSampleBufferDisplayLayer()
+  /// 离屏宿主视图（只为让 layer 处于窗口层级，本体移出屏幕）
+  private var hostView: UIView?
+  /// CVPixelBufferPool（尺寸不变则复用）
+  private var pixelPool: CVPixelBufferPool?
+  private var poolSize = CGSize.zero
+  /// 已向 layer 画过帧（layer 无帧时系统拒绝开窗）
+  private var hasPainted = false
+  /// 帧驱动定时器（PiP 激活期间 20fps 出帧；Timer 后台仍触发）
+  private var frameTimer: Timer?
   private var pipController: AVPictureInPictureController?
-  /// VideoCall 式 PiP 的源视图锚点（clear、不交互，挂 App 视图层级）
-  private var sourceView: UIView?
-  /// PiP 内容控制器（iOS15+ 类，为兼容存基类类型）
-  private var contentController: UIViewController?
-  private var barView: PipLyricBarView?
   /// controller.delegate 为弱引用，必须自行持有
   private var delegateHolder: AnyObject?
-  /// 启动重试（等 isPictureInPicturePossible，参照工程 requestPiPStartWhenReady）
+  /// 启动重试（等宿主进层级 + 首帧 + isPictureInPicturePossible）
   private var startRetry: DispatchWorkItem?
   /// PiP 开关状态机：startPictureInPicture / stopPictureInPicture 都是异步
   /// 指令，快速连点开关时上一个操作未完成又收到反向指令，会让 controller
@@ -702,7 +672,6 @@ final class LyricsPipManager: NSObject {
     parsed.sort { $0.start < $1.start }
     lines = parsed
     recomputeNextLine()
-    barView?.setNeedsDisplay()
   }
 
   // MARK: setLine（当前行 + 逐字时间轴 + 进度校准）
@@ -732,7 +701,6 @@ final class LyricsPipManager: NSObject {
       scrollLineStartMs = lineStartMs
     }
     recomputeNextLine()
-    barView?.setNeedsDisplay()
   }
 
   /// 副行 = 整包歌词里当前句的下一句（安卓 FloatingLyricService 的
@@ -754,7 +722,6 @@ final class LyricsPipManager: NSObject {
     anchorPositionMs = (args["position"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
-    barView?.setNeedsDisplay()
   }
 
   /// 估算当前播放位置：锚点 + 本机单调钟流逝（播放中原生自推进）。
@@ -782,18 +749,20 @@ final class LyricsPipManager: NSObject {
       return
     }
     buildInfrastructureIfNeeded()
-    guard sourceView != nil, pipController != nil else {
+    guard hostView != nil, pipController != nil else {
       result(FlutterError(
         code: "unavailable",
-        message: "No root view controller to host PiP source view",
+        message: "No root view controller to host PiP sample layer",
         details: nil))
       return
     }
     // PiP 需要活跃的音频会话（本 app 音频会话由 Dart audio_session 配置为
     // .playback，这里只确保激活态，不改 category 以免与 just_audio 冲突）。
     try? AVAudioSession.sharedInstance().setActive(true)
+    // 先画一帧：layer 无帧时系统不会开窗
+    renderFrame()
     requestStart()
-    NSLog("[MD3Music] lyrics pip (videoCall) start requested")
+    NSLog("[MD3Music] lyrics pip (sampleBuffer) start requested")
     // 已受理；真实激活态由 didStart/didStop -> 'state' 回调回报（不乐观置位）
     result(true)
   }
@@ -811,8 +780,7 @@ final class LyricsPipManager: NSObject {
     case .idle:
       state = .starting
       pendingIntent = true
-      restoreBarForOpening()
-      // 按参照工程重试启动：等源视图进层级 + isPictureInPicturePossible
+      // 重试启动：等宿主进层级 + 已画首帧 + isPictureInPicturePossible
       scheduleStartAttempt(attempt: 0)
     }
   }
@@ -835,7 +803,6 @@ final class LyricsPipManager: NSObject {
     case .started:
       state = .stopping
       pendingIntent = false
-      hideBarForClosing()
       pipController?.stopPictureInPicture()
     case .stopping:
       pendingIntent = false
@@ -850,14 +817,11 @@ final class LyricsPipManager: NSObject {
     if pendingIntent == false {
       pendingIntent = nil
       state = .stopping
-      hideBarForClosing()
       pipController?.stopPictureInPicture()
       return
     }
     pendingIntent = nil
-    restoreBarForOpening()
-    barView?.setNeedsDisplay()
-    barView?.startAnimating()
+    startFrameLoop()
     notifyState(active: true)
   }
 
@@ -866,8 +830,7 @@ final class LyricsPipManager: NSObject {
   private func handleDidStop() {
     state = .idle
     awaitingStartCallback = false
-    barView?.stopAnimating()
-    restoreBarForOpening()
+    stopFrameLoop()
     let wantStart = pendingIntent == true
     pendingIntent = nil
     if wantStart {
@@ -882,13 +845,12 @@ final class LyricsPipManager: NSObject {
     state = .idle
     awaitingStartCallback = false
     pendingIntent = nil
-    barView?.stopAnimating()
+    stopFrameLoop()
     notifyState(active: false)
   }
 
-  /// 构建 VideoCall 式 PiP 基础设施（幂等）。
-  /// 源视图（宽高比锚点）+ AVPictureInPictureVideoCallViewController（自绘内容）
-  /// + ContentSource(activeVideoCallSourceView:contentViewController:)。
+  /// 构建 SampleBuffer 式 PiP 基础设施（幂等）。
+  /// 离屏宿主视图 + AVSampleBufferDisplayLayer + 双协议代理。
   @available(iOS 15.0, *)
   private func buildInfrastructureIfNeeded() {
     guard pipController == nil else { return }
@@ -896,40 +858,25 @@ final class LyricsPipManager: NSObject {
       NSLog("[MD3Music] lyrics pip no root view controller!")
       return
     }
-    // 1. 源视图：PiP 窗口宽高比跟随它；clear、不交互、无可见内容
-    let source = UIView(frame: CGRect(origin: .zero, size: Self.barSize))
-    source.backgroundColor = .clear
-    source.isOpaque = false
-    source.isUserInteractionEnabled = false
-    source.clipsToBounds = true
-    rootViewController.view.addSubview(source)
-    sourceView = source
+    // 1. 离屏宿主：layer 必须在窗口层级里 PiP 才会从它取帧；本体移出屏幕不显示
+    let host = UIView(frame: CGRect(
+      x: -Self.barSize.width - 16, y: -8,
+      width: Self.barSize.width, height: Self.barSize.height))
+    host.backgroundColor = .clear
+    host.isUserInteractionEnabled = false
+    rootViewController.view.addSubview(host)
+    sampleLayer.videoGravity = .resizeAspect
+    sampleLayer.frame = host.bounds
+    host.layer.addSublayer(sampleLayer)
+    hostView = host
 
-    // 2. 内容控制器：承载歌词条，PiP 小窗直接显示它（无系统播放控件）
-    let content = AVPictureInPictureVideoCallViewController()
-    content.preferredContentSize = Self.barSize
-    content.view.backgroundColor = .clear
-    content.view.isOpaque = false
-    content.view.layer.backgroundColor = UIColor.clear.cgColor
-    content.view.clipsToBounds = true
-    let bar = PipLyricBarView(frame: content.view.bounds)
-    bar.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    bar.renderer = self
-    content.view.addSubview(bar)
-    barView = bar
-    contentController = content
-
-    // 3. controller + 生命周期 delegate + 无控件样式
-    let contentSource = AVPictureInPictureController.ContentSource(
-      activeVideoCallSourceView: source,
-      contentViewController: content)
-    let controller = AVPictureInPictureController(contentSource: contentSource)
+    // 2. controller + 双协议代理（生命周期 + sample buffer 播放控制）
     let lifecycle = LyricsPipLifecycleDelegate()
     lifecycle.onStarted = { [weak self] in
       self?.handleDidStart()
     }
     lifecycle.onWillStop = { [weak self] in
-      self?.barView?.stopAnimating()
+      self?.stopFrameLoop()
     }
     lifecycle.onStopped = { [weak self] in
       self?.handleDidStop()
@@ -939,9 +886,18 @@ final class LyricsPipManager: NSObject {
       self?.handleStartFailed()
     }
     delegateHolder = lifecycle
+    let contentSource = AVPictureInPictureController.ContentSource(
+      sampleBufferDisplayLayer: sampleLayer,
+      playbackDelegate: lifecycle)
+    let controller = AVPictureInPictureController(contentSource: contentSource)
     controller.delegate = lifecycle
     controller.requiresLinearPlayback = true
-    controller.canStartPictureInPictureAutomaticallyFromInline = false
+    // 私有样式：去掉播放/暂停/跳过等传输控件，只留系统关闭(X)/还原按钮。
+    // responds 检查兜底——API 若被移除，小窗仍可用（多几个用不上的控件）。
+    let selector = NSSelectorFromString("setControlsStyle:")
+    if controller.responds(to: selector) {
+      controller.setValue(1, forKey: "controlsStyle")
+    }
     pipController = controller
   }
 
@@ -953,19 +909,17 @@ final class LyricsPipManager: NSObject {
     return keyWindow?.rootViewController
   }
 
-  /// requiresLinearPlayback 兜底禁用快进/快退（系统控件交给 PiP 窗口自带
-  /// 关闭/还原按钮）。
-  /// 参照工程 requestPiPStartWhenReady：源视图进层级且 isPictureInPicturePossible
-  /// 才 startPictureInPicture，最多 8 次（0.02/0.12s 间隔）。
+  /// 等"宿主进层级 + 已画首帧 + isPictureInPicturePossible"后再
+  /// startPictureInPicture，最多 8 次（0.02/0.12s 间隔）。
   private func scheduleStartAttempt(attempt: Int) {
     guard #available(iOS 15.0, *) else { return }
     startRetry?.cancel()
     let work = DispatchWorkItem { [weak self] in
       guard let self = self, self.state == .starting, self.pendingIntent == true else { return }
-      guard let source = self.sourceView, let controller = self.pipController else { return }
+      guard let host = self.hostView, let controller = self.pipController else { return }
       guard !controller.isPictureInPictureActive else { return }
-      let sourceReady = !source.bounds.isEmpty && source.window != nil
-      if sourceReady && controller.isPictureInPicturePossible {
+      let infraReady = self.hasPainted && host.window != nil
+      if infraReady && controller.isPictureInPicturePossible {
         self.awaitingStartCallback = true
         controller.startPictureInPicture()
         return
@@ -974,7 +928,7 @@ final class LyricsPipManager: NSObject {
         self.scheduleStartAttempt(attempt: attempt + 1)
       } else {
         NSLog(
-          "[MD3Music] lyrics pip start gave up: possible=\(controller.isPictureInPicturePossible), sourceReady=\(sourceReady)")
+          "[MD3Music] lyrics pip start gave up: possible=\(controller.isPictureInPicturePossible), infraReady=\(infraReady)")
         self.state = .idle
         self.pendingIntent = nil
         self.notifyState(active: false)
@@ -990,44 +944,134 @@ final class LyricsPipManager: NSObject {
     result(nil)
   }
 
-  /// 关闭前把内容与源视图藏起来（参照工程 hidePiPContentForClosing /
-  /// movePiPSourceViewOffscreenForClosing），避免关闭动画闪烁。
-  private func hideBarForClosing() {
-    guard let source = sourceView else { return }
-    UIView.performWithoutAnimation {
-      barView?.layer.removeAllAnimations()
-      barView?.alpha = 0.01
-      barView?.layer.opacity = 0
-      source.frame = CGRect(x: -8, y: -8, width: 1, height: 1)
-      source.superview?.layoutIfNeeded()
-      CATransaction.flush()
-    }
-  }
-
-  /// 启动/恢复内容可见性与源视图尺寸（参照工程 restorePiPVisualSurfaces）
-  private func restoreBarForOpening() {
-    guard let source = sourceView else { return }
-    UIView.performWithoutAnimation {
-      source.frame = CGRect(origin: .zero, size: Self.barSize)
-      barView?.alpha = 1
-      barView?.layer.opacity = 1
-      contentController?.preferredContentSize = Self.barSize
-      source.superview?.layoutIfNeeded()
-    }
-  }
-
   private func notifyState(active: Bool) {
     channel?.invokeMethod("state", arguments: ["active": active])
   }
 
-  // MARK: 单行卡拉OK绘制（PipLyricBarView.draw 调用，UIKit 坐标系）
+  // MARK: SampleBuffer 帧管线（frameTimer 每帧调用）
 
-  /// 在条状画布上绘制一帧：半透明黑背景 + 底部细进度条 + 单行逐字卡拉OK。
+  /// 帧驱动：PiP 激活期间 20fps 出帧。用 Timer 而非 CADisplayLink——退后台
+  /// （音频后台模式）时 displayLink 随屏幕刷新停摆，Timer 仍持续触发。
+  private func startFrameLoop() {
+    stopFrameLoop()
+    let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+      self?.renderFrame()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    frameTimer = timer
+  }
+
+  private func stopFrameLoop() {
+    frameTimer?.invalidate()
+    frameTimer = nil
+  }
+
+  /// 渲染一帧并入队：@2x 位图上画歌词条 → blit 进 CVPixelBuffer → 包成
+  /// CMSampleBuffer enqueue。
+  private func renderFrame() {
+    guard let sample = makeSample() else { return }
+    // failed 态的 renderer 会静默吞帧（表现为画面冻结），先 flush 再入队。
+    // sampleBufferRenderer 是 iOS17+；更低版本 layer 本身就是入队口。
+    if #available(iOS 17.0, *) {
+      let renderer = sampleLayer.sampleBufferRenderer
+      if renderer.status == .failed { renderer.flush() }
+      renderer.enqueue(sample)
+    } else {
+      if sampleLayer.status == .failed { sampleLayer.flush() }
+      sampleLayer.enqueue(sample)
+    }
+    hasPainted = true
+  }
+
+  private func makeSample() -> CMSampleBuffer? {
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 2 // @2x 位图（600x88），小窗里文字足够清晰
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: Self.barSize, format: format)
+    let image = renderer.image { ctx in
+      // 渲染器上下文已是 UIKit 左上原点坐标系，与 drawBar 的坐标约定一致
+      self.drawBar(in: ctx.cgContext, size: Self.barSize)
+    }
+    guard let cgImage = image.cgImage else { return nil }
+
+    let pixels = CGSize(width: cgImage.width, height: cgImage.height)
+    guard let pool = pixelBufferPool(pixels) else { return nil }
+    var buffer: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer) == kCVReturnSuccess,
+          let buffer else { return nil }
+
+    CVPixelBufferLockBaseAddress(buffer, [])
+    let drawn = CGContext(
+      data: CVPixelBufferGetBaseAddress(buffer),
+      width: cgImage.width,
+      height: cgImage.height,
+      bitsPerComponent: 8,
+      bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        | CGBitmapInfo.byteOrder32Little.rawValue)
+    drawn?.draw(cgImage, in: CGRect(origin: .zero, size: pixels))
+    CVPixelBufferUnlockBaseAddress(buffer, [])
+    guard drawn != nil else { return nil }
+
+    var formatDescription: CMFormatDescription?
+    guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescriptionOut: &formatDescription) == noErr,
+          let formatDescription else { return nil }
+    // PTS 取 hostTime 当前时刻 + DisplayImmediately：没有 timebase 驱动，
+    // 每帧到达即显示。
+    var timing = CMSampleTimingInfo(
+      duration: .invalid,
+      presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+      decodeTimeStamp: .invalid)
+    var sample: CMSampleBuffer?
+    guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sample) == noErr,
+          let sample else { return nil }
+    if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+       CFArrayGetCount(attachments) > 0 {
+      let entry = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+      CFDictionarySetValue(
+        entry,
+        Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    }
+    return sample
+  }
+
+  private func pixelBufferPool(_ size: CGSize) -> CVPixelBufferPool? {
+    if let pixelPool, poolSize == size { return pixelPool }
+    let attributes: [CFString: Any] = [
+      kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+      kCVPixelBufferWidthKey: Int(size.width),
+      kCVPixelBufferHeightKey: Int(size.height),
+      kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+    ]
+    var created: CVPixelBufferPool?
+    guard CVPixelBufferPoolCreate(
+            kCFAllocatorDefault, nil, attributes as CFDictionary,
+            &created) == kCVReturnSuccess,
+          let created else { return nil }
+    pixelPool = created
+    poolSize = size
+    return created
+  }
+
+  // MARK: 卡拉OK绘制（makeSample 的位图上下文调用，UIKit 坐标系）
+
+  /// 在条状画布上绘制一帧：黑背景 + 底部细进度条 + 双行逐字卡拉OK。
   func drawBar(in ctx: CGContext, size: CGSize) {
     let width = size.width
     let height = size.height
-    // 半透明黑背景
-    ctx.setFillColor(UIColor(white: 0.0, alpha: 0.75).cgColor)
+    // 底色：sample buffer 视为不透明视频帧，无透明合成对象；实色黑与原
+    // 0.75 透明黑叠在小窗黑底上的观感一致
+    ctx.setFillColor(UIColor.black.cgColor)
     ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
     // 底部细进度条（进度 = 当前位置 / 最后一行结束时间）
@@ -1262,10 +1306,12 @@ final class LyricsPipManager: NSObject {
   }
 }
 
-/// PiP 生命周期代理：iOS15+ 的 AVPictureInPictureControllerDelegate。
-/// VideoCall 式不需要 AVPictureInPictureSampleBufferPlaybackDelegate——
-/// 没有播放控制协议，也就没有系统传输控件。
-private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureControllerDelegate {
+/// PiP 双协议代理：AVPictureInPictureControllerDelegate（生命周期）+
+/// AVPictureInPictureSampleBufferPlaybackDelegate（sample buffer 播放控制）。
+/// 播放控制按"只读仪表"语义实现——歌词条不是播放器，不响应播放/seek，
+/// 仅维持"永远在播"的表象让系统不叠加暂停态。
+private final class LyricsPipLifecycleDelegate: NSObject,
+    AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
   var onStarted: () -> Void = {}
   var onWillStop: () -> Void = {}
   var onStopped: () -> Void = {}
@@ -1305,7 +1351,46 @@ private final class LyricsPipLifecycleDelegate: NSObject, AVPictureInPictureCont
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
   ) {
     // 小窗系统自带的关闭/还原按钮都走这里：返回 true 让系统把 App 拉回
-    // 前台（对齐悬浮读数参照工程——关闭与最大化均回到 App）。
+    // 前台（关闭与最大化均回到 App）。
     completionHandler(true)
+  }
+
+  // —— SampleBuffer 播放控制（协议要求的 5 个必选方法 + 1 个可选） ——
+
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    setPlaying playing: Bool
+  ) {}
+
+  func pictureInPictureControllerTimeRangeForPlayback(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) -> CMTimeRange {
+    CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+  }
+
+  func pictureInPictureControllerIsPlaybackPaused(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) -> Bool {
+    false
+  }
+
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    didTransitionToRenderSize newRenderSize: CMVideoDimensions
+  ) {}
+
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    skipByInterval skipInterval: CMTime,
+    completion completionHandler: @escaping () -> Void
+  ) {
+    completionHandler()
+  }
+
+  func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) -> Bool {
+    // 音乐就是本 app 在放，绝不能禁止后台音频
+    false
   }
 }
