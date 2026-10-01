@@ -2886,13 +2886,24 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('更新最新版本'),
           subtitle: Text(
             _pendingUpdateVersion.isEmpty
-                ? 'https://github.com/zzyoxml/md3Music/releases'
+                ? (Platform.isIOS
+                      ? 'https://github.com/EPXiaohua/MD3Music-iOS/releases'
+                      : 'https://github.com/zzyoxml/md3Music/releases')
                 : '有新版 v$_pendingUpdateVersion 可用，点击前往下载',
           ),
           leading: const Icon(Icons.system_update_outlined),
           trailing: const Icon(Icons.open_in_new, size: 18),
           onTap: () => _openReleasesUrl(),
         ),
+        // iOS 移植版仓库入口：Android 用户直接看上游发布页即可
+        if (Platform.isIOS)
+          ListTile(
+            title: const Text('GitHub 仓库'),
+            subtitle: const Text('github.com/EPXiaohua/MD3Music-iOS · 上游安卓版移植'),
+            leading: const Icon(Icons.code_outlined),
+            trailing: const Icon(Icons.open_in_new, size: 18),
+            onTap: () => _openProjectRepoUrl(),
+          ),
         // 渲染引擎与版本号同属"当前构建的事实"，故并入版本组：
         // 由构建期 flavor 决定（skia / impeller），运行时不可切换，只读展示。
         // search: 渲染引擎 渲染 引擎 图形 兼容 skia impeller 构建
@@ -2997,8 +3008,18 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _openReleasesUrl() async {
-    const url = 'https://github.com/zzyoxml/md3Music/releases';
+    final url = Platform.isIOS
+        ? 'https://github.com/EPXiaohua/MD3Music-iOS/releases'
+        : 'https://github.com/zzyoxml/md3Music/releases';
     final uri = Uri.parse(url);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  /// iOS 移植版项目仓库（上游安卓版 zzyoxml/md3Music 的移植）
+  Future<void> _openProjectRepoUrl() async {
+    final uri = Uri.parse('https://github.com/EPXiaohua/MD3Music-iOS/');
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }

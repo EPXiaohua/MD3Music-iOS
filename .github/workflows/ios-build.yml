@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-ios:
     runs-on: macos-15
@@ -115,3 +118,23 @@ jobs:
         with:
           name: md3music-ios-unsigned
           path: build/ios/MD3Music-unsigned.ipa
+
+      # App 内更新检测读取本仓库 releases/latest（tag 由 pubspec version 生成，
+      # 如 v5.7.0+45）；同版本重复构建时更新已有 Release 并覆盖资产
+      - name: Read app version from pubspec
+        id: appver
+        run: |
+          VERSION="$(grep -E '^version:' pubspec.yaml | awk '{print $2}' | tr -d '\r')"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "App version: ${VERSION}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.appver.outputs.tag }}
+          name: MD3Music iOS ${{ steps.appver.outputs.tag }}
+          body: |
+            未签名 IPA：下载后自行签名安装（侧载工具均可）。
+
+            本项目为上游安卓版 [zzyoxml/md3Music](https://github.com/zzyoxml/md3Music) 的 iOS 移植。
+          files: build/ios/MD3Music-unsigned.ipa

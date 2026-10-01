@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
@@ -19,7 +21,14 @@ String? parseTagFromRedirectLocation(String? location) {
     if (end >= 0) tag = tag.substring(0, end);
   }
   tag = tag.trim();
-  return tag.isEmpty ? null : tag;
+  if (tag.isEmpty) return null;
+  // GitHub 会把 tag 名 URL 编码进 Location 头（如 + → %2B），先还原再返回，
+  // 否则含 build 号的 tag（v5.7.0+45）会解析成无法比较的版本串
+  try {
+    return Uri.decodeComponent(tag);
+  } on FormatException {
+    return tag;
+  }
 }
 
 /// GitHub Release 客户端：REST API 为主链路，HTML 302 为回退链路。
@@ -41,23 +50,22 @@ class GithubReleaseClient implements ReleaseSource {
             ),
           );
 
-  /// 检测目标（唯一来源；换仓库只改这两行）
-  static const String owner = 'zzyoxml';
-  static const String repo = 'md3Music';
+  /// 检测目标：Android 走上游安卓仓库，iOS 走移植仓库（各自发布各自的包：
+  /// APK / 未签名 IPA）。换仓库只改这里的分支。
+  static String get owner => Platform.isIOS ? 'EPXiaohua' : 'zzyoxml';
+  static String get repo => Platform.isIOS ? 'MD3Music-iOS' : 'md3Music';
 
   /// GitHub 要求 User-Agent 非空，显式声明产品标识避免被拒。
-  static const String userAgent = 'MD3Music-Android';
+  static String get userAgent =>
+      Platform.isIOS ? 'MD3Music-iOS' : 'MD3Music-Android';
 
-  static final Uri apiLatestUri = Uri.parse(
-    'https://api.github.com/repos/$owner/$repo/releases/latest',
-  );
-  static final Uri htmlLatestUri = Uri.parse(
-    'https://github.com/$owner/$repo/releases/latest',
-  );
+  static Uri get apiLatestUri =>
+      Uri.parse('https://api.github.com/repos/$owner/$repo/releases/latest');
+  static Uri get htmlLatestUri =>
+      Uri.parse('https://github.com/$owner/$repo/releases/latest');
 
-  static final Uri _fallbackHtmlUri = Uri.parse(
-    'https://github.com/$owner/$repo/releases',
-  );
+  static Uri get _fallbackHtmlUri =>
+      Uri.parse('https://github.com/$owner/$repo/releases');
 
   final Dio _dio;
 
@@ -119,9 +127,7 @@ class GithubReleaseClient implements ReleaseSource {
         response.headers.value('location'),
       );
       if (tagName == null) {
-        debugPrint(
-          '[UpdateCheck] 回退链路未解析出 tag（status=${response.statusCode}）',
-        );
+        debugPrint('[UpdateCheck] 回退链路未解析出 tag（status=${response.statusCode}）');
         return null;
       }
       return ReleaseInfo.fromTag(

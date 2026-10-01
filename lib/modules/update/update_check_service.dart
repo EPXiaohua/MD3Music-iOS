@@ -14,10 +14,13 @@ import 'release_version.dart';
 enum UpdateCheckOutcome {
   /// 已 toast 提醒用户
   notified,
+
   /// 已是最新（或远端版本无法比较）
   upToDate,
-  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非 Android）
+
+  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非移动端）
   skipped,
+
   /// 查询失败（网络等原因，静默）
   failed,
 }
@@ -57,7 +60,8 @@ class UpdateCheckService {
   /// 同一次运行内的防重入。
   bool _running = false;
 
-  static void _defaultNotifier(String message) => showToast(message, long: true);
+  static void _defaultNotifier(String message) =>
+      showToast(message, long: true);
 
   static Future<String> _defaultCurrentVersion() async {
     try {
@@ -74,8 +78,9 @@ class UpdateCheckService {
   /// [suppress] 为 true 时直接跳过（首次启动引导 / 用户协议未确认时不应打扰）。
   void scheduleStartupCheck({bool suppress = false}) {
     if (suppress) return;
-    // Release 资产只有 Android APK，其它平台检查无意义
-    if (kIsWeb || !Platform.isAndroid) return;
+    // Android 资产是上游仓库的 APK；iOS 走移植仓库 EPXiaohua/MD3Music-iOS
+    // 发布的未签名 IPA——提醒后引导用户去 GitHub 下载，两端检查都有意义
+    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return;
     Timer(startupDelay, () {
       // ignore: discarded_futures
       checkAndNotify();
@@ -101,7 +106,8 @@ class UpdateCheckService {
 
     final now = DateTime.now().millisecondsSinceEpoch;
     final lastCheckMs = await _settings.getUpdateLastCheckMs();
-    if (lastCheckMs > 0 && now - lastCheckMs < minCheckInterval.inMilliseconds) {
+    if (lastCheckMs > 0 &&
+        now - lastCheckMs < minCheckInterval.inMilliseconds) {
       debugPrint('[UpdateCheck] 距上次检查不足 12 小时，跳过');
       return UpdateCheckOutcome.skipped;
     }
