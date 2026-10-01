@@ -13,6 +13,7 @@ import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../player/mini_player.dart';
 import 'floating_recognition_service.dart';
+import 'pip_recognition_controller.dart';
 import 'recognition_utils.dart';
 
 class SongRecognitionPage extends StatefulWidget {
@@ -54,6 +55,7 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     super.initState();
     // 监听悬浮窗识曲状态变化（开启/关闭）刷新入口按钮
     FloatingRecognitionService.instance.addListener(_onFloatingRecognitionChanged);
+    PipRecognitionController.instance.addListener(_onFloatingRecognitionChanged);
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
@@ -70,12 +72,17 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   @override
   void dispose() {
     FloatingRecognitionService.instance.removeListener(_onFloatingRecognitionChanged);
+    PipRecognitionController.instance.removeListener(_onFloatingRecognitionChanged);
     _pulseController.dispose();
     _recorder.dispose();
     super.dispose();
   }
 
   Future<void> _toggleRecording() async {
+    // iOS 悬浮窗识别进行中时麦克风被占用，页面内识别不启动
+    if (Platform.isIOS && PipRecognitionController.instance.isLooping) {
+      return;
+    }
     if (_isLooping) {
       await _stopLoop();
     } else {
@@ -367,9 +374,12 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   }
 
   /// 悬浮窗识曲入口按钮（顶部横幅）。
-  /// 点击开启/关闭悬浮窗式识曲；Android < 10 或权限缺失时给出提示。
+  /// 点击开启/关闭悬浮窗式识曲；Android < 10 或权限缺失时给出提示；
+  /// iOS 走 PiP 悬浮窗（PipRecognitionController），无系统版本限制。
   Widget _buildFloatingEntry(ColorScheme colorScheme, TextTheme textTheme) {
-    final active = FloatingRecognitionService.instance.isActive;
+    final active = Platform.isIOS
+        ? PipRecognitionController.instance.isActive
+        : FloatingRecognitionService.instance.isActive;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       child: SizedBox(
@@ -384,6 +394,28 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   }
 
   Future<void> _openFloatingRecognition() async {
+    // iOS：PiP 悬浮窗（麦克风识别链路），无 Android 10 限制
+    if (Platform.isIOS) {
+      final pip = PipRecognitionController.instance;
+      if (pip.isActive) {
+        await pip.stop();
+        if (mounted) {
+          showToast('已关闭悬浮窗识曲', long: true);
+          setState(() {});
+        }
+        return;
+      }
+      final ok = await pip.start();
+      if (!mounted) return;
+      if (ok) {
+        showToast('悬浮窗识曲已开启，轻点悬浮窗并点还原按钮开始识别', long: true);
+        Navigator.of(context).pop();
+      } else {
+        showToast('悬浮窗识曲开启失败，请重试', long: true);
+      }
+      return;
+    }
+
     final svc = FloatingRecognitionService.instance;
     if (svc.isActive) {
       await svc.stop();

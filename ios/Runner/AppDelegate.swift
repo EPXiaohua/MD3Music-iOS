@@ -80,6 +80,10 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     LyricsPipManager.shared.attach(messenger: messenger)
 
+    // iOS 听歌识曲悬浮窗（系统画中画）。Android 悬浮识曲走 FloatingRecognitionService，
+    // 本 channel 仅在 iOS Runner 内注册，互不影响。
+    SongRecognitionPipManager.shared.attach(messenger: messenger)
+
     channelsConfigured = true
     NSLog("[MD3Music] picker MethodChannels registered on FlutterViewController")
   }
