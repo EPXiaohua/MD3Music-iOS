@@ -66,16 +66,16 @@ final class SongRecognitionPipManager: NSObject {
   private static let windowSize = CGSize(width: 300, height: 150)
 
   // MD3E 深色主题 token（与安卓悬浮识曲服务默认配色一致）
-  private static let panelColor = Self.argb(0xFF1D1B20)
-  private static let idleCircleColor = Self.argb(0xFF26242B)
-  private static let onSurfaceColor = Self.argb(0xFFE6E0E9)
-  private static let onSurfaceVariantColor = Self.argb(0xFFCAC4D0)
-  private static let errorColor = Self.argb(0xFFFFB4AB)
-  private static let onErrorColor = Self.argb(0xFF601410)
-  private static let tertiaryColor = Self.argb(0xFFEFB8C8)
-  private static let onTertiaryColor = Self.argb(0xFF492532)
-  private static let resultBgColor = Self.argb(0xFFEADDFF)
-  private static let onResultColor = Self.argb(0xFF21005D)
+  private static let panelColor = argb(0xFF1D1B20)
+  private static let idleCircleColor = argb(0xFF26242B)
+  private static let onSurfaceColor = argb(0xFFE6E0E9)
+  private static let onSurfaceVariantColor = argb(0xFFCAC4D0)
+  private static let errorColor = argb(0xFFFFB4AB)
+  private static let onErrorColor = argb(0xFF601410)
+  private static let tertiaryColor = argb(0xFFEFB8C8)
+  private static let onTertiaryColor = argb(0xFF492532)
+  private static let resultBgColor = argb(0xFFEADDFF)
+  private static let onResultColor = argb(0xFF21005D)
 
   private static func argb(_ value: Int) -> UIColor {
     UIColor(
