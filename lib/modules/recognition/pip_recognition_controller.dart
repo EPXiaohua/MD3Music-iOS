@@ -153,11 +153,13 @@ class PipRecognitionController {
   Future<Map<String, dynamic>?> takePendingResult() async {
     final memory = _pendingResult;
     _pendingResult = null;
-    if (memory != null) return memory;
+    // 无论内存是否命中，持久化一律清掉：内存命中时不清，回前台/再次打开
+    // 识曲页会从 prefs 重复读到同一结果，导致结果展示两遍
     try {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_prefsResultKey);
       if (raw != null) await prefs.remove(_prefsResultKey);
+      if (memory != null) return memory;
       if (raw == null) return null;
       final wrapper = jsonDecode(raw);
       if (wrapper is! Map || wrapper['response'] is! Map) return null;
@@ -314,6 +316,9 @@ class PipRecognitionController {
           // 保存未读结果：回前台/重新打开应用时自动打开识曲页展示
           await _storePendingResult(matched.response);
           _pushState('result', songName: matched.name, artist: matched.artist);
+          // App 在前台时（悬浮窗浮于应用之上）不会有 resume 事件，
+          // 结果一出直接打开识曲页展示；后台时 push 同样安全（回前台已在栈顶）
+          unawaited(openPendingResultPageIfAny());
           break;
         }
       }
