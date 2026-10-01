@@ -22,9 +22,11 @@ import UIKit
 ///   录音，与识曲页同一链路），原生不采集任何音频；
 /// - 聆听中：麦克风圆标变红 + 红色边缘发光 + 1.0→1.15 脉冲缩放（对齐识曲页
 ///   录音态动效）；结果态圆标变 primaryContainer 并显示对勾；
-/// - 轻点窗口浮现系统按钮，还原按钮回调 restore 通知 Dart（开始/继续识别
-///   循环）；PiP 随还原操作关闭后由 Dart 稍候重开，小窗因此常驻；
-///   点关闭(X)则原生回报关闭态，Dart 结束悬浮模式并停止识别。
+/// - 轻点窗口浮现系统按钮，还原按钮回调 restore 通知 Dart（重新开始识别
+///   循环，用于结果/未识别后再次识别）；PiP 随还原操作关闭后由 Dart 稍候
+///   重开，小窗因此常驻；点关闭(X)则原生回报关闭态，Dart 结束悬浮模式并
+///   停止识别。Dart 开窗后会立即开始识别循环（悬浮窗内部不可点，识别
+///   不依赖窗口交互）。
 ///
 /// Dart 端对应 lib/modules/recognition/pip_recognition_controller.dart。
 
@@ -135,7 +137,7 @@ final class SongRecognitionPipManager: NSObject {
     switch state {
     case "listening": return "正在聆听..."
     case "recognizing": return "正在识别..."
-    case "stopped": return "已停止识别"
+    case "stopped": return "未识别到歌曲"
     default: return "点击开始听歌识曲"
     }
   }

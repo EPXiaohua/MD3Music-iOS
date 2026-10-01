@@ -1,16 +1,21 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/utils/app_toast.dart';
+import '../../main.dart' show appNavigatorKey;
 import '../../services/kugou_api/kugou_api_client.dart';
 import 'recognition_utils.dart';
+import 'song_recognition_page.dart';
 
 /// iOS 听歌识曲悬浮窗控制器（系统画中画）。
 ///
@@ -20,23 +25,47 @@ import 'recognition_utils.dart';
 /// 窗口，状态经 update 推送（idle/listening/recognizing/result/stopped）。
 ///
 /// 交互：
-/// - 识曲页「悬浮窗模式」开窗（idle 态，显示"点击开始听歌识曲"）；
-/// - 轻点悬浮窗浮现系统按钮，点「还原」→ 原生回调 restore → 开始识别循环，
-///   PiP 随还原操作关闭后由这里稍候自动重开（小窗常驻，显示聆听中状态）；
-/// - 点系统关闭(X) → 原生回报关闭态 → 结束悬浮模式并停止识别循环。
+/// - 识曲页「悬浮窗模式」开窗后**立即开始识别循环**（iOS 悬浮窗内部不可点，
+///   识别不依赖窗口交互）；
+/// - 轻点悬浮窗浮现系统按钮，点「还原」→ 原生回调 restore → 重新开始识别
+///   循环（用于结果/未识别后再次识别），PiP 随还原操作关闭后由这里稍候
+///   自动重开（小窗常驻）；
+/// - 点系统关闭(X) → 原生回报关闭态 → 结束悬浮模式并停止识别循环；
+/// - 识别到歌后保存未读结果：回前台或重新打开应用时自动打开识曲页展示。
 class PipRecognitionController {
-  PipRecognitionController._();
+  PipRecognitionController._() {
+    // App 回前台时：若有悬浮窗识别出的未读结果，打开识曲页展示
+    _lifecycleListener = AppLifecycleListener(
+      onResume: () {
+        unawaited(openPendingResultPageIfAny());
+      },
+    );
+  }
   static final PipRecognitionController instance = PipRecognitionController._();
 
-  static const MethodChannel _channel =
-      MethodChannel('com.md3music/recognition_pip');
+  // 故意持有：AppLifecycleListener 需保持引用存活，dispose 时才需要访问
+  // ignore: unused_field
+  late final AppLifecycleListener _lifecycleListener;
+
+  static const MethodChannel _channel = MethodChannel(
+    'com.md3music/recognition_pip',
+  );
+
+  /// 未消费识别结果的本地存储 key（跨会话，覆盖"识别后杀掉 App 再打开"）
+  static const String _prefsResultKey = 'pip_recognition_pending_result';
+
+  /// 未读结果保留时长：超过后不再自动打开识曲页（避免陈旧结果突兀弹出）
+  static const Duration _pendingResultTtl = Duration(minutes: 10);
 
   /// 每段录制时长（秒），与识曲页/安卓悬浮窗一致
   static const int _segmentDuration = 8;
+
   /// 最大总录制时长（秒），56s = 7 轮
   static const int _maxTotalDuration = 56;
+
   /// 录音采样率（44100Hz，与识曲页一致）
   static const int _recordSampleRate = 44100;
+
   /// 目标采样率（酷狗指纹接口要求 8000Hz）
   static const int _targetSampleRate = 8000;
 
@@ -46,12 +75,14 @@ class PipRecognitionController {
   bool _windowWanted = false;
   bool _isActive = false;
   bool _isLooping = false;
+
   /// restore 触发的关窗需要自动重开
   bool _pendingRestart = false;
   int _attemptCount = 0;
 
   /// 悬浮窗模式是否开启（小窗存活中）
   bool get isActive => _isActive;
+
   /// 识别循环是否进行中
   bool get isLooping => _isLooping;
 
@@ -65,8 +96,8 @@ class PipRecognitionController {
     }
   }
 
-  /// 开启悬浮窗模式：打开 PiP 小窗（idle 态），不自动开始识别
-  /// （开始识别由小窗还原按钮或后续 restore 回调驱动）。
+  /// 开启悬浮窗模式：打开 PiP 小窗并直接开始识别循环
+  /// （iOS 悬浮窗内部不可点，不依赖还原按钮触发识别）。
   Future<bool> start() async {
     if (_isActive) return true;
     _channel.setMethodCallHandler(_onNativeCall);
@@ -81,6 +112,8 @@ class PipRecognitionController {
     _isActive = true;
     _notify();
     _pushState('idle', text: '点击开始听歌识曲');
+    // 直接开始识别（麦克风权限弹窗等准备期间小窗显示 idle 文案）
+    unawaited(startLoop());
     return true;
   }
 
@@ -93,6 +126,73 @@ class PipRecognitionController {
     } catch (_) {}
     _isActive = false;
     _notify();
+  }
+
+  // ===================== 识别结果的回前台/冷启动展示 =====================
+
+  /// 未消费的识别结果（内存缓存，持久化见 _storePendingResult）
+  Map<String, dynamic>? _pendingResult;
+
+  /// 保存识别结果：内存 + 本地持久化（跨会话，覆盖杀掉 App 再打开的场景）
+  Future<void> _storePendingResult(Map<String, dynamic> response) async {
+    _pendingResult = response;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _prefsResultKey,
+        jsonEncode({
+          'ts': DateTime.now().millisecondsSinceEpoch,
+          'response': response,
+        }),
+      );
+    } catch (e) {
+      print('[PipRecognition] save pending result failed: $e');
+    }
+  }
+
+  /// 取走未消费的识别结果（读后即清）。
+  /// 超过保留时长（10 分钟）的陈旧结果直接丢弃，不再自动打开识曲页。
+  Future<Map<String, dynamic>?> takePendingResult() async {
+    final memory = _pendingResult;
+    _pendingResult = null;
+    if (memory != null) return memory;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefsResultKey);
+      if (raw != null) await prefs.remove(_prefsResultKey);
+      if (raw == null) return null;
+      final wrapper = jsonDecode(raw);
+      if (wrapper is! Map || wrapper['response'] is! Map) return null;
+      final ts = wrapper['ts'];
+      if (ts is! int ||
+          DateTime.now().millisecondsSinceEpoch - ts >
+              _pendingResultTtl.inMilliseconds) {
+        return null;
+      }
+      return Map<String, dynamic>.from(wrapper['response'] as Map);
+    } catch (e) {
+      print('[PipRecognition] load pending result failed: $e');
+      return null;
+    }
+  }
+
+  /// 有未消费的悬浮窗识别结果时，打开识曲页展示。
+  /// 回前台（AppLifecycleListener.onResume）与冷启动（app.dart 首帧后）都会调用。
+  Future<void> openPendingResultPageIfAny() async {
+    final result = await takePendingResult();
+    if (result == null) return;
+    final navigator = appNavigatorKey.currentState;
+    if (navigator == null) {
+      print('[PipRecognition] navigator not ready, drop pending result');
+      return;
+    }
+    unawaited(
+      navigator.push(
+        MaterialPageRoute<void>(
+          builder: (_) => SongRecognitionPage(initialResult: result),
+        ),
+      ),
+    );
   }
 
   Future<dynamic> _onNativeCall(MethodCall call) async {
@@ -163,41 +263,48 @@ class PipRecognitionController {
     // 切换音频会话为录音模式（与识曲页一致）
     try {
       final session = await AudioSession.instance;
-      await session.configure(const AudioSessionConfiguration(
-        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-        avAudioSessionMode: AVAudioSessionMode.defaultMode,
-        androidAudioAttributes: AndroidAudioAttributes(
-          contentType: AndroidAudioContentType.music,
-          usage: AndroidAudioUsage.media,
+      await session.configure(
+        const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+          avAudioSessionMode: AVAudioSessionMode.defaultMode,
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.music,
+            usage: AndroidAudioUsage.media,
+          ),
+          androidWillPauseWhenDucked: false,
         ),
-        androidWillPauseWhenDucked: false,
-      ));
+      );
     } catch (_) {}
 
     try {
       while (_isLooping) {
         final elapsed = _attemptCount * _segmentDuration;
         if (elapsed >= _maxTotalDuration) {
-          // 超时未识别到：直接提示已停止识别
-          _pushState('stopped', text: '已停止识别');
+          // 超时未识别到
+          _pushState('stopped', text: '未识别到歌曲');
           break;
         }
         _attemptCount++;
-        _pushState('listening',
-            text: '正在聆听... ${_attemptCount * _segmentDuration}s / $_maxTotalDuration}s');
+        _pushState(
+          'listening',
+          text:
+              '正在聆听... ${_attemptCount * _segmentDuration}s / ${_maxTotalDuration}s',
+        );
         final wav = await _recordSegment();
         if (!_isLooping) break;
         _pushState('recognizing', text: '正在识别第 $_attemptCount 段...');
         final matched = await _recognizeSegment(wav);
         if (!_isLooping) break;
         if (matched != null) {
-          _pushState('result', songName: matched.$1, artist: matched.$2);
+          // 保存未读结果：回前台/重新打开应用时自动打开识曲页展示
+          await _storePendingResult(matched.response);
+          _pushState('result', songName: matched.name, artist: matched.artist);
           break;
         }
       }
     } catch (e) {
       print('[PipRecognition] loop error: $e');
-      if (_isLooping) _pushState('stopped', text: '已停止识别');
+      if (_isLooping) _pushState('stopped', text: '未识别到歌曲');
     } finally {
       _isLooping = false;
       await _releaseRecorderAndSession();
@@ -230,17 +337,17 @@ class PipRecognitionController {
     final path =
         '${dir.path}/pip_recog_${DateTime.now().millisecondsSinceEpoch}.wav';
     RecordConfig configFor(AndroidAudioSource source) => RecordConfig(
-          encoder: AudioEncoder.wav,
-          sampleRate: _recordSampleRate,
-          numChannels: 1,
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
-          androidConfig: AndroidRecordConfig(
-            audioSource: source,
-            audioManagerMode: AudioManagerMode.modeNormal,
-          ),
-        );
+      encoder: AudioEncoder.wav,
+      sampleRate: _recordSampleRate,
+      numChannels: 1,
+      autoGain: false,
+      echoCancel: false,
+      noiseSuppress: false,
+      androidConfig: AndroidRecordConfig(
+        audioSource: source,
+        audioManagerMode: AudioManagerMode.modeNormal,
+      ),
+    );
     try {
       await _recorder.start(
         configFor(AndroidAudioSource.unprocessed),
@@ -273,7 +380,7 @@ class PipRecognitionController {
     try {
       final file = File(stopped);
       final bytes = await file.readAsBytes();
-      await file.delete().catchError((_) {});
+      await file.delete().catchError((_) => file);
       return bytes;
     } catch (_) {
       return null;
@@ -281,8 +388,10 @@ class PipRecognitionController {
   }
 
   /// 识别一段：静音检测 → 增益归一化 → 酷狗 audioMatch。
-  /// 返回 (歌名, 歌手)；未命中返回 null。
-  Future<(String, String)?> _recognizeSegment(Uint8List? wav) async {
+  /// 返回命中的歌名/歌手/完整响应（识曲页结果卡片要用完整响应）；
+  /// 未命中返回 null。
+  Future<({String name, String artist, Map<String, dynamic> response})?>
+  _recognizeSegment(Uint8List? wav) async {
     try {
       if (wav == null || wav.isEmpty) return null;
       // 优先用本地 Rust 服务器做 PCM 前处理，失败降级 Dart 实现（与识曲页一致）
@@ -310,13 +419,23 @@ class PipRecognitionController {
       final response = await KugouApiClient().audioMatch(pcmData);
       if (response == null || !hasSongData(response)) return null;
       final audioInfo = _extractAudioInfo(response);
-      final name = extractField(
-              audioInfo, ['songname', 'song_name', 'name', 'SongName']) ??
+      final name =
+          extractField(audioInfo, [
+            'songname',
+            'song_name',
+            'name',
+            'SongName',
+          ]) ??
           '未知歌曲';
-      final artistName = extractField(
-              audioInfo, ['singername', 'singer_name', 'artist', 'SingerName']) ??
+      final artistName =
+          extractField(audioInfo, [
+            'singername',
+            'singer_name',
+            'artist',
+            'SingerName',
+          ]) ??
           '';
-      return (name, artistName);
+      return (name: name, artist: artistName, response: response);
     } catch (e) {
       print('[PipRecognition] recognize error: $e');
       return null;
@@ -341,9 +460,15 @@ class PipRecognitionController {
 
   Uint8List _extractPcmFromWav(List<int> bytes) {
     if (bytes.length < 44) return Uint8List.fromList(bytes);
-    if (bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46) {
+    if (bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46) {
       for (int i = 12; i < bytes.length - 4; i++) {
-        if (bytes[i] == 0x64 && bytes[i + 1] == 0x61 && bytes[i + 2] == 0x74 && bytes[i + 3] == 0x61) {
+        if (bytes[i] == 0x64 &&
+            bytes[i + 1] == 0x61 &&
+            bytes[i + 2] == 0x74 &&
+            bytes[i + 3] == 0x61) {
           final pcmStart = i + 8;
           if (pcmStart < bytes.length) {
             return Uint8List.fromList(bytes.sublist(pcmStart));

@@ -34,6 +34,7 @@ import 'modules/coverflow/coverflow_page.dart';
 import 'utils/landscape_immersive.dart';
 import 'modules/charts/charts_page.dart';
 import 'modules/ip/ip_page.dart';
+import 'modules/recognition/pip_recognition_controller.dart';
 import 'modules/user/user_center_page.dart';
 import 'modules/user/favorites_page.dart';
 import 'modules/brush/brush_page.dart';
@@ -243,6 +244,10 @@ class _AppViewState extends State<_AppView> {
       // 并主动拉取一次冷启动期间原生侧积压的待处理音频
       // ignore: discarded_futures
       ExternalMediaIntentService.instance.start();
+      // 悬浮窗识曲：打开应用时若有未消费的识别结果（10 分钟内），
+      // 自动打开识曲页展示
+      // ignore: discarded_futures
+      PipRecognitionController.instance.openPendingResultPageIfAny();
     });
   }
 
