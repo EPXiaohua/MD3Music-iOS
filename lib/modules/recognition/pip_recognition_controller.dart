@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart' as mui;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -26,12 +27,12 @@ import 'song_recognition_page.dart';
 ///
 /// 交互：
 /// - 识曲页「悬浮窗模式」开窗后**立即开始识别循环**（iOS 悬浮窗内部不可点，
-///   识别不依赖窗口交互）；
-/// - 轻点悬浮窗浮现系统按钮，点「还原」→ 原生回调 restore → 重新开始识别
-///   循环（用于结果/未识别后再次识别），PiP 随还原操作关闭后由这里稍候
-///   自动重开（小窗常驻）；
-/// - 点系统关闭(X) → 原生回报关闭态 → 结束悬浮模式并停止识别循环；
-/// - 识别到歌后保存未读结果：回前台或重新打开应用时自动打开识曲页展示。
+///   识别不依赖窗口交互）；窗口配色经 setThemeColors 同步应用主题
+///   （莫奈/动态取色 + 深浅色模式自适应）；
+/// - 轻点悬浮窗浮现系统按钮：点「还原」回前台即退出悬浮模式（小窗不重开，
+///   循环停止）；点「关闭(X)」同样结束悬浮模式；
+/// - 识别到歌后保存未读结果：回前台或重新打开应用时自动打开识曲页展示；
+///   识曲页已打开时直接在该页展示，防重复弹页。
 class PipRecognitionController {
   PipRecognitionController._() {
     // App 回前台时：若有悬浮窗识别出的未读结果，打开识曲页展示
@@ -75,9 +76,6 @@ class PipRecognitionController {
   bool _windowWanted = false;
   bool _isActive = false;
   bool _isLooping = false;
-
-  /// restore 触发的关窗需要自动重开
-  bool _pendingRestart = false;
   int _attemptCount = 0;
 
   /// 悬浮窗模式是否开启（小窗存活中）
@@ -178,9 +176,13 @@ class PipRecognitionController {
 
   /// 有未消费的悬浮窗识别结果时，打开识曲页展示。
   /// 回前台（AppLifecycleListener.onResume）与冷启动（app.dart 首帧后）都会调用。
+  /// 识曲页已打开（且在栈顶）时直接在该页展示，防重复弹页。
   Future<void> openPendingResultPageIfAny() async {
     final result = await takePendingResult();
     if (result == null) return;
+    // 识曲页已打开：交给页面直接展示；页面不在栈顶时返回 false 走 push
+    final sink = _activePageSink;
+    if (sink != null && sink(result)) return;
     final navigator = appNavigatorKey.currentState;
     if (navigator == null) {
       print('[PipRecognition] navigator not ready, drop pending result');
@@ -195,17 +197,48 @@ class PipRecognitionController {
     );
   }
 
+  /// 当前存活识曲页的结果展示回调（防重复弹页）。
+  /// 页面 initState 注册、dispose 注销；返回 false 表示页面无法立即展示
+  /// （不在栈顶），控制器改走 push 新页面。
+  bool Function(Map<String, dynamic> result)? _activePageSink;
+
+  void attachPageSink(bool Function(Map<String, dynamic> result) sink) {
+    _activePageSink = sink;
+  }
+
+  void detachPageSink(bool Function(Map<String, dynamic> result) sink) {
+    if (_activePageSink == sink) _activePageSink = null;
+  }
+
+  // ===================== 主题配色同步（莫奈/动态取色 + 深浅色自适应） =====================
+
+  /// 把应用当前 ColorScheme 的关键 token 推送给原生窗口渲染。
+  /// 浅色主题推近白的 surface 面板，深色主题推深色容器——原生不做任何
+  /// 颜色计算，只按推送值渲染，深浅匹配由 Dart 侧的 colorScheme 天然完成。
+  /// 注意：页面里 Theme.of(context).colorScheme 是 material_ui 包的
+  /// ColorScheme，故此处也收 mui.ColorScheme。
+  Future<void> pushThemeColors(mui.ColorScheme cs) async {
+    // 浅色面板用 surface（主题里最贴白的底色），深色面板用 surfaceContainer
+    // （深色容器色，与旧版深色窗口观感一致）
+    final isDark = cs.brightness == Brightness.dark;
+    try {
+      await _channel.invokeMethod('setThemeColors', {
+        'panel': (isDark ? cs.surfaceContainer : cs.surface).toARGB32(),
+        'idleCircle': cs.surfaceContainerHighest.toARGB32(),
+        'onSurface': cs.onSurface.toARGB32(),
+        'onSurfaceVariant': cs.onSurfaceVariant.toARGB32(),
+        'error': cs.error.toARGB32(),
+        'onError': cs.onError.toARGB32(),
+        'tertiary': cs.tertiary.toARGB32(),
+        'onTertiary': cs.onTertiary.toARGB32(),
+        'resultBg': cs.primaryContainer.toARGB32(),
+        'onResult': cs.onPrimaryContainer.toARGB32(),
+      });
+    } catch (_) {}
+  }
+
   Future<dynamic> _onNativeCall(MethodCall call) async {
     switch (call.method) {
-      case 'restore':
-        // 轻点悬浮窗 → 系统还原按钮：PiP 即将关闭，先记录重开意图，
-        // 再启动识别循环（小窗重开后显示聆听中状态）。
-        _pendingRestart = true;
-        if (!_isLooping) {
-          final ok = await startLoop();
-          if (!ok) _pendingRestart = false;
-        }
-        break;
       case 'state':
         final args = call.arguments as Map?;
         final active = args?['active'] == true;
@@ -214,12 +247,10 @@ class PipRecognitionController {
             _isActive = true;
             _notify();
           }
-        } else if (_pendingRestart) {
-          // restore 引发的关窗：稍候自动重开，保持小窗常驻
-          _pendingRestart = false;
-          Future.delayed(const Duration(milliseconds: 700), _reopenIfNeeded);
         } else if (_windowWanted) {
-          // 用户用系统 X 关闭小窗：结束悬浮模式（识别循环一并停止）
+          // 用户用系统 X / 还原键关闭小窗：结束悬浮模式（识别循环一并停止）。
+          // 还原键不重开小窗——回前台即退出悬浮模式；若有识别结果，
+          // 回前台的 onResume 会自动打开识曲页展示。
           _windowWanted = false;
           await _abortLoop();
           _isActive = false;
@@ -228,22 +259,6 @@ class PipRecognitionController {
         break;
     }
     return null;
-  }
-
-  /// restore 后重开小窗；期间悬浮模式已被关闭则放弃并同步状态
-  Future<void> _reopenIfNeeded() async {
-    if (!_windowWanted) {
-      if (_isActive) {
-        _isActive = false;
-        _notify();
-      }
-      return;
-    }
-    try {
-      await _channel.invokeMethod<bool>('start');
-    } catch (e) {
-      print('[PipRecognition] reopen failed: $e');
-    }
   }
 
   // ===================== 识别循环（麦克风，与识曲页同链路） =====================

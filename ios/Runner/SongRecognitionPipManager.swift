@@ -67,17 +67,19 @@ final class SongRecognitionPipManager: NSObject {
   /// 2:1 横向窗口（pt）
   private static let windowSize = CGSize(width: 300, height: 150)
 
-  // MD3E 深色主题 token（与安卓悬浮识曲服务默认配色一致）
-  private static let panelColor = argb(0xFF1D1B20)
-  private static let idleCircleColor = argb(0xFF26242B)
-  private static let onSurfaceColor = argb(0xFFE6E0E9)
-  private static let onSurfaceVariantColor = argb(0xFFCAC4D0)
-  private static let errorColor = argb(0xFFFFB4AB)
-  private static let onErrorColor = argb(0xFF601410)
-  private static let tertiaryColor = argb(0xFFEFB8C8)
-  private static let onTertiaryColor = argb(0xFF492532)
-  private static let resultBgColor = argb(0xFFEADDFF)
-  private static let onResultColor = argb(0xFF21005D)
+  // 主题配色：由 Dart 经 setThemeColors 推送（应用莫奈/动态取色的
+  // ColorScheme token，浅色主题为近白面板、深色主题为深色容器，深浅
+  // 匹配由 Dart 侧完成）。未推送前用 MD3E 深色 token 兜底。
+  private var panelColor = argb(0xFF1D1B20)
+  private var idleCircleColor = argb(0xFF26242B)
+  private var onSurfaceColor = argb(0xFFE6E0E9)
+  private var onSurfaceVariantColor = argb(0xFFCAC4D0)
+  private var errorColor = argb(0xFFFFB4AB)
+  private var onErrorColor = argb(0xFF601410)
+  private var tertiaryColor = argb(0xFFEFB8C8)
+  private var onTertiaryColor = argb(0xFF492532)
+  private var resultBgColor = argb(0xFFEADDFF)
+  private var onResultColor = argb(0xFF21005D)
 
   private static func argb(_ value: Int) -> UIColor {
     UIColor(
@@ -117,6 +119,11 @@ final class SongRecognitionPipManager: NSObject {
           self.update(args)
         }
         result(nil)
+      case "setThemeColors":
+        if let args = call.arguments as? [String: Any] {
+          self.applyThemeColors(args)
+        }
+        result(nil)
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -131,6 +138,27 @@ final class SongRecognitionPipManager: NSObject {
     hintText = text.isEmpty ? Self.defaultHint(for: state) : text
     songName = args["songName"] as? String ?? ""
     artist = args["artist"] as? String ?? ""
+  }
+
+  // MARK: 主题配色（Dart 推送应用 ColorScheme token）
+
+  /// 应用 Dart 推送的主题色（ARGB int）。窗口下一帧（≤50ms）即用新配色，
+  /// 深浅色匹配与莫奈取色都在 Dart 侧由 ColorScheme 完成，这里只做赋值。
+  private func applyThemeColors(_ args: [String: Any]) {
+    func color(_ key: String, current: UIColor) -> UIColor {
+      guard let v = args[key] as? Int else { return current }
+      return Self.argb(v)
+    }
+    panelColor = color("panel", current: panelColor)
+    idleCircleColor = color("idleCircle", current: idleCircleColor)
+    onSurfaceColor = color("onSurface", current: onSurfaceColor)
+    onSurfaceVariantColor = color("onSurfaceVariant", current: onSurfaceVariantColor)
+    errorColor = color("error", current: errorColor)
+    onErrorColor = color("onError", current: onErrorColor)
+    tertiaryColor = color("tertiary", current: tertiaryColor)
+    onTertiaryColor = color("onTertiary", current: onTertiaryColor)
+    resultBgColor = color("resultBg", current: resultBgColor)
+    onResultColor = color("onResult", current: onResultColor)
   }
 
   private static func defaultHint(for state: String) -> String {
@@ -283,10 +311,8 @@ final class SongRecognitionPipManager: NSObject {
       NSLog("[MD3Music] recognition pip failed to start: \(message)")
       self?.handleStartFailed()
     }
-    lifecycle.onRestore = { [weak self] in
-      // 还原按钮：通知 Dart 开始/继续识别循环（Dart 随后重开小窗）
-      self?.channel?.invokeMethod("restore", arguments: nil)
-    }
+    // 还原按钮不额外回调：restore 回前台即退出悬浮模式，由 Dart 侧
+    // 监听 state(active:false) 统一收尾（停止循环、结果经回前台展示）
     delegateHolder = lifecycle
     let contentSource = AVPictureInPictureController.ContentSource(
       sampleBufferDisplayLayer: sampleLayer,
@@ -657,7 +683,6 @@ private final class SongRecognitionPipLifecycleDelegate: NSObject,
   var onWillStop: () -> Void = {}
   var onStopped: () -> Void = {}
   var onFailed: (String) -> Void = { _ in }
-  var onRestore: () -> Void = {}
 
   func pictureInPictureControllerWillStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
@@ -692,9 +717,8 @@ private final class SongRecognitionPipLifecycleDelegate: NSObject,
     _ pictureInPictureController: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
   ) {
-    // 还原按钮：先把还原意图通知 Dart（开始/继续识别循环），再返回 true
-    // 让系统把 App 拉回前台。PiP 随还原操作关闭，Dart 稍候自动重开小窗。
-    onRestore()
+    // 还原按钮：返回 true 让系统把 App 拉回前台即可。PiP 随还原操作关闭，
+    // Dart 侧监听 state(active:false) 结束悬浮模式，不重开小窗。
     completionHandler(true)
   }
 

@@ -71,6 +71,8 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     PipRecognitionController.instance.addListener(
       _onFloatingRecognitionChanged,
     );
+    // 防重复弹页：悬浮窗识别出结果时，若本页已在栈顶则直接在此展示
+    PipRecognitionController.instance.attachPageSink(_showExternalResult);
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
@@ -93,6 +95,19 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     if (mounted) setState(() {});
   }
 
+  /// 悬浮窗识别出结果的回调：本页在栈顶则直接展示并返回 true（防重复弹页）；
+  /// 不在栈顶（用户从本页进入了其他页面）返回 false，由控制器 push 新页面。
+  bool _showExternalResult(Map<String, dynamic> result) {
+    if (!mounted) return false;
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return false;
+    setState(() {
+      _result = result;
+      _error = null;
+    });
+    return true;
+  }
+
   @override
   void dispose() {
     FloatingRecognitionService.instance.removeListener(
@@ -101,6 +116,7 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     PipRecognitionController.instance.removeListener(
       _onFloatingRecognitionChanged,
     );
+    PipRecognitionController.instance.detachPageSink(_showExternalResult);
     _pulseController.dispose();
     _recorder.dispose();
     super.dispose();
@@ -369,6 +385,11 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
         Theme.of(context).colorScheme,
       );
     }
+    if (Platform.isIOS && PipRecognitionController.instance.isActive) {
+      PipRecognitionController.instance.pushThemeColors(
+        Theme.of(context).colorScheme,
+      );
+    }
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
@@ -443,6 +464,8 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
         }
         return;
       }
+      // 开窗前先推主题色，原生首帧即用应用配色（莫奈/动态取色 + 深浅色自适应）
+      await pip.pushThemeColors(Theme.of(context).colorScheme);
       final ok = await pip.start();
       if (!mounted) return;
       if (ok) {
