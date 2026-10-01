@@ -486,8 +486,8 @@ final class SongRecognitionPipManager: NSObject {
   private func drawWindow(in ctx: CGContext, size: CGSize) {
     let w = size.width
     let h = size.height
-    // 面板底色：SampleBuffer 是不透明视频帧，用实色深色面板
-    ctx.setFillColor(Self.panelColor.cgColor)
+    // 面板底色：SampleBuffer 是不透明视频帧，用实色面板
+    ctx.setFillColor(panelColor.cgColor)
     ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
     // —— 左侧圆形麦克风标 ——
@@ -507,18 +507,18 @@ final class SongRecognitionPipManager: NSObject {
     }
     let radius = diameter / 2 * scale
 
-    var circleColor = Self.idleCircleColor
-    var iconColor = Self.onSurfaceColor
+    var circleColor = idleCircleColor
+    var iconColor = onSurfaceColor
     switch state {
     case "listening":
-      circleColor = Self.errorColor
-      iconColor = Self.onErrorColor
+      circleColor = errorColor
+      iconColor = onErrorColor
     case "recognizing":
-      circleColor = Self.tertiaryColor
-      iconColor = Self.onTertiaryColor
+      circleColor = tertiaryColor
+      iconColor = onTertiaryColor
     case "result":
-      circleColor = Self.resultBgColor
-      iconColor = Self.onResultColor
+      circleColor = resultBgColor
+      iconColor = onResultColor
     default:
       break
     }
@@ -528,7 +528,7 @@ final class SongRecognitionPipManager: NSObject {
       let glow: [(extra: CGFloat, alpha: CGFloat)] = [(3, 0.5), (8, 0.28), (15, 0.13)]
       for g in glow {
         let r = radius + g.extra
-        ctx.setStrokeColor(Self.errorColor.withAlphaComponent(g.alpha).cgColor)
+        ctx.setStrokeColor(errorColor.withAlphaComponent(g.alpha).cgColor)
         ctx.setLineWidth(g.extra)
         ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
       }
@@ -620,7 +620,7 @@ final class SongRecognitionPipManager: NSObject {
     paragraph.lineBreakMode = .byTruncatingTail
     var attrs: [NSAttributedString.Key: Any] = [
       .font: UIFont.systemFont(ofSize: fontSize, weight: .medium),
-      .foregroundColor: muted ? Self.onSurfaceVariantColor : Self.onSurfaceColor,
+      .foregroundColor: muted ? onSurfaceVariantColor : onSurfaceColor,
       .paragraphStyle: paragraph,
     ]
     let text = hintText as NSString
@@ -647,12 +647,12 @@ final class SongRecognitionPipManager: NSObject {
     paragraph.lineBreakMode = .byTruncatingTail
     let nameAttrs: [NSAttributedString.Key: Any] = [
       .font: nameFont,
-      .foregroundColor: Self.onSurfaceColor,
+      .foregroundColor: onSurfaceColor,
       .paragraphStyle: paragraph,
     ]
     let artistAttrs: [NSAttributedString.Key: Any] = [
       .font: artistFont,
-      .foregroundColor: Self.onSurfaceVariantColor,
+      .foregroundColor: onSurfaceVariantColor,
       .paragraphStyle: paragraph,
     ]
     let nameSize = name.size(withAttributes: nameAttrs)
