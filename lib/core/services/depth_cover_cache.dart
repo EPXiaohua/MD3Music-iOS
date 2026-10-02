@@ -35,9 +35,14 @@ class DepthCoverCache {
   Future<String> _baseDir() async {
     final override = baseDirOverride;
     if (override != null) return override;
-    final base =
-        await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
-    return '${base.path}${Platform.pathSeparator}stream_cache'
+    // getExternalStorageDirectory 仅 Android 提供，iOS/macOS 上会直接抛
+    // UnsupportedError（?? 兜底接不住异常）。此前设置页读缓存大小时在 iOS
+    // 上被这里中断，导致整个设置加载失败、所有开关回落默认值。
+    final base = Platform.isAndroid
+        ? await getExternalStorageDirectory()
+        : null;
+    final dir = base ?? await getApplicationDocumentsDirectory();
+    return '${dir.path}${Platform.pathSeparator}stream_cache'
         '${Platform.pathSeparator}depth_cover';
   }
 

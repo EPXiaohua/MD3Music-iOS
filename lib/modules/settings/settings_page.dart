@@ -443,9 +443,18 @@ class _SettingsPageState extends State<SettingsPage>
     // 读取 3D 封面 AI 背景修补开关（MI-GAN 神经细化）
     final depthCoverNeuralInpaint = await _settingsRepository
         .getDepthCoverNeuralInpaint();
-    // 读取 3D 封面深度图缓存占用
-    final depthCacheBytes = await DepthCoverService.instance.cache
-        .cacheSizeBytes();
+    // 读取 3D 封面深度图缓存占用：仅 depth3d 构建才查缓存（standard/iOS
+    // 平台无原生推理，缓存目录不存在）；再兜底 try/catch，保证任何异常
+    // 都不会中断整个设置加载（否则所有开关会回落默认值，看起来像"保存失效"）
+    var depthCacheBytes = 0;
+    if (kDepthCoverAvailable) {
+      try {
+        depthCacheBytes = await DepthCoverService.instance.cache
+            .cacheSizeBytes();
+      } catch (_) {
+        depthCacheBytes = 0;
+      }
+    }
     // 读取锁屏歌词开关
     final lockScreenLyricEnabled = await _settingsRepository
         .getLockScreenLyricEnabled();
@@ -4085,11 +4094,11 @@ class _SettingsPageState extends State<SettingsPage>
           trailing: const Icon(Icons.open_in_new, size: 18),
           onTap: () => _openReleasesUrl(),
         ),
-        // iOS 移植版仓库入口：Android 用户直接看上游发布页即可
+        // iOS 移植版仓库入口：指向上游仓库（Android 用户直接看上游发布页即可）
         if (Platform.isIOS)
           ListTile(
             title: const Text('GitHub 仓库'),
-            subtitle: const Text('github.com/EPXiaohua/MD3Music-iOS · 上游安卓版移植'),
+            subtitle: const Text('github.com/zzyoxml/md3Music · 上游仓库'),
             leading: const Icon(Icons.code_outlined),
             trailing: const Icon(Icons.open_in_new, size: 18),
             onTap: () => _openProjectRepoUrl(),
@@ -4212,9 +4221,9 @@ class _SettingsPageState extends State<SettingsPage>
     }
   }
 
-  /// iOS 移植版项目仓库（上游安卓版 zzyoxml/md3Music 的移植）
+  /// 上游仓库（iOS 移植版的上游安卓项目）
   Future<void> _openProjectRepoUrl() async {
-    final uri = Uri.parse('https://github.com/EPXiaohua/MD3Music-iOS/');
+    final uri = Uri.parse('https://github.com/zzyoxml/md3Music/');
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }

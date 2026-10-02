@@ -55,8 +55,16 @@ jobs:
           cd kugou_api_server/rust
           ./build_ios.sh
 
-      - name: Build iOS (no codesign)
+      - name: Build iOS standard (no codesign, 无 3D 封面)
         run: flutter build ios --release --no-codesign
+
+      - name: Package standard unsigned ipa
+        run: |
+          cd build/ios/iphoneos
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R Runner.app Payload/Runner.app
+          zip -qry ../MD3Music-unsigned.ipa Payload
 
       - name: Diagnose actool/icon build (results in job summary)
         if: failure()
@@ -107,17 +115,23 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Package as unsigned ipa
+      - name: Build iOS 3D cover variant (no codesign, ENABLE_DEPTH_3D=true)
+        run: flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true
+
+      - name: Package 3D variant unsigned ipa
         run: |
           cd build/ios/iphoneos
+          rm -rf Payload
           mkdir -p Payload
           cp -R Runner.app Payload/Runner.app
-          zip -qry ../MD3Music-unsigned.ipa Payload
+          zip -qry ../MD3Music-3D-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
           name: md3music-ios-unsigned
-          path: build/ios/MD3Music-unsigned.ipa
+          path: |
+            build/ios/MD3Music-unsigned.ipa
+            build/ios/MD3Music-3D-unsigned.ipa
 
       # App 内更新检测读取本仓库 releases/latest（tag 由 pubspec version 生成，
       # 如 v5.7.0+45）；同版本重复构建时更新已有 Release 并覆盖资产
@@ -136,5 +150,10 @@ jobs:
           body: |
             未签名 IPA：下载后自行签名安装（侧载工具均可）。
 
+            - `MD3Music-unsigned.ipa`：标准版（无 3D 封面，推荐）
+            - `MD3Music-3D-unsigned.ipa`：含 3D 封面支持版（设置中显示 3D 封面选项；当前 iOS 端深度推理未接入，生成失败时自动回退平面封面）
+
             本项目为上游安卓版 [zzyoxml/md3Music](https://github.com/zzyoxml/md3Music) 的 iOS 移植。
-          files: build/ios/MD3Music-unsigned.ipa
+          files: |
+            build/ios/MD3Music-unsigned.ipa
+            build/ios/MD3Music-3D-unsigned.ipa
