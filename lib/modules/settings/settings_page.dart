@@ -39,6 +39,7 @@ import '../../core/theme/motion_constants.dart';
 import '../../data/repositories/settings_repository.dart';
 import '../onboarding/onboarding_page.dart';
 import '../onboarding/user_agreement_page.dart';
+import '../update/update_check_service.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/shortcut_config_provider.dart';
@@ -110,6 +111,8 @@ class _SettingsPageState extends State<SettingsPage>
   bool _legacyAppIconEnabled = false;
   // 上次已提醒的新版本号（形如 5.6.5，空串=无）。用于「更新最新版本」副标题提示。
   String _pendingUpdateVersion = '';
+  // 手动检查更新进行中（关于区块显示加载态，防重复点击）
+  bool _checkingUpdate = false;
   // 本地 API 服务器重启中（在线音乐区块显示加载态）
   bool _isRestarting = false;
   // 诊断日志导出进行中（关于区块显示加载态，防重复点击）
@@ -4068,6 +4071,23 @@ class _SettingsPageState extends State<SettingsPage>
             _setUpdateReminderEnabled(value);
           },
         ),
+        // search: 检查更新 立即检查 手动 update check
+        ListTile(
+          title: const Text('检查更新'),
+          subtitle: Text(
+            _checkingUpdate
+                ? '正在检查 GitHub 上的最新版本…'
+                : '立即手动检查，不受启动检查的 12 小时间隔限制',
+          ),
+          leading: _checkingUpdate
+              ? const SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.refresh_outlined),
+          onTap: _checkingUpdate ? null : _checkUpdateNow,
+        ),
         if (Platform.isAndroid) ...[
           // search: 图标 旧版 桌面图标 恢复
           SwitchListTile(
@@ -4218,6 +4238,35 @@ class _SettingsPageState extends State<SettingsPage>
     final uri = Uri.parse(url);
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  /// 手动检查更新：force 绕过启动检查的 12 小时间隔/同版本去重，
+  /// 让用户点按钮立刻拿到真实结果（发现新版本时服务层已 toast 提醒）。
+  Future<void> _checkUpdateNow() async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    try {
+      final outcome = await UpdateCheckService.instance.checkAndNotify(
+        force: true,
+      );
+      switch (outcome) {
+        case UpdateCheckOutcome.notified:
+          // 服务层已提示「发现新版本 vX.Y.Z」；同步刷新「更新最新版本」副标题
+          final pending = await SettingsRepository()
+              .getUpdateLastNotifiedVersion();
+          if (mounted && pending.isNotEmpty) {
+            setState(() => _pendingUpdateVersion = pending);
+          }
+        case UpdateCheckOutcome.upToDate:
+          showToast('已是最新版本', long: true);
+        case UpdateCheckOutcome.failed:
+          showToast('检查失败，请稍后重试', long: true);
+        case UpdateCheckOutcome.skipped:
+          showToast('检查被跳过，请稍后重试', long: true);
+      }
+    } finally {
+      if (mounted) setState(() => _checkingUpdate = false);
     }
   }
 

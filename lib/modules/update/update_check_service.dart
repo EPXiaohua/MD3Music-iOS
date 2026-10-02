@@ -88,25 +88,30 @@ class UpdateCheckService {
   }
 
   /// 检查并在发现新版本时提醒。返回值便于日志与测试断言。
-  Future<UpdateCheckOutcome> checkAndNotify() async {
+  ///
+  /// [force] 为 true 时绕过「12 小时最小间隔」与「同一版本只提醒一次」
+  /// 以及提醒开关（设置页「检查更新」等用户主动触发场景：用户点按钮
+  /// 就是要立刻拿结果，节流反而让按钮看起来失灵）；启动检查保持全部门控。
+  Future<UpdateCheckOutcome> checkAndNotify({bool force = false}) async {
     if (_running) return UpdateCheckOutcome.skipped;
     _running = true;
     try {
-      return await _run();
+      return await _run(force: force);
     } finally {
       _running = false;
     }
   }
 
-  Future<UpdateCheckOutcome> _run() async {
-    if (!await _settings.getUpdateReminderEnabled()) {
+  Future<UpdateCheckOutcome> _run({bool force = false}) async {
+    if (!force && !await _settings.getUpdateReminderEnabled()) {
       debugPrint('[UpdateCheck] 用户已关闭新版本提醒，跳过');
       return UpdateCheckOutcome.skipped;
     }
 
     final now = DateTime.now().millisecondsSinceEpoch;
     final lastCheckMs = await _settings.getUpdateLastCheckMs();
-    if (lastCheckMs > 0 &&
+    if (!force &&
+        lastCheckMs > 0 &&
         now - lastCheckMs < minCheckInterval.inMilliseconds) {
       debugPrint('[UpdateCheck] 距上次检查不足 12 小时，跳过');
       return UpdateCheckOutcome.skipped;
@@ -126,7 +131,8 @@ class UpdateCheckService {
     }
 
     // 同一版本只提醒一次：避免每次启动都弹同一个版本
-    if (await _settings.getUpdateLastNotifiedVersion() == release.version) {
+    if (!force &&
+        await _settings.getUpdateLastNotifiedVersion() == release.version) {
       debugPrint('[UpdateCheck] ${release.version} 已提醒过，跳过');
       return UpdateCheckOutcome.skipped;
     }

@@ -140,4 +140,45 @@ void main() {
     );
     expect(ctx.messages, isEmpty);
   });
+
+  test('force 绕过 12 小时最小间隔立即查询', () async {
+    SharedPreferences.setMockInitialValues({
+      'update_last_check_ms': DateTime.now().millisecondsSinceEpoch,
+    });
+    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
+
+    expect(
+      await ctx.service.checkAndNotify(force: true),
+      UpdateCheckOutcome.notified,
+    );
+    expect(ctx.source.calls, 1);
+    expect(ctx.messages, isNotEmpty);
+  });
+
+  test('force 绕过同版本只提醒一次的去重', () async {
+    SharedPreferences.setMockInitialValues({
+      'update_last_check_ms': await _hoursAgo(13),
+      'update_last_notified_version': '5.6.5',
+    });
+    final ctx = _build(remote: _release('v5.6.5'), currentVersion: '5.6.0');
+
+    expect(
+      await ctx.service.checkAndNotify(force: true),
+      UpdateCheckOutcome.notified,
+    );
+    expect(ctx.messages, isNotEmpty);
+  });
+
+  test('force 绕过提醒开关（手动检查是用户显式动作）', () async {
+    SharedPreferences.setMockInitialValues({
+      'settings_update_reminder_enabled': false,
+    });
+    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
+
+    expect(
+      await ctx.service.checkAndNotify(force: true),
+      UpdateCheckOutcome.notified,
+    );
+    expect(ctx.source.calls, 1);
+  });
 }
