@@ -13,6 +13,7 @@ import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../player/mv_player_page.dart';
+import '../player/secondary_mini_player.dart';
 import '../playlist/playlist_page.dart';
 
 /// 编辑精选详情页。
@@ -242,15 +243,17 @@ class _IpDetailPageState extends State<IpDetailPage>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          _buildSongsTab(),
-          _buildAlbumsTab(),
-          _buildVideosTab(),
-          _buildArtistsTab(),
-          _buildPlaylistsTab(),
-        ],
+      body: SecondaryMiniPlayerHost(
+        child: TabBarView(
+          controller: _tabController,
+          children: [
+            _buildSongsTab(),
+            _buildAlbumsTab(),
+            _buildVideosTab(),
+            _buildArtistsTab(),
+            _buildPlaylistsTab(),
+          ],
+        ),
       ),
     );
   }

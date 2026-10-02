@@ -1,8 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../lib/data/models/song.dart';
-import '../../lib/providers/player_provider.dart';
+import 'package:md3music/data/models/song.dart';
+import 'package:md3music/providers/player_provider.dart';
 
 /// 歌单加载时的随机播放顺序测试。
 ///

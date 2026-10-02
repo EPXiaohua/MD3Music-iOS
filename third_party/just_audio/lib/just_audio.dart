@@ -1325,7 +1325,9 @@ class AudioPlayer {
     // ignore: avoid_print
     print('[AudioFocusFork] setForceWillPauseWhenDucked force=$force id=$_id');
     _pendingForceWillPauseWhenDucked = force;
-    if (_id == null) return;
+    if (_id == null ||
+        _platformValue == null ||
+        _platformValue is _IdleAudioPlayer) return;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
       await channel
@@ -1349,7 +1351,9 @@ class AudioPlayer {
     // ignore: avoid_print
     print('[AudioFocusFork] setIgnoreAudioFocus ignore=$ignore id=$_id');
     _pendingIgnoreAudioFocus = ignore;
-    if (_id == null) return;
+    if (_id == null ||
+        _platformValue == null ||
+        _platformValue is _IdleAudioPlayer) return;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
       await channel.invokeMethod('setIgnoreAudioFocus', {'ignore': ignore});
@@ -1371,7 +1375,9 @@ class AudioPlayer {
     // ignore: avoid_print
     print('[AudioFocusFork] setForceKeepPlaying keep=$keepPlaying id=$_id');
     _pendingForceKeepPlaying = keepPlaying;
-    if (_id == null) return;
+    if (_id == null ||
+        _platformValue == null ||
+        _platformValue is _IdleAudioPlayer) return;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
       await channel
@@ -2027,17 +2033,28 @@ class AudioPlayer {
     final details =
         (e.details as Map<dynamic, dynamic>?)?.cast<String, dynamic>();
     final index = details?['index'] as int? ?? currentIndex;
+    final rawAndroidExoType = details?['type'];
+    final androidExoType = rawAndroidExoType is int ? rawAndroidExoType : null;
+    final rawHttpStatusCode = details?['httpStatusCode'];
+    final httpStatusCode = rawHttpStatusCode is int ? rawHttpStatusCode : null;
     final code = int.tryParse(e.code);
     if (code == null) {
       if (e.code == 'abort') {
         return PlayerInterruptedException(e.message);
       } else {
-        return PlayerException(kUnknownErrorCode, e.message, index);
+        return PlayerException(
+          kUnknownErrorCode,
+          e.message,
+          index,
+          androidExoType: androidExoType,
+          httpStatusCode: httpStatusCode,
+        );
       }
     } else if (code == kInterruptedErrorCode) {
       return PlayerInterruptedException(e.message);
     } else {
-      return PlayerException(code, e.message, index);
+      return PlayerException(code, e.message, index,
+          androidExoType: androidExoType, httpStatusCode: httpStatusCode);
     }
   }
 }
@@ -2047,8 +2064,14 @@ class AudioPlayer {
 /// could not be understood.
 class PlayerException implements Exception {
   /// On iOS and macOS, maps to `NSError.code`. On Android, maps to
-  /// `ExoPlaybackException.type`. On Web, maps to `MediaError.code`.
+  /// `PlaybackException.errorCode`. On Web, maps to `MediaError.code`.
   final int code;
+
+  /// Coarse `ExoPlaybackException.type` retained by the MD3 Android fork.
+  final int? androidExoType;
+
+  /// HTTP response code found in the Media3 source exception cause chain.
+  final int? httpStatusCode;
 
   /// On iOS and macOS, maps to `NSError.localizedDescription`. On Android,
   /// maps to `ExoPlaybackException.getMessage()`. On Web, a generic message
@@ -2058,7 +2081,18 @@ class PlayerException implements Exception {
   /// The index of the audio source associated with this error.
   final int? index;
 
-  PlayerException(this.code, this.message, this.index);
+  PlayerException(
+    this.code,
+    this.message,
+    this.index, {
+    this.androidExoType,
+    int? httpStatusCode,
+  }) : httpStatusCode = httpStatusCode ?? _httpStatusFromMessage(message);
+
+  static int? _httpStatusFromMessage(String? message) {
+    final match = RegExp(r'\[http_status=(\d{3})\]').firstMatch(message ?? '');
+    return match == null ? null : int.tryParse(match.group(1)!);
+  }
 
   @override
   String toString() => "($code) $message";
@@ -4016,15 +4050,48 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
       request.response.statusCode = 200;
     }
 
+    request.response.bufferOutput = false;
     final completer = Completer<void>();
-    final subscription = stream.listen(request.response.add,
-        onError: (e, st) {}, onDone: completer.complete);
+    var streamFailed = false;
+    var streamHasWrittenData = false;
+    void completeStream() {
+      if (!completer.isCompleted) completer.complete();
+    }
+
+    final subscription = stream.listen(
+      (chunk) {
+        try {
+          request.response.add(chunk);
+          streamHasWrittenData = true;
+        } catch (_) {
+          streamFailed = true;
+          completeStream();
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        streamFailed = true;
+        completeStream();
+      },
+      onDone: completeStream,
+    );
 
     request.response.done.then((dynamic value) {
       subscription.cancel();
     });
 
     await completer.future;
+
+    if (streamFailed) {
+      if (streamHasWrittenData) {
+        await _abortProxyResponse(request.response);
+      } else {
+        await _closeProxyResponse(
+          request.response,
+          statusCode: HttpStatus.internalServerError,
+        );
+      }
+      return;
+    }
 
     await request.response.close();
   }
@@ -4113,47 +4180,89 @@ _ProxyHandler _proxyHandlerForUri(
       await request.response.close();
     } on HttpException {
       // We likely are dealing with a streaming protocol
-      if (uri.scheme == 'http') {
-        // Try parsing HTTP 0.9 response
-        //request.response.headers.clear();
-        final socket = await Socket.connect(uri.host, uri.port);
-        final clientSocket =
-            await request.response.detachSocket(writeHeaders: false);
-        final done = Completer<dynamic>();
-        socket.listen(
-          clientSocket.add,
-          onDone: () async {
-            await clientSocket.flush();
-            socket.close();
-            clientSocket.close();
-            done.complete();
-          },
-        );
-        // Rewrite headers
-        final headers = <String, String?>{};
-        request.headers.forEach((name, value) {
-          if (name.toLowerCase() != HttpHeaders.hostHeader) {
-            headers[name] = value.join(",");
+      try {
+        if (uri.scheme == 'http') {
+          // Try parsing HTTP 0.9 response
+          //request.response.headers.clear();
+          final socket = await Socket.connect(uri.host, uri.port);
+          final clientSocket =
+              await request.response.detachSocket(writeHeaders: false);
+          final done = Completer<dynamic>();
+          socket.listen(
+            clientSocket.add,
+            onDone: () async {
+              await clientSocket.flush();
+              socket.close();
+              clientSocket.close();
+              done.complete();
+            },
+          );
+          // Rewrite headers
+          final headers = <String, String?>{};
+          request.headers.forEach((name, value) {
+            if (name.toLowerCase() != HttpHeaders.hostHeader) {
+              headers[name] = value.join(",");
+            }
+          });
+          for (var name in headers.keys) {
+            headers[name] = headers[name];
           }
-        });
-        for (var name in headers.keys) {
-          headers[name] = headers[name];
+          socket.write("GET ${uri.path} HTTP/1.1\n");
+          if (host != null) {
+            socket.write("Host: $host\n");
+          }
+          for (var name in headers.keys) {
+            socket.write("$name: ${headers[name]}\n");
+          }
+          socket.write("\n");
+          await socket.flush();
+          await done.future;
+        } else {
+          await _closeProxyResponse(request.response);
         }
-        socket.write("GET ${uri.path} HTTP/1.1\n");
-        if (host != null) {
-          socket.write("Host: $host\n");
-        }
-        for (var name in headers.keys) {
-          socket.write("$name: ${headers[name]}\n");
-        }
-        socket.write("\n");
-        await socket.flush();
-        await done.future;
+      } catch (_) {
+        await _closeProxyResponse(request.response);
       }
+    } catch (_) {
+      // 网络错误、客户端断开和其他上游失败都必须结束本地响应。
+      // 此handler由HttpServer监听器异步调用，不能把Future异常泄漏到Zone。
+      await _closeProxyResponse(request.response);
+    } finally {
+      client.close(force: true);
     }
   }
 
   return handler;
+}
+
+Future<void> _closeProxyResponse(
+  HttpResponse response, {
+  int statusCode = HttpStatus.badGateway,
+}) async {
+  try {
+    response.statusCode = statusCode;
+    response.contentLength = 0;
+  } catch (_) {
+    // 响应头已经发送时无法修改状态码，但仍需尽量关闭响应体。
+  }
+  try {
+    await response.close();
+  } catch (_) {
+    // 对端可能已经断开。
+  }
+}
+
+Future<void> _abortProxyResponse(HttpResponse response) async {
+  try {
+    final socket = await response.detachSocket(writeHeaders: false);
+    socket.destroy();
+  } catch (_) {
+    try {
+      await response.close();
+    } catch (_) {
+      // 对端可能已经断开。
+    }
+  }
 }
 
 Future<Directory> _getCacheDir() async =>

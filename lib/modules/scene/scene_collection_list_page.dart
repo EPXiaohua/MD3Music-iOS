@@ -7,7 +7,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 import '../playlist/playlist_page.dart';
 
 /// 场景音乐歌单列表页（/scene/collection/list?tag_id=tag_id）。
@@ -132,8 +132,8 @@ class _SceneCollectionListPageState extends State<SceneCollectionListPage> {
         opaque: true,
         scrollController: _scrollController,
       ),
-      bottomNavigationBar: const MiniPlayer(),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _lists.isEmpty
               ? _buildEmpty(cs)
@@ -172,6 +172,7 @@ class _SceneCollectionListPageState extends State<SceneCollectionListPage> {
                     },
                   ),
                 ),
+      ),
     );
   }
 

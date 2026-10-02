@@ -1,4 +1,4 @@
-﻿import 'package:material_ui/material_ui.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
@@ -8,9 +8,10 @@ import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/smart_artwork_image.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 /// 听书专辑详情页：专辑信息 + 简介 + 章节列表（可播放）。
 ///
@@ -371,7 +372,8 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
     final displaySongs = _displaySongs;
 
     return Scaffold(
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : Column(
               children: [
@@ -527,9 +529,9 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                     ],
                   ),
                 ),
-                const MiniPlayer(),
               ],
             ),
+      ),
     );
   }
 
@@ -566,69 +568,27 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
             onPressed: _scrollToPlayingSong,
           ),
         if (displaySongs.isNotEmpty)
-          PopupMenuButton<_SortBy>(
-            icon: const Icon(Icons.sort),
-            onSelected: (value) {
+          M3ESortButton<_SortBy>(
+            tooltip: '排序',
+            current: _sortBy,
+            options: const [
+              (value: _SortBy.time, label: '章节顺序'),
+              (value: _SortBy.title, label: '章节名称'),
+              (value: _SortBy.duration, label: '时长'),
+            ],
+            onPicked: (value, repeated) {
               setState(() {
-                if (_sortBy == value) {
+                if (repeated) {
+                  // 再次点当前项：只翻转升/降序
                   _sortAscending = !_sortAscending;
                 } else {
                   _sortBy = value;
+                  // 章序默认正序（第 1 集在最上面），其余默认降序
                   _sortAscending = value == _SortBy.time ? false : true;
                 }
                 _invalidateDisplaySongs();
               });
             },
-            itemBuilder: (context) => [
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.time,
-                checked: _sortBy == _SortBy.time,
-                child: Row(
-                  children: [
-                    const Text('章节顺序'),
-                    if (_sortBy == _SortBy.time) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending ? Icons.arrow_upward : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.title,
-                checked: _sortBy == _SortBy.title,
-                child: Row(
-                  children: [
-                    const Text('章节名称'),
-                    if (_sortBy == _SortBy.title) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending ? Icons.arrow_upward : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.duration,
-                checked: _sortBy == _SortBy.duration,
-                child: Row(
-                  children: [
-                    const Text('时长'),
-                    if (_sortBy == _SortBy.duration) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending ? Icons.arrow_upward : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ],
           ),
       ],
       title: Opacity(

@@ -7,6 +7,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
@@ -402,13 +403,22 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
       child: Scaffold(
         appBar: AppBar(title: const Text('导入外部歌单')),
         body: SafeArea(
-          child: _phase == _ImportPhase.success
-              ? _buildSuccessPanel(cs)
-              : _phase == _ImportPhase.failure
-                  ? _buildFailurePanel(cs)
-                  : _busy
-                      ? _buildWorkingPanel(cs)
-                      : _buildForm(),
+          // 大屏「重组而非拉伸」：表单内容约束到可读宽度并居中，
+          // 窄屏（手机）不足此宽度时无副作用，宽屏多余宽度留白。
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(
+                maxWidth: AppLayout.readableMaxWidth,
+              ),
+              child: _phase == _ImportPhase.success
+                  ? _buildSuccessPanel(cs)
+                  : _phase == _ImportPhase.failure
+                      ? _buildFailurePanel(cs)
+                      : _busy
+                          ? _buildWorkingPanel(cs)
+                          : _buildForm(),
+            ),
+          ),
         ),
       ),
     );
@@ -441,7 +451,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
   Widget _buildLinkTab() {
     final cs = Theme.of(context).colorScheme;
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(AppSpacing.lg),
       children: [
         Text(
           '支持从其他音乐平台复制的歌单分享链接，'
@@ -450,7 +460,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                 color: cs.onSurfaceVariant,
               ),
         ),
-        const SizedBox(height: 16),
+        const Gap(AppSpacing.lg),
         TextField(
           controller: _urlController,
           maxLines: 3,
@@ -460,7 +470,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
             border: OutlineInputBorder(),
           ),
         ),
-        const SizedBox(height: 16),
+        const Gap(AppSpacing.lg),
         FilledButton.icon(
           onPressed: _startLinkImport,
           icon: const Icon(Icons.input),
@@ -473,7 +483,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
   Widget _buildImageTab() {
     final cs = Theme.of(context).colorScheme;
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(AppSpacing.lg),
       children: [
         Text(
           '对另一个平台的歌单逐屏截图后上传，云端通过图片识别歌曲。'
@@ -482,7 +492,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                 color: cs.onSurfaceVariant,
               ),
         ),
-        const SizedBox(height: 16),
+        const Gap(AppSpacing.lg),
         // 已选截图网格
         Wrap(
           spacing: 8,
@@ -496,13 +506,13 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
             if (_images.length < _maxImages)
               InkWell(
                 onTap: _pickImages,
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: AppRadius.smAll,
                 child: Container(
                   width: 72,
                   height: 72,
                   decoration: BoxDecoration(
                     border: Border.all(color: cs.outlineVariant),
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: AppRadius.smAll,
                   ),
                   child: Icon(
                     Icons.add_photo_alternate_outlined,
@@ -513,7 +523,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
           ],
         ),
         if (_images.isNotEmpty) ...[
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           Text(
             '已选 ${_images.length} 张（最多 $_maxImages 张）',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -521,7 +531,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                 ),
           ),
         ],
-        const SizedBox(height: 24),
+        const Gap(AppSpacing.xl),
         // 导入目标
         RadioGroup<bool>(
           groupValue: _targetExisting,
@@ -537,7 +547,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
               ),
               if (!_targetExisting)
                 Padding(
-                  padding: const EdgeInsets.only(left: 16),
+                  padding: const EdgeInsets.only(left: AppSpacing.lg),
                   child: TextField(
                     controller: _listNameController,
                     decoration: const InputDecoration(
@@ -560,29 +570,47 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
         ),
         if (_targetExisting)
           Padding(
-            padding: const EdgeInsets.only(left: 16),
-            child: DropdownButtonFormField<KugouPlaylistBrief>(
-              initialValue: _selectedPlaylist,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.only(left: AppSpacing.lg),
+            // M3EDropdownMenu 没有 initialSelection 参数：初始选中值由
+            // M3EDropdownItem.selected 表达，每次 build 按 _selectedPlaylist 重建
+            child: M3EDropdownMenu<KugouPlaylistBrief>(
+              items: [
+                for (final p in _existingPlaylists)
+                  M3EDropdownItem(
+                    label: '${p.name}（${p.songCount}首）',
+                    value: p,
+                    selected: _selectedPlaylist == p,
+                  ),
+              ],
+              singleSelect: true,
+              // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+              showChipAnimation: false,
+              // 原为 OutlineInputBorder 表单字段：保持带描边、小圆角，
+              // 与本页「新歌单名称」输入框外观一致
+              fieldStyle: M3EDropdownFieldStyle(
+                hintText: '选择目标歌单',
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.md,
+                  vertical: AppSpacing.sm,
+                ),
+                backgroundColor: Colors.transparent,
+                border: BorderSide(color: cs.outline),
+                focusedBorder: BorderSide(color: cs.primary, width: 2),
+                borderRadius: AppRadius.xsAll,
               ),
-              items: _existingPlaylists
-                  .map(
-                    (p) => DropdownMenuItem(
-                      value: p,
-                      child: Text(
-                        '${p.name}（${p.songCount}首）',
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  )
-                  .toList(),
-              onChanged: (p) => setState(() => _selectedPlaylist = p),
+              onSelectionChanged: (selected) {
+                // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+                if (selected.isEmpty) {
+                  setState(() {});
+                  return;
+                }
+                final p = selected.first.value;
+                if (p == _selectedPlaylist) return;
+                setState(() => _selectedPlaylist = p);
+              },
             ),
           ),
-        const SizedBox(height: 24),
+        const Gap(AppSpacing.xl),
         FilledButton.icon(
           onPressed: _startImageImport,
           icon: const Icon(Icons.input),
@@ -595,18 +623,18 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
   Widget _buildWorkingPanel(ColorScheme cs) {
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const M3ELoadingIndicator(),
-            const SizedBox(height: 24),
+            const Gap(AppSpacing.xl),
             Text(
               _statusText,
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium,
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '云端识别可能需要一些时间，请勿关闭页面',
               textAlign: TextAlign.center,
@@ -623,7 +651,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
   Widget _buildSuccessPanel(ColorScheme cs) {
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -632,12 +660,12 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
               size: 72,
               color: cs.primary,
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '导入成功',
               style: Theme.of(context).textTheme.titleLarge,
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               _resultSongNames.isNotEmpty
                   ? '已导入 ${_resultSongNames.length} 首歌曲'
@@ -647,20 +675,20 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                   ),
             ),
             if (_resultSongNames.isNotEmpty) ...[
-              const SizedBox(height: 16),
+              const Gap(AppSpacing.lg),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 decoration: BoxDecoration(
                   color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: AppRadius.mdAll,
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     for (final n in _resultSongNames.take(8))
                       Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
                         child: Text(
                           n,
                           maxLines: 1,
@@ -670,7 +698,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                       ),
                     if (_resultSongNames.length > 8)
                       Padding(
-                        padding: const EdgeInsets.only(top: 2),
+                        padding: const EdgeInsets.only(top: AppSpacing.xxs),
                         child: Text(
                           '等共 ${_resultSongNames.length} 首',
                           style: Theme.of(context)
@@ -683,7 +711,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                 ),
               ),
             ],
-            const SizedBox(height: 24),
+            const Gap(AppSpacing.xl),
             FilledButton(
               onPressed: () => Navigator.pop(context, true),
               child: const Text('完成'),
@@ -697,17 +725,17 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
   Widget _buildFailurePanel(ColorScheme cs) {
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(Icons.error_outline, size: 72, color: cs.error),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '导入失败',
               style: Theme.of(context).textTheme.titleLarge,
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               _errorMsg ?? '未知错误',
               textAlign: TextAlign.center,
@@ -715,7 +743,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                     color: cs.onSurfaceVariant,
                   ),
             ),
-            const SizedBox(height: 24),
+            const Gap(AppSpacing.xl),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -723,7 +751,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                   onPressed: () => Navigator.pop(context),
                   child: const Text('返回'),
                 ),
-                const SizedBox(width: 12),
+                const Gap(AppSpacing.md),
                 FilledButton(
                   onPressed: () => setState(() {
                     _phase = _ImportPhase.idle;
@@ -754,7 +782,7 @@ class _ImageThumb extends StatelessWidget {
       clipBehavior: Clip.none,
       children: [
         ClipRRect(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: AppRadius.smAll,
           child: Image.file(
             File(file.path),
             width: 72,
@@ -778,7 +806,7 @@ class _ImageThumb extends StatelessWidget {
               customBorder: const CircleBorder(),
               onTap: onRemove,
               child: Padding(
-                padding: const EdgeInsets.all(4),
+                padding: const EdgeInsets.all(AppSpacing.xs),
                 child: Icon(
                   Icons.close,
                   size: 14,

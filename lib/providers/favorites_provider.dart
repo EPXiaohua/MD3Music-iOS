@@ -16,8 +16,8 @@ class FavoritesProvider extends ChangeNotifier {
   Set<String> get favoriteIds => _favoriteIds;
   bool get isLoading => _isLoading;
 
-  FavoritesProvider() {
-    loadFavorites();
+  FavoritesProvider({bool syncOnStart = true}) {
+    if (syncOnStart) loadFavorites();
   }
 
   Future<void> loadFavorites() async {

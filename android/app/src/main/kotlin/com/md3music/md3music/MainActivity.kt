@@ -3,14 +3,18 @@ package com.md3music.md3music
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PictureInPictureParams
+import android.content.ComponentName
 import android.content.Intent
+import android.content.Context
 import android.content.res.Configuration
+import android.content.pm.PackageManager
 import android.annotation.TargetApi
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -33,7 +37,6 @@ class MainActivity : FlutterActivity() {
     private val FONT_PICKER_CHANNEL = "com.md3music.md3music/font_picker"
     private val BACKGROUND_PICKER_CHANNEL = "com.md3music.md3music/background_picker"
     private val MEDIA_STORE_CHANNEL = "com.md3music.md3music/media_store"
-    private val HOME_WIDGET_CHANNEL = "com.md3music.md3music/home_widget"
     private val RECOGNITION_CHANNEL = "com.md3music.md3music/floating_recognition"
     private val PIP_CHANNEL = "com.md3music.md3music/pip"
     private val TASK_CHANNEL = "com.md3music.md3music/task"
@@ -46,7 +49,7 @@ class MainActivity : FlutterActivity() {
     // MV 画中画 channel：原生→Dart 回调 onPipModeChanged
     private var pipChannel: MethodChannel? = null
     // 首次帧监听只注册一次（引擎复用路径 configureFlutterEngine 会再次执行）
-    private var firstFrameListenerAttached = false
+    private var firstFrameListener: io.flutter.embedding.engine.renderer.FlutterUiDisplayListener? = null
 
     companion object {
         private const val FOLDER_PICKER_REQUEST_CODE = 9999
@@ -57,7 +60,7 @@ class MainActivity : FlutterActivity() {
         // 静态引用：让 Service 也能调用 MethodChannel（无 FlutterEngine 缓存时走这里）
         private var cachedEngine: FlutterEngine? = null
         private var cachedChannel: MethodChannel? = null
-        // KugouApiService 单例引用，便于 Activity onDestroy / onTrimMemory 时确定性关停
+        // KugouApiService 由应用进程持有。Activity 重建/退后台不能关停仍服务后台播放的 API。
         @Volatile private var kugouApiService: KugouApiService? = null
         // 频谱插件引用，Activity 销毁时释放 Visualizer
         @Volatile private var spectrumPlugin: SpectrumPlugin? = null
@@ -76,18 +79,58 @@ class MainActivity : FlutterActivity() {
         // UsbAudioPlugin 会注册两个拔插广播接收器（无法 unregister），导致 USB
         // 事件被处理两次；而新引擎（进程被杀后重建）仍需注册，故按引擎身份判断。
         private var customPluginsEngine: FlutterEngine? = null
+        @Volatile private var equalizerPlugin: EqualizerPlugin? = null
+        @Volatile private var usbAudioPlugin: UsbAudioPlugin? = null
+        @Volatile private var directPcmPlugin: DirectPcmPlugin? = null
+
+        /** Activity 与 headless 服务共用自定义播放插件，避免缺 handler 和重复USB接收器。 */
+        @Synchronized
+        internal fun registerPlaybackPlugins(context: Context, engine: FlutterEngine) {
+            if (customPluginsEngine === engine) return
+
+            runCatching { spectrumPlugin?.cleanup() }
+            runCatching { equalizerPlugin?.cleanup() }
+            runCatching { usbAudioPlugin?.cleanup() }
+            runCatching { directPcmPlugin?.cleanup() }
+            customPluginsEngine = engine
+
+            EqualizerPlugin().also {
+                it.register(engine)
+                equalizerPlugin = it
+            }
+            // 蝰蛇母带通道：将母带设置与十段均衡器增益发送到 just_audio 处理链。
+            ViperDspPlugin().register(engine)
+            spectrumPlugin = SpectrumPlugin().also { it.register(engine) }
+            UsbAudioPlugin(context).also {
+                it.register(engine)
+                usbAudioPlugin = it
+            }
+            // 系统 Direct PCM 档（走系统 AudioTrack 的 bit-perfect 路径，与 USB 独占互斥）
+            DirectPcmPlugin(context).also {
+                it.register(engine)
+                directPcmPlugin = it
+            }
+            ExternalEditorPlugin(context).register(engine)
+            DiagnosticLogPlugin().register(engine)
+            AutomixAnalysisPlugin().register(engine)
+        }
+
+        @Synchronized
+        internal fun unregisterPlaybackPlugins(engine: FlutterEngine) {
+            if (customPluginsEngine !== engine) return
+            runCatching { spectrumPlugin?.cleanup() }
+            runCatching { equalizerPlugin?.cleanup() }
+            runCatching { usbAudioPlugin?.cleanup() }
+            runCatching { directPcmPlugin?.cleanup() }
+            spectrumPlugin = null
+            equalizerPlugin = null
+            usbAudioPlugin = null
+            directPcmPlugin = null
+            customPluginsEngine = null
+        }
 
         fun setKugouApiService(service: KugouApiService?) {
             kugouApiService = service
-        }
-
-        /** Activity 销毁或被系统回收时调用，尽力通知本地 API 服务器停止监听 */
-        fun shutdownNodeJs() {
-            try {
-                kugouApiService?.stopServer()
-            } catch (_: Exception) {
-                // 进程即将销毁，吞掉异常
-            }
         }
 
         fun sendDesktopLyricAction(action: String) {
@@ -119,7 +162,13 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val createStartedAt = SystemClock.elapsedRealtime()
+        Log.i("StartupTiming", "phase=activity_on_create_enter elapsed_realtime_ms=$createStartedAt")
         super.onCreate(savedInstanceState)
+        Log.i(
+            "StartupTiming",
+            "phase=activity_on_create_super_complete elapsed_ms=${SystemClock.elapsedRealtime() - createStartedAt}",
+        )
         // 本次启动被看门狗判定自动回退（resolveUseImpeller 已在 super.onCreate 中结算）：
         // UI 尚未就绪，直接弹系统 Toast（不依赖 Flutter 渲染）。
         if (RenderEngineManager.fellBackToSkiaThisLaunch) {
@@ -226,34 +275,85 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /** 启用旧版或当前 launcher alias，并关闭另一个，避免桌面出现重复图标。 */
+    private fun setLegacyLauncherIcon(useLegacy: Boolean) {
+        val classPrefix = MainActivity::class.java.name.substringBeforeLast('.')
+        val modern = ComponentName(this, "$classPrefix.LauncherModernIcon")
+        val legacy = ComponentName(this, "$classPrefix.LauncherLegacyIcon")
+        val selected = if (useLegacy) legacy else modern
+        val disabled = if (useLegacy) modern else legacy
+        packageManager.setComponentEnabledSetting(
+            selected,
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+            PackageManager.DONT_KILL_APP,
+        )
+        packageManager.setComponentEnabledSetting(
+            disabled,
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+            PackageManager.DONT_KILL_APP,
+        )
+    }
+
     /// 复用后台（headless）FlutterEngine：线控耳机「唤醒播放」被拉起时，
     /// AudioPlaybackService 已创建并运行完整 App（main() 已执行、PlayerProvider
     /// 正在恢复播放状态）。此处返回缓存引擎，避免创建第二个 FlutterEngine 导致
     /// 双 Dart 隔离区 / 双音频会话冲突。引擎不可用时走默认逻辑新建。
     override fun provideFlutterEngine(context: android.content.Context): FlutterEngine? {
         val cached = FlutterEngineCache.getInstance().get("md3music_engine")
-        if (cached != null && cached.dartExecutor.isExecutingDart()) {
+        if (cached != null && cached.dartExecutor.isExecutingDart() && isFlutterJniAttached(cached)) {
             // 宿主引擎复用路径：configureFlutterEngine 不保证执行，显式补注册 Lyrico 编辑插件
             try { ExternalEditorPlugin(this).register(cached) } catch (_: Throwable) {}
             return cached
         }
+        if (cached != null) {
+            // 有些 Android 版本/任务移除时序会留下“Dart 仍报告运行、JNI 已 detach”的缓存壳；
+            // 复用后 FlutterView 首次布局会在 setViewportMetrics 崩溃。丢弃壳并走标准新引擎路径。
+            Log.w("MainActivity", "discarding cached FlutterEngine: Dart or FlutterJNI is no longer active")
+            if (FlutterEngineCache.getInstance().get("md3music_engine") === cached) {
+                FlutterEngineCache.getInstance().remove("md3music_engine")
+            }
+            if (cachedEngine === cached) cachedEngine = null
+        }
         return super.provideFlutterEngine(context)
     }
 
+    private fun isFlutterJniAttached(engine: FlutterEngine): Boolean = try {
+        // FlutterEngine 未公开 JNI attached 状态；以官方 embedding 的 FlutterJNI.isAttached 作防御性校验。
+        val field = FlutterEngine::class.java.getDeclaredField("flutterJNI")
+        field.isAccessible = true
+        (field.get(engine) as? io.flutter.embedding.engine.FlutterJNI)?.isAttached == true
+    } catch (error: Exception) {
+        Log.w("MainActivity", "unable to inspect cached FlutterJNI attachment", error)
+        false
+    }
+
+    // 引擎已交给进程缓存和播放服务持有；首个 Activity 也不能销毁它，
+    // 否则新 Activity 接管缓存引擎时会触发 Flutter 的所有权断言。
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        val configureStartedAt = SystemClock.elapsedRealtime()
+        Log.i("StartupTiming", "phase=configure_flutter_engine_enter elapsed_realtime_ms=$configureStartedAt")
         super.configureFlutterEngine(flutterEngine)
+        Log.i(
+            "StartupTiming",
+            "phase=configure_flutter_engine_super_complete elapsed_ms=${SystemClock.elapsedRealtime() - configureStartedAt}",
+        )
         // 首帧监听：Impeller 成功渲染首帧 → 清零启动失败计数（证明本次未崩溃）。
-        if (!firstFrameListenerAttached) {
-            firstFrameListenerAttached = true
-            flutterEngine.renderer.addIsDisplayingFlutterUiListener(
-                object : io.flutter.embedding.engine.renderer.FlutterUiDisplayListener {
-                    override fun onFlutterUiDisplayed() {
-                        RenderEngineManager.firstFrameConfirmed(this@MainActivity)
-                    }
-                    override fun onFlutterUiNoLongerDisplayed() {}
-                },
-            )
+        if (firstFrameListener == null) {
+            val listener = object : io.flutter.embedding.engine.renderer.FlutterUiDisplayListener {
+                override fun onFlutterUiDisplayed() {
+                    Log.i(
+                        "StartupTiming",
+                        "phase=flutter_ui_displayed elapsed_realtime_ms=${SystemClock.elapsedRealtime()}",
+                    )
+                    RenderEngineManager.firstFrameConfirmed(this@MainActivity)
+                }
+                override fun onFlutterUiNoLongerDisplayed() {}
+            }
+            firstFrameListener = listener
+            flutterEngine.renderer.addIsDisplayingFlutterUiListener(listener)
         }
 
         // 渲染引擎通道：设置页展示当前构建引擎（构建期 flavor 决定，运行时不可切换）
@@ -266,6 +366,45 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // 设置页切换当前启用的 launcher alias；DONT_KILL_APP 保证图标变更不打断播放。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.md3music.md3music/app_icon")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "setLegacyIcon" -> {
+                        val useLegacy = call.arguments as? Boolean
+                        if (useLegacy == null) {
+                            result.error("INVALID_ARGUMENT", "enabled 必须为布尔值", null)
+                        } else {
+                            runCatching { setLegacyLauncherIcon(useLegacy) }
+                                .onSuccess { result.success(null) }
+                                .onFailure {
+                                    result.error("ICON_SWITCH_FAILED", it.message, null)
+                                }
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // 3D 封面：Depth Anything V2 ORT 推理 + 3 层切割（背景/中景/前景，带 alpha）
+        // 3D 深度封面插件仅存在于 depth3d flavor（standard 包无此类、无 onnxruntime so）。
+        // 用反射注册保持 MainActivity 对两个 flavor 通用；找不到类时静默跳过。
+        // 注意：DepthCoverPlugin 是 Kotlin object，register 是实例方法——
+        // 必须先取 INSTANCE 再反射，直接在 Class 上 getDeclaredMethod 会 NoSuchMethodException。
+        runCatching {
+            val pluginClass = Class.forName("com.md3music.md3music.DepthCoverPlugin")
+            val pluginInstance = pluginClass.getDeclaredField("INSTANCE").get(null)
+            pluginInstance.javaClass
+                .getMethod(
+                    "register",
+                    android.app.Activity::class.java,
+                    io.flutter.plugin.common.BinaryMessenger::class.java,
+                )
+                .invoke(pluginInstance, this, flutterEngine.dartExecutor.binaryMessenger)
+        }.onFailure {
+            android.util.Log.w("DepthCover", "depth3d 插件注册失败：$it")
+        }
 
         // MD3Music fork（方向1）：前台 UI 引擎恢复启用媒体3会话（headless 引擎曾关闭），
         // 保证系统媒体会话始终=前台 UI 播放器。
@@ -282,34 +421,15 @@ class MainActivity : FlutterActivity() {
         // 将 FlutterEngine 传递给 AudioPlaybackService
         AudioPlaybackService.setFlutterEngine(flutterEngine)
 
-        // 自定义插件仅对同一引擎注册一次：引擎被复用（provideFlutterEngine 返回
-        // 缓存引擎）时 configureFlutterEngine 会再次执行，重复注册会注册两个
-        // USB 拔插广播接收器
-        if (customPluginsEngine !== flutterEngine) {
-            customPluginsEngine = flutterEngine
-
-            // 注册均衡器插件：Android 原生 Equalizer，绑定 just_audio 的 audio session ID
-            EqualizerPlugin().register(flutterEngine)
-
-            // 注册频谱可视化插件：Android 原生 Visualizer，回传 FFT 数据给 Dart 端绘制环形频谱
-            spectrumPlugin = SpectrumPlugin().also { it.register(flutterEngine) }
-
-            // 注册 USB 独占输出插件：MethodChannel + 动态拔插广播 + AudioSink 拦截桥接
-            UsbAudioPlugin(this).register(flutterEngine)
-
-            // 注册 Lyrico 外部编辑插件：本地歌曲经 FileProvider 交给 Lyrico 编辑
-            ExternalEditorPlugin(this).register(flutterEngine)
-
-            // 注册诊断日志插件：导出当前应用进程的 Android 原生日志
-            DiagnosticLogPlugin().register(flutterEngine)
-        }
+        registerPlaybackPlugins(applicationContext, flutterEngine)
 
         // 初始化本地 API 服务器（KugouApiService 含 JNI external 方法，
         // 如果 .so 的 JNI 符号名与当前包名不匹配，实例化可能触发类验证错误，
         // 这里包一层 try-catch，失败时 Dart 端会走 dart:ffi 兜底）。
         android.util.Log.d("MainActivity", "Initializing KugouApiService...")
         try {
-            val apiSvc = KugouApiService(this, flutterEngine)
+            // API 服务由进程级静态引用持有，必须使用 applicationContext，避免旋转/重建后泄漏 Activity。
+            val apiSvc = KugouApiService(applicationContext, flutterEngine)
             setKugouApiService(apiSvc)
             android.util.Log.d("MainActivity", "KugouApiService initialized")
         } catch (e: Throwable) {
@@ -474,6 +594,7 @@ class MainActivity : FlutterActivity() {
                             // media3 会话承载（不受影响），但封面注入依赖本服务前台启动——
                             // 直接调 AudioPlaybackService.injectCover 兜底注入封面到媒体3会话。
                             AudioPlaybackService.injectCover(
+                                this@MainActivity,
                                 call.argument<String>("songId") ?: "",
                                 call.argument<String>("title") ?: "",
                                 call.argument<String>("artist") ?: "",
@@ -685,6 +806,8 @@ class MainActivity : FlutterActivity() {
         AudioPlaybackService.registerLyriconChannel(flutterEngine)
         // 注册 SuperLyric MethodChannel，让 Dart 端能推送当前歌词行到 SuperLyric
         AudioPlaybackService.registerSuperLyricChannel(flutterEngine)
+        // 注册魅族 Flyme 状态栏歌词 MethodChannel（Dart 切行时推送当前歌词行）
+        FlymeLyricBridge.registerChannel(flutterEngine, applicationContext)
 
         // 注册文件夹选择器 MethodChannel
         val folderPickerChannel = MethodChannel(
@@ -833,44 +956,7 @@ class MainActivity : FlutterActivity() {
         }
 
         // 注册桌面小组件 MethodChannel：Flutter 侧推送播放状态到 AppWidget
-        val homeWidgetChannel = MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            HOME_WIDGET_CHANNEL
-        )
-        homeWidgetChannel.setMethodCallHandler { call, result ->
-            when (call.method) {
-                "updateWidget" -> {
-                    val title = call.argument<String>("title") ?: ""
-                    val artist = call.argument<String>("artist") ?: ""
-                    val isPlaying = call.argument<Boolean>("isPlaying") ?: false
-                    val position = call.argument<Number>("position")?.toLong() ?: 0L
-                    val duration = call.argument<Number>("duration")?.toLong() ?: 0L
-                    MusicWidgetProvider.updateAllWidgets(
-                        this, title, artist, isPlaying, position, duration
-                    )
-                    // 2×2 封面小部件：同一推送同步歌名/歌手/播放态（无进度条，忽略 position/duration）
-                    CoverPlayerWidgetProvider.updateAllWidgets(this, title, artist, isPlaying)
-                    result.success(true)
-                }
-                // 私人FM小部件：快照 Map 原样交给 Provider 拍平成广播 extras
-                "updateFmWidget" -> {
-                    @Suppress("UNCHECKED_CAST")
-                    val data = call.arguments as? Map<String, Any?> ?: emptyMap()
-                    PersonalFmWidgetProvider.updateAllWidgets(this, data)
-                    result.success(true)
-                }
-                // 音乐播放器小部件：仅推送主题色（文本走原生缓存）。
-                // 2×2 封面小部件共用同一套 color_* 协议作为封面取色失败的兜底。
-                "updateMusicWidgetTheme" -> {
-                    @Suppress("UNCHECKED_CAST")
-                    val colors = call.arguments as? Map<String, Number> ?: emptyMap()
-                    MusicWidgetProvider.updateTheme(this, colors)
-                    CoverPlayerWidgetProvider.updateTheme(this, colors)
-                    result.success(true)
-                }
-                else -> result.notImplemented()
-            }
-        }
+        HomeWidgetChannel.register(this, flutterEngine.dartExecutor.binaryMessenger)
 
         // 注册屏幕常亮 MethodChannel：Dart 端 WakelockService 调用，开关 FLAG_KEEP_SCREEN_ON
         val wakelockChannel = MethodChannel(
@@ -1196,18 +1282,26 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    override fun onDestroy() {
-        // Activity 销毁（含应用从最近任务划掉时系统先回调 onDestroy 再杀进程）
-        // 同步通知 Rust 服务器停止监听，释放端口
-        shutdownNodeJs()
-        // 释放频谱 Visualizer，避免 native 资源泄漏
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        // 引擎接管时先解绑旧 Activity，再绑定新 Activity。不能等旧 onDestroy
+        // 才清理共享引用，否则会把新 Activity 刚注册的通道一并清空。
+        if (isFinishing && !isChangingConfigurations &&
+            FlutterEngineCache.getInstance().get("md3music_engine") === flutterEngine
+        ) {
+            // 最近任务移除会结束当前媒体会话；不要把随后 detach 的 UI 引擎留在进程缓存，
+            // 否则用户重新打开时可能把已脱离 JNI 的引擎交给 FlutterView。
+            FlutterEngineCache.getInstance().remove("md3music_engine")
+            Log.i("MainActivity", "removed cached FlutterEngine after finishing activity")
+        }
+        firstFrameListener?.let { flutterEngine.renderer.removeIsDisplayingFlutterUiListener(it) }
+        firstFrameListener = null
+        // 释放 Visualizer，保留引擎插件引用，供后续 Activity 继续使用和清理。
         try { spectrumPlugin?.cleanup() } catch (_: Throwable) {}
-        spectrumPlugin = null
         cachedEngine = null
         cachedChannel = null
         recognitionChannel = null
         pipChannel = null
         pipVideoActive = false
-        super.onDestroy()
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 }

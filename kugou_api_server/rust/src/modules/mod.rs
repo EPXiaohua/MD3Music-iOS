@@ -20,6 +20,7 @@ pub mod extras;
 pub mod dycover;
 pub mod fm;
 pub mod get_model;
+pub mod home;
 pub mod images;
 pub mod import_playlist;
 pub mod ip;
@@ -56,7 +57,7 @@ pub mod yueku;
 pub struct Ctx {
     pub ip: String,
     /// 原始二进制请求体（octet-stream，如 /audio/match 的 PCM 数据）。
-    pub body_bytes: Option<Vec<u8>>,
+    pub body_bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Ctx {
@@ -145,6 +146,7 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/youth/union/vip", youth::handle_union_vip));
     routes.push(("/youth/user/song", youth::handle_user_song));
     routes.push(("/youth/vip", youth::handle_vip));
+    routes.push(("/home/discover", home::handle));
     routes.push(("/brush", extras::handle_brush));
     routes.push(("/everyday/style/recommend", everyday::handle_style_recommend));
     routes.push(("/everyday/recommend", everyday::handle_recommend));
@@ -187,6 +189,7 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     // 写接口：必须排在 /comment/floor、/comment/playlist、/comment/album、/comment/music
     // 之前——prefix_match 是路径段前缀匹配，短前缀先命中会把 POST 当查询接口转发。
     routes.push(("/comment/music/send", comment_send::handle_music_send));
+    routes.push(("/comment/music/del", comment_send::handle_music_del));
     routes.push(("/comment/floor/send", comment_send::handle_floor_send));
     routes.push(("/comment/playlist/send", comment_send::handle_playlist_send));
     routes.push(("/comment/album/send", comment_send::handle_album_send));

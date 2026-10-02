@@ -82,7 +82,10 @@ void main() {
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       // 再切回 inactive
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       expect(renderer.targetAlpha, closeTo(0.2, 1e-9));
       expect(renderer.isActive, isFalse);
     });
@@ -95,7 +98,10 @@ void main() {
       }
       // 切回 inactive 并 tick（RELEASE 速度较慢，多 tick 一些）
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       for (int i = 0; i < 300; i++) {
         renderer.tick(0.016);
       }
@@ -115,7 +121,10 @@ void main() {
 
       // 变暗到 0.2
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       for (int i = 0; i < 500; i++) {
         renderer.tick(0.016);
       }
@@ -169,15 +178,17 @@ void main() {
 
       // 测量变暗所需 tick 数：从 1.0 到 closeTo(0.2, 0.01)
       final downRenderer = LineRenderer();
-      downRenderer.setLineState(
-          isActive: true, scale: LyricLayout.activeScale);
+      downRenderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       // 先让 alpha 充分变亮到 1.0
       for (int i = 0; i < 500; i++) {
         downRenderer.tick(0.016);
       }
       // 切到 inactive 开始计时
       downRenderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       int downTicks = 0;
       while ((downRenderer.currentAlpha - 0.2).abs() >= 0.01) {
         downRenderer.tick(0.016);
@@ -202,13 +213,15 @@ void main() {
 
       // 变暗：5 帧（从充分变亮的 1.0 开始）
       final downRenderer = LineRenderer();
-      downRenderer.setLineState(
-          isActive: true, scale: LyricLayout.activeScale);
+      downRenderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       for (int i = 0; i < 500; i++) {
         downRenderer.tick(0.016);
       }
       downRenderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       for (int i = 0; i < 5; i++) {
         downRenderer.tick(0.016);
       }
@@ -262,7 +275,10 @@ void main() {
 
     test('非当前行绘制不崩溃', () {
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
     });
 
@@ -304,7 +320,10 @@ void main() {
 
     test('整行 alpha 在 inactive 时保持 0.2（SOLID 暗态）', () {
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       // 即使 tick，alpha 仍保持 0.2（目标也是 0.2，无变化）
       for (int i = 0; i < 100; i++) {
         renderer.tick(0.016);
@@ -314,14 +333,22 @@ void main() {
 
     test('scale 参数影响 alpha 计算（与 WordRenderer 公式一致）', () {
       // isActive=true，scale 不同 → dynamicBrightAlpha 不同
-      // factor = clamp01((scale - 0.97) / 0.03)
+      // factor = clamp01((scale - inactiveScale) / (activeScale - inactiveScale))
       // dynamicBrightAlpha = factor * 0.8 + 0.2
       final r1 = LineRenderer()
-        ..setLineState(isActive: true, scale: LyricLayout.activeScale); // factor=1 → 1.0
+        ..setLineState(
+          isActive: true,
+          scale: LyricLayout.activeScale,
+        ); // factor=1 → 1.0
       final r2 = LineRenderer()
-        ..setLineState(isActive: true, scale: LyricLayout.inactiveScale); // factor=0 → 0.2
+        ..setLineState(
+          isActive: true,
+          scale: LyricLayout.inactiveScale,
+        ); // factor=0 → 0.2
+      final midScale =
+          (LyricLayout.inactiveScale + LyricLayout.activeScale) / 2;
       final r3 = LineRenderer()
-        ..setLineState(isActive: true, scale: 0.985); // factor=0.5 → 0.6
+        ..setLineState(isActive: true, scale: midScale); // factor=0.5 → 0.6
 
       for (int i = 0; i < 100; i++) {
         r1.tick(0.016);
@@ -330,9 +357,9 @@ void main() {
       }
       // r1: scale=1.0 → dynamicBright=1.0
       expect(r1.currentAlpha, closeTo(1.0, 0.01));
-      // r2: scale=0.97 → dynamicBright=0.2
+      // r2: inactiveScale → dynamicBright=0.2
       expect(r2.currentAlpha, closeTo(0.2, 0.01));
-      // r3: scale=0.985 → dynamicBright=0.6
+      // r3: 两档 scale 中点 → dynamicBright=0.6
       expect(r3.currentAlpha, closeTo(0.6, 0.01));
     });
   });
@@ -353,20 +380,21 @@ void main() {
       renderer.paintLine(canvas, ui.Offset.zero, longLine, 15, maxWidth: 60);
       final ys = canvas.drawParagraphOffsets.map((o) => o.dy).toList();
       // 确认确实换行成多行
-      expect(ys.length, greaterThanOrEqualTo(3),
-          reason: '长文本在窄视口下应自动换行为多行');
+      expect(ys.length, greaterThanOrEqualTo(3), reason: '长文本在窄视口下应自动换行为多行');
       final double mainLineHeight = 15 * LyricLayout.lineHeight;
       final double wrapLineHeight =
           mainLineHeight * LyricLayout.wrapLineHeightFactor;
       // 第 1 行（主行）：完整行高，从 offset.dy=0 开始
       expect(ys[0], closeTo(0, 1e-6));
       // 第 2 行：从主行底开始（不再是 0.8x 处，避免与主行行盒重叠）
-      expect(ys[1], closeTo(mainLineHeight, 1e-6),
-          reason: '第 2 行应从主行底部开始');
+      expect(ys[1], closeTo(mainLineHeight, 1e-6), reason: '第 2 行应从主行底部开始');
       // 第 3 行：再 +0.8x 行高（换行行之间紧凑但不重叠）
       if (ys.length > 2) {
-        expect(ys[2], closeTo(mainLineHeight + wrapLineHeight, 1e-6),
-            reason: '第 3 行应在第 2 行基础上加 0.8x 行高');
+        expect(
+          ys[2],
+          closeTo(mainLineHeight + wrapLineHeight, 1e-6),
+          reason: '第 3 行应在第 2 行基础上加 0.8x 行高',
+        );
       }
     });
 
@@ -397,15 +425,20 @@ void main() {
       final ys = canvas.drawParagraphOffsets.map((o) => o.dy).toList();
       // 逐 word 拼接行（word 累加），与 _wordAccumulateRowStarts 相同的逻辑：
       // 每行文本在窄宽度下拆行，断言行数 >= 2 且第 2 行从主行底开始
-      expect(ys.length, greaterThanOrEqualTo(2),
-          reason: 'KRC 长行应自动换行为多行');
+      expect(ys.length, greaterThanOrEqualTo(2), reason: 'KRC 长行应自动换行为多行');
       final double mainLineHeight = 15 * LyricLayout.lineHeight;
-      expect(ys[1], closeTo(mainLineHeight, 1e-6),
-          reason: 'KRC 行第 2 行也应从主行底开始');
+      expect(
+        ys[1],
+        closeTo(mainLineHeight, 1e-6),
+        reason: 'KRC 行第 2 行也应从主行底开始',
+      );
       // 关键断言：与 WordRenderer 当前行行数一致（此处用 word 累加行数直接断言）
       final int wordRows = _wordAccumulateForTest(krcLine, 15, 90);
-      expect(ys.length, wordRows,
-          reason: 'LineRenderer 非当前行行数必须等于 word 累加行数（当前行/测量）');
+      expect(
+        ys.length,
+        wordRows,
+        reason: 'LineRenderer 非当前行行数必须等于 word 累加行数（当前行/测量）',
+      );
     });
   });
 
@@ -415,10 +448,11 @@ void main() {
     LineRenderer createConvergedHidden() {
       final r = LineRenderer()
         ..setLineState(
-            isActive: false,
-            scale: LyricLayout.inactiveScale,
-            blurFade: 1.0,
-            blurActive: true);
+          isActive: false,
+          scale: LyricLayout.inactiveScale,
+          blurFade: 1.0,
+          blurActive: true,
+        );
       // 收敛到"非当前行 + 高斯模糊全开"的不可见稳态（alpha 目标 0）
       for (int i = 0; i < 300; i++) {
         r.tick(0.016);
@@ -440,10 +474,11 @@ void main() {
       r.beginExitFadeFrom(0.8);
       // 同样的输入：若输入缓存未作废会早退，_targetAlpha 停在 0.2
       r.setLineState(
-          isActive: false,
-          scale: LyricLayout.inactiveScale,
-          blurFade: 1.0,
-          blurActive: true);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurFade: 1.0,
+        blurActive: true,
+      );
       expect(r.targetAlpha, closeTo(0, 1e-9));
     });
 
@@ -451,10 +486,11 @@ void main() {
       final r = createConvergedHidden();
       r.beginExitFadeFrom(0.8);
       r.setLineState(
-          isActive: false,
-          scale: LyricLayout.inactiveScale,
-          blurFade: 1.0,
-          blurActive: true);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurFade: 1.0,
+        blurActive: true,
+      );
       // 0.3s ≈ 19 帧：rate=6.7 → 0.8×e^-2.01 ≈ 0.108
       // 旧值 rate=18 时同一时刻只剩 0.0037，会被本断言挡住
       for (int i = 0; i < 19; i++) {
@@ -468,10 +504,11 @@ void main() {
       final r = createConvergedHidden();
       r.beginExitFadeFrom(0.8);
       r.setLineState(
-          isActive: false,
-          scale: LyricLayout.inactiveScale,
-          blurFade: 1.0,
-          blurActive: true);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurFade: 1.0,
+        blurActive: true,
+      );
       // 1.0s ≈ 63 帧：rate=6.7 → 0.8×e^-6.7 ≈ 0.00094 < alphaEpsilon(0.001)
       // → 吸附到 0、_isExitFading 清除
       for (int i = 0; i < 63; i++) {
@@ -490,10 +527,11 @@ void main() {
       final r = createConvergedHidden();
       r.beginExitFadeFrom(0.8);
       r.setLineState(
-          isActive: false,
-          scale: LyricLayout.inactiveScale,
-          blurFade: 1.0,
-          blurActive: true);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurFade: 1.0,
+        blurActive: true,
+      );
       for (int i = 0; i < 400; i++) {
         r.tick(0.016);
       }
@@ -517,8 +555,7 @@ void main() {
     /// 副行文字块高度 = 视觉行数 × 副行字号 × 副行行高（与渲染器口径一致）。
     double sublineHeight() {
       const double fontSize = 20;
-      final int rows =
-          LyricLayout.measureAuxRows('译文', fontSize, 200);
+      final int rows = LyricLayout.measureAuxRows('译文', fontSize, 200);
       return rows *
           LyricLayout.translationFontSize(fontSize) *
           LyricLayout.translationLineHeight;
@@ -530,11 +567,16 @@ void main() {
       renderer.translationFade = 1.0;
       renderer.translationExiting = false;
       final canvas = RecordingCanvas();
-      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
-          maxWidth: 200, viewportWidth: 200);
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        lineWithTrans,
+        20,
+        maxWidth: 200,
+        viewportWidth: 200,
+      );
       expect(canvas.transforms, isEmpty, reason: '就位副行走直绘路径，零变换开销');
-      expect(canvas.drawParagraphOffsets.length, 2,
-          reason: '主行 1 次 + 副行 1 次');
+      expect(canvas.drawParagraphOffsets.length, 2, reason: '主行 1 次 + 副行 1 次');
     });
 
     test('入场中途绕副行底边翻转（锚线不动、方向为负）', () {
@@ -543,8 +585,14 @@ void main() {
       renderer.translationFade = 0.5;
       renderer.translationExiting = false;
       final canvas = RecordingCanvas();
-      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
-          maxWidth: 200, viewportWidth: 200);
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        lineWithTrans,
+        20,
+        maxWidth: 200,
+        viewportWidth: 200,
+      );
       expect(canvas.transforms, hasLength(1), reason: '翻转中恰好施加 1 次变换');
 
       final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
@@ -559,23 +607,37 @@ void main() {
         exiting: false,
       );
       final double anchorY = anchor.dy;
-      expect(anchorY, closeTo(subOffset.dy + sublineHeight(), 1e-6),
-          reason: '入场锚线 = 副行底边');
-      final ui.Offset fixed =
-          MatrixUtils.transformPoint(m, ui.Offset(123, anchorY));
+      expect(
+        anchorY,
+        closeTo(subOffset.dy + sublineHeight(), 1e-6),
+        reason: '入场锚线 = 副行底边',
+      );
+      final ui.Offset fixed = MatrixUtils.transformPoint(
+        m,
+        ui.Offset(123, anchorY),
+      );
       expect(fixed.dx, closeTo(123, 1e-6));
       expect(fixed.dy, closeTo(anchorY, 1e-6), reason: '锚线是不动点');
     });
 
     test('出场绕副行顶边翻转，且压缩方向与入场相反', () {
       renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
       renderer.translationExpand = 0.5;
       renderer.translationFade = 0.5;
       renderer.translationExiting = true;
       final canvas = RecordingCanvas();
-      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
-          maxWidth: 200, viewportWidth: 200);
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        lineWithTrans,
+        20,
+        maxWidth: 200,
+        viewportWidth: 200,
+      );
       expect(canvas.transforms, hasLength(1));
 
       final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
@@ -589,18 +651,25 @@ void main() {
       );
       final double anchorY = anchor.dy;
       expect(anchorY, closeTo(subOffset.dy, 1e-6), reason: '出场锚线 = 副行顶边');
-      final ui.Offset fixed =
-          MatrixUtils.transformPoint(m, ui.Offset(0, anchorY));
+      final ui.Offset fixed = MatrixUtils.transformPoint(
+        m,
+        ui.Offset(0, anchorY),
+      );
       expect(fixed.dy, closeTo(anchorY, 1e-6));
 
       // 锚线下方 d 处的点必须向锚线（上方）压缩：expand=0.5 的出场转角为
       // 63.6°（cos 0.44），12px 离轴点压缩约 6.7px，取 0.5px 下限即可区分
       // 「向锚线压缩」与「不动 / 外扩」。
       const double d = 12;
-      final ui.Offset below =
-          MatrixUtils.transformPoint(m, ui.Offset(0, anchorY + d));
-      expect(anchorY + d - below.dy, greaterThan(0.5),
-          reason: '出场副行向顶边压缩（向上翻走）');
+      final ui.Offset below = MatrixUtils.transformPoint(
+        m,
+        ui.Offset(0, anchorY + d),
+      );
+      expect(
+        anchorY + d - below.dy,
+        greaterThan(0.5),
+        reason: '出场副行向顶边压缩（向上翻走）',
+      );
     });
   });
 }
@@ -613,8 +682,7 @@ int _wordAccumulateForTest(LyricLine line, double fontSize, double maxWidth) {
     final tp = TextPainter(
       text: TextSpan(
         text: w.text,
-        style: TextStyle(
-            fontSize: fontSize, height: LyricLayout.lineHeight),
+        style: TextStyle(fontSize: fontSize, height: LyricLayout.lineHeight),
       ),
       textDirection: TextDirection.ltr,
     )..layout();

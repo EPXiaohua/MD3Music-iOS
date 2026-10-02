@@ -6,6 +6,7 @@
 //! - `module/comment_floor_send.js`     → `/comment/floor/send`
 //! - `module/comment_playlist_send.js`  → `/comment/playlist/send`
 //! - `module/comment_album_send.js`     → `/comment/album/send`
+//! - `module/comment_music_del.js`      → `/comment/music/del`（删除，歌曲/专辑/歌单共用）
 //!
 //! 与读取侧（`comment_music.rs` / `comment_more.rs` 走明文 lite 路径）不同：
 //! 写侧统一走评论服务 `/index.php` + `x-router: m.comment.service.kugou.com`，
@@ -283,6 +284,34 @@ pub fn reply_options(
         .cookie(q_cookie(q))
 }
 
+/// JS `buildCommentDelConfig` → `r=commentsv2/delcomment`（删除评论，GET 无请求体）。
+///
+/// 与 `reply_options` 的差别只有 `r` 与参数集合（`cid`/`tid` 代替 content/is_t/pid），
+/// `key` 算法完全一致（`signParamsKey(clienttime+mid)`），因此复用 `auth_params`。
+pub fn del_options(q: &Value, cid: &str, children_id: &str, code: &str, tid: &str) -> RequestOptions {
+    let id = identity(q);
+    let key = sign_params_key(&format!("{}{}", id.clienttime, id.mid), "", "");
+
+    let mut params = compact_map(vec![
+        ("r", json!("commentsv2/delcomment")),
+        ("code", json!(code)),
+        ("childrenid", json!(children_id)),
+        ("cid", json!(cid)),
+        ("tid", json!(tid)),
+    ]);
+    for (k, v) in auth_params(&id, &key) {
+        params.insert(k.to_string(), v);
+    }
+
+    RequestOptions::new(COMMENT_URL)
+        .get(COMMENT_URL)
+        .params(Value::Object(params))
+        .header("x-router", COMMENT_ROUTER)
+        .clear_default_params(true)
+        .not_signature(true)
+        .cookie(q_cookie(q))
+}
+
 // ---------------------------------------------------------------------------
 // 资源解析
 // ---------------------------------------------------------------------------
@@ -415,6 +444,45 @@ pub fn handle_music_send(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleR
     let opts = send_options(q, &content, &special_id, &name, SONG_CODE, &mixsongid);
     let result = ctx.send(&opts);
     log_send("music", SONG_CODE, &special_id, &result);
+    result
+}
+
+/// comment_music_del.js → /comment/music/del（删除评论，歌曲/专辑/歌单共用）。
+///
+/// [cid] 为评论列表返回的评论 id；`special_id` 必须取列表项的 `special_child_id`
+/// （**不要**用发送评论响应里的 `special_id`）；只传 mixsongid 时服务端先查一次
+/// 歌曲评论自动反查，最可靠。删楼中楼回复时 [tid]（所属顶层评论 id）必传。
+pub fn handle_music_del(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+    let cid = first_param(q, &["cid", "comment_id"]);
+    if cid.is_empty() {
+        return Err(bad_request("cid（评论 ID）不能为空，可从评论列表接口获取"));
+    }
+
+    let mixsongid = first_param(q, &["mixsongid", "album_audio_id"]);
+    let mut special_id = first_param(q, &["special_id", "childrenid"]);
+
+    // 仅传 mixsongid 时先查一次歌曲评论，自动解析 special_id（与 handle_music_send 同策略）
+    if special_id.is_empty() && !mixsongid.is_empty() {
+        let lookup = with_overrides(
+            q,
+            &[
+                ("mixsongid", json!(mixsongid)),
+                ("page", json!(1)),
+                ("pagesize", json!(1)),
+            ],
+        );
+        special_id = extract_resolved_resource(&lookup_body(super::comment_music::handle(&lookup, ctx))).0;
+    }
+
+    if special_id.is_empty() {
+        return Err(bad_request("无法解析评论资源 special_id，请传入 special_id 或 mixsongid"));
+    }
+
+    let code = resolve_code(q);
+    let tid = first_param(q, &["tid"]);
+    let opts = del_options(q, &cid, &special_id, &code, &tid);
+    let result = ctx.send(&opts);
+    log_send("del", &code, &special_id, &result);
     result
 }
 

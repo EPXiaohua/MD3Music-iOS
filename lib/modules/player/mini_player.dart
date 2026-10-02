@@ -16,6 +16,7 @@ import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/car_mode_provider.dart';
 import '../../widgets/smart_artwork_image.dart';
+import '../../widgets/playback_status_feedback.dart';
 import 'full_player_route.dart';
 
 /// 全局开关：MiniPlayer 是否支持水平滑动切歌（设置页可切换，默认开启）。
@@ -401,9 +402,10 @@ class _MiniPlayerState extends State<MiniPlayer>
     }
 
     // 车机模式：播放器常驻在侧边面板里，任何界面都不再显示 MiniPlayer。
-    // 判定用 enabled 而不是 panelVisible —— 设置页 / 登录页虽然不显示面板，
+    // 判定用 active 而不是 panelVisible —— 设置页 / 登录页虽然不显示面板，
     // 但同样不该出现迷你条，否则「开了车机模式还有迷你条」前后不一致。
-    if (context.watch<CarModeProvider>().enabled) {
+    // active 含自动检测：命中车机屏也静音 MiniPlayer。
+    if (context.watch<CarModeProvider>().active) {
       return const SizedBox.shrink();
     }
 
@@ -575,6 +577,7 @@ class _MiniPlayerState extends State<MiniPlayer>
                 );
               },
             ),
+            const PlaybackStatusFeedback(),
             Padding(
               // 左右内边距在「自身即屏幕最底部」时按圆角反解值加宽
               //（本机 R=58 / 底部 20dp → 15dp），有导航栏时为 4dp。
@@ -679,22 +682,6 @@ class _MiniPlayerState extends State<MiniPlayer>
                   // —— 固定区：右侧按钮不参与滑动 ——
                   IconButton(
                     visualDensity: VisualDensity.compact,
-                    icon: Icon(
-                      playerProvider.isPlaying
-                          ? Icons.pause
-                          : Icons.play_arrow,
-                    ),
-                    onPressed: () {
-                      AppHaptics.click();
-                      if (playerProvider.isPlaying) {
-                        playerProvider.pause();
-                      } else {
-                        playerProvider.resume();
-                      }
-                    },
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
                     tooltip: DesktopLyricService.instance.enabled
                         ? '关闭桌面歌词'
                         : '开启桌面歌词',
@@ -734,6 +721,22 @@ class _MiniPlayerState extends State<MiniPlayer>
                               DesktopLyricService.instance.enabled,
                           isFavorited: isFavorited,
                         );
+                      }
+                    },
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(
+                      playerProvider.isPlaying
+                          ? Icons.pause
+                          : Icons.play_arrow,
+                    ),
+                    onPressed: () {
+                      AppHaptics.click();
+                      if (playerProvider.isPlaying) {
+                        playerProvider.pause();
+                      } else {
+                        playerProvider.resume();
                       }
                     },
                   ),

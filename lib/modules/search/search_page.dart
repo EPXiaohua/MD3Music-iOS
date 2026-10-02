@@ -1,5 +1,6 @@
 import 'dart:ui' as ui;
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/widgets.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,6 +9,8 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../providers/kugou_provider.dart';
+import '../../core/layout/adaptive_content_grid.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/widgets/app_background.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/player_provider.dart';
@@ -19,15 +22,14 @@ import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../playlist/playlist_page.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
+import 'explore_sections.dart';
 
 class SearchPage extends StatefulWidget {
-  /// 是否在页面底部显示 MiniPlayer。
-  /// 作为独立路由打开时为 true（页面自带 MiniPlayer）；
-  /// 作为主页 Tab 显示时为 false（由 _MainLayout 统一提供全局 MiniPlayer，避免重复）。
-  final bool showMiniPlayer;
+  /// 打开时预填并立即执行的查询（桌面顶部工具栏搜索框提交时传入，见计划 4.3）。
+  final String? initialQuery;
 
-  const SearchPage({super.key, this.showMiniPlayer = true});
+  const SearchPage({super.key, this.initialQuery});
 
   @override
   State<SearchPage> createState() => _SearchPageState();
@@ -58,9 +60,14 @@ class _SearchPageState extends State<SearchPage>
     _tabController = TabController(length: 6, vsync: this);
     _tabController.addListener(_onTabChanged);
     _loadSearchHistory();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadHotSearch();
-    });
+    // 桌面工具栏搜索框提交：预填查询并在首帧后立即执行搜索。
+    final q = widget.initialQuery?.trim() ?? '';
+    if (q.isNotEmpty) {
+      _searchController.text = q;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _performSearch(q);
+      });
+    }
   }
 
   @override
@@ -91,11 +98,6 @@ class _SearchPageState extends State<SearchPage>
         _performSearchByType(_query, newType);
       }
     }
-  }
-
-  Future<void> _loadHotSearch() async {
-    final kugouProvider = context.read<KugouProvider>();
-    await kugouProvider.getHotSearch();
   }
 
   Future<void> _loadSearchHistory() async {
@@ -165,21 +167,19 @@ class _SearchPageState extends State<SearchPage>
     }
 
     return Scaffold(
-      body: Column(
-        children: [
-          Expanded(
-            child: NestedScrollView(
-              headerSliverBuilder: (context, innerBoxIsScrolled) {
-                return [
-                  SliverAppBar(
-                    floating: true,
-                    pinned: true,
-                    // 有壁纸时顶栏全透明，flexibleSpace 独立加载同一张背景图
-                    // （topCenter 对齐与页面主体背景视觉连续）；列表滚到顶栏下时
-                    // 被这张背景图盖住（不透底下 UI）；无壁纸时不透明 surface
-                    backgroundColor: useBackgroundImage
-                        ? Colors.transparent
-                        : colorScheme.surface,
+      body: SecondaryMiniPlayerHost(
+        child: NestedScrollView(
+          headerSliverBuilder: (context, innerBoxIsScrolled) {
+            return [
+              SliverAppBar(
+                floating: true,
+                pinned: true,
+                // 有壁纸时顶栏全透明，flexibleSpace 独立加载同一张背景图
+                // （topCenter 对齐与页面主体背景视觉连续）；列表滚到顶栏下时
+                // 被这张背景图盖住（不透底下 UI）；无壁纸时不透明 surface
+                backgroundColor: useBackgroundImage
+                    ? Colors.transparent
+                    : colorScheme.surface,
                     flexibleSpace: useBackgroundImage
                         ? ClipRect(
                             child: Builder(builder: (context) {
@@ -275,7 +275,7 @@ class _SearchPageState extends State<SearchPage>
                             borderSide: BorderSide.none,
                           ),
                           contentPadding: const EdgeInsets.symmetric(
-                            vertical: 0,
+                            vertical: AppSpacing.none,
                           ),
                           isDense: true,
                         ),
@@ -321,92 +321,52 @@ class _SearchPageState extends State<SearchPage>
                   ? _buildSuggestions()
                   : _buildEmptyState(),
             ),
-          ),
-          if (widget.showMiniPlayer) const MiniPlayer(),
-        ],
       ),
     );
   }
 
   Widget _buildEmptyState() {
-    final colorScheme = Theme.of(context).colorScheme;
-    final kugouProvider = context.watch<KugouProvider>();
-    final hotKeywords = kugouProvider.hotSearchKeywords;
-
-    if (_searchHistory.isEmpty && hotKeywords.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              Icons.search,
-              size: 64,
-              color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              '搜索你喜欢的音乐',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                color: colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
+    // 未输入关键词：搜索历史 + 音乐探索（从发现页迁移的内容模块）。
+    // 已移除「热门搜索」及其自动网络请求。
     return ListView(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
       children: [
         if (_searchHistory.isNotEmpty) ...[
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('搜索历史', style: Theme.of(context).textTheme.titleLarge),
-              TextButton(
-                onPressed: _clearSearchHistory,
-                child: const Text('清空'),
-              ),
-            ],
+          Padding(
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, 0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('搜索历史', style: Theme.of(context).textTheme.titleMedium),
+                TextButton(
+                  onPressed: _clearSearchHistory,
+                  child: const Text('清空'),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: _searchHistory.map((history) {
-              return ActionChip(
-                label: Text(history),
-                onPressed: () {
-                  _searchController.text = history;
-                  _performSearch(history);
-                },
-              );
-            }).toList(),
-          ),
-          const SizedBox(height: 16),
-        ],
-        if (hotKeywords.isNotEmpty) ...[
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('热门搜索', style: Theme.of(context).textTheme.titleMedium),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: hotKeywords.take(15).map((keyword) {
-              return ActionChip(
-                label: Text(keyword),
-                onPressed: () {
-                  _searchController.text = keyword;
-                  _performSearch(keyword);
-                },
-              );
-            }).toList(),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _searchHistory.map((history) {
+                return ActionChip(
+                  label: Text(history),
+                  onPressed: () {
+                    _searchController.text = history;
+                    _performSearch(history);
+                  },
+                );
+              }).toList(),
+            ),
           ),
         ],
+        // 搜索历史与下方「音乐探索」之间加大间距，形成明显分段（见改版计划补充三）。
+        if (_searchHistory.isNotEmpty) const Gap(AppSpacing.lg),
+        // 音乐探索：主题歌单 / 场景音乐 / 热门歌单 / 排行榜 / 新碟上架，
+        // 复用 KugouProvider 已有数据与缓存（内部数据为空时自动补拉）。
+        const MusicExploreSections(),
       ],
     );
   }
@@ -435,7 +395,7 @@ class _SearchPageState extends State<SearchPage>
     }
 
     return ListView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
       itemCount: suggestions.length,
       itemBuilder: (context, index) {
         final suggestion = suggestions[index];
@@ -449,6 +409,7 @@ class _SearchPageState extends State<SearchPage>
           dense: true,
           onTap: () {
             _searchController.text = suggestion;
+            FocusManager.instance.primaryFocus?.unfocus();
             _performSearch(suggestion);
           },
         );
@@ -499,6 +460,8 @@ class _SearchPageState extends State<SearchPage>
               itemBuilder: (context, index) {
                 return SongListItem(
                   song: results[index],
+                  showDuration: false,
+                  trailingActions: SongTrailingActions.detailAndMv,
                   onTap: () {
                     context.read<PlayerProvider>().playOnlinePlaylist(
                       results,
@@ -512,7 +475,7 @@ class _SearchPageState extends State<SearchPage>
           ),
           if (kugouProvider.isLoading)
             const Padding(
-              padding: EdgeInsets.all(12),
+              padding: EdgeInsets.all(AppSpacing.md),
               child: M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24)),
             ),
         ],
@@ -555,26 +518,44 @@ class _SearchPageState extends State<SearchPage>
         children: [
           Expanded(
             child: ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               itemCount: results.length,
               itemBuilder: (context, index) {
                 final detail = results[index];
-                return _LyricSearchResultItem(
-                  song: detail.toSong(),
-                  lyricSnippet: detail.lyrics ?? '',
+                final snippet = detail.lyrics ?? '';
+                final song = detail.toSong();
+                final cs = Theme.of(context).colorScheme;
+                final tt = Theme.of(context).textTheme;
+                return SongListItem(
+                  song: song,
+                  showDuration: false,
+                  trailingActions: SongTrailingActions.detailAndMv,
+                  // 保留命中的歌词片段作为副标题（primary 强调）。
+                  subtitleOverride: Text(
+                    snippet.isNotEmpty ? snippet : song.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: tt.labelSmall?.copyWith(
+                      color: snippet.isNotEmpty
+                          ? cs.primary.withValues(alpha: 0.85)
+                          : cs.onSurfaceVariant,
+                    ),
+                  ),
                   onTap: () {
-                    final songs = results
-                        .map((e) => e.toSong())
-                        .toList();
-                    context.read<PlayerProvider>().playOnlinePlaylist(songs, index);
+                    final songs = results.map((e) => e.toSong()).toList();
+                    context.read<PlayerProvider>().playOnlinePlaylist(
+                      songs,
+                      index,
+                    );
                   },
+                  onMoreTap: () {},
                 );
               },
             ),
           ),
           if (kugouProvider.isLoading)
             const Padding(
-              padding: EdgeInsets.all(12),
+              padding: EdgeInsets.all(AppSpacing.md),
               child: M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24)),
             ),
         ],
@@ -629,7 +610,7 @@ class _SearchPageState extends State<SearchPage>
             // 用 PinchableGridView 替代固定 2 列的 GridView，
             // Pad 模式下可双指捏合动态调整列数，非 Pad 模式仍固定 2 列
             child: PinchableGridView(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               // 原 childAspectRatio 0.75、spacing 12 保持不变
               childAspectRatio: 0.75,
               spacing: 12,
@@ -653,7 +634,7 @@ class _SearchPageState extends State<SearchPage>
           ),
           if (kugouProvider.isLoading)
             const Padding(
-              padding: EdgeInsets.all(12),
+              padding: EdgeInsets.all(AppSpacing.md),
               child: M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24)),
             ),
         ],
@@ -707,8 +688,14 @@ class _SearchPageState extends State<SearchPage>
       child: Column(
         children: [
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            // 歌手是卡片类结果：手机竖屏（<600）单列，变宽后铺成多列横向卡片（计划 ⑥）。
+            child: AdaptiveContentGrid(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+              targetExtent: 380,
+              childAspectRatio: 3.5,
+              spacing: AppSpacing.sm,
+              minColumns: 2,
+              maxColumns: 3,
               itemCount: results.length,
               itemBuilder: (context, index) {
                 final artist = results[index];
@@ -741,7 +728,7 @@ class _SearchPageState extends State<SearchPage>
           ),
           if (kugouProvider.isLoading)
             const Padding(
-              padding: EdgeInsets.all(12),
+              padding: EdgeInsets.all(AppSpacing.md),
               child: M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24)),
             ),
         ],
@@ -790,7 +777,7 @@ class _SearchPageState extends State<SearchPage>
             // 用 PinchableGridView 替代固定 2 列的 GridView，
             // Pad 模式下可双指捏合动态调整列数，非 Pad 模式仍固定 2 列
             child: PinchableGridView(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               // 原 childAspectRatio 0.75、spacing 12 保持不变
               childAspectRatio: 0.75,
               spacing: 12,
@@ -816,7 +803,7 @@ class _SearchPageState extends State<SearchPage>
           ),
           if (kugouProvider.isLoading)
             const Padding(
-              padding: EdgeInsets.all(12),
+              padding: EdgeInsets.all(AppSpacing.md),
               child: M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24)),
             ),
         ],
@@ -927,7 +914,7 @@ class _SearchPageState extends State<SearchPage>
       return _buildNoResult();
     }
     return ListView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
       itemCount: results.length,
       itemBuilder: (context, index) {
         return SongListItem(
@@ -946,7 +933,7 @@ class _SearchPageState extends State<SearchPage>
     final colorScheme = Theme.of(context).colorScheme;
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -955,14 +942,14 @@ class _SearchPageState extends State<SearchPage>
               size: 48,
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpacing.md),
             Text(
               '搜索失败',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               error,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -970,7 +957,7 @@ class _SearchPageState extends State<SearchPage>
               ),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             FilledButton.tonal(onPressed: onRetry, child: const Text('重试')),
           ],
         ),
@@ -989,7 +976,7 @@ class _SearchPageState extends State<SearchPage>
             size: 48,
             color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           Text(
             '未找到相关结果',
             style: Theme.of(context).textTheme.titleMedium?.copyWith(
@@ -1122,7 +1109,7 @@ class _SearchAlbumCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: AppRadius.mdAll,
       clipBehavior: Clip.antiAlias,
       child: Material(
         color: colorScheme.surfaceContainerLow,
@@ -1146,7 +1133,7 @@ class _SearchAlbumCard extends StatelessWidget {
                     : _buildPlaceholder(colorScheme),
               ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+                padding: const EdgeInsets.fromLTRB(10, AppSpacing.sm, 10, AppSpacing.xs),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1160,7 +1147,7 @@ class _SearchAlbumCard extends StatelessWidget {
                       ),
                     ),
                     if (artist.isNotEmpty) ...[
-                      const SizedBox(height: 2),
+                      const Gap(AppSpacing.xxs),
                       Text(
                         artist,
                         maxLines: 1,
@@ -1185,99 +1172,6 @@ class _SearchAlbumCard extends StatelessWidget {
       width: double.infinity,
       color: colorScheme.surfaceContainerHighest,
       child: Icon(icon, size: 40, color: colorScheme.onSurfaceVariant),
-    );
-  }
-}
-
-/// 歌词搜索结果项：封面 + 歌名/歌手 + 匹配的歌词片段，点击播放。
-class _LyricSearchResultItem extends StatelessWidget {
-  final Song song;
-  final String lyricSnippet;
-  final VoidCallback? onTap;
-
-  const _LyricSearchResultItem({
-    required this.song,
-    required this.lyricSnippet,
-    this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final textTheme = Theme.of(context).textTheme;
-    const imgSize = 52.0;
-
-    return InkWell(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        child: Row(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: song.artworkUri != null
-                  ? CachedNetworkImage(
-                      imageUrl: song.artworkUri!,
-                      memCacheWidth: 144,
-                      memCacheHeight: 144,
-                      width: imgSize,
-                      height: imgSize,
-                      fit: BoxFit.cover,
-                      placeholder: (_, _) => _buildPlaceholder(colorScheme),
-                      errorWidget: (_, _, _) => _buildPlaceholder(colorScheme),
-                    )
-                  : _buildPlaceholder(colorScheme),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    song.displayName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    lyricSnippet.isNotEmpty
-                        ? lyricSnippet
-                        : song.artist,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: textTheme.labelSmall?.copyWith(
-                      color: lyricSnippet.isNotEmpty
-                          ? colorScheme.primary.withValues(alpha: 0.85)
-                          : colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 8),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              child: Icon(Icons.play_arrow, size: 22, color: colorScheme.onSurfaceVariant),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPlaceholder(ColorScheme colorScheme) {
-    return Container(
-      width: 52,
-      height: 52,
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Icon(Icons.music_note, size: 26, color: colorScheme.onSurfaceVariant),
     );
   }
 }

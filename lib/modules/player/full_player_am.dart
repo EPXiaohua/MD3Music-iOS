@@ -2,7 +2,6 @@ import 'dart:io' show Platform;
 import 'dart:math' as math;
 import 'dart:ui';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
@@ -21,10 +20,14 @@ import '../../core/utils/local_lyric_loader.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../main.dart';
 import '../../core/utils/app_toast.dart';
+import '../../widgets/add_to_playlist_dialog.dart';
+import '../../widgets/depth_cover_host.dart';
+import '../../widgets/marquee_text.dart';
 import '../../core/utils/artwork_color_extractor.dart';
 import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../data/repositories/settings_repository.dart';
+import '../../services/depth_cover_service.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../coverflow/coverflow_page.dart';
@@ -32,6 +35,7 @@ import '../listen_together/widgets/listen_together_pill.dart';
 import '../settings/equalizer_settings_page.dart';
 import '../sound/sounds_page.dart';
 import 'mv_player_page.dart';
+import 'sleep_timer_sheet.dart';
 import 'song_info_page.dart';
 import 'am_transport_controls.dart';
 import '../../providers/favorites_provider.dart';
@@ -42,7 +46,6 @@ import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/comment_display_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
-import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/apple_lyrics/apple_lyrics_view.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences_panel.dart';
@@ -55,12 +58,11 @@ import '../../widgets/dynamic_cover_view.dart';
 import '../../widgets/player_artwork_image.dart';
 import '../../widgets/player_seek_bar.dart';
 import '../../widgets/player_tab_strip.dart';
-import '../../widgets/smart_artwork_image.dart';
 import '../../widgets/spectrum_artwork.dart';
 import '../../widgets/spectrum_background.dart';
 import '../../utils/landscape_immersive.dart';
-import '../../utils/playlist_order_utils.dart';
 import '../../widgets/player_playlist_view.dart';
+import '../../widgets/playback_status_feedback.dart';
 import 'car_mode_exit.dart';
 import '../../services/kugou_api/comment_reply_target.dart';
 import 'comment_compose_sheet.dart';
@@ -71,11 +73,7 @@ import 'player_tab_layout.dart';
 
 /// 预加载封面图片到磁盘缓存，防止切换时白屏
 void _preloadArtwork(String? url) {
-  if (url == null || url.isEmpty) return;
-  // 仅预加载在线封面，本地封面（content:// / local:// / file://）由组件按需加载
-  if (url.startsWith('http://') || url.startsWith('https://')) {
-    CachedNetworkImageProvider(url).resolve(const ImageConfiguration());
-  }
+  preloadPlayerArtwork(url);
 }
 
 const List<AudioQuality> _audioQualities = [
@@ -83,16 +81,6 @@ const List<AudioQuality> _audioQualities = [
   AudioQuality.high,
   AudioQuality.flac,
   AudioQuality.hires,
-];
-
-/// 定时关闭预定义档位（分钟）。
-const List<Duration> _sleepTimerPresets = [
-  Duration(minutes: 5),
-  Duration(minutes: 10),
-  Duration(minutes: 15),
-  Duration(minutes: 30),
-  Duration(minutes: 60),
-  Duration(minutes: 90),
 ];
 
 /// 翻译/罗马音按钮图标四周的透明安全区（每边像素）。
@@ -181,6 +169,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   bool get _isDragOverlay =>
       ModalRoute.of(context) == null && playerDragActive.value;
 
+  /// 封面是否为圆形（旋转圆盘）：仅在开启频谱且样式为柱状(0)/曲线(1)时成立，
+  /// 其余情况为圆角方形。圆盘时横屏/平板标题居中，方形时左对齐（见改版计划）。
+  bool get _isDiscCover => _spectrumEnabled && _spectrumStyle < 2;
+
   /// 是否已修改过系统栏（沉浸模式）。
   /// 覆盖层（非路由）场景从未修改，dispose 时无需恢复系统栏。
   bool _systemUiModified = false;
@@ -204,6 +196,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   bool _zenLongPressEnabled = true;
   // 专辑动态封面开关（设置页「播放页样式」与播放页「界面设置」共用；默认开启）
   bool _dynamicCoverEnabled = true;
+
   /// 播放页「界面设置」里「当前歌曲动态封面」的展示值（null = 检测中）
   ///
   /// 刻意**不在 dispose() 里销毁**：二级菜单挂在根 Navigator 上，可能比本 State
@@ -252,8 +245,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   // 环绕频谱透明度（style 0/1 分开记忆，默认不透明）
   double _spectrumBarOpacity = 1.0;
   double _spectrumCurveOpacity = 1.0;
-  // 频谱动态取色独立开关（默认开启）：AM 播放器频谱颜色取封面主色 50/50 混合
-  bool _spectrumDynamicColor = true;
+  // 偏好读取前先关闭取色，避免启动期多发一次封面请求；读取后恢复用户设置。
+  bool _spectrumDynamicColor = false;
 
   /// 频谱颜色：独立开关「频谱动态取色」开启且已提取到封面主色时，
   /// 用 50% 白 + 50% 取色混合（与歌词动态取色相同的兜底：抬升明度避免深色）；
@@ -528,6 +521,17 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       'comments=${next.hasComments} local=$isLocalSong index=${_tabController.index}',
     );
     setState(() {});
+  }
+
+  /// 播放列表 tab 上「从右往左滑」→ 切到下一个 tab。
+  ///
+  /// 下标从 `_tabController.index + 1` 推导，不写死 1：宽屏（横屏/平板）没有封面
+  /// tab，此时下一页是歌词 tab；边界用 `_tabController.length`（等于
+  /// [_tabLayout].length）兜住，避免在最后一个 tab 上越界。
+  /// 播放列表恒为 index 0，故实际只有「封面页」或「歌词页」两种落点。
+  void _showNextTabFromPlaylist() {
+    final next = _tabController.index + 1;
+    if (next < _tabController.length) _tabController.animateTo(next);
   }
 
   @override
@@ -1060,8 +1064,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       );
     }
     return Selector<PlayerProvider, (String?, String?)>(
-      selector: (_, p) =>
-          (p.currentSong?.artworkUri, p.currentSong?.localPath),
+      selector: (_, p) => (p.currentSong?.artworkUri, p.currentSong?.localPath),
       builder: (context, data, __) => _buildArtworkWithDynamicCover(
         currentSong,
         colorScheme,
@@ -1106,7 +1109,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             Positioned.fill(
               child: Opacity(
                 opacity: newOpacity,
-                child: PlayerArtworkImage(
+                // 3D 深度封面宿主：开关关闭/生成未完成时内部回退为平面封面，
+                // 保留 AM 风格的白底占位与淡入效果；与动态封面互斥由
+                // _buildArtworkWithDynamicCover 的分流保证（有动态封面时不会走到这里）。
+                child: DepthCoverHost(
                   artworkUri: artworkUrl,
                   fallbackFilePath: fallbackFilePath,
                   fit: BoxFit.cover,
@@ -1151,19 +1157,19 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             fallbackFilePath: fallbackFilePath,
           ),
           if (currentSong is Song && currentSong.isOnline)
-            DynamicCoverView(
-              song: currentSong,
-              enabled: _dynamicCoverEnabled,
-            ),
+            DynamicCoverView(song: currentSong, enabled: _dynamicCoverEnabled),
         ],
       ),
     );
   }
 
-  /// 模糊背景淡入淡出（无 alpha 渐变；渐变移到 AppleLyricsView 歌词界面边界）
+  /// 模糊背景淡入淡出（无 alpha 渐变；渐变移到 AppleLyricsView 歌词界面边界）。
+  /// [sigma] 为用户可调模糊强度（0~30），0 时跳过滤镜直接渲染原图。
+  /// 仅在动态流光关闭时被调用（调用点有条件判断）。
   Widget _buildCrossfadeBlurredBackground(
     String? artworkUrl, {
     String? fallbackFilePath,
+    required double sigma,
   }) {
     return AnimatedBuilder(
       animation: _artworkFadeAnimation,
@@ -1177,20 +1183,33 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                 child: Opacity(
                   opacity: oldOpacity,
                   child: RepaintBoundary(
-                    // 缓存已模糊栅格：切歌动画只做 alpha 混合，不再逐帧重算 sigma30 全屏模糊
-                    child: ImageFiltered(
-                      // sigma 30：全屏大图模糊的计算量随 sigma 近似平方增长，
-                      // 50→30 显著降低进入播放器时的 GPU 峰值，视觉上同为"重度背景模糊"
-                      imageFilter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-                      child: PlayerArtworkImage(
-                        artworkUri: _previousArtworkUrl,
-                        fallbackFilePath: fallbackFilePath,
-                        isFill: true,
-                        fit: BoxFit.cover,
-                        backgroundColor: Colors.black,
-                        iconColor: Colors.white24,
-                      ),
-                    ),
+                    // sigma=0（用户调为不模糊）：跳过滤镜，省一层 GPU 合成
+                    child: sigma <= 0
+                        ? PlayerArtworkImage(
+                            artworkUri: _previousArtworkUrl,
+                            fallbackFilePath: fallbackFilePath,
+                            isFill: true,
+                            fit: BoxFit.cover,
+                            backgroundColor: Colors.black,
+                            iconColor: Colors.white24,
+                          )
+                        : ImageFiltered(
+                            // sigma 随设置变化（0~30）；RepaintBoundary 缓存的
+                            // 已模糊栅格只在 sigma 变更时重算一次，切歌动画
+                            // 仍只做 alpha 混合（保持 2026-09-01 性能优化结构）
+                            imageFilter: ImageFilter.blur(
+                              sigmaX: sigma,
+                              sigmaY: sigma,
+                            ),
+                            child: PlayerArtworkImage(
+                              artworkUri: _previousArtworkUrl,
+                              fallbackFilePath: fallbackFilePath,
+                              isFill: true,
+                              fit: BoxFit.cover,
+                              backgroundColor: Colors.black,
+                              iconColor: Colors.white24,
+                            ),
+                          ),
                   ),
                 ),
               ),
@@ -1198,18 +1217,29 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               child: Opacity(
                 opacity: newOpacity,
                 child: RepaintBoundary(
-                  // 缓存已模糊栅格：切歌动画只做 alpha 混合，不再逐帧重算 sigma30 全屏模糊
-                  child: ImageFiltered(
-                    imageFilter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-                    child: PlayerArtworkImage(
-                      artworkUri: artworkUrl,
-                      fallbackFilePath: fallbackFilePath,
-                      isFill: true,
-                      fit: BoxFit.cover,
-                      backgroundColor: Colors.black,
-                      iconColor: Colors.white24,
-                    ),
-                  ),
+                  child: sigma <= 0
+                      ? PlayerArtworkImage(
+                          artworkUri: artworkUrl,
+                          fallbackFilePath: fallbackFilePath,
+                          isFill: true,
+                          fit: BoxFit.cover,
+                          backgroundColor: Colors.black,
+                          iconColor: Colors.white24,
+                        )
+                      : ImageFiltered(
+                          imageFilter: ImageFilter.blur(
+                            sigmaX: sigma,
+                            sigmaY: sigma,
+                          ),
+                          child: PlayerArtworkImage(
+                            artworkUri: artworkUrl,
+                            fallbackFilePath: fallbackFilePath,
+                            isFill: true,
+                            fit: BoxFit.cover,
+                            backgroundColor: Colors.black,
+                            iconColor: Colors.white24,
+                          ),
+                        ),
                 ),
               ),
             ),
@@ -1439,7 +1469,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     Song song,
     List<String> artists,
   ) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       builder: (sheetCtx) {
         return SafeArea(
@@ -1563,6 +1593,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         final lyricDoubleTap = context
             .watch<ThemeProvider>()
             .lyricDoubleTapToJump;
+        // 播放页背景模糊强度：watch 让设置页改动即时重建本节点，
+        // 已模糊栅格随 sigma 变化重算一次（RepaintBoundary 结构保持不变）
+        final amBlur = context.watch<ThemeProvider>().amPlayerBlur;
         final currentSong = playerProvider.currentSong;
         final colorScheme = Theme.of(context).colorScheme;
 
@@ -1598,6 +1631,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             currentSong,
             colorScheme,
             lyricDoubleTap,
+            amBlur,
           ),
         );
       },
@@ -1611,6 +1645,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     dynamic currentSong,
     ColorScheme colorScheme,
     bool lyricDoubleTap,
+    double amBlur,
   ) {
     // extendBody: true 让内容延伸到系统导航栏后面，实现沉浸效果
     // 拖拽展开模式下系统栏样式跟随展开进度，避免拖动过程提前切换（见 PlayerSystemUiScope）
@@ -1635,6 +1670,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                 child: _buildCrossfadeBlurredBackground(
                   currentSong.artworkUri,
                   fallbackFilePath: currentSong.localPath,
+                  sigma: amBlur,
                 ),
               ),
             // 2. 动态流光背景层（可选，从专辑封面提取色彩流动）
@@ -1712,7 +1748,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               controller: _tabController,
               children: [
                 // 播放列表面板（index 0，专辑封面 tab 左侧）
-                const PlayerPlaylistView(useDisplayName: true),
+                // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
+                PlayerPlaylistView(
+                  useDisplayName: true,
+                  onSwipeToNextTab: _showNextTabFromPlaylist,
+                ),
                 // 封面 tab：宽屏/平板不存在（封面常驻左栏）
                 if (_tabLayout.hasCover)
                   GestureDetector(
@@ -1885,81 +1925,123 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                 // ── 左侧：封面 + 歌曲信息 ──
                 Expanded(
                   flex: 4,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        // 横屏时封面为正方形，需同时受可用宽度与高度约束：
-                        // 减去 56 顶栏补偿后的可用高度，避免高度不足时正方形上下被裁切
-                        final availableHeight = constraints.maxHeight - 72;
-                        final size =
-                            (constraints.maxWidth < availableHeight
-                                    ? constraints.maxWidth
-                                    : availableHeight)
-                                .clamp(120.0, 300.0);
-                        return Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            SizedBox(
-                              width: size,
-                              height: size,
-                              // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
-                              // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
-                              child: GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
-                                onVerticalDragStart: widget.dockMode
-                                    ? null
-                                    : _onTopBarDragStart,
-                                onVerticalDragUpdate: widget.dockMode
-                                    ? null
-                                    : _onTopBarDragUpdate,
-                                onVerticalDragEnd: widget.dockMode
-                                    ? null
-                                    : _onTopBarDragEnd,
-                                onVerticalDragCancel: widget.dockMode
-                                    ? null
-                                    : _onTopBarDragCancel,
-                                child: _wrapArtworkZenPress(
-                                  child: AnimatedScale(
-                                    // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
-                                    scale:
-                                        _spectrumEnabled && _spectrumStyle < 2
-                                        ? 1.0
-                                        : (playerProvider.isPlaying
+                  child: Builder(
+                    builder: (context) {
+                      // 封面 + 标题视作一个整体，以统一间距 g 贴合左栏：
+                      // 方角封面左锚定（文字左缘 = 封面左缘，右侧余量归歌词面板）、
+                      // 圆盘封面（频谱 0/1）整块居中；纵向居中令上下留白相等。
+                      // 异形屏内嵌“算入”等距而非叠加：内层左 padding = clamp(g - 刘海, 0, g)，
+                      // 叠加外层 SafeArea 已让出的刘海后物理左间距 = max(g, 刘海)，不再右推封面。
+                      const g = 16.0;
+                      final cutoutLeft = MediaQuery.viewPaddingOf(context).left;
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          left: (g - cutoutLeft).clamp(0.0, g),
+                          top: g,
+                          bottom: g,
+                        ),
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            // 正方形封面同时受可用宽/高约束（预留标题块高度 72），
+                            // 避免高度不足时上下被裁切。
+                            final availableHeight = constraints.maxHeight - 72;
+                            final size =
+                                (constraints.maxWidth < availableHeight
+                                        ? constraints.maxWidth
+                                        : availableHeight)
+                                    .clamp(120.0, 300.0);
+                            return Align(
+                              alignment: _isDiscCover
+                                  ? Alignment.center
+                                  : Alignment.centerLeft,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: _isDiscCover
+                                    ? CrossAxisAlignment.center
+                                    : CrossAxisAlignment.start,
+                                children: [
+                                  SizedBox(
+                                    width: size,
+                                    height: size,
+                                    // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
+                                    // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      // 横屏封面仅注册竖向拖拽时，静止点击会被唯一的
+                                      // VerticalDragGestureRecognizer 通过 arena sweep 认领，
+                                      // 走进 _onTopBarDrag* 的微拖拽收起路径（曾表现为「点击封面闪回」）。
+                                      // 加一个 no-op onTap，让静止点击被 TapGestureRecognizer 赢下手势竞技场。
+                                      onTap: () {
+                                        _consumeZenPressTap();
+                                      },
+                                      // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
+                                      onVerticalDragStart: widget.dockMode
+                                          ? null
+                                          : _onTopBarDragStart,
+                                      onVerticalDragUpdate: widget.dockMode
+                                          ? null
+                                          : _onTopBarDragUpdate,
+                                      onVerticalDragEnd: widget.dockMode
+                                          ? null
+                                          : _onTopBarDragEnd,
+                                      onVerticalDragCancel: widget.dockMode
+                                          ? null
+                                          : _onTopBarDragCancel,
+                                      child: _wrapArtworkZenPress(
+                                        child: AnimatedScale(
+                                          // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
+                                          scale:
+                                              _spectrumEnabled &&
+                                                  _spectrumStyle < 2
                                               ? 1.0
-                                              : 0.85),
-                                    duration: const Duration(milliseconds: 500),
-                                    curve: Curves.easeOutBack,
-                                    child: _buildLandscapeArtworkContent(
-                                      playerProvider,
-                                      currentSong,
-                                      colorScheme,
+                                              : (playerProvider.isPlaying
+                                                    ? 1.0
+                                                    : 0.85),
+                                          // 缩放锚点=左下角：暂停缩小时封面左缘、下缘保持不动，
+                                          // 只向右上收。故标题块恒按布局盒 size 左对齐即与封面
+                                          // 可见左缘对齐，无需随 scale 改宽/位移，消除标题跳动。
+                                          alignment: Alignment.bottomLeft,
+                                          duration: const Duration(
+                                            milliseconds: 500,
+                                          ),
+                                          curve: Curves.easeOutBack,
+                                          child: _buildLandscapeArtworkContent(
+                                            playerProvider,
+                                            currentSong,
+                                            colorScheme,
+                                          ),
+                                        ),
+                                      ),
                                     ),
                                   ),
-                                ),
+                                  const SizedBox(height: 16),
+                                  // 歌名 / 艺人·专辑：三种横屏形态（手机横屏、平板竖屏、
+                                  // 平板横屏）都固定在封面正下方，不再随 tab 变化。
+                                  // 标题块宽度=封面布局盒 size，左边缘与专辑封面左边缘对齐。
+                                  // 圆盘封面（频谱 0/1）居中标题以贴合圆盘圆心：线条文本对
+                                  // 圆形封面无法 stretch 出可靠左缘，只对方角封面左对齐才成立。
+                                  //
+                                  // 封面 AnimatedScale 已锚定左下角，暂停缩小时左缘不动，
+                                  // 故此处恒用 size 取宽 + stretch 即与可见封面左缘对齐，
+                                  // 不再随 scale 改宽/加左留白（旧实现会让标题每次暂停跳动）。
+                                  SizedBox(
+                                    width: size,
+                                    child: _buildTitleBlock(
+                                      playerProvider,
+                                      currentSong,
+                                      isExpanded: true,
+                                      alignment: _isDiscCover
+                                          ? CrossAxisAlignment.center
+                                          : CrossAxisAlignment.stretch,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ),
-                            const SizedBox(height: 16),
-                            // 歌名 / 艺人·专辑：三种横屏形态（手机横屏、平板竖屏、
-                            // 平板横屏）都固定在封面正下方，不再随 tab 变化。
-                            // 标题块宽度收到与封面同宽 → 左边缘与专辑封面对齐
-                            // （横屏 Zen 模式同样左对齐）。
-                            SizedBox(
-                              width: size,
-                              child: _buildTitleBlock(
-                                playerProvider,
-                                currentSong,
-                                isExpanded: true,
-                              ),
-                            ),
-                          ],
-                        );
-                      },
-                    ),
+                            );
+                          },
+                        ),
+                      );
+                    },
                   ),
                 ),
                 // ── 右侧：Tab + 内容 + 控制 ──
@@ -1974,7 +2056,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                           controller: _tabController,
                           children: [
                             // 播放列表面板（index 0，封面信息 tab 左侧）
-                            const PlayerPlaylistView(useDisplayName: true),
+                            // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
+                            PlayerPlaylistView(
+                              useDisplayName: true,
+                              onSwipeToNextTab: _showNextTabFromPlaylist,
+                            ),
                             _wrapLyricsWithTranslateToggle(
                               _isLoadingLyrics
                                   // AM 风格：歌词 loading 改为白色，与深色背景协调
@@ -2080,88 +2166,124 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               children: [
                 Expanded(
                   flex: 4,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        // 减去标题块高度后再取正方形边长，避免封面上下被裁切
-                        final maxSize = (constraints.maxWidth - 32)
-                            .clamp(0.0, 380.0)
-                            .clamp(
-                              0.0,
-                              (constraints.maxHeight - 72).clamp(
-                                0.0,
-                                double.infinity,
-                              ),
-                            );
-                        return Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            ConstrainedBox(
-                              constraints: BoxConstraints(
-                                maxWidth: maxSize,
-                                maxHeight: maxSize,
-                              ),
-                              child: AspectRatio(
-                                aspectRatio: 1,
-                                // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
-                                // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.opaque,
-                                  // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
-                                  onVerticalDragStart: widget.dockMode
-                                      ? null
-                                      : _onTopBarDragStart,
-                                  onVerticalDragUpdate: widget.dockMode
-                                      ? null
-                                      : _onTopBarDragUpdate,
-                                  onVerticalDragEnd: widget.dockMode
-                                      ? null
-                                      : _onTopBarDragEnd,
-                                  onVerticalDragCancel: widget.dockMode
-                                      ? null
-                                      : _onTopBarDragCancel,
-                                  child: _wrapArtworkZenPress(
-                                    child: AnimatedScale(
-                                      // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
-                                      scale:
-                                          _spectrumEnabled && _spectrumStyle < 2
-                                          ? 1.0
-                                          : (playerProvider.isPlaying
+                  child: Builder(
+                    builder: (context) {
+                      // 封面 + 标题视作一个整体，以统一间距 g 贴合左栏：
+                      // 方角封面左锚定（文字左缘 = 封面左缘，右侧余量归歌词面板）、
+                      // 圆盘封面（频谱 0/1）整块居中；纵向居中令上下留白相等。
+                      // 异形屏内嵌“算入”等距而非叠加：内层左 padding = clamp(g - 刘海, 0, g)，
+                      // 叠加外层 SafeArea 已让出的刘海后物理左间距 = max(g, 刘海)，不再右推封面。
+                      const g = 16.0;
+                      final cutoutLeft = MediaQuery.viewPaddingOf(context).left;
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          left: (g - cutoutLeft).clamp(0.0, g),
+                          top: g,
+                          bottom: g,
+                        ),
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            // 减去标题块高度后再取正方形边长，避免封面上下被裁切
+                            final maxSize = (constraints.maxWidth - 32)
+                                .clamp(0.0, 380.0)
+                                .clamp(
+                                  0.0,
+                                  (constraints.maxHeight - 72).clamp(
+                                    0.0,
+                                    double.infinity,
+                                  ),
+                                );
+                            return Align(
+                              alignment: _isDiscCover
+                                  ? Alignment.center
+                                  : Alignment.centerLeft,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: _isDiscCover
+                                    ? CrossAxisAlignment.center
+                                    : CrossAxisAlignment.start,
+                                children: [
+                                  ConstrainedBox(
+                                    constraints: BoxConstraints(
+                                      maxWidth: maxSize,
+                                      maxHeight: maxSize,
+                                    ),
+                                    child: AspectRatio(
+                                      aspectRatio: 1,
+                                      // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
+                                      // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        // 见上：no-op onTap 让静止点击被 Tap 识别器赢下竞技场，
+                                        // 避免唯一竖向拖拽识别器把点击误判为微拖拽收起（「点击封面闪回」）。
+                                        onTap: () {
+                                          _consumeZenPressTap();
+                                        },
+                                        // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
+                                        onVerticalDragStart: widget.dockMode
+                                            ? null
+                                            : _onTopBarDragStart,
+                                        onVerticalDragUpdate: widget.dockMode
+                                            ? null
+                                            : _onTopBarDragUpdate,
+                                        onVerticalDragEnd: widget.dockMode
+                                            ? null
+                                            : _onTopBarDragEnd,
+                                        onVerticalDragCancel: widget.dockMode
+                                            ? null
+                                            : _onTopBarDragCancel,
+                                        child: _wrapArtworkZenPress(
+                                          child: AnimatedScale(
+                                            // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
+                                            scale:
+                                                _spectrumEnabled &&
+                                                    _spectrumStyle < 2
                                                 ? 1.0
-                                                : 0.85),
-                                      duration: const Duration(
-                                        milliseconds: 500,
-                                      ),
-                                      curve: Curves.easeOutBack,
-                                      child: _buildLandscapeArtworkContent(
-                                        playerProvider,
-                                        currentSong,
-                                        colorScheme,
+                                                : (playerProvider.isPlaying
+                                                      ? 1.0
+                                                      : 0.85),
+                                            // 缩放锚点=左下角：暂停缩小时封面左缘不动，
+                                            // 标题恒按 maxSize 左对齐即与封面可见左缘对齐。
+                                            alignment: Alignment.bottomLeft,
+                                            duration: const Duration(
+                                              milliseconds: 500,
+                                            ),
+                                            curve: Curves.easeOutBack,
+                                            child:
+                                                _buildLandscapeArtworkContent(
+                                                  playerProvider,
+                                                  currentSong,
+                                                  colorScheme,
+                                                ),
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   ),
-                                ),
+                                  const SizedBox(height: 16),
+                                  // 歌名 / 艺人·专辑：固定在封面正下方（三种横屏形态一致），
+                                  // 标题块宽度=封面布局盒 maxSize → 左边缘与专辑封面左缘对齐。
+                                  // 封面 AnimatedScale 已锚定左下角，暂停缩小时左缘不动，
+                                  // 故恒用 maxSize 取宽 + stretch 即与可见封面左缘对齐，
+                                  // 不再随 scale 改宽/加左留白（旧实现会让标题每次暂停跳动）。
+                                  SizedBox(
+                                    width: maxSize,
+                                    child: _buildTitleBlock(
+                                      playerProvider,
+                                      currentSong,
+                                      isExpanded: true,
+                                      alignment: _isDiscCover
+                                          ? CrossAxisAlignment.center
+                                          : CrossAxisAlignment.stretch,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ),
-                            const SizedBox(height: 16),
-                            // 歌名 / 艺人·专辑：固定在封面正下方（三种横屏形态一致），
-                            // 标题块宽度收到与封面同宽 → 左边缘与专辑封面对齐
-                            SizedBox(
-                              width: maxSize,
-                              child: _buildTitleBlock(
-                                playerProvider,
-                                currentSong,
-                                isExpanded: true,
-                              ),
-                            ),
-                          ],
-                        );
-                      },
-                    ),
+                            );
+                          },
+                        ),
+                      );
+                    },
                   ),
                 ),
                 Expanded(
@@ -2173,7 +2295,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                           controller: _tabController,
                           children: [
                             // 播放列表面板（index 0，封面信息 tab 左侧）
-                            const PlayerPlaylistView(useDisplayName: true),
+                            // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
+                            PlayerPlaylistView(
+                              useDisplayName: true,
+                              onSwipeToNextTab: _showNextTabFromPlaylist,
+                            ),
                             _wrapLyricsWithTranslateToggle(
                               _isLoadingLyrics
                                   // AM 风格：歌词 loading 改为白色，与深色背景协调
@@ -2291,15 +2417,23 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             // AM v2: 顶部栏右侧 FLAC 质量徽章，点击复用 _showQualityDialog，
             // 长按呼出 _showVolumeDialog（与 MD 风格统一）
             _buildQualityPill(playerProvider),
-            // 睡眠药丸：只订阅剩余时间独立通道，每秒走字不再触发整页重建
-            ValueListenableBuilder<Duration?>(
-              valueListenable: playerProvider.sleepTimerRemainingNotifier,
-              builder: (context, remaining, _) {
-                if (remaining == null) {
-                  return const SizedBox.shrink();
-                }
-                return _buildSleepTimerPill(playerProvider, remaining);
-              },
+            // 睡眠药丸：外层订阅 provider（模式开关，低频），内层只订阅剩余
+            // 时间通道（每秒走字），可见性判定已下沉到 buildSleepTimerPill
+            ListenableBuilder(
+              listenable: playerProvider,
+              builder: (context, _) => ValueListenableBuilder<Duration?>(
+                valueListenable: playerProvider.sleepTimerRemainingNotifier,
+                builder: (context, remaining, _) => buildSleepTimerPill(
+                  context: context,
+                  remaining: remaining,
+                  mode: playerProvider.sleepTimerMode,
+                  style: SleepTimerPillStyle.amOf(),
+                  onTap: () => showSleepTimerSheet(
+                    context: context,
+                    player: playerProvider,
+                  ),
+                ),
+              ),
             ),
             IconButton(
               icon: const Icon(Icons.more_horiz, color: Colors.white),
@@ -2493,25 +2627,22 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         InkWell(
           onTap: () => _navigateToAlbum(currentSong as Song),
           borderRadius: BorderRadius.circular(4),
-          child: Text(
+          // 标题过长时优雅滚动（起停往返 + 边缘渐隐），不换行也不截断。
+          child: GentleScrollingText(
             currentSong.displayName,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
+            textAlign: textAlign,
             style: (isExpanded ? textTheme.titleMedium : textTheme.titleLarge)
                 ?.copyWith(color: Colors.white, fontWeight: FontWeight.w600),
-            textAlign: textAlign,
           ),
         ),
         const SizedBox(height: 2),
         InkWell(
           onTap: () => _navigateToAlbum(currentSong as Song),
           borderRadius: BorderRadius.circular(4),
-          child: Text(
+          child: GentleScrollingText(
             subtitle,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: textTheme.bodyMedium?.copyWith(color: Colors.white70),
             textAlign: textAlign,
+            style: textTheme.bodyMedium?.copyWith(color: Colors.white70),
           ),
         ),
       ],
@@ -2532,6 +2663,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          const PlaybackStatusFeedback(amStyle: true),
           // 与上方 tab 内容拉开距离：进度条拖动时时间标签会向上浮出 16px
           SizedBox(height: isExpanded ? 4 : 8),
           // P0: 进度条监听 positionNotifier（高频 200ms）+ provider（duration/切歌等低频），
@@ -3039,8 +3171,15 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                       const SizedBox(height: 12),
                       Icon(icon, size: 32, color: colorScheme.primary),
                       const SizedBox(height: 8),
-                      Slider(
+                      M3ESlider(
                         value: volume,
+                        // 不传 divisions = 无级调节（无节点）
+                        decoration: const M3ESliderDecoration(
+                          // divisions 为空时组件默认取连续触觉（10ms 最小间隔），
+                          // 拖动会高频震动，故显式改为离散配置
+                          haptic: M3EHapticFeedback.medium,
+                          hapticConfig: M3EHapticConfig.discrete(),
+                        ),
                         onChanged: (value) {
                           if (usbEnabled) {
                             // 独占：与设置页「USB 音量」同步
@@ -3114,7 +3253,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                       ),
                       const SizedBox(height: 16),
                       // 横条滑块
-                      Slider(
+                      M3ESlider(
                         value: currentIndex.toDouble(),
                         min: 0,
                         max: (speeds.length - 1).toDouble(),
@@ -3176,6 +3315,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         return '无损';
       case AudioQuality.hires:
         return 'Hi-Res';
+      case AudioQuality.viper:
+        return '蝰蛇母带';
     }
   }
 
@@ -3220,7 +3361,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     final albumTitle = song.album.isEmpty ? '查看专辑' : '查看专辑：${song.album}';
     final artistTitle = song.artist.isEmpty ? '查看歌手' : '查看歌手：${song.artist}';
 
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: rootContext,
       isScrollControlled: true,
       builder: (sheetContext) {
@@ -3273,7 +3414,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                   title: const Text('添加到歌单'),
                   onTap: () {
                     Navigator.pop(sheetContext);
-                    _showAddToPlaylistDialog(rootContext, song);
+                    showAddToPlaylistDialog(rootContext, song);
                   },
                 ),
                 // 歌曲信息：频率/位深/码率/声道 + USB 独占开关（原顶栏按钮收纳到菜单）
@@ -3362,7 +3503,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                             active: player.isSleepTimerActive,
                             onTap: () {
                               Navigator.pop(sheetContext);
-                              _showSleepTimerSheet(rootContext, player);
+                              showSleepTimerSheet(
+                                context: rootContext,
+                                player: player,
+                              );
                             },
                           );
                         },
@@ -3402,7 +3546,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
   /// 界面设置：二级菜单弹层（歌词类型 / 歌词显示设置 / 评论设置 / 音乐频谱）。
   void _showMoreSettingsSheet(BuildContext rootContext) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: rootContext,
       isScrollControlled: true,
       builder: (sheetContext) {
@@ -3527,6 +3671,23 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     ],
                   ),
                 ),
+                // 3D 封面：与设置页开关同源（写入后 DepthCoverHost 即时响应）
+                StatefulBuilder(
+                  builder: (context, setSheetState) => FutureBuilder<bool>(
+                    future: SettingsRepository().getDepthCoverEnabled(),
+                    builder: (context, snap) => SwitchListTile(
+                      title: const Text('3D 封面'),
+                      value: snap.data ?? false,
+                      onChanged: (v) {
+                        HapticFeedback.lightImpact();
+                        setSheetState(() {});
+                        // ignore: discarded_futures
+                        SettingsRepository().setDepthCoverEnabled(v);
+                        DepthCoverService.enabledSignal.value = v;
+                      },
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -3539,7 +3700,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   /// 与 MD 风格面板保持一致：全部使用主题标准色（onSurface / onSurfaceVariant /
   /// primary），由主题自动适配深色/浅色模式，不再硬编码白色文字。
   void _showCommentDisplaySheet(BuildContext rootContext) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: rootContext,
       isScrollControlled: true,
       builder: (sheetCtx) {
@@ -3598,7 +3759,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                         ),
                       ],
                     ),
-                    Slider(
+                    M3ESlider(
                       value: display.commentFontSize,
                       min: 10.0,
                       max: 24.0,
@@ -3744,179 +3905,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     );
   }
 
-  /// AM v2 睡眠定时药丸 — 复用 _buildQualityPill 样式（白色 15% 背景）。
-  Widget _buildSleepTimerPill(
-    PlayerProvider playerProvider,
-    Duration remaining,
-  ) {
-    final textTheme = Theme.of(context).textTheme;
-    return Material(
-      color: Colors.white.withValues(alpha: 0.15),
-      shape: const StadiumBorder(),
-      child: InkWell(
-        onTap: () => _showSleepTimerSheet(context, playerProvider),
-        customBorder: const StadiumBorder(),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.timer_outlined, size: 14, color: Colors.white),
-              const SizedBox(width: 4),
-              Text(
-                _formatSleepTime(remaining),
-                style: textTheme.labelMedium?.copyWith(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// AM v2 定时关闭选择面板。
-  void _showSleepTimerSheet(BuildContext rootContext, PlayerProvider player) {
-    showModalBottomSheet(
-      context: rootContext,
-      isScrollControlled: true,
-      builder: (sheetCtx) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  '定时关闭',
-                  style: Theme.of(rootContext).textTheme.titleMedium,
-                ),
-              ),
-              ..._sleepTimerPresets.map((d) {
-                final r = player.sleepTimerRemaining;
-                final active =
-                    r != null && (r.inSeconds - d.inSeconds).abs() < 2;
-                return ListTile(
-                  leading: Icon(
-                    active
-                        ? Icons.radio_button_checked
-                        : Icons.radio_button_unchecked,
-                  ),
-                  title: Text('${d.inMinutes} 分钟'),
-                  onTap: () {
-                    player.setSleepTimer(d);
-                    Navigator.pop(sheetCtx);
-                    showToast('将在 ${d.inMinutes} 分钟后自动暂停', long: true);
-                  },
-                );
-              }),
-              ListTile(
-                leading: const Icon(Icons.edit_outlined),
-                title: const Text('自定义…'),
-                onTap: () {
-                  Navigator.pop(sheetCtx);
-                  _showCustomSleepTimerDialog(rootContext, player);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.cancel_outlined),
-                title: const Text('关闭定时'),
-                onTap: () {
-                  player.setSleepTimer(null);
-                  Navigator.pop(sheetCtx);
-                },
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  /// AM v2 自定义分钟数对话框。
-  void _showCustomSleepTimerDialog(
-    BuildContext rootContext,
-    PlayerProvider player,
-  ) {
-    final controller = TextEditingController();
-    showDialog(
-      context: rootContext,
-      builder: (dialogCtx) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 320),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.timer_outlined, size: 32),
-                const SizedBox(height: 8),
-                const Text('自定义定时关闭', style: TextStyle(fontSize: 16)),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: controller,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    labelText: '分钟',
-                    hintText: '1-240',
-                    border: OutlineInputBorder(),
-                  ),
-                  autofocus: true,
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    TextButton(
-                      onPressed: () {
-                        Navigator.pop(dialogCtx);
-                      },
-                      child: const Text('取消'),
-                    ),
-                    FilledButton(
-                      onPressed: () {
-                        // 先读值再处理；controller 由 Dart GC 在 dialog 销毁后回收，
-                        // 不在按钮回调里提前 dispose（TextField 在 pop 动画期间仍引用它）
-                        final n = int.tryParse(controller.text);
-                        if (n == null || n < 1 || n > 240) {
-                          showToast('请输入 1-240 之间的整数', long: true);
-                          return;
-                        }
-                        final d = Duration(minutes: n);
-                        player.setSleepTimer(d);
-                        Navigator.pop(dialogCtx);
-                        showToast('将在 $n 分钟后自动暂停', long: true);
-                      },
-                      child: const Text('确定'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// AM v2 睡眠定时剩余时间格式：>=1h 显示 `XhYYm`，否则 `mm:ss`。
-  String _formatSleepTime(Duration d) {
-    if (d.inHours >= 1) {
-      final h = d.inHours;
-      final m = d.inMinutes.remainder(60);
-      return '${h}h${m.toString().padLeft(2, '0')}m';
-    }
-    final m = d.inMinutes;
-    final s = d.inSeconds.remainder(60);
-    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
-  }
-
   /// 弹出 DLNA 投屏二级菜单（设备选择 + 传输控制）。
   void _showDlnaCastSheet(BuildContext context) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (context) => const DlnaCastSheet(),
@@ -3925,237 +3916,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
   /// 弹出歌词字号/行间距调节面板（从播放页右上角菜单进入）。
   void _showLyricPreferencesSheet(BuildContext context) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (context) => SafeArea(child: const LyricPreferencesPanel()),
     );
-  }
-
-  void _showAddToPlaylistDialog(BuildContext context, dynamic song) async {
-    final api = KugouApiClient();
-    if (!api.isLoggedIn) {
-      showToast('请先登录', long: true);
-      return;
-    }
-
-    showDialog(
-      context: context,
-      builder: (dialogContext) {
-        return FutureBuilder<List<Map<String, dynamic>>?>(
-          future: _loadUserPlaylistsSorted(api),
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const AlertDialog(
-                content: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // AM 风格：白色 loading，与深色对话框背景协调
-                    M3ELoadingIndicator(
-                      constraints: BoxConstraints.tightFor(
-                        width: 32,
-                        height: 32,
-                      ),
-                      color: Colors.white,
-                    ),
-                    SizedBox(height: 16),
-                    Text('加载歌单中...'),
-                  ],
-                ),
-              );
-            }
-
-            if (snapshot.hasError || snapshot.data == null) {
-              return AlertDialog(
-                title: const Text('错误'),
-                content: const Text('获取歌单失败'),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(dialogContext),
-                    child: const Text('关闭'),
-                  ),
-                ],
-              );
-            }
-
-            final playlists = snapshot.data!;
-
-            if (playlists.isEmpty) {
-              return AlertDialog(
-                title: const Text('我的歌单'),
-                content: const Text('暂无歌单，请先创建歌单'),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(dialogContext),
-                    child: const Text('关闭'),
-                  ),
-                ],
-              );
-            }
-
-            return AlertDialog(
-              title: const Text('添加到歌单'),
-              content: SizedBox(
-                width: 300,
-                height: 400,
-                child: ListView.builder(
-                  itemCount: playlists.length,
-                  itemBuilder: (context, index) {
-                    final playlist = playlists[index];
-                    final name =
-                        (playlist['name'] ?? playlist['specialname'] ?? '未知歌单')
-                            .toString();
-                    // 优先使用模型解析后的 songCount，再尝试原始字段
-                    final songCount =
-                        playlist['songCount'] ??
-                        playlist['songcount'] ??
-                        playlist['song_count'] ??
-                        playlist['count'] ??
-                        0;
-                    final coverUrl = playlist['coverUrl']?.toString();
-
-                    return ListTile(
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                      ),
-                      leading: SmartArtworkImage(
-                        artworkUri: coverUrl,
-                        size: 44,
-                        borderRadius: 6,
-                      ),
-                      title: Text(name),
-                      subtitle: Text('$songCount 首'),
-                      onTap: () {
-                        Navigator.pop(dialogContext);
-                        _addSongToPlaylist(song, playlist);
-                      },
-                    );
-                  },
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('取消'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  /// 拉取用户歌单并解析为「添加到歌单」对话框所需的 Map 列表，
-  /// 再按收藏页「创建的歌单」自定义顺序原地排序后返回。
-  /// 返回 null 表示请求失败（与旧逻辑中 snapshot.data == null 等价）。
-  Future<List<Map<String, dynamic>>?> _loadUserPlaylistsSorted(
-    KugouApiClient api,
-  ) async {
-    final resp = await api.getUserPlaylist(pagesize: 50);
-    if (resp == null) return null;
-    final data = resp['data'];
-    List<dynamic> rawPlaylists = [];
-    if (data is List) {
-      rawPlaylists = data;
-    } else if (data is Map) {
-      rawPlaylists = data['info'] ?? data['list'] ?? data['special_list'] ?? [];
-    }
-
-    // 使用 KugouPlaylistBrief 模型解析，确保字段名映射正确
-    // 只显示用户自己创建的歌单 (type=0)
-    final playlists = <Map<String, dynamic>>[];
-    for (final item in rawPlaylists) {
-      final json = item as Map<String, dynamic>;
-      final brief = KugouPlaylistBrief.fromJson(json);
-      if (brief.type != 0) continue;
-      // 排除「我喜欢」默认收藏歌单：收藏走红心机制，不走添加到歌单
-      // （判定与 FavoritesProvider 一致：name == '我喜欢' || is_def == 2）
-      if (brief.name == '我喜欢' || json['is_def'] == 2) continue;
-      // 将模型数据转回 Map 以便 UI 使用（包含正确的字段值）
-      playlists.add({
-        'name': brief.name,
-        'songCount': brief.songCount,
-        'coverUrl': brief.coverUrl,
-        'listid': brief.listId.isEmpty ? brief.id : brief.listId,
-        'specialid': brief.id,
-        'global_collection_id': brief.globalCollectionId,
-        'type': brief.type,
-        // 保留原始 JSON 用于 API 调用
-        ...json,
-      });
-    }
-
-    await PlaylistOrderUtils.sortCreatedPlaylistMaps(playlists);
-    return playlists;
-  }
-
-  /// 将歌曲添加到指定歌单。
-  ///
-  /// 不依赖对话框的 BuildContext：调用时对话框刚被 pop，其子树会在退出动画
-  /// 结束后卸载；若用该 context 做 mounted 检查，await 网络请求后必然
-  /// 提前 return，导致"第一次点击没反应"（issue #66）。
-  /// showToast 为全局 Fluttertoast，API 调用为后台异步，均无需挂载中的 context。
-  Future<void> _addSongToPlaylist(
-    dynamic song,
-    Map<String, dynamic> playlist,
-  ) async {
-    final api = KugouApiClient();
-    final listid =
-        playlist['listid']?.toString() ?? playlist['list_id']?.toString() ?? '';
-    final globalCollectionId =
-        playlist['global_collection_id']?.toString() ??
-        playlist['gid']?.toString() ??
-        '';
-
-    if (listid.isEmpty) {
-      showToast('歌单ID无效', long: true);
-      return;
-    }
-
-    final name = (playlist['name'] ?? playlist['specialname'] ?? '未知歌单')
-        .toString();
-
-    // 公开版偏好：添加前先检查歌曲是否已在歌单中，存在则不执行。
-    // 用 global_collection_id 拉取歌单歌曲，按歌曲 hash（song.id）判断是否已存在。
-    try {
-      final gid = globalCollectionId.isNotEmpty ? globalCollectionId : listid;
-      final existing = await api.getPlaylistTrackAll(
-        id: gid,
-        page: 1,
-        pagesize: 100,
-      );
-      if (existing != null) {
-        final songHash = song.id?.toString().toLowerCase() ?? '';
-        final already = existing.any((s) => s.hash.toLowerCase() == songHash);
-        if (already) {
-          showToast('已在歌单「$name」中');
-          return;
-        }
-      }
-    } catch (_) {
-      // 查询失败不阻断添加，继续走原逻辑
-    }
-
-    // 乐观更新：立即显示成功，后台同步到酷狗服务器
-    showToast('已添加到「$name」');
-
-    // 构造歌曲数据 — 酷狗API要求的格式：歌名|hash|albumId|albumAudioId
-    final songData =
-        '${song.title}|${song.id}|${song.albumId ?? 0}|${int.tryParse(song.albumAudioId ?? '') ?? 0}';
-
-    // 后台同步，不阻塞 UI
-    api
-        .addPlaylistTracks(listid, songData)
-        .then((result) {
-          // 同步失败时提示用户（静默失败，不影响已显示的乐观更新）
-          if (result == null) {
-            showToast('同步到服务器失败，将在下次启动时重试', long: true);
-          }
-        })
-        .catchError((_) {
-          // 网络错误等，同样静默处理
-        });
   }
 }
 

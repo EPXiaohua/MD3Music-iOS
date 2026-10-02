@@ -17,7 +17,8 @@ package androidx.media3.session;
 
 import static android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD;
 import static android.view.KeyEvent.KEYCODE_MEDIA_NEXT;
-import static android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE;
+import static android.view.KeyEvent.KEYCODE_MEDIA_PAUSE;
+import static android.view.KeyEvent.KEYCODE_MEDIA_PLAY;
 import static android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS;
 import static android.view.KeyEvent.KEYCODE_MEDIA_REWIND;
 import static android.view.KeyEvent.KEYCODE_MEDIA_STOP;
@@ -112,7 +113,7 @@ import androidx.media3.common.util.Util;
   @Override
   public PendingIntent createMediaActionPendingIntent(
       MediaSession mediaSession, @Player.Command long command) {
-    int keyCode = toKeyCode(command);
+    int keyCode = toKeyCode(command, mediaSession.getPlayer().getPlayWhenReady());
     Intent intent = new Intent(Intent.ACTION_MEDIA_BUTTON);
     intent.setData(mediaSession.getImpl().getUri());
     intent.setComponent(new ComponentName(service, service.getClass()));
@@ -130,7 +131,7 @@ import androidx.media3.common.util.Util;
     }
   }
 
-  private int toKeyCode(@Player.Command long action) {
+  static int toKeyCode(@Player.Command long action, boolean playWhenReady) {
     if (action == COMMAND_SEEK_TO_NEXT_MEDIA_ITEM || action == COMMAND_SEEK_TO_NEXT) {
       return KEYCODE_MEDIA_NEXT;
     } else if (action == COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
@@ -143,7 +144,8 @@ import androidx.media3.common.util.Util;
     } else if (action == COMMAND_SEEK_BACK) {
       return KEYCODE_MEDIA_REWIND;
     } else if (action == COMMAND_PLAY_PAUSE) {
-      return KEYCODE_MEDIA_PLAY_PAUSE;
+      // 通知按钮的文案在创建时已固定；同一个 PendingIntent 重发必须保持原动作。
+      return playWhenReady ? KEYCODE_MEDIA_PAUSE : KEYCODE_MEDIA_PLAY;
     }
     return KEYCODE_UNKNOWN;
   }

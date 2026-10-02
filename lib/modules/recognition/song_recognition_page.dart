@@ -11,7 +11,7 @@ import 'package:record/record.dart';
 
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 import 'floating_recognition_service.dart';
 import 'pip_recognition_controller.dart';
 import 'recognition_utils.dart';
@@ -395,40 +395,46 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
 
     return Scaffold(
       appBar: AppBar(title: const Text('听歌识曲')),
-      body: Column(
-        children: [
-          _buildFloatingEntry(colorScheme, textTheme),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                return SingleChildScrollView(
-                  padding: const EdgeInsets.all(24),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      minHeight: constraints.maxHeight - 48,
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        const SizedBox(height: 32),
-                        _buildPulseCircle(colorScheme),
-                        const SizedBox(height: 32),
-                        _buildStatusText(textTheme, colorScheme),
-                        const SizedBox(height: 32),
-                        if (_result != null)
-                          _buildResult(colorScheme, textTheme),
-                        if (_error != null) _buildError(colorScheme, textTheme),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          if (widget.showMiniPlayer) const MiniPlayer(),
-        ],
+      // 悬浮播放器宿主统一承载：二级形态渲染悬浮条，一级 Tab 形态自动退化
+      // 交由主脚手架底部常驻 MiniPlayer（复用 isSecondaryRoutePage 路由栈判据）
+      body: SecondaryMiniPlayerHost(
+        child: _buildRecognitionBody(colorScheme, textTheme),
       ),
+    );
+  }
+
+  Widget _buildRecognitionBody(ColorScheme colorScheme, TextTheme textTheme) {
+    return Column(
+      children: [
+        _buildFloatingEntry(colorScheme, textTheme),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    minHeight: constraints.maxHeight - 48,
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      const SizedBox(height: 32),
+                      _buildPulseCircle(colorScheme),
+                      const SizedBox(height: 32),
+                      _buildStatusText(textTheme, colorScheme),
+                      const SizedBox(height: 32),
+                      if (_result != null) _buildResult(colorScheme, textTheme),
+                      if (_error != null) _buildError(colorScheme, textTheme),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
     );
   }
 

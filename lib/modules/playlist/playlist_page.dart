@@ -3,6 +3,9 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../../core/layout/adaptive_navigator.dart';
+import '../../core/layout/responsive_layout.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/widgets/app_background.dart';
 import '../../data/models/playlist.dart';
@@ -10,16 +13,17 @@ import '../../data/models/song.dart';
 import '../../data/repositories/collected_playlist_store.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
 import '../../providers/favorites_provider.dart';
-import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/playlist_collection_notifier.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
+import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/playlist_comments_view.dart';
 import '../../widgets/keyboard_expand_sheet.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
+import 'playlist_songs_loader.dart';
 
 class PlaylistPage extends StatefulWidget {
   /// 可选扩展：对显示列表应用变换（默认关闭，由私有构建注入，用于筛选等）。
@@ -541,7 +545,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
               children: [
                 // 拖动手柄
                 Container(
-                  margin: const EdgeInsets.only(top: 12),
+                  margin: const EdgeInsets.only(top: AppSpacing.md),
                   width: 40,
                   height: 4,
                   decoration: BoxDecoration(
@@ -552,8 +556,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 // 标题栏
                 Padding(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
+                    horizontal: AppSpacing.lg,
+                    vertical: AppSpacing.md,
                   ),
                   child: Row(
                     children: [
@@ -562,7 +566,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                         size: 20,
                         color: colorScheme.onSurfaceVariant,
                       ),
-                      const SizedBox(width: 8),
+                      const Gap(AppSpacing.sm),
                       Text(
                         '评论',
                         style: Theme.of(context).textTheme.titleMedium
@@ -812,104 +816,20 @@ class _PlaylistPageState extends State<PlaylistPage> {
       _error = null;
     });
     try {
-      // 「我的收藏」里的歌单（listid 是用户订阅的版本）走 listid 接口拿完整歌曲；
-      // 其它歌单（发现页、排行榜、热门歌单）走 globalCollectionId。
-      // 两种情况都强制 forceRefresh，绕过本地代理 2 分钟 apicache，
-      // 避免"换个歌单回来老歌单不刷新"。
-      final api = KugouApiClient();
-      final isLoggedIn = api.isLoggedIn;
-      // 拉取歌曲的 listid 优先级：
-      // 1. subscribedListId（用户订阅/收藏版本的 listid，调 /playlist/track/all/new）
-      // 2. listCreateListid（仅自己创建的歌单有效，收藏别人的歌单这个是原作者的 id）
-      final fetchListid =
-          widget.playlist.subscribedListId ?? widget.playlist.listCreateListid;
-
-      List<Song> all = [];
-      // 追踪 API 是否真的成功过：KugouApiClient._get 在网络异常时返回 null
-      // （吞了 DioException），不抛异常；KugouProvider.getPlaylistTrackAll
-      // 类似，仅设 _error 后吞掉。所以必须主动追踪"有没有成功调用过"。
-      bool apiSucceeded = false;
-      if (isLoggedIn && fetchListid != null && fetchListid.isNotEmpty) {
-        // 已登录 + 有 listid：用 /playlist/track/all/new 拉（仅支持用户创建/收藏的歌单）
-        const int pageSize = 200;
-        const int maxSongs = 9999;
-        // 向上取整，保证能拉到 maxSongs 首（200*50=10000 ≥ 9999）
-        const int maxPages = (maxSongs + pageSize - 1) ~/ pageSize;
-        for (int page = 1; page <= maxPages; page++) {
-          final r = await api.getPlaylistSongsByListid(
-            listid: fetchListid,
-            page: page,
-            pagesize: pageSize,
-            noCache: true,
-          );
-          if (!mounted) return;
-          if (r == null) break;
-          apiSucceeded = true;
-          final batch = r.songs.map((s) => s.toSong()).toList();
-          all.addAll(batch);
-          if (all.length >= maxSongs) {
-            all = all.sublist(0, maxSongs);
-            break;
-          }
-          if (batch.length < pageSize) break;
-        }
-        // listid 接口拉不到歌曲时，回退到用原始歌单的 global_collection_id 拉取
-        // （收藏的歌单 listid 有时失效，用原始歌单的 listCreateGid 才能正确拉取
-        final fallbackGid =
-            widget.playlist.listCreateGid ??
-            (widget.playlist.listCreateListid != null
-                ? null
-                : widget.playlist.id);
-        if (all.isEmpty && fallbackGid != null && fallbackGid.isNotEmpty) {
-          await context.read<KugouProvider>().getPlaylistTrackAll(
-            id: fallbackGid,
-            forceRefresh: true,
-          );
-          if (!mounted) return;
-          all = context
-              .read<KugouProvider>()
-              .currentPlaylistSongs
-              .map((e) => e.toSong())
-              .toList();
-          if (all.isNotEmpty) apiSucceeded = true;
-        }
-      } else if (widget.playlist.id.isNotEmpty) {
-        // 未登录 或 无 listid：用 global_collection_id 调 /playlist/track/all 拉
-        await context.read<KugouProvider>().getPlaylistTrackAll(
-          id: widget.playlist.id,
-          forceRefresh: true,
-        );
-        if (!mounted) return;
-        all = context
-            .read<KugouProvider>()
-            .currentPlaylistSongs
-            .map((e) => e.toSong())
-            .toList();
-        if (all.isNotEmpty) apiSucceeded = true;
-      } else {
-        // 普通歌单（未登录）：走 KugouProvider 的分页聚合（/playlist/track/all，30 一次翻页拉全）
-        await context.read<KugouProvider>().getPlaylistTrackAll(
-          id: widget.playlist.id,
-          forceRefresh: true,
-        );
-        if (!mounted) return;
-        all = context
-            .read<KugouProvider>()
-            .currentPlaylistSongs
-            .map((e) => e.toSong())
-            .toList();
-        if (all.isNotEmpty) apiSucceeded = true;
-      }
-
+      // 复用歌单详情页 / 收藏页共用的加载器（listid / global_collection_id
+      // 接口 + 本地缓存，见 PlaylistSongsLoader），避免两套歌单解析逻辑。
+      final result = await PlaylistSongsLoader.fetch(
+        context,
+        widget.playlist,
+        isInMyFavorites: widget.isInMyFavorites,
+      );
+      if (!mounted) return;
+      final all = result.songs;
       setState(() {
         // 网络拿到数据时正常覆盖；网络空但本地已有 cache 时保留 cache，
         // 避免断网重进歌单时被空响应覆盖掉本地缓存的歌曲
         if (all.isNotEmpty || _songs.isEmpty) {
-          _songs = all.where((song) {
-            // 只过滤标题为空的歌曲；保留时长未知（duration=0）的歌曲，
-            // 部分无版权/信息不全的歌曲（如 "白菊 -shiragiku-"）可能缺少时长字段。
-            return song.title.isNotEmpty && song.title != '-';
-          }).toList();
+          _songs = all;
         }
         _invalidateDisplaySongs();
       });
@@ -920,24 +840,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
           _songs.map((s) => s.id).toList(),
         );
       }
-      // 「我的收藏」里的歌单：成功拉到歌曲时写本地缓存
-      if (apiSucceeded && _songs.isNotEmpty) {
-        final cacheKey = _cacheKey();
-        if (cacheKey != null && cacheKey.isNotEmpty) {
-          FavoriteListsCache.savePlaylistSongs(cacheKey, _songs);
-        }
-      } else if (!apiSucceeded) {
-        // 网络失败（KugouApiClient._get 把异常吞成 null 时走这里）
-        // 有 cache（_songs 非空）保留显示；无 cache 报错
-        if (mounted) {
-          setState(() {
-            if (_songs.isEmpty) {
-              _error = '加载失败，请检查手机网络连接（WiFi / 移动数据）';
-            } else {
-              _error = null;
-            }
-          });
-        }
+      // 缓存写入已由 PlaylistSongsLoader.fetch 处理（同 key）。网络失败
+      // （apiSucceeded=false）时：有 cache 保留显示；无 cache 报错。
+      if (!result.apiSucceeded) {
+        setState(() {
+          if (_songs.isEmpty) {
+            _error = '加载失败，请检查手机网络连接（WiFi / 移动数据）';
+          } else {
+            _error = null;
+          }
+        });
       }
     } catch (e) {
       // 已有本地缓存（_songs 非空）时，吞掉错误，保留 cache 给用户查看
@@ -963,7 +875,34 @@ class _PlaylistPageState extends State<PlaylistPage> {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
-    final displayPlaylist = widget.playlist.copyWith(songs: _songs);
+    // 「我喜欢」（默认收藏）歌单本身无封面：头部封面套用与收藏页一致的
+    // 动态来源——最新收藏歌曲的专辑封面（FavoritesProvider 实时优先，
+    // favorites 本地点红心按新增时间倒序，first 即最新），
+    // 回退到已加载歌单的最新收藏封面（云端正序取末），最后才用歌单自带封面。
+    // 始终优先「最新收藏」，不再因云端返回了非空默认封面而跳过动态解析
+    // （见改版计划补充二）。
+    String? effectiveArtwork = widget.playlist.artworkUri;
+    if (widget.isDefaultFavorite) {
+      final favs = context.watch<FavoritesProvider>().favorites;
+      if (favs.isNotEmpty &&
+          favs.first.artworkUri != null &&
+          favs.first.artworkUri!.isNotEmpty) {
+        effectiveArtwork = favs.first.artworkUri; // 应用内实时最新收藏（倒序取首）
+      } else if (_songs.isNotEmpty) {
+        // 回退：已加载歌单里的最新收藏（云端「我喜欢」歌单接口按收藏时间
+        // **正序**返回——最早在前、最新在最后——故从末尾取带封面的歌）
+        for (final s in _songs.reversed) {
+          if (s.artworkUri != null && s.artworkUri!.isNotEmpty) {
+            effectiveArtwork = s.artworkUri;
+            break;
+          }
+        }
+      }
+    }
+    final displayPlaylist = widget.playlist.copyWith(
+      songs: _songs,
+      artworkUri: effectiveArtwork,
+    );
     final useBackgroundImage = context
         .watch<ThemeProvider>()
         .useBackgroundImage;
@@ -984,7 +923,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
             if (!didPop && _isMultiSelectMode) _exitMultiSelectMode();
           },
           child: Scaffold(
-            body: Column(
+            body: SecondaryMiniPlayerHost(
+              child: Column(
               children: [
                 if (_isLoading)
                   const Expanded(child: Center(child: M3ELoadingIndicator()))
@@ -1019,7 +959,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
                             displayPlaylist.description!.isNotEmpty)
                           SliverToBoxAdapter(
                             child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                              padding: const EdgeInsets.fromLTRB(
+                                AppSpacing.lg,
+                                AppSpacing.sm,
+                                AppSpacing.lg,
+                                0,
+                              ),
                               child: GestureDetector(
                                 onTap: () {
                                   setState(() {
@@ -1029,11 +974,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                 },
                                 child: Container(
                                   width: double.infinity,
-                                  padding: const EdgeInsets.all(12),
+                                  padding: const EdgeInsets.all(AppSpacing.md),
                                   decoration: BoxDecoration(
                                     color: colorScheme.surfaceContainerHighest
                                         .withValues(alpha: 0.5),
-                                    borderRadius: BorderRadius.circular(12),
+                                    borderRadius: AppRadius.mdAll,
                                   ),
                                   child: Column(
                                     crossAxisAlignment:
@@ -1072,7 +1017,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                           ),
                                         ],
                                       ),
-                                      const SizedBox(height: 8),
+                                      const Gap(AppSpacing.sm),
                                       AnimatedSize(
                                         duration: const Duration(
                                           milliseconds: 250,
@@ -1104,7 +1049,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
                         if (!_isMultiSelectMode && _isSearching)
                           SliverToBoxAdapter(
                             child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                              padding: const EdgeInsets.fromLTRB(
+                                AppSpacing.lg,
+                                AppSpacing.sm,
+                                AppSpacing.lg,
+                                0,
+                              ),
                               child: TextField(
                                 controller: _searchController,
                                 focusNode: _searchFocusNode,
@@ -1127,12 +1077,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                   fillColor: colorScheme.surfaceContainerHighest
                                       .withValues(alpha: 0.5),
                                   border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(28),
+                                    borderRadius: AppRadius.xlAll,
                                     borderSide: BorderSide.none,
                                   ),
                                   contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 16,
-                                    vertical: 12,
+                                    horizontal: AppSpacing.lg,
+                                    vertical: AppSpacing.md,
                                   ),
                                 ),
                                 onChanged: (value) {
@@ -1148,8 +1098,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           SliverToBoxAdapter(
                             child: Padding(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 8,
+                                horizontal: AppSpacing.lg,
+                                vertical: AppSpacing.sm,
                               ),
                               child: Row(
                                 children: [
@@ -1169,7 +1119,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                       ),
                                     ),
                                   ),
-                                  const SizedBox(width: 12),
+                                  const Gap(AppSpacing.md),
                                   Expanded(
                                     child: OutlinedButton.icon(
                                       onPressed: () {
@@ -1191,7 +1141,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                   // 「我收藏」和「我创建的歌单」可通过长按删除，隐藏红心。
                                   if (!widget.isInMyFavorites &&
                                       !widget.isUserCreated) ...[
-                                    const SizedBox(width: 12),
+                                    const Gap(AppSpacing.md),
                                     IconButton.filledTonal(
                                       onPressed: _isCollected
                                           ? _uncollectPlaylist
@@ -1210,11 +1160,50 @@ class _PlaylistPageState extends State<PlaylistPage> {
                               ),
                             ),
                           ),
-                        SliverList(
-                          delegate: SliverChildBuilderDelegate((
-                            context,
-                            index,
-                          ) {
+                        // 歌曲列表：改用 m3e_core 分段列表（试点）。
+                        // 这里用 sliver 变体 SliverM3ESegmentedList 替换原 SliverList：
+                        // 它同样基于 SliverChildBuilderDelegate 懒构建、不引入嵌套
+                        // Scrollable，所以 _scrollController 折叠逻辑与
+                        // Scrollable.ensureVisible 定位链路完全不受影响。
+                        // 分段项自带卡片背景/圆角/内边距，这里全部置零——行内已有
+                        // 自己的内边距（水平 10 / 垂直 6）且背景透明，避免出现
+                        // 双层留白与多余底色。行本身无自带圆角，故无双层圆角。
+                        SliverM3ESegmentedList(
+                          itemCount: _displaySongs.length,
+                          outerRadius: 0,
+                          innerRadius: 0,
+                          gap: 0,
+                          padding: EdgeInsets.zero,
+                          color: Colors.transparent,
+                          // 悬停底色：M3E 分段项会先用该色铺容器底色、再把它作为
+                          // InkWell 悬停色叠一层，故取主题悬停色的一半——两层叠加
+                          // 后 ≈ 原行内 InkWell 的单层悬停高亮；若传 null 会铺
+                          // surfaceContainerHigh 大块实色，离现状更远。
+                          hoverColor: Theme.of(context).hoverColor.withValues(
+                            alpha: Theme.of(context).hoverColor.a / 2,
+                          ),
+                          // 聚焦不铺底色（聚焦反馈由 M3E 焦点环提供）
+                          focusColor: Colors.transparent,
+                          // 点击/长按统一由列表级手势接管（分段项 InkWell 负责
+                          // M3E 触觉）：行内不再挂手势，否则行内 InkWell 会在
+                          // gesture arena 中胜出，列表级回调永远不会触发。
+                          // enableFeedback: false 关闭 InkWell 自带的平台反馈，
+                          // 保证一次点击只发一次 M3E light 触觉（与原来一致）。
+                          enableFeedback: false,
+                          haptic: M3EHapticFeedback.light,
+                          onTap: (index) {
+                            final song = _displaySongs[index];
+                            if (_isMultiSelectMode) {
+                              _toggleSongSelection(song.id);
+                            } else {
+                              context
+                                  .read<PlayerProvider>()
+                                  .playOnlinePlaylist(_displaySongs, index);
+                            }
+                          },
+                          onLongPress: (index) =>
+                              _enterMultiSelectMode(_displaySongs[index].id),
+                          itemBuilder: (context, index) {
                             final song = _displaySongs[index];
                             final isHighlighted = _highlightSongId == song.id;
                             final isSelected = _selectedSongIds.contains(
@@ -1235,19 +1224,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                 song: song,
                                 isSelectMode: _isMultiSelectMode,
                                 isSelected: isSelected,
-                                onLongPress: () =>
-                                    _enterMultiSelectMode(song.id),
-                                onSelectToggle: () =>
-                                    _toggleSongSelection(song.id),
-                                onTap: () {
-                                  context
-                                      .read<PlayerProvider>()
-                                      .playOnlinePlaylist(_displaySongs, index);
-                                },
                                 onMoreTap: () {},
                               ),
                             );
-                          }, childCount: _displaySongs.length),
+                          },
                         ),
                         // 搜索无结果提示
                         if (!_isMultiSelectMode &&
@@ -1256,7 +1236,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                             _songs.isNotEmpty)
                           SliverToBoxAdapter(
                             child: Padding(
-                              padding: const EdgeInsets.all(32),
+                              padding: const EdgeInsets.all(AppSpacing.xxl),
                               child: Column(
                                 children: [
                                   Icon(
@@ -1265,7 +1245,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                     color: colorScheme.onSurfaceVariant
                                         .withValues(alpha: 0.5),
                                   ),
-                                  const SizedBox(height: 8),
+                                  const Gap(AppSpacing.sm),
                                   Text(
                                     '没有找到「$_searchQuery」相关的歌曲',
                                     style: textTheme.bodyMedium?.copyWith(
@@ -1284,10 +1264,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
                       ],
                     ),
                   ),
-                  const MiniPlayer(),
                 ],
               ],
             ),
+              ),
           ),
         );
       },
@@ -1347,11 +1327,18 @@ class _PlaylistPageState extends State<PlaylistPage> {
             tooltip: '相似歌单',
           ),
         if (_songs.isNotEmpty)
-          PopupMenuButton<_SortBy>(
-            icon: const Icon(Icons.sort),
-            onSelected: (value) {
+          M3ESortButton<_SortBy>(
+            tooltip: '排序',
+            current: _sortBy,
+            options: const [
+              (value: _SortBy.time, label: '添加时间'),
+              (value: _SortBy.title, label: '歌曲名称'),
+              (value: _SortBy.duration, label: '时长'),
+            ],
+            onPicked: (value, repeated) {
               setState(() {
-                if (_sortBy == value) {
+                if (repeated) {
+                  // 再次点当前项 → 翻转升/降序
                   _sortAscending = !_sortAscending;
                 } else {
                   _sortBy = value;
@@ -1360,62 +1347,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 _invalidateDisplaySongs();
               });
             },
-            itemBuilder: (context) => [
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.time,
-                checked: _sortBy == _SortBy.time,
-                child: Row(
-                  children: [
-                    const Text('添加时间'),
-                    if (_sortBy == _SortBy.time) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending
-                            ? Icons.arrow_upward
-                            : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.title,
-                checked: _sortBy == _SortBy.title,
-                child: Row(
-                  children: [
-                    const Text('歌曲名称'),
-                    if (_sortBy == _SortBy.title) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending
-                            ? Icons.arrow_upward
-                            : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              CheckedPopupMenuItem<_SortBy>(
-                value: _SortBy.duration,
-                checked: _sortBy == _SortBy.duration,
-                child: Row(
-                  children: [
-                    const Text('时长'),
-                    if (_sortBy == _SortBy.duration) ...[
-                      const Spacer(),
-                      Icon(
-                        _sortAscending
-                            ? Icons.arrow_upward
-                            : Icons.arrow_downward,
-                        size: 16,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ],
           ),
       ],
       // pinned 后顶栏标题：折叠后 fade-in（AnimatedOpacity 200ms 过渡）
@@ -1521,12 +1452,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
                   ),
                   child: SafeArea(
                     child: Padding(
-                      padding: const EdgeInsets.fromLTRB(24, 48, 24, 16),
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpacing.xl,
+                        AppSpacing.xxxl,
+                        AppSpacing.xl,
+                        AppSpacing.lg,
+                      ),
                       child: Row(
                         crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
                           ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
+                            borderRadius: AppRadius.mdAll,
                             child: SizedBox(
                               width: coverSize,
                               height: coverSize,
@@ -1592,7 +1528,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                                 fontWeight: FontWeight.bold,
                                               ),
                                         ),
-                                        const SizedBox(height: 4),
+                                        const Gap(AppSpacing.xs),
                                         Text(
                                           '${displayPlaylist.creator ?? ''} · ${_songs.length} 首',
                                           maxLines: 1,
@@ -1625,7 +1561,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 离线时无缓存歌曲的空状态：仅展示歌单元数据，不显示错误页面。
   Widget _buildEmptySongsHint(ColorScheme colorScheme, TextTheme textTheme) {
     return Padding(
-      padding: const EdgeInsets.all(32),
+      padding: const EdgeInsets.all(AppSpacing.xxl),
       child: Column(
         children: [
           Icon(
@@ -1633,7 +1569,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
             size: 48,
             color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           Text(
             _error != null ? '暂无缓存的歌曲' : '暂无歌曲',
             style: textTheme.titleMedium?.copyWith(
@@ -1641,14 +1577,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
             ),
           ),
           if (_error != null) ...[
-            const SizedBox(height: 4),
+            const Gap(AppSpacing.xs),
             Text(
               '联网后下拉刷新即可加载',
               style: textTheme.bodySmall?.copyWith(
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpacing.md),
             FilledButton.tonal(
               onPressed: _fetchSongs,
               child: const Text('重新加载'),
@@ -1668,7 +1604,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     return Material(
       color: colorScheme.errorContainer.withValues(alpha: 0.85),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: 10),
         child: Row(
           children: [
             Icon(
@@ -1676,7 +1612,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
               size: 18,
               color: colorScheme.onErrorContainer,
             ),
-            const SizedBox(width: 8),
+            const Gap(AppSpacing.sm),
             Expanded(
               child: Text(
                 _error ?? '',
@@ -1719,7 +1655,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       child: SafeArea(
         bottom: false,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: AppSpacing.xs),
           child: Row(
             children: [
               IconButton(
@@ -1737,7 +1673,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
               ),
               if (_isDeleting)
                 const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 12),
+                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
                   child: M3ELoadingIndicator(
                     constraints: BoxConstraints.tightFor(width: 20, height: 20),
                   ),
@@ -1916,7 +1852,7 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
       children: [
         // 拖动手柄
         Container(
-          margin: const EdgeInsets.only(top: 12),
+          margin: const EdgeInsets.only(top: AppSpacing.md),
           width: 40,
           height: 4,
           decoration: BoxDecoration(
@@ -1926,11 +1862,11 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
         ),
         // 标题栏
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
           child: Row(
             children: [
               Icon(Icons.auto_awesome, size: 20, color: cs.onSurfaceVariant),
-              const SizedBox(width: 8),
+              const Gap(AppSpacing.sm),
               Text(
                 '相似歌单',
                 style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
@@ -1961,12 +1897,12 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
               size: 48,
               color: cs.onSurfaceVariant.withValues(alpha: 0.4),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               _error!,
               style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             TextButton(onPressed: _load, child: const Text('重试')),
           ],
         ),
@@ -1982,7 +1918,7 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
               size: 48,
               color: cs.onSurfaceVariant.withValues(alpha: 0.4),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '暂无相似歌单',
               style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
@@ -1993,14 +1929,14 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
     }
     return ListView.builder(
       controller: widget.scrollController,
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
       itemCount: _playlists.length,
       itemBuilder: (context, i) {
         final pl = _playlists[i];
         final cleanName = pl.name.replaceAll(RegExp(r'<[^>]*>'), '');
         return ListTile(
           leading: ClipRRect(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: AppRadius.smAll,
             child: SizedBox(
               width: 48,
               height: 48,
@@ -2016,14 +1952,25 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
           title: Text(cleanName, maxLines: 2, overflow: TextOverflow.ellipsis),
           subtitle: pl.songCount > 0 ? Text('${pl.songCount} 首歌曲') : null,
           onTap: () {
-            // 先取 navigator 再 pop，避免 pop 后使用已销毁的 context
-            final navigator = Navigator.of(context);
-            navigator.pop();
-            navigator.push(
-              MaterialPageRoute(
-                builder: (_) => PlaylistPage(playlist: pl.toPlaylist()),
-              ),
-            );
+            final target = pl.toPlaylist();
+            if (isDesktopLayout(context)) {
+              // 桌面双栏：在详情 pane 内前进到相似歌单，浏览器式前进/后退接管；
+              // 不在 pane 作用域时 openDetail 自动回落为中央 Navigator push。
+              AdaptiveNav.openDetail(
+                context,
+                (_) => PlaylistPage(playlist: target),
+              );
+            } else {
+              // 手机：保留「替换当前歌单」语义，避免相似歌单链式堆栈。
+              // 先取 navigator 再 pop，避免 pop 后使用已销毁的 context。
+              final navigator = Navigator.of(context);
+              navigator.pop();
+              navigator.push(
+                MaterialPageRoute(
+                  builder: (_) => PlaylistPage(playlist: target),
+                ),
+              );
+            }
           },
         );
       },

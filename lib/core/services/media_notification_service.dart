@@ -1,5 +1,28 @@
 import 'package:flutter/services.dart';
 
+/// 为原生重试提供有界的命令去重，并且只确认实际交给回调的命令。
+class MediaCommandAckRouter {
+  MediaCommandAckRouter({this.maxRememberedCommands = 64});
+
+  final int maxRememberedCommands;
+  final Set<int> _handledCommandIds = <int>{};
+  final List<int> _handledOrder = <int>[];
+
+  bool dispatch(int? commandId, void Function()? callback) {
+    if (commandId == null || callback == null) return false;
+    if (_handledCommandIds.contains(commandId)) return true;
+    // 回调同步成功返回后才确认并记入去重表。若回调抛错，原生端会以同一
+    // commandId 重试；提前记账会让重试被当作重复命令吞掉。
+    callback();
+    _handledCommandIds.add(commandId);
+    _handledOrder.add(commandId);
+    while (_handledOrder.length > maxRememberedCommands) {
+      _handledCommandIds.remove(_handledOrder.removeAt(0));
+    }
+    return true;
+  }
+}
+
 class MediaNotificationService {
   static const MethodChannel _channel = MethodChannel(
     'com.md3music.md3music/floating_lyric',
@@ -32,25 +55,49 @@ class MediaNotificationService {
   static void Function()? onWidgetFmOpenLogin;
   // 屏幕亮灭（FloatingLyricService SCREEN_OFF/ON 广播转发）
   static void Function(bool on)? onScreenStateChanged;
+  static final MediaCommandAckRouter _mediaCommandAckRouter =
+      MediaCommandAckRouter();
+
+  static int? _commandIdFromArguments(Object? arguments) {
+    if (arguments is! Map) return null;
+    final commandId = arguments['commandId'];
+    return commandId is int ? commandId : null;
+  }
 
   static void initCallbacks() {
     _channel.setMethodCallHandler((call) async {
       switch (call.method) {
         case 'previous':
-          onPrevious?.call();
-          break;
+          return _mediaCommandAckRouter.dispatch(
+            _commandIdFromArguments(call.arguments),
+            onPrevious,
+          );
         case 'next':
-          onNext?.call();
-          break;
+          return _mediaCommandAckRouter.dispatch(
+            _commandIdFromArguments(call.arguments),
+            onNext,
+          );
         case 'togglePlayPause':
-          onTogglePlayPause?.call();
-          break;
+          return _mediaCommandAckRouter.dispatch(
+            _commandIdFromArguments(call.arguments),
+            onTogglePlayPause,
+          );
         case 'play':
-          onPlay?.call();
-          break;
+          return _mediaCommandAckRouter.dispatch(
+            _commandIdFromArguments(call.arguments),
+            onPlay,
+          );
         case 'pause':
-          onPause?.call();
-          break;
+          // just_audio fork 从 Media3 onPlayerCommandRequest 转来的同步暂停没有
+          // commandId；它与原生队列重试不同，直接交给 Provider 使在途换源失效。
+          final commandId = _commandIdFromArguments(call.arguments);
+          if (commandId == null) {
+            final callback = onPause;
+            if (callback == null) return false;
+            callback();
+            return true;
+          }
+          return _mediaCommandAckRouter.dispatch(commandId, onPause);
         case 'seekTo':
           final pos = call.arguments as int?;
           if (pos != null) onSeekTo?.call(pos);

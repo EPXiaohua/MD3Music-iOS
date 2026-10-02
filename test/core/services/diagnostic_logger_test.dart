@@ -41,6 +41,23 @@ void main() {
     );
   });
 
+  test('诊断文本保留上下文并清理 URI 与凭证字段', () {
+    final sanitized = DiagnosticLogger.sanitizeDiagnosticText(
+      'load failed url=https://media.example/song.mp3?token=abc '
+      'Authorization: Bearer secret cookie="sid=private" '
+      'content://media/external/audio/123',
+    );
+
+    expect(sanitized, contains('load failed'));
+    expect(sanitized, contains('[URI_REDACTED]'));
+    expect(sanitized, contains('Authorization: [REDACTED]'));
+    expect(sanitized, contains('cookie="[REDACTED]"'));
+    expect(sanitized, contains('https://media.example/[URI_REDACTED]'));
+    expect(sanitized, isNot(contains('/song.mp3')));
+    expect(sanitized, isNot(contains('secret')));
+    expect(sanitized, isNot(contains('sid=private')));
+  });
+
   test('init 后日志写入文件', () async {
     await DiagnosticLogger.instance.init(dir: tempDir);
     DiagnosticLogger.instance.i('hello world');

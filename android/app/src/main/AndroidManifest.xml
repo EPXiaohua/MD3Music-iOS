@@ -62,10 +62,6 @@
               android:name="io.flutter.embedding.android.NormalTheme"
               android:resource="@style/NormalTheme"
               />
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
-            </intent-filter>
             <!-- 外部调用：文件管理器等以 ACTION_VIEW 打开音频文件。
                  同时接收 content://（MediaStore / SAF）与 file:// 两种 scheme；
                  MIME 覆盖 audio/* 与常见的 ogg/opus 容器类型。
@@ -81,6 +77,31 @@
                 <data android:mimeType="application/opus" />
             </intent-filter>
         </activity>
+        <!-- 两个 launcher alias 共用 MainActivity，运行时始终只启用一个，供用户切换桌面图标。 -->
+        <activity-alias
+            android:name=".LauncherModernIcon"
+            android:targetActivity=".MainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="MD3Music">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherLegacyIcon"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher_legacy_cropped"
+            android:label="MD3Music">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
         <service
             android:name=".AudioPlaybackService"
             android:foregroundServiceType="mediaPlayback"

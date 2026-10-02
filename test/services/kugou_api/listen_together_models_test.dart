@@ -27,7 +27,9 @@ void main() {
       final v = unwrapListenPayload({'data': '[{"hash": "H"}]'});
       expect(v, isA<List<dynamic>>());
       // 多层 data 包裹 → 全部解开后交给 extractList 取数组
-      final nested = unwrapListenPayload({'data': '{"data": {"list": [{"hash": "H"}]}}'});
+      final nested = unwrapListenPayload({
+        'data': '{"data": {"list": [{"hash": "H"}]}}',
+      });
       expect(extractList(nested), hasLength(1));
     });
 
@@ -56,30 +58,35 @@ void main() {
     });
 
     test('extractRoomId 顶层直取、嵌套递归、数值兜底仅限顶层', () {
-      expect(extractRoomId({
-        'data': {'groupid': 'G1'},
-      }), 'G1');
-      expect(extractRoomId({
-        'data': {
-          'room': {'room_id': 'G2'},
-        },
-      }), 'G2');
+      expect(
+        extractRoomId({
+          'data': {'groupid': 'G1'},
+        }),
+        'G1',
+      );
+      expect(
+        extractRoomId({
+          'data': {
+            'room': {'room_id': 'G2'},
+          },
+        }),
+        'G2',
+      );
       expect(extractRoomId('G3'), 'G3');
       // 嵌套数值（join_time 等）不能被当房间号
-      expect(extractRoomId({
-        'data': {'join_time': 1700000000},
-      }), '');
+      expect(
+        extractRoomId({
+          'data': {'join_time': 1700000000},
+        }),
+        '',
+      );
     });
 
     test('readNestedString / readNestedInt / readNestedFlag 支持任意深度与数组', () {
       final payload = {
         'data': {
           'list': [
-            {
-              'list_version': 'v9',
-              'quantity': 42,
-              'room_state': 1,
-            },
+            {'list_version': 'v9', 'quantity': 42, 'room_state': 1},
           ],
         },
       };
@@ -88,7 +95,12 @@ void main() {
       expect(readNestedFlag(payload, 'room_state'), isTrue);
       expect(readNestedFlag(payload, 'missing'), isFalse);
       // 嵌套数值（时间戳）不会被 readNestedInt 误认为是缺失字段的兜底
-      expect(readNestedInt({'data': {'join_time': 0}}, 'quantity'), 0);
+      expect(
+        readNestedInt({
+          'data': {'join_time': 0},
+        }, 'quantity'),
+        0,
+      );
     });
 
     test('toMs 秒与毫秒归一', () {
@@ -144,9 +156,18 @@ void main() {
     });
 
     test('is_hide=1 或 room_status=0 视为已关闭', () {
-      expect(MusicRoomBrief.fromJson({'room_id': 'a', 'is_hide': 1}).closed, isTrue);
-      expect(MusicRoomBrief.fromJson({'room_id': 'b', 'room_status': 0}).closed, isTrue);
-      expect(MusicRoomBrief.fromJson({'room_id': 'c', 'room_status': 1}).closed, isFalse);
+      expect(
+        MusicRoomBrief.fromJson({'room_id': 'a', 'is_hide': 1}).closed,
+        isTrue,
+      );
+      expect(
+        MusicRoomBrief.fromJson({'room_id': 'b', 'room_status': 0}).closed,
+        isTrue,
+      );
+      expect(
+        MusicRoomBrief.fromJson({'room_id': 'c', 'room_status': 1}).closed,
+        isFalse,
+      );
     });
 
     test('解析广场真实结构：room_info.pic 房间图与 album_info 专辑封面', () {
@@ -167,7 +188,8 @@ void main() {
         'room_info': {
           'room_theme': '',
           'member_count': 2,
-          'pic': 'https://youthimgbssdl.kugou.com/f03da9cccc2d56529252aa317a86640e.webp',
+          'pic':
+              'https://youthimgbssdl.kugou.com/f03da9cccc2d56529252aa317a86640e.webp',
           'roomid': '1554083409834407307',
         },
         'user_info': {'userid': 2366194698, 'nick_name': 'Amaterasu'},
@@ -181,10 +203,14 @@ void main() {
       expect(room.ownerId, '2366194698');
       expect(room.ownerName, 'Amaterasu');
       expect(room.currentSongName, '割心');
-      expect(room.backgroundUrl,
-          'https://youthimgbssdl.kugou.com/f03da9cccc2d56529252aa317a86640e.webp');
-      expect(room.currentSongCover,
-          'http://imge.kugou.com/stdmusic/400/20241206/20241206175557508526.jpg');
+      expect(
+        room.backgroundUrl,
+        'https://youthimgbssdl.kugou.com/f03da9cccc2d56529252aa317a86640e.webp',
+      );
+      expect(
+        room.currentSongCover,
+        'https://imge.kugou.com/stdmusic/400/20241206/20241206175557508526.jpg',
+      );
       // 缩略图优先歌曲封面
       expect(room.thumbnailUrl, room.currentSongCover);
     });
@@ -232,7 +258,10 @@ void main() {
     });
 
     test('duration 为毫秒时归一为秒', () {
-      expect(RoomSong.fromJson({'hash': 'H', 'duration': 269000}).durationSeconds, 269);
+      expect(
+        RoomSong.fromJson({'hash': 'H', 'duration': 269000}).durationSeconds,
+        269,
+      );
     });
 
     test('genting_hash 作为备用身份，hash 缺失时顶替', () {
@@ -243,29 +272,64 @@ void main() {
 
     test('sameAs 按 hash、genting_hash、mixSongId 全键比对', () {
       const a = RoomSong(
-        hash: 'A', originalHash: 'GA', mixSongId: '1', name: '', singer: '',
-        durationSeconds: 0, coverUrl: '', orderUserId: '',
+        hash: 'A',
+        originalHash: 'GA',
+        mixSongId: '1',
+        name: '',
+        singer: '',
+        durationSeconds: 0,
+        coverUrl: '',
+        orderUserId: '',
       );
       const b = RoomSong(
-        hash: 'B', originalHash: 'GA', mixSongId: '2', name: '', singer: '',
-        durationSeconds: 0, coverUrl: '', orderUserId: '',
+        hash: 'B',
+        originalHash: 'GA',
+        mixSongId: '2',
+        name: '',
+        singer: '',
+        durationSeconds: 0,
+        coverUrl: '',
+        orderUserId: '',
       );
       const c = RoomSong(
-        hash: 'C', originalHash: '', mixSongId: '1', name: '', singer: '',
-        durationSeconds: 0, coverUrl: '', orderUserId: '',
+        hash: 'C',
+        originalHash: '',
+        mixSongId: '1',
+        name: '',
+        singer: '',
+        durationSeconds: 0,
+        coverUrl: '',
+        orderUserId: '',
       );
       const d = RoomSong(
-        hash: 'D', originalHash: '', mixSongId: '9', name: '', singer: '',
-        durationSeconds: 0, coverUrl: '', orderUserId: '',
+        hash: 'D',
+        originalHash: '',
+        mixSongId: '9',
+        name: '',
+        singer: '',
+        durationSeconds: 0,
+        coverUrl: '',
+        orderUserId: '',
       );
       expect(a.sameAs(b), isTrue); // 共享 genting_hash
       expect(a.sameAs(c), isTrue); // 共享 mixSongId
       expect(a.sameAs(d), isFalse);
       // 大小写不敏感
-      expect(a.sameAs(const RoomSong(
-        hash: 'a', originalHash: '', mixSongId: '', name: '', singer: '',
-        durationSeconds: 0, coverUrl: '', orderUserId: '',
-      )), isTrue);
+      expect(
+        a.sameAs(
+          const RoomSong(
+            hash: 'a',
+            originalHash: '',
+            mixSongId: '',
+            name: '',
+            singer: '',
+            durationSeconds: 0,
+            coverUrl: '',
+            orderUserId: '',
+          ),
+        ),
+        isTrue,
+      );
     });
   });
 
@@ -277,8 +341,14 @@ void main() {
       expect(PlayerSyncState.fromJson({'pause': '1'}).isPlaying, isTrue);
       expect(PlayerSyncState.fromJson({'pause': '2'}).isPlaying, isFalse);
       // 无 pause 时回落状态串 / is_playing
-      expect(PlayerSyncState.fromJson({'play_status': 'pause'}).isPlaying, isFalse);
-      expect(PlayerSyncState.fromJson({'play_status': 'playing'}).isPlaying, isTrue);
+      expect(
+        PlayerSyncState.fromJson({'play_status': 'pause'}).isPlaying,
+        isFalse,
+      );
+      expect(
+        PlayerSyncState.fromJson({'play_status': 'playing'}).isPlaying,
+        isTrue,
+      );
       expect(PlayerSyncState.fromJson({'is_playing': true}).isPlaying, isTrue);
     });
 
@@ -296,7 +366,10 @@ void main() {
             'album_audio_id': '937333852',
           },
           'song_info': [
-            {'hash': 'da730299a806d0410ed1494d0ffef616', 'album_audio_id': '937333852'},
+            {
+              'hash': 'da730299a806d0410ed1494d0ffef616',
+              'album_audio_id': '937333852',
+            },
           ],
           'pause': '1',
         },
@@ -324,9 +397,18 @@ void main() {
     });
 
     test('进度秒/毫秒归一：>10000 视为毫秒', () {
-      expect(PlayerSyncState.fromJson({'hash': 'H', 'progress': 30000}).progressMs, 30000);
-      expect(PlayerSyncState.fromJson({'hash': 'H', 'progress': 30}).progressMs, 30000);
-      expect(PlayerSyncState.fromJson({'hash': 'H', 'progress': 0}).progressMs, 0);
+      expect(
+        PlayerSyncState.fromJson({'hash': 'H', 'progress': 30000}).progressMs,
+        30000,
+      );
+      expect(
+        PlayerSyncState.fromJson({'hash': 'H', 'progress': 30}).progressMs,
+        30000,
+      );
+      expect(
+        PlayerSyncState.fromJson({'hash': 'H', 'progress': 0}).progressMs,
+        0,
+      );
     });
 
     test('快照时间戳：秒转毫秒；与当前时间差超 60s 的可疑值回退为解析时刻', () {
@@ -347,9 +429,7 @@ void main() {
     test('list_version 可从嵌套结构读取', () {
       final s = PlayerSyncState.fromJson({
         'hash': 'H',
-        'data': {
-          'list_version': 'v12',
-        },
+        'data': {'list_version': 'v12'},
       });
       expect(s.listVersion, 'v12');
     });
@@ -400,7 +480,12 @@ void main() {
     test('801 普通消息取 alert；系统消息按码表生成文案', () {
       final m = ChatMessage.fromJson({
         'id': 'm1',
-        'msg': {'msgtype': 801, 'alert': '你好', 'nickname': 'A', 'img': 'https://x/a.jpg'},
+        'msg': {
+          'msgtype': 801,
+          'alert': '你好',
+          'nickname': 'A',
+          'img': 'https://x/a.jpg',
+        },
         'addtime': 1700000000,
       });
       expect(m.isSystem, isFalse);
@@ -472,7 +557,10 @@ void main() {
     });
 
     test('标签缺失时 tagRoomId 为空（本地合成消息无标签）', () {
-      final m = ChatMessage.fromJson({'msgid': 'z', 'msg': {'msgtype': 4001, 'nickname': 'A'}});
+      final m = ChatMessage.fromJson({
+        'msgid': 'z',
+        'msg': {'msgtype': 4001, 'nickname': 'A'},
+      });
       expect(m.roomTag, isEmpty);
       expect(m.tagRoomId, isEmpty);
     });
@@ -480,16 +568,16 @@ void main() {
 
   group('scopeMessagesToRoom（跨房间聊天隔离）', () {
     ChatMessage msg(String id, {String tag = ''}) => ChatMessage(
-          id: id,
-          userId: 'u',
-          text: 'x',
-          nickname: 'n',
-          avatar: '',
-          type: 801,
-          timestampMs: 1,
-          isSystem: false,
-          roomTag: tag,
-        );
+      id: id,
+      userId: 'u',
+      text: 'x',
+      nickname: 'n',
+      avatar: '',
+      type: 801,
+      timestampMs: 1,
+      isSystem: false,
+      roomTag: tag,
+    );
 
     test('只保留当前房间与本地的消息', () {
       final list = [
@@ -497,14 +585,14 @@ void main() {
         msg('b', tag: 'rm_1009:ROOM_B'),
         msg('c'), // 本地合成（无标签）→ 保留
       ];
-      expect(
-        scopeMessagesToRoom(list, 'ROOM_B').map((m) => m.id).toList(),
-        ['b', 'c'],
-      );
-      expect(
-        scopeMessagesToRoom(list, 'ROOM_A').map((m) => m.id).toList(),
-        ['a', 'c'],
-      );
+      expect(scopeMessagesToRoom(list, 'ROOM_B').map((m) => m.id).toList(), [
+        'b',
+        'c',
+      ]);
+      expect(scopeMessagesToRoom(list, 'ROOM_A').map((m) => m.id).toList(), [
+        'a',
+        'c',
+      ]);
     });
 
     test('房间号为空时原样返回', () {
@@ -518,14 +606,26 @@ void main() {
       final now = DateTime.now().millisecondsSinceEpoch;
       const dur = 200000;
       final playing = PlayerSyncState(
-        hash: 'H', originalHash: '', mixSongId: '1', isPlaying: true,
-        progressMs: 10000, durationMs: dur, listVersion: 'v', updatedAtMs: now - 2000,
+        hash: 'H',
+        originalHash: '',
+        mixSongId: '1',
+        isPlaying: true,
+        progressMs: 10000,
+        durationMs: dur,
+        listVersion: 'v',
+        updatedAtMs: now - 2000,
       );
       expect(projectRemotePosition(playing, now), 12000);
 
       final paused = PlayerSyncState(
-        hash: 'H', originalHash: '', mixSongId: '1', isPlaying: false,
-        progressMs: 10000, durationMs: dur, listVersion: 'v', updatedAtMs: now - 2000,
+        hash: 'H',
+        originalHash: '',
+        mixSongId: '1',
+        isPlaying: false,
+        progressMs: 10000,
+        durationMs: dur,
+        listVersion: 'v',
+        updatedAtMs: now - 2000,
       );
       expect(projectRemotePosition(paused, now), 10000);
     });
@@ -564,15 +664,15 @@ void main() {
 
   group('RoomSong.fromSong（播放器歌曲 → 房间曲目身份）', () {
     Song online({String id = 'HASH1', String? albumAudioId = '9001'}) => Song(
-          id: id,
-          title: '晴天.mp3',
-          artist: '周杰伦',
-          album: '叶惠美',
-          duration: const Duration(seconds: 269),
-          isOnline: true,
-          albumAudioId: albumAudioId,
-          artworkUri: 'https://x/c.jpg',
-        );
+      id: id,
+      title: '晴天.mp3',
+      artist: '周杰伦',
+      album: '叶惠美',
+      duration: const Duration(seconds: 269),
+      isOnline: true,
+      albumAudioId: albumAudioId,
+      artworkUri: 'https://x/c.jpg',
+    );
 
     test('在线歌曲映射出 hash / mixSongId 与展示用歌名', () {
       final rs = RoomSong.fromSong(online());
@@ -587,15 +687,17 @@ void main() {
 
     test('本地文件不给 hash —— 调用方据此拒绝入房', () {
       // 本地音乐 id 形如 local_/storage/...，上报上游会变成成员端无法解析的曲目
-      final rs = RoomSong.fromSong(Song(
-        id: 'local_/storage/emulated/0/Music/a.mp3',
-        title: '本地歌',
-        artist: '未知艺术家',
-        album: '',
-        duration: const Duration(seconds: 100),
-        localPath: '/storage/emulated/0/Music/a.mp3',
-        isOnline: false,
-      ));
+      final rs = RoomSong.fromSong(
+        Song(
+          id: 'local_/storage/emulated/0/Music/a.mp3',
+          title: '本地歌',
+          artist: '未知艺术家',
+          album: '',
+          duration: const Duration(seconds: 100),
+          localPath: '/storage/emulated/0/Music/a.mp3',
+          isOnline: false,
+        ),
+      );
       expect(rs.hash, isEmpty);
     });
 
@@ -607,22 +709,22 @@ void main() {
 
   group('roomAudiosFromPlaylist（建房初始歌单过滤）', () {
     Song local(String path) => Song(
-          id: 'local_$path',
-          title: '本地歌.mp3',
-          artist: '未知',
-          album: '',
-          duration: const Duration(seconds: 1),
-          localPath: path,
-          isOnline: false,
-        );
+      id: 'local_$path',
+      title: '本地歌.mp3',
+      artist: '未知',
+      album: '',
+      duration: const Duration(seconds: 1),
+      localPath: path,
+      isOnline: false,
+    );
     Song remote(String hash) => Song(
-          id: hash,
-          title: '在线歌',
-          artist: '歌手',
-          album: '',
-          duration: const Duration(seconds: 1),
-          isOnline: true,
-        );
+      id: hash,
+      title: '在线歌',
+      artist: '歌手',
+      album: '',
+      duration: const Duration(seconds: 1),
+      isOnline: true,
+    );
 
     test('剔除本地音乐，只保留在线曲目', () {
       final list = roomAudiosFromPlaylist([
@@ -643,7 +745,10 @@ void main() {
     });
 
     test('全部为本地音乐时返回空表（建房据此提前拦截）', () {
-      expect(roomAudiosFromPlaylist([local('/a.mp3'), local('/b.mp3')]), isEmpty);
+      expect(
+        roomAudiosFromPlaylist([local('/a.mp3'), local('/b.mp3')]),
+        isEmpty,
+      );
     });
 
     test('limit 限制上报条数（上游单批上限）', () {
@@ -736,7 +841,10 @@ void main() {
       expect(room.toSong(playUrl: '').url, isNull);
       expect(room.toSong(playUrl: '  ').url, isNull);
       expect(room.toSong(playUrl: null).url, isNull);
-      expect(room.toSong(playUrl: 'https://x/play.m4a').url, 'https://x/play.m4a');
+      expect(
+        room.toSong(playUrl: 'https://x/play.m4a').url,
+        'https://x/play.m4a',
+      );
     });
 
     test('fromSong 从播放器歌曲带出 artistId/albumId', () {
@@ -966,19 +1074,23 @@ void main() {
   });
 
   group('RoomSong.matchesRemote', () {
-    RoomSong song({String hash = 'AAA', String original = '', String mix = '9'}) =>
-        RoomSong(
-          hash: hash,
-          originalHash: original,
-          mixSongId: mix,
-          name: '',
-          singer: '',
-          durationSeconds: 0,
-          coverUrl: '',
-          orderUserId: '',
-        );
+    RoomSong song({
+      String hash = 'AAA',
+      String original = '',
+      String mix = '9',
+    }) => RoomSong(
+      hash: hash,
+      originalHash: original,
+      mixSongId: mix,
+      name: '',
+      singer: '',
+      durationSeconds: 0,
+      coverUrl: '',
+      orderUserId: '',
+    );
 
-    PlayerSyncState remote({String hash = 'AAA', String mix = '9'}) => PlayerSyncState(
+    PlayerSyncState remote({String hash = 'AAA', String mix = '9'}) =>
+        PlayerSyncState(
           hash: hash,
           originalHash: '',
           mixSongId: mix,
@@ -994,16 +1106,31 @@ void main() {
     });
 
     test('genting_hash（originalHash）命中', () {
-      expect(song(hash: 'X', original: 'BBB').matchesRemote(remote(hash: 'bbb')), isTrue);
+      expect(
+        song(hash: 'X', original: 'BBB').matchesRemote(remote(hash: 'bbb')),
+        isTrue,
+      );
     });
 
     test('mixSongId 命中', () {
-      expect(song(hash: 'X', mix: '12345').matchesRemote(remote(hash: 'Y', mix: '12345')), isTrue);
+      expect(
+        song(
+          hash: 'X',
+          mix: '12345',
+        ).matchesRemote(remote(hash: 'Y', mix: '12345')),
+        isTrue,
+      );
     });
 
     test('mixSongId 为 0 或空时不参与匹配', () {
-      expect(song(hash: 'X', mix: '0').matchesRemote(remote(hash: 'Y', mix: '0')), isFalse);
-      expect(song(hash: 'X', mix: '').matchesRemote(remote(hash: 'Y', mix: '')), isFalse);
+      expect(
+        song(hash: 'X', mix: '0').matchesRemote(remote(hash: 'Y', mix: '0')),
+        isFalse,
+      );
+      expect(
+        song(hash: 'X', mix: '').matchesRemote(remote(hash: 'Y', mix: '')),
+        isFalse,
+      );
     });
   });
 
@@ -1015,20 +1142,24 @@ void main() {
       int duration = 0,
       String hash = 'AAA',
       String mix = '9',
-    }) =>
-        RoomSong(
-          hash: hash,
-          originalHash: '',
-          mixSongId: mix,
-          name: name,
-          singer: singer,
-          durationSeconds: duration,
-          coverUrl: cover,
-          orderUserId: '',
-        );
+    }) => RoomSong(
+      hash: hash,
+      originalHash: '',
+      mixSongId: mix,
+      name: name,
+      singer: singer,
+      durationSeconds: duration,
+      coverUrl: cover,
+      orderUserId: '',
+    );
 
     test('原始文件名不算「有用歌名」，不得覆盖已富化的干净歌名', () {
-      final cached = s(name: '晴天', singer: '周杰伦', cover: 'http://c.jpg', duration: 269);
+      final cached = s(
+        name: '晴天',
+        singer: '周杰伦',
+        cover: 'http://c.jpg',
+        duration: 269,
+      );
       final incoming = s(name: '周杰伦 - 晴天.mp3');
       final merged = mergeRoomSongPreferRicher(cached, incoming);
       expect(merged.name, '晴天');
@@ -1053,7 +1184,12 @@ void main() {
 
     test('身份字段非空优先，不被合并改写', () {
       final cached = s(hash: 'CACHED', mix: '111');
-      final incoming = s(hash: 'INCOMING', mix: '222', name: '晴天', singer: '周杰伦');
+      final incoming = s(
+        hash: 'INCOMING',
+        mix: '222',
+        name: '晴天',
+        singer: '周杰伦',
+      );
       final merged = mergeRoomSongPreferRicher(cached, incoming);
       expect(merged.hash, 'CACHED');
       expect(merged.mixSongId, '111');
@@ -1085,8 +1221,14 @@ void main() {
     test('按房间号去重，详情覆盖历史，created 覆盖详情', () {
       final r = mergeMyRooms(
         created: [room('a', name: 'created-a')],
-        detailed: [room('a', name: 'detail-a'), room('b')],
-        history: [room('a', name: 'history-a'), room('c')],
+        detailed: [
+          room('a', name: 'detail-a'),
+          room('b'),
+        ],
+        history: [
+          room('a', name: 'history-a'),
+          room('c'),
+        ],
         selfUserId: 'me',
       );
       final byId = {for (final e in r) e.roomId: e};
@@ -1132,7 +1274,12 @@ void main() {
 
     test('全部源为空时返回空列表（不抛异常）', () {
       expect(
-        mergeMyRooms(created: const [], detailed: const [], history: const [], selfUserId: 'me'),
+        mergeMyRooms(
+          created: const [],
+          detailed: const [],
+          history: const [],
+          selfUserId: 'me',
+        ),
         isEmpty,
       );
     });

@@ -1279,10 +1279,22 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
                 : () -> sessionStub.playForControllerInfo(controllerInfo, UNKNOWN_SEQUENCE_NUMBER);
         break;
       case KEYCODE_MEDIA_PLAY:
-        command = () -> sessionStub.playForControllerInfo(controllerInfo, UNKNOWN_SEQUENCE_NUMBER);
+        // 显式播放键重复送达时不再次进入通用 PLAY_PAUSE 命令回调。
+        command =
+            () -> {
+              if (!getPlayerWrapper().getPlayWhenReady()) {
+                sessionStub.playForControllerInfo(controllerInfo, UNKNOWN_SEQUENCE_NUMBER);
+              }
+            };
         break;
       case KEYCODE_MEDIA_PAUSE:
-        command = () -> sessionStub.pauseForControllerInfo(controllerInfo, UNKNOWN_SEQUENCE_NUMBER);
+        // 显式暂停键重复送达时同样保持幂等。
+        command =
+            () -> {
+              if (getPlayerWrapper().getPlayWhenReady()) {
+                sessionStub.pauseForControllerInfo(controllerInfo, UNKNOWN_SEQUENCE_NUMBER);
+              }
+            };
         break;
       case KEYCODE_MEDIA_NEXT: // Fall through.
       case KEYCODE_MEDIA_SKIP_FORWARD:

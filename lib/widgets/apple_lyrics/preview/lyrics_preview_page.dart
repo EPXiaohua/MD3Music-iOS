@@ -8,6 +8,7 @@
 /// - 顶部 PopupMenuButton 提供示例数据一键加载
 library;
 
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences_panel.dart';
@@ -88,7 +89,7 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
             icon: const Icon(Icons.lyrics),
             tooltip: '歌词显示设置',
             onPressed: () {
-              showModalBottomSheet(
+              showM3EModalBottomSheet(
                 context: context,
                 isScrollControlled: true,
                 builder: (context) => SafeArea(

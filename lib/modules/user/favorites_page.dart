@@ -8,15 +8,21 @@ import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/layout/adaptive_content_grid.dart';
+import '../../core/layout/adaptive_navigator.dart';
 import '../../core/layout/page_title_alignment.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
 import '../../data/repositories/settings_repository.dart';
+import '../../providers/favorites_provider.dart';
+import '../../providers/player_provider.dart';
 import '../../providers/playlist_collection_notifier.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../artist/artist_detail_page.dart';
 import '../playlist/playlist_page.dart';
+import '../playlist/playlist_songs_loader.dart';
 import 'import_playlist_page.dart';
 import 'widgets/offline_banner.dart';
 
@@ -57,6 +63,7 @@ class _FavoritesPageState extends State<FavoritesPage>
   // 的场景。dio 拦截器本身会在任意请求失败时即时更新
   // KugouApiClient.networkReachable，这里只兜底"长时间没有任何 dio 调用"。
   Timer? _networkProbeTimer;
+  PlaylistCollectionNotifier? _playlistCollectionNotifier;
 
   // 分组折叠状态
   bool _createdExpanded = true;
@@ -96,6 +103,17 @@ class _FavoritesPageState extends State<FavoritesPage>
   /// 歌单 tab 无法下拉刷新；专辑/歌手 tab 用临时 controller 不受影响。
   final ScrollController _scrollController = ScrollController(keepScrollOffset: false);
 
+  /// 「我喜欢」歌单动态封面：解析出的（歌单接口第一首）专辑封面 URL，
+  /// 持久化到 SharedPreferences，离线启动仍可显示（见改版计划四）。
+  /// App 内最新点红心的歌由 FavoritesProvider 实时优先，二者都缺失时
+  /// 回退歌单接口自带封面。
+  String? _myFavoriteCoverUrl;
+  static const String _kMyFavoriteCoverKey = 'fav_my_favorite_cover_v1';
+  bool _resolvingMyFavoriteCover = false;
+
+  /// 正在「点击封面一键播放」的歌单行下标：封面上显示进度并防重复点击。
+  final Set<int> _coverPlayingIndices = {};
+
   @override
   void initState() {
     super.initState();
@@ -121,9 +139,9 @@ class _FavoritesPageState extends State<FavoritesPage>
       if (!mounted) return;
       setState(() {});
       _loadAllData();
-      context.read<PlaylistCollectionNotifier>().addListener(
-        _onCollectionChanged,
-      );
+      final notifier = context.read<PlaylistCollectionNotifier>();
+      _playlistCollectionNotifier = notifier;
+      notifier.addListener(_onCollectionChanged);
     });
   }
 
@@ -142,9 +160,9 @@ class _FavoritesPageState extends State<FavoritesPage>
 
   @override
   void dispose() {
-    context.read<PlaylistCollectionNotifier>().removeListener(
-      _onCollectionChanged,
-    );
+    _networkProbeTimer?.cancel();
+    _playlistCollectionNotifier?.removeListener(_onCollectionChanged);
+    _playlistCollectionNotifier = null;
     _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     _scrollController.dispose();
@@ -159,6 +177,12 @@ class _FavoritesPageState extends State<FavoritesPage>
       final cachedAlbums = await FavoriteListsCache.readAlbums();
       final cachedArtists = await FavoriteListsCache.readArtists();
       final lastSync = await FavoriteListsCache.readLastSyncTime();
+      // 「我喜欢」缓存封面：离线启动即可显示最近解析出的专辑封面
+      String? cachedCover;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        cachedCover = prefs.getString(_kMyFavoriteCoverKey);
+      } catch (_) {}
       if (!mounted) return;
       final hasAny =
           cachedPlaylists.isNotEmpty ||
@@ -170,6 +194,7 @@ class _FavoritesPageState extends State<FavoritesPage>
           _albums = cachedAlbums;
           _artists = cachedArtists;
           _lastSyncTime = lastSync;
+          _myFavoriteCoverUrl = cachedCover;
           _isLoadingPlaylists = false;
           _isLoadingAlbums = false;
           _isLoadingArtists = false;
@@ -177,6 +202,7 @@ class _FavoritesPageState extends State<FavoritesPage>
       } else {
         setState(() {
           _lastSyncTime = lastSync;
+          _myFavoriteCoverUrl = cachedCover;
         });
       }
     } catch (_) {
@@ -235,6 +261,109 @@ class _FavoritesPageState extends State<FavoritesPage>
       _loadAlbums(noCache: true, showLoading: false),
       _loadArtists(noCache: true, showLoading: false),
     ]);
+    // 歌单就位后解析「我喜欢」动态封面（不阻塞主加载）
+    unawaited(_resolveMyFavoriteCover());
+  }
+
+  /// 找到收藏页里的「我喜欢」默认歌单（name == 我喜欢）。
+  KugouPlaylistBrief? get _myFavoritePlaylist {
+    for (final p in _playlists) {
+      if (p.name == '我喜欢') return p;
+    }
+    return null;
+  }
+
+  /// 解析「我喜欢」动态封面：取该歌单「最新收藏」的专辑封面（改版计划四）
+  /// ——云端歌单接口按收藏时间正序返回，最新在最后，故从**末尾**往前取
+  /// 第一首带封面的歌——写入 SharedPreferences 供离线启动显示。
+  /// App 内最新红心由 FavoritesProvider 在 tile 里实时优先（最新在前）。
+  /// 纯旁路刷新，失败静默，不阻塞任何收藏操作。
+  Future<void> _resolveMyFavoriteCover() async {
+    if (_resolvingMyFavoriteCover) return;
+    final playlist = _myFavoritePlaylist;
+    if (playlist == null) return;
+    _resolvingMyFavoriteCover = true;
+    try {
+      final p = playlist.toPlaylist();
+      // 复用歌单加载器：缓存优先，缓存为空再拉网络（同详情页接口/缓存）
+      var songs = await PlaylistSongsLoader.readCached(
+        p,
+        isInMyFavorites: true,
+      );
+      if (songs.isEmpty) {
+        if (!mounted) return;
+        final r = await PlaylistSongsLoader.fetch(context, p);
+        songs = r.songs;
+      }
+      // 取「最新收藏」的专辑封面。云端「我喜欢」歌单接口按收藏时间
+      // **正序**返回（最早在前、最新在最后），所以取最后一首带封面的歌
+      // 才是最新收藏（改版计划四：接口无可靠时间字段，以列表顺序为准，
+      // 正序取末、倒序取首）；没有则保持回退到歌单自带封面。
+      String? cover;
+      for (final s in songs.reversed) {
+        final art = s.artworkUri;
+        if (art != null && art.isNotEmpty) {
+          cover = art;
+          break;
+        }
+      }
+      if (cover == null || cover == _myFavoriteCoverUrl) return;
+      if (mounted) setState(() => _myFavoriteCoverUrl = cover);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_kMyFavoriteCoverKey, cover);
+      } catch (_) {}
+    } catch (_) {
+      // 忽略：封面解析失败继续用歌单自带封面
+    } finally {
+      _resolvingMyFavoriteCover = false;
+    }
+  }
+
+  /// 点击歌单行左侧封面：加载该歌单并从第一首开始播放（改版计划四）。
+  /// 复用歌单加载器（缓存优先），加载中封面显示进度并防重复点击；
+  /// 失败保留原队列并提示，不进入空播放。
+  Future<void> _playPlaylistFromCover(
+    KugouPlaylistBrief playlist,
+    int index,
+  ) async {
+    if (_coverPlayingIndices.contains(index)) return; // 防重复点击
+    setState(() => _coverPlayingIndices.add(index));
+    try {
+      final p = playlist.toPlaylist();
+      var songs = await PlaylistSongsLoader.readCached(
+        p,
+        isInMyFavorites: true,
+      );
+      if (songs.isEmpty) {
+        if (!mounted) return;
+        final r = await PlaylistSongsLoader.fetch(context, p);
+        songs = r.songs;
+      }
+      if (!mounted) return;
+      if (songs.isEmpty) {
+        showToast('歌单加载失败，请检查网络后重试', long: true);
+        return;
+      }
+      await _recordPlaylistAccess(playlist);
+      if (!mounted) return;
+      // 倒序播放：歌单接口按收藏时间升序返回（最早在前、最新在后），
+      // 反转后从最新收藏开始。用户要求所有歌单封面一键播放均倒序。
+      final ordered = songs.reversed.toList();
+      // 只等到队列构建完成即释放进度环，不等整条 URL 解析/播放链
+      // （playOnlinePlaylist 内部自带 try/catch，失败时会链式 next()，
+      //  若在此 await 整条链，进度环会长期不消失 → 一直转圈）。
+      unawaited(context.read<PlayerProvider>().playOnlinePlaylist(ordered, 0));
+      showToast('开始播放「${playlist.name}」');
+    } catch (_) {
+      if (mounted) showToast('歌单加载失败，请检查网络后重试', long: true);
+    } finally {
+      if (mounted) {
+        setState(() => _coverPlayingIndices.remove(index));
+      } else {
+        _coverPlayingIndices.remove(index);
+      }
+    }
   }
 
   String? get _currentUserId => KugouApiClient().userid;
@@ -290,7 +419,7 @@ class _FavoritesPageState extends State<FavoritesPage>
   }
 
   /// 分组拖拽排序回调：更新内存顺序并立即持久化。
-  /// [newIndex] 已由 onReorderItem 换算为移除后的插入位置，无需再修正。
+  /// [newIndex] 已由拖拽回调换算为移除后的插入位置，无需再修正。
   void _reorderGroup(int group, int oldIndex, int newIndex) {
     // getter 返回的是已排序的新列表副本，可直接原地调整
     final list = group == 1 ? _createdPlaylists : _collectedPlaylists;
@@ -842,7 +971,7 @@ class _FavoritesPageState extends State<FavoritesPage>
               fontWeight: FontWeight.w600,
             ),
             unselectedLabelStyle: textTheme.labelMedium,
-            labelPadding: const EdgeInsets.symmetric(vertical: 2),
+            labelPadding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
             tabs: const [
               Tab(
                 height: 52,
@@ -913,21 +1042,21 @@ class _FavoritesPageState extends State<FavoritesPage>
                 context,
               ).colorScheme.onSurfaceVariant.withValues(alpha: 0.3),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '还没有歌单',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '去发现页找找喜欢的歌单吧',
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             // 空列表时分组标题不渲染，这里补一个新建歌单入口
             FilledButton.tonalIcon(
               onPressed: _showCreatePlaylistDialog,
@@ -957,8 +1086,8 @@ class _FavoritesPageState extends State<FavoritesPage>
           physics: const AlwaysScrollableScrollPhysics(),
           // 底部叠加系统手势条（小横条）高度，避免末项被压住
           padding: EdgeInsets.only(
-            top: 8,
-            bottom: 8 + MediaQuery.paddingOf(context).bottom,
+            top: AppSpacing.sm,
+            bottom: AppSpacing.sm + MediaQuery.paddingOf(context).bottom,
           ),
           children: [
             // 分组标题常驻（即使暂无自建歌单），保证右侧「+」新建入口始终可达
@@ -1018,13 +1147,13 @@ class _FavoritesPageState extends State<FavoritesPage>
             // 底部加载更多指示器
             if (_isLoadingMorePlaylists)
               const Padding(
-                padding: EdgeInsets.all(16),
+                padding: EdgeInsets.all(AppSpacing.lg),
                 child: Center(child: M3ELoadingIndicator()),
               )
             else if (!_hasMorePlaylists &&
                 _playlists.length > _playlistPageSize)
               Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpacing.lg),
                 child: Center(
                   child: Text(
                     '没有更多了',
@@ -1057,10 +1186,113 @@ class _FavoritesPageState extends State<FavoritesPage>
     );
   }
 
+  /// 52×52 圆角封面图（含占位/错误兜底）。
+  Widget _coverImage(String? url, ColorScheme cs) {
+    final placeholder = Container(
+      color: cs.surfaceContainerHighest,
+      child: Icon(Icons.queue_music, size: 24, color: cs.onSurfaceVariant),
+    );
+    if (url == null || url.isEmpty) return placeholder;
+    return CachedNetworkImage(
+      imageUrl: url,
+      memCacheWidth: 156,
+      memCacheHeight: 156,
+      fit: BoxFit.cover,
+      placeholder: (_, _) => placeholder,
+      errorWidget: (_, _, _) => placeholder,
+    );
+  }
+
+  /// 歌单行左侧封面：点击直接从第一首播放（改版计划四）；加载中显示进度环。
+  /// 「我喜欢」歌单动态封面 = App 内最新红心歌曲专辑封面（FavoritesProvider
+  /// 实时优先），回退解析缓存 [_myFavoriteCoverUrl]，再回退歌单自带封面。
+  Widget _buildPlaylistCover(
+    KugouPlaylistBrief playlist,
+    int index,
+    ColorScheme cs,
+  ) {
+    final isMyFavorite = playlist.name == '我喜欢';
+    final reordering = _isCreated(playlist)
+        ? _reorderingGroup == 1
+        : _reorderingGroup == 2;
+    final loading = _coverPlayingIndices.contains(index);
+
+    final Widget cover = isMyFavorite
+        ? Selector<FavoritesProvider, String?>(
+            // FavoritesProvider.favorites 本地点红心按新增时间**倒序**（最新在前，
+            // toggleFavorite insert(0)），取 first 即最新收藏。封面随最新红心实时更新。
+            selector: (_, fav) => fav.favorites.isNotEmpty
+                ? fav.favorites.first.artworkUri
+                : null,
+            builder: (context, newestArt, _) {
+              final url = (newestArt != null && newestArt.isNotEmpty)
+                  ? newestArt
+                  : (_myFavoriteCoverUrl ?? playlist.coverUrl);
+              return _coverImage(url, cs);
+            },
+          )
+        : _coverImage(playlist.coverUrl, cs);
+
+    final clipped = ClipRRect(
+      borderRadius: AppRadius.smAll,
+      child: SizedBox(
+        width: 52,
+        height: 52,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            cover,
+            // 右下角一键播放小三角：提示「点击封面即可从头播放」。
+            // 无底色，仅保留白色三角；叠一层轻微阴影保证在浅色封面上可辨识。
+            // 加载中（进度环覆盖）或管理/排序模式（封面点击被劫持）时隐藏。
+            if (!loading && !_isManaging && !reordering)
+              const Positioned(
+                right: 2,
+                bottom: 2,
+                child: Icon(
+                  Icons.play_arrow_rounded,
+                  size: 20,
+                  color: Colors.white,
+                  shadows: [
+                    Shadow(
+                      color: Colors.black54,
+                      blurRadius: 3,
+                      offset: Offset(0, 1),
+                    ),
+                  ],
+                ),
+              ),
+            if (loading)
+              Container(
+                color: Colors.black.withValues(alpha: 0.45),
+                alignment: Alignment.center,
+                child: const SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+
+    // 管理/排序模式下不劫持封面点击，交给整行的选择/拖拽逻辑
+    if (_isManaging || reordering) return clipped;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: loading ? null : () => _playPlaylistFromCover(playlist, index),
+      child: clipped,
+    );
+  }
+
   Widget _buildPlaylistTile(KugouPlaylistBrief playlist, int index) {
     final colorScheme = Theme.of(context).colorScheme;
     final isSelected = _selectedIndices.contains(index);
-    // 排序模式下禁用点击跳转与长按管理，长按留给 ReorderableListView 拖拽
+    // 排序模式下禁用点击跳转与长按管理，长按留给 M3E 列表的整行拖拽
     final reordering = _isCreated(playlist)
         ? _reorderingGroup == 1
         : _reorderingGroup == 2;
@@ -1081,15 +1313,13 @@ class _FavoritesPageState extends State<FavoritesPage>
             : () async {
                 await _recordPlaylistAccess(playlist);
                 if (!mounted) return;
-                Navigator.push(
+                AdaptiveNav.openDetail(
                   context,
-                  MaterialPageRoute(
-                    builder: (context) => PlaylistPage(
-                      playlist: playlist.toPlaylist(),
-                      isInMyFavorites: true,
-                      isUserCreated: _isCreated(playlist),
-                      isDefaultFavorite: playlist.name == '我喜欢',
-                    ),
+                  (_) => PlaylistPage(
+                    playlist: playlist.toPlaylist(),
+                    isInMyFavorites: true,
+                    isUserCreated: _isCreated(playlist),
+                    isDefaultFavorite: playlist.name == '我喜欢',
                   ),
                 );
               },
@@ -1100,7 +1330,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                 setState(() => _selectedIndices.add(index));
               },
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
           color: isSelected
               ? colorScheme.primaryContainer.withValues(alpha: 0.3)
               : null,
@@ -1108,7 +1338,7 @@ class _FavoritesPageState extends State<FavoritesPage>
             children: [
               if (_isManaging)
                 Padding(
-                  padding: const EdgeInsets.only(right: 12),
+                  padding: const EdgeInsets.only(right: AppSpacing.md),
                   child: Icon(
                     isSelected ? Icons.check_circle : Icons.circle_outlined,
                     color: isSelected
@@ -1117,45 +1347,8 @@ class _FavoritesPageState extends State<FavoritesPage>
                     size: 22,
                   ),
                 ),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: SizedBox(
-                  width: 52,
-                  height: 52,
-                  child: playlist.coverUrl != null
-                      ? CachedNetworkImage(
-                          imageUrl: playlist.coverUrl!,
-                          memCacheWidth: 156,
-                          memCacheHeight: 156,
-                          fit: BoxFit.cover,
-                          placeholder: (_, _) => Container(
-                            color: colorScheme.surfaceContainerHighest,
-                            child: Icon(
-                              Icons.queue_music,
-                              size: 24,
-                              color: colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                          errorWidget: (_, _, _) => Container(
-                            color: colorScheme.surfaceContainerHighest,
-                            child: Icon(
-                              Icons.queue_music,
-                              size: 24,
-                              color: colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        )
-                      : Container(
-                          color: colorScheme.surfaceContainerHighest,
-                          child: Icon(
-                            Icons.queue_music,
-                            size: 24,
-                            color: colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                ),
-              ),
-              const SizedBox(width: 12),
+              _buildPlaylistCover(playlist, index, colorScheme),
+              const Gap(AppSpacing.md),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -1168,7 +1361,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                         fontWeight: FontWeight.w500,
                       ),
                     ),
-                    const SizedBox(height: 2),
+                    const Gap(AppSpacing.xxs),
                     Text(
                       '${playlist.songCount} 首',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -1178,15 +1371,10 @@ class _FavoritesPageState extends State<FavoritesPage>
                   ],
                 ),
               ),
+              // 歌单行右侧不再显示箭头（改版计划四）；排序模式保留拖拽把手。
               if (reordering)
                 Icon(
                   Icons.drag_indicator,
-                  color: colorScheme.onSurfaceVariant,
-                  size: 20,
-                )
-              else if (!_isManaging)
-                Icon(
-                  Icons.chevron_right,
                   color: colorScheme.onSurfaceVariant,
                   size: 20,
                 ),
@@ -1215,7 +1403,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                 context,
               ).colorScheme.onSurfaceVariant.withValues(alpha: 0.3),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '还没有收藏专辑',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
@@ -1229,11 +1417,18 @@ class _FavoritesPageState extends State<FavoritesPage>
 
     return Md3PullToRefresh(
       onRefresh: () => _loadAlbums(noCache: true, showLoading: false),
-      child: ListView.builder(
+      // 卡片类内容按实宽自适应：手机竖屏（<600）保持单列，横屏 / 平板变宽后
+      // 铺成多列横向卡片（计划 ⑥）。歌曲列表不走此组件、始终单列。
+      child: AdaptiveContentGrid(
         padding: EdgeInsets.only(
-          top: 8,
-          bottom: 8 + MediaQuery.paddingOf(context).bottom,
+          top: AppSpacing.sm,
+          bottom: AppSpacing.sm + MediaQuery.paddingOf(context).bottom,
         ),
+        targetExtent: 380,
+        childAspectRatio: 3.5,
+        spacing: AppSpacing.sm,
+        minColumns: 2,
+        maxColumns: 3,
         itemCount: _albums.length,
         itemBuilder: (context, index) {
           final album = _albums[index];
@@ -1267,15 +1462,13 @@ class _FavoritesPageState extends State<FavoritesPage>
               debugPrint(
                 '[AlbumTile] tapping ${album.name} -> albumGlobalCollectionId=$originalId',
               );
-              Navigator.push(
+              AdaptiveNav.openDetail(
                 context,
-                MaterialPageRoute(
-                  builder: (context) => PlaylistPage(
-                    playlist: album.toPlaylist(),
-                    isInMyFavorites: true,
-                    isAlbum: true,
-                    albumGlobalCollectionId: originalId,
-                  ),
+                (_) => PlaylistPage(
+                  playlist: album.toPlaylist(),
+                  isInMyFavorites: true,
+                  isAlbum: true,
+                  albumGlobalCollectionId: originalId,
                 ),
               );
             },
@@ -1286,7 +1479,7 @@ class _FavoritesPageState extends State<FavoritesPage>
               setState(() => _selectedIndices.add(index));
             },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
         color: isSelected
             ? colorScheme.primaryContainer.withValues(alpha: 0.3)
             : null,
@@ -1294,7 +1487,7 @@ class _FavoritesPageState extends State<FavoritesPage>
           children: [
             if (_isManaging)
               Padding(
-                padding: const EdgeInsets.only(right: 12),
+                padding: const EdgeInsets.only(right: AppSpacing.md),
                 child: Icon(
                   isSelected ? Icons.check_circle : Icons.circle_outlined,
                   color: isSelected
@@ -1304,7 +1497,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                 ),
               ),
             ClipRRect(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: AppRadius.smAll,
               child: SizedBox(
                 width: 52,
                 height: 52,
@@ -1341,7 +1534,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                       ),
               ),
             ),
-            const SizedBox(width: 12),
+            const Gap(AppSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1354,7 +1547,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                       fontWeight: FontWeight.w500,
                     ),
                   ),
-                  const SizedBox(height: 2),
+                  const Gap(AppSpacing.xxs),
                   Text(
                     '${album.songCount} 首',
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -1394,7 +1587,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                 context,
               ).colorScheme.onSurfaceVariant.withValues(alpha: 0.3),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '还没有关注歌手',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
@@ -1408,11 +1601,18 @@ class _FavoritesPageState extends State<FavoritesPage>
 
     return Md3PullToRefresh(
       onRefresh: () => _loadArtists(noCache: true, showLoading: false),
-      child: ListView.builder(
+      // 卡片类内容按实宽自适应：手机竖屏（<600）保持单列，变宽后铺成多列
+      // 横向卡片（计划 ⑥）。
+      child: AdaptiveContentGrid(
         padding: EdgeInsets.only(
-          top: 8,
-          bottom: 8 + MediaQuery.paddingOf(context).bottom,
+          top: AppSpacing.sm,
+          bottom: AppSpacing.sm + MediaQuery.paddingOf(context).bottom,
         ),
+        targetExtent: 380,
+        childAspectRatio: 3.5,
+        spacing: AppSpacing.sm,
+        minColumns: 2,
+        maxColumns: 3,
         itemCount: _artists.length,
         itemBuilder: (context, index) {
           final artist = _artists[index];
@@ -1451,20 +1651,18 @@ class _FavoritesPageState extends State<FavoritesPage>
 
     return InkWell(
       onTap: () {
-        Navigator.push(
+        AdaptiveNav.openDetail(
           context,
-          MaterialPageRoute(
-            builder: (context) => ArtistDetailPage(
-              artistId: id,
-              artistName: name.toString(),
-              avatarUrl: avatar,
-              initialIsFollowed: true,
-            ),
+          (_) => ArtistDetailPage(
+            artistId: id,
+            artistName: name.toString(),
+            avatarUrl: avatar,
+            initialIsFollowed: true,
           ),
         );
       },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
         child: Row(
           children: [
             CircleAvatar(
@@ -1481,7 +1679,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                     )
                   : null,
             ),
-            const SizedBox(width: 12),
+            const Gap(AppSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1520,13 +1718,13 @@ class _GroupSection extends StatefulWidget {
   final List<KugouPlaylistBrief> playlists;
   final Widget Function(KugouPlaylistBrief) onBuildTile;
 
-  /// 是否处于自由排序模式：分组主体切换为可拖拽的 ReorderableListView。
+  /// 是否处于自由排序模式：分组主体切换为可拖拽的 M3E 列表。
   final bool reordering;
 
   /// 拖拽调整顺序回调（reordering 为 true 时必填）。
   final void Function(int oldIndex, int newIndex)? onReorder;
 
-  /// 歌单的稳定 key（reordering 为 true 时必填，供 ReorderableListView 去重）。
+  /// 歌单的稳定 key（reordering 为 true 时必填，供拖拽列表去重）。
   final String Function(KugouPlaylistBrief)? keyFor;
 
   /// 标题行最右侧的附加控件（如「我创建的歌单」的新建按钮）。
@@ -1599,8 +1797,8 @@ class _GroupSectionState extends State<_GroupSection>
                 onTap: widget.onToggle,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
+                    horizontal: AppSpacing.lg,
+                    vertical: AppSpacing.md,
                   ),
                   child: Row(
                     children: [
@@ -1614,7 +1812,7 @@ class _GroupSectionState extends State<_GroupSection>
                           size: 18,
                         ),
                       ),
-                      const SizedBox(width: 4),
+                      const Gap(AppSpacing.xs),
                       // 分组标题：比 TabBar 的「歌单/专辑/歌手」再小一档
                       Text(
                         widget.title,
@@ -1624,7 +1822,7 @@ class _GroupSectionState extends State<_GroupSection>
                           color: colorScheme.onSurface,
                         ),
                       ),
-                      const SizedBox(width: 8),
+                      const Gap(AppSpacing.sm),
                       Text(
                         '${widget.playlists.length}',
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -1638,7 +1836,7 @@ class _GroupSectionState extends State<_GroupSection>
             ),
             if (widget.trailing != null)
               Padding(
-                padding: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.only(right: AppSpacing.sm),
                 child: widget.trailing,
               ),
           ],
@@ -1649,18 +1847,35 @@ class _GroupSectionState extends State<_GroupSection>
             alignment: Alignment.topCenter,
             child: widget.reordering
                 // 排序模式：嵌套在外层 ListView 内，自适应高度且禁止自滚动；
-                // 长按列表项触发拖拽（buildDefaultDragHandles 默认行为）
-                ? ReorderableListView(
+                // 整行长按（M3E 200ms 延迟拖拽）触发重排
+                ? M3EReorderableDismissibleList(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
-                    onReorderItem: widget.onReorder!,
-                    children: [
-                      for (final playlist in widget.playlists)
-                        KeyedSubtree(
-                          key: ValueKey(widget.keyFor!(playlist)),
-                          child: widget.onBuildTile(playlist),
-                        ),
-                    ],
+                    itemCount: widget.playlists.length,
+                    // key 由 M3E 内部套用（KeyedSubtree），保证重排后行状态稳定
+                    keyBuilder: (index) =>
+                        ValueKey(widget.keyFor!(widget.playlists[index])),
+                    // M3E 的 newIndex 是「移除前」的插入位（等同标准
+                    // ReorderableListView.onReorder，源码在 to > from 时补 +1）；
+                    // 而 widget.onReorder（_reorderGroup）沿用旧 material_ui
+                    // onReorderItem 的「移除后」语义（直接用 newIndex 做 insert），
+                    // 故此处补回框架原先自动做的 -1，保证手动顺序的写回逐字不变。
+                    onReorder: (oldIndex, newIndex) => widget.onReorder!(
+                      oldIndex,
+                      newIndex > oldIndex ? newIndex - 1 : newIndex,
+                    ),
+                    // 置零 M3E 卡片自身的背景/圆角/间距/内边距：行内是自带样式的自绘行；
+                    // 同时用 direction: none 关掉滑动（本列表只有拖拽排序，没有删除）
+                    style: const M3EDismissibleCardStyle(
+                      outerRadius: 0,
+                      innerRadius: 0,
+                      gap: 0,
+                      padding: EdgeInsets.zero,
+                      color: Colors.transparent,
+                      direction: DismissDirection.none,
+                    ),
+                    itemBuilder: (context, index) =>
+                        widget.onBuildTile(widget.playlists[index]),
                   )
                 : Column(
                     children: widget.playlists.map((playlist) {

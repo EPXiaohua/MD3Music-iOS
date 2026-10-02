@@ -173,16 +173,18 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
       vsync: this,
       duration: _pressDuration,
     );
-    _pressScale = Tween<double>(begin: 1.0, end: 0.92).animate(
-      CurvedAnimation(parent: _pressController, curve: Curves.easeOut),
-    );
+    _pressScale = Tween<double>(
+      begin: 1.0,
+      end: 0.92,
+    ).animate(CurvedAnimation(parent: _pressController, curve: Curves.easeOut));
     _pressColor = CurvedAnimation(
       parent: _pressController,
       curve: Curves.easeOut,
     );
-    _pressIconOffset = Tween<double>(begin: 0, end: 2).animate(
-      CurvedAnimation(parent: _pressController, curve: Curves.easeOut),
-    );
+    _pressIconOffset = Tween<double>(
+      begin: 0,
+      end: 2,
+    ).animate(CurvedAnimation(parent: _pressController, curve: Curves.easeOut));
 
     // 监听 _controller.value，phase2 末段（约 _controller.value=0.5 时）触发
     // 业务回调，保证视觉形变接近完成时再切歌，避免"功能错乱"
@@ -291,12 +293,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
   /// settled 状态下原 slot 可能接管其他位置并显示不同形态，按压反馈的
   /// 配色应跟随当前视觉形态，否则颜色会"错位"（如 prev 形态按压时
   /// 颜色却用 play 形态的 primary.withValues(0.85)）。
-  ({
-    Color normalBg,
-    Color pressedBg,
-    Color normalFg,
-    Color pressedFg,
-  }) _resolvePressColors(_Button visualId, ColorScheme cs) {
+  ({Color normalBg, Color pressedBg, Color normalFg, Color pressedFg})
+  _resolvePressColors(_Button visualId, ColorScheme cs) {
     switch (visualId) {
       case _Button.prev:
         return (
@@ -338,7 +336,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
   ///
   /// 动画进行中（_isAnimating=true）一律禁用所有点击，避免动画中重复触发。
   ({VoidCallback? onTapDown, VoidCallback? onTapUp, bool enabled})
-      _resolveInteraction(_Button slot) {
+  _resolveInteraction(_Button slot) {
     // 动画进行中：所有点击禁用
     if (_isAnimating) {
       return (onTapDown: null, onTapUp: null, enabled: false);
@@ -403,11 +401,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         break;
     }
 
-    return (
-      onTapDown: down,
-      onTapUp: up,
-      enabled: down != null && up != null,
-    );
+    return (onTapDown: down, onTapUp: up, enabled: down != null && up != null);
   }
 
   void _startTransition(_Transition t) {
@@ -455,8 +449,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
   double get _playLeft => widget.sideButtonSize + widget.spacing;
 
   /// next slot 的 left 起点
-  double get _nextLeft =>
-      _playLeft + widget.playButtonSize + widget.spacing;
+  double get _nextLeft => _playLeft + widget.playButtonSize + widget.spacing;
 
   // ===== 构建 =====
 
@@ -706,8 +699,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     final fg = pressT > 0
         ? Color.lerp(normalFg, pressedFg, pressT)!
         : (fgOverride ?? normalFg);
-    final icon = iconOverride ??
-        (effectiveIsPlaying ? Icons.pause : Icons.play_arrow);
+    final icon =
+        iconOverride ?? (effectiveIsPlaying ? Icons.pause : Icons.play_arrow);
 
     return Positioned(
       left: left,
@@ -855,7 +848,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
       currentWidth = widget.sideButtonSize * _phase2.value;
       opacity = _phase2.value;
       // left 从 (_prevLeft - sideButtonSize - spacing) 渐近到 _prevLeft
-      left = _prevLeft -
+      left =
+          _prevLeft -
           (widget.sideButtonSize + widget.spacing) * (1.0 - _phase2.value);
     } else if (_activeTransition == _Transition.settledToPrev) {
       // 动画完成后保持在 _prevLeft 显示
@@ -875,8 +869,9 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     final VoidCallback? onTapDown = enabled
         ? () => _handlePressDown(_Button.prev)
         : null;
-    final VoidCallback? onTapUp =
-        enabled ? () => _handlePressUp(_Button.prev) : null;
+    final VoidCallback? onTapUp = enabled
+        ? () => _handlePressUp(_Button.prev)
+        : null;
     // 按压反馈：此 slot 固定显示 prev 形态
     final bool isPressed = _pressedButton == _Button.prev;
     final double pressT = isPressed ? _pressColor.value : 0.0;
@@ -927,13 +922,15 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
       // toNext 期间新 next 从右侧外拉到 _nextLeft，宽度 0 → sideButtonSize
       currentWidth = widget.sideButtonSize * _phase2.value;
       opacity = _phase2.value;
-      left = _nextLeft +
+      left =
+          _nextLeft +
           (widget.sideButtonSize + widget.spacing) * (1.0 - _phase2.value);
     } else if (_activeTransition == _Transition.toPrev && _phase2.value > 0) {
       // toPrev 期间新 next 从右侧外拉到 _nextLeft，宽度 0 → sideButtonSize
       currentWidth = widget.sideButtonSize * _phase2.value;
       opacity = _phase2.value;
-      left = _nextLeft +
+      left =
+          _nextLeft +
           (widget.sideButtonSize + widget.spacing) * (1.0 - _phase2.value);
     } else if (_activeTransition == _Transition.settledToNext ||
         _activeTransition == _Transition.settledToPrev) {
@@ -950,14 +947,15 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 交互：仅在 settledToNext / settledToPrev 且非动画中、且 onNext 非空时启用
     final bool activeSettled =
         (_activeTransition == _Transition.settledToNext ||
-                _activeTransition == _Transition.settledToPrev) &&
-            !_isAnimating;
+            _activeTransition == _Transition.settledToPrev) &&
+        !_isAnimating;
     final bool enabled = activeSettled && widget.onNext != null;
     final VoidCallback? onTapDown = enabled
         ? () => _handlePressDown(_Button.next)
         : null;
-    final VoidCallback? onTapUp =
-        enabled ? () => _handlePressUp(_Button.next) : null;
+    final VoidCallback? onTapUp = enabled
+        ? () => _handlePressUp(_Button.next)
+        : null;
     // 按压反馈：此 slot 固定显示 next 形态
     final bool isPressed = _pressedButton == _Button.next;
     final double pressT = isPressed ? _pressColor.value : 0.0;
@@ -1019,40 +1017,47 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     final currentHeight = size * heightFactor;
     // 中央 play 按钮的图标略大
     final iconSize = size * (isCenterPlay ? 0.45 : 0.5);
+    final label = switch (icon) {
+      Icons.skip_previous => '上一首',
+      Icons.skip_next => '下一首',
+      Icons.pause => '暂停',
+      _ => '播放',
+    };
 
     // 用 Center + SizedBox 包裹按钮，Transform.scale 默认以中心为锚点，
     // 这样 playBounce 的缩放就是"以圆心居中缩放"，不会从左上角漂移。
     return Opacity(
       opacity: opacity,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        // 用 onTapDown?.call() 而非 onTapDown()，保证 null 安全
-        // （enabled=false 时 onTapDown/onTapUp 为 null，但 enabled 也会关掉回调）
-        onTapDown: enabled ? (_) => onTapDown?.call() : null,
-        onTapUp: enabled ? (_) => onTapUp?.call() : null,
-        onTapCancel: enabled ? onTapCancel : null,
-        // 不直接调用 onTap，避免与动画开始时的回调重复触发
-        onTap: null,
-        child: Center(
-          child: Transform.scale(
-            scale: pressScale,
-            child: SizedBox(
-              width: currentWidth,
-              height: currentHeight,
-              child: Material(
-                color: backgroundColor,
-                // 圆角矩形：圆角 8dp，比胶囊形更克制、更现代
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                clipBehavior: Clip.antiAlias,
-                child: Center(
-                  child: Transform.translate(
-                    offset: Offset(0, iconOffset),
-                    child: Icon(
-                      icon,
-                      size: iconSize,
-                      color: foregroundColor,
+      child: Semantics(
+        button: true,
+        enabled: enabled,
+        label: label,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          // 用 onTapDown?.call() 而非 onTapDown()，保证 null 安全
+          // （enabled=false 时 onTapDown/onTapUp 为 null，但 enabled 也会关掉回调）
+          onTapDown: enabled ? (_) => onTapDown?.call() : null,
+          onTapUp: enabled ? (_) => onTapUp?.call() : null,
+          onTapCancel: enabled ? onTapCancel : null,
+          // 不直接调用 onTap，避免与动画开始时的回调重复触发
+          onTap: null,
+          child: Center(
+            child: Transform.scale(
+              scale: pressScale,
+              child: SizedBox(
+                width: currentWidth,
+                height: currentHeight,
+                child: Material(
+                  color: backgroundColor,
+                  // 圆角矩形：圆角 8dp，比胶囊形更克制、更现代
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: Center(
+                    child: Transform.translate(
+                      offset: Offset(0, iconOffset),
+                      child: Icon(icon, size: iconSize, color: foregroundColor),
                     ),
                   ),
                 ),

@@ -19,6 +19,16 @@ android {
     compileSdk = 36
     ndkVersion = "28.2.13676358"
 
+    // 产品 flavor（3D 深度封面）:
+    //   standard - 不含 3D 封面：无 onnxruntime so、无深度模型资产，体积最小
+    //   depth3d  - 3D 全量包：内置 ONNX Runtime so + Depth Anything V2 模型资产
+    // 两 flavor 共用同一 applicationId/签名，depth3d 包可直接覆盖安装 standard 包。
+    flavorDimensions += "feature"
+    productFlavors {
+        create("standard") {}
+        create("depth3d") {}
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -94,6 +104,13 @@ android {
         }
     }
 
+    // MD3Music fork: JVM 单元测试里 android.util.Log 等框架桩默认会抛
+    // "Method i in android.util.Log not mocked"。DirectPcmController 等 fork 侧的
+    // 状态类在测试中需要走 setEnabled（内部会打日志），故开启返回默认值。
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
 }
 
 kotlin {
@@ -119,6 +136,16 @@ dependencies {
     implementation("androidx.media3:media3-common:1.4.1")
     // 2×2 封面小部件：从专辑封面位图提取主色（vibrant/dominant swatch）
     implementation("androidx.palette:palette-ktx:1.0.0")
+    // 3D 深度封面：端上 Depth Anything V2 推理（ONNX Runtime Mobile）
+    // 仅 depth3d flavor 打包（standard 包不含此 so，体积 -13.2MB）
+    // 自编 reduced-ops AAR：官方 libonnxruntime.so 33.0MB → 13.2MB（13,201,664 B），
+    // 只编译两份深度模型实际用到的算子内核；保留 NNAPI EP 符号以匹配官方
+    // libonnxruntime4j_jni.so 的符号引用（该 jni 层原样保留，勿动）；仅 arm64-v8a。
+    // 算子并集 = depth 模型 ∪ MI-GAN Pipeline（52 项注册 / 9 行）；配置与重建流程见
+    // android/app/libs/ort-ops/（REBUILD.md + depth_migan_union_v3.config）。
+    // ⚠️ 内核裁剪后 strings/差分都判不出算子是否可用，唯一判据是真机 createSession
+    //    日志（loadInpaintModel OK）。
+    "depth3dImplementation"(files("libs/onnxruntime-android-1.30.0-custom-v8a.aar"))
 
     // USB 独占数据路径（UsbDither / UsbAudioStream.writeRaw）的 JVM 单元测试
     testImplementation("junit:junit:4.13.2")

@@ -78,8 +78,9 @@ class LineRenderer {
   /// 翻译副行专用 TextPainter（与主文本分离，避免复用 _painter 导致
   /// v4 缓存校验失效——主文本在 alpha 未变时会跳过 set text，若 _painter
   /// 被翻译副行改写过，下次主文本绘制会错误地画出翻译文本）。
-  final TextPainter _translationPainter =
-      TextPainter(textDirection: TextDirection.ltr);
+  final TextPainter _translationPainter = TextPainter(
+    textDirection: TextDirection.ltr,
+  );
 
   /// 最近一次多行绘制时的视觉行数（0 表示上次为单行/未多行）。
   ///
@@ -166,7 +167,9 @@ class LineRenderer {
 
   /// 多行对齐绘制时使用的临时 TextPainter（仅 _paintMultiLineAligned 内用）。
   /// 与 _painter 分离避免污染主 painter 的 layout 缓存。
-  final TextPainter _lineMeasurer = TextPainter(textDirection: TextDirection.ltr);
+  final TextPainter _lineMeasurer = TextPainter(
+    textDirection: TextDirection.ltr,
+  );
 
   // ============== setLineState 输入缓存 ==============
   //
@@ -216,7 +219,13 @@ class LineRenderer {
   /// **v4 bug 修复**：检测 _targetAlpha 变化时重置 _isConverged=false。
   /// 之前 setLineState 修改 _targetAlpha 但不重置 _isConverged，
   /// 导致后续 tick 调用时 _isConverged=true（来自上次收敛）即便 target 已变也不会重新计算。
-  void setLineState({required bool isActive, required double scale, double blurFade = 1.0, bool blurActive = true, int? activeColorValue}) {
+  void setLineState({
+    required bool isActive,
+    required double scale,
+    double blurFade = 1.0,
+    bool blurActive = true,
+    int? activeColorValue,
+  }) {
     // 输入缓存早退：稳态下 5 个输入全相等 → 跳过 dynamic 公式重算与 target 比较
     if (isActive == _lastIsActive &&
         scale == _lastScale &&
@@ -233,15 +242,18 @@ class LineRenderer {
 
     _isActive = isActive;
     _activeColorValue = activeColorValue;
-    final double factor = ((scale - LyricLayout.inactiveScale) /
-            (LyricLayout.activeScale - LyricLayout.inactiveScale))
-        .clamp(0.0, 1.0)
-        .toDouble();
+    final double factor =
+        ((scale - LyricLayout.inactiveScale) /
+                (LyricLayout.activeScale - LyricLayout.inactiveScale))
+            .clamp(0.0, 1.0)
+            .toDouble();
     final double dynamicDark = factor * 0.2 + 0.2;
     final double dynamicBright = factor * 0.8 + 0.2;
     // 非当前行 alpha = dynamicDark * (1 - blurFade)，blurActive=false 时不降低
     final double effectiveFade = blurActive ? blurFade : 0.0;
-    final double newTargetAlpha = isActive ? dynamicBright : dynamicDark * (1.0 - effectiveFade);
+    final double newTargetAlpha = isActive
+        ? dynamicBright
+        : dynamicDark * (1.0 - effectiveFade);
     // v4 修复：target 变化时重置 _isConverged，让 tick 重新计算 alpha
     if ((newTargetAlpha - _targetAlpha).abs() > 1e-6) {
       _isConverged = false;
@@ -287,8 +299,8 @@ class LineRenderer {
     final double speed = _isExitFading
         ? _exitRate
         : (_targetAlpha >= _currentAlpha
-            ? LyricLayout.attackSpeed
-            : LyricLayout.releaseSpeed);
+              ? LyricLayout.attackSpeed
+              : LyricLayout.releaseSpeed);
     final double decay = 1.0 - exp(-speed * dt);
     double next = _currentAlpha + (_targetAlpha - _currentAlpha) * decay;
     // 阈值收敛：差值小于 alphaEpsilon 直接吸附到目标
@@ -322,16 +334,19 @@ class LineRenderer {
   /// - **v4 优化**：alpha 变化 < 0.001 且 maxWidth 未变时跳过 set text + layout
   ///   （layout 结果与 alpha 无关，复用上次的 layout 结果直接 paint）
   void paintLine(
-      Canvas canvas, Offset offset, LyricLine line, double fontSize,
-      {double maxWidth = double.infinity,
-      DuetAlignment alignment = DuetAlignment.defaultAlign,
-      double viewportWidth = 0}) {
+    Canvas canvas,
+    Offset offset,
+    LyricLine line,
+    double fontSize, {
+    double maxWidth = double.infinity,
+    DuetAlignment alignment = DuetAlignment.defaultAlign,
+    double viewportWidth = 0,
+  }) {
     if (line.text.isEmpty) return;
     // 解析当前行实际文字颜色：动态字体颜色（仅当前行）优先，否则回退主题默认色
-    final int textColorValue =
-        (_isActive && _activeColorValue != null)
-            ? _activeColorValue!
-            : LyricLayout.textColorValue;
+    final int textColorValue = (_isActive && _activeColorValue != null)
+        ? _activeColorValue!
+        : LyricLayout.textColorValue;
     final int textRed = (textColorValue >> 16) & 0xFF;
     final int textGreen = (textColorValue >> 8) & 0xFF;
     final int textBlue = textColorValue & 0xFF;
@@ -371,7 +386,8 @@ class LineRenderer {
         ),
       );
       _painter.layout(
-          maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth);
+        maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
+      );
       _lastSetAlpha = _currentAlpha;
       _lastSetMaxWidth = maxWidth;
       _lastTextColorValue = textColorValue;
@@ -391,14 +407,26 @@ class LineRenderer {
     if (!isMultiLine) {
       // 单行：直接用整体对齐 x
       final double x = _alignX(
-          alignment, offset.dx, _painter.width, viewportWidth);
+        alignment,
+        offset.dx,
+        _painter.width,
+        viewportWidth,
+      );
       _painter.paint(canvas, Offset(x, offset.dy));
       // 单行重置多行行数（防上次多行残留影响翻译副行高度计算）
       _lastMultiLineRowCount = 0;
     } else {
       // 多行：按行拆分绘制，每行独立对齐
-      _paintMultiLineAligned(canvas, offset, line, fontSize, alignment,
-          maxWidth, viewportWidth, textColorValue);
+      _paintMultiLineAligned(
+        canvas,
+        offset,
+        line,
+        fontSize,
+        alignment,
+        maxWidth,
+        viewportWidth,
+        textColorValue,
+      );
     }
 
     // 辅助副行（翻译或罗马音）：有内容 + 渐显进度 > 0 时绘制。
@@ -411,14 +439,12 @@ class LineRenderer {
     // **不读 showTranslation 做立即短路**：关闭翻译时注入进度衰减到 0、
     // alpha 平滑渐隐至消失——若在此短路，关闭瞬间副行直接消失无动画。
     // 副行字号为主行 70%，alpha = translationOpacity × translationFade。
-    final auxText = LyricPreferences.instance.displayMode == LyricDisplayMode.roma
+    final auxText =
+        LyricPreferences.instance.displayMode == LyricDisplayMode.roma
         ? line.roma
         : line.translation;
-    final double transAlpha =
-        LyricLayout.translationOpacity * translationFade;
-    if (transAlpha > 0.001 &&
-        auxText != null &&
-        auxText.isNotEmpty) {
+    final double transAlpha = LyricLayout.translationOpacity * translationFade;
+    if (transAlpha > 0.001 && auxText != null && auxText.isNotEmpty) {
       final transFontSize = LyricLayout.translationFontSize(fontSize);
       // 主文本实际高度（含换行）：与 measureLineHeight 的压缩模型一致。
       // TextPainter 整行高度是完整行高（每行 ≈ mainLineHeight），而
@@ -426,10 +452,10 @@ class LineRenderer {
       // 与下一行歌词重叠——多行时用压缩高度反推。
       final double mainHeight = _lastMultiLineRowCount > 1
           ? fontSize * LyricLayout.lineHeight +
-              (_lastMultiLineRowCount - 1) *
-                  fontSize *
-                  LyricLayout.lineHeight *
-                  LyricLayout.wrapLineHeightFactor
+                (_lastMultiLineRowCount - 1) *
+                    fontSize *
+                    LyricLayout.lineHeight *
+                    LyricLayout.wrapLineHeightFactor
           : _painter.height;
       // 副行"长出/收回"偏移：expand=0 时贴主行底（隐藏位），=1 时到正常位。
       // 先布局副行文本，再按**实际视觉行数**取副行高度：副行过长换行时高度随行数
@@ -446,18 +472,25 @@ class LineRenderer {
         ),
       );
       _translationPainter.layout(
-          maxWidth:
-              maxWidth == double.infinity ? double.infinity : maxWidth);
-      final int subRows =
-          max(1, _translationPainter.computeLineMetrics().length);
+        maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
+      );
+      final int subRows = max(
+        1,
+        _translationPainter.computeLineMetrics().length,
+      );
       final double subH = LyricLayout.auxSubHeight(fontSize, subRows);
-      final double transY = offset.dy +
+      final double transY =
+          offset.dy +
           mainHeight +
           transFontSize * 0.3 +
           subH * (translationExpand - 1.0);
       // 翻译副行对齐跟随原文，用 _alignX 计算起始 x
-      final double transX = _alignX(alignment, offset.dx,
-          _translationPainter.width, viewportWidth);
+      final double transX = _alignX(
+        alignment,
+        offset.dx,
+        _translationPainter.width,
+        viewportWidth,
+      );
       // 多行翻译副行需设置 textAlign 让每条视觉行独立对齐到 transX
       _translationPainter.textAlign = _duetToTextAlign(alignment);
       _paintTranslation(canvas, Offset(transX, transY));
@@ -471,8 +504,10 @@ class LineRenderer {
   /// （已就位）时不施加任何画布变换，走与改造前完全一致的直绘路径——稳态每帧
   /// 只做一次浮点比较，无额外 save/transform/restore 开销。
   void _paintTranslation(Canvas canvas, Offset at) {
-    final double angle = LyricLayout.sublineFlipAngle(translationExpand,
-        exiting: translationExiting);
+    final double angle = LyricLayout.sublineFlipAngle(
+      translationExpand,
+      exiting: translationExiting,
+    );
     if (angle == 0) {
       _translationPainter.paint(canvas, at);
       return;
@@ -488,7 +523,8 @@ class LineRenderer {
     );
     canvas.save();
     canvas.transform(
-        LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage);
+      LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage,
+    );
     _translationPainter.paint(canvas, at);
     canvas.restore();
   }
@@ -496,11 +532,16 @@ class LineRenderer {
   /// 临时调试：打印行换行分析（word 累加 vs TextPainter 行数），定位歌词重叠。
   void _debugLogWrap(LyricLine line, double fontSize, double maxWidth) {
     final StringBuffer sb = StringBuffer();
-    sb.write('[LyricWrap] LR hasWord=${line.hasWordTiming} '
-        'text="${line.text}" maxW=${maxWidth.toStringAsFixed(1)} fs=$fontSize');
+    sb.write(
+      '[LyricWrap] LR hasWord=${line.hasWordTiming} '
+      'text="${line.text}" maxW=${maxWidth.toStringAsFixed(1)} fs=$fontSize',
+    );
     if (line.hasWordTiming) {
-      final List<int> starts =
-          _wordAccumulateRowStarts(line, fontSize, maxWidth);
+      final List<int> starts = _wordAccumulateRowStarts(
+        line,
+        fontSize,
+        maxWidth,
+      );
       sb.write(' wordRows=${starts.length}');
       final List<double> widths = _ensureWordWidths(line, fontSize);
       sb.write(' words[');
@@ -530,9 +571,15 @@ class LineRenderer {
 
   /// 多行文本按行独立对齐绘制：按视觉行拆分文本，每行用对应 x 偏移。
   void _paintMultiLineAligned(
-      Canvas canvas, Offset offset, LyricLine line, double fontSize,
-      DuetAlignment alignment, double maxWidth, double viewportWidth,
-      int textColorValue) {
+    Canvas canvas,
+    Offset offset,
+    LyricLine line,
+    double fontSize,
+    DuetAlignment alignment,
+    double maxWidth,
+    double viewportWidth,
+    int textColorValue,
+  ) {
     final String text = line.text;
     final int textRed = (textColorValue >> 16) & 0xFF;
     final int textGreen = (textColorValue >> 8) & 0xFF;
@@ -544,12 +591,17 @@ class LineRenderer {
     //   （与 measure 的 TextPainter 换行一致）。
     final List<String> rowTexts;
     if (line.hasWordTiming) {
-      final List<int> rowStarts = _wordAccumulateRowStarts(line, fontSize, maxWidth);
+      final List<int> rowStarts = _wordAccumulateRowStarts(
+        line,
+        fontSize,
+        maxWidth,
+      );
       rowTexts = <String>[];
       for (int r = 0; r < rowStarts.length; r++) {
         final ws = rowStarts[r];
-        final we =
-            r + 1 < rowStarts.length ? rowStarts[r + 1] : line.words.length;
+        final we = r + 1 < rowStarts.length
+            ? rowStarts[r + 1]
+            : line.words.length;
         final StringBuffer sb = StringBuffer();
         for (int wi = ws; wi < we; wi++) {
           sb.write(line.words[wi].text);
@@ -602,7 +654,11 @@ class LineRenderer {
       );
       _lineMeasurer.layout(maxWidth: double.infinity);
       final double x = _alignX(
-          alignment, offset.dx, _lineMeasurer.width, viewportWidth);
+        alignment,
+        offset.dx,
+        _lineMeasurer.width,
+        viewportWidth,
+      );
       final double y = isFirstRow
           ? offset.dy
           : offset.dy + mainLineHeight + (i - 1) * wrapLineHeight;
@@ -643,7 +699,10 @@ class LineRenderer {
   /// 按 word 累加换行（与 measureLineHeight 逐字分支、WordRenderer 完全一致）：
   /// 返回每视觉行的起始 word 索引（首元素 0）。
   List<int> _wordAccumulateRowStarts(
-      LyricLine line, double fontSize, double maxWidth) {
+    LyricLine line,
+    double fontSize,
+    double maxWidth,
+  ) {
     final List<int> starts = <int>[0];
     if (line.words.isEmpty || maxWidth == double.infinity) return starts;
     final List<double> widths = _ensureWordWidths(line, fontSize);
@@ -661,8 +720,12 @@ class LineRenderer {
 
   /// 根据对唱对齐方式计算文本起始 x 坐标（与 [WordRenderer._alignX] 一致）。
   /// [leftPadding] 为左侧 1em 边距（即 offset.dx），右侧对称留白。
-  double _alignX(DuetAlignment alignment, double leftPadding,
-      double textWidth, double viewportWidth) {
+  double _alignX(
+    DuetAlignment alignment,
+    double leftPadding,
+    double textWidth,
+    double viewportWidth,
+  ) {
     if (viewportWidth <= 0 ||
         alignment == DuetAlignment.defaultAlign ||
         alignment == DuetAlignment.left) {
@@ -714,5 +777,13 @@ class LineRenderer {
     _lastBlurFade = double.nan;
     _lastBlurActive = false;
     _lastActiveColorValue = null;
+  }
+
+  /// 最终释放渲染器持有的测量与绘制器。
+  void dispose() {
+    reset();
+    _painter.dispose();
+    _translationPainter.dispose();
+    _lineMeasurer.dispose();
   }
 }

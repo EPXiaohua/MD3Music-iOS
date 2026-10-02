@@ -1,7 +1,8 @@
-import 'package:flutter_test/flutter_test.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:async';
 
-import '../../lib/providers/player_provider.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:md3music/providers/player_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// audioReady 就绪信号测试。
 ///
@@ -22,8 +23,8 @@ class _FakeAudioService {
 
   // ignore: annotate_overrides
   dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError(
-        '_FakeAudioService: 未实现的方法 ${invocation.memberName}',
-      );
+    '_FakeAudioService: 未实现的方法 ${invocation.memberName}',
+  );
 }
 
 void main() {
@@ -42,6 +43,25 @@ void main() {
       player.dispose();
       // 让初始化期间派生的后台异步任务（均为 try/catch 包裹）跑完
       await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+  });
+
+  test('Provider销毁后迟到的音频服务加载不会继续接线或通知', () async {
+    SharedPreferences.setMockInitialValues({});
+    final pendingAudioService = Completer<dynamic>();
+    AudioServiceLoader.setTestOverride(() => pendingAudioService.future);
+    final player = PlayerProvider();
+    var notificationsAfterDispose = 0;
+    player.addListener(() => notificationsAfterDispose++);
+
+    player.dispose();
+    pendingAudioService.complete(_FakeAudioService());
+    try {
+      await player.audioReady.timeout(const Duration(seconds: 10));
+      expect(() => player.notifyListeners(), returnsNormally);
+      expect(notificationsAfterDispose, 0);
+    } finally {
+      AudioServiceLoader.setTestOverride(null);
     }
   });
 }

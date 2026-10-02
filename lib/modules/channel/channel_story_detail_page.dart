@@ -9,7 +9,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 /// 音乐故事详情页（/youth/channel/song/detail）。
 ///
@@ -164,8 +164,8 @@ class _ChannelStoryDetailPageState extends State<ChannelStoryDetailPage> {
         title: widget.title,
         scrollController: _scrollController,
       ),
-      bottomNavigationBar: const MiniPlayer(),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : Md3PullToRefresh(
               onRefresh: () => _load(showLoading: false),
@@ -260,6 +260,7 @@ class _ChannelStoryDetailPageState extends State<ChannelStoryDetailPage> {
                 ],
               ),
             ),
+      ),
     );
   }
 }

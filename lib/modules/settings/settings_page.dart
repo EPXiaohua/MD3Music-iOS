@@ -23,13 +23,17 @@ import '../../core/services/custom_font_loader.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/services/desktop_lyric_service.dart';
 import '../../core/services/equalizer_service.dart';
+import '../../core/services/viper_master_service.dart';
 import '../../core/services/listen_report_service.dart';
 import '../../core/services/lyricon_provider_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/services/media_store_service.dart';
 import '../../core/services/spectrum_service.dart';
+import '../../core/services/startup_auto_play.dart';
 import '../../core/services/wakelock_service.dart';
 import '../../core/services/diagnostic_exporter.dart';
+import '../../core/layout/responsive_layout.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../data/repositories/settings_repository.dart';
@@ -38,9 +42,10 @@ import '../onboarding/user_agreement_page.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/shortcut_config_provider.dart';
-import '../../providers/tab_config_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_server.dart';
+import '../../services/depth_cover_service.dart';
+import '../../core/services/depth_cover_feature.dart';
 import '../../utils/landscape_immersive.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'lyric_animation_settings_page.dart';
@@ -52,6 +57,12 @@ import '../player/car_mode_panel.dart';
 import '../../providers/car_mode_provider.dart';
 import '../sound/sounds_page.dart';
 import 'equalizer_settings_page.dart';
+import 'settings_group_heading.dart';
+import 'settings_navigation.dart';
+import 'settings_two_pane.dart';
+import '../../core/layout/adaptive_navigator.dart' show DetailEmptyState;
+import 'home_tab_manager.dart';
+import 'mcp_agent_section.dart';
 import 'settings_search_index.g.dart';
 
 /// CI compile-time version injection via --dart-define=APP_VERSION=X
@@ -81,13 +92,22 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage>
     with SingleTickerProviderStateMixin, CarModePanelSuppressor<SettingsPage> {
   final SettingsRepository _settingsRepository = SettingsRepository();
+  static const MethodChannel _appIconChannel = MethodChannel(
+    'com.md3music.md3music/app_icon',
+  );
   String _wifiQuality = '128';
   String _mobileQuality = '128';
+  // 蝰蛇母带处理（10 段 EQ + 限幅母带链，默认关闭）
+  bool _viperMasterEnabled = false;
+  // 蝰蛇母带音源档位（实验功能，默认关闭）
+  bool _viperTapeQualityEnabled = false;
   bool _autoReceiveVip = true;
   // 上传听歌时长（听歌等级累计上报）开关（默认关闭，用户主动开启才累计/上报）
   bool _uploadListeningDuration = false;
   // 新版本提醒开关（默认开启，关闭后启动时不再查询 GitHub Release）
   bool _updateReminderEnabled = true;
+  // 还原旧版桌面图标（默认沿用当前图标，仅 Android 提供）
+  bool _legacyAppIconEnabled = false;
   // 上次已提醒的新版本号（形如 5.6.5，空串=无）。用于「更新最新版本」副标题提示。
   String _pendingUpdateVersion = '';
   // 本地 API 服务器重启中（在线音乐区块显示加载态）
@@ -135,6 +155,13 @@ class _SettingsPageState extends State<SettingsPage>
   bool _showQualityDowngradeToast = false;
   // 记忆播放状态开关（默认开启）：冷启动恢复上次播放的歌曲与进度
   bool _restoreMemoryEnabled = true;
+  // 启动时自动播放（默认关闭）。后两项仅在它打开时才有意义，故一并收在这里。
+  // 音源下拉直接用 StartupAutoPlaySource.values，保证与启动流程的解析口径
+  // 只有一份来源；持久化走它的 value 字符串。
+  bool _startupAutoPlayEnabled = false;
+  String _startupAutoPlaySource = 'resume';
+  // 起播后连带推起完整播放页（默认开启）
+  bool _startupAutoPlayOpenPage = true;
   // 设备 Android SDK 版本（SuperLyricApi 3.4 要求 API 26+，低于此禁用该协议选项）
   int? _androidSdkVersion;
 
@@ -145,8 +172,50 @@ class _SettingsPageState extends State<SettingsPage>
   bool _bluetoothLyricEnabled = false;
   // 蓝牙歌词封面压缩开关：默认关闭（不压缩，保持原始封面质量）
   bool _bluetoothLyricCompressArt = false;
-  // 锁屏歌词开关：锁屏时全屏显示滚动歌词（覆盖在系统锁屏上方），默认关闭
+  // 3D 封面（深度视差）总开关：默认关闭（模型需在设置页导入）
+  bool _depthCoverEnabled = false;
+  // 3D 封面视差强度：背景层最大平移像素，0 = 不动
+  double _depthCoverStrength = 9.0;
+  // 3D 封面 AI 背景修补（MI-GAN 神经细化）：默认开启，关闭则仅用金字塔修补
+  bool _depthCoverNeuralInpaint = true;
+  // 深度图缓存占用（字节，仅统计可重建的分层/深度图）
+  int _depthCacheBytes = 0;
+  // 魅族 Flyme 状态栏歌词：仅 Flyme 设备显示（原生把歌词贴到媒体通知 tickerText 上）
+  bool _flymeStatusBarLyricEnabled = false;
+  bool _flymeStatusBarLyricSupported = false;
+
+  static const _flymeChannel = MethodChannel(
+    'com.md3music.md3music/flyme_status_bar_lyric',
+  );
+
+  /// 查询本机是否 Flyme，并回读已保存的开关。非 Flyme 时整项隐藏，
+  /// 避免用户在别的品牌上打开却完全看不到效果。
+  Future<void> _loadFlymeStatusBarLyric() async {
+    bool supported = false;
+    try {
+      supported =
+          await _flymeChannel.invokeMethod<bool>(
+            'isFlymeStatusBarLyricSupported',
+          ) ??
+          false;
+    } catch (_) {
+      supported = false;
+    }
+    if (!supported) {
+      if (mounted) setState(() => _flymeStatusBarLyricSupported = false);
+      return;
+    }
+    final enabled = await _settingsRepository.getFlymeStatusBarLyricEnabled();
+    if (mounted) {
+      setState(() {
+        _flymeStatusBarLyricSupported = true;
+        _flymeStatusBarLyricEnabled = enabled;
+      });
+    }
+  }
+
   // 样式（字号/行距/字重/字体等）全部跟随 AM 歌词偏好，与播放页 Zen 模式一致
+  // 锁屏歌词开关：锁屏时全屏显示滚动歌词（覆盖在系统锁屏上方），默认关闭
   bool _lockScreenLyricEnabled = false;
   // 禁用本应用挂载的 Android 系统音效链，避免与手机厂商音效叠加后播放音乐炸音
   bool _disableSystemAudioEffects = false;
@@ -155,6 +224,8 @@ class _SettingsPageState extends State<SettingsPage>
   // 交叉淡化（自动切歌时上一首渐出与下一首渐入叠加）
   bool _crossfadeEnabled = false;
   int _crossfadeSeconds = SettingsRepository.kCrossfadeDefaultSeconds;
+  // 自动混音（AutoMix）：交叉淡化开启时按节拍对齐过渡点，由 Task 12 的播放器侧实现消费
+  bool _automixEnabled = false;
   // 音量均衡（响度归一）
   bool _volumeNormalizationEnabled = false;
   double _volumeNormalizationLufs =
@@ -182,11 +253,17 @@ class _SettingsPageState extends State<SettingsPage>
   bool _closeLocalMusicComments = true;
   // 歌词双击跳转开关（默认关闭，开启后需双击歌词才能跳转位置）
   bool _lyricDoubleTapToJump = false;
-  // 自定义背景图片（全局界面背景）；默认开启，未选择图片时回落到内置默认壁纸
-  bool _useBackgroundImage = true;
+  // 桌面布局（侧栏 + 顶部工具栏）总开关：默认关闭，开启后无论横竖屏都用桌面外壳
+  bool _desktopModeEnabled = false;
+  // 悬浮迷你播放器（二级页面底部悬浮播放条）总开关：默认关闭
+  bool _secondaryPlayerEnabled = false;
+  // 自定义背景图片（全局界面背景）；默认关闭，未选择图片时回落到内置默认壁纸
+  bool _useBackgroundImage = false;
   String? _backgroundImagePath;
   double _backgroundBlur = 20.0;
-  double _backgroundOpacity = 0.4;
+  // AM 播放页背景模糊（sigma 0~30，默认 30；仅动态流光关闭时渲染/显示）
+  double _amPlayerBlur = 30.0;
+  double _backgroundOpacity = 0.2;
   // 按背景图莫奈取色（默认开启）
   bool _useBackgroundMonet = true;
   // 文字阴影（默认关闭，仅在启用自定义背景图片时生效）
@@ -228,6 +305,7 @@ class _SettingsPageState extends State<SettingsPage>
     _loadVersion();
     _loadLyricPushSettings();
     _loadAndroidSdkVersion();
+    _loadFlymeStatusBarLyric();
     _initEnable32bit();
     LyriconProviderService.instance.addListener(_onLyriconStateChanged);
     // 桌面歌词状态变化（设置页开关 / 播放器长按 / 通知栏按钮）→ 刷新 UI
@@ -347,6 +425,7 @@ class _SettingsPageState extends State<SettingsPage>
         .read<ThemeProvider>()
         .backgroundImagePath;
     final backgroundBlur = context.read<ThemeProvider>().backgroundBlur;
+    final amPlayerBlur = context.read<ThemeProvider>().amPlayerBlur;
     final backgroundOpacity = context.read<ThemeProvider>().backgroundOpacity;
     final useBackgroundMonet = context.read<ThemeProvider>().useBackgroundMonet;
     final useTextShadow = context.read<ThemeProvider>().useTextShadow;
@@ -357,6 +436,16 @@ class _SettingsPageState extends State<SettingsPage>
     // 读取蓝牙歌词封面压缩开关
     final bluetoothLyricCompressArt = await _settingsRepository
         .getBluetoothLyricCompressArt();
+    // 读取 3D 封面（深度视差）总开关
+    final depthCoverEnabled = await _settingsRepository.getDepthCoverEnabled();
+    final depthCoverStrength = await _settingsRepository
+        .getDepthCoverStrength();
+    // 读取 3D 封面 AI 背景修补开关（MI-GAN 神经细化）
+    final depthCoverNeuralInpaint = await _settingsRepository
+        .getDepthCoverNeuralInpaint();
+    // 读取 3D 封面深度图缓存占用
+    final depthCacheBytes = await DepthCoverService.instance.cache
+        .cacheSizeBytes();
     // 读取锁屏歌词开关
     final lockScreenLyricEnabled = await _settingsRepository
         .getLockScreenLyricEnabled();
@@ -365,6 +454,7 @@ class _SettingsPageState extends State<SettingsPage>
     final pauseFadeEnabled = await _settingsRepository.getPauseFadeEnabled();
     final crossfadeEnabled = await _settingsRepository.getCrossfadeEnabled();
     final crossfadeSeconds = await _settingsRepository.getCrossfadeSeconds();
+    final automixEnabled = await _settingsRepository.getAutomixEnabled();
     final volumeNormalizationEnabled = await _settingsRepository
         .getVolumeNormalizationEnabled();
     final volumeNormalizationLufs = await _settingsRepository
@@ -400,22 +490,43 @@ class _SettingsPageState extends State<SettingsPage>
         .getShowQualityDowngradeToast();
     final restoreMemoryEnabled = await _settingsRepository
         .getRestoreMemoryEnabled();
+    final startupAutoPlayEnabled = await _settingsRepository
+        .getStartupAutoPlayEnabled();
+    final startupAutoPlaySource = await _settingsRepository
+        .getStartupAutoPlaySource();
+    final startupAutoPlayOpenPage = await _settingsRepository
+        .getStartupAutoPlayOpenPage();
     final closeLocalMusicComments = await _settingsRepository
         .getCloseLocalMusicComments();
     final mvDanmakuEnabled = await _settingsRepository.getMvDanmakuEnabled();
     final mvDanmakuOpacity = await _settingsRepository.getMvDanmakuOpacity();
     final updateReminderEnabled = await _settingsRepository
         .getUpdateReminderEnabled();
+    final legacyAppIconEnabled = await _settingsRepository
+        .getLegacyAppIconEnabled();
     final pendingUpdateVersion = await _settingsRepository
         .getUpdateLastNotifiedVersion();
+    final desktopModeEnabled = await _settingsRepository
+        .getDesktopModeEnabled();
+    final secondaryPlayerEnabled = await _settingsRepository
+        .getSecondaryPlayerEnabled();
+    final viperMasterEnabled = await _settingsRepository
+        .getViperMasterEnabled();
+    final viperTapeQualityEnabled = await _settingsRepository
+        .getViperTapeQualityEnabled();
 
     setState(() {
       _wifiQuality = wifiQuality;
       _mobileQuality = mobileQuality;
+      _viperMasterEnabled = viperMasterEnabled;
+      _viperTapeQualityEnabled = viperTapeQualityEnabled;
       _autoReceiveVip = autoReceiveVip;
       _uploadListeningDuration = uploadListeningDuration;
       _updateReminderEnabled = updateReminderEnabled;
+      _legacyAppIconEnabled = legacyAppIconEnabled;
       _pendingUpdateVersion = pendingUpdateVersion;
+      _desktopModeEnabled = desktopModeEnabled;
+      _secondaryPlayerEnabled = secondaryPlayerEnabled;
       _useDynamicColor = useDynamicColor;
       _useCoverSeedColor = useCoverSeedColor;
       _useAmStylePlayer = useAmStylePlayer;
@@ -426,6 +537,7 @@ class _SettingsPageState extends State<SettingsPage>
       _useBackgroundImage = useBackgroundImage;
       _backgroundImagePath = backgroundImagePath;
       _backgroundBlur = backgroundBlur;
+      _amPlayerBlur = amPlayerBlur;
       _backgroundOpacity = backgroundOpacity;
       _useBackgroundMonet = useBackgroundMonet;
       _useTextShadow = useTextShadow;
@@ -439,11 +551,18 @@ class _SettingsPageState extends State<SettingsPage>
       _glowThresholdFactor = LyricPreferences.instance.glowThresholdFactor;
       _bluetoothLyricEnabled = bluetoothLyricEnabled;
       _bluetoothLyricCompressArt = bluetoothLyricCompressArt;
+      _depthCoverEnabled = depthCoverEnabled;
+      _depthCoverStrength = depthCoverStrength;
+      _depthCoverNeuralInpaint = depthCoverNeuralInpaint;
+      _depthCacheBytes = depthCacheBytes;
+      // 同步全局开关信号（播放页若在场即时响应；播放页 host 首次加载也读它）
+      DepthCoverService.enabledSignal.value = depthCoverEnabled;
       _lockScreenLyricEnabled = lockScreenLyricEnabled;
       _disableSystemAudioEffects = disableSystemAudioEffects;
       _pauseFadeEnabled = pauseFadeEnabled;
       _crossfadeEnabled = crossfadeEnabled;
       _crossfadeSeconds = crossfadeSeconds;
+      _automixEnabled = automixEnabled;
       _volumeNormalizationEnabled = volumeNormalizationEnabled;
       _volumeNormalizationLufs = volumeNormalizationLufs;
       _keepScreenOn = keepScreenOn;
@@ -455,6 +574,9 @@ class _SettingsPageState extends State<SettingsPage>
       _landscapeImmersiveEnabled = landscapeImmersiveEnabled;
       _showQualityDowngradeToast = showQualityDowngradeToast;
       _restoreMemoryEnabled = restoreMemoryEnabled;
+      _startupAutoPlayEnabled = startupAutoPlayEnabled;
+      _startupAutoPlaySource = startupAutoPlaySource;
+      _startupAutoPlayOpenPage = startupAutoPlayOpenPage;
       _closeLocalMusicComments = closeLocalMusicComments;
       _mvDanmakuEnabled = mvDanmakuEnabled;
       _mvDanmakuOpacity = mvDanmakuOpacity;
@@ -507,6 +629,52 @@ class _SettingsPageState extends State<SettingsPage>
     await _settingsRepository.setUpdateReminderEnabled(value);
   }
 
+  /// 通过 Android activity-alias 切换桌面图标；失败时保持开关原值。
+  Future<void> _setLegacyAppIconEnabled(bool value) async {
+    HapticFeedback.lightImpact();
+    try {
+      await _appIconChannel.invokeMethod<void>('setLegacyIcon', value);
+      await _settingsRepository.setLegacyAppIconEnabled(value);
+      if (mounted) setState(() => _legacyAppIconEnabled = value);
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(content: Text('切换应用图标失败：${error.message ?? error.code}')),
+      );
+    } on MissingPluginException {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(const SnackBar(content: Text('当前 Android 构建不支持切换应用图标')));
+    }
+  }
+
+  /// 清理 3D 封面深度图缓存（确认后执行；模型文件不受影响）。
+  Future<void> _clearDepthCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清理深度图缓存'),
+        content: const Text('将删除所有 3D 封面的分层/深度图缓存，\n各封面下次打开时会自动重新生成。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('清理'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await DepthCoverService.instance.cache.clearCache();
+    if (!mounted) return;
+    setState(() => _depthCacheBytes = 0);
+    showToast('深度图缓存已清理');
+  }
+
   Future<void> _loadVersion() async {
     try {
       final info = await PackageInfo.fromPlatform();
@@ -527,156 +695,576 @@ class _SettingsPageState extends State<SettingsPage>
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    // 是否处于二级页面（分类详情）
-    final inSubpage = _activeSection != null;
+    final level = _level;
+    final category = _categoryNamed(_activeSection);
 
     return PopScope(
-      // 二级页面时拦截系统返回键：先回到分类总览，而非直接退出设置页
-      canPop: !inSubpage,
+      // 非总览页时拦截系统返回键：逐级回退（三级→二级→总览），而非直接退出设置页
+      canPop: level == SettingsLevel.overview,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
-        _closeSection();
+        _onBackInvoked();
       },
       child: Scaffold(
         appBar: AppBar(
-          leading: inSubpage
-              ? IconButton(
+          leading: level == SettingsLevel.overview
+              ? null
+              : IconButton(
                   icon: const Icon(Icons.arrow_back),
-                  onPressed: _closeSection,
-                )
-              : null,
-          title: Text(inSubpage ? _activeSection! : '设置'),
-          // 统一对齐规则：设置页内部的分类详情本身即二级页面，一律居中；
+                  onPressed: level == SettingsLevel.subpage
+                      ? _closeSubpage
+                      : _closeSection,
+                ),
+          title: _buildAppBarTitle(level, category),
+          // 统一对齐规则：设置页内部的一/二/三级页面一律居中；
           // 总览页则按「是否为底部导航栏可直达的一级页面」判定
-          centerTitle: inSubpage || centerPageTitle(context, tabId: 'settings'),
+          centerTitle:
+              level != SettingsLevel.overview ||
+              centerPageTitle(context, tabId: 'settings'),
         ),
-        // 页面切换过渡：先淡出旧页 → 切换内容 → 再淡入新页（严格串行）。
-        // 淡入方向按页面层级区分：进入二级页自右侧推进、返回总览自左侧退回。
-        body: FadeTransition(
-          opacity: _sectionTransition,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: Offset(inSubpage ? 0.03 : -0.03, 0),
-              end: Offset.zero,
-            ).animate(_sectionTransition),
-            child: inSubpage
-                ? ListView(
-                    children: [
-                      _buildSettingsCard(
-                        _buildActiveSectionContent(colorScheme),
+        // 页面切换过渡：先淡出旧层 → 切换内容 → 再淡入新层（严格串行）。
+        // 淡入方向按层级方向区分：下钻自右侧推进、返回自左侧退回。
+        //
+        // 大屏「重组而非拉伸」：设置项是单栏内容，宽屏下约束到
+        // [AppLayout.maxContentWidth] 并居中，多余宽度留白，避免整行 ListTile
+        // 被无脑拉长（手机 <840dp 不触发，等同全宽，无回归）。
+        body: _useTwoPane
+            ? _buildTwoPaneBody(colorScheme, level, category)
+            : _buildSinglePaneBody(colorScheme, level, category),
+      ),
+    );
+  }
+
+  /// 是否使用 Pad 双列布局（build 内求值一次，两个 body 方法共用）。
+  bool get _useTwoPane => settingsUseTwoPaneLayout(
+    padLayout: isPadLayout(context),
+    width: MediaQuery.sizeOf(context).width,
+    desktopLayout: isDesktopLayout(context),
+  );
+
+  /// 层级切换过渡包裹：淡出旧层 → 切内容 → 淡入新层（方向 _navForward）。
+  Widget _transitioned(Widget child) {
+    return FadeTransition(
+      opacity: _sectionTransition,
+      child: SlideTransition(
+        position: Tween<Offset>(
+          begin: Offset(_navForward ? 0.03 : -0.03, 0),
+          end: Offset.zero,
+        ).animate(_sectionTransition),
+        child: child,
+      ),
+    );
+  }
+
+  /// 单列 body（手机 / 窄屏 / 桌面外壳）：与改造前完全一致。
+  Widget _buildSinglePaneBody(
+    ColorScheme colorScheme,
+    SettingsLevel level,
+    SettingsCategory? category,
+  ) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: AppLayout.maxContentWidth),
+        child: _transitioned(
+          level == SettingsLevel.overview
+              ? ListView(
+                  children: [
+                    _buildSearchField(colorScheme),
+                    if (_searchQuery.trim().isNotEmpty)
+                      ..._buildSearchResults(colorScheme)
+                    else
+                      ..._buildCategoryEntries(colorScheme),
+                    const Gap(AppSpacing.xxl),
+                  ],
+                )
+              : ListView(
+                  children: [
+                    ListTileTheme(
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.lg,
                       ),
-                      const SizedBox(height: 32),
-                    ],
-                  )
-                : ListView(
-                    children: [
-                      _buildSearchField(colorScheme),
-                      if (_searchQuery.trim().isNotEmpty)
-                        ..._buildSearchResults(colorScheme)
-                      else
-                        ..._buildCategoryEntries(colorScheme),
-                      const SizedBox(height: 32),
-                    ],
-                  ),
-          ),
+                      minVerticalPadding: AppSpacing.sm,
+                      iconColor: colorScheme.onSurfaceVariant,
+                      child: _buildSectionContent(
+                        level: level,
+                        category: category,
+                        colorScheme: colorScheme,
+                      ),
+                    ),
+                    const Gap(AppSpacing.xxl),
+                  ],
+                ),
         ),
       ),
     );
   }
 
-  /// 当前激活的二级页面标题；null 表示分类总览页
+  /// Pad 双列 body：左列分类/搜索列表常驻，右列显示当前选中层内容。
+  /// 总览态右列复用 DetailEmptyState（transparent：不遮挡壁纸背景）；
+  /// 过渡动画只作用于右列（左列静态）。
+  Widget _buildTwoPaneBody(
+    ColorScheme colorScheme,
+    SettingsLevel level,
+    SettingsCategory? category,
+  ) {
+    return SettingsTwoPaneBody(
+      master: ListView(
+        children: [
+          _buildSearchField(colorScheme),
+          if (_searchQuery.trim().isNotEmpty)
+            ..._buildSearchResults(colorScheme)
+          else
+            ..._buildCategoryEntries(colorScheme),
+          const Gap(AppSpacing.xxl),
+        ],
+      ),
+      detail: _transitioned(
+        level == SettingsLevel.overview
+            ? const DetailEmptyState(
+                icon: Icons.tune,
+                text: '从左侧选择分类进行配置',
+                color: Colors.transparent,
+              )
+            : ListView(
+                children: [
+                  ListTileTheme(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.lg,
+                    ),
+                    minVerticalPadding: AppSpacing.sm,
+                    iconColor: colorScheme.onSurfaceVariant,
+                    child: _buildSectionContent(
+                      level: level,
+                      category: category,
+                      colorScheme: colorScheme,
+                    ),
+                  ),
+                  const Gap(AppSpacing.xxl),
+                ],
+              ),
+      ),
+    );
+  }
+
+  /// 当前激活的二级分类标题；null 表示分类总览页
   String? _activeSection;
+
+  /// 当前激活的三级子页标题；null 表示停留在二级页
+  String? _activeSubpage;
+
+  /// 本次层级切换的过渡方向：true = 下钻（新页自右侧推进），false = 返回
+  bool _navForward = true;
 
   /// 页面切换过渡控制器（fade 0→1，见 initState）
   late AnimationController _sectionTransition;
 
-  /// 进入分类二级页面：先快速淡出总览，切换内容后再淡入（严格串行）
-  void _openSection(String title) {
-    if (_sectionTransition.isAnimating || _activeSection == title) return;
-    // 已在二级页面（理论上不会发生，防御性处理）：直接切换内容
-    if (_activeSection != null) {
-      setState(() => _activeSection = title);
-      return;
+  /// 当前所在层级
+  SettingsLevel get _level =>
+      resolveSettingsLevel(category: _activeSection, subpage: _activeSubpage);
+
+  /// 按标题取分类；未命中返回 null（状态与模型不同步时降级为空内容）
+  SettingsCategory? _categoryNamed(String? title) {
+    if (title == null) return null;
+    for (final category in _categories) {
+      if (category.title == title) return category;
     }
+    return null;
+  }
+
+  /// 设置页内层级切换：先快速淡出当前层，替换内容后再淡入（严格串行）。
+  /// [forward] 决定淡入时的滑动方向：下钻自右侧推进、返回自左侧退回。
+  void _navigateTo({
+    required String? category,
+    required String? subpage,
+    required bool forward,
+  }) {
+    if (_sectionTransition.isAnimating) return;
+    if (_activeSection == category && _activeSubpage == subpage) return;
+    _navForward = forward;
     // 淡出更快（90ms），淡入稍长（160ms）带层次，整体跟手
     _sectionTransition.duration = const Duration(milliseconds: 90);
     _sectionTransition.reverse().whenComplete(() {
       if (!mounted) return;
-      setState(() => _activeSection = title);
+      setState(() {
+        _activeSection = category;
+        _activeSubpage = subpage;
+      });
       _sectionTransition.duration = const Duration(milliseconds: 160);
       _sectionTransition.forward();
     });
   }
 
-  /// 返回分类总览：先快速淡出二级页，切换回总览后再淡入（严格串行）
-  void _closeSection() {
-    if (_sectionTransition.isAnimating || _activeSection == null) return;
-    _sectionTransition.duration = const Duration(milliseconds: 90);
-    _sectionTransition.reverse().whenComplete(() {
-      if (!mounted) return;
-      setState(() => _activeSection = null);
-      _sectionTransition.duration = const Duration(milliseconds: 160);
-      _sectionTransition.forward();
-    });
+  /// 进入分类二级页面
+  void _openSection(String title) =>
+      _navigateTo(category: title, subpage: null, forward: true);
+
+  /// 进入三级子页（保留当前分类）
+  void _openSubpage(String title) =>
+      _navigateTo(category: _activeSection, subpage: title, forward: true);
+
+  /// 三级子页返回二级页
+  void _closeSubpage() =>
+      _navigateTo(category: _activeSection, subpage: null, forward: false);
+
+  /// 返回分类总览
+  void _closeSection() =>
+      _navigateTo(category: null, subpage: null, forward: false);
+
+  /// 系统返回键：按层级逐级回退（三级→二级→总览）；总览页交还系统处理
+  void _onBackInvoked() {
+    final target = settingsBackTarget(
+      category: _activeSection,
+      subpage: _activeSubpage,
+    );
+    if (target == null) return;
+    _navigateTo(
+      category: target.category,
+      subpage: target.subpage,
+      forward: false,
+    );
   }
 
-  /// 分类条目：图标 + 标题 + 二级页面内容构建器
-  List<(String, IconData, Widget Function(ColorScheme))> get _categories => [
-    ('外观', Icons.palette_outlined, _buildAppearanceSection),
-    ('播放页样式', Icons.music_note_outlined, _buildPlayerStyleSection),
-    ('歌词', Icons.lyrics_outlined, _buildLyricSection),
-    ('播放', Icons.play_circle_outline, _buildPlaybackSection),
-    (
-      'USB 独占',
-      Icons.usb,
-      (colorScheme) => UsbExclusiveSection(
+  /// 分类条目：图标 + 标题 + 副标题 + 三级子页 + 内容构建器
+  List<SettingsCategory> get _categories => [
+    SettingsCategory(
+      title: '外观',
+      icon: Icons.palette_outlined,
+      description: '主题、字体与界面背景',
+      subpages: [
+        SettingsSubpage(
+          title: '主题与配色',
+          icon: Icons.brightness_6_outlined,
+          description: '明暗模式、OLED 纯黑与主题色来源',
+          builder: _buildThemeSubpage,
+        ),
+        SettingsSubpage(
+          title: '字体与显示',
+          icon: Icons.text_fields,
+          description: '全局字体与显示大小',
+          builder: _buildFontDisplaySubpage,
+        ),
+        SettingsSubpage(
+          title: '导航与布局',
+          icon: Icons.dashboard_outlined,
+          description: '底部导航栏标签、桌面布局与悬浮播放条',
+          builder: _buildShellLayoutSubpage,
+        ),
+        SettingsSubpage(
+          title: '车机模式',
+          icon: Icons.directions_car_outlined,
+          description: '常驻播放器面板、面板尺寸与停靠位置',
+          builder: _buildCarModeSubpage,
+        ),
+        SettingsSubpage(
+          title: '界面背景',
+          icon: Icons.wallpaper_outlined,
+          description: '自定义背景图、模糊与文字可读性',
+          builder: _buildBackgroundSubpage,
+        ),
+      ],
+    ),
+    SettingsCategory(
+      title: '播放页样式',
+      icon: Icons.music_note_outlined,
+      description: '播放页风格与视觉效果',
+      leading: _buildPlayerStyleLeading,
+      body: _buildPlayerStyleTail,
+      subpages: [
+        SettingsSubpage(
+          title: '封面与动态',
+          icon: Icons.album_outlined,
+          description: '专辑动态封面、移动网络加载与 3D 深度封面',
+          builder: _buildCoverDynamicSubpage,
+        ),
+        SettingsSubpage(
+          title: '歌词效果',
+          icon: Icons.auto_awesome_outlined,
+          description: '对唱优化、动态颜色、模糊、辉光与省电模式',
+          builder: _buildLyricEffectSubpage,
+        ),
+        SettingsSubpage(
+          title: '音乐频谱',
+          icon: Icons.graphic_eq,
+          description: '频谱样式、柱数量、取色与各层透明度',
+          builder: _buildSpectrumSubpage,
+        ),
+        SettingsSubpage(
+          title: '播放页背景',
+          icon: Icons.wallpaper_outlined,
+          description: '歌手写真轮播、背景流光与背景模糊',
+          builder: _buildPlayerBackgroundSubpage,
+        ),
+      ],
+    ),
+    SettingsCategory(
+      title: '歌词',
+      icon: Icons.lyrics_outlined,
+      description: '歌词推送与设备显示',
+      body: _buildLyricTail,
+      subpages: [
+        SettingsSubpage(
+          title: '歌词推送',
+          icon: Icons.push_pin_outlined,
+          description: '推送协议与翻译 / 罗马音偏好',
+          builder: _buildLyricPushSubpage,
+        ),
+        SettingsSubpage(
+          title: '设备歌词',
+          icon: Icons.devices_outlined,
+          description: '桌面、蓝牙、锁屏与状态栏歌词',
+          builder: _buildDeviceLyricSubpage,
+        ),
+      ],
+    ),
+    SettingsCategory(
+      title: '播放',
+      icon: Icons.play_circle_outline,
+      description: '音质、音效与播放行为',
+      subpages: [
+        SettingsSubpage(
+          title: '音质与输出',
+          icon: Icons.high_quality_outlined,
+          description: '网络音质、VIP 领取与 32bit 输出',
+          builder: _buildAudioQualitySubpage,
+        ),
+        SettingsSubpage(
+          title: '音效与音量',
+          icon: Icons.equalizer_outlined,
+          description: '均衡器、蝰蛇母带与音量均衡',
+          builder: _buildAudioEffectsSubpage,
+        ),
+        SettingsSubpage(
+          title: '播放行为',
+          icon: Icons.play_circle_outline,
+          description: '记忆播放、淡入淡出与音频焦点策略',
+          builder: _buildPlaybackBehaviorSubpage,
+        ),
+        SettingsSubpage(
+          title: '屏幕与视频',
+          icon: Icons.movie_outlined,
+          description: '屏幕常亮、横屏沉浸、MV 画中画与弹幕',
+          builder: _buildScreenVideoSubpage,
+        ),
+        SettingsSubpage(
+          title: '列表与交互',
+          icon: Icons.list_alt_outlined,
+          description: '评论区显示、滑动切歌与歌单排序',
+          builder: _buildListInteractionSubpage,
+        ),
+      ],
+    ),
+    SettingsCategory(
+      title: 'USB 独占',
+      icon: Icons.usb,
+      description: '独占输出与设备状态',
+      body: (colorScheme) => UsbExclusiveSection(
         onAutoPause: () => context.read<PlayerProvider>().pause(),
       ),
     ),
-    ('主页管理', Icons.tab_outlined, _buildTabManagementSection),
-    ('桌面快捷方式', Icons.bolt_outlined, _buildDesktopShortcutSection),
-    ('缓存与数据', Icons.storage_outlined, _buildCacheSection),
-    ('关于', Icons.info_outline, _buildAboutSection),
-    // 可选扩展：私有构建注入的额外分类（默认无）
-    ...?SettingsPage.extraCategories,
+    SettingsCategory(
+      title: '主页管理',
+      icon: Icons.tab_outlined,
+      description: '主页标签显示与排序',
+      body: _buildTabManagementSection,
+    ),
+    SettingsCategory(
+      title: '桌面快捷方式',
+      icon: Icons.bolt_outlined,
+      description: '应用图标长按快捷入口',
+      body: _buildDesktopShortcutSection,
+    ),
+    SettingsCategory(
+      title: 'AI 代理',
+      icon: Icons.smart_toy_outlined,
+      description: 'MCP 接口、访问令牌与只读模式',
+      body: _buildAiAgentSection,
+    ),
+    SettingsCategory(
+      title: '缓存与数据',
+      icon: Icons.storage_outlined,
+      description: '本地服务与数据维护',
+      body: _buildCacheSection,
+    ),
+    SettingsCategory(
+      title: '关于',
+      icon: Icons.info_outline,
+      description: '版本、帮助与许可',
+      body: _buildAboutSection,
+    ),
+    // 可选扩展：私有构建注入的额外分类（默认无）。扩展点类型与语义保持不变，
+    // 转换后无三级子页，二级页直接渲染其内容。
+    ...?(SettingsPage.extraCategories?.map(settingsCategoryFromLegacy)),
   ];
 
-  /// 二级页面内容：根据 _activeSection 匹配分类构建器
-  Widget _buildActiveSectionContent(ColorScheme colorScheme) {
-    for (final (title, _, builder) in _categories) {
-      if (title == _activeSection) {
-        return builder(colorScheme);
-      }
+  /// 二级/三级页面内容。
+  /// 三级：直接渲染子页构建器；二级：leading → 三级入口列表 → body。
+  Widget _buildSectionContent({
+    required SettingsLevel level,
+    required SettingsCategory? category,
+    required ColorScheme colorScheme,
+  }) {
+    if (category == null) return const SizedBox.shrink();
+    if (level == SettingsLevel.subpage) {
+      final subpage = category.subpageNamed(_activeSubpage);
+      if (subpage != null) return subpage.builder(colorScheme);
     }
-    return const SizedBox.shrink();
+    final leading = category.leading;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (leading != null) leading(colorScheme),
+        for (var i = 0; i < category.subpages.length; i++)
+          _buildSubpageEntry(
+            category.subpages[i],
+            colorScheme,
+            first: leading == null && i == 0,
+          ),
+        if (category.body != null) category.body!(colorScheme),
+      ],
+    );
   }
 
   /// 分类总览条目列表
   List<Widget> _buildCategoryEntries(ColorScheme colorScheme) {
+    final categories = _categories;
     return [
-      for (final (title, icon, _) in _categories)
-        ListTile(
-          leading: Icon(icon),
-          title: Text(title),
-          trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () => _openSection(title),
-        ),
+      _buildGroupLabel('界面与显示', colorScheme, first: true),
+      for (final c in categories.take(3)) _buildCategoryEntry(c, colorScheme),
+      _buildGroupLabel('播放与音频', colorScheme),
+      for (final c in categories.skip(3).take(2))
+        _buildCategoryEntry(c, colorScheme),
+      _buildGroupLabel('应用与管理', colorScheme),
+      for (final c in categories.skip(5).take(5))
+        _buildCategoryEntry(c, colorScheme),
+      if (categories.length > 10) ...[
+        _buildGroupLabel('更多设置', colorScheme),
+        for (final c in categories.skip(10))
+          _buildCategoryEntry(c, colorScheme),
+      ],
     ];
+  }
+
+  /// 分类条目（一级 → 二级）
+  Widget _buildCategoryEntry(
+    SettingsCategory category,
+    ColorScheme colorScheme,
+  ) {
+    return _buildNavEntryTile(
+      icon: category.icon,
+      title: category.title,
+      subtitle: category.description.isEmpty ? null : category.description,
+      colorScheme: colorScheme,
+      onTap: () => _openSection(category.title),
+    );
+  }
+
+  /// 三级子页入口条目（二级 → 三级）
+  Widget _buildSubpageEntry(
+    SettingsSubpage subpage,
+    ColorScheme colorScheme, {
+    required bool first,
+  }) {
+    return Padding(
+      padding: EdgeInsets.only(top: first ? AppSpacing.sm : 0),
+      child: _buildNavEntryTile(
+        icon: subpage.icon,
+        title: subpage.title,
+        subtitle: subpage.description,
+        colorScheme: colorScheme,
+        onTap: () => _openSubpage(subpage.title),
+      ),
+    );
+  }
+
+  /// 导航条目共用外观：图标 + 标题 + 副标题 + 右侧箭头（分类/子页入口一致）。
+  /// MD3：触控目标由 ListTile 保证 ≥48dp；间距走 AppSpacing（4dp 网格）。
+  Widget _buildNavEntryTile({
+    required IconData icon,
+    required String title,
+    required String? subtitle,
+    required ColorScheme colorScheme,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+      minVerticalPadding: AppSpacing.md,
+      leading: Icon(icon, color: colorScheme.primary),
+      title: Text(
+        title,
+        style: Theme.of(
+          context,
+        ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+      ),
+      subtitle: subtitle == null
+          ? null
+          : Text(
+              subtitle,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+      trailing: Icon(
+        Icons.chevron_right,
+        size: 20,
+        color: colorScheme.onSurfaceVariant,
+      ),
+      onTap: onTap,
+    );
+  }
+
+  /// AppBar 标题：总览固定「设置」；二级为分类名；三级为「分类名 + 子页名」双行。
+  /// 三级用 MD3 顶栏「标题 + 副标题」形态：上方小字保留分类上下文。
+  Widget _buildAppBarTitle(SettingsLevel level, SettingsCategory? category) {
+    if (level == SettingsLevel.overview) return const Text('设置');
+    final title = category?.title ?? _activeSection ?? '';
+    final subpage = category?.subpageNamed(_activeSubpage);
+    if (level != SettingsLevel.subpage || subpage == null) {
+      return Text(title, maxLines: 1, overflow: TextOverflow.ellipsis);
+    }
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.labelMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        Text(
+          subpage.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
   }
 
   /// 按查询词过滤搜索索引（label + aliases 包含匹配）。
   /// 索引由 scripts/tools/gen_settings_search_index.dart 从本文件源码生成，
-  /// 新增/改名设置项后重新生成即可，无需手工维护条目。
-  List<({String label, String category, String aliases})> _searchResults(
-    String query,
-  ) {
+  /// 新增/改名/下钻设置项后重新生成即可，无需手工维护条目。
+  List<({String label, String category, String subpage, String aliases})>
+  _searchResults(String query) {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return const [];
-    // 合并私有构建注入的额外索引条目（默认无）
-    final entries = [
-      ...kSettingsSearchIndex,
-      ...?SettingsPage.extraSearchIndexEntries,
-    ];
+    // 合并私有构建注入的额外索引条目（默认无）：老三元组没有三级页，补空串
+    final entries =
+        <({String label, String category, String subpage, String aliases})>[
+          ...kSettingsSearchIndex,
+          for (final e in SettingsPage.extraSearchIndexEntries ?? const [])
+            (
+              label: e.label,
+              category: e.category,
+              subpage: '',
+              aliases: e.aliases,
+            ),
+        ];
     return entries
         .where((e) => '${e.label} ${e.aliases}'.toLowerCase().contains(q))
         .toList();
@@ -685,7 +1273,12 @@ class _SettingsPageState extends State<SettingsPage>
   /// 总览页顶部搜索框。
   Widget _buildSearchField(ColorScheme colorScheme) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.md,
+        AppSpacing.sm,
+        AppSpacing.md,
+        AppSpacing.xs,
+      ),
       child: TextField(
         controller: _searchController,
         onChanged: (v) => setState(() => _searchQuery = v),
@@ -706,7 +1299,7 @@ class _SettingsPageState extends State<SettingsPage>
           filled: true,
           fillColor: colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
           border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(28),
+            borderRadius: AppRadius.xlAll,
             borderSide: BorderSide.none,
           ),
         ),
@@ -720,7 +1313,7 @@ class _SettingsPageState extends State<SettingsPage>
     if (results.isEmpty) {
       return [
         Padding(
-          padding: const EdgeInsets.symmetric(vertical: 48),
+          padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxxl),
           child: Center(
             child: Text(
               '未找到「${_searchQuery.trim()}」相关设置',
@@ -737,104 +1330,113 @@ class _SettingsPageState extends State<SettingsPage>
         ListTile(
           leading: const Icon(Icons.search, size: 20),
           title: Text(r.label),
-          subtitle: Text('${r.category} ›'),
+          subtitle: Text(
+            r.subpage.isEmpty
+                ? '${r.category} ›'
+                : '${r.category} › ${r.subpage}',
+          ),
           trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () {
-            // 清空搜索后进入对应分类
-            _searchController.clear();
-            setState(() => _searchQuery = '');
-            _openSection(r.category);
-          },
+          onTap: () => _openSearchResult(r),
         ),
     ];
   }
 
-  /// 将 section 内容包裹在圆角矩形卡片内，提升视觉分组。
-  /// 卡片背景使用 surfaceContainerLow，与播放器风格卡片保持一致。
-  Widget _buildSettingsCard(Widget child) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: child,
+  /// 点击搜索结果：清空搜索并直达对应层级。
+  /// 条目带三级页归属时直接落到三级子页，否则落到二级页。
+  void _openSearchResult(
+    ({String label, String category, String subpage, String aliases}) entry,
+  ) {
+    _searchController.clear();
+    setState(() => _searchQuery = '');
+    _navigateTo(
+      category: entry.category,
+      subpage: entry.subpage.isEmpty ? null : entry.subpage,
+      forward: true,
     );
   }
 
-  /// 区块内的分组小标题：把语义相关的设置项聚成一组。
-  /// [first] 为区块内第一个分组（顶部留白小一些，避免与卡片上沿脱开）。
+  /// 分组标题统一承担定位与分隔作用；不使用多张独立卡片。
   Widget _buildGroupLabel(
     String text,
     ColorScheme colorScheme, {
     bool first = false,
   }) {
-    return Padding(
-      padding: EdgeInsets.fromLTRB(16, first ? 12 : 20, 16, 4),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Text(
-          text,
-          style: Theme.of(
-            context,
-          ).textTheme.titleSmall?.copyWith(color: colorScheme.onSurfaceVariant),
-        ),
+    return SettingsGroupHeading(text, first: first);
+  }
+
+  /// 设置行尾部的状态数值（如「3 秒」「85%」「-14 LUFS」）统一弱化：
+  /// labelLarge + onSurfaceVariant，与行标题拉开层级、不与之争夺注意力。
+  Widget _statusText(String text) {
+    final theme = Theme.of(context);
+    return Text(
+      text,
+      style: theme.textTheme.labelLarge?.copyWith(
+        color: theme.colorScheme.onSurfaceVariant,
       ),
     );
   }
 
-  /// 歌词设置 section：MD3 与 Apple Music 两种风格播放页的歌词
-  /// （字号/行间距/字体）均已移入播放页右上角菜单的"歌词显示设置"入口，
-  /// 设置页不再保留独立入口。
-  Widget _buildLyricSection(ColorScheme colorScheme) {
+  /// 「歌词推送」三级子页：推送协议 + 共用文本偏好（翻译 / 罗马音 / 优先翻译）。
+  Widget _buildLyricPushSubpage(ColorScheme colorScheme) {
     final protocolActive = _lyricPushProtocol != 'none';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ① 歌词推送：先选推送协议，再调该协议下的共用文本偏好
-        _buildGroupLabel('歌词推送', colorScheme, first: true),
+        const Gap(AppSpacing.sm),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-          child: DropdownButtonFormField<String>(
-            initialValue: _lyricPushProtocol,
-            // 按钮占满可用宽度，选中文本过长时省略号截断，避免 right overflowed
-            isExpanded: true,
-            decoration: const InputDecoration(
-              isDense: true,
-              contentPadding: EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 10,
-              ),
-              border: OutlineInputBorder(),
-            ),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
+          // M3E 字段式下拉：初始选中值由 M3EDropdownItem.selected 表达
+          // （M3EDropdownMenu 没有 initialSelection 参数），每次 build 按当前
+          // 状态重建 item，控制器 setItems 后即显示正确的当前值。
+          child: M3EDropdownMenu<String>(
             items: [
-              const DropdownMenuItem(value: 'none', child: Text('关闭')),
-              const DropdownMenuItem(
+              M3EDropdownItem(
+                label: '关闭',
+                value: 'none',
+                selected: _lyricPushProtocol == 'none',
+              ),
+              M3EDropdownItem(
+                label: 'Lyricon 词幕',
                 value: 'lyricon',
-                child: Text('Lyricon 词幕'),
+                selected: _lyricPushProtocol == 'lyricon',
               ),
-              DropdownMenuItem(
+              M3EDropdownItem(
+                label: _superLyricSupported
+                    ? 'SuperLyric（系统级，需 Android 8.0+）'
+                    : 'SuperLyric（需 Android 8.0+）',
                 value: 'super_lyric',
-                enabled: _superLyricSupported,
-                child: Text(
-                  _superLyricSupported
-                      ? 'SuperLyric（系统级，需 Android 8.0+）'
-                      : 'SuperLyric（需 Android 8.0+）',
-                  overflow: TextOverflow.ellipsis,
-                ),
+                selected: _lyricPushProtocol == 'super_lyric',
+                disabled: !_superLyricSupported,
               ),
-              const DropdownMenuItem(
+              M3EDropdownItem(
+                label: 'LyricInfo',
                 value: 'lyric_info',
-                child: Text('LyricInfo'),
+                selected: _lyricPushProtocol == 'lyric_info',
               ),
             ],
-            onChanged: (value) {
-              if (value != null) {
-                // ignore: discarded_futures
-                _setLyricPushProtocol(value);
+            singleSelect: true,
+            // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+            showChipAnimation: false,
+            fieldStyle: const M3EDropdownFieldStyle(
+              hintText: '选择歌词推送方式',
+              // 对应原 isDense + contentPadding
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            ),
+            onSelectionChanged: (selected) {
+              // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+              if (selected.isEmpty) {
+                setState(() {});
+                return;
               }
+              final value = selected.first.value;
+              if (value == _lyricPushProtocol) return;
+              // ignore: discarded_futures
+              _setLyricPushProtocol(value);
             },
           ),
         ),
@@ -851,7 +1453,12 @@ class _SettingsPageState extends State<SettingsPage>
         // 选中 Lyricon 时显示连接状态
         if (_lyricPushProtocol == 'lyricon')
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.sm,
+            ),
             child: Align(
               alignment: Alignment.centerLeft,
               child: Text(
@@ -903,9 +1510,18 @@ class _SettingsPageState extends State<SettingsPage>
                 }
               : null,
         ),
-        // ② 桌面歌词：悬浮窗锁定后点击穿透（无法点击自身解锁），
+      ],
+    );
+  }
+
+  /// 「设备歌词」三级子页：桌面悬浮歌词、蓝牙歌词、锁屏歌词与魅族状态栏歌词。
+  Widget _buildDeviceLyricSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 桌面歌词：悬浮窗锁定后点击穿透（无法点击自身解锁），
         // 且无法下拉通知栏时，可在此一键解锁悬浮窗。
-        _buildGroupLabel('桌面歌词', colorScheme),
+        _buildGroupLabel('桌面歌词', colorScheme, first: true),
         // search: 桌面歌词 桌面
         SwitchListTile(
           title: const Text('解锁桌面歌词'),
@@ -919,7 +1535,6 @@ class _SettingsPageState extends State<SettingsPage>
             await DesktopLyricService.instance.unlock();
           },
         ),
-        // ③ 蓝牙歌词：主开关 + 从属的封面压缩
         _buildGroupLabel('蓝牙歌词', colorScheme),
         // search: 蓝牙
         SwitchListTile(
@@ -945,8 +1560,6 @@ class _SettingsPageState extends State<SettingsPage>
             await _settingsRepository.setBluetoothLyricCompressArt(value);
           },
         ),
-        // ④ 锁屏歌词：主开关（字号/行距/字重/字体等样式全部跟随 AM 歌词偏好，
-        // 与播放页 Zen 沉浸模式一致，在播放页歌词设置中调整）
         _buildGroupLabel('锁屏歌词', colorScheme),
         // search: 锁屏
         SwitchListTile(
@@ -962,7 +1575,36 @@ class _SettingsPageState extends State<SettingsPage>
             await DesktopLyricService.instance.setLockScreenLyricEnabled(value);
           },
         ),
-        // ⑤ 歌词同步：逐字歌词时间偏移（仅在线音乐生效）
+        if (_flymeStatusBarLyricSupported) ...[
+          _buildGroupLabel('魅族状态栏歌词', colorScheme),
+          // search: 魅族 flyme 状态栏
+          SwitchListTile(
+            title: const Text('状态栏歌词'),
+            subtitle: const Text('歌词显示在状态栏时钟旁，由 Flyme 系统渲染'),
+            value: _flymeStatusBarLyricEnabled,
+            onChanged: (value) async {
+              HapticFeedback.lightImpact();
+              setState(() => _flymeStatusBarLyricEnabled = value);
+              await _settingsRepository.setFlymeStatusBarLyricEnabled(value);
+              // 启停歌词定时器，并把开关与当前行同步到原生
+              await DesktopLyricService.instance.setFlymeStatusBarLyricEnabled(
+                value,
+              );
+            },
+          ),
+          // search: 状态栏 提前 提前量 快 慢
+          if (_flymeStatusBarLyricEnabled) const _FlymeLyricAdvanceTile(),
+        ],
+      ],
+    );
+  }
+
+  /// 「歌词」二级页尾部：歌词同步。
+  /// 仅 1 项，按 R2「短分组内联」原则留在二级页，不产生只有一行的三级页。
+  Widget _buildLyricTail(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
         _buildGroupLabel('歌词同步', colorScheme),
         const _LyricTimeOffsetTile(),
       ],
@@ -1091,109 +1733,231 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  Widget _buildAppearanceSection(ColorScheme colorScheme) {
-    final themeProvider = context.read<ThemeProvider>();
-    // 仅 ThemeMode.light 时禁用 OLED 开关；dark 与 system 均可勾选。
-    // system 模式下勾选后，等系统切到深色时 darkTheme 自动应用纯黑（MaterialApp 机制）。
-    // 以 ThemeProvider 为准（单一数据源），避免与本地 _themeMode 双份不同步
-    final canToggleOled =
-        context.watch<ThemeProvider>().themeMode != ThemeMode.light;
+  /// 「车机模式」三级子页：总开关 + 自动检测 + 面板宽/高 + Dock 避让 + 面板位置。
+  Widget _buildCarModeSubpage(ColorScheme colorScheme) {
     final carMode = context.watch<CarModeProvider>();
-    final ratioPercent = (carMode.panelRatio * 100).round();
+    // 滑条下限随布局切换：底部（竖屏/近方屏车机）10%，侧边 20%。
+    // 显示值同样按布局夹取：侧边布局下存量 0.12 若直接喂给滑条会触发
+    // value < min 断言。
+    final sliderMinRatio = carMode.useBottomLayout
+        ? kCarModePanelMinRatioBottom
+        : kCarModePanelMinRatio;
+    final ratioPercent =
+        (carMode.panelRatio.clamp(sliderMinRatio, kCarModePanelMaxRatio) * 100)
+            .round();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ⓪ 车机模式：原独立分类移入外观，置于顶部独立分组
-        // （开关 + 面板宽度 + 面板位置）。
-        //
-        // 本页（设置页）自身不显示面板（由 State 上的 CarModePanelSuppressor
-        // 声明），所以这里的调整不会在页内实时预览，退出设置页后生效。
-        _buildGroupLabel('车机模式', colorScheme, first: true),
+        const Gap(AppSpacing.sm),
         // 独立总开关：默认关闭。开启后任何界面（设置页 / 登录页 / 引导页 /
-        // 用户协议页除外）常驻一块播放器面板，且不再显示 MiniPlayer
+        // 用户协议页除外）常驻一块播放器面板，且不再显示 MiniPlayer。
+        // 这是**强制开启**开关：无论屏幕类型都启用。
         // search: 车机 车载 常驻 面板 大屏 副屏 副驾 miniplayer 迷你条
         SwitchListTile(
           title: const Text('车机模式'),
+          subtitle: const Text('任何界面常驻播放器面板，不再显示 MiniPlayer'),
           value: carMode.enabled,
           onChanged: (value) {
             HapticFeedback.lightImpact();
             context.read<CarModeProvider>().setEnabled(value);
           },
         ),
-        _buildGroupLabel('面板宽度', colorScheme),
-        ListTile(
-          enabled: carMode.enabled,
-          title: const Text('面板宽度'),
-          subtitle: M3ESlider(
-            decoration: const M3ESliderDecoration(
-              // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
-              // M3EHapticConfig.continuous()（10ms 最小间隔 + 2% 阈值），
-              // 拖动中会以最高约 100 次/秒走 MethodChannel 触发 vibrate，
-              // 真机上马达饱和 + 通道洪泛。
-              haptic: M3EHapticFeedback.medium,
-              hapticConfig: M3EHapticConfig.discrete(),
-            ),
-            value: carMode.panelRatio * 100,
-            min: kCarModePanelMinRatio * 100,
-            max: kCarModePanelMaxRatio * 100,
-            // 不传 divisions = 无级调节（M3ESlider.divisions 为 int?），
-            // 有档位吸附会破坏「无级」手感。
-            label: '$ratioPercent%',
-            // 拖动中只改内存（persist: false），松手才落盘。
-            // 注意：divisions == null 时 M3ESlider 的 onChangeEnd 可能在按下
-            // 超过 100ms 后被 tap-cancel 提前触发一次（见 _DisplayScaleTile 的
-            // 注释）。这里提前落盘的只是一个 double，不影响手感，真正的终值
-            // 会在拖动结束时再落一次。
-            onChanged: (value) => context.read<CarModeProvider>().setPanelRatio(
-              value / 100,
-              persist: false,
-            ),
-            onChangeEnd: (value) =>
-                context.read<CarModeProvider>().setPanelRatio(value / 100),
-          ),
-          trailing: Text('$ratioPercent%'),
+        // 自动检测开关：独立于上面的强制开关。开启后按屏幕长比自动判断，
+        // 命中车机屏（短边/长边 ≥ 0.55，常见 16:9 车机即满足）即自动启用。
+        // search: 车机 车载 自动 检测 屏幕 分辨率 识别 竖屏 方屏
+        SwitchListTile(
+          title: const Text('检测到车机屏幕时自动开启'),
+          subtitle: const Text('匹配竖屏或方屏车机等车载屏幕时自动启用车机模式'),
+          value: carMode.autoScreenEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            context.read<CarModeProvider>().setAutoScreenEnabled(value);
+          },
         ),
-        _buildGroupLabel('面板位置', colorScheme),
+        _buildGroupLabel(
+          carMode.useBottomLayout ? '面板高度' : '面板宽度',
+          colorScheme,
+          first: true,
+        ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-          // search-item: 面板位置 | 车机 面板 左侧 右侧 停靠 位置
-          child: M3EToggleButtonGroup(
-            actions: const [
-              M3EToggleButtonGroupAction(
-                label: Text('左侧'),
-                icon: Icon(Icons.align_horizontal_left),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // 标题随布局切换：侧边 =「面板宽度」（横贯左侧/右侧、只调宽），
+              // 底部 =「面板高度」（横贯全宽、只调高）。两者共用同一个占比值
+              // （panelRatio），通过 resolveCarModePanelWidth / Height 换算成
+              // 不同的物理尺寸。search: 面板宽度 面板高度 车机 底部
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      carMode.useBottomLayout ? '面板高度' : '面板宽度',
+                      style: Theme.of(context).textTheme.bodyLarge,
+                    ),
+                  ),
+                  Text(
+                    '$ratioPercent%',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ],
               ),
-              M3EToggleButtonGroupAction(
-                label: Text('右侧'),
-                icon: Icon(Icons.align_horizontal_right),
+              const SizedBox(height: 4),
+              // 滑条始终显示（两布局共用），拖动只改内存，松手落盘。
+              M3ESlider(
+                decoration: const M3ESliderDecoration(
+                  // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
+                  // M3EHapticConfig.continuous()（10ms 最小间隔 + 2% 阈值），
+                  // 拖动中会以最高约 100 次/秒走 MethodChannel 触发 vibrate，
+                  // 真机上马达饱和 + 通道洪泛。
+                  haptic: M3EHapticFeedback.medium,
+                  hapticConfig: M3EHapticConfig.discrete(),
+                ),
+                value:
+                    carMode.panelRatio.clamp(
+                      sliderMinRatio,
+                      kCarModePanelMaxRatio,
+                    ) *
+                    100,
+                // 底部布局（竖屏/近方屏车机）下限 10%，侧边保持 20%。
+                min: sliderMinRatio * 100,
+                max: kCarModePanelMaxRatio * 100,
+                // 不传 divisions = 无级调节（M3ESlider.divisions 为 int?），
+                // 有档位吸附会破坏「无级」手感。
+                label: '$ratioPercent%',
+                // 拖动中只改内存（persist: false），松手才落盘。
+                // 注意：divisions == null 时 M3ESlider 的 onChangeEnd 可能在
+                // 按下超过 100ms 后被 tap-cancel 提前触发一次（见
+                // _DisplayScaleTile 的注释）。这里提前落盘的只是一个 double，
+                // 不影响手感，真正的终值会在拖动结束时再落一次。
+                onChanged: (value) => context
+                    .read<CarModeProvider>()
+                    .setPanelRatio(value / 100, persist: false),
+                onChangeEnd: (value) =>
+                    context.read<CarModeProvider>().setPanelRatio(value / 100),
               ),
             ],
-            selectedIndex: carMode.panelSide == CarModePanelSide.left ? 0 : 1,
-            onSelectedIndexChanged: (index) {
-              if (index == null || !carMode.enabled) return;
-              HapticFeedback.lightImpact();
-              context.read<CarModeProvider>().setPanelSide(
-                index == 0 ? CarModePanelSide.left : CarModePanelSide.right,
-              );
-            },
           ),
         ),
-        if (!carMode.enabled)
+        // Dock 避让高度校准：仅底部布局（面板贴屏幕下缘）有意义 —— 车联
+        // dock 栏是系统悬浮窗、不产生 WindowInsets，SafeArea 挡不住，只能
+        // 由用户按 dock 实际高度校准（见 kCarModeBottomDockClearance 注释）。
+        // search-item: dock 避让高度 | 车机 车联 dock 避让 底部 空隙 高度
+        if (carMode.useBottomLayout) ...[
+          _buildGroupLabel('Dock 避让高度', colorScheme),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '底部面板与屏幕下缘留出的空隙，用于避开车联 dock 栏；0 为不避让',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    Expanded(
+                      child: M3ESlider(
+                        decoration: const M3ESliderDecoration(
+                          haptic: M3EHapticFeedback.medium,
+                          hapticConfig: M3EHapticConfig.discrete(),
+                        ),
+                        value: carMode.dockClearanceDp,
+                        min: 0,
+                        max: kCarModeDockClearanceMax,
+                        // 1dp 一档：整数值好读好记，档位 haptic 也与
+                        // M3EHapticConfig.discrete() 匹配。
+                        divisions: kCarModeDockClearanceMax.round(),
+                        label: '${carMode.dockClearanceDp.round()}dp',
+                        onChanged: (value) => context
+                            .read<CarModeProvider>()
+                            .setDockClearance(value, persist: false),
+                        onChangeEnd: (value) => context
+                            .read<CarModeProvider>()
+                            .setDockClearance(value),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 72,
+                      child: Text(
+                        carMode.dockClearanceDp <= 0
+                            ? '不避让'
+                            : '${carMode.dockClearanceDp.round()}dp',
+                        textAlign: TextAlign.end,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+        // 面板位置仅在侧边布局下有意义（底部布局面板横贯全宽）。
+        if (!carMode.useBottomLayout) _buildGroupLabel('面板位置', colorScheme),
+        if (!carMode.useBottomLayout)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+            // search-item: 面板位置 | 车机 面板 左侧 右侧 停靠 位置
+            child: M3EToggleButtonGroup(
+              actions: const [
+                M3EToggleButtonGroupAction(
+                  label: Text('左侧'),
+                  icon: Icon(Icons.align_horizontal_left),
+                ),
+                M3EToggleButtonGroupAction(
+                  label: Text('右侧'),
+                  icon: Icon(Icons.align_horizontal_right),
+                ),
+              ],
+              selectedIndex: carMode.panelSide == CarModePanelSide.left ? 0 : 1,
+              onSelectedIndexChanged: (index) {
+                if (index == null || !carMode.active) return;
+                HapticFeedback.lightImpact();
+                context.read<CarModeProvider>().setPanelSide(
+                  index == 0 ? CarModePanelSide.left : CarModePanelSide.right,
+                );
+              },
+            ),
+          ),
+        if (!carMode.active)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.xs,
+              AppSpacing.lg,
+              AppSpacing.lg,
+            ),
             child: Text(
-              '开启车机模式后生效',
+              '开启车机模式或检测到车机屏幕后生效',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
           )
         else
-          const SizedBox(height: 16),
-        // ① 明暗：主题模式 + 其从属的 OLED 纯黑（仅深色生效）
-        _buildGroupLabel('主题模式', colorScheme),
+          const Gap(AppSpacing.lg),
+      ],
+    );
+  }
+
+  /// 「主题与配色」三级子页：明暗模式 + 主题色来源。
+  Widget _buildThemeSubpage(ColorScheme colorScheme) {
+    final themeProvider = context.read<ThemeProvider>();
+    // 仅 ThemeMode.light 时禁用 OLED 开关；dark 与 system 均可勾选。
+    // system 模式下勾选后，等系统切到深色时 darkTheme 自动应用纯黑（MaterialApp 机制）。
+    // 以 ThemeProvider 为准（单一数据源），避免与本地 _themeMode 双份不同步
+    final canToggleOled =
+        context.watch<ThemeProvider>().themeMode != ThemeMode.light;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildGroupLabel('主题模式', colorScheme, first: true),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
           // 注意：按钮顺序(浅色/深色/跟随系统)与 ThemeMode.index(system=0,light=1,dark=2)
           // 不一致，必须用显式映射，不能直接 ThemeMode.values[index]，否则切换错位。
           child: M3EToggleButtonGroup(
@@ -1295,8 +2059,17 @@ class _SettingsPageState extends State<SettingsPage>
             onTap: () => _showSeedColorPicker(themeProvider),
           ),
         ),
-        // ③ 字体与显示：全局字体来源 + 显示大小，两者都直接改变文字/界面尺寸
-        _buildGroupLabel('字体与显示', colorScheme),
+      ],
+    );
+  }
+
+  /// 「字体与显示」三级子页：全局字体来源 + 强调排版 + 显示大小。
+  Widget _buildFontDisplaySubpage(ColorScheme colorScheme) {
+    final themeProvider = context.read<ThemeProvider>();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
         // app全局字体入口：点击弹出两选一面板（系统 / 自定义 TTF）
         // 选择"自定义"时打开 Android SAF 文件选择器选 .ttf/.otf 文件
         // search: 字体
@@ -1307,15 +2080,35 @@ class _SettingsPageState extends State<SettingsPage>
           trailing: const Icon(Icons.chevron_right, size: 18),
           onTap: () => _showFontSourceSheet(themeProvider),
         ),
+        // 「强调排版」开关（默认开启）：M3E 排版，统一提升标题与正文字重。
+        // 关闭后回退常规字重，用于对字体观感敏感时的回退。
+        // search: 强调排版 m3e 字重 typography
+        SwitchListTile(
+          title: const Text('强调排版'),
+          subtitle: const Text('M3E 排版：提升标题与正文字重，突出层级'),
+          value: themeProvider.emphasizedTypographyEnabled,
+          onChanged: (v) {
+            HapticFeedback.lightImpact();
+            context.read<ThemeProvider>().setEmphasizedTypographyEnabled(v);
+          },
+        ),
         // 「显示大小」滑块单独抽成 StatefulWidget：拖动中的中间值只重建这一小块。
         // 若放在设置页里用 setState 承接，每个 drag update 都会重建整页三千余行的
         // 元素树，滑块自身的手势识别器可能被连带重建 → 拖动中途"断触"、
         // onChangeEnd 提前触发（手还没抬就应用并弹确认框）。
         const _DisplayScaleTile(),
-        // ④ 导航栏：底部导航栏文字显示行为（始终显示 / 仅当前页 / 始终不显示）
-        _buildGroupLabel('底部导航栏', colorScheme),
+      ],
+    );
+  }
+
+  /// 「导航与布局」三级子页：底部导航栏标签行为 + 桌面布局外壳 + 悬浮播放器。
+  Widget _buildShellLayoutSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildGroupLabel('底部导航栏', colorScheme, first: true),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
           child: M3EToggleButtonGroup(
             actions: const [
               M3EToggleButtonGroupAction(
@@ -1349,19 +2142,46 @@ class _SettingsPageState extends State<SettingsPage>
             },
           ),
         ),
-        // ⑤ 界面背景：全局背景图及其衍生的取色 / 可读性设置
-        _buildGroupLabel('界面背景', colorScheme),
-        _buildBackgroundSection(colorScheme),
+        // ⑤ 桌面布局：侧栏 + 顶部工具栏外壳总开关（默认关，开启后横竖屏皆用）
+        _buildGroupLabel('桌面布局', colorScheme),
+        // search: 桌面布局 侧栏 大屏 平板 横屏 双栏 工具栏 desktop
+        SwitchListTile(
+          title: const Text('桌面布局'),
+          subtitle: const Text('开启后无论横屏竖屏都使用侧栏 + 顶部工具栏界面'),
+          value: _desktopModeEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _desktopModeEnabled = value);
+            _settingsRepository.setDesktopModeEnabled(value);
+            // 立即切换外壳：驱动全局判定源，触发主布局重建。
+            kDesktopModeEnabled.value = value;
+          },
+        ),
+        // ⑥ 悬浮播放器：二级页面悬浮迷你播放条总开关（默认开，可关闭）
+        _buildGroupLabel('悬浮播放器', colorScheme),
+        // search: 悬浮播放器 悬浮迷你播放器 迷你播放器 二级页面 播放栏 圆盘 浮动 关闭 secondary mini player
+        SwitchListTile(
+          title: const Text('悬浮迷你播放器'),
+          subtitle: const Text('开启后主页与二级页面均使用悬浮播放条；关闭后统一改用底部常驻播放条'),
+          value: _secondaryPlayerEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _secondaryPlayerEnabled = value);
+            _settingsRepository.setSecondaryPlayerEnabled(value);
+            // 立即生效：驱动全局判定源，各页宿主随 ValueListenableBuilder 重建。
+            kSecondaryPlayerEnabled.value = value;
+          },
+        ),
       ],
     );
   }
 
-  /// 界面背景子区块（嵌套于外观 section）：全局自定义背景图片
+  /// 界面背景三级子页：全局自定义背景图片
   /// （开关 / 选图 / 清除 / 预览 / 模糊 / 透明度）。
   ///
   /// 启用后全局页面表面的 Scaffold/AppBar 等变为透明，底层模糊背景图透出；
   /// 同时自动按背景图提取主色作为莫奈取色种子（封面动态取色开启时仍优先）。
-  Widget _buildBackgroundSection(ColorScheme colorScheme) {
+  Widget _buildBackgroundSubpage(ColorScheme colorScheme) {
     final themeProvider = context.read<ThemeProvider>();
     final hasImage =
         _backgroundImagePath != null &&
@@ -1370,6 +2190,7 @@ class _SettingsPageState extends State<SettingsPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        const Gap(AppSpacing.sm),
         // search: 背景 图片 壁纸
         SwitchListTile(
           title: const Text('启用自定义背景图片'),
@@ -1392,9 +2213,14 @@ class _SettingsPageState extends State<SettingsPage>
         ),
         // 实时预览：按当前模糊 / 透明度渲染（无用户图片时显示内置默认壁纸）
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            AppSpacing.xs,
+          ),
           child: ClipRRect(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: AppRadius.mdAll,
             child: SizedBox(
               height: 120,
               width: double.infinity,
@@ -1435,11 +2261,16 @@ class _SettingsPageState extends State<SettingsPage>
         // 模糊程度滑块
         // search-item: 背景图片模糊 | 模糊 高斯模糊 背景
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Row(
             children: [
               Icon(Icons.blur_on, color: colorScheme.onSurfaceVariant),
-              const SizedBox(width: 12),
+              const Gap(AppSpacing.md),
               Expanded(
                 child: M3ESlider(
                   value: _backgroundBlur,
@@ -1468,11 +2299,16 @@ class _SettingsPageState extends State<SettingsPage>
         // 透明度滑块
         // search-item: 背景图片透明度 | 透明度 背景
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Row(
             children: [
               Icon(Icons.opacity, color: colorScheme.onSurfaceVariant),
-              const SizedBox(width: 12),
+              const Gap(AppSpacing.md),
               Expanded(
                 child: M3ESlider(
                   value: _backgroundOpacity,
@@ -1533,7 +2369,12 @@ class _SettingsPageState extends State<SettingsPage>
         // 阴影磅数：阴影本身没生效时置灰（与「文字阴影」开关同一套约定，
         // 保留用户已选的磅数）
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Row(
             children: [
               Icon(
@@ -1606,22 +2447,61 @@ class _SettingsPageState extends State<SettingsPage>
     showToast('已清除背景图片，使用默认壁纸', long: true);
   }
 
-  /// 播放页样式 section：播放器风格卡片选择 + 视觉特效开关。
-  ///
-  /// 排列逻辑：先选风格 → 两种风格通用项 → MD3 专属 → Apple Music 专属 →
-  /// 两种风格均支持的频谱。专属项按其生效风格聚拢，避免灰显开关散落在各处。
-  Widget _buildPlayerStyleSection(ColorScheme colorScheme) {
+  /// 「播放页样式」二级页置顶内容：风格选择卡。
+  /// 风格决定各子页内专属项的可用性，按 R3 必须常驻可见、不下钻。
+  Widget _buildPlayerStyleLeading(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ① 风格选择：决定下方哪些专属项可用
         _buildGroupLabel('播放页风格', colorScheme, first: true),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppSpacing.lg,
+            vertical: AppSpacing.sm,
+          ),
           child: _buildStyleCards(colorScheme),
         ),
-        // ② 两种风格通用
-        _buildGroupLabel('通用', colorScheme),
+      ],
+    );
+  }
+
+  /// 「播放页样式」二级页尾部内容：歌词动画入口。
+  /// 歌词动画已是独立整屏页（LyricAnimationSettingsPage），若再挂到
+  /// 「歌词效果」子页下会形成四级导航，故按 R5 保留在二级页。
+  Widget _buildPlayerStyleTail(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 歌词动画子页内的设置项在本页没有对应 tile，用手写条目补索引。
+        // 必须挂在非 tile 节点上：生成器遇到 search-item 注释所在的 tile 会
+        // 走手写分支、跳过该 tile 的标题自动收集（丢「歌词动画」自身条目）。
+        // search-item: 歌词模糊强度 | 歌词 模糊 强度 程度 高斯模糊
+        // search-item: 辉光触发阈值 | 辉光 发光 阈值 灵敏度
+        _buildGroupLabel('歌词动效调节', colorScheme),
+        // 歌词动画入口：动画参数、歌词模糊强度、辉光触发阈值统一在独立子页无极调节，
+        // 排在歌词省电模式（特效兜底开关）之后、音乐频谱分组之前。
+        // search: 歌词 动画 当前行 上浮 非当前行 缩放 位置 错峰 步长 衰减
+        ListTile(
+          leading: const Icon(Icons.animation),
+          title: const Text('歌词动画'),
+          subtitle: const Text('动画细节 · 模糊强度 · 辉光阈值'),
+          trailing: const Icon(Icons.chevron_right, size: 20),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => const LyricAnimationSettingsPage(),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 「封面与动态」三级子页：歌词双击跳转 + 专辑动态封面 + 3D 深度封面。
+  Widget _buildCoverDynamicSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
         // search: 双击 跳转
         SwitchListTile(
           title: const Text('歌词双击跳转'),
@@ -1660,58 +2540,78 @@ class _SettingsPageState extends State<SettingsPage>
                 }
               : null,
         ),
-        // ③ MD3 风格专属：歌手写真背景 + 其从属的间隔 / 透明度
-        _buildGroupLabel('MD3Music 风格', colorScheme),
-        // search: 写真 背景 轮播
-        SwitchListTile(
-          title: const Text('歌手写真背景轮播'),
-          value: _useArtistPhotoBackground,
-          onChanged: !_useAmStylePlayer
-              ? (v) {
-                  HapticFeedback.lightImpact();
-                  setState(() => _useArtistPhotoBackground = v);
-                  context.read<ThemeProvider>().setUseArtistPhotoBackground(v);
-                }
-              : null,
-        ),
-        if (_useArtistPhotoBackground && !_useAmStylePlayer)
-          // search: 写真 轮播 间隔
-          ListTile(
-            title: const Text('轮播间隔'),
-            trailing: DropdownButton<int>(
-              value: _artistPhotoInterval,
-              items: [5, 10, 15, 20, 30, 45, 60]
-                  .map((s) => DropdownMenuItem(value: s, child: Text('$s 秒')))
-                  .toList(),
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() => _artistPhotoInterval = v);
-                context.read<ThemeProvider>().setArtistPhotoInterval(v);
-              },
-            ),
+        // 3D 封面（深度视差）：仅 depth3d 全量包启用；standard 包整体隐藏。
+        // 开启后陀螺仪驱动封面深度视差（模型内置，亦可导入更新）
+        if (kDepthCoverAvailable) ...[
+          // search: 3D 封面;深度;视差;立体;封面
+          SwitchListTile(
+            title: const Text('3D 封面'),
+            value: _depthCoverEnabled,
+            onChanged: (value) async {
+              HapticFeedback.lightImpact();
+              setState(() => _depthCoverEnabled = value);
+              await _settingsRepository.setDepthCoverEnabled(value);
+              DepthCoverService.enabledSignal.value = value;
+            },
           ),
-        if (_useArtistPhotoBackground && !_useAmStylePlayer)
-          // search: 写真 透明度
-          ListTile(
-            title: const Text('写真背景透明度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
+          // 开关关闭时隐藏以下三项（强度 / 导入模型 / 清理缓存）
+          if (_depthCoverEnabled) ...[
+            // search: 3D 封面 强度;视差 灵敏度;陀螺仪 灵敏度;深度 幅度
+            ListTile(
+              title: const Text('3D 封面强度'),
+              subtitle: M3ESlider(
+                decoration: const M3ESliderDecoration(
+                  haptic: M3EHapticFeedback.medium,
+                  hapticConfig: M3EHapticConfig.discrete(),
+                ),
+                value: _depthCoverStrength,
+                min: 0,
+                max: 40,
+                label: '${_depthCoverStrength.round()}',
+                onChanged: (value) {
+                  setState(() => _depthCoverStrength = value);
+                  unawaited(_settingsRepository.setDepthCoverStrength(value));
+                },
               ),
-              value: _artistPhotoOpacity,
-              min: 0.0,
-              max: 0.95,
-              divisions: 19,
-              label: '${(_artistPhotoOpacity * 100).round()}%',
-              onChanged: (v) {
-                setState(() => _artistPhotoOpacity = v);
-                context.read<ThemeProvider>().setArtistPhotoOpacity(v);
+            ),
+            // search: 3D 封面 AI 修补;背景 修补;神经网络;模型 修补;智能 填充
+            SwitchListTile(
+              title: const Text('AI 背景修补'),
+              subtitle: const Text('神经网络细化背景填充质量，关闭后用快速算法'),
+              value: _depthCoverNeuralInpaint,
+              onChanged: (value) async {
+                HapticFeedback.lightImpact();
+                setState(() => _depthCoverNeuralInpaint = value);
+                await _settingsRepository.setDepthCoverNeuralInpaint(value);
+                // 关闭→开启切换后，清缓存让新封面用神经修补重新生成
+                if (value) {
+                  await DepthCoverService.instance.cache.clearCache();
+                  if (mounted) {
+                    setState(() => _depthCacheBytes = 0);
+                  }
+                }
               },
             ),
-            trailing: Text('${(_artistPhotoOpacity * 100).round()}%'),
-          ),
-        // ④ Apple Music 风格专属：先歌词内容/排版，再颜色，再特效，最后性能兜底
-        _buildGroupLabel('Apple Music 风格', colorScheme),
+            // search: 3D 封面 缓存;清理 缓存;深度 缓存
+            ListTile(
+              title: const Text('清理深度图缓存'),
+              subtitle: Text(
+                '当前占用 ${(_depthCacheBytes / 1048576).toStringAsFixed(1)} MB',
+              ),
+              onTap: _depthCacheBytes > 0 ? _clearDepthCache : null,
+            ),
+          ],
+        ],
+      ],
+    );
+  }
+
+  /// 「歌词效果」三级子页：AM 歌词的对唱 / 取色 / 模糊 / 辉光 / 省电模式。
+  Widget _buildLyricEffectSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
         // search: 对唱 男女
         SwitchListTile(
           title: const Text('男女对唱歌词优化'),
@@ -1750,19 +2650,6 @@ class _SettingsPageState extends State<SettingsPage>
                   LyricPreferences.instance.setUseGaussianBlur(v);
                 }
               : null,
-        ),
-        // 歌词动画：当前行细节（上浮高度）+ 非当前行缩放 + 当前行位置 + 切行错峰三参数，统一在独立子页无极调节。
-        // search: 歌词 动画 当前行 上浮 非当前行 缩放 位置 错峰 步长 衰减
-        ListTile(
-          leading: const Icon(Icons.animation),
-          title: const Text('歌词动画'),
-          subtitle: const Text('当前行细节 · 非当前行缩放 · 错峰'),
-          trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () => Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => const LyricAnimationSettingsPage(),
-            ),
-          ),
         ),
         // search: 辉光 发光
         SwitchListTile(
@@ -1806,19 +2693,6 @@ class _SettingsPageState extends State<SettingsPage>
                 : null,
           ),
         ),
-        // search: 流光 背景
-        SwitchListTile(
-          title: const Text('背景动态流光'),
-          subtitle: const Text('高功耗'),
-          value: _useFlowingBackground,
-          onChanged: _useAmStylePlayer
-              ? (v) {
-                  HapticFeedback.lightImpact();
-                  setState(() => _useFlowingBackground = v);
-                  LyricPreferences.instance.setUseFlowingBackground(v);
-                }
-              : null,
-        ),
         // 歌词省电模式：AM 播放器歌词界面锁定 60fps，上下滑动歌词时临时解锁。
         // 排在特效末尾：它是上面几项高功耗特效的性能兜底。
         // search: 省电 限帧
@@ -1833,9 +2707,139 @@ class _SettingsPageState extends State<SettingsPage>
                 }
               : null,
         ),
-        // ⑤ 音乐频谱：两种风格均支持。开关 → 样式（决定下方哪些参数有效）
-        // → 柱数量 → 取色 → 该样式的透明度/高度
-        _buildGroupLabel('音乐频谱', colorScheme),
+      ],
+    );
+  }
+
+  /// 「播放页背景」三级子页：MD3 写真背景轮播 + AM 流光与背景模糊。
+  Widget _buildPlayerBackgroundSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // search: 写真 背景 轮播
+        SwitchListTile(
+          title: const Text('歌手写真背景轮播'),
+          value: _useArtistPhotoBackground,
+          onChanged: !_useAmStylePlayer
+              ? (v) {
+                  HapticFeedback.lightImpact();
+                  setState(() => _useArtistPhotoBackground = v);
+                  context.read<ThemeProvider>().setUseArtistPhotoBackground(v);
+                }
+              : null,
+        ),
+        if (_useArtistPhotoBackground && !_useAmStylePlayer)
+          // search: 写真 轮播 间隔
+          // 原 trailing 的紧凑 DropdownButton 换成字段式 M3EDropdownMenu：
+          // 控件下沉到 subtitle，与下方「写真背景透明度」的 subtitle 控件行
+          // 保持同一节奏（行高、左右留白、取值文本尺寸均靠拢该行）。
+          ListTile(
+            title: const Text('轮播间隔'),
+            subtitle: M3EDropdownMenu<int>(
+              items: [
+                for (final s in const [5, 10, 15, 20, 30, 45, 60])
+                  M3EDropdownItem(
+                    label: '$s 秒',
+                    value: s,
+                    selected: _artistPhotoInterval == s,
+                  ),
+              ],
+              singleSelect: true,
+              showChipAnimation: false,
+              fieldStyle: M3EDropdownFieldStyle(
+                hintText: '选择轮播间隔',
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.md,
+                  vertical: AppSpacing.sm,
+                ),
+                selectedTextStyle: Theme.of(context).textTheme.bodyMedium,
+              ),
+              onSelectionChanged: (selected) {
+                // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+                if (selected.isEmpty) {
+                  setState(() {});
+                  return;
+                }
+                final v = selected.first.value;
+                if (v == _artistPhotoInterval) return;
+                setState(() => _artistPhotoInterval = v);
+                context.read<ThemeProvider>().setArtistPhotoInterval(v);
+              },
+            ),
+          ),
+        if (_useArtistPhotoBackground && !_useAmStylePlayer)
+          // search: 写真 透明度
+          ListTile(
+            title: const Text('写真背景透明度'),
+            subtitle: M3ESlider(
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
+              value: _artistPhotoOpacity,
+              min: 0.0,
+              max: 0.95,
+              divisions: 19,
+              label: '${(_artistPhotoOpacity * 100).round()}%',
+              onChanged: (v) {
+                setState(() => _artistPhotoOpacity = v);
+                context.read<ThemeProvider>().setArtistPhotoOpacity(v);
+              },
+            ),
+            trailing: _statusText('${(_artistPhotoOpacity * 100).round()}%'),
+          ),
+        // search: 流光 背景
+        SwitchListTile(
+          title: const Text('背景动态流光'),
+          subtitle: const Text('高功耗'),
+          value: _useFlowingBackground,
+          onChanged: _useAmStylePlayer
+              ? (v) {
+                  HapticFeedback.lightImpact();
+                  setState(() => _useFlowingBackground = v);
+                  LyricPreferences.instance.setUseFlowingBackground(v);
+                }
+              : null,
+        ),
+        // 播放页背景模糊：仅 AM 风格 + 动态流光关闭时渲染此模糊层，
+        // 两种条件任一不满足即隐藏（流光开启时滑块无意义）
+        // search: 模糊 背景 播放器 毛玻璃 封面
+        if (_useAmStylePlayer && !_useFlowingBackground)
+          ListTile(
+            title: const Text('播放页背景模糊'),
+            subtitle: M3ESlider(
+              // 控件统一用 md3e_core 的无节点 M3ESlider（不传 divisions）。
+              // 显式给 hapticConfig：divisions == null 时 M3ESlider 默认取
+              // continuous（10ms 间隔 + 2% 阈值），拖动会以最高约 100 次/秒
+              // 走 MethodChannel 触发 vibrate，真机马达饱和 + 通道洪泛
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+                hapticConfig: M3EHapticConfig.discrete(),
+              ),
+              value: _amPlayerBlur,
+              min: 0,
+              max: 30,
+              // 不传 divisions = 无级调节（无节点）
+              label: '${_amPlayerBlur.round()}',
+              onChanged: (v) {
+                setState(() => _amPlayerBlur = v);
+              },
+              onChangeEnd: (v) {
+                context.read<ThemeProvider>().setAmPlayerBlur(v);
+              },
+            ),
+            trailing: Text('${_amPlayerBlur.round()}'),
+          ),
+      ],
+    );
+  }
+
+  /// 「音乐频谱」三级子页：环绕开关 + 样式 + 柱数量 + 取色 + 各透明度/高度。
+  Widget _buildSpectrumSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
         // 音乐频谱环绕：Android / iOS 均支持实时频谱；其他平台开关置灰
         // search: 频谱 环绕 可视化
         SwitchListTile(
@@ -1857,11 +2861,14 @@ class _SettingsPageState extends State<SettingsPage>
         // 先定样式，再调该样式下的参数。
         if (_spectrumEnabled && (Platform.isAndroid || Platform.isIOS))
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.lg,
+              vertical: AppSpacing.xs,
+            ),
             child: Row(
               children: [
                 const Text('频谱样式'),
-                const SizedBox(width: 16),
+                const Gap(AppSpacing.lg),
                 Expanded(
                   child: M3EToggleButtonGroup(
                     actions: const [
@@ -1901,7 +2908,7 @@ class _SettingsPageState extends State<SettingsPage>
                 SpectrumService.instance.bandCount = count;
               },
             ),
-            trailing: Text('$_spectrumBandCount 根'),
+            trailing: _statusText('$_spectrumBandCount 根'),
           ),
         // 频谱动态取色：AM 播放器频谱颜色取封面主色（50% 白 + 50% 取色混合）
         if (_spectrumEnabled && (Platform.isAndroid || Platform.isIOS))
@@ -1938,7 +2945,7 @@ class _SettingsPageState extends State<SettingsPage>
                   _settingsRepository.setSpectrumBarOpacity(v);
                 },
               ),
-              trailing: Text('${(_spectrumBarOpacity * 100).round()}%'),
+              trailing: _statusText('${(_spectrumBarOpacity * 100).round()}%'),
             )
           else if (_spectrumStyle == 1)
             // search: 频谱 透明度
@@ -1960,7 +2967,9 @@ class _SettingsPageState extends State<SettingsPage>
                   _settingsRepository.setSpectrumCurveOpacity(v);
                 },
               ),
-              trailing: Text('${(_spectrumCurveOpacity * 100).round()}%'),
+              trailing: _statusText(
+                '${(_spectrumCurveOpacity * 100).round()}%',
+              ),
             ),
         // 背景层参数：仅 style=2 时显示
         if (_spectrumEnabled &&
@@ -1985,7 +2994,7 @@ class _SettingsPageState extends State<SettingsPage>
                 _settingsRepository.setSpectrumBgOpacity(v);
               },
             ),
-            trailing: Text('${(_spectrumBgOpacity * 100).round()}%'),
+            trailing: _statusText('${(_spectrumBgOpacity * 100).round()}%'),
           ),
           // search: 频谱 高度
           ListTile(
@@ -2006,7 +3015,7 @@ class _SettingsPageState extends State<SettingsPage>
                 _settingsRepository.setSpectrumBgHeight(v);
               },
             ),
-            trailing: Text('${(_spectrumBgHeight * 100).round()}%'),
+            trailing: _statusText('${(_spectrumBgHeight * 100).round()}%'),
           ),
         ],
       ],
@@ -2016,7 +3025,7 @@ class _SettingsPageState extends State<SettingsPage>
   /// 弹出 8 色预设种子色选择面板。
   /// 选择后调用 ThemeProvider.setManualSeedColor 持久化并立即生效。
   void _showSeedColorPicker(ThemeProvider themeProvider) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       showDragHandle: true,
       builder: (ctx) => SeedColorPicker(
@@ -2048,7 +3057,7 @@ class _SettingsPageState extends State<SettingsPage>
   /// - 自定义字体：通过 Android SAF 选择 .ttf/.otf 文件，
   ///   原生端拷贝到 filesDir/fonts/user_custom.ttf，Dart 端用 FontLoader 注册
   void _showFontSourceSheet(ThemeProvider themeProvider) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       showDragHandle: true,
       builder: (ctx) {
@@ -2058,7 +3067,12 @@ class _SettingsPageState extends State<SettingsPage>
             mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.lg,
+                  AppSpacing.sm,
+                  AppSpacing.lg,
+                  AppSpacing.sm,
+                ),
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
@@ -2102,7 +3116,7 @@ class _SettingsPageState extends State<SettingsPage>
                   await _pickAndApplyCustomFont(themeProvider);
                 },
               ),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
             ],
           ),
         );
@@ -2140,24 +3154,28 @@ class _SettingsPageState extends State<SettingsPage>
   /// 单个网络的音质四选一按钮组（WiFi / 移动网络共用）。
   /// 加载时把遗留 'hq' 归一化到 '320'（高音质 API 码为 '320'）。
   Widget _buildNetworkQualityGroup(String value, ValueChanged<String?> onPick) {
+    // 五档；「蝰蛇母带」仅在实验开关开启时出现。
+    // 遗留值归一化：'hq'→'320'；开关关闭时 'viper_tape' 按 'high' 显示
+    // （与 PlayerProvider 请求侧的钳制一致，不改写存储值）。
+    const all = ['128', '320', 'flac', 'high', 'viper_tape'];
+    final codes = _viperTapeQualityEnabled ? all : all.sublist(0, 4);
+    var normalized = value == 'hq' ? '320' : value;
+    if (!_viperTapeQualityEnabled && normalized == 'viper_tape') {
+      normalized = 'high';
+    }
     return M3EToggleButtonGroup(
-      actions: const [
+      actions: [
         M3EToggleButtonGroupAction(label: Text('标准')),
         M3EToggleButtonGroupAction(label: Text('高品质')),
         M3EToggleButtonGroupAction(label: Text('无损')),
         M3EToggleButtonGroupAction(label: Text('Hi-Res')),
+        if (_viperTapeQualityEnabled)
+          M3EToggleButtonGroupAction(label: Text('蝰蛇母带')),
       ],
-      // 高音质码是 '320'（KuGou 合法值）；遗留 'hq' 归一化到 '320'
-      selectedIndex: const [
-        '128',
-        '320',
-        'flac',
-        'high',
-      ].indexOf(value == 'hq' ? '320' : value),
+      selectedIndex: codes.indexOf(normalized),
       onSelectedIndexChanged: (index) {
         if (index == null) return;
-        const q = ['128', '320', 'flac', 'high'];
-        onPick(q[index]);
+        onPick(codes[index]);
       },
     );
   }
@@ -2198,41 +3216,42 @@ class _SettingsPageState extends State<SettingsPage>
     return 'skia';
   }
 
-  /// 播放 section。
-  ///
-  /// 排列逻辑：音质与音效（音质 → 解锁高音质的 VIP → 输出音效）→ 播放行为
-  /// （淡入淡出 / 音频焦点及其从属策略）→ 屏幕与视频 → 列表与交互。
-  Widget _buildPlaybackSection(ColorScheme colorScheme) {
+  /// 「音质与输出」三级子页：网络音质（WiFi / 移动）+ VIP 领取 + 32bit + 降级提示。
+  Widget _buildAudioQualitySubpage(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ① 音质与音效
-        _buildGroupLabel('音质与音效', colorScheme, first: true),
+        const Gap(AppSpacing.sm),
         // 标题与按钮组分离（非 ListTile），索引条目手写声明
         // search-item: 网络音质 | 音质 清晰度 wifi 移动
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('网络音质', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 4),
+              const SettingsSubGroupLabel('网络音质'),
+              const Gap(AppSpacing.xs),
               Text(
                 '分别设置 WiFi 与移动网络下的播放音质，随当前网络自动生效',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                   color: colorScheme.onSurfaceVariant,
                 ),
               ),
-              const SizedBox(height: 16),
+              const Gap(AppSpacing.lg),
               Text('WiFi 网络下', style: Theme.of(context).textTheme.bodyMedium),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
               _buildNetworkQualityGroup(
                 _wifiQuality,
                 (q) => _onNetworkQualityPicked(true, q),
               ),
-              const SizedBox(height: 16),
+              const Gap(AppSpacing.lg),
               Text('移动网络下', style: Theme.of(context).textTheme.bodyMedium),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
               _buildNetworkQualityGroup(
                 _mobileQuality,
                 (q) => _onNetworkQualityPicked(false, q),
@@ -2271,17 +3290,16 @@ class _SettingsPageState extends State<SettingsPage>
             context.read<PlayerProvider>().setShowQualityDowngradeToast(value);
           },
         ),
-        // search: 记忆 播放状态 恢复 上次播放 播放进度 断点 续播 冷启动
-        SwitchListTile(
-          title: const Text('记忆播放状态'),
-          subtitle: const Text('冷启动恢复上次播放的歌曲与进度；关闭后不再记忆'),
-          value: _restoreMemoryEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _restoreMemoryEnabled = value);
-            context.read<PlayerProvider>().setRestoreMemoryEnabled(value);
-          },
-        ),
+      ],
+    );
+  }
+
+  /// 「音效与音量」三级子页：均衡器 / 音效库入口 + 蝰蛇母带链 + 音量均衡。
+  Widget _buildAudioEffectsSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
         ListenableBuilder(
           listenable: EqualizerService.instance,
           builder: (context, _) {
@@ -2351,6 +3369,29 @@ class _SettingsPageState extends State<SettingsPage>
                   MaterialPageRoute(builder: (_) => const SoundsPage()),
                 ),
         ),
+        // search: 蝰蛇 母带 母带处理 限幅 削波 均衡 viper master
+        SwitchListTile(
+          title: const Text('蝰蛇母带处理'),
+          subtitle: const Text('10 段均衡 + 限幅的母带级处理链，仅 Android；关闭时输出逐字节透传'),
+          value: _viperMasterEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _viperMasterEnabled = value);
+            _settingsRepository.setViperMasterEnabled(value);
+            ViperMasterService.instance.setEnabled(value);
+          },
+        ),
+        // search: 蝰蛇母带 音源 母带音质 viper tape VPT
+        SwitchListTile(
+          title: const Text('蝰蛇母带音源'),
+          subtitle: const Text('实验功能 · 开启后音质选择出现「蝰蛇母带」档，需要 VIP'),
+          value: _viperTapeQualityEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _viperTapeQualityEnabled = value);
+            _settingsRepository.setViperTapeQualityEnabled(value);
+          },
+        ),
         // —— 音量均衡（响度归一）——
         // search: 音量均衡 响度归一 响度 均衡 参考响度 LUFS 安静歌 放大 峰值
         SwitchListTile(
@@ -2388,10 +3429,94 @@ class _SettingsPageState extends State<SettingsPage>
                 AudioService().setVolumeNormalization(referenceLufs: lufs);
               },
             ),
-            trailing: Text('${_volumeNormalizationLufs.round()} LUFS'),
+            trailing: _statusText('${_volumeNormalizationLufs.round()} LUFS'),
           ),
-        // ② 播放行为：音量过渡 → 与其他应用共存策略
-        _buildGroupLabel('播放行为', colorScheme),
+      ],
+    );
+  }
+
+  /// 「播放行为」三级子页：记忆播放 + 淡入淡出 / 交叉淡化 + 音频焦点策略。
+  Widget _buildPlaybackBehaviorSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // search: 记忆 播放状态 恢复 上次播放 播放进度 断点 续播 冷启动
+        SwitchListTile(
+          title: const Text('记忆播放状态'),
+          subtitle: const Text('冷启动恢复上次播放的歌曲与进度；关闭后不再记忆'),
+          value: _restoreMemoryEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _restoreMemoryEnabled = value);
+            context.read<PlayerProvider>().setRestoreMemoryEnabled(value);
+          },
+        ),
+        // search: 自动播放 启动 开机 冷启动 一进来 就播
+        SwitchListTile(
+          title: const Text('启动时自动播放'),
+          subtitle: const Text('打开应用后自动开始播放音乐；默认关闭'),
+          value: _startupAutoPlayEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _startupAutoPlayEnabled = value);
+            _settingsRepository.setStartupAutoPlayEnabled(value);
+          },
+        ),
+        // 以下两项是上面那个开关的从属项：关着时它们没有意义，直接隐藏
+        if (_startupAutoPlayEnabled) ...[
+          // search: 播放内容 音源 每日推荐 私人FM 红心 探索 小众 继续上次 续播 电台
+          ListTile(
+            title: const Text('播放内容'),
+            subtitle: M3EDropdownMenu<String>(
+              items: [
+                for (final s in StartupAutoPlaySource.values)
+                  M3EDropdownItem(
+                    label: s.label,
+                    value: s.value,
+                    selected: _startupAutoPlaySource == s.value,
+                    // 「继续上次播放」靠记忆播放状态才有记录可续，关着它
+                    // 选了也只会静默不动 —— 置灰并说明原因，别让用户白等
+                    disabled: s.value == 'resume' && !_restoreMemoryEnabled,
+                  ),
+              ],
+              singleSelect: true,
+              // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+              showChipAnimation: false,
+              fieldStyle: const M3EDropdownFieldStyle(
+                hintText: '选择启动时播放的内容',
+                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+              onSelectionChanged: (selected) {
+                // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+                if (selected.isEmpty) {
+                  setState(() {});
+                  return;
+                }
+                final value = selected.first.value;
+                if (value == _startupAutoPlaySource) return;
+                HapticFeedback.lightImpact();
+                setState(() => _startupAutoPlaySource = value);
+                _settingsRepository.setStartupAutoPlaySource(value);
+              },
+            ),
+            trailing:
+                _startupAutoPlaySource == 'resume' && !_restoreMemoryEnabled
+                ? _statusText('需开启记忆播放状态')
+                : null,
+          ),
+          // search: 自动打开 播放页 全屏 推起 进播放页 启动
+          SwitchListTile(
+            title: const Text('自动打开播放页'),
+            subtitle: const Text('开始播放后自动进入完整播放页'),
+            value: _startupAutoPlayOpenPage,
+            onChanged: (value) {
+              HapticFeedback.lightImpact();
+              setState(() => _startupAutoPlayOpenPage = value);
+              _settingsRepository.setStartupAutoPlayOpenPage(value);
+            },
+          ),
+        ],
         // search: 淡入淡出 渐变 音量
         SwitchListTile(
           title: const Text('暂停淡入淡出'),
@@ -2402,45 +3527,6 @@ class _SettingsPageState extends State<SettingsPage>
               _pauseFadeEnabled = value;
             });
             _settingsRepository.setPauseFadeEnabled(value);
-          },
-        ),
-        // search: zen 沉浸 长按封面 沉浸模式
-        SwitchListTile(
-          title: const Text('长按封面进入 Zen 模式'),
-          value: _zenCoverLongPress,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _zenCoverLongPress = value);
-            _settingsRepository.setZenCoverLongPress(value);
-          },
-        ),
-        // 横屏进播放器自动隐藏状态栏/导航栏；关闭后横屏保持系统栏可见
-        // search: 横屏 沉浸 状态栏 导航栏 隐藏 全屏播放器
-        SwitchListTile(
-          title: const Text('横屏隐藏状态栏'),
-          value: _landscapeImmersiveEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _landscapeImmersiveEnabled = value);
-            _settingsRepository.setLandscapeImmersiveEnabled(value);
-            // 全局标志即时同步：再次进入播放器或旋转屏幕即按新值应用系统栏
-            kLandscapeImmersiveEnabled = value;
-          },
-        ),
-        // 本地歌曲没有在线评论：默认关闭评论 tab 与「看评论」入口；
-        // 关掉该开关后本地歌曲恢复显示，在线歌曲不受影响
-        // search: 本地音乐 评论区 评论 tab 看评论 关闭评论 本地歌曲
-        SwitchListTile(
-          title: const Text('关闭本地音乐评论区'),
-          value: _closeLocalMusicComments,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() {
-              _closeLocalMusicComments = value;
-            });
-            // 播放器把该开关缓存在 PlayerProvider 字段里（切歌判定路径上读取），
-            // 改完必须通知它，否则已挂载的全屏播放器本次运行内不重建 tab 结构
-            context.read<PlayerProvider>().setCloseLocalMusicComments(value);
           },
         ),
         // search: 歌曲淡入淡出 交叉淡化 crossfade 渐入渐出 叠加 衔接 无缝 过渡
@@ -2484,7 +3570,24 @@ class _SettingsPageState extends State<SettingsPage>
                 context.read<PlayerProvider>().refreshCrossfadeSettings();
               },
             ),
-            trailing: Text('$_crossfadeSeconds 秒'),
+            trailing: _statusText('$_crossfadeSeconds 秒'),
+          ),
+        // search: 自动混音 AutoMix 无缝过渡 对拍 节拍 变速 混音 DJ
+        if (_crossfadeEnabled)
+          SwitchListTile(
+            title: const Text('自动混音（AutoMix）'),
+            subtitle: const Text('按节拍对齐过渡点、按节奏自适应时长，BPM 接近时自动对拍'),
+            value: _automixEnabled,
+            onChanged: (value) {
+              HapticFeedback.lightImpact();
+              setState(() {
+                _automixEnabled = value;
+              });
+              _settingsRepository.setAutomixEnabled(value);
+              // ignore: use_build_context_synchronously
+              // refreshAutomixSettings() 由 Task 12 在 PlayerProvider 中提供
+              context.read<PlayerProvider>().refreshAutomixSettings();
+            },
           ),
         // 「失去音频焦点时」是下面这个开关的从属策略：忽略焦点关闭时才有意义
         // search: 音频焦点 忽略焦点 同时播放 共存 不被打断 焦点
@@ -2500,13 +3603,18 @@ class _SettingsPageState extends State<SettingsPage>
           },
         ),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // 与「默认音质」一致的标题排版
-              Text('失去音频焦点时', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 8),
+              const SettingsSubGroupLabel('失去音频焦点时'),
+              const Gap(AppSpacing.sm),
               // 与「默认音质」同款 M3E 按钮组；横排 + xs 尺寸 + 紧凑密度，文字过长省略
               M3EToggleButtonGroup(
                 actions: const [
@@ -2548,7 +3656,7 @@ class _SettingsPageState extends State<SettingsPage>
                   );
                 },
               ),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
               Text(
                 _audioFocusModeDescription(_audioFocusInterruptionMode),
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -2576,8 +3684,39 @@ class _SettingsPageState extends State<SettingsPage>
             }
           },
         ),
-        // ③ 屏幕与视频：都与「播放时的屏幕表现」相关
-        _buildGroupLabel('屏幕与视频', colorScheme),
+      ],
+    );
+  }
+
+  /// 「屏幕与视频」三级子页：Zen 长按、横屏沉浸、常亮、MV 画中画与弹幕。
+  Widget _buildScreenVideoSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // search: zen 沉浸 长按封面 沉浸模式
+        SwitchListTile(
+          title: const Text('长按封面进入 Zen 模式'),
+          value: _zenCoverLongPress,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _zenCoverLongPress = value);
+            _settingsRepository.setZenCoverLongPress(value);
+          },
+        ),
+        // 横屏进播放器自动隐藏状态栏/导航栏；关闭后横屏保持系统栏可见
+        // search: 横屏 沉浸 状态栏 导航栏 隐藏 全屏播放器
+        SwitchListTile(
+          title: const Text('横屏隐藏状态栏'),
+          value: _landscapeImmersiveEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _landscapeImmersiveEnabled = value);
+            _settingsRepository.setLandscapeImmersiveEnabled(value);
+            // 全局标志即时同步：再次进入播放器或旋转屏幕即按新值应用系统栏
+            kLandscapeImmersiveEnabled = value;
+          },
+        ),
         // search: 屏幕常亮 常亮 息屏
         SwitchListTile(
           title: const Text('播放时保持屏幕常亮'),
@@ -2644,13 +3783,38 @@ class _SettingsPageState extends State<SettingsPage>
               onChanged: (v) => setState(() => _mvDanmakuOpacity = v),
               onChangeEnd: (v) => _settingsRepository.setMvDanmakuOpacity(v),
             ),
-            trailing: Text('${(_mvDanmakuOpacity * 100).round()}%'),
+            trailing: _statusText('${(_mvDanmakuOpacity * 100).round()}%'),
           ),
-        // ④ 列表与交互：不改变音频本身，只影响操作手势与列表排序
-        _buildGroupLabel('列表与交互', colorScheme),
+      ],
+    );
+  }
+
+  /// 「列表与交互」三级子页：本地音乐评论区、MiniPlayer 滑动切歌、歌单排序。
+  Widget _buildListInteractionSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // 本地歌曲没有在线评论：默认关闭评论 tab 与「看评论」入口；
+        // 关掉该开关后本地歌曲恢复显示，在线歌曲不受影响
+        // search: 本地音乐 评论区 评论 tab 看评论 关闭评论 本地歌曲
+        SwitchListTile(
+          title: const Text('关闭本地音乐评论区'),
+          value: _closeLocalMusicComments,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() {
+              _closeLocalMusicComments = value;
+            });
+            // 播放器把该开关缓存在 PlayerProvider 字段里（切歌判定路径上读取），
+            // 改完必须通知它，否则已挂载的全屏播放器本次运行内不重建 tab 结构
+            context.read<PlayerProvider>().setCloseLocalMusicComments(value);
+          },
+        ),
         // search: miniplayer 迷你播放条 滑动切歌 切歌
         SwitchListTile(
           title: const Text('MiniPlayer 滑动切歌'),
+          subtitle: const Text('浮动迷你播放器暂不支持滑动切歌'),
           value: _miniPlayerSwipeSwitch,
           onChanged: (value) {
             HapticFeedback.lightImpact();
@@ -2688,6 +3852,13 @@ class _SettingsPageState extends State<SettingsPage>
   Widget _buildDesktopShortcutSection(ColorScheme colorScheme) {
     // search-item: 桌面快捷方式 | 快捷方式 快捷 长按
     return const _DesktopShortcutPanel();
+  }
+
+  /// AI 代理接口（MCP）section：外部 AI 客户端经 MCP 调用播放器的全部设置。
+  /// 独立一栏而非并入「缓存与数据」：能力面与风险面都独立，需要单独可见/可控。
+  Widget _buildAiAgentSection(ColorScheme colorScheme) {
+    // search-item: AI 代理接口 | AI 代理 mcp 大模型 智能体 claude 调用
+    return const McpAgentSection();
   }
 
   /// 本地持久化音频管理 section 未包含在公开版本中。
@@ -2752,6 +3923,7 @@ class _SettingsPageState extends State<SettingsPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _buildGroupLabel('本地服务', colorScheme, first: true),
         // 原「在线音乐」页内容：本地 Rust 服务器状态与重启入口
         // search: 接口 本地服务器 api 在线音乐
         ListTile(
@@ -2775,7 +3947,7 @@ class _SettingsPageState extends State<SettingsPage>
                   ),
                   decoration: BoxDecoration(
                     color: colorScheme.primaryContainer,
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: AppRadius.mdAll,
                   ),
                   child: Text(
                     '运行中',
@@ -2790,8 +3962,14 @@ class _SettingsPageState extends State<SettingsPage>
           context,
           '本地 Rust 服务器运行中，推荐/排行/搜索/播放/登录等数据接口均通过本地处理（点击上方可重启）',
           colorScheme,
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
         ),
+        _buildGroupLabel('存储维护', colorScheme),
         // search: 缓存 清除
         ListTile(
           title: const Text('清除缓存'),
@@ -2881,6 +4059,18 @@ class _SettingsPageState extends State<SettingsPage>
             _setUpdateReminderEnabled(value);
           },
         ),
+        if (Platform.isAndroid) ...[
+          // search: 图标 旧版 桌面图标 恢复
+          SwitchListTile(
+            title: const Text('还原旧版本 App 图标'),
+            subtitle: const Text('将桌面图标切换为旧版渐变音符图标'),
+            value: _legacyAppIconEnabled,
+            onChanged: (value) {
+              // ignore: discarded_futures
+              _setLegacyAppIconEnabled(value);
+            },
+          ),
+        ],
         // search: 更新
         ListTile(
           title: const Text('更新最新版本'),
@@ -2927,7 +4117,12 @@ class _SettingsPageState extends State<SettingsPage>
           context,
           '渲染引擎在应用构建时确定，运行中无法切换。· Skia 版：兼容性优先，适用于 32 位/老旧设备；· Impeller 版：图形更流畅，适用于新设备；iOS 端固定为 Impeller（系统默认，不可配置）。如需切换，请安装对应构建版本。',
           colorScheme,
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            AppSpacing.md,
+          ),
           singleLineLandscape: true,
         ),
         // ② 帮助
@@ -3151,7 +4346,7 @@ class _SettingsPageState extends State<SettingsPage>
           },
           preview: _SettingsMd3StylePreview(colorScheme: colorScheme),
         ),
-        const SizedBox(width: 16),
+        const Gap(AppSpacing.lg),
         _buildStyleCard(
           colorScheme: colorScheme,
           title: 'Apple Music',
@@ -3255,97 +4450,9 @@ class _TabManagementPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final tabConfig = context.watch<TabConfigProvider>();
-    final allTabs = tabConfig.allTabs;
-    final hiddenTabs = tabConfig.hiddenTabs;
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  '主页 Tab 管理',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-              ),
-              TextButton(
-                onPressed: () => tabConfig.resetToDefault(),
-                child: const Text('重置'),
-              ),
-            ],
-          ),
-        ),
-        _settingsDescription(
-          context,
-          '拖拽排序、开关显示/隐藏（“我的”不可隐藏）',
-          colorScheme,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-        ),
-        const SizedBox(height: 8),
-        ReorderableListView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          itemCount: allTabs.length,
-          onReorder: (oldIndex, newIndex) {
-            tabConfig.reorderTabs(oldIndex, newIndex);
-          },
-          itemBuilder: (context, index) {
-            final tab = allTabs[index];
-            final isHidden = hiddenTabs.contains(tab.id);
-            // search: -
-            return ListTile(
-              key: ValueKey(tab.id),
-              leading: Icon(
-                _tabIconForId(tab.id),
-                color: isHidden
-                    ? colorScheme.onSurfaceVariant
-                    : colorScheme.primary,
-              ),
-              title: Text(
-                tab.label,
-                style: TextStyle(
-                  color: isHidden ? colorScheme.onSurfaceVariant : null,
-                ),
-              ),
-              subtitle: !tab.isRemovable
-                  ? Text(
-                      '必显示',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                    )
-                  : null,
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (tab.isRemovable)
-                    Switch(
-                      value: !isHidden,
-                      onChanged: (_) {
-                        HapticFeedback.lightImpact();
-                        tabConfig.toggleTabVisibility(tab.id);
-                      },
-                    ),
-                  Icon(
-                    Icons.drag_handle,
-                    size: 20,
-                    color: colorScheme.onSurfaceVariant,
-                  ),
-                ],
-              ),
-            );
-          },
-        ),
-      ],
-    );
+    // 与 LaunchPad 编辑托盘共用同一套主页管理组件（见 home_tab_manager.dart）。
+    // 内嵌于设置页 ListView，故 embedded: true（shrinkWrap + 不滚动）。
+    return const HomeTabManagerList(embedded: true);
   }
 }
 
@@ -3358,7 +4465,12 @@ Widget _settingsDescription(
   BuildContext context,
   String text,
   ColorScheme colorScheme, {
-  EdgeInsets padding = const EdgeInsets.fromLTRB(16, 4, 16, 12),
+  EdgeInsets padding = const EdgeInsets.fromLTRB(
+    AppSpacing.lg,
+    AppSpacing.xs,
+    AppSpacing.lg,
+    AppSpacing.md,
+  ),
   bool singleLineLandscape = false,
 }) {
   final singleLine =
@@ -3458,7 +4570,12 @@ class _DesktopShortcutPanel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.sm,
+            AppSpacing.lg,
+            AppSpacing.xs,
+          ),
           child: Row(
             children: [
               Expanded(
@@ -3478,23 +4595,35 @@ class _DesktopShortcutPanel extends StatelessWidget {
           context,
           '长按应用图标弹出；拖拽排序、开关显示/隐藏',
           colorScheme,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         ),
-        const SizedBox(height: 8),
-        ReorderableListView.builder(
+        const Gap(AppSpacing.sm),
+        M3EReorderableDismissibleList(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+          listPadding: const EdgeInsets.symmetric(horizontal: 8),
           itemCount: allShortcuts.length,
+          // key 由 M3E 内部套用（KeyedSubtree），保证重排后行状态稳定
+          keyBuilder: (index) => ValueKey(allShortcuts[index].id),
+          // 索引语义与 ReorderableListView 一致（M3E 内部已在 to > from 时补 +1），
+          // 因此 provider 侧不需要任何换算
           onReorder: (oldIndex, newIndex) {
             shortcutConfig.reorderShortcuts(oldIndex, newIndex);
           },
+          // 置零卡片自身样式 + 关掉滑动（本列表只有显示/隐藏，没有删除）
+          style: const M3EDismissibleCardStyle(
+            outerRadius: 0,
+            innerRadius: 0,
+            gap: 0,
+            padding: EdgeInsets.zero,
+            color: Colors.transparent,
+            direction: DismissDirection.none,
+          ),
           itemBuilder: (context, index) {
             final shortcut = allShortcuts[index];
             final isHidden = hiddenIds.contains(shortcut.id);
             // search: -
             return ListTile(
-              key: ValueKey(shortcut.id),
               leading: Icon(
                 _tabIconForId(shortcut.id),
                 color: isHidden
@@ -3834,14 +4963,19 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.lg,
+        AppSpacing.sm,
+        AppSpacing.lg,
+        AppSpacing.sm,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
               Icon(Icons.av_timer, size: 20, color: colorScheme.primary),
-              const SizedBox(width: 8),
+              const Gap(AppSpacing.sm),
               Text(
                 '逐字歌词时间偏移',
                 style: textTheme.titleSmall?.copyWith(
@@ -3894,7 +5028,7 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const Gap(AppSpacing.xs),
           Text(
             '输入框支持 ±10000ms；正值 = 歌词延后显示，仅在线音乐生效',
             style: textTheme.bodySmall?.copyWith(
@@ -3979,11 +5113,16 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.xs,
+          ),
           child: Row(
             children: [
               Icon(Icons.fit_screen, color: colorScheme.onSurfaceVariant),
-              const SizedBox(width: 12),
+              const Gap(AppSpacing.md),
               Expanded(
                 // Listener 在 GestureDetector 之上，指针事件按 hit-test 路径原样
                 // 送达、不参与手势竞技场，所以 up / cancel 是可靠的「抬手」信号。
@@ -4031,7 +5170,12 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
           ),
         ),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            0,
+            AppSpacing.lg,
+            AppSpacing.sm,
+          ),
           child: Text(
             '显示大小：与系统同名设置一致，整体等比放大或缩小界面，一屏能显示的内容随之增减',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -4096,6 +5240,148 @@ class _DisplayScaleConfirmDialogState
           child: const Text('保留'),
         ),
       ],
+    );
+  }
+}
+
+/// 魅族状态栏歌词「提前量」。只影响状态栏这一路，不动播放页/悬浮窗/蓝牙的时间轴。
+class _FlymeLyricAdvanceTile extends StatefulWidget {
+  const _FlymeLyricAdvanceTile();
+
+  @override
+  State<_FlymeLyricAdvanceTile> createState() => _FlymeLyricAdvanceTileState();
+}
+
+class _FlymeLyricAdvanceTileState extends State<_FlymeLyricAdvanceTile> {
+  static const int _sliderMax = SettingsRepository.kFlymeLyricAdvanceMaxMs;
+  // 上限取自仓库常量而非本地字面量：UI 钳位与持久化钳位必须同源，
+  // 否则改一处就会出现"滑块能拖到 600、存进去被截到 300"这类不一致。
+
+  final TextEditingController _controller = TextEditingController();
+  late int _advance;
+
+  @override
+  void initState() {
+    super.initState();
+    _advance = SettingsRepository.kFlymeLyricAdvanceDefaultMs;
+    // 先用默认值占位再异步读持久化值：SharedPreferences 是异步的，
+    // 直接 await 会让这一行首帧空白。与 _LyricTimeOffsetTile 同一写法。
+    _controller.text = _advance.toString();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final v = await SettingsRepository().getFlymeLyricAdvanceMs();
+    if (!mounted) return;
+    setState(() {
+      _advance = v;
+      _controller.text = v.toString();
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _apply(int v) {
+    final clamped = v.clamp(0, _sliderMax);
+    setState(() {
+      _advance = clamped;
+      _controller.text = clamped.toString();
+    });
+    final repo = SettingsRepository();
+    // ignore: discarded_futures
+    repo.setFlymeLyricAdvanceMs(clamped);
+    // 即时生效：不重推的话要等到下一行才看得出变化
+    // ignore: discarded_futures
+    DesktopLyricService.instance.setFlymeAdvanceMs(clamped);
+  }
+
+  void _submitFromField() {
+    final v = int.tryParse(_controller.text.trim());
+    if (v == null) {
+      _controller.text = _advance.toString();
+      return;
+    }
+    _apply(v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.fast_rewind, size: 20, color: colorScheme.primary),
+              const SizedBox(width: 8),
+              Text(
+                '状态栏歌词提前量',
+                style: textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '${_advance}ms',
+                style: textTheme.labelLarge?.copyWith(
+                  color: colorScheme.primary,
+                ),
+              ),
+            ],
+          ),
+          M3ESlider(
+            value: _advance.clamp(0, _sliderMax).toDouble(),
+            min: 0,
+            max: _sliderMax.toDouble(),
+            label: '${_advance}ms',
+            onChanged: (v) => _apply(v.round()),
+          ),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '滑块 0–$_sliderMax ms',
+                  style: textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 120,
+                child: TextField(
+                  controller: _controller,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    signed: false,
+                  ),
+                  textAlign: TextAlign.end,
+                  style: textTheme.bodyMedium,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    suffixText: 'ms',
+                    hintText: '0',
+                  ),
+                  onSubmitted: (_) => _submitFromField(),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '状态栏歌词是通知驱动的，系统渲染有约 100ms 延迟，所以默认提前 120ms 抵消它。'
+            '觉得字出太早就调小，太晚就调大；只影响状态栏，不影响播放页与悬浮窗。',
+            style: textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

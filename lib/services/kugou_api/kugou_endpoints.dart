@@ -40,6 +40,9 @@ class KugouEndpoints {
   static const String favoriteCount = '/favorite/count';
   static const String recommendSongs = '/recommend/songs';
 
+  // Home
+  static const String homeDiscover = '/home/discover';
+
   // Lyric
   static const String lyric = '/lyric';
 
@@ -53,6 +56,7 @@ class KugouEndpoints {
   static const String commentAlbum = '/comment/album';
   static const String commentCount = '/comment/count';
   static const String commentMusicSend = '/comment/music/send';
+  static const String commentMusicDel = '/comment/music/del';
   static const String commentFloorSend = '/comment/floor/send';
   static const String commentPlaylistSend = '/comment/playlist/send';
   static const String commentAlbumSend = '/comment/album/send';

@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 
-import '../../widgets/apple_lyrics/models/lyric_line.dart';
+import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/md3_lyric_preferences.dart';
 
 class LyricsView extends StatefulWidget {

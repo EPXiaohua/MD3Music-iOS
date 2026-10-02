@@ -8,6 +8,7 @@ import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/services/media_store_service.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
 import '../../providers/library_provider.dart';
@@ -15,7 +16,7 @@ import '../../providers/player_provider.dart';
 import '../../services/kugou_api/cloud_song_mapper.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 class CloudMusicPage extends StatefulWidget {
   const CloudMusicPage({super.key});
@@ -172,7 +173,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                 return Column(
                   children: [
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                      padding: const EdgeInsets.fromLTRB(20, 0, 20, AppSpacing.sm),
                       child: Row(
                         children: [
                           Text(
@@ -212,7 +213,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                         .onSurfaceVariant,
                                   ),
                             ),
-                          const SizedBox(width: 8),
+                          const Gap(AppSpacing.sm),
                           Text(
                             inSelectMode
                                 ? '已选 ${selected.length} 首'
@@ -243,7 +244,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                         .onSurfaceVariant
                                         .withValues(alpha: 0.5),
                                   ),
-                                  const SizedBox(height: 12),
+                                  const Gap(AppSpacing.md),
                                   Text(
                                     '本地音乐库暂无歌曲\n请先到「我的音乐」扫描本地歌曲',
                                     textAlign: TextAlign.center,
@@ -304,7 +305,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                       SafeArea(
                         top: false,
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.xs, AppSpacing.lg, AppSpacing.md),
                           child: SizedBox(
                             width: double.infinity,
                             child: FilledButton.icon(
@@ -561,7 +562,8 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                 ),
               ],
       ),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _error != null
               ? _buildError()
@@ -611,10 +613,10 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                   ),
                           ),
                           if (_isSelectMode) _buildSelectActionBar(),
-                          const MiniPlayer(),
                         ],
                       ),
                     ),
+      ),
     );
   }
 
@@ -658,7 +660,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
   /// 列表项三点菜单：单曲删除入口。
   void _showSongMoreMenu(Song song) {
     final colorScheme = Theme.of(context).colorScheme;
-    showModalBottomSheet<void>(
+    showM3EModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
       builder: (sheetContext) => SafeArea(
@@ -694,7 +696,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
     return SafeArea(
       top: false,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+        padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.xs, AppSpacing.lg, AppSpacing.sm),
         child: SizedBox(
           width: double.infinity,
           child: FilledButton.icon(
@@ -787,7 +789,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
 
   Widget _buildHeader() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
       child: Row(
         children: [
           Text(
@@ -816,7 +818,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
   Widget _buildSearchBar() {
     final colorScheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
       child: TextField(
         controller: _searchController,
         decoration: InputDecoration(
@@ -849,7 +851,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
             borderRadius: BorderRadius.circular(20),
             borderSide: BorderSide.none,
           ),
-          contentPadding: const EdgeInsets.symmetric(vertical: 0),
+          contentPadding: const EdgeInsets.symmetric(vertical: AppSpacing.none),
           isDense: true,
         ),
         onChanged: (value) => setState(() => _searchQuery = value),
@@ -868,7 +870,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
             size: 48,
             color: cs.onSurfaceVariant.withValues(alpha: 0.5),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           Text(
             '没有匹配 "${_searchQuery.trim()}" 的歌曲',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
@@ -891,16 +893,16 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
             size: 64,
             color: cs.onSurfaceVariant.withValues(alpha: 0.4),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           Text(
             '云盘暂无音乐',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: cs.onSurfaceVariant,
                 ),
           ),
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxl),
             child: Text(
               '在酷狗音乐 App 中上传歌曲后即可在此查看',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -909,7 +911,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
               textAlign: TextAlign.center,
             ),
           ),
-          const SizedBox(height: 16),
+          const Gap(AppSpacing.lg),
           FilledButton.tonalIcon(
             onPressed: _loadCloudSongs,
             icon: const Icon(Icons.refresh, size: 18),
@@ -931,7 +933,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
             size: 64,
             color: cs.error.withValues(alpha: 0.5),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           Text(
             _error!,
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
@@ -939,7 +941,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                 ),
             textAlign: TextAlign.center,
           ),
-          const SizedBox(height: 16),
+          const Gap(AppSpacing.lg),
           FilledButton.tonal(
             onPressed: _loadCloudSongs,
             child: const Text('重试'),

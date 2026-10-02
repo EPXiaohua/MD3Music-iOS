@@ -438,7 +438,7 @@ class KugouSongDetail {
   });
 
   /// 创建副本并覆盖指定字段（用于补全 albumName 等缺失字段）
-  KugouSongDetail copyWith({String? albumName}) {
+  KugouSongDetail copyWith({String? albumName, String? artworkUri}) {
     return KugouSongDetail(
       hash: hash,
       albumId: albumId,
@@ -453,7 +453,7 @@ class KugouSongDetail {
       hash128: hash128,
       lyrics: lyrics,
       albumAudioId: albumAudioId,
-      artworkUri: artworkUri,
+      artworkUri: artworkUri ?? this.artworkUri,
       fileName: fileName,
       privilege: privilege,
       albumAudioId2: albumAudioId2,
@@ -1192,7 +1192,7 @@ class KugouComment {
         _zeroAsNull(json['tid']) ?? json['id'] ?? json['comment_id'],
       ),
       code: _strNull(json['code']),
-      userId: _strNull(json['user_id'] ?? json['userid']),
+      userId: _strNull(json['user_id'] ?? json['userid'] ?? json['kugouid']),
       images: CommentImage.listFromJson(json['images']),
       mixSongId: _strNull(
         json['mixsongid'] ?? json['audio_id'] ?? json['album_audio_id'],
@@ -1352,13 +1352,27 @@ class KugouArtistAudios {
   const KugouArtistAudios({this.songs = const [], this.total = 0});
 
   factory KugouArtistAudios.fromJson(Map<String, dynamic> json) {
-    final data = json['data'] as Map<String, dynamic>? ?? json;
-    final list = data['list'] ?? data['songs'] ?? data['info'] ?? [];
+    dynamic rawData = json['data'] ?? json;
+    List<dynamic> list;
+    if (rawData is List) {
+      list = rawData;
+    } else if (rawData is Map) {
+      list = rawData['list'] ?? rawData['songs'] ?? rawData['info'] ?? [];
+    } else {
+      list = [];
+    }
+    
+    // total 可能是根节点的 total，也可能是 data 里的 total
+    int parsedTotal = 0;
+    if (json['total'] != null) {
+      parsedTotal = _parseInt(json['total']);
+    } else if (rawData is Map && (rawData['total'] != null || rawData['total_count'] != null)) {
+      parsedTotal = _parseInt(rawData['total'] ?? rawData['total_count']);
+    }
+
     return KugouArtistAudios(
-      songs: (list as List<dynamic>)
-          .map((e) => KugouSongDetail.fromJson(e as Map<String, dynamic>))
-          .toList(),
-      total: _parseInt(data['total'] ?? data['total_count'] ?? 0),
+      songs: list.map((e) => KugouSongDetail.fromJson(e as Map<String, dynamic>)).toList(),
+      total: parsedTotal,
     );
   }
 }
@@ -1696,12 +1710,17 @@ class KugouQuality {
   static const String hires = 'high';
   static const String master = 'hi-res';
 
+  /// 蝰蛇母带（/v6/priv_url qualities 下标 6，等级 101，需要 VIP）。
+  /// Rust 侧 song_url_new.rs 的 QUALITIES 已包含该值，按下标命中即回写此音质。
+  static const String viperTape = 'viper_tape';
+
   /// 音质代号 → 中文标签
   static const labels = {
     standard: '标准音质',
     high: '高音质',
     lossless: '无损音质',
     hires: 'Hi-Res',
+    viperTape: '蝰蛇母带',
   };
 
   static String labelOf(String quality) => labels[quality] ?? quality;
@@ -2369,5 +2388,64 @@ class KugouLoginAccount {
         json['avatar'] ?? json['pic'] ?? json['img'] ?? json['imgurl'],
       ),
     );
+  }
+}
+
+/// 从 `/home/discover`（上游 `homediscoverrec/v1/client/home_discover_rec`）的原始
+/// 响应里取出歌曲列表。
+///
+/// 上游的 JS 参考实现把 JSON **原样透传**，既无字段文档也无样例响应，歌曲数组究竟
+/// 挂在哪个键上无从确认，因此这里按「通用信封 → 多键兜底 → 逐条降级」来解析：任何
+/// 一层形状不符都只损失那一条、或整体退化为空列表，**绝不把异常抛给调用方**——刷歌
+/// 推荐页必须在酷狗改字段时继续可用，而不是整页崩掉。单条解析直接交给
+/// [KugouSongDetail.fromJson]（它已处理 `album_info`/`audio_info`/`Singers`/`authors`
+/// 等多种嵌套形态），此处不重复造。
+///
+/// 候选键优先级：`song_list` → `songs` → `list` → `info` → `data` → `items`。
+/// `data` 这个键在酷狗响应里既可能是信封也可能是数组本身（`{data:[...]}`），所以先
+/// 判它是不是 `List`，是的话直接当歌曲列表用，不再按候选键下钻。
+List<KugouSongDetail> parseHomeDiscoverSongs(Map<String, dynamic> json) {
+  // 逐条映射：非 Map 元素与单条解析异常都只跳过这一条，不牵连同批其余歌曲。
+  List<KugouSongDetail> take(List<dynamic> raw) {
+    final songs = <KugouSongDetail>[];
+    for (final element in raw) {
+      if (element is! Map<String, dynamic>) continue;
+      try {
+        songs.add(KugouSongDetail.fromJson(element));
+      } catch (_) {
+        continue;
+      }
+    }
+    return songs;
+  }
+
+  try {
+    final envelope = json['data'];
+    // `data` 本身就是数组：信封即列表，此时根对象上的其它键不该抢优先级。
+    if (envelope is List) return take(envelope);
+    // `data` 是 Map 才按通用信封下钻；键缺失或类型不对就直接用根对象，
+    // 因为确有响应不带信封、歌曲键挂在顶层的形态。
+    final body = envelope is Map ? envelope : json;
+    for (final key in const [
+      'song_list',
+      'songs',
+      'list',
+      'info',
+      'data',
+      'items',
+    ]) {
+      final value = body[key];
+      if (value is List) return take(value);
+    }
+    // 兜底：候选键全落空时，根对象 / data 自身就是数组也接受（键名不在候选表
+    // 内）。入参签名固定为 `Map<String, dynamic>`，故「根为数组」实际走不到，
+    // 这里保留检查只为把该不变量写死；`data` 为数组的形态已由上面的信封分支
+    // 先命中，此处是双重保险。
+    for (final holder in <Object?>[json, envelope]) {
+      if (holder is List) return take(holder);
+    }
+    return const [];
+  } catch (_) {
+    return const [];
   }
 }

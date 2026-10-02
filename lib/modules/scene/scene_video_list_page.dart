@@ -9,7 +9,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 import '../player/mv_player_page.dart';
 
 /// 场景音乐视频列表页（/scene/video/list?tag_id=tag_id）。
@@ -144,8 +144,8 @@ class _SceneVideoListPageState extends State<SceneVideoListPage> {
         opaque: true,
         scrollController: _scrollController,
       ),
-      bottomNavigationBar: const MiniPlayer(),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _videos.isEmpty
               ? _buildEmpty(cs)
@@ -174,6 +174,7 @@ class _SceneVideoListPageState extends State<SceneVideoListPage> {
                     ),
                   ),
                 ),
+      ),
     );
   }
 

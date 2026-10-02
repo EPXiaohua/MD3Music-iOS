@@ -82,8 +82,7 @@ void main() {
 
   group('初始状态', () {
     test('非当前行（scale=0.97）：所有 word alpha 初始为 dynamicDarkAlpha=0.2', () {
-      renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale);
+      renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       final alphas = renderer.wordAlphas;
       expect(alphas.length, 4);
@@ -131,8 +130,11 @@ void main() {
         renderer.tick(0.016, 4000);
       }
       for (int i = 0; i < 4; i++) {
-        expect(renderer.wordAlphas[i]!, closeTo(1.0, 0.01),
-            reason: 'word $i 应趋向 brightAlpha=1.0');
+        expect(
+          renderer.wordAlphas[i]!,
+          closeTo(1.0, 0.01),
+          reason: 'word $i 应趋向 brightAlpha=1.0',
+        );
       }
     });
   });
@@ -140,8 +142,7 @@ void main() {
   group('isActive 切换', () {
     test('从非当前行切到当前行，alpha 从 0.2 渐变到 0.4', () {
       // 初始非当前行：scale=0.97, factor=0, dynamicDarkAlpha=0.2
-      renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale);
+      renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       for (final a in renderer.wordAlphas.values) {
         expect(a, closeTo(0.2, 1e-9));
@@ -168,8 +169,7 @@ void main() {
 
       // 切到非当前行：scale=0.97, factor=0, dynamicDarkAlpha=0.2
       // 非当前行 SOLID 模式，所有字目标 = 0.2
-      renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale);
+      renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       for (int i = 0; i < 200; i++) {
         renderer.tick(0.016, 2000);
       }
@@ -180,23 +180,33 @@ void main() {
   });
 
   group('scale 联动', () {
-    test('scale=0.97 时 factor=0，dynamicDarkAlpha=0.2，dynamicBrightAlpha=0.2', () {
-      renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale);
-      expect(renderer.factor, closeTo(0.0, 1e-9));
-      expect(renderer.dynamicDarkAlpha, closeTo(0.2, 1e-9));
-      expect(renderer.dynamicBrightAlpha, closeTo(0.2, 1e-9));
-    });
+    test(
+      'scale=0.97 时 factor=0，dynamicDarkAlpha=0.2，dynamicBrightAlpha=0.2',
+      () {
+        renderer.setLineState(
+          isActive: false,
+          scale: LyricLayout.inactiveScale,
+        );
+        expect(renderer.factor, closeTo(0.0, 1e-9));
+        expect(renderer.dynamicDarkAlpha, closeTo(0.2, 1e-9));
+        expect(renderer.dynamicBrightAlpha, closeTo(0.2, 1e-9));
+      },
+    );
 
-    test('scale=1.0 时 factor=1，dynamicDarkAlpha=0.4，dynamicBrightAlpha=1.0', () {
-      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
-      expect(renderer.factor, closeTo(1.0, 1e-9));
-      expect(renderer.dynamicDarkAlpha, closeTo(0.4, 1e-9));
-      expect(renderer.dynamicBrightAlpha, closeTo(1.0, 1e-9));
-    });
+    test(
+      'scale=1.0 时 factor=1，dynamicDarkAlpha=0.4，dynamicBrightAlpha=1.0',
+      () {
+        renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+        expect(renderer.factor, closeTo(1.0, 1e-9));
+        expect(renderer.dynamicDarkAlpha, closeTo(0.4, 1e-9));
+        expect(renderer.dynamicBrightAlpha, closeTo(1.0, 1e-9));
+      },
+    );
 
-    test('scale=0.985 时 factor=0.5，dynamicDarkAlpha=0.3，dynamicBrightAlpha=0.6', () {
-      renderer.setLineState(isActive: true, scale: 0.985);
+    test('scale 为活动/非活动档位中点时 factor=0.5，alpha 取中间值', () {
+      final midScale =
+          (LyricLayout.inactiveScale + LyricLayout.activeScale) / 2;
+      renderer.setLineState(isActive: true, scale: midScale);
       expect(renderer.factor, closeTo(0.5, 1e-9));
       expect(renderer.dynamicDarkAlpha, closeTo(0.3, 1e-9));
       expect(renderer.dynamicBrightAlpha, closeTo(0.6, 1e-9));
@@ -349,8 +359,7 @@ void main() {
       renderer.reset();
 
       // 重新设置并绑定
-      renderer.setLineState(
-          isActive: false, scale: LyricLayout.inactiveScale);
+      renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       for (final a in renderer.wordAlphas.values) {
         expect(a, closeTo(0.2, 1e-9));
@@ -511,8 +520,14 @@ void main() {
       renderer.translationFade = 1.0;
       renderer.translationExiting = false;
       final canvas = RecordingCanvas();
-      renderer.paintLine(canvas, ui.Offset.zero, krcLineWithTrans, 20,
-          maxWidth: 200, viewportWidth: 200);
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        krcLineWithTrans,
+        20,
+        maxWidth: 200,
+        viewportWidth: 200,
+      );
       expect(canvas.transforms, isEmpty);
       expect(canvas.drawParagraphOffsets, isNotEmpty);
     });
@@ -523,8 +538,14 @@ void main() {
       renderer.translationFade = 0.5;
       renderer.translationExiting = false;
       final canvas = RecordingCanvas();
-      renderer.paintLine(canvas, ui.Offset.zero, krcLineWithTrans, 20,
-          maxWidth: 200, viewportWidth: 200);
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        krcLineWithTrans,
+        20,
+        maxWidth: 200,
+        viewportWidth: 200,
+      );
       expect(canvas.transforms, hasLength(1));
 
       final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
@@ -539,10 +560,15 @@ void main() {
         exiting: false,
       );
       final double anchorY = anchor.dy;
-      expect(anchorY, closeTo(subOffset.dy + sublineHeight(), 1e-6),
-          reason: '入场锚线 = 副行底边');
-      final ui.Offset fixed =
-          MatrixUtils.transformPoint(m, ui.Offset(50, anchorY));
+      expect(
+        anchorY,
+        closeTo(subOffset.dy + sublineHeight(), 1e-6),
+        reason: '入场锚线 = 副行底边',
+      );
+      final ui.Offset fixed = MatrixUtils.transformPoint(
+        m,
+        ui.Offset(50, anchorY),
+      );
       expect(fixed.dy, closeTo(anchorY, 1e-6), reason: '锚线是不动点');
     });
   });

@@ -17,9 +17,12 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   // We need an actual HttpClient to test the proxy server.
   final overrides = MyHttpOverrides();
+  testHttpOverrides = overrides;
   HttpOverrides.global = overrides;
   HttpOverrides.runWithHttpOverrides(runTests, overrides);
 }
+
+late MyHttpOverrides testHttpOverrides;
 
 void runTests() {
   final mock = MockJustAudio();
@@ -455,6 +458,8 @@ void runTests() {
     final server = MockWebServer();
     await server.start();
     final player = AudioPlayer();
+    final trackedClientOffset = testHttpOverrides.clients.length;
+    final client = HttpClient();
     // This simulates an actual URL
     var headers = {
       'custom-header': 'Hello',
@@ -466,7 +471,7 @@ void runTests() {
     // Obtain the proxy URL that the platform side should use to load the data.
     final proxyUri = Uri.parse(player.icyMetadata!.info!.url!);
     // Simulate the platform side requesting the data.
-    final request = await HttpClient().getUrl(proxyUri);
+    final request = await client.getUrl(proxyUri);
     final response = await request.close();
     final responseText = await response.transform(utf8.decoder).join();
     expect(response.statusCode, equals(HttpStatus.ok));
@@ -477,8 +482,67 @@ void runTests() {
     // (with 'original_' prepended)
     headers.forEach(
         (key, value) => expect(response.headers.value('original_$key'), value));
+    final newClients = testHttpOverrides.clients.skip(trackedClientOffset);
+    expect(newClients, hasLength(2));
+    await expectLater(
+      Future<HttpClientRequest>.sync(
+        () => newClients.last.getUrl(
+          Uri.parse(
+            'http://${InternetAddress.loopbackIPv4.address}:${server.port}/proxy/foo.mp3',
+          ),
+        ),
+      ).then((request) => request.close()),
+      throwsA(anything),
+    );
+    client.close(force: true);
     await server.stop();
     await player.dispose();
+  });
+
+  test('proxy returns bad gateway when the upstream closes', () async {
+    final server = MockWebServer();
+    await server.start();
+    final player = AudioPlayer();
+    var serverStopped = false;
+    Socket? proxySocket;
+    try {
+      final uri = Uri.parse(
+        'http://${InternetAddress.loopbackIPv4.address}:${server.port}/proxy/foo.mp3',
+      );
+      await player.setUrl('$uri', headers: {'custom-header': 'test'});
+      final proxyUri = Uri.parse(player.icyMetadata!.info!.url!);
+
+      // 保留已注册的上游URL，但在代理请求前关闭上游服务，稳定地产生SocketException。
+      await server.stop(force: true);
+      serverStopped = true;
+
+      proxySocket = await Socket.connect(proxyUri.host, proxyUri.port);
+      proxySocket.write(
+        'GET ${proxyUri.path} HTTP/1.1\r\n'
+        'Host: ${proxyUri.host}:${proxyUri.port}\r\n'
+        'Connection: close\r\n\r\n',
+      );
+      await proxySocket.flush();
+      final responseHeaders = Completer<String>();
+      var responseText = '';
+      late StreamSubscription<List<int>> subscription;
+      subscription = proxySocket.listen((bytes) {
+        responseText += utf8.decode(bytes);
+        final headerEnd = responseText.indexOf('\r\n\r\n');
+        if (headerEnd >= 0 && !responseHeaders.isCompleted) {
+          responseHeaders.complete(responseText.substring(0, headerEnd));
+          unawaited(subscription.cancel());
+        }
+      }, onError: responseHeaders.completeError);
+      final response = await responseHeaders.future.timeout(
+        const Duration(seconds: 8),
+      );
+      expect(response, contains('502'));
+    } finally {
+      proxySocket?.destroy();
+      if (!serverStopped) await server.stop();
+      await player.dispose();
+    }
   });
 
   test('proxy0.9', () async {
@@ -553,6 +617,58 @@ void runTests() {
 
     await server.stop();
     await player.dispose();
+  });
+
+  test('stream-source closes with server error when its stream fails',
+      () async {
+    final player = AudioPlayer();
+    final client = HttpClient();
+    try {
+      await player.setAudioSource(_FailingStreamAudioSource());
+      final proxyUri = Uri.parse(player.icyMetadata!.info!.url!);
+      final request = await client.getUrl(proxyUri);
+      final response = await request.close().timeout(
+            const Duration(seconds: 3),
+          );
+
+      expect(response.statusCode, equals(HttpStatus.internalServerError));
+      await response.drain<void>();
+    } finally {
+      client.close(force: true);
+      await player.dispose();
+    }
+  });
+
+  test('stream-source aborts a response that fails after data starts',
+      () async {
+    final player = AudioPlayer();
+    final client = HttpClient();
+    try {
+      await player.setAudioSource(_FailingStreamAudioSource(emitChunk: true));
+      final proxyUri = Uri.parse(player.icyMetadata!.info!.url!);
+      final request = await client.getUrl(proxyUri);
+      final response = await request.close().timeout(
+            const Duration(seconds: 3),
+          );
+      final received = <int>[];
+      Object? streamError;
+      try {
+        await for (final chunk in response.timeout(
+          const Duration(seconds: 3),
+        )) {
+          received.addAll(chunk);
+        }
+      } catch (error) {
+        streamError = error;
+      }
+
+      expect(response.statusCode, equals(HttpStatus.ok));
+      expect(received, equals([1, 2, 3]));
+      expect(streamError, isNotNull);
+    } finally {
+      client.close(force: true);
+      await player.dispose();
+    }
   });
 
   test('sequence', () async {
@@ -1867,11 +1983,11 @@ class MockAudioPlayer extends AudioPlayerPlatform {
     _broadcastPlaybackEvent();
     if (audioSource is UriAudioSourceMessage) {
       final uri = Uri.parse(audioSource.uri);
-      if (uri.path.contains('abort')) {
+      if (uri.path.endsWith('/abort.mp3')) {
         throw _sendError(415, 'Failed to load URL');
-      } else if (uri.path.contains('404')) {
+      } else if (uri.path.endsWith('/404.mp3')) {
         throw _sendError(404, 'Not found: ${audioSource.uri}');
-      } else if (uri.path.contains('error')) {
+      } else if (uri.path.endsWith('/error.mp3')) {
         throw _sendError(500, 'Unknown error');
       }
       _duration = audioSourceDuration;
@@ -2168,6 +2284,39 @@ class TestStreamAudioSource extends StreamAudioSource {
   }
 }
 
+class _FailingStreamAudioSource extends StreamAudioSource {
+  _FailingStreamAudioSource({this.emitChunk = false});
+
+  final bool emitChunk;
+
+  @override
+  Future<StreamAudioResponse> request([int? start, int? end]) async {
+    late final Stream<List<int>> stream;
+    if (emitChunk) {
+      final controller = StreamController<List<int>>();
+      scheduleMicrotask(() {
+        controller
+          ..add([1, 2, 3])
+          ..addError(StateError('simulated source failure'))
+          ..close();
+      });
+      stream = controller.stream;
+    } else {
+      stream = Stream<List<int>>.error(
+        StateError('simulated source failure'),
+      );
+    }
+    return StreamAudioResponse(
+      contentType: 'audio/mock',
+      stream: stream,
+      contentLength: null,
+      offset: null,
+      sourceLength: null,
+      rangeRequestsSupported: false,
+    );
+  }
+}
+
 class MockWebServer {
   late HttpServer _server;
   int get port => _server.port;
@@ -2197,9 +2346,18 @@ class MockWebServer {
     });
   }
 
-  Future<void> stop() => _server.close();
+  Future<void> stop({bool force = false}) => _server.close(force: force);
 }
 
-class MyHttpOverrides extends HttpOverrides {}
+class MyHttpOverrides extends HttpOverrides {
+  final clients = <HttpClient>[];
+
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    clients.add(client);
+    return client;
+  }
+}
 
 T? _ambiguate<T>(T? value) => value;

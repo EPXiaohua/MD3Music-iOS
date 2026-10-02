@@ -169,6 +169,8 @@ fn server_responds_404_and_cors() {
         "POST /playlist/add HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         // 评论写接口：content 为空 → 400（不发上游请求）。非 404 即证明 dispatch 成功。
         "POST /comment/music/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        // 删除评论：cid 为空 → 400（不发上游请求）。非 404 即证明 dispatch 成功。
+        "POST /comment/music/del HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         "POST /comment/floor/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         "POST /comment/playlist/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         "POST /comment/album/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
@@ -203,6 +205,18 @@ fn server_responds_404_and_cors() {
             resp
         );
     }
+
+    // 删除评论同理：必须真正命中本地 handler（空 cid → 400），而不是被更短的
+    // /comment/music 前缀抢先当成查询接口转发到上游（那样同样不是 404，是 502）。
+    let resp = tcp_request(
+        port,
+        "POST /comment/music/del HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert!(
+        resp.contains("400 Bad Request") && resp.contains("cid"),
+        "POST /comment/music/del 未命中本地写接口 handler（疑似被短前缀路由抢先）:\n{}",
+        resp
+    );
 
     kugou_server::server::stop();
 }
@@ -255,6 +269,168 @@ fn server_starts_on_random_port() {
         assert!(resp.contains("404 Not Found"), "got: {}", resp);
         kugou_server::server::stop();
     }
+}
+
+/// stop 必须等待旧 listener 释放端口；连续启停不能被全局 running 标志跨代复活。
+#[test]
+fn server_stop_joins_listener_and_restart_isolated() {
+    use std::net::TcpListener;
+
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_stop_restart")
+        .to_string_lossy()
+        .into_owned();
+    let port = 18083;
+
+    for _ in 0..50 {
+        assert_eq!(kugou_server::server::start(port, dir.clone()), Some(port));
+        assert!(kugou_server::server::is_running());
+        assert_eq!(kugou_server::server::get_port(), port);
+        // 幂等启动应返回同一代端口，而不是额外创建 listener。
+        assert_eq!(kugou_server::server::start(0, dir.clone()), Some(port));
+
+        kugou_server::server::stop();
+        assert!(!kugou_server::server::is_running());
+        assert_eq!(kugou_server::server::get_port(), 0);
+        let probe = TcpListener::bind(("127.0.0.1", port))
+            .expect("stop 返回后旧 listener 必须已释放端口");
+        drop(probe);
+    }
+}
+
+#[test]
+fn server_start_fails_when_fixed_port_is_occupied_then_recovers() {
+    use std::net::TcpListener;
+
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port = 18084;
+    let occupied = TcpListener::bind(("127.0.0.1", port)).expect("reserve test port");
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_port_occupied")
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(kugou_server::server::start(port, dir.clone()), None);
+    assert!(!kugou_server::server::is_running());
+    assert_eq!(kugou_server::server::get_port(), 0);
+
+    drop(occupied);
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+    kugou_server::server::stop();
+    assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
+
+#[test]
+fn concurrent_start_stop_keeps_one_consistent_generation() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier};
+
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port = 18085;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_start_stop_race")
+        .to_string_lossy()
+        .into_owned();
+    let workers = 4;
+    let barrier = Arc::new(Barrier::new(workers));
+    let threads = (0..workers)
+        .map(|worker| {
+            let barrier = Arc::clone(&barrier);
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for round in 0..4 {
+                    if (worker + round) % 2 == 0 {
+                        assert_eq!(kugou_server::server::start(port, dir.clone()), Some(port));
+                    } else {
+                        kugou_server::server::stop();
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread.join().expect("concurrent lifecycle worker panicked");
+    }
+    kugou_server::server::stop();
+    assert!(!kugou_server::server::is_running());
+    assert_eq!(kugou_server::server::get_port(), 0);
+    assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
+
+#[test]
+fn stop_joins_listener_without_waiting_for_slow_request_body() {
+    use std::net::{Shutdown, TcpStream};
+    use std::time::Instant;
+
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port = 18086;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_slow_request_stop")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to server");
+    client
+        .write_all(
+            b"POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n",
+        )
+        .expect("send headers without completing body");
+
+    let request_deadline = Instant::now() + Duration::from_secs(2);
+    while kugou_server::server::active_request_count() == 0 && Instant::now() < request_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(kugou_server::server::active_request_count(), 1);
+
+    let stop_started = Instant::now();
+    kugou_server::server::stop();
+    assert!(
+        stop_started.elapsed() < Duration::from_secs(1),
+        "stop waited for request-body processing instead of only joining listener"
+    );
+    assert_eq!(kugou_server::server::active_request_count(), 1);
+
+    client.shutdown(Shutdown::Both).expect("release slow request");
+    drop(client);
+    let request_exit_deadline = Instant::now() + Duration::from_secs(2);
+    while kugou_server::server::active_request_count() != 0
+        && Instant::now() < request_exit_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(kugou_server::server::active_request_count(), 0);
+}
+
+#[test]
+fn stopped_generation_port_does_not_reach_restarted_server() {
+    use std::net::{SocketAddr, TcpStream};
+
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let old_port = 18087;
+    let new_port = 18088;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_old_generation")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        kugou_server::server::start(old_port, dir.clone()),
+        Some(old_port)
+    );
+    kugou_server::server::stop();
+    assert_eq!(kugou_server::server::start(new_port, dir), Some(new_port));
+
+    let old_address = SocketAddr::from(([127, 0, 0, 1], old_port));
+    assert!(TcpStream::connect_timeout(&old_address, Duration::from_millis(200)).is_err());
+    let response = tcp_request(
+        new_port,
+        "GET /nonexistent HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.contains("404 Not Found"), "got: {response}");
+    kugou_server::server::stop();
 }
 
 /// /song/url/new 的音质挑选。上游请求体不带 quality，所以响应里的 url 有两种语义：
@@ -735,3 +911,99 @@ fn video_barrage_send_route_order() {
     );
 }
 
+/// `/home/discover`（首页刷歌推荐）路由已注册，且没有更短的前缀路由会遮蔽它。
+///
+/// `prefix_match` 是路径段前缀匹配：若将来有人加了 `/home` 之类的短前缀并注册在
+/// 前面，`/home/discover` 会被送进那个 handler（与 `/video/barrage` 踩过的坑同类）。
+#[test]
+fn home_discover_route_registered_and_unshadowed() {
+    use kugou_server::modules::{register, ModuleFn};
+    let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
+    register(&mut routes);
+    let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
+
+    let target = "/home/discover";
+    let idx = paths.iter().position(|p| *p == target);
+    assert!(idx.is_some(), "/home/discover 未注册");
+
+    // 任何比它短的、且是它的段前缀的路由，只要注册在前面就会遮蔽。
+    for (i, route) in paths.iter().enumerate() {
+        if i >= idx.unwrap() {
+            break;
+        }
+        let shadows = target.len() > route.len()
+            && target.starts_with(route)
+            && target.as_bytes().get(route.len()) == Some(&b'/');
+        assert!(
+            !shadows,
+            "{} 注册在前会遮蔽 {}（前缀匹配会先命中前者）",
+            route,
+            target
+        );
+    }
+}
+
+/// `home_discover_rec` body 的默认值必须与参考实现一致。
+///
+/// `pagesize` 默认 4 是文档约定；`today_play_num` 默认 0、`recall_type` 默认 song
+/// 同理。任一处被改都会静默改变推荐条数/去重行为，故固化为回归测试。
+#[test]
+fn home_discover_body_defaults() {
+    use kugou_server::modules::home::{build_body, build_params};
+    use serde_json::json;
+
+    let q = json!({});
+    let body = build_body(&q);
+    assert_eq!(body["support"], json!("only_song"));
+    assert_eq!(body["userid"], json!(0));
+    assert_eq!(body["recall_type"], json!("song"));
+    assert_eq!(body["today_play_num"], json!(0));
+    assert_eq!(body["pagesize"], json!(4));
+
+    // go_ky_extra 三项定死，值是字符串（不是数字）。
+    let extra = body["go_ky_extra"].as_array().expect("go_ky_extra 应为数组");
+    assert_eq!(extra.len(), 3);
+    for (item, (key, val)) in extra
+        .iter()
+        .zip([("network", "2"), ("play_mode", "2"), ("no_mv_ret", "1")])
+    {
+        assert_eq!(item["key"], json!(key));
+        assert_eq!(item["val"], json!(val));
+    }
+
+    // clientver 必须被抬到 20809，否则上游静默返回空列表。
+    let params = build_params(&q);
+    assert_eq!(params["module_key"], json!("home_discover_rec"));
+    assert_eq!(params["module_id"], json!(1));
+    assert_eq!(params["area_code"], json!(1));
+    assert_eq!(params["platform"], json!("android"));
+    assert_eq!(params["clientver"], json!(20809));
+}
+
+/// 显式传入的参数要覆盖默认值；`page` 仅在 >0 时出现。
+///
+/// `page` 是给无限滚动预留的探针位：上游若不认，多一个未知 query 参数也无害；
+/// 但它绝不能以 0 的形式混进去（那会让上游按「第 0 页」解析）。
+#[test]
+fn home_discover_body_overrides_and_page_optin() {
+    use kugou_server::modules::home::{build_body, build_params};
+    use serde_json::json;
+
+    let q = json!({
+        "pagesize": "30",
+        "today_play_num": "57",
+        "recall_type": "songlist",
+        "userid": "10086",
+    });
+    let body = build_body(&q);
+    assert_eq!(body["pagesize"], json!(30));
+    assert_eq!(body["today_play_num"], json!(57));
+    assert_eq!(body["recall_type"], json!("songlist"));
+    assert_eq!(body["userid"], json!(10086));
+
+    // 缺失 / 0 都不写入 page。
+    assert!(build_params(&json!({})).get("page").is_none());
+    assert!(build_params(&json!({ "page": 0 })).get("page").is_none());
+    // 正值写入。
+    assert_eq!(build_params(&json!({ "page": 3 }))["page"], json!(3));
+}

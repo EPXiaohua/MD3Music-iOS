@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -8,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'kugou_api/kugou_api_client.dart';
 import 'kugou_api/kugou_endpoints.dart';
+import 'local_server_lifecycle.dart';
 
 /// libkugou_server.so FFI: int start_server(int port, const char* data_dir)
 /// port==0 表示随机选端口；返回实际监听端口（0=失败）。
@@ -22,75 +24,137 @@ typedef IsRunning = int Function();
 typedef StopServerNative = Void Function();
 typedef StopServer = void Function();
 
+/// 在独立 isolate 加载动态库并停止服务器，避免Rust join阻塞Flutter主isolate。
+void _stopServerInWorker(String libraryName) {
+  final lib = DynamicLibrary.open(libraryName);
+  final stopServer = lib.lookupFunction<StopServerNative, StopServer>(
+    'stop_server',
+  );
+  stopServer();
+}
+
+/// Android FFI启动工作放入worker isolate，避免dlopen和Rust启动占住UI isolate。
+/// 返回值为 [port, dlopen耗时, 符号查找耗时, start_server耗时]，只跨isolate传基础类型。
+List<int> _startServerInWorker(String libraryName, String dataDirPath) {
+  final loadClock = Stopwatch()..start();
+  final lib = DynamicLibrary.open(libraryName);
+  final loadMs = loadClock.elapsedMilliseconds;
+
+  final lookupClock = Stopwatch()..start();
+  final startServer = lib.lookupFunction<StartServerNative, StartServer>(
+    'start_server',
+  );
+  lookupClock.stop();
+
+  final nativePath = dataDirPath.toNativeUtf8();
+  late final int port;
+  final startClock = Stopwatch()..start();
+  try {
+    port = startServer(0, nativePath);
+  } finally {
+    calloc.free(nativePath);
+  }
+  final startMs = startClock.elapsedMilliseconds;
+  if (port <= 0) throw StateError('start_server failed with code $port');
+  return [port, loadMs, lookupClock.elapsedMilliseconds, startMs];
+}
+
+bool _isServerRunningInWorker(String libraryName) {
+  final lib = DynamicLibrary.open(libraryName);
+  final isRunning = lib.lookupFunction<IsRunningNative, IsRunning>(
+    'is_server_running',
+  );
+  return isRunning() == 1;
+}
+
 class KugouApiServer {
   static const _channel = MethodChannel('com.md3music.md3music/kugou_api');
   static bool _started = false;
 
-  /// P0: 启动中/已完成 Future，供并发调用去重（main() 与播放前兜底）。
+  /// 并发启动、停止与重启分别合并；native启停调用另按提交顺序串行。
   static Future<void>? _startFuture;
+  static Future<void>? _stopFuture;
+  static Future<bool>? _restartFuture;
+  static final AsyncSerialQueue _nativeTransitions = AsyncSerialQueue();
   static DynamicLibrary? _lib;
   static StopServer? _stopServerFn;
   static IsRunning? _isRunningFn;
 
-  static Future<void> start() async {
-    if (_started || kIsWeb) return;
+  static Future<void> start() {
+    if (kIsWeb) return Future<void>.value();
+    final pending = _startFuture;
+    if (pending != null) return pending;
+    if (_started) return _confirmRunning();
 
-    // P0: 并发调用去重。main() 后台启动与 player_provider 播放前兜底
-    // 可能同时触发 start()；此前 await getApplicationSupportDirectory()
-    // 期间 _started 仍为 false，二次进入会重复 dlopen libkugou_server.so
-    // + startServer（实测日志出现两次 start_server 调用），浪费启动时间。
-    return _startFuture ??= _doStart();
+    final generation = KugouApiClient.markServerStarting();
+    final future = _doStart(generation);
+    _startFuture = future;
+    return future;
   }
 
-  static Future<void> _doStart() async {
-    // 最外层兜底：启动失败时允许下次调用重试，且不向调用方抛未处理异常
-    // （main() 与播放兜底都依赖 start() 不抛）
-    try {
-      // 优先走 dart:ffi（纯 C 函数名不含包名，JNI 符号不匹配时也能用）
-      try {
-        await _startViaFfi();
-        _started = true;
-        return;
-      } catch (e) {
-        if (Platform.isAndroid) {
-          print('dart:ffi start failed, falling back to MethodChannel: $e');
-        } else {
-          // 桌面没有 MethodChannel 兜底，FFI 失败即彻底失败。最常见原因是
-          // 原生库没有跟 exe 放在一起（需先跑
-          // kugou_api_server/rust/build_desktop.ps1 产出 dll）。
-          print(
-            'dart:ffi start failed and no fallback on this platform '
-            '(missing ${_libraryName()}?): $e',
-          );
-        }
-      }
-
-      // MethodChannel（JNI 方式）仅 Android 有该通道，桌面直接走下方失败处理
-      if (Platform.isAndroid) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-          try {
-            final port = await _channel.invokeMethod<int>('startServer');
-            if (port != null && port > 0) {
-              _applyPort(port);
-              _started = true;
-              await _waitForReady(port);
-              return;
-            }
-            print('MethodChannel start returned invalid port: $port');
-          } catch (e) {
-            print('MethodChannel start failed (attempt ${attempt + 1}): $e');
-            await Future.delayed(const Duration(seconds: 1));
-          }
-        }
-      }
-    } catch (e) {
-      print('KugouApiServer start failed: $e');
-    }
-    // 启动失败：重置去重 Future，允许后续调用重试（如播放前兜底）。
-    // 之前桌面分支在此之前直接 return，既跳过了这行（start() 再也不会重试），
-    // 也从不置错误态，导致 KugouApiClient 每个请求都白等满 8s 就绪超时。
+  static Future<void> _confirmRunning() async {
+    if (await isRunning()) return;
+    _started = false;
     _startFuture = null;
     KugouApiClient.markServerStartFailed();
+    await start();
+  }
+
+  static Future<void> _doStart(int generation) async {
+    var succeeded = false;
+    try {
+      final stopping = _stopFuture;
+      if (stopping != null) await stopping;
+      final port = await _nativeTransitions.run(_startNativeServer);
+      if (generation != KugouApiClient.localServerGeneration) return;
+      if (!await _waitForReady(port)) {
+        throw TimeoutException('本地 API 服务端口 $port 未就绪');
+      }
+      if (generation != KugouApiClient.localServerGeneration) return;
+      _applyPort(port);
+      _started = true;
+      succeeded = true;
+      KugouApiClient.markServerReady(generation);
+    } catch (e) {
+      print('KugouApiServer start failed: $e');
+    } finally {
+      if (generation == KugouApiClient.localServerGeneration) {
+        if (!succeeded) {
+          _started = false;
+          KugouApiClient.markServerStartFailed(generation);
+        }
+        _startFuture = null;
+      }
+    }
+  }
+
+  static Future<int> _startNativeServer() async {
+    // 优先走 dart:ffi（纯 C 函数名不含包名，JNI 符号不匹配时也能用）。
+    try {
+      return await _startViaFfi();
+    } catch (e) {
+      if (!Platform.isAndroid) {
+        print(
+          'dart:ffi start failed and no fallback on this platform '
+          '(missing ${_libraryName()}?): $e',
+        );
+        rethrow;
+      }
+      print('dart:ffi start failed, falling back to MethodChannel: $e');
+    }
+
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        final port = await _channel.invokeMethod<int>('startServer');
+        if (port != null && port > 0) return port;
+        throw StateError('MethodChannel returned invalid port: $port');
+      } catch (e) {
+        print('MethodChannel start failed (attempt ${attempt + 1}): $e');
+        if (attempt == 1) rethrow;
+        await Future.delayed(const Duration(seconds: 1));
+      }
+    }
+    throw StateError('MethodChannel start failed');
   }
 
   /// 返回当前平台的原生库文件名（桌面与 Android 命名不同）。
@@ -111,7 +175,21 @@ class KugouApiServer {
     return _lib!;
   }
 
-  static Future<void> _startViaFfi() async {
+  static Future<int> _startViaFfi() async {
+    if (Platform.isAndroid) {
+      // path_provider依赖PlatformChannel，只能先在主isolate取得可传递的路径。
+      final appDir = await getApplicationSupportDirectory();
+      final dataDirPath = appDir.path;
+      final nativeTimes = await Isolate.run(
+        () => _startServerInWorker(_libraryName(), dataDirPath),
+      );
+      print(
+        '[Startup] phase=ffi_start_complete dlopen_ms=${nativeTimes[1]} '
+        'lookup_ms=${nativeTimes[2]} start_server_ms=${nativeTimes[3]}',
+      );
+      return nativeTimes[0];
+    }
+
     final lib = _loadLib();
     final startServer = lib.lookupFunction<StartServerNative, StartServer>(
       'start_server',
@@ -123,7 +201,6 @@ class KugouApiServer {
       'is_server_running',
     );
 
-    // 用 path_provider 获取 filesDir，避免硬编码包名路径
     final appDir = await getApplicationSupportDirectory();
     final dataDirPath = appDir.path.toNativeUtf8();
     late int port;
@@ -133,11 +210,10 @@ class KugouApiServer {
       if (port <= 0) {
         throw StateError('start_server failed with code $port');
       }
-      _applyPort(port);
     } finally {
       calloc.free(dataDirPath);
     }
-    await _waitForReady(port);
+    return port;
   }
 
   /// 把 Rust 返回的实际端口写入 baseUrl（全部请求走本地随机端口）。
@@ -151,61 +227,111 @@ class KugouApiServer {
 
   /// 当前本地 API 服务器端口（start() 成功后有效，未启动/失败时 0）。
   static int get currentPort {
+    if (KugouApiClient.localServerState != LocalServerState.ready) return 0;
     final uri = Uri.tryParse(KugouEndpoints.baseUrl);
     return uri?.port ?? 0;
   }
 
-  static Future<void> _waitForReady(int port) async {
-    for (int i = 0; i < 30; i++) {
+  static Future<bool> _waitForReady(int port) async {
+    const timeout = Duration(seconds: 30);
+    final stopwatch = Stopwatch()..start();
+    while (stopwatch.elapsed < timeout) {
+      final remaining = timeout - stopwatch.elapsed;
+      final probeTimeout = remaining < const Duration(seconds: 1)
+          ? remaining
+          : const Duration(seconds: 1);
       try {
         final socket = await Socket.connect(
           '127.0.0.1',
           port,
-          timeout: const Duration(seconds: 1),
+          timeout: probeTimeout,
         );
         await socket.close();
         print('Local API server is ready on port $port');
-        // P0: 通知 KugouApiClient 服务器已就绪（runApp 不等待服务器启动，
-        // 首屏请求依赖此信号放行）
-        KugouApiClient.markServerReady();
-        return;
+        return true;
       } catch (_) {
         // P0: 重试间隔 1s → 200ms。start_server 返回端口即已 bind，
         // 就绪通常 <100ms，1s 轮询会在端口/线程调度抖动时白白多等 1s。
-        await Future.delayed(const Duration(milliseconds: 200));
+        final afterProbe = timeout - stopwatch.elapsed;
+        if (afterProbe > Duration.zero) {
+          await Future.delayed(
+            afterProbe < const Duration(milliseconds: 200)
+                ? afterProbe
+                : const Duration(milliseconds: 200),
+          );
+        }
       }
     }
     print('Local API server did not become ready within 30 seconds');
-    // 同上：就绪信号永远不会来，若不置错误态，后续每个请求都要白等满 8s。
-    KugouApiClient.markServerStartFailed();
+    return false;
   }
 
   static Future<bool> isRunning() async {
+    if (!_started) return false;
+    final generation = KugouApiClient.localServerGeneration;
+    bool running;
     // 优先用 FFI 查询（不依赖 JNI 符号）
     try {
-      final lib = _loadLib();
-      _isRunningFn ??= lib.lookupFunction<IsRunningNative, IsRunning>(
-        'is_server_running',
-      );
-      return _isRunningFn!() == 1;
+      if (Platform.isAndroid) {
+        running = await Isolate.run(
+          () => _isServerRunningInWorker(_libraryName()),
+        );
+      } else {
+        final lib = _loadLib();
+        _isRunningFn ??= lib.lookupFunction<IsRunningNative, IsRunning>(
+          'is_server_running',
+        );
+        running = _isRunningFn!() == 1;
+      }
     } catch (_) {
       // FFI 不可用再试 MethodChannel
       try {
-        return await _channel.invokeMethod('isRunning') ?? false;
+        running = await _channel.invokeMethod<bool>('isRunning') ?? false;
       } catch (_) {
-        return false;
+        running = false;
       }
     }
+    if (!running && _started) {
+      _started = false;
+      KugouApiClient.markServerStartFailed(generation);
+      if (generation == KugouApiClient.localServerGeneration) {
+        _startFuture = null;
+      }
+    }
+    return running;
   }
 
   /// 显式停止本地 API 服务器，释放端口，避免下一次冷启动时端口冲突。
   /// Android 直接划掉应用时进程会被系统 kill，线程随之终止；这里保证温和退出
   /// （确认退出 / Activity 销毁）场景能确定性关停。
-  static Future<void> stop() async {
-    if (kIsWeb) return;
+  static Future<void> stop() {
+    if (kIsWeb) return Future<void>.value();
+    final pending = _stopFuture;
+    if (pending != null) return pending;
 
-    // 优先用 FFI 停止（不依赖 JNI 符号）
+    final generation = KugouApiClient.markServerStopping();
+    _started = false;
+    _startFuture = null;
+    final operation = _nativeTransitions.run(_stopNativeServer).then((_) {
+      KugouApiClient.markServerStopped(generation);
+    });
+    late final Future<void> tracked;
+    tracked = operation.whenComplete(() {
+      if (identical(_stopFuture, tracked)) _stopFuture = null;
+    });
+    _stopFuture = tracked;
+    return tracked;
+  }
+
+  static Future<void> _stopNativeServer() async {
+    // 优先用 FFI 停止（不依赖 JNI 符号）。
     try {
+      if (Platform.isAndroid) {
+        // Rust stop() 会 join listener 线程；在主 isolate 同步调用会冻结UI。
+        await Isolate.run(() => _stopServerInWorker(_libraryName()));
+        print('KugouApiServer stopped via background FFI isolate');
+        return;
+      }
       final lib = _loadLib();
       _stopServerFn ??= lib.lookupFunction<StopServerNative, StopServer>(
         'stop_server',
@@ -230,13 +356,19 @@ class KugouApiServer {
   /// 停掉后清空 _started 标记，重新走 start() 分配新随机端口并更新 baseUrl。
   /// Rust 侧 device_info.json 已持久化，重启后 dfid/mid 不变，无需重新注册。
   /// 返回是否成功。
-  static Future<bool> restart() async {
+  static Future<bool> restart() {
+    final pending = _restartFuture;
+    if (pending != null) return pending;
+    final future = _doRestart();
+    _restartFuture = future;
+    return future.whenComplete(() {
+      if (identical(_restartFuture, future)) _restartFuture = null;
+    });
+  }
+
+  static Future<bool> _doRestart() async {
     await stop();
-    await Future.delayed(const Duration(milliseconds: 300));
-    _started = false;
-    // P0: 清空启动去重 Future，否则 start() 直接返回已完成旧 Future 不重启
-    _startFuture = null;
     await start();
-    return await isRunning();
+    return isRunning();
   }
 }

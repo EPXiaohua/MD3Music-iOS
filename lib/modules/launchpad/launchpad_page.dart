@@ -1,10 +1,12 @@
 import 'dart:async';
 
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../providers/tab_config_provider.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
+import '../settings/home_tab_manager.dart';
 
 /// LaunchPad 导航页：以"导航网站"的形式列出所有可用 Tab（除"我的"和自身），
 /// 按「未固定 / 已固定」两个分区展示（固定 = 出现在底部导航栏，置底显示）。
@@ -141,7 +143,7 @@ class _LaunchPadPageState extends State<LaunchPadPage> {
   /// 右上角「编辑」：弹出底部托盘管理固定项（交互与设置页「主页管理」一致：
   /// 拖拽排序 + 开关固定状态，点外部或下滑关闭）。
   void _showEditSheet() {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
@@ -200,7 +202,7 @@ class _LaunchPadPageState extends State<LaunchPadPage> {
           final tab = items[i];
           final hidden = tabConfig.hiddenTabs.contains(tab.id);
           return _LaunchPadCard(
-            icon: _launchPadTabIcon(tab.id),
+            icon: homeTabIcon(tab.id),
             label: tab.label,
             hidden: hidden,
             enabling: _enablingTabId == tab.id,
@@ -220,162 +222,22 @@ class _LaunchPadPageState extends State<LaunchPadPage> {
   }
 }
 
-/// Tab 图标映射，与 app.dart / 设置页的映射保持一致。
-IconData _launchPadTabIcon(String tabId) {
-  switch (tabId) {
-    case 'discover':
-      return Icons.explore;
-    case 'coverflow':
-      return Icons.album;
-    case 'library':
-      return Icons.library_music;
-    case 'favorites':
-      return Icons.favorite;
-    case 'fm':
-      return Icons.radio;
-    case 'search':
-      return Icons.search;
-    case 'charts':
-      return Icons.leaderboard;
-    case 'ip':
-      return Icons.edit_note;
-    case 'recognition':
-      return Icons.mic;
-    case 'audiobook':
-      return Icons.auto_stories;
-    case 'scene':
-      return Icons.landscape;
-    case 'channel':
-      return Icons.dynamic_feed;
-    case 'brush':
-      return Icons.swipe;
-    case 'listen_together':
-      return Icons.groups;
-    case 'settings':
-      return Icons.settings;
-    default:
-      return Icons.circle;
-  }
-}
-
 /// LaunchPad 编辑托盘（右上角「编辑」弹出）：可拖拽排序 + 固定/取消固定开关。
 ///
-/// 交互与设置页「主页管理」面板一致：底部弹出、拖动手柄、点外部关闭。
-/// 列表按 [TabConfigProvider.allTabs] 的全局顺序展示（不分区），
-/// 拖动即所见位置；固定开关走 [TabConfigProvider.toggleTabVisibility]，
-/// 底栏顺序 = allTabs 顺序过滤掉未固定项。
+/// 与设置页「主页管理」共用 [HomeTabManagerList]：展示完整 Tab 列表、
+/// 下标与 [TabConfigProvider.allTabs] 1:1（不再过滤 user/launchpad、不再做下标换算），
+/// 拖拽/开关/重置行为两处完全一致，任一处修改后另一处经 Provider 立即刷新。
 class _LaunchPadEditPanel extends StatelessWidget {
   const _LaunchPadEditPanel();
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tt = Theme.of(context).textTheme;
-    final tabConfig = context.watch<TabConfigProvider>();
-    final items = tabConfig.allTabs
-        .where((t) => t.id != 'user' && t.id != 'launchpad')
-        .toList();
-
     return SafeArea(
       child: SizedBox(
         height: MediaQuery.sizeOf(context).height * 0.85,
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      'LaunchPad 管理',
-                      style: tt.titleMedium,
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: () => tabConfig.resetToDefault(),
-                    child: const Text('重置'),
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                '拖动排序，开关控制是否固定到底部导航栏',
-                style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: ReorderableListView.builder(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: items.length,
-                onReorderItem: (oldIndex, newIndex) {
-                  // newIndex 已按「移除 oldIndex 之后」调整过，是插入下标。
-                  // items 是 allTabs 过滤掉 user/launchpad 的结果，下标不能直接用，
-                  // 这里用「锚点元素」换算成 allTabs 下标。
-                  final moved = items[oldIndex];
-                  final rest = [...items]..removeAt(oldIndex);
-                  if (rest.isEmpty) return;
-                  final all = tabConfig.allTabs;
-                  final from = all.indexWhere((t) => t.id == moved.id);
-                  if (from < 0) return;
-                  // 移除 moved 后，moved 在 allTabs 中的目标插入下标
-                  final int desired;
-                  if (newIndex == 0) {
-                    // 排到最前：插在原第一项之前
-                    final anchor = all.indexWhere((t) => t.id == rest.first.id);
-                    if (anchor < 0) return;
-                    desired = anchor > from ? anchor - 1 : anchor;
-                  } else {
-                    // 插在 rest[newIndex - 1] 之后
-                    final anchor = all.indexWhere(
-                      (t) => t.id == rest[newIndex - 1].id,
-                    );
-                    if (anchor < 0) return;
-                    desired = (anchor > from ? anchor - 1 : anchor) + 1;
-                  }
-                  if (desired == from) return;
-                  // reorderTabs 内部对「向后移动」会再减 1，这里补偿回去
-                  tabConfig.reorderTabs(
-                    from,
-                    desired > from ? desired + 1 : desired,
-                  );
-                },
-                itemBuilder: (context, i) {
-                  final tab = items[i];
-                  final isPinned = !tabConfig.hiddenTabs.contains(tab.id);
-                  return ListTile(
-                    key: ValueKey(tab.id),
-                    leading: Icon(
-                      _launchPadTabIcon(tab.id),
-                      color: isPinned ? cs.primary : cs.onSurfaceVariant,
-                    ),
-                    title: Text(tab.label, style: tt.bodyLarge),
-                    subtitle: Text(
-                      isPinned ? '已固定到底部导航栏' : '未固定',
-                      style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Switch(
-                          value: isPinned,
-                          onChanged: (_) =>
-                              tabConfig.toggleTabVisibility(tab.id),
-                        ),
-                        const SizedBox(width: 8),
-                        Icon(
-                          Icons.drag_handle,
-                          color: cs.onSurfaceVariant,
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
+        child: const HomeTabManagerList(
+          title: 'LaunchPad 管理',
+          embedded: false,
         ),
       ),
     );

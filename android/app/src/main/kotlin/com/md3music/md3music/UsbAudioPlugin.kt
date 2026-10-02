@@ -545,6 +545,25 @@ class UsbAudioPlugin(private val context: Context) {
         mainHandler.post { ch.invokeMethod("onStatusChanged", status) }
     }
 
+    /**
+     * 推送「独占开启失败」。
+     *
+     * 与 `result.error(...)` 并行发出：后者只回给发起本次调用的 Dart 侧调用方，
+     * 而失败也可能来自拔插广播的自动恢复（result == null），此时 Dart 完全收不到信号。
+     * Dart 侧 `OutputModeCoordinator` 收到后自动回退到系统 Direct PCM
+     * （见计划阶段 4：音质最好的独占打不开时，至少还有一条 bit-perfect 的路）。
+     */
+    private fun pushExclusiveFailed(code: String, message: String?) {
+        val ch = channel ?: return
+        val payload = mapOf(
+            "code" to code,
+            "message" to (message ?: code),
+            "sdkInt" to android.os.Build.VERSION.SDK_INT,
+        )
+        UsbLog.e(TAG, "exclusive failed($code): $message")
+        mainHandler.post { ch.invokeMethod("onExclusiveFailed", payload) }
+    }
+
     // ── 开关 ─────────────────────────────────────────────────────
 
     /** 开启独占（可带授权流程）。result 为空时表示由拔插广播触发。 */
@@ -552,6 +571,7 @@ class UsbAudioPlugin(private val context: Context) {
         val device = findCachedDevice()
         if (device == null) {
             UsbLog.e(TAG, "enableExclusive: no USB audio device")
+            pushExclusiveFailed("NO_DEVICE", "未检测到 USB 音频设备")
             if (result != null) result.error("NO_DEVICE", "未检测到 USB 音频设备", null)
             return
         }
@@ -564,6 +584,7 @@ class UsbAudioPlugin(private val context: Context) {
                     doEnable(device, result)
                 } else {
                     UsbLog.e(TAG, "enableExclusive: permission denied")
+                    pushExclusiveFailed("PERMISSION_DENIED", "USB 设备授权被拒绝")
                     if (result != null) {
                         result.error("PERMISSION_DENIED", "USB 设备授权被拒绝", null)
                     }
@@ -582,6 +603,7 @@ class UsbAudioPlugin(private val context: Context) {
                 synchronized(exclusiveLock) {
                     val adapter = createStartedStream(device) ?: run {
                         mainHandler.post {
+                            pushExclusiveFailed("STREAM_CREATE_FAILED", "USB 流创建失败，详见 logcat")
                             if (result != null) result.error("STREAM_CREATE_FAILED", "USB 流创建失败，详见 logcat", null)
                         }
                         return@Thread
@@ -614,13 +636,21 @@ class UsbAudioPlugin(private val context: Context) {
                         pushStatus()
                         if (result != null) {
                             if (ok) result.success(getStatus())
-                            else result.error("ENABLE_FAILED", "USB 独占开启失败", null)
+                            else {
+                                pushExclusiveFailed("ENABLE_FAILED", "USB 独占开启失败")
+                                result.error("ENABLE_FAILED", "USB 独占开启失败", null)
+                            }
+                        } else if (!ok) {
+                            // 拔插广播触发的自动恢复失败：Dart 侧没有 result 可依赖，
+                            // 必须靠事件通知它回退到 Direct PCM。
+                            pushExclusiveFailed("ENABLE_FAILED", "USB 独占自动恢复失败")
                         }
                     }
                 }
             } catch (e: Exception) {
                 UsbLog.e(TAG, "doEnable threw: ${e.message}", e)
                 mainHandler.post {
+                    pushExclusiveFailed("ENABLE_FAILED", e.message)
                     if (result != null) result.error("ENABLE_FAILED", e.message, null)
                 }
             }

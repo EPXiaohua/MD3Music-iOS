@@ -59,6 +59,14 @@ class ScrollAwareAppBar extends StatefulWidget implements PreferredSizeWidget {
   /// 从来不作为 tab 出现的页面（各类详情页/列表页）不传，标题自动居中。
   final String? tabId;
 
+  /// 标题**左对齐**（一级固定页）时的 `AppBar.titleSpacing`（计划 ⑦）。
+  ///
+  /// 默认 [AppBar] 左对齐 titleSpacing 是 [NavigationToolbar.kMiddleSpacing]（16dp），
+  /// 常比页面 body 内容的左内边距（网格 12、SongListItem ~10）更宽，视觉上标题比
+  /// 内容更靠右。传入页面内容的实际左内边距即可对齐（内容齐边则传 0）。
+  /// 居中（二级页面）时忽略此值、用 [AppBar] 默认。null 表示保持 [AppBar] 默认。
+  final double? titleSpacing;
+
   const ScrollAwareAppBar({
     super.key,
     required this.title,
@@ -69,6 +77,7 @@ class ScrollAwareAppBar extends StatefulWidget implements PreferredSizeWidget {
     this.titleTrailing,
     this.opaque = false,
     this.tabId,
+    this.titleSpacing,
   });
 
   @override
@@ -117,6 +126,7 @@ class _ScrollAwareAppBarState extends State<ScrollAwareAppBar> {
     final t = (_scrollOffset / widget.fadeRange).clamp(0.0, 1.0);
     final useBackgroundImage =
         context.watch<ThemeProvider>().useBackgroundImage;
+    final centerTitle = centerPageTitle(context, tabId: widget.tabId);
 
     // 背景从透明渐变到 surface：仅插值 alpha（透明度），保持 surface 色相。
     // 不能用 Color.lerp(Colors.transparent, surface, t)：transparent 是
@@ -141,7 +151,9 @@ class _ScrollAwareAppBarState extends State<ScrollAwareAppBar> {
       title: _buildTitle(textTheme),
       actions: widget.actions,
       // 统一对齐规则：底部导航栏可直达的一级页面左对齐，二级页面居中
-      centerTitle: centerPageTitle(context, tabId: widget.tabId),
+      centerTitle: centerTitle,
+      // 左对齐时标题左内边距对齐页面内容（计划 ⑦）；居中时用 AppBar 默认
+      titleSpacing: centerTitle ? null : widget.titleSpacing,
     );
   }
 

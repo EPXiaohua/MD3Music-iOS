@@ -1,3 +1,4 @@
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../../core/utils/app_toast.dart';
@@ -17,7 +18,7 @@ void showCommentComposeSheet(
   required Song song,
   CommentReplyTarget? target,
 }) {
-  showModalBottomSheet<void>(
+  showM3EModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,

@@ -4,6 +4,7 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/models/kugou_account.dart';
 import '../../providers/favorites_provider.dart';
@@ -121,9 +122,9 @@ class _UserCenterPageState extends State<UserCenterPage> {
               physics: const AlwaysScrollableScrollPhysics(),
               slivers: [
                 _buildUserHeader(cs, tt, kugou),
-                const SliverToBoxAdapter(child: SizedBox(height: 16)),
+                const SliverToBoxAdapter(child: Gap(AppSpacing.lg)),
                 _buildActionGrid(cs),
-                const SliverToBoxAdapter(child: SizedBox(height: 16)),
+                const SliverToBoxAdapter(child: Gap(AppSpacing.lg)),
                 _buildVipCard(cs, tt, kugou),
                 // 80 之上叠加系统手势条（小横条）高度，避免末项被压住
                 SliverToBoxAdapter(
@@ -142,7 +143,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
   Widget _buildNotLoggedIn(ColorScheme cs, TextTheme tt) {
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -151,19 +152,19 @@ class _UserCenterPageState extends State<UserCenterPage> {
               size: 80,
               color: cs.onSurfaceVariant.withValues(alpha: 0.4),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '登录后享受更多精彩',
               style: tt.titleMedium?.copyWith(color: cs.onSurfaceVariant),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '同步歌单、收藏、云盘等',
               style: tt.bodyMedium?.copyWith(
                 color: cs.onSurfaceVariant.withValues(alpha: 0.7),
               ),
             ),
-            const SizedBox(height: 24),
+            const Gap(AppSpacing.xl),
             FilledButton.icon(
               icon: const Icon(Icons.person),
               label: const Text('登录'),
@@ -246,7 +247,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
     return SliverToBoxAdapter(
       child: Padding(
         // 顶部留出空间容纳超出卡片的头像
-        padding: EdgeInsets.fromLTRB(16, 28, 16, 16),
+        padding: EdgeInsets.fromLTRB(AppSpacing.lg, 28, AppSpacing.lg, AppSpacing.lg),
         child: Stack(
           clipBehavior: Clip.none,
           children: [
@@ -284,7 +285,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                         _kCardPadH,
                         18,
                         _kCardPadH,
-                        12,
+                        AppSpacing.md,
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -333,7 +334,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                               ),
                             ),
                           ],
-                          const SizedBox(height: 12),
+                          const Gap(AppSpacing.md),
                           Text(
                             kugou.userInfo?.nickname ?? '用户',
                             textAlign: TextAlign.right,
@@ -549,7 +550,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
 
   /// 打开「账号管理」底部面板：展示已保存账号、支持切换/删除/登录新账号
   void _showAccountManager(BuildContext context, KugouProvider kugou) {
-    showModalBottomSheet<void>(
+    showM3EModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
@@ -557,7 +558,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
       builder: (sheetCtx) {
         return SafeArea(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
             child: Consumer<KugouProvider>(
               builder: (context, provider, _) {
                 final cs = Theme.of(context).colorScheme;
@@ -589,10 +590,10 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             ),
                         ],
                       ),
-                      const SizedBox(height: 8),
+                      const Gap(AppSpacing.sm),
                       if (accounts.isEmpty)
                         Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 32),
+                          padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxl),
                           child: Column(
                             children: [
                               Icon(
@@ -602,7 +603,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                                   alpha: 0.4,
                                 ),
                               ),
-                              const SizedBox(height: 8),
+                              const Gap(AppSpacing.sm),
                               Text(
                                 '暂无已保存的账号',
                                 style: tt.bodyMedium?.copyWith(
@@ -626,7 +627,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             ),
                           ),
                         ),
-                      const SizedBox(height: 12),
+                      const Gap(AppSpacing.md),
                       FilledButton.icon(
                         onPressed: () => Navigator.of(context).push(
                           MaterialPageRoute(builder: (_) => const LoginPage()),
@@ -658,7 +659,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
         ? account.nickname!
         : '用户 ${account.userid}';
     return ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+      contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
       leading: _accountAvatar(account, cs),
       title: Row(
         children: [
@@ -699,7 +700,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
         children: [
           if (isCurrent)
             Padding(
-              padding: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsets.only(right: AppSpacing.sm),
               child: Icon(Icons.check_circle, color: cs.primary, size: 20),
             ),
           IconButton(
@@ -887,9 +888,9 @@ class _UserCenterPageState extends State<UserCenterPage> {
     final svip = findActiveBusiVip(busiList, 'svip');
     return SliverToBoxAdapter(
       child: Container(
-        margin: const EdgeInsets.symmetric(horizontal: 16),
+        margin: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: AppRadius.lgAll,
           // 实心纯色圆角矩形：不描边
           color: cs.surfaceContainer,
         ),
@@ -902,14 +903,14 @@ class _UserCenterPageState extends State<UserCenterPage> {
               MaterialPageRoute(builder: (_) => const SignInCalendarPage()),
             ),
             child: Padding(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(AppSpacing.md),
               // IntrinsicHeight：让左侧入口与右侧两行会员等高
               child: IntrinsicHeight(
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     _buildCalendarEntry(cs, tt),
-                    const SizedBox(width: 12),
+                    const Gap(AppSpacing.md),
                     Expanded(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
@@ -923,7 +924,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             iconBg: cs.secondaryContainer,
                             iconFg: cs.onSecondaryContainer,
                           ),
-                          const SizedBox(height: 8),
+                          const Gap(AppSpacing.sm),
                           _buildVipRow(
                             cs: cs,
                             tt: tt,
@@ -952,13 +953,13 @@ class _UserCenterPageState extends State<UserCenterPage> {
       width: 76,
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: AppRadius.mdAll,
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Icon(Icons.event_available, color: cs.primary),
-          const SizedBox(height: 4),
+          const Gap(AppSpacing.xs),
           Text(
             '签到日历',
             maxLines: 1,
@@ -1006,7 +1007,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
             color: dimmed ? cs.onSurfaceVariant : iconFg,
           ),
         ),
-        const SizedBox(width: 8),
+        const Gap(AppSpacing.sm),
         Text(
           title,
           style: tt.labelLarge?.copyWith(
@@ -1014,7 +1015,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
             color: dimmed ? cs.onSurfaceVariant : null,
           ),
         ),
-        const SizedBox(width: 8),
+        const Gap(AppSpacing.sm),
         Expanded(
           child: Text(
             status,
@@ -1035,7 +1036,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
   Widget _buildActionGrid(ColorScheme cs) {
     return SliverToBoxAdapter(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(AppSpacing.lg),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [

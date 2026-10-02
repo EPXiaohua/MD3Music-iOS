@@ -311,6 +311,31 @@ struct RawResponse {
     body: Vec<u8>,
 }
 
+/// 只有完整读完上游响应才返回body；读取中断不能被误当成成功响应。
+fn read_response_body(mut reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|error| format!("response body read failed: {error}"))?;
+    Ok(body)
+}
+
+fn response_body_value(response_type: Option<&str>, body: &[u8]) -> BodyValue {
+    if is_arraybuffer_response(response_type) {
+        BodyValue::Bytes(body.to_vec())
+    } else {
+        BodyValue::from_bytes(body)
+    }
+}
+
+fn is_arraybuffer_response(response_type: Option<&str>) -> bool {
+    response_type.is_some_and(|value| value.eq_ignore_ascii_case("arraybuffer"))
+}
+
+fn response_is_error(response_type: Option<&str>, body: &BodyValue) -> bool {
+    !is_arraybuffer_response(response_type) && body_is_error(body)
+}
+
 /// Low-level HTTP send replicating axios behavior for our purposes.
 fn do_send(opts: &RequestOptions, params: &Value, final_headers: &HashMap<String, String>, extra: &HashMap<String, String>) -> Result<RawResponse, String> {
     let base_url = opts.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
@@ -409,9 +434,7 @@ fn do_send(opts: &RequestOptions, params: &Value, final_headers: &HashMap<String
         return Err(format!("status {}", status));
     }
 
-    let mut body = Vec::new();
-    let mut reader = resp.into_reader();
-    let _ = reader.read_to_end(&mut body);
+    let body = read_response_body(resp.into_reader())?;
 
     Ok(RawResponse {
         cookies,
@@ -564,10 +587,10 @@ pub fn create_request(opts: &RequestOptions) -> Result<ModuleResponse, ModuleRes
         Err(e) => return Err(transport_error_with(e.to_string())),
     };
 
-    let mut body = BodyValue::from_bytes(&raw.body);
+    let mut body = response_body_value(opts.response_type.as_deref(), &raw.body);
     let mut cookies = raw.cookies;
     ssa_code = raw.ssa_code;
-    let is_error = body_is_error(&body);
+    let is_error = response_is_error(opts.response_type.as_deref(), &body);
 
     if is_error && ssa_code.is_some() {
         let sim = generate_simulate(&mid, &userid.to_string(), &dfid, webgl_hash.as_deref());
@@ -575,7 +598,7 @@ pub fn create_request(opts: &RequestOptions) -> Result<ModuleResponse, ModuleRes
         extra.insert("sid".to_string(), sim.sid);
         match do_send(opts, &params, &final_headers, &extra) {
             Ok(r) => {
-                body = BodyValue::from_bytes(&r.body);
+                body = response_body_value(opts.response_type.as_deref(), &r.body);
                 cookies = r.cookies;
                 ssa_code = r.ssa_code;
             }
@@ -595,7 +618,7 @@ pub fn create_request(opts: &RequestOptions) -> Result<ModuleResponse, ModuleRes
             .insert("ssa-code".to_string(), code.clone());
     }
 
-    if body_is_error(&answer.body) {
+    if response_is_error(opts.response_type.as_deref(), &answer.body) {
         if answer.body.to_json().get("status").and_then(|v| v.as_i64()) == Some(2) {
             answer.status = 200;
             Ok(answer)
@@ -660,9 +683,10 @@ pub fn raw_get(url: &str, params: &Value) -> Result<ModuleResponse, ModuleRespon
         Err(e) => return Err(transport_error_with(e.to_string())),
     };
     let status = resp.status();
-    let mut body = Vec::new();
-    let mut reader = resp.into_reader();
-    let _ = reader.read_to_end(&mut body);
+    let body = match read_response_body(resp.into_reader()) {
+        Ok(body) => body,
+        Err(error) => return Err(transport_error_with(error)),
+    };
     Ok(ModuleResponse {
         status,
         body: BodyValue::from_bytes(&body),
@@ -732,9 +756,10 @@ pub fn raw_request(
         Err(e) => return Err(transport_error_with(e.to_string())),
     };
     let status = resp.status();
-    let mut body = Vec::new();
-    let mut reader = resp.into_reader();
-    let _ = reader.read_to_end(&mut body);
+    let body = match read_response_body(resp.into_reader()) {
+        Ok(body) => body,
+        Err(error) => return Err(transport_error_with(error)),
+    };
     Ok(ModuleResponse {
         status,
         body: BodyValue::from_bytes(&body),
@@ -773,4 +798,112 @@ pub fn open_stream(
         .unwrap_or("video/mp4")
         .to_string();
     Ok((status, len, ct, resp.into_reader()))
+}
+
+#[cfg(test)]
+mod response_body_tests {
+    use super::{
+        create_request, read_response_body, response_body_value, response_is_error, BodyValue,
+        RequestOptions,
+    };
+    use std::io::{self, Read};
+
+    struct PartialThenError {
+        sent: bool,
+    }
+
+    impl Read for PartialThenError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "injected upstream read failure",
+                ));
+            }
+            self.sent = true;
+            buf[..7].copy_from_slice(b"partial");
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn rejects_partial_body_when_upstream_read_fails() {
+        let result = read_response_body(PartialThenError { sent: false });
+
+        let error = result.expect_err("incomplete response must not be accepted");
+        assert!(error.contains("response body read failed"));
+        assert!(error.contains("injected upstream read failure"));
+    }
+
+    #[test]
+    fn preserves_complete_binary_body() {
+        let expected = [0, 0xff, 0x10, 0x80];
+
+        assert_eq!(read_response_body(expected.as_slice()).unwrap(), expected);
+    }
+
+    #[test]
+    fn arraybuffer_keeps_json_looking_bytes_unchanged() {
+        let body = br#"{"encrypted":"payload"}"#;
+
+        assert!(matches!(
+            response_body_value(Some("arraybuffer"), body),
+            BodyValue::Bytes(bytes) if bytes == body
+        ));
+        assert!(matches!(
+            response_body_value(None, body),
+            BodyValue::Json(_)
+        ));
+
+        let error_like_body = br#"{"status":0,"msg":"encrypted bytes"}"#;
+        let arraybuffer = response_body_value(Some("arraybuffer"), error_like_body);
+        let json = response_body_value(None, error_like_body);
+        assert!(!response_is_error(Some("arraybuffer"), &arraybuffer));
+        assert!(response_is_error(None, &json));
+    }
+
+    fn serve_one_response(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let task = std::thread::spawn(move || {
+            let request = server.recv().expect("request should reach local fixture");
+            request
+                .respond(tiny_http::Response::from_data(body))
+                .expect("fixture response should be sent");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn local_request_options(base_url: &str) -> RequestOptions {
+        RequestOptions::new("/response-test")
+            .base_url(base_url)
+            .get("/response-test")
+            .clear_default_params(true)
+            .not_signature(true)
+    }
+
+    #[test]
+    fn create_request_keeps_arraybuffer_json_bytes_out_of_error_classifier() {
+        let body = br#"{"status":0,"msg":"opaque payload"}"#.to_vec();
+        let (base_url, task) = serve_one_response(body.clone());
+        let options = local_request_options(&base_url).response_type("arraybuffer");
+
+        let response = create_request(&options).expect("arraybuffer response should succeed");
+        task.join().unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(matches!(response.body, BodyValue::Bytes(bytes) if bytes == body));
+    }
+
+    #[test]
+    fn create_request_keeps_default_json_error_mapping() {
+        let body = br#"{"status":0,"msg":"upstream error"}"#.to_vec();
+        let (base_url, task) = serve_one_response(body);
+
+        let error = create_request(&local_request_options(&base_url))
+            .expect_err("default JSON error response should be rejected");
+        task.join().unwrap();
+
+        assert_eq!(error.status, 502);
+    }
 }

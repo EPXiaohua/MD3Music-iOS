@@ -8,11 +8,13 @@ import 'package:provider/provider.dart';
 import 'package:provider/single_child_widget.dart';
 import 'package:quick_actions/quick_actions.dart';
 
+import 'core/layout/desktop_shell.dart';
 import 'core/layout/responsive_layout.dart';
 import 'core/layout/ui_density.dart';
 import 'core/services/external_media_intent_service.dart';
 import 'core/services/fm_widget_sync.dart';
 import 'core/services/lyricon_provider_service.dart';
+import 'core/services/startup_auto_play.dart';
 import 'core/theme/app_theme.dart';
 import 'core/theme/motion_constants.dart';
 import 'core/utils/artwork_color_extractor.dart';
@@ -21,6 +23,7 @@ import 'core/widgets/app_background.dart';
 import 'core/widgets/safe_insets_guard.dart';
 import 'data/models/playlist.dart';
 import 'data/models/song.dart';
+import 'data/repositories/settings_repository.dart';
 import 'services/kugou_api/kugou_api_client.dart';
 import 'services/kugou_api/listen_together_models.dart';
 import 'main.dart'
@@ -30,6 +33,8 @@ import 'main.dart'
         pendingShortcutType,
         shortcutTabRequest;
 import 'modules/discover/discover_page.dart';
+import 'modules/mcp/mcp_player_control.dart';
+import 'modules/mcp/mcp_service.dart';
 import 'modules/coverflow/coverflow_page.dart';
 import 'utils/landscape_immersive.dart';
 import 'modules/charts/charts_page.dart';
@@ -46,6 +51,7 @@ import 'modules/player/full_player_route.dart';
 import 'modules/player/mini_player.dart';
 import 'modules/player/player_drag_overlay.dart';
 import 'modules/player/car_mode_panel.dart';
+import 'modules/player/secondary_mini_player.dart';
 import 'modules/playlist/playlist_page.dart';
 import 'modules/search/search_page.dart';
 import 'modules/settings/settings_page.dart';
@@ -78,6 +84,7 @@ import 'providers/car_mode_provider.dart';
 import 'providers/listen_together_provider.dart';
 import 'services/kugou_server.dart';
 import 'widgets/dlna_casting_overlay.dart';
+import 'core/widgets/local_server_down_banner.dart';
 
 /// 主页（`/`）专用的 [MaterialPageRoute] 子类。
 ///
@@ -139,6 +146,7 @@ class _UpFadeMainRoute<T> extends MaterialPageRoute<T> {
 class MyApp extends StatelessWidget {
   final bool showOnboarding;
   final bool showUserAgreement;
+  final bool initialUseBackgroundImage;
 
   /// 可选扩展：额外注册的 Provider 列表（默认无，由私有构建注入，
   /// 用于注册私有功能 Provider）。
@@ -148,6 +156,7 @@ class MyApp extends StatelessWidget {
     super.key,
     this.showOnboarding = false,
     this.showUserAgreement = false,
+    this.initialUseBackgroundImage = true,
     this.extraProviders,
   });
 
@@ -155,10 +164,28 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => ThemeProvider()),
+        ChangeNotifierProvider(
+          create: (_) => ThemeProvider(
+            initialUseBackgroundImage: initialUseBackgroundImage,
+          ),
+        ),
         ChangeNotifierProvider(create: (_) => DeviceProvider()),
         ChangeNotifierProvider(create: (_) => GridColumnsProvider()),
         ChangeNotifierProvider(create: (_) => PlayerProvider()),
+        // AI 代理接口（MCP）：默认关闭。非惰性创建——需要在每次冷启动时读取
+        // 持久化设置决定是否恢复监听，否则用户开启后必须先进一次设置页才会起服务。
+        // 默认关闭时构造只做一次 SharedPreferences 读取即返回，零网络副作用。
+        ChangeNotifierProxyProvider<PlayerProvider, McpService>(
+          lazy: false,
+          create: (context) => McpService(
+            playerControl: PlayerProviderBackedControl(
+              context.read<PlayerProvider>(),
+            ),
+          ),
+          update: (context, player, previous) =>
+              previous ??
+              McpService(playerControl: PlayerProviderBackedControl(player)),
+        ),
         ChangeNotifierProvider(create: (_) => LibraryProvider()),
         ChangeNotifierProvider(create: (_) => KugouProvider()),
         ChangeNotifierProvider(create: (_) => FavoritesProvider()),
@@ -358,6 +385,7 @@ class _AppViewState extends State<_AppView> {
         AppTheme.lightThemeFromSeed(
           themeProvider.effectiveSeedColor,
           fontFamily: fontFamily,
+          emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
         ),
         themeProvider,
@@ -367,6 +395,7 @@ class _AppViewState extends State<_AppView> {
           themeProvider.effectiveSeedColor,
           useOledBlack: themeProvider.useOledBlack,
           fontFamily: fontFamily,
+          emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
         ),
         themeProvider,
@@ -646,6 +675,11 @@ class _MainLayoutState extends State<_MainLayout>
   int _selectedIndex = 0;
   int _previousSelectedIndex = 0;
 
+  /// 桌面外壳句柄：横屏平板布局下由根 [PopScope] 调用其 [DesktopShellState.maybePop]
+  /// 先回退当前 Tab 的中央内容栈（见横屏平板重设计计划 4.4 / 六）。
+  final GlobalKey<DesktopShellState> _desktopShellKey =
+      GlobalKey<DesktopShellState>();
+
   /// 上一次同步的沉浸状态，避免重复调用 SystemChrome（幂等去重）。
   bool _immersiveSynced = false;
 
@@ -699,8 +733,8 @@ class _MainLayoutState extends State<_MainLayout>
         page = const PersonalFmPage();
         break;
       case 'search':
-        // Tab 模式：隐藏页面自带 MiniPlayer，由 _MainLayout 统一提供全局 MiniPlayer
-        page = const SearchPage(showMiniPlayer: false);
+        // Tab 模式：SearchPage 自包悬浮宿主，一级形态自动退化交由 MiniPlayer 承载
+        page = const SearchPage();
         break;
       case 'charts':
         page = const ChartsPage();
@@ -709,8 +743,8 @@ class _MainLayoutState extends State<_MainLayout>
         page = const IpPage();
         break;
       case 'recognition':
-        // Tab 模式：由 _MainLayout 统一提供全局 MiniPlayer，页面不自带
-        page = const SongRecognitionPage(showMiniPlayer: false);
+        // Tab 模式：SongRecognitionPage 自包悬浮宿主，一级形态自动退化交由 MiniPlayer 承载
+        page = const SongRecognitionPage();
         break;
       case 'audiobook':
         page = const AudiobookPage();
@@ -1231,14 +1265,28 @@ class _MainLayoutState extends State<_MainLayout>
     // 冷启动一起听会话恢复：进程被杀后服务端会话仍在进行（其他成员还能看到
     // 自己），按服务端会话重建 RoomSession，让播放器胶囊不进页也立即回到
     // 会话态。首帧后执行（等 Provider 挂载），恢复失败静默跳过。
+    // 启动自动播放串在它**之后**：一起听恢复末尾可能自己 resume()/playSong()
+    // （见 ListenTogetherProvider 的恢复路径），并发会互相顶掉播放目标。
+    // 默认关闭（见 SettingsRepository.getStartupAutoPlayEnabled），关着时
+    // 这里对播放零参与。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(
-        ltProvider.restoreCurrentSessionIfAny(
+      unawaited(() async {
+        await ltProvider.restoreCurrentSessionIfAny(
           player: playerProvider,
           account: context.read<KugouProvider>(),
-        ),
-      );
+        );
+        if (!mounted) return;
+        final result = await StartupAutoPlay.maybeAutoPlay(
+          kugou: context.read<KugouProvider>(),
+          player: playerProvider,
+        );
+        // 导航决策留在这一层：服务只负责起播，不认识 Navigator。
+        // 必须等「真的起播了」再推 —— 联网源解析播放地址要 1~3s，
+        // 提前推会先闪一个空播放页。
+        if (!mounted || !result.started || !result.openPlayerPage) return;
+        openFullPlayer(context);
+      }());
     });
     // 监听应用生命周期：detached（进程被系统销毁前的最后窗口）时尝试关停本地 API 服务器
     WidgetsBinding.instance.addObserver(this);
@@ -1253,6 +1301,14 @@ class _MainLayoutState extends State<_MainLayout>
     );
     // 监听封面流沉浸请求（长按切换 / 返回键恢复），变更时重算沉浸状态
     kCoverFlowImmersive.addListener(_onCoverFlowImmersiveChanged);
+    // 桌面外壳总开关：启动时载入持久化值 + 监听运行时切换（设置页开关）。
+    // 载入前默认 false（常规响应式布局），载入/切换后触发整棵子树重建。
+    kDesktopModeEnabled.addListener(_onDesktopModeChanged);
+    unawaited(_loadDesktopModeEnabled());
+    // 悬浮播放器总开关：启动时载入持久化值（宿主自己订阅，无需本 State 监听）。
+    unawaited(_loadSecondaryPlayerEnabled());
+    // 悬浮播放器停靠位：启动时载入持久化值；未设置过则按设备形态取默认。
+    unawaited(_loadSecondaryPlayerDock());
     // 监听词幕连接失败（原生侧多次重试后 connect_failed）→ 弹窗提示
     LyriconProviderService.instance.addListener(_onLyriconStateChanged);
     // 冷启动前若已连接失败（如后台唤醒时），进入主页后立即补弹一次
@@ -1270,6 +1326,7 @@ class _MainLayoutState extends State<_MainLayout>
     _exitController.dispose();
     LyriconProviderService.instance.removeListener(_onLyriconStateChanged);
     kCoverFlowImmersive.removeListener(_onCoverFlowImmersiveChanged);
+    kDesktopModeEnabled.removeListener(_onDesktopModeChanged);
     shortcutTabRequest.removeListener(_handleShortcutTabRequest);
     externalMediaRequest.removeListener(_handleExternalMediaRequest);
     WidgetsBinding.instance.removeObserver(this);
@@ -1288,6 +1345,50 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// 封面流沉浸请求变化（长按 / 返回键）→ 重算实际沉浸状态。
   void _onCoverFlowImmersiveChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// 启动时从持久化载入桌面外壳开关，写入全局 [kDesktopModeEnabled]。
+  Future<void> _loadDesktopModeEnabled() async {
+    final enabled = await SettingsRepository().getDesktopModeEnabled();
+    if (!mounted) return;
+    // 仅在与当前值不同时赋值，避免无谓通知；赋值会触发 _onDesktopModeChanged。
+    if (kDesktopModeEnabled.value != enabled) {
+      kDesktopModeEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入悬浮播放器开关，写入全局 [kSecondaryPlayerEnabled]。
+  ///
+  /// 无需监听运行时变更：SecondaryMiniPlayerHost 自己用 ValueListenableBuilder
+  /// 订阅，设置页切换后各页宿主即时重建，不依赖本 State。
+  Future<void> _loadSecondaryPlayerEnabled() async {
+    final enabled = await SettingsRepository().getSecondaryPlayerEnabled();
+    if (!mounted) return;
+    if (kSecondaryPlayerEnabled.value != enabled) {
+      kSecondaryPlayerEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时载入悬浮播放器停靠位；未持久化过则按设备形态取默认
+  /// （手机 center、Pad right，与产品约定一致）。
+  Future<void> _loadSecondaryPlayerDock() async {
+    final raw = await SettingsRepository().getSecondaryPlayerDockRaw();
+    if (!mounted) return;
+    final side =
+        SecondaryPlayerDockSide.tryParse(raw) ??
+        (isPadLayout(context)
+            ? SecondaryPlayerDockSide.right
+            : SecondaryPlayerDockSide.center);
+    if (kSecondaryPlayerDock.value != side) {
+      kSecondaryPlayerDock.value = side;
+    }
+  }
+
+  /// 桌面外壳开关变化（启动载入 / 设置页切换）→ 重建整棵子树，
+  /// 让 [isDesktopLayout] 分支（外壳选择、双栏导航、探索列数等）随之切换。
+  void _onDesktopModeChanged() {
     if (!mounted) return;
     setState(() {});
   }
@@ -1396,12 +1497,15 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// tabId → 可作为二级路由打开的页面（复用主 tab 页面，去掉主 tab 专属参数）。
   ///
-  /// 二级路由页统一在底部挂全局 MiniPlayer（与主 tab 模式一致）：
-  /// - 页面自带 MiniPlayer 的（如 SearchPage）通过 showMiniPlayer: false 关闭，
-  ///   避免与这里提供的重复；
-  /// - 其余页面在 tab 模式下依赖 _MainLayout 的全局 MiniPlayer，作为二级路由
-  ///   打开时没有该全局条，这里统一补上；
-  /// - 设置页除外：不挂 MiniPlayer，保持纯设置界面。
+  /// 二级路由页统一挂悬浮播放器（[SecondaryMiniPlayerHost]）：
+  /// - 二级路由（`route.isFirst == false`）→ 宿主渲染悬浮播放栏；
+  /// - 页面若自身已包 [SecondaryMiniPlayerHost]（如 DiscoverPage / ChartsPage），
+  ///   内层宿主检测到外层作用域后自动退化透传，不会双份；
+  /// - 设置页除外：不挂播放栏，保持纯设置界面。
+  ///
+  /// 一级 tab 形态由 [_MainLayout] 底部常驻 [MiniPlayer] 承载（见 [_buildBody]）；
+  /// 悬浮 vs 常驻的判定复用标题对齐同一路由栈判据（见
+  /// `page_title_alignment.dart` 的 `isSecondaryRoutePage`）。
   Widget _pageForTabAsRoute(String tabId) {
     final Widget page;
     switch (tabId) {
@@ -1421,8 +1525,7 @@ class _MainLayoutState extends State<_MainLayout>
         page = const PersonalFmPage();
         break;
       case 'search':
-        // 路由模式的 MiniPlayer 由本方法统一提供，关闭页面自带的以免重复
-        page = const SearchPage(showMiniPlayer: false);
+        page = const SearchPage();
         break;
       case 'charts':
         page = const ChartsPage();
@@ -1431,8 +1534,7 @@ class _MainLayoutState extends State<_MainLayout>
         page = const IpPage();
         break;
       case 'recognition':
-        // 路由模式的 MiniPlayer 由本方法统一提供，关闭页面自带的以免重复
-        page = const SongRecognitionPage(showMiniPlayer: false);
+        page = const SongRecognitionPage();
         break;
       case 'audiobook':
         page = const AudiobookPage();
@@ -1455,22 +1557,9 @@ class _MainLayoutState extends State<_MainLayout>
       default:
         page = const SizedBox.shrink();
     }
-    // 设置页不挂 MiniPlayer，其余二级路由页统一挂载
+    // 设置页不挂播放栏，其余二级路由页统一挂悬浮播放器宿主。
     if (tabId == 'settings') return page;
-    // removeBottom：底部小横条的 inset 已由下方 MiniPlayer 的 SafeArea 消费，
-    // 若不去掉，page 内的滚动视图会按原 inset 再留一份，MiniPlayer 上方多出空白
-    return Column(
-      children: [
-        Expanded(
-          child: MediaQuery.removePadding(
-            context: context,
-            removeBottom: true,
-            child: page,
-          ),
-        ),
-        const MiniPlayer(),
-      ],
-    );
+    return SecondaryMiniPlayerHost(child: page);
   }
 
   @override
@@ -1750,6 +1839,11 @@ class _MainLayoutState extends State<_MainLayout>
           playerExpansion.value = 0.0;
           return;
         }
+        // 桌面布局：先回退当前 Tab 的中央内容栈（详情页返回），空栈才继续。
+        if (isDesktopLayout(context) &&
+            (_desktopShellKey.currentState?.maybePop() ?? false)) {
+          return;
+        }
         if (immersive) {
           kCoverFlowImmersive.value = false;
         } else {
@@ -1778,28 +1872,49 @@ class _MainLayoutState extends State<_MainLayout>
               ),
             );
           },
-          child: ResponsiveScaffold(
-            destinations: destinations,
-            railDestinations: railDestinations,
-            drawerDestinations: drawerDestinations,
-            selectedIndex: _selectedIndex,
-            onDestinationSelected: (index) {
-              // 守卫：FullPlayer 在栈顶时（展开进度 > 0.5），忽略 tab 切换，
-              // 避免与 FullPlayer 动画叠加导致状态混乱。
-              if (isFullPlayerOnTop) {
-                return;
-              }
-              setState(() {
-                _previousSelectedIndex = _selectedIndex;
-                _selectedIndex = index;
-              });
-            },
-            hideNavigation: immersive,
-            body: _buildBody(context, visibleTabs, immersive),
-            compactBody: _buildBody(context, visibleTabs, immersive),
-            mediumBody: _buildBody(context, visibleTabs, immersive),
-            expandedBody: _buildBody(context, visibleTabs, immersive),
-          ),
+          child: isDesktopLayout(context)
+              ? DesktopShell(
+                  key: _desktopShellKey,
+                  visibleTabs: visibleTabs,
+                  selectedIndex: _selectedIndex,
+                  railDestinations: railDestinations,
+                  pageBuilder: _buildPageForTab,
+                  header: ValueListenableBuilder<bool>(
+                    valueListenable: KugouApiClient.localServerAvailable,
+                    builder: (context, available, _) => available
+                        ? const SizedBox.shrink()
+                        : LocalServerDownBanner(onRetry: KugouApiServer.start),
+                  ),
+                  onDestinationSelected: (index) {
+                    if (isFullPlayerOnTop) return;
+                    setState(() {
+                      _previousSelectedIndex = _selectedIndex;
+                      _selectedIndex = index;
+                    });
+                  },
+                )
+              : ResponsiveScaffold(
+                  destinations: destinations,
+                  railDestinations: railDestinations,
+                  drawerDestinations: drawerDestinations,
+                  selectedIndex: _selectedIndex,
+                  onDestinationSelected: (index) {
+                    // 守卫：FullPlayer 在栈顶时（展开进度 > 0.5），忽略 tab 切换，
+                    // 避免与 FullPlayer 动画叠加导致状态混乱。
+                    if (isFullPlayerOnTop) {
+                      return;
+                    }
+                    setState(() {
+                      _previousSelectedIndex = _selectedIndex;
+                      _selectedIndex = index;
+                    });
+                  },
+                  hideNavigation: immersive,
+                  body: _buildBody(context, visibleTabs, immersive),
+                  compactBody: _buildBody(context, visibleTabs, immersive),
+                  mediumBody: _buildBody(context, visibleTabs, immersive),
+                  expandedBody: _buildBody(context, visibleTabs, immersive),
+                ),
         ),
       ),
     );
@@ -1844,76 +1959,90 @@ class _MainLayoutState extends State<_MainLayout>
     final safeIndex = _selectedIndex.clamp(0, visibleTabs.length - 1);
     final currentTab = visibleTabs[safeIndex];
 
-    return Column(
-      children: [
-        // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
-        // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
-        ValueListenableBuilder<bool>(
-          valueListenable: KugouApiClient.localServerAvailable,
-          builder: (context, available, _) => available
-              ? const SizedBox.shrink()
-              : const _LocalServerDownBanner(),
-        ),
-        Expanded(
-          child: AnimatedSwitcher(
-            duration: M3ExpressiveMotion.defaultDuration,
-            switchInCurve: const Interval(
-              0.5,
-              1.0,
-              curve: M3ExpressiveMotion.expressiveEasing,
-            ),
-            // 退出曲线必须与进入曲线错开：旧页（outgoing）的 controller 是
-            // reverse（1→0），Interval(0.5,1.0) 对反向值映射后旧页恰好在前半段
-            // 淡出、新页在后半段淡入，避免新旧页同时过渡造成内容重叠/闪烁。
-            switchOutCurve: const Interval(
-              0.5,
-              1.0,
-              curve: M3ExpressiveMotion.expressiveEasing,
-            ),
-            transitionBuilder: (child, animation) {
-              final isEntering = child.key == ValueKey(currentTab.id);
+    // 主页（一级页面）与二级页面统一由悬浮播放器承载：整段 body 包进宿主后，
+    // 开关开启时底部常驻 MiniPlayer 隐藏（下方 builder），避免两套播放器并存。
+    // 沉浸态（封面流全屏浏览）透传 immersive，宿主不渲染悬浮条，保持全屏无遮挡。
+    return SecondaryMiniPlayerHost(
+      immersive: immersive,
+      child: Column(
+        children: [
+          // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
+          // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
+          ValueListenableBuilder<bool>(
+            valueListenable: KugouApiClient.localServerAvailable,
+            builder: (context, available, _) => available
+                ? const SizedBox.shrink()
+                : LocalServerDownBanner(onRetry: KugouApiServer.start),
+          ),
+          Expanded(
+            child: AnimatedSwitcher(
+              duration: M3ExpressiveMotion.defaultDuration,
+              switchInCurve: const Interval(
+                0.5,
+                1.0,
+                curve: M3ExpressiveMotion.expressiveEasing,
+              ),
+              // 退出曲线必须与进入曲线错开：旧页（outgoing）的 controller 是
+              // reverse（1→0），Interval(0.5,1.0) 对反向值映射后旧页恰好在前半段
+              // 淡出、新页在后半段淡入，避免新旧页同时过渡造成内容重叠/闪烁。
+              switchOutCurve: const Interval(
+                0.5,
+                1.0,
+                curve: M3ExpressiveMotion.expressiveEasing,
+              ),
+              transitionBuilder: (child, animation) {
+                final isEntering = child.key == ValueKey(currentTab.id);
 
-              if (useVerticalTransition) {
-                // 侧边导航栏：基于 tab 顺序上下滑动
-                final slideY = isEntering
-                    ? (goingRight ? 0.1 : -0.1)
-                    : (goingRight ? -0.1 : 0.1);
-                return FadeTransition(
-                  opacity: animation,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: Offset(0.0, slideY),
-                      end: Offset.zero,
-                    ).animate(animation),
-                    child: child,
-                  ),
-                );
-              } else {
-                // 底部导航栏：左右滑动淡入淡出
-                final slideX = isEntering
-                    ? (goingRight ? 0.12 : -0.12)
-                    : (goingRight ? -0.12 : 0.12);
-                return FadeTransition(
-                  opacity: animation,
-                  child: SlideTransition(
-                    position: Tween<Offset>(
-                      begin: Offset(slideX, 0.0),
-                      end: Offset.zero,
-                    ).animate(animation),
-                    child: child,
-                  ),
-                );
-              }
-            },
-            child: KeyedSubtree(
-              key: ValueKey(currentTab.id),
-              child: _buildPageForTab(currentTab.id),
+                if (useVerticalTransition) {
+                  // 侧边导航栏：基于 tab 顺序上下滑动
+                  final slideY = isEntering
+                      ? (goingRight ? 0.1 : -0.1)
+                      : (goingRight ? -0.1 : 0.1);
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: Offset(0.0, slideY),
+                        end: Offset.zero,
+                      ).animate(animation),
+                      child: child,
+                    ),
+                  );
+                } else {
+                  // 底部导航栏：左右滑动淡入淡出
+                  final slideX = isEntering
+                      ? (goingRight ? 0.12 : -0.12)
+                      : (goingRight ? -0.12 : 0.12);
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: Offset(slideX, 0.0),
+                        end: Offset.zero,
+                      ).animate(animation),
+                      child: child,
+                    ),
+                  );
+                }
+              },
+              child: KeyedSubtree(
+                key: ValueKey(currentTab.id),
+                child: _buildPageForTab(currentTab.id),
+              ),
             ),
           ),
-        ),
-        // 封面流页横屏沉浸：隐藏 MiniPlayer，实现全屏浏览
-        if (!immersive) const MiniPlayer(),
-      ],
+          // 封面流页横屏沉浸：隐藏 MiniPlayer，实现全屏浏览
+          if (!immersive)
+            ValueListenableBuilder<bool>(
+              valueListenable: kSecondaryPlayerEnabled,
+              builder: (context, playerEnabled, _) => playerEnabled
+                  // 悬浮播放器接管：主页同样由悬浮条承载（页面主体已被
+                  // SecondaryMiniPlayerHost 包裹），隐藏底部常驻条避免两套并存。
+                  ? const SizedBox.shrink()
+                  : const MiniPlayer(),
+            ),
+        ],
+      ),
     );
   }
 
@@ -1946,58 +2075,17 @@ class _MainLayoutState extends State<_MainLayout>
   /// 异常时兜底 [SystemNavigator.pop]（回桌面但保留后台进程与服务器）。
   Future<void> _doExit() async {
     if (_isExiting) return;
+    _isExiting = true;
     try {
-      const MethodChannel(
+      await context.read<PlayerProvider>().flushPersistence();
+      await const MethodChannel(
         'com.md3music.md3music/task',
-      ).invokeMethod('moveToBack');
+      ).invokeMethod<void>('moveToBack');
     } catch (_) {
-      SystemNavigator.pop();
+      await SystemNavigator.pop();
+    } finally {
+      _isExiting = false;
     }
-  }
-}
-
-/// 本地 API 服务器未启动提示条（所有 tab 顶部）。
-///
-/// 触发条件：[KugouApiClient.localServerAvailable] 为 false，即本地 Rust
-/// 服务器连端口都没拿到。此时所有在线接口都会被拦截器立即拒绝，
-/// 页面只会显示空状态，必须告知用户真正的原因。
-class _LocalServerDownBanner extends StatelessWidget {
-  const _LocalServerDownBanner();
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final textTheme = Theme.of(context).textTheme;
-    // Windows 上最常见的成因是打包时漏了 kugou_server.dll，直接给出可操作提示。
-    final hint = Platform.isWindows
-        ? '本地数据接口未启动，在线内容不可用（可能缺少 kugou_server.dll）'
-        : '本地数据接口未启动，在线内容不可用';
-
-    return Material(
-      color: colorScheme.errorContainer.withValues(alpha: 0.85),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        child: Row(
-          children: [
-            Icon(
-              Icons.dns_outlined,
-              size: 18,
-              color: colorScheme.onErrorContainer,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                hint,
-                style: textTheme.bodySmall?.copyWith(
-                  color: colorScheme.onErrorContainer,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }
 

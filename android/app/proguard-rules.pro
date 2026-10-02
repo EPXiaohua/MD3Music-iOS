@@ -105,3 +105,14 @@
 -keepclasseswithmembers class androidx.media3.effect.DefaultVideoFrameProcessor$Factory$Builder {
   androidx.media3.effect.DefaultVideoFrameProcessor$Factory build();
 }
+
+# 3D 深度封面：DepthCoverPlugin 仅存在于 depth3d flavor，且通过反射注册/调用
+# （MainActivity 反射取 INSTANCE；通道按名字分发）。R8 混淆会重命名类与
+# INSTANCE 字段导致 Class.forName/getDeclaredField 失败，必须整类 keep。
+# standard flavor 无此类：keep 规则匹配空集无害。
+-keep class com.md3music.md3music.DepthCoverPlugin { *; }
+
+# ONNX Runtime Java 层在 JNI(convertToTensorInfo 等) 内部用反射访问
+# ai.onnxruntime 包内类，R8 混淆重命名后 GetMethodID 返回 null 直接 SIGABRT。
+-keep class ai.onnxruntime.** { *; }
+-dontwarn ai.onnxruntime.**

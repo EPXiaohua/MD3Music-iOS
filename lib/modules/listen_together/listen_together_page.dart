@@ -116,7 +116,7 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
         break;
       }
     }
-    final joined = await showModalBottomSheet<bool>(
+    final joined = await showM3EModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       builder: (_) => RoomPreviewSheet(brief: brief ?? MusicRoomBrief.byRoomId(roomId)),
@@ -126,7 +126,7 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
   }
 
   Future<void> _createRoom() async {
-    final created = await showModalBottomSheet<bool>(
+    final created = await showM3EModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       builder: (_) => const CreateRoomSheet(),
@@ -140,7 +140,7 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
   }
 
   Future<void> _joinById() async {
-    final id = await showModalBottomSheet<String>(
+    final id = await showM3EModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
       builder: (_) => const JoinRoomSheet(),

@@ -4,11 +4,12 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 import '../playlist/playlist_page.dart';
 import 'scene_content_filter.dart';
 import 'scene_audio_list_page.dart';
@@ -150,14 +151,14 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
         opaque: true,
         scrollController: _scrollController,
       ),
-      bottomNavigationBar: const MiniPlayer(),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : Md3PullToRefresh(
               onRefresh: () => _load(showLoading: false),
               child: ListView(
                 controller: _scrollController,
-                padding: const EdgeInsets.only(bottom: 32),
+                padding: const EdgeInsets.only(bottom: AppSpacing.xxl),
                 children: [
                   _buildHeader(context),
                   if (_musicTags.isNotEmpty)
@@ -175,6 +176,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
                 ],
               ),
             ),
+      ),
     );
   }
 
@@ -183,11 +185,11 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.sm),
       child: Row(
         children: [
           ClipRRect(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: AppRadius.lgAll,
             child: SizedBox(
               width: 120,
               height: 120,
@@ -214,7 +216,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
                     ),
             ),
           ),
-          const SizedBox(width: 16),
+          const Gap(AppSpacing.lg),
           Expanded(
             child: Text(
               widget.scene.name,
@@ -241,7 +243,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
           child: Text(
             title,
             style: Theme.of(context).textTheme.titleLarge,
@@ -251,12 +253,12 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
           height: 130,
           child: ListView.builder(
             scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
             itemCount: items.length,
             itemBuilder: (context, i) {
               final item = items[i];
               return Padding(
-                padding: const EdgeInsets.only(right: 12),
+                padding: const EdgeInsets.only(right: AppSpacing.md),
                 child: _TagCard(
                   tag: item.tag,
                   onTap: () => _onTagTap(title, item),
@@ -304,7 +306,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
           child: Text(
             '讨论区',
             style: Theme.of(context).textTheme.titleLarge,
@@ -312,7 +314,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
         ),
         for (final d in items)
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.xs, AppSpacing.lg, AppSpacing.xs),
             child: _DiscussCard(
               discuss: d,
               onSongTap: () {
@@ -332,7 +334,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
               },
             ),
           ),
-        const SizedBox(height: 4),
+        const Gap(AppSpacing.xs),
       ],
     );
   }
@@ -349,7 +351,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
               size: 48,
               color: cs.onSurfaceVariant.withValues(alpha: 0.5),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpacing.md),
             Text(
               '该场景暂无内容',
               style: Theme.of(
@@ -376,7 +378,7 @@ class _TagCard extends StatelessWidget {
     return SizedBox(
       width: 110,
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: AppRadius.lgAll,
         clipBehavior: Clip.antiAlias,
         child: Material(
           color: cs.surfaceContainerLow,
@@ -396,7 +398,7 @@ class _TagCard extends StatelessWidget {
                       : _fallback(cs),
                 ),
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 6),
                   child: Text(
                     tag.name,
                     maxLines: 1,
@@ -446,10 +448,10 @@ class _DiscussCard extends StatelessWidget {
     final song = discuss.song;
     final collection = discuss.collection;
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(AppSpacing.md),
       decoration: BoxDecoration(
         color: cs.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: AppRadius.lgAll,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -467,7 +469,7 @@ class _DiscussCard extends StatelessWidget {
                     ? Icon(Icons.person, size: 18, color: cs.onSurfaceVariant)
                     : null,
               ),
-              const SizedBox(width: 8),
+              const Gap(AppSpacing.sm),
               Expanded(
                 child: Text(
                   discuss.nickname.isEmpty ? '匿名' : discuss.nickname,
@@ -491,19 +493,19 @@ class _DiscussCard extends StatelessWidget {
           ],
           // 关联歌曲
           if (song != null && song.hash.isNotEmpty) ...[
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Material(
               color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: AppRadius.mdAll,
               child: InkWell(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: AppRadius.mdAll,
                 onTap: onSongTap,
                 child: Padding(
-                  padding: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(AppSpacing.sm),
                   child: Row(
                     children: [
                       ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: AppRadius.smAll,
                         child: SizedBox(
                           width: 40,
                           height: 40,
@@ -554,19 +556,19 @@ class _DiscussCard extends StatelessWidget {
           ],
           // 关联歌单
           if (collection != null && collection.id.isNotEmpty) ...[
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Material(
               color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: AppRadius.mdAll,
               child: InkWell(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: AppRadius.mdAll,
                 onTap: onCollectionTap,
                 child: Padding(
-                  padding: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(AppSpacing.sm),
                   child: Row(
                     children: [
                       ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: AppRadius.smAll,
                         child: SizedBox(
                           width: 40,
                           height: 40,
@@ -605,18 +607,18 @@ class _DiscussCard extends StatelessWidget {
           ],
           // 点赞/评论数
           if (discuss.likeTotal > 0 || discuss.commentTotal > 0) ...[
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Row(
               children: [
                 Icon(Icons.thumb_up_outlined, size: 14, color: cs.onSurfaceVariant),
-                const SizedBox(width: 4),
+                const Gap(AppSpacing.xs),
                 Text(
                   '${discuss.likeTotal}',
                   style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
                 ),
-                const SizedBox(width: 16),
+                const Gap(AppSpacing.lg),
                 Icon(Icons.mode_comment_outlined, size: 14, color: cs.onSurfaceVariant),
-                const SizedBox(width: 4),
+                const Gap(AppSpacing.xs),
                 Text(
                   '${discuss.commentTotal}',
                   style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),

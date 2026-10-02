@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
+import '../../services/kugou_api/comment_delete.dart';
 import '../../services/kugou_api/comment_reply_target.dart';
 import '../../services/kugou_api/comment_send_result.dart';
 import '../../services/kugou_api/comment_sort.dart';
@@ -14,6 +15,7 @@ import '../../widgets/comment_composer.dart';
 import '../../widgets/comment_image_grid.dart';
 import '../../widgets/comment_image_viewer.dart';
 import '../../widgets/keyboard_expand_sheet.dart';
+import '../../widgets/md3_pull_to_refresh.dart';
 import '../login/login_page.dart';
 import '../../providers/comment_display_provider.dart';
 import '../../providers/kugou_provider.dart';
@@ -173,6 +175,31 @@ class _CommentsViewState extends State<CommentsView> {
 
   /// 评论发送在途：禁用输入框，防止连点造成重复公开评论。
   bool _sendingComment = false;
+
+  /// 删除在途的评论 id（含楼中楼回复）：在途时忽略再次长按，防止重复删除。
+  final Set<String> _deletingCommentIds = {};
+
+  /// 范围筛选：全部 / 歌手 / 我的（客户端过滤已加载数据，
+  /// 上游无按用户筛选的评论接口；「加载更多」照常可用）。
+  CommentScope _scope = CommentScope.all;
+
+  /// 下拉菜单条目。**必须是稳定实例**：M3EDropdownMenu.didUpdateWidget 以
+  /// `widget.items != oldWidget.items`（列表同一性）判断是否 setItems，
+  /// 每次 build 新建列表会让它恒真 → setItems 在 build 期间回调
+  /// _onSelectionChange → setState during build → 语义树更新无限互递归
+  /// （真机 ANR，2026-09-29）。选中态交给 controller 维护，列表只提供初始选中。
+  late final List<M3EDropdownItem<CommentScope>> _scopeItems = [
+    for (final scope in CommentScope.values)
+      M3EDropdownItem(
+        label: switch (scope) {
+          CommentScope.all => '全部评论',
+          CommentScope.singer => '歌手评论',
+          CommentScope.mine => '我的评论',
+        },
+        value: scope,
+        selected: scope == CommentScope.all,
+      ),
+  ];
 
   /// 评论排序方式（默认最热）。切换后重新拉取第一页。
   CommentSortMode _sortMode = CommentSortMode.hottest;
@@ -564,6 +591,76 @@ class _CommentsViewState extends State<CommentsView> {
     if (mounted) setState(() {});
   }
 
+  /// 长按删除自己的评论（顶层或楼中楼回复）。
+  ///
+  /// 流程：归属校验 → 确认弹窗 → 调用 /comment/music/del → 刷新。
+  /// 不自动重试（删除成功不可撤销）；在途时忽略再次长按。
+  Future<void> _deleteOwnComment(
+    KugouComment comment, {
+    KugouComment? floorRoot,
+  }) async {
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) return;
+    if (_deletingCommentIds.contains(comment.id)) return;
+
+    final args = buildCommentDeleteArgs(
+      comment: comment,
+      floorRoot: floorRoot,
+      resourceType: 'song',
+      fallbackSpecialId: _childrenId.isEmpty ? null : _childrenId,
+      mixsongid: widget.albumAudioId,
+    );
+    if (args == null) return;
+
+    final errorColor = Theme.of(context).colorScheme.error;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除评论'),
+        content: const Text('删除后无法恢复，确定要删除这条评论吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: errorColor),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _deletingCommentIds.add(comment.id));
+    try {
+      final result = await api.deleteComment(
+        cid: args.cid,
+        specialId: args.specialId,
+        mixsongid: args.mixsongid,
+        tid: args.tid,
+        resourceType: args.resourceType,
+        code: args.code,
+      );
+      if (!mounted) return;
+      if (result.ok) {
+        showToast('评论已删除');
+        if (floorRoot == null) {
+          await _fetchComments(silent: true);
+        } else {
+          // 保持该楼层展开并重新拉取，列表里立刻看不到已删的回复
+          _getFloorState(floorRoot.id).expanded = true;
+          await _fetchFloorReplies(floorRoot, reset: true, silent: true);
+        }
+      } else {
+        showToast(result.message, long: true);
+      }
+    } finally {
+      if (mounted) setState(() => _deletingCommentIds.remove(comment.id));
+    }
+  }
+
   /// 计算评论项顶部相对视口顶部的偏移（负数表示在视口上方）。
   double? _commentTopInViewport(String commentId) {
     final rb = _keyForComment(commentId).currentContext?.findRenderObject();
@@ -601,16 +698,6 @@ class _CommentsViewState extends State<CommentsView> {
             ),
           )
         : null;
-    final buttonDecoration = widget.isAmStyle
-        ? M3EButtonDecoration(
-            backgroundColor: WidgetStateProperty.resolveWith(
-              (states) => states.contains(WidgetState.pressed)
-                  ? const Color(0x2EFFFFFF)
-                  : const Color(0x1FFFFFFF),
-            ),
-            foregroundColor: WidgetStateProperty.all(Colors.white),
-          )
-        : null;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
       child: Row(
@@ -631,14 +718,61 @@ class _CommentsViewState extends State<CommentsView> {
             },
           ),
           const Spacer(),
+          SizedBox(
+            width: 100,
+            child: M3EDropdownMenu<CommentScope>(
+              items: _scopeItems,
+              singleSelect: true,
+              showChipAnimation: false,
+              onSelectionChanged: (selected) {
+                if (selected.isEmpty) return;
+                final scope = selected.first.value;
+                // setItems（父级任何重建都会触发）也会回调到这里：
+                // 同值直接忽略，避免 build 期间 setState
+                if (scope == _scope) return;
+                HapticFeedback.selectionClick();
+                setState(() => _scope = scope);
+              },
+              fieldStyle: widget.isAmStyle
+                  ? const M3EDropdownFieldStyle(
+                      padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      backgroundColor: Color(0x14FFFFFF),
+                      // 前景色同时驱动下拉箭头（fgColor），AM 皮肤下要求白色
+                      foregroundColor: Colors.white,
+                      border: BorderSide.none,
+                      focusedBorder: BorderSide.none,
+                      selectedTextStyle: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                      ),
+                      hintStyle: TextStyle(color: Color(0xB3FFFFFF), fontSize: 12),
+                    )
+                  : const M3EDropdownFieldStyle(
+                      padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          // 纯图标按钮（m3e_core 无 M3EIconButton）：去内边距 + 固定正方形
           if (showComposeButton)
-            M3EFilledButton.icon(
+            M3EFilledButton(
               onPressed: () => widget.onReplyComment?.call(null),
-              icon: const Icon(Icons.edit_outlined, size: 14),
-              label: const Text('评论'),
-              size: M3EButtonSize.xs,
-              decoration: buttonDecoration,
+              tooltip: '写评论',
+              decoration: widget.isAmStyle
+                  ? M3EButtonDecoration(
+                      padding: EdgeInsets.zero,
+                      fixedSize: const Size.square(36),
+                      backgroundColor: WidgetStateProperty.all(
+                        const Color(0x1FFFFFFF),
+                      ),
+                      foregroundColor: WidgetStateProperty.all(Colors.white),
+                    )
+                  : const M3EButtonDecoration(
+                      padding: EdgeInsets.zero,
+                      fixedSize: Size.square(36),
+                    ),
               semanticLabel: '写评论',
+              child: const Icon(Icons.edit_outlined, size: 18),
             ),
         ],
       ),
@@ -803,23 +937,89 @@ class _CommentsViewState extends State<CommentsView> {
     // 只来自 /comment/music 的 star_cmts/hot_list，不一定包含它（可能为空）。
     // 统一在此把主列表里的歌手评论补进「歌手评论」栏（按 id 去重），
     // 并从主列表移除，避免歌手评论重复或「歌手评论」栏空着。
-    final hotFromComments = _activeList.where((c) => c.isStar).toList();
+    // 范围筛选：mine 只保留自己的评论、singer 只保留歌手评论（均为客户端过滤）
+    final mine = _scope == CommentScope.mine;
+    final singer = _scope == CommentScope.singer;
+    final ownUserid = mine ? KugouApiClient().userid : null;
+    final hotFromComments = mine
+        ? const <KugouComment>[]
+        : _activeList.where((c) => c.isStar).toList();
     // 「最热」= 原生 topliked 的点赞序；时间模式客户端按时间排
-    final regularComments = _sortMode == CommentSortMode.hottest
+    final baseRegular = _sortMode == CommentSortMode.hottest
         ? _activeList.where((c) => !c.isStar).toList()
         : sortCommentsForDisplay(
             _activeList.where((c) => !c.isStar).toList(), _sortMode);
-    final mainSectionLabel = switch (_sortMode) {
-      CommentSortMode.hottest => '最热评论',
-      CommentSortMode.timeDesc => '最新评论',
-      CommentSortMode.timeAsc => '最早评论',
-    };
+    final regularComments = mine
+        ? baseRegular.where((c) => isOwnComment(c, ownUserid)).toList()
+        : (singer ? const <KugouComment>[] : baseRegular);
+    final mainSectionLabel = mine
+        ? '我的评论'
+        : switch (_sortMode) {
+            CommentSortMode.hottest => '最热评论',
+            CommentSortMode.timeDesc => '最新评论',
+            CommentSortMode.timeAsc => '最早评论',
+          };
     final starFromHot = _hotComments.where((c) => c.isStar).toSet();
-    final singerComments = <KugouComment>[
-      ..._hotComments,
-      for (final c in hotFromComments)
-        if (!starFromHot.any((s) => s.id == c.id)) c,
-    ];
+    final singerComments = mine
+        ? const <KugouComment>[]
+        : <KugouComment>[
+            ..._hotComments,
+            for (final c in hotFromComments)
+              if (!starFromHot.any((s) => s.id == c.id)) c,
+          ];
+
+    // 筛选下没有任何自己的评论：给可操作的提示（而不是空列表 + 加载更多）
+    if (mine && regularComments.isEmpty) {
+      final loggedIn = KugouApiClient().isLoggedIn;
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.person_outline, size: 48, color: secondaryTextColor),
+              const SizedBox(height: 12),
+              Text(
+                loggedIn ? '暂无你的评论' : '登录后可查看自己的评论',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  color: secondaryTextColor,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '仅筛选已加载的 ${_activeList.length} 条评论，可通过「加载更多」继续查找',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: secondaryTextColor.withValues(alpha: 0.6),
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // 「歌手」下没有歌手评论
+    if (singer && singerComments.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.star_outline, size: 48, color: secondaryTextColor),
+              const SizedBox(height: 12),
+              Text(
+                '暂无歌手评论',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  color: secondaryTextColor,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
     final displayItems = <_CommentDisplayItem>[];
 
@@ -858,7 +1058,9 @@ class _CommentsViewState extends State<CommentsView> {
                   ).createShader(bounds);
                 },
                 blendMode: BlendMode.dstIn,
-                child: ListView.builder(
+                child: Md3PullToRefresh(
+                  onRefresh: () => _fetchComments(silent: true),
+                  child: ListView.builder(
               controller: _scrollController,
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   itemCount: displayItems.length + (_activeHasMore ? 1 : 0),
@@ -896,6 +1098,7 @@ class _CommentsViewState extends State<CommentsView> {
                     );
                   },
                 ),
+                  ),
               ),
             ),
             // 输入框内联在列表下方并常驻（showComposer=false 时整块不存在）
@@ -941,7 +1144,7 @@ class _CommentsViewState extends State<CommentsView> {
     double replyFontSize,
   ) {
     final floorState = _floorStates[comment.id];
-    return Padding(
+    final Widget item = Padding(
       key: _keyForComment(comment.id),
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(
@@ -1124,6 +1327,17 @@ class _CommentsViewState extends State<CommentsView> {
           ),
         ],
       ),
+    );
+
+    // 自己的评论支持长按删除；非本人评论不响应长按
+    if (!isOwnComment(comment, KugouApiClient().userid)) return item;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        _deleteOwnComment(comment);
+      },
+      child: item,
     );
   }
 
@@ -1371,7 +1585,7 @@ class _CommentsViewState extends State<CommentsView> {
     final content = node.isOrphan
         ? reply.content
         : stripReplyQuote(reply.content);
-    return Padding(
+    final Widget item = Padding(
       padding: EdgeInsets.only(
         top: 6,
         bottom: 6,
@@ -1464,6 +1678,17 @@ class _CommentsViewState extends State<CommentsView> {
           ),
         ],
       ),
+    );
+
+    // 自己的回复支持长按删除；非本人回复不响应长按
+    if (!isOwnComment(reply, KugouApiClient().userid)) return item;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        _deleteOwnComment(reply, floorRoot: top);
+      },
+      child: item,
     );
   }
 

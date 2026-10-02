@@ -5,8 +5,8 @@
 //! 任何签名/参数改动都必须能解释这些值为何不变。
 
 use kugou_server::modules::comment_send::{
-    extract_resolved_resource, identity, reply_options, resolve_code, send_options, with_quote_suffix,
-    ALBUM_CODE, PLAYLIST_CODE, SONG_CODE,
+    del_options, extract_resolved_resource, identity, reply_options, resolve_code, send_options,
+    with_quote_suffix, ALBUM_CODE, PLAYLIST_CODE, SONG_CODE,
 };
 use serde_json::json;
 
@@ -169,6 +169,59 @@ fn extract_resolved_resource_prefers_top_level_childrenid() {
 
     // 空列表 / 缺字段 → 空串（不 panic）
     assert_eq!(extract_resolved_resource(&json!({})), (String::new(), String::new()));
+}
+
+#[test]
+fn del_options_matches_reference() {
+    let opts = del_options(&fixture_query(), "123", "100285259", SONG_CODE, "678433417");
+
+    assert_eq!(opts.method, "GET", "commentsv2/delcomment 是 GET，无请求体");
+    assert_eq!(opts.url, "/index.php");
+    assert!(opts.data.is_none(), "删除接口无请求体");
+    assert_eq!(
+        opts.headers.get("Content-Type").map(String::as_str),
+        None,
+        "无 body 时不下发 Content-Type"
+    );
+    assert_eq!(
+        opts.headers.get("x-router").map(String::as_str),
+        Some("m.comment.service.kugou.com")
+    );
+    assert!(opts.not_signature, "写接口必须跳过 signature");
+    assert!(opts.clear_default_params, "写接口必须清空默认参数");
+    assert_eq!(opts.base_url, None);
+
+    let p = &opts.params;
+    assert_eq!(p["r"], json!("commentsv2/delcomment"));
+    assert_eq!(p["code"], json!(SONG_CODE));
+    assert_eq!(p["childrenid"], json!("100285259"));
+    assert_eq!(p["cid"], json!("123"));
+    assert_eq!(p["tid"], json!("678433417"));
+    assert_eq!(p["kugouid"], json!(12345));
+    assert_eq!(p["ver"], json!(6));
+    assert_eq!(p["clienttoken"], json!("TOK"));
+    assert_eq!(p["appid"], json!(3116));
+    assert_eq!(p["clientver"], json!(11440));
+    assert_eq!(p["mid"], json!("abcdef1234567890"));
+    assert_eq!(p["clienttime"], json!(1758182400));
+    assert_eq!(p["uuid"], json!("-"));
+    assert_eq!(p["dfid"], json!("-"));
+    assert_eq!(
+        p["key"],
+        json!("4045fee0201228de18b625ff1499aed0"),
+        "key = signParamsKey(clienttime+mid)，与 commentsv2/reply 同源"
+    );
+    assert!(p.get("signature").is_none(), "跳过签名后不得带 signature");
+}
+
+#[test]
+fn del_options_omits_empty_tid() {
+    let opts = del_options(&fixture_query(), "123", "100285259", ALBUM_CODE, "");
+    assert!(
+        opts.params.get("tid").is_none(),
+        "空 tid 必须被 compact 掉（删除顶层评论场景）"
+    );
+    assert_eq!(opts.params["code"], json!(ALBUM_CODE));
 }
 
 #[test]

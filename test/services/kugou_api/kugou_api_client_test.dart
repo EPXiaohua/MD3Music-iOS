@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/services/kugou_api/kugou_api_client.dart';
 import 'package:md3music/services/kugou_api/kugou_models.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../test_helpers/fake_secure_storage.dart';
 
 /// KugouApiClient.getLyric 双请求（LRC + KRC）合并逻辑测试。
 ///
@@ -13,6 +14,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 覆盖 spec.md "Requirement: KRC 双请求与降级" 的 5 种场景。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() => SharedPreferences.setMockInitialValues({}));
+  setUp(installFakeSecureStorage);
+  tearDown(uninstallFakeSecureStorage);
 
   group('KugouApiClient.mergeLyricResponses', () {
     // 模拟 LRC 响应 data 节点：decodeContent 为 LRC 明文
@@ -125,7 +130,10 @@ void main() {
         'decodeContent': krcText,
         'translated_content': '[00:01.00]KRC翻译',
       };
-      final lyric = KugouApiClient.mergeLyricResponses(lrcNoTrans, krcWithTrans);
+      final lyric = KugouApiClient.mergeLyricResponses(
+        lrcNoTrans,
+        krcWithTrans,
+      );
       expect(lyric, isNotNull);
       expect(lyric!.translatedContent, '[00:01.00]KRC翻译');
     });
@@ -174,7 +182,8 @@ void main() {
       });
       final b64 = base64Encode(utf8.encode(langJson));
       // KRC 明文：歌词行带时间戳（韩文原文）+ [language:] 元数据
-      final krcText = '[1000,2000]<0,1000,0>행1\n'
+      final krcText =
+          '[1000,2000]<0,1000,0>행1\n'
           '[3000,2000]<0,1000,0>행2\n'
           '[language:$b64]';
       final krcJson = <String, dynamic>{
@@ -255,7 +264,11 @@ void main() {
 
     test('updateAccountProfile 更新昵称/头像', () async {
       await client.setLoginCookies('token', 'user1');
-      await client.updateAccountProfile('user1', nickname: '测试用户', avatar: 'http://example.com/avatar.png');
+      await client.updateAccountProfile(
+        'user1',
+        nickname: '测试用户',
+        avatar: 'http://example.com/avatar.png',
+      );
       final saved = client.savedAccounts.first;
       expect(saved.nickname, '测试用户');
       expect(saved.avatar, 'http://example.com/avatar.png');

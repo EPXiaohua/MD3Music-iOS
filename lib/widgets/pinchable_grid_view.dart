@@ -7,7 +7,8 @@ import '../providers/grid_columns_provider.dart';
 /// 封装捏合手势调整列数的可复用网格组件。
 ///
 /// Pad 模式下双指捏合可动态调整列数（向内捏合增列、向外捏合减列），
-/// 列数由 [GridColumnsProvider] 管理并持久化；非 Pad 模式固定 2 列、
+/// 列数由 [GridColumnsProvider] 管理并持久化；非 Pad 模式改为**按局部实宽
+/// 自适应列数**（计划 ⑥：窄屏手机竖屏落回 2 列，横屏等变宽后自然增列），
 /// 不挂载手势。列数变化时通过 [AnimatedSwitcher] 做淡入淡出过渡。
 class PinchableGridView extends StatefulWidget {
   final IndexedWidgetBuilder itemBuilder;
@@ -92,13 +93,39 @@ class _PinchableGridViewState extends State<PinchableGridView> {
     return gridView;
   }
 
+  /// 非 Pad 分支按局部实宽自适应列数（计划 ⑥ 宽屏密度）。
+  ///
+  /// 目标每列宽 ~180dp（封面卡尺度），窄屏（手机竖屏 ~360–420dp）落回 2 列，
+  /// 与旧行为一致；变宽（手机横屏等）后自然增列。Pad 分支仍走捏合列数。
+  static const double _adaptiveTargetExtent = 180;
+
   @override
   Widget build(BuildContext context) {
     final isPad = isPadLayout(context);
-    // Pad 模式取 provider 列数（watch 以便列数变化时重建），非 Pad 固定 2
-    final columns = isPad
-        ? context.watch<GridColumnsProvider>().gridColumns
-        : 2;
+
+    // 非 Pad 模式：按局部约束实宽自适应列数（不挂载捏合手势）。
+    if (!isPad) {
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          final columns = gridColumnsForWidth(
+            constraints.maxWidth,
+            targetExtent: _adaptiveTargetExtent,
+            min: 2,
+            max: 6,
+          );
+          // AnimatedSwitcher + ValueKey 让列数变化时整体淡入淡出
+          return AnimatedSwitcher(
+            duration: const Duration(milliseconds: 250),
+            transitionBuilder: (child, animation) =>
+                FadeTransition(opacity: animation, child: child),
+            child: _buildGrid(columns),
+          );
+        },
+      );
+    }
+
+    // Pad 模式取 provider 列数（watch 以便列数变化时重建）
+    final columns = context.watch<GridColumnsProvider>().gridColumns;
 
     // AnimatedSwitcher + ValueKey 让列数变化时整体淡入淡出
     final gridContent = AnimatedSwitcher(
@@ -107,11 +134,6 @@ class _PinchableGridViewState extends State<PinchableGridView> {
           FadeTransition(opacity: animation, child: child),
       child: _buildGrid(columns),
     );
-
-    // 非 Pad 模式不挂载捏合手势，直接返回
-    if (!isPad) {
-      return gridContent;
-    }
 
     // Pad 模式包裹 GestureDetector；behavior opaque 确保空白区域也能接收手势，
     // 手势竞技场中双指 scale 会胜出、单指 drag 让给 GridView 滚动

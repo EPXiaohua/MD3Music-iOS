@@ -2,7 +2,9 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/widgets/app_background.dart';
 import '../../data/models/song.dart';
@@ -10,8 +12,9 @@ import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 class ArtistDetailPage extends StatefulWidget {
   final String artistId;
@@ -35,6 +38,10 @@ class ArtistDetailPage extends StatefulWidget {
 enum _SortBy { time, title, duration }
 
 class _ArtistDetailPageState extends State<ArtistDetailPage> {
+  static const _prefArtistSongSortKey = 'pref_artist_song_sort';
+  String _artistSongSort = 'hot';
+  int _fetchToken = 0;
+
   List<Song> _songs = [];
   bool _isLoading = true;
   String? _error;
@@ -59,6 +66,39 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
   // 排序
   _SortBy _sortBy = _SortBy.time;
   bool _sortAscending = false;
+
+  void _switchArtistSongSort(String newSort) {
+    if (_artistSongSort == newSort && !_isLoading) {
+      if (_sortBy == _SortBy.time) {
+        setState(() {
+          _sortAscending = !_sortAscending;
+          _invalidateDisplaySongs();
+        });
+      } else {
+        setState(() {
+          _sortBy = _SortBy.time;
+          _sortAscending = false;
+          _invalidateDisplaySongs();
+        });
+      }
+      return;
+    }
+    setState(() {
+      _artistSongSort = newSort;
+      _sortBy = _SortBy.time;
+      _sortAscending = false;
+      _invalidateDisplaySongs();
+    });
+    _fetchArtistSongs(sort: newSort);
+  }
+
+  /// 当前排序项（供 M3E 排序托盘高亮）：字段排序时返回 'title'/'duration'，
+  /// 否则返回接口排序 'hot'/'new'。
+  String get _currentSortOption {
+    if (_sortBy == _SortBy.title) return 'title';
+    if (_sortBy == _SortBy.duration) return 'duration';
+    return _artistSongSort;
+  }
 
   // 定位正在播放歌曲
   String? _highlightSongId;
@@ -97,15 +137,14 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
       switch (_sortBy) {
         case _SortBy.time:
           cmp = _songs.indexOf(a).compareTo(_songs.indexOf(b));
-          break;
+          return _sortAscending ? -cmp : cmp;
         case _SortBy.title:
           cmp = a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
-          break;
+          return _sortAscending ? cmp : -cmp;
         case _SortBy.duration:
           cmp = a.duration.compareTo(b.duration);
-          break;
+          return _sortAscending ? cmp : -cmp;
       }
-      return _sortAscending ? cmp : -cmp;
     });
     _cachedDisplaySongs = list;
     _lastSearchQuery = _searchQuery;
@@ -190,7 +229,27 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
     );
   }
 
-  Future<void> _fetchArtistSongs() async {
+  Future<void> _fetchArtistSongs({String? sort}) async {
+    final token = ++_fetchToken;
+
+    if (sort != null) {
+      _artistSongSort = sort;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_prefArtistSongSortKey, sort);
+      } catch (_) {}
+    } else {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final savedSort = prefs.getString(_prefArtistSongSortKey);
+        if (savedSort != null && (savedSort == 'hot' || savedSort == 'new')) {
+          _artistSongSort = savedSort;
+        }
+      } catch (_) {}
+    }
+
+    if (!mounted || token != _fetchToken) return;
+
     setState(() {
       _isLoading = true;
       _error = null;
@@ -200,20 +259,22 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
       final api = KugouApiClient();
       final artistId = widget.artistId;
       final artistName = widget.artistName;
+      final currentSort = _artistSongSort;
 
       // 并行获取歌手详情和第一页歌曲
-      const batchSize = 30;
+      const batchSize = 500;
       const maxPages = 100;
       final detailFuture = api.getArtistDetail(artistId);
       final firstPageFuture = api.getArtistAudios(
         artistId,
         page: 1,
         pagesize: batchSize,
+        sort: currentSort,
         noCache: true,
       );
 
       final initial = await Future.wait([detailFuture, firstPageFuture]);
-      if (!mounted) return;
+      if (!mounted || token != _fetchToken) return;
 
       final detail = initial[0] as KugouArtistDetail?;
       final firstPage = initial[1] as KugouArtistAudios?;
@@ -243,10 +304,12 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
 
         int currentPage = 2;
         while (allSongs.length < targetTotal && currentPage <= maxPages) {
+          if (!mounted || token != _fetchToken) return;
           final pageResult = await api.getArtistAudios(
             artistId,
             page: currentPage,
             pagesize: batchSize,
+            sort: currentSort,
             noCache: true,
           );
           if (pageResult == null || pageResult.songs.isEmpty) break;
@@ -260,7 +323,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
       final expectedTotal = firstPage?.total ?? 0;
       if (allSongs.isEmpty || (expectedTotal > 0 && allSongs.length < expectedTotal && allSongs.length < 30)) {
         final searchSongs = await _searchArtistSongs(api, artistId, artistName);
-        if (!mounted) return;
+        if (!mounted || token != _fetchToken) return;
         if (searchSongs.isNotEmpty) {
           final existingHashes = allSongs.map((s) => s.hash).toSet();
           for (final song in searchSongs) {
@@ -272,13 +335,18 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
         }
       }
 
+      if (!mounted || token != _fetchToken) return;
+
       setState(() {
-        _songs = allSongs.map((s) => s.toSong()).toList();
+        _songs = allSongs.map((s) {
+          final song = s.toSong();
+          return song.copyWith(artistId: song.artistId ?? artistId);
+        }).toList();
         _isLoading = false;
         _invalidateDisplaySongs();
       });
     } catch (e) {
-      if (mounted) {
+      if (mounted && token == _fetchToken) {
         setState(() {
           _error = e.toString();
           _isLoading = false;
@@ -410,7 +478,8 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
     final avatarUrl = _fixImageUrl(_resolvedAvatarUrl ?? widget.avatarUrl);
 
     return Scaffold(
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _error != null
               ? _buildError(context, colorScheme)
@@ -437,61 +506,35 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                             tooltip: '定位正在播放',
                           ),
                         if (_songs.isNotEmpty)
-                          PopupMenuButton<_SortBy>(
-                            icon: const Icon(Icons.sort),
+                          M3ESortButton<String>(
                             tooltip: '排序',
-                            onSelected: (value) {
-                              setState(() {
-                                if (_sortBy == value) {
-                                  _sortAscending = !_sortAscending;
-                                } else {
-                                  _sortBy = value;
-                                  _sortAscending = value == _SortBy.time ? false : true;
-                                }
-                                _invalidateDisplaySongs();
-                              });
-                            },
-                            itemBuilder: (context) => [
-                              CheckedPopupMenuItem<_SortBy>(
-                                value: _SortBy.time,
-                                checked: _sortBy == _SortBy.time,
-                                child: Row(
-                                  children: [
-                                    const Text('添加时间'),
-                                    if (_sortBy == _SortBy.time) ...[
-                                      const Spacer(),
-                                      Icon(_sortAscending ? Icons.arrow_upward : Icons.arrow_downward, size: 16),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              CheckedPopupMenuItem<_SortBy>(
-                                value: _SortBy.title,
-                                checked: _sortBy == _SortBy.title,
-                                child: Row(
-                                  children: [
-                                    const Text('歌曲名称'),
-                                    if (_sortBy == _SortBy.title) ...[
-                                      const Spacer(),
-                                      Icon(_sortAscending ? Icons.arrow_upward : Icons.arrow_downward, size: 16),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              CheckedPopupMenuItem<_SortBy>(
-                                value: _SortBy.duration,
-                                checked: _sortBy == _SortBy.duration,
-                                child: Row(
-                                  children: [
-                                    const Text('时长'),
-                                    if (_sortBy == _SortBy.duration) ...[
-                                      const Spacer(),
-                                      Icon(_sortAscending ? Icons.arrow_upward : Icons.arrow_downward, size: 16),
-                                    ],
-                                  ],
-                                ),
-                              ),
+                            current: _currentSortOption,
+                            options: const [
+                              (value: 'hot', label: '按热度排行'),
+                              (value: 'new', label: '按发布时间'),
+                              (value: 'title', label: '按歌曲名称'),
+                              (value: 'duration', label: '按时长'),
                             ],
+                            // 不用 repeated 改分支：'hot'/'new' 的「再次点当前项」
+                            // 由 _switchArtistSongSort 内部自行判定并翻转方向
+                            onPicked: (value, repeated) {
+                              if (value == 'hot' || value == 'new') {
+                                _switchArtistSongSort(value);
+                              } else {
+                                final sortBy = value == 'title'
+                                    ? _SortBy.title
+                                    : _SortBy.duration;
+                                setState(() {
+                                  if (_sortBy == sortBy) {
+                                    _sortAscending = !_sortAscending;
+                                  } else {
+                                    _sortBy = sortBy;
+                                    _sortAscending = true;
+                                  }
+                                  _invalidateDisplaySongs();
+                                });
+                              }
+                            },
                           ),
                       ],
                       // 背景图模式：顶栏恒透明——flexibleSpace 是普通 Stack
@@ -525,118 +568,148 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                       // 显式 ClipRect：全屏壁纸层仅靠 Stack 默认 hardEdge 裁剪
                       // 可能失效，必须显式裁剪，否则壁纸会溢出覆盖下方歌曲列表
                       flexibleSpace: ClipRect(
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            if (useBackgroundImage)
-                              const WallpaperHeaderBackground(),
-                            Container(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                // 开启壁纸时主题色渐变半透明叠加在壁纸上，
-                                // 渐变可见且壁纸透出；未开启时实色渐变
-                                useBackgroundImage
-                                    ? colorScheme.primaryContainer
-                                        .withValues(alpha: 0.35)
-                                    : colorScheme.primaryContainer,
-                                // 底部渐变到透明：启用全局背景图（页面背景透明）时，
-                                // 若此处仍是实色 surface 会与下方背景图形成接缝穿帮。
-                                colorScheme.surface.withValues(alpha: 0),
-                              ],
-                            ),
-                          ),
-                          child: SafeArea(
-                            bottom: false,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(24, 48, 24, 16),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.end,
-                                children: [
-                                  avatarUrl != null
-                                      ? ClipOval(
-                                          child: CachedNetworkImage(
-                                            imageUrl: avatarUrl,
-                                            memCacheWidth: 300,
-                                            memCacheHeight: 300,
-                                            width: 100,
-                                            height: 100,
-                                            fit: BoxFit.cover,
-                                            placeholder: (_, _) => Container(
-                                              width: 100,
-                                              height: 100,
-                                              color: colorScheme.surfaceContainerHighest,
-                                              child: Icon(
-                                                Icons.person,
-                                                size: 40,
-                                                color: colorScheme.onSurfaceVariant,
-                                              ),
-                                            ),
-                                            errorWidget: (_, _, _) => Container(
-                                              width: 100,
-                                              height: 100,
-                                              color: colorScheme.surfaceContainerHighest,
-                                              child: Icon(
-                                                Icons.person,
-                                                size: 40,
-                                                color: colorScheme.onSurfaceVariant,
-                                              ),
-                                            ),
-                                          ),
-                                        )
-                                      : Container(
-                                          width: 100,
-                                          height: 100,
-                                          decoration: BoxDecoration(
-                                            shape: BoxShape.circle,
-                                            color: colorScheme.surfaceContainerHighest,
-                                          ),
-                                          child: Icon(
-                                            Icons.person,
-                                            size: 40,
-                                            color: colorScheme.onSurfaceVariant,
-                                          ),
-                                        ),
-                                  const SizedBox(width: 16),
-                                  Expanded(
-                                    child: Column(
-                                      mainAxisAlignment: MainAxisAlignment.end,
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          widget.artistName,
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
-                                        if (_songs.isNotEmpty) ...[
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            '${_songs.length} 首歌曲',
-                                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                              color: colorScheme.onSurfaceVariant,
-                                            ),
-                                          ),
-                                        ],
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            // 折叠时 flexibleSpace 高度收缩：头像随可用高度平滑
+                            // 缩放（100 → 0）而非固定 100 被视口上边界截断，避免
+                            // RenderFlex overflow；可用高度不足时文字淡出。与
+                            // 歌单页（playlist_page.dart）的防溢出方案保持一致。
+                            // 竖直 padding 共 64（AppSpacing.xxxl 48 + lg 16）。
+                            final safeTop = MediaQuery.paddingOf(context).top;
+                            final availH = (constraints.maxHeight - 64 - safeTop)
+                                .clamp(0.0, constraints.maxHeight);
+                            final avatarSize = availH.clamp(0.0, 100.0);
+                            // 标题透明度连续映射：可用高度充足时全显示，
+                            // 折叠到阈值以下时淡出，实现平滑过渡。
+                            final textOpacity = ((availH - 100) / 22).clamp(0.0, 1.0);
+                            return Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                if (useBackgroundImage)
+                                  const WallpaperHeaderBackground(),
+                                Container(
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topCenter,
+                                      end: Alignment.bottomCenter,
+                                      colors: [
+                                        // 开启壁纸时主题色渐变半透明叠加在壁纸上，
+                                        // 渐变可见且壁纸透出；未开启时实色渐变
+                                        useBackgroundImage
+                                            ? colorScheme.primaryContainer
+                                                .withValues(alpha: 0.35)
+                                            : colorScheme.primaryContainer,
+                                        // 底部渐变到透明：启用全局背景图（页面背景透明）时，
+                                        // 若此处仍是实色 surface 会与下方背景图形成接缝穿帮。
+                                        colorScheme.surface.withValues(alpha: 0),
                                       ],
                                     ),
                                   ),
-                                ],
-                              ),
-                            ),
-                          ),
+                                  child: SafeArea(
+                                    bottom: false,
+                                    child: Padding(
+                                      padding: const EdgeInsets.fromLTRB(AppSpacing.xl, AppSpacing.xxxl, AppSpacing.xl, AppSpacing.lg),
+                                      child: Row(
+                                        crossAxisAlignment: CrossAxisAlignment.end,
+                                        children: [
+                                          avatarUrl != null
+                                              ? ClipOval(
+                                                  child: CachedNetworkImage(
+                                                    imageUrl: avatarUrl,
+                                                    memCacheWidth: 300,
+                                                    memCacheHeight: 300,
+                                                    width: avatarSize,
+                                                    height: avatarSize,
+                                                    fit: BoxFit.cover,
+                                                    placeholder: (_, _) => Container(
+                                                      width: avatarSize,
+                                                      height: avatarSize,
+                                                      color: colorScheme.surfaceContainerHighest,
+                                                      child: Icon(
+                                                        Icons.person,
+                                                        size: 40,
+                                                        color: colorScheme.onSurfaceVariant,
+                                                      ),
+                                                    ),
+                                                    errorWidget: (_, _, _) => Container(
+                                                      width: avatarSize,
+                                                      height: avatarSize,
+                                                      color: colorScheme.surfaceContainerHighest,
+                                                      child: Icon(
+                                                        Icons.person,
+                                                        size: 40,
+                                                        color: colorScheme.onSurfaceVariant,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                )
+                                              : Container(
+                                                  width: avatarSize,
+                                                  height: avatarSize,
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    color: colorScheme.surfaceContainerHighest,
+                                                  ),
+                                                  child: Icon(
+                                                    Icons.person,
+                                                    size: 40,
+                                                    color: colorScheme.onSurfaceVariant,
+                                                  ),
+                                                ),
+                                          const Gap(AppSpacing.lg),
+                                          Expanded(
+                                            // 文字区可视高度随 availH 收缩：超出部分由
+                                            // ClipRect 裁掉并配合淡出，折叠过程中不触发
+                                            // RenderFlex overflow（黄条）。
+                                            child: SizedBox(
+                                              height: availH,
+                                              child: Align(
+                                                alignment: Alignment.bottomLeft,
+                                                child: ClipRect(
+                                                  child: Opacity(
+                                                    opacity: textOpacity,
+                                                    child: Column(
+                                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                                      mainAxisSize: MainAxisSize.min,
+                                                      children: [
+                                                        Text(
+                                                          widget.artistName,
+                                                          maxLines: 2,
+                                                          overflow: TextOverflow.ellipsis,
+                                                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                                                            fontWeight: FontWeight.bold,
+                                                          ),
+                                                        ),
+                                                        if (_songs.isNotEmpty) ...[
+                                                          const Gap(AppSpacing.xs),
+                                                          Text(
+                                                            '${_songs.length} 首歌曲 · ${_artistSongSort == "hot" ? "热门" : "最新"}',
+                                                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                                              color: colorScheme.onSurfaceVariant,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            );
+                          },
                         ),
-                        ],
                       ),
                     ),
-                  ),
                     SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(AppSpacing.lg),
                         child: Row(
                           children: [
                             Expanded(
@@ -654,7 +727,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 12),
+                            const Gap(AppSpacing.md),
                             Expanded(
                               child: OutlinedButton.icon(
                                 onPressed: _displaySongs.isNotEmpty
@@ -670,7 +743,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                                 label: const Text('随机播放'),
                               ),
                             ),
-                            const SizedBox(width: 12),
+                            const Gap(AppSpacing.md),
                             // 关注/取消关注按钮
                             _isFollowLoading
                                 ? const SizedBox(
@@ -700,7 +773,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                     if (_description != null && _description!.isNotEmpty)
                       SliverToBoxAdapter(
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
                           child: GestureDetector(
                             onTap: () {
                               setState(() {
@@ -709,11 +782,11 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                             },
                             child: Container(
                               width: double.infinity,
-                              padding: const EdgeInsets.all(12),
+                              padding: const EdgeInsets.all(AppSpacing.md),
                               decoration: BoxDecoration(
                                 color: colorScheme.surfaceContainerHighest
                                     .withValues(alpha: 0.5),
-                                borderRadius: BorderRadius.circular(12),
+                                borderRadius: AppRadius.mdAll,
                               ),
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -747,7 +820,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                                       ),
                                     ],
                                   ),
-                                  const SizedBox(height: 8),
+                                  const Gap(AppSpacing.sm),
                                   AnimatedSize(
                                     duration: const Duration(milliseconds: 250),
                                     curve: Curves.easeInOut,
@@ -774,11 +847,55 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                           ),
                         ),
                       ),
+                    // 歌曲列表控制栏
+                    if (_songs.isNotEmpty || _isLoading)
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                          child: Row(
+                            children: [
+                              Text(
+                                _artistSongSort == 'hot' ? '热门歌曲' : '最新歌曲',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.bold,
+                                      color: colorScheme.onSurface,
+                                    ),
+                              ),
+                              if (_songs.isNotEmpty) ...[
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: colorScheme.surfaceContainerHighest,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    '${_displaySongs.length}',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(
+                                          color: colorScheme.onSurfaceVariant,
+                                        ),
+                                  ),
+                                ),
+                              ],
+                              const Spacer(),
+                            ],
+                          ),
+                        ),
+                      ),
                     // 搜索栏
                     if (_isSearching)
                       SliverToBoxAdapter(
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, 0),
                           child: TextField(
                             controller: _searchController,
                             focusNode: _searchFocusNode,
@@ -800,10 +917,10 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                               filled: true,
                               fillColor: colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
                               border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(28),
+                                borderRadius: AppRadius.xlAll,
                                 borderSide: BorderSide.none,
                               ),
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
                             ),
                             onChanged: (value) {
                               setState(() {
@@ -818,11 +935,11 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                     if (_isSearching && _displaySongs.isEmpty && _songs.isNotEmpty)
                       SliverToBoxAdapter(
                         child: Padding(
-                          padding: const EdgeInsets.all(32),
+                          padding: const EdgeInsets.all(AppSpacing.xxl),
                           child: Column(
                             children: [
                               Icon(Icons.search_off, size: 48, color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5)),
-                              const SizedBox(height: 8),
+                              const Gap(AppSpacing.sm),
                               Text(
                                 '没有找到「$_searchQuery」相关的歌曲',
                                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: colorScheme.onSurfaceVariant),
@@ -835,7 +952,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                       SliverToBoxAdapter(
                         child: Center(
                           child: Padding(
-                            padding: const EdgeInsets.all(32),
+                            padding: const EdgeInsets.all(AppSpacing.xxl),
                             child: Column(
                               children: [
                                 Icon(
@@ -843,7 +960,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                                   size: 48,
                                   color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
                                 ),
-                                const SizedBox(height: 12),
+                                const Gap(AppSpacing.md),
                                 Text(
                                   '暂无歌曲',
                                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -883,14 +1000,14 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                       ),
                     ],
                   ),
-      bottomNavigationBar: const MiniPlayer(),
+      ),
     );
   }
 
   Widget _buildError(BuildContext context, ColorScheme colorScheme) {
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -899,14 +1016,14 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
               size: 48,
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpacing.md),
             Text(
               '加载失败',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                   ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               _error ?? '未知错误',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -914,7 +1031,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                   ),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             FilledButton.tonal(
               onPressed: _fetchArtistSongs,
               child: const Text('重试'),

@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/layout/adaptive_navigator.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../data/models/album.dart';
 import '../../data/models/song.dart';
@@ -10,6 +11,7 @@ import '../../providers/player_provider.dart';
 import '../../widgets/album_card.dart';
 import '../../widgets/app_animation.dart';
 import '../../widgets/song_list_item.dart';
+import '../player/secondary_mini_player.dart';
 
 class AlbumsPage extends StatefulWidget {
   final List<Album> albums;
@@ -65,8 +67,16 @@ class _AlbumsPageState extends State<AlbumsPage> {
 
         int crossAxisCount;
         if (isPad) {
-          // Pad 模式：使用用户捏合手势调整的列数偏好
-          crossAxisCount = gridColumns;
+          // Pad 模式：用户捏合调整的列数偏好，再按面板局部宽度夹取上限
+          //（计划 4.7：双栏/分栏改变可用宽度，窄面板不塞过多列）。
+          final localMax = gridColumnsForWidth(
+            constraints.maxWidth,
+            targetExtent: 200,
+            min: GridColumnsProvider.minColumns,
+            max: GridColumnsProvider.maxColumns,
+          );
+          crossAxisCount =
+              gridColumns.clamp(GridColumnsProvider.minColumns, localMax);
         } else {
           // 手机端：保留原有屏幕宽度响应式逻辑
           final screenType = getScreenType(constraints.maxWidth);
@@ -99,13 +109,11 @@ class _AlbumsPageState extends State<AlbumsPage> {
               onTap: () {
                 final library = context.read<LibraryProvider>();
                 final songs = library.getSongsInAlbum(widget.albums[index].name);
-                Navigator.push(
+                AdaptiveNav.openDetail(
                   context,
-                  MaterialPageRoute(
-                    builder: (_) => AlbumSongsPage(
-                      album: widget.albums[index],
-                      songs: songs,
-                    ),
+                  (_) => AlbumSongsPage(
+                    album: widget.albums[index],
+                    songs: songs,
                   ),
                 );
               },
@@ -159,7 +167,8 @@ class AlbumSongsPage extends StatelessWidget {
               ),
         ),
       ),
-      body: songs.isEmpty
+      body: SecondaryMiniPlayerHost(
+        child: songs.isEmpty
           ? Center(
               child: Text(
                 '此专辑暂无歌曲',
@@ -211,6 +220,7 @@ class AlbumSongsPage extends StatelessWidget {
                 ),
               ],
             ),
+      ),
     );
   }
 }

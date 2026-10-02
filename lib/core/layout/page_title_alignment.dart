@@ -21,6 +21,21 @@ import 'package:provider/provider.dart';
 
 import '../../providers/tab_config_provider.dart';
 
+/// 当前页面是否以「二级页面」形态呈现，即位于路由栈里 push 出来的非栈底路由
+/// （详情页、tab 被隐藏后从 LaunchPad / 桌面快捷方式打开的功能页、设置子分区等）。
+///
+/// 这是区分一级 / 二级页面的**路由栈判据**，被以下两处共用，保证行为一致：
+/// - 标题对齐（[isPinnedNavPage] / [centerPageTitle]）：二级页面标题居中；
+/// - 播放栏形态（`SecondaryMiniPlayerHost`）：二级页面用悬浮播放栏，一级页面
+///   由主布局底部常驻 `MiniPlayer` 承载。
+///
+/// 栈底主布局内（`route.isFirst`）视为一级形态；`route` 为空（无路由环境，
+/// 如测试）同样按一级形态处理。必须在 build 内调用（依赖 [ModalRoute]）。
+bool isSecondaryRoutePage(BuildContext context) {
+  final route = ModalRoute.of(context);
+  return route != null && !route.isFirst;
+}
+
 /// 当前页面是否为「已固定」的一级导航页面（底部导航栏可直达）。
 ///
 /// [tabId] 是页面在 [TabConfigProvider] 中的 tab id（取值见 [kAllAvailableTabs]）；
@@ -31,8 +46,7 @@ import '../../providers/tab_config_provider.dart';
 bool isPinnedNavPage(BuildContext context, [String? tabId]) {
   if (tabId == null || tabId.isEmpty) return false;
   // 二级页面（push 出来的路由）一律不算已固定，即使其 tab 同时可见
-  final route = ModalRoute.of(context);
-  if (route != null && !route.isFirst) return false;
+  if (isSecondaryRoutePage(context)) return false;
   return context.watch<TabConfigProvider>().visibleIndexOf(tabId) >= 0;
 }
 

@@ -2,6 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/library_provider.dart';
 import '../../providers/local_favorites_provider.dart';
@@ -82,8 +83,8 @@ class _LibraryPageState extends State<LibraryPage>
                     // 搜索栏
                     Padding(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 4,
+                        horizontal: AppSpacing.lg,
+                        vertical: AppSpacing.xs,
                       ),
                       child: TextField(
                         controller: _searchController,
@@ -106,11 +107,11 @@ class _LibraryPageState extends State<LibraryPage>
                               : null,
                           isDense: true,
                           contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 8,
+                            horizontal: AppSpacing.md,
+                            vertical: AppSpacing.sm,
                           ),
                           border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(28),
+                            borderRadius: AppRadius.xlAll,
                             borderSide: BorderSide.none,
                           ),
                           filled: true,
@@ -166,15 +167,19 @@ class _LibraryPageState extends State<LibraryPage>
   }
 
   Widget _buildScanFAB(BuildContext context, ColorScheme colorScheme) {
-    return FloatingActionButton(
+    // 替换为 M3E 规范的 FAB：M3EFab 默认中等尺寸的容器 56 / 图标 24 /
+    // 圆角 16，配色沿用 primaryContainer + onPrimaryContainer，
+    // 与本项目 floatingActionButtonTheme 原有定义一致，故无需显式传色。
+    // 本页仅此一个 FAB，M3EFab 不支持 heroTag，不存在 Hero 标签冲突。
+    return M3EFab(
       onPressed: () => _showScanMenu(context),
-      child: const Icon(Icons.add),
+      icon: const Icon(Icons.add),
     );
   }
 
   void _showScanMenu(BuildContext context) {
     final provider = context.read<LibraryProvider>();
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       builder: (ctx) {
         return SafeArea(
@@ -182,7 +187,7 @@ class _LibraryPageState extends State<LibraryPage>
             mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpacing.lg),
                 child: Text(
                   '扫描本地音乐',
                   style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
@@ -220,7 +225,7 @@ class _LibraryPageState extends State<LibraryPage>
                   _showExcludedFolderManagement(context);
                 },
               ),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
             ],
           ),
         );
@@ -230,7 +235,7 @@ class _LibraryPageState extends State<LibraryPage>
 
   void _showExcludedFolderManagement(BuildContext context) {
     final provider = context.read<LibraryProvider>();
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (ctx) {
@@ -239,7 +244,7 @@ class _LibraryPageState extends State<LibraryPage>
             final excludedFolders = provider.excludedFolders;
             return SafeArea(
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpacing.lg),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -259,17 +264,17 @@ class _LibraryPageState extends State<LibraryPage>
                         ),
                       ],
                     ),
-                    const SizedBox(height: 4),
+                    const Gap(AppSpacing.xs),
                     Text(
                       '排除的文件夹及其子目录不会被扫描',
                       style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
                         color: Theme.of(ctx).colorScheme.onSurfaceVariant,
                       ),
                     ),
-                    const SizedBox(height: 12),
+                    const Gap(AppSpacing.md),
                     if (excludedFolders.isEmpty)
                       const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 24),
+                        padding: EdgeInsets.symmetric(vertical: AppSpacing.xl),
                         child: Center(child: Text('暂无排除文件夹')),
                       )
                     else
@@ -309,7 +314,7 @@ class _LibraryPageState extends State<LibraryPage>
                           },
                         ),
                       ),
-                    const SizedBox(height: 8),
+                    const Gap(AppSpacing.sm),
                     // 添加排除文件夹按钮
                     SizedBox(
                       width: double.infinity,
@@ -327,7 +332,7 @@ class _LibraryPageState extends State<LibraryPage>
                         label: const Text('添加排除文件夹'),
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    const Gap(AppSpacing.sm),
                   ],
                 ),
               ),
@@ -344,7 +349,7 @@ class _LibraryPageState extends State<LibraryPage>
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const M3ELoadingIndicator(),
-          const SizedBox(height: 16),
+          const Gap(AppSpacing.lg),
           Text(
             '正在扫描本地音乐...',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
@@ -366,21 +371,21 @@ class _LibraryPageState extends State<LibraryPage>
             size: 64,
             color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
           ),
-          const SizedBox(height: 16),
+          const Gap(AppSpacing.lg),
           Text(
             '还没有本地音乐',
             style: Theme.of(context).textTheme.titleMedium?.copyWith(
               color: colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           Text(
             '点击扫描按钮添加本地音乐',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
             ),
           ),
-          const SizedBox(height: 24),
+          const Gap(AppSpacing.xl),
           FilledButton.tonal(
             onPressed: () {
               context.read<LibraryProvider>().loadLocalMusic();
@@ -435,14 +440,14 @@ class _LocalFavoritesTab extends StatelessWidget {
                 context,
               ).colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             Text(
               '还没有本地收藏',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '在曲目列表中点击心形图标即可收藏',
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(

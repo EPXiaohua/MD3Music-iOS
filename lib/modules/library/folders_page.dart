@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/layout/adaptive_navigator.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/models/music_folder.dart';
 import '../../data/models/song.dart';
@@ -9,6 +10,7 @@ import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/app_animation.dart';
 import '../../widgets/song_list_item.dart';
+import '../player/secondary_mini_player.dart';
 
 class FoldersPage extends StatelessWidget {
   final List<MusicFolder> folders;
@@ -43,11 +45,9 @@ class FoldersPage extends StatelessWidget {
           subtitle: Text('${folder.songCount} 首歌曲'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () {
-            Navigator.push(
+            AdaptiveNav.openDetail(
               context,
-              MaterialPageRoute(
-                builder: (_) => FolderSongsPage(folder: folder),
-              ),
+              (_) => FolderSongsPage(folder: folder),
             );
           },
         );
@@ -83,7 +83,8 @@ class FolderSongsPage extends StatelessWidget {
               ),
         ),
       ),
-      body: songs.isEmpty
+      body: SecondaryMiniPlayerHost(
+        child: songs.isEmpty
           ? Center(
               child: Text(
                 '此文件夹暂无歌曲',
@@ -137,6 +138,7 @@ class FolderSongsPage extends StatelessWidget {
                 ),
               ],
             ),
+      ),
     );
   }
 }

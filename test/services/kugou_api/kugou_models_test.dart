@@ -231,4 +231,14 @@ void main() {
       );
     });
   });
+
+  group('KugouComment.fromJson userId 字段名降级', () {
+    test('user_id / userid / kugouid 三种字段名都能解析', () {
+      expect(KugouComment.fromJson({'id': 'c', 'user_id': '1'}).userId, '1');
+      expect(KugouComment.fromJson({'id': 'c', 'userid': '2'}).userId, '2');
+      expect(KugouComment.fromJson({'id': 'c', 'kugouid': '3'}).userId, '3');
+      // 全缺时为 null（isOwnComment 对 null 一律 false，不出删除入口）
+      expect(KugouComment.fromJson({'id': 'c'}).userId, isNull);
+    });
+  });
 }

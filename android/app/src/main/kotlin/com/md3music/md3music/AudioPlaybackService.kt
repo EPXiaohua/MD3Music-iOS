@@ -41,8 +41,10 @@ import io.flutter.plugins.GeneratedPluginRegistrant
 import io.github.proify.lyricon.provider.ConnectionListener
 import java.io.File
 import java.io.FileOutputStream
-import java.util.concurrent.ConcurrentHashMap
+import java.io.InputStream
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
 import io.github.proify.lyricon.provider.LyriconFactory
 import io.github.proify.lyricon.provider.LyriconProvider
@@ -63,6 +65,7 @@ class AudioPlaybackService : Service() {
         const val ACTION_REFRESH_FOREGROUND = "com.md3music.md3music.REFRESH_FOREGROUND"
         const val ACTION_PREV = "com.md3music.md3music.ACTION_PREV"
         const val ACTION_PLAY_PAUSE = "com.md3music.md3music.ACTION_PLAY_PAUSE"
+        const val ACTION_PAUSE = "com.md3music.md3music.ACTION_PAUSE"
         const val ACTION_NEXT = "com.md3music.md3music.ACTION_NEXT"
         const val ACTION_STOP = "com.md3music.md3music.ACTION_STOP"
         const val ACTION_TOGGLE_DESKTOP_LYRIC = "com.md3music.md3music.ACTION_TOGGLE_DESKTOP_LYRIC"
@@ -113,15 +116,30 @@ class AudioPlaybackService : Service() {
 
         // 方案A：在线封面本地缓存（根治切歌空档）。内存缓存 key=artUrl，磁盘缓存按 URL hash 命名。
         // 命中内存/磁盘 → 免网络下载，切歌秒显；未命中才下载并写缓存。
-        private val coverMemoryCache = ConcurrentHashMap<String, Bitmap>()
+        // 缓存容量按 Bitmap 实际字节计；淘汰时只移除缓存引用，不 recycle，
+        // 因为通知/MediaSession 可能仍在使用同一张共享 Bitmap。
+        private const val COVER_MEMORY_CACHE_MAX_BYTES = 16 * 1024 * 1024
+        private const val COVER_MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024
+        private const val COVER_DECODE_MAX_SIZE = 512
+        private val coverDecodeSlots = Semaphore(2)
+        private val coverDownloadLocks = Array(32) { Any() }
+        private val coverArtworkExecutor = BoundedArtworkExecutor(
+            workerCount = 2,
+            queueCapacity = 16,
+            threadFactory = ThreadFactory { runnable ->
+                Thread(runnable, "md3-cover-prefetch").apply { isDaemon = true }
+            }
+        )
+        private val coverMemoryCache = ByteSizeLruCache<String, Bitmap>(
+            COVER_MEMORY_CACHE_MAX_BYTES,
+        ) { bitmap -> bitmap.allocationByteCount.coerceAtLeast(1) }
         private const val COVER_CACHE_DIR = "cover_cache"
         // 磁盘缓存上限（张）：超限清空最旧文件，避免无限增长
         private const val COVER_CACHE_MAX = 200
 
-        /// 进程被杀后由本服务创建的后台 FlutterEngine 是否已就绪。
-        /// Dart 端 PlayerProvider 完成状态恢复后会通过 playerReady 通知置为 true。
+        /// Dart 已完成恢复的引擎身份；旧引擎迟到的 ready 不得放行新引擎命令。
         @Volatile
-        var playerReadyReceived = false
+        private var playerReadyEngine: FlutterEngine? = null
 
         /// 当前是否正在播放（供 LockScreenLyricReceiver 判断锁屏时是否拉起歌词界面）。
         @Volatile
@@ -131,6 +149,7 @@ class AudioPlaybackService : Service() {
         /// 不依赖 AudioPlaybackService 启动。处理 http(s) 在线封面，命中内存缓存免下载。
         @JvmStatic
         fun injectCover(
+            context: Context,
             mediaId: String,
             title: String,
             artist: String,
@@ -138,21 +157,21 @@ class AudioPlaybackService : Service() {
             fallbackFilePath: String?
         ) {
             val effective = artUrl ?: fallbackFilePath ?: return
-            Thread {
+            val appContext = context.applicationContext
+            val accepted = coverArtworkExecutor.executePriority {
                 try {
-                    // 1) 内存缓存命中：先剔除已回收的失效条目，避免复用后 isRecycled 判 false
-                    var bmp: Bitmap? = null
-                    if (effective.startsWith("http://") || effective.startsWith("https://")) {
-                        val cached = coverMemoryCache[effective]
-                        bmp = if (cached != null && cached.isRecycled) {
-                            coverMemoryCache.remove(effective)
-                            null
-                        } else cached
-                    }
-                    // 2) 未命中：按来源加载（http 下载 / file·local·纯路径读内嵌封面），
-                    //    http 下载失败时回退 fallbackFilePath
-                    if (bmp == null) {
-                        bmp = loadCoverBitmapForInject(effective, fallbackFilePath)
+                    val bmp = synchronized(coverDownloadLock(effective)) {
+                        // 先剔除已回收项；同URL加载串行化，避免通知/预取重复下载和解码。
+                        val cached = if (effective.startsWith("http://") || effective.startsWith("https://")) {
+                            coverMemoryCache.get(effective)
+                        } else null
+                        if (cached != null && cached.isRecycled) coverMemoryCache.remove(effective)
+                        cached?.takeUnless { it.isRecycled }
+                            ?: loadCoverBitmapForInject(
+                                effective,
+                                fallbackFilePath,
+                                File(appContext.cacheDir, COVER_CACHE_DIR)
+                            )
                     }
                     if (bmp != null && !bmp.isRecycled) {
                         // 降采样到 512px 后再注入，避免大图常驻内存
@@ -166,25 +185,27 @@ class AudioPlaybackService : Service() {
                 } catch (e: Exception) {
                     Log.e(TAG, "injectCover 异常 " + e.message)
                 }
-            }.start()
+            }
+            if (!accepted) Log.w(TAG, "封面注入队列已满，未能提交关键封面任务")
         }
 
         /// 兜底封面加载：http(s) 在线下载（成功写入内存缓存）；非 http 或下载失败时
         /// 依次尝试 [source]（file:///local:///纯路径）与 [fallback] 的内嵌封面。
-        private fun loadCoverBitmapForInject(source: String, fallback: String?): Bitmap? {
+        private fun loadCoverBitmapForInject(
+            source: String,
+            fallback: String?,
+            cacheDirectory: File
+        ): Bitmap? {
             var bmp: Bitmap? = null
             if (source.startsWith("http://") || source.startsWith("https://")) {
                 try {
-                    val conn = java.net.URL(source).openConnection() as java.net.HttpURLConnection
-                    conn.connectTimeout = 5000
-                    conn.readTimeout = 10000
-                    conn.instanceFollowRedirects = true
-                    try {
-                        bmp = BitmapFactory.decodeStream(conn.inputStream)
-                        if (bmp != null && !bmp.isRecycled) coverMemoryCache[source] = bmp
-                    } finally {
-                        conn.disconnect()
-                    }
+                    bmp = downloadSampledCover(
+                        source,
+                        cacheDirectory,
+                        connectTimeoutMs = 5000,
+                        readTimeoutMs = 10000
+                    )
+                    if (bmp != null && !bmp.isRecycled) coverMemoryCache.put(source, bmp)
                 } catch (e: Exception) {
                     Log.w(TAG, "injectCover http 下载异常 ${e.message} url=$source")
                 }
@@ -208,7 +229,7 @@ class AudioPlaybackService : Service() {
                     mmr.setDataSource(path)
                     val art = mmr.embeddedPicture
                     mmr.release()
-                    if (art != null) BitmapFactory.decodeByteArray(art, 0, art.size) else null
+                    if (art != null) decodeSampledCoverBytes(art) else null
                 } catch (e: Exception) {
                     null
                 }
@@ -244,64 +265,161 @@ class AudioPlaybackService : Service() {
         fun prefetchCovers(context: Context, urls: List<String>) {
             for (url in urls) {
                 if (url.isEmpty() || (!url.startsWith("http://") && !url.startsWith("https://"))) continue
-                // 内存缓存命中（且未回收）则跳过
-                val cached = coverMemoryCache[url]
-                if (cached != null && !cached.isRecycled) continue
-                if (cached != null && cached.isRecycled) coverMemoryCache.remove(url)
-                // 磁盘缓存命中则直接回填内存
-                val cacheFile = try {
-                    File(File(context.cacheDir, COVER_CACHE_DIR), url.hashCode().toString() + ".jpg")
-                } catch (_: Exception) {
-                    null
-                }
-                if (cacheFile != null && cacheFile.exists()) {
-                    try {
-                        val bmp = BitmapFactory.decodeFile(cacheFile.absolutePath)
-                        if (bmp != null && !bmp.isRecycled) {
-                            coverMemoryCache[url] = bmp
-                            continue
-                        }
-                    } catch (_: Exception) {}
-                }
-                // 网路线程下载并写内存 + 磁盘缓存
-                Thread {
-                    try {
-                        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                        conn.connectTimeout = 3000
-                        conn.readTimeout = 5000
-                        conn.instanceFollowRedirects = true
-                        try {
-                            val bmp = BitmapFactory.decodeStream(conn.inputStream)
-                            if (bmp != null && !bmp.isRecycled) {
-                                val small = if (bmp.width <= 512 && bmp.height <= 512) bmp else {
-                                    val ratio = 512.0 / maxOf(bmp.width, bmp.height)
-                                    Bitmap.createScaledBitmap(
-                                        bmp,
-                                        (bmp.width * ratio).toInt(),
-                                        (bmp.height * ratio).toInt(),
-                                        true
-                                    )
-                                }
-                                if (small !== bmp) bmp.recycle()
-                                coverMemoryCache[url] = small
-                                try {
-                                    val dir = File(context.cacheDir, COVER_CACHE_DIR)
-                                    if (!dir.exists()) dir.mkdirs()
-                                    val cf = File(dir, url.hashCode().toString() + ".jpg")
-                                    if (!cf.exists()) {
-                                        FileOutputStream(cf).use { out ->
-                                            small.compress(Bitmap.CompressFormat.JPEG, 88, out)
-                                        }
-                                    }
-                                } catch (_: Exception) {}
-                                Log.i(TAG, "封面预取完成 url=$url")
-                            }
-                        } finally {
-                            conn.disconnect()
-                        }
-                    } catch (_: Exception) {}
-                }.start()
+                enqueueCoverPrefetch(context.applicationContext, url)
             }
+        }
+
+        private fun enqueueCoverPrefetch(context: Context, url: String) {
+            val accepted = coverArtworkExecutor.executePrefetch(url) {
+                try {
+                    synchronized(coverDownloadLock(url)) {
+                        val memory = coverMemoryCache.get(url)
+                        if (memory != null && !memory.isRecycled) return@executePrefetch
+                        if (memory != null) coverMemoryCache.remove(url)
+
+                        val directory = File(context.cacheDir, COVER_CACHE_DIR)
+                        if (!directory.exists()) directory.mkdirs()
+                        val cacheFile = File(directory, artworkCacheFileName(url))
+                        val fromDisk = if (cacheFile.exists()) decodeSampledCoverFile(cacheFile) else null
+                        if (cacheFile.exists() && fromDisk == null) cacheFile.delete()
+                        if (fromDisk != null) ArtworkDiskCache.touch(cacheFile)
+                        val bitmap = fromDisk ?: downloadSampledCover(
+                            url,
+                            directory,
+                            connectTimeoutMs = 3000,
+                            readTimeoutMs = 5000
+                        ) ?: return@executePrefetch
+                        coverMemoryCache.put(url, bitmap)
+                        if (!cacheFile.exists()) {
+                            FileOutputStream(cacheFile).use { out ->
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
+                            }
+                        }
+                        ArtworkDiskCache.trim(directory, COVER_CACHE_MAX)
+                        Log.i(TAG, "封面预取完成 url=$url")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "封面预取失败 ${e.message}")
+                }
+            }
+            if (!accepted) {
+                Log.d(TAG, "封面预取队列已满，跳过低优先级预取")
+            }
+        }
+
+        private fun coverDownloadLock(url: String): Any =
+            coverDownloadLocks[(url.hashCode() and Int.MAX_VALUE) % coverDownloadLocks.size]
+
+        private fun decodeSampledCoverFile(file: File): Bitmap? {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val sampleSize = coverBitmapSampleSize(
+                bounds.outWidth,
+                bounds.outHeight,
+                COVER_DECODE_MAX_SIZE
+            )
+            coverDecodeSlots.acquire()
+            return try {
+                val decoded = BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                ) ?: return null
+                val resized = resizeCoverBitmap(decoded)
+                if (resized !== decoded) decoded.recycle()
+                resized
+            } finally {
+                coverDecodeSlots.release()
+            }
+        }
+
+        private fun downloadSampledCover(
+            url: String,
+            cacheDirectory: File,
+            connectTimeoutMs: Int,
+            readTimeoutMs: Int
+        ): Bitmap? {
+            if (!cacheDirectory.exists() && !cacheDirectory.mkdirs()) return null
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = readTimeoutMs
+            connection.instanceFollowRedirects = true
+            var tempFile: File? = null
+            try {
+                val temp = File.createTempFile("cover-", ".download", cacheDirectory)
+                tempFile = temp
+                connection.inputStream.use { input ->
+                    FileOutputStream(temp).use { output ->
+                        copyCoverInputBounded(input, output)
+                    }
+                }
+                return decodeSampledCoverFile(temp)
+            } finally {
+                connection.disconnect()
+                tempFile?.delete()
+            }
+        }
+
+        private fun decodeSampledCoverStream(input: InputStream, cacheDirectory: File): Bitmap? {
+            if (!cacheDirectory.exists() && !cacheDirectory.mkdirs()) return null
+            val tempFile = File.createTempFile("cover-", ".stream", cacheDirectory)
+            return try {
+                FileOutputStream(tempFile).use { output -> copyCoverInputBounded(input, output) }
+                decodeSampledCoverFile(tempFile)
+            } finally {
+                tempFile.delete()
+            }
+        }
+
+        private fun decodeSampledCoverBytes(bytes: ByteArray): Bitmap? {
+            if (bytes.isEmpty() || bytes.size > COVER_MAX_DOWNLOAD_BYTES) return null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val sampleSize = coverBitmapSampleSize(
+                bounds.outWidth,
+                bounds.outHeight,
+                COVER_DECODE_MAX_SIZE
+            )
+            coverDecodeSlots.acquire()
+            return try {
+                val decoded = BitmapFactory.decodeByteArray(
+                    bytes,
+                    0,
+                    bytes.size,
+                    BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                ) ?: return null
+                val resized = resizeCoverBitmap(decoded)
+                if (resized !== decoded) decoded.recycle()
+                resized
+            } finally {
+                coverDecodeSlots.release()
+            }
+        }
+
+        private fun copyCoverInputBounded(input: InputStream, output: FileOutputStream) {
+            val buffer = ByteArray(32 * 1024)
+            var totalBytes = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                totalBytes += count
+                require(totalBytes <= COVER_MAX_DOWNLOAD_BYTES) { "封面图片超过下载上限" }
+                output.write(buffer, 0, count)
+            }
+        }
+
+        private fun resizeCoverBitmap(source: Bitmap): Bitmap {
+            val width = source.width
+            val height = source.height
+            if (width <= COVER_DECODE_MAX_SIZE && height <= COVER_DECODE_MAX_SIZE) return source
+            val ratio = COVER_DECODE_MAX_SIZE.toDouble() / maxOf(width, height)
+            return Bitmap.createScaledBitmap(
+                source,
+                (width * ratio).toInt().coerceAtLeast(1),
+                (height * ratio).toInt().coerceAtLeast(1),
+                true
+            )
         }
 
         /** 检查是否有可用的 FlutterEngine（供 MusicWidgetProvider 判断是否需要拉起 app） */
@@ -757,9 +875,7 @@ class AudioPlaybackService : Service() {
     private var foregroundStarted = false
     // 媒体键命令合并：唤醒期间连续按键只保留最新命令、只启动一个派发会话，
     // 避免双击（play→next）并发创建多个后台 FlutterEngine
-    private val mediaCommandLock = Any()
-    private var pendingMediaCommand: String? = null
-    private var mediaCommandInFlight = false
+    private val mediaCommandQueue = LatestMediaCommandQueue()
 
     // 方案B阶段1：绑定媒体3会话承载服务，使其 onCreate 注册为 fork 的 host（渲染 now playing 通知）
     private var media3ServiceBound = false
@@ -888,10 +1004,16 @@ class AudioPlaybackService : Service() {
             AudioPlayer.setCustomActionListener(object : AudioPlayer.CustomActionListener {
                 override fun onToggleDesktopLyric() { handleAction(ACTION_TOGGLE_DESKTOP_LYRIC) }
                 override fun onToggleFavorite() { handleAction(ACTION_TOGGLE_FAVORITE) }
-                // 阶段6修复：媒体卡片/通知栏原生 PREVIOUS/NEXT → App 自有切歌逻辑
-                override fun onPrevious() { handleAction(ACTION_PREV) }
-                override fun onNext() { handleAction(ACTION_NEXT) }
+                // MediaNotificationService 的切歌命令需要带 commandId 确认；复用媒体键队列
+                // 派发，避免直接 invokeMethod 时因缺少 commandId 被 Dart 端拒绝。
+                override fun onPrevious() { handleMediaButtonCommand("previous") }
+                override fun onNext() { handleMediaButtonCommand("next") }
+                override fun onPause() {
+                    Log.i(TAG, "Media3 user pause intent forwarded to Flutter")
+                    handleAction(ACTION_PAUSE)
+                }
             })
+            Log.i(TAG, "Media3 command listener registered")
         } catch (_: Throwable) {}
     }
 
@@ -957,7 +1079,8 @@ class AudioPlaybackService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_PREV, ACTION_PLAY_PAUSE, ACTION_NEXT, ACTION_TOGGLE_DESKTOP_LYRIC, ACTION_TOGGLE_FAVORITE,
+            ACTION_PREV, ACTION_PLAY_PAUSE, ACTION_PAUSE, ACTION_NEXT,
+            ACTION_TOGGLE_DESKTOP_LYRIC, ACTION_TOGGLE_FAVORITE,
             ACTION_WIDGET_PLAY_PAUSE, ACTION_WIDGET_NEXT,
             ACTION_WIDGET_FM_PLAY_PAUSE, ACTION_WIDGET_FM_TOGGLE_FAVORITE,
             ACTION_WIDGET_FM_SELECT_STATION, ACTION_WIDGET_FM_OPEN_TRACK,
@@ -1090,6 +1213,7 @@ class AudioPlaybackService : Service() {
         if (engine != null) {
             val method = when (action) {
                 ACTION_PREV -> "previous"
+                ACTION_PAUSE -> "pause"
                 ACTION_PLAY_PAUSE, ACTION_WIDGET_PLAY_PAUSE -> "togglePlayPause"
                 ACTION_NEXT, ACTION_WIDGET_NEXT -> "next"
                 ACTION_TOGGLE_DESKTOP_LYRIC -> "toggleDesktopLyric"
@@ -1120,6 +1244,7 @@ class AudioPlaybackService : Service() {
     private fun sendFlutterCommand(action: String) {
         val method = when (action) {
             ACTION_PREV -> "previous"
+            ACTION_PAUSE -> "pause"
             ACTION_PLAY_PAUSE -> "togglePlayPause"
             ACTION_NEXT -> "next"
             ACTION_TOGGLE_DESKTOP_LYRIC -> "toggleDesktopLyric"
@@ -1177,7 +1302,7 @@ class AudioPlaybackService : Service() {
         foregroundStarted = true
         try {
             val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setSmallIcon(R.drawable.ic_launcher_monochrome)
                 .setContentTitle("md3music")
                 .setContentText("准备播放")
                 .setOngoing(true)
@@ -1200,7 +1325,7 @@ class AudioPlaybackService : Service() {
         try {
             val pendingIntent = launchPendingIntent()
             val builder = NotificationCompat.Builder(this, KEEPALIVE_CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setSmallIcon(R.drawable.ic_launcher_monochrome)
                 .setContentTitle("")
                 .setContentText(KEEPALIVE_NOTIFICATION_TEXT)
                 .setContentIntent(pendingIntent)
@@ -1218,9 +1343,7 @@ class AudioPlaybackService : Service() {
     /// - 进程存活：复用现有 FlutterEngine（含 MainActivity 缓存的引擎）
     /// - 进程被杀：创建后台 FlutterEngine 启动 App，恢复上次播放状态后执行命令
     ///
-    /// 唤醒期间可能连续收到多个按键（双击=下一首），这里做命令合并：
-    /// 任意时刻只保留「最新」命令（pendingMediaCommand），且同一进程内只启动
-    /// 一个派发会话，避免并发创建多个后台 FlutterEngine。
+    /// 唤醒期间可能连续收到多个按键，这里只保留最新待执行命令，并为重试保留稳定 ID。
     private fun handleMediaButtonCommand(command: String) {
         val method = when (command) {
             "play" -> "play"
@@ -1229,15 +1352,10 @@ class AudioPlaybackService : Service() {
             "previous" -> "previous"
             else -> "play"
         }
-        var launch = false
-        synchronized(mediaCommandLock) {
-            pendingMediaCommand = method
-            if (!mediaCommandInFlight) {
-                mediaCommandInFlight = true
-                launch = true
-            }
-        }
-        if (!launch) return
+        if (mediaCommandQueue.offer(method)) launchMediaCommandDispatcher()
+    }
+
+    private fun launchMediaCommandDispatcher() {
         Thread {
             try {
                 val engine = obtainFlutterEngine()
@@ -1246,21 +1364,16 @@ class AudioPlaybackService : Service() {
                 } else {
                     createHeadlessEngineAndDispatch()
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "media command dispatch failed: $e")
+                mediaCommandQueue.discardPending()
             } finally {
-                synchronized(mediaCommandLock) {
-                    mediaCommandInFlight = false
-                    pendingMediaCommand = null
-                }
+                if (mediaCommandQueue.finishDispatch()) launchMediaCommandDispatcher()
             }
         }.start()
     }
 
-    /// 取走当前待派发的媒体命令（取后清空，避免被后续处理重复消费）。
-    private fun takeMediaCommand(): String? = synchronized(mediaCommandLock) {
-        val m = pendingMediaCommand
-        pendingMediaCommand = null
-        m
-    }
+    private fun takeMediaCommand(): LatestMediaCommandQueue.Command? = mediaCommandQueue.take()
 
     /// 找到可用的 FlutterEngine：实例字段 → 静态引用 → FlutterEngineCache。
     /// 已销毁的引擎（isExecutingDart() == false）会被跳过，避免对死引擎派发命令。
@@ -1285,16 +1398,30 @@ class AudioPlaybackService : Service() {
     /// 歌曲重复调用 resume 造成音量波动。每次重试都取「最新」命令，唤醒期间的
     /// 双击（play→next）能正确合并为 next。
     ///
-    /// 同步执行（调用方已在后台线程）：必须在本方法内消费 pendingMediaCommand，
-    /// 否则外层 finally 会提前清空命令导致派发丢失（headless 场景曾因此失效）。
+    /// 同步执行（调用方已在后台线程），复用相同命令 ID 做有界重试。
     private fun dispatchToDartWithRetry(engine: FlutterEngine) {
-        try {
-            for (i in 0 until 3) {
-                val method = takeMediaCommand() ?: return
-                if (dispatchOnce(engine, method)) return
-                Thread.sleep(500)
+        while (true) {
+            val command = takeMediaCommand() ?: return
+            var delivered = false
+            for (attempt in 0 until 3) {
+                if (dispatchOnce(engine, command)) {
+                    delivered = true
+                    break
+                }
+                mediaCommandQueue.requeueIfEmpty(command)
+                if (!mediaCommandQueue.hasPending()) break
+                val pending = takeMediaCommand() ?: break
+                if (pending.id != command.id) {
+                    mediaCommandQueue.requeueIfEmpty(pending)
+                    break
+                }
+                if (attempt < 2) Thread.sleep(500)
             }
-        } catch (_: Exception) {}
+            if (!delivered) {
+                mediaCommandQueue.dropIfPending(command.id)
+                Log.e(TAG, "media command ${command.method} exhausted retries")
+            }
+        }
     }
 
     /// 进程被杀场景：创建后台 FlutterEngine 运行完整 App（main() → runApp →
@@ -1304,57 +1431,139 @@ class AudioPlaybackService : Service() {
     ///
     /// 线程注意：FlutterEngine 必须在主线程创建并执行入口（引擎的平台线程即创建
     /// 线程，后台线程创建会导致后续 MainActivity 复用/UI 附着失败）。
-    /// 本方法在调用方（handleMediaButtonCommand 的后台线程）内同步执行到命令
-    /// 被消费为止：内层不再新起线程，避免外层 finally 提前清空
-    /// pendingMediaCommand 导致 play/next 命令派发丢失。
+    /// 本方法在调用方（handleMediaButtonCommand 的后台线程）内同步执行；
+    /// 外层通过队列原子收尾，确保执行期间新到的命令会启动下一轮派发。
     private fun createHeadlessEngineAndDispatch() {
-        playerReadyReceived = false
         // MD3Music fork（方向1）：headless 引擎帧的播放器不创建媒体3会话，
         // 使系统仅暴露前台 UI 播放器的会话，杜绝「媒体卡片暂停 vs app 内播放」不同步。
         try { AudioPlayer.setMediaSessionEnabled(false) } catch (_: Throwable) {}
         val engineLatch = CountDownLatch(1)
-        runOnMainThread {
+        val creationRequest = CancellableMainThreadTask()
+        val createdEngine = arrayOfNulls<FlutterEngine>(1)
+        val mainHandler = Handler(Looper.getMainLooper())
+        val createEngineTask = Runnable {
             try {
-                val engine = FlutterEngine(applicationContext)
-                // 手动创建的引擎不会自动注册插件（just_audio 等），必须显式注册
-                GeneratedPluginRegistrant.registerWith(engine)
-                FlutterEngineCache.getInstance().put("md3music_engine", engine)
-                staticFlutterEngine = engine
-                flutterEngine = engine
-                setupHeadlessChannels(engine)
-                engine.dartExecutor.executeDartEntrypoint(
-                    DartExecutor.DartEntrypoint.createDefault()
-                )
+                creationRequest.run {
+                    val existing = obtainFlutterEngine()
+                    if (existing != null) {
+                        createdEngine[0] = existing
+                        if (!creationRequest.commit()) createdEngine[0] = null
+                        return@run
+                    }
+
+                    val engine = FlutterEngine(applicationContext, null, false)
+                    createdEngine[0] = engine
+                    if (creationRequest.isCancelled) {
+                        MainActivity.unregisterPlaybackPlugins(engine)
+                        engine.destroy()
+                        createdEngine[0] = null
+                        return@run
+                    }
+                    // 此构造显式关闭自动注册，因此在这里统一注册一次插件。
+                    GeneratedPluginRegistrant.registerWith(engine)
+                    if (creationRequest.isCancelled) {
+                        MainActivity.unregisterPlaybackPlugins(engine)
+                        engine.destroy()
+                        createdEngine[0] = null
+                        return@run
+                    }
+                    setupHeadlessChannels(engine)
+                    if (creationRequest.isCancelled) {
+                        MainActivity.unregisterPlaybackPlugins(engine)
+                        engine.destroy()
+                        createdEngine[0] = null
+                        return@run
+                    }
+                    FlutterEngineCache.getInstance().put("md3music_engine", engine)
+                    staticFlutterEngine = engine
+                    flutterEngine = engine
+                    // 资源发布与超时取消使用同一状态门：超时先赢则撤销并销毁；
+                    // 提交先赢则后续派发可以复用缓存引擎，不会重复创建。
+                    if (!creationRequest.commit()) {
+                        FlutterEngineCache.getInstance().remove("md3music_engine")
+                        staticFlutterEngine = null
+                        flutterEngine = null
+                        MainActivity.unregisterPlaybackPlugins(engine)
+                        engine.destroy()
+                        createdEngine[0] = null
+                        return@run
+                    }
+                    engine.dartExecutor.executeDartEntrypoint(
+                        DartExecutor.DartEntrypoint.createDefault()
+                    )
+                }
             } catch (e: Exception) {
+                val engine = createdEngine[0]
+                if (engine != null && !engine.dartExecutor.isExecutingDart()) {
+                    if (FlutterEngineCache.getInstance().get("md3music_engine") === engine) {
+                        FlutterEngineCache.getInstance().remove("md3music_engine")
+                    }
+                    if (staticFlutterEngine === engine) staticFlutterEngine = null
+                    if (flutterEngine === engine) flutterEngine = null
+                    MainActivity.unregisterPlaybackPlugins(engine)
+                    engine.destroy()
+                    createdEngine[0] = null
+                }
                 Log.w(TAG, "headless engine create failed: $e")
             } finally {
                 engineLatch.countDown()
             }
         }
+        val mainHandlerAccepted = mainHandler.post(createEngineTask)
+        if (!mainHandlerAccepted) {
+            Log.e(TAG, "headless engine creation could not be posted; media command dropped")
+            mediaCommandQueue.discardPending()
+            return
+        }
         try {
-            engineLatch.await(5, TimeUnit.SECONDS)
-            val engine = flutterEngine ?: staticFlutterEngine
-            if (engine == null || !engine.dartExecutor.isExecutingDart()) return
+            if (!engineLatch.await(5, TimeUnit.SECONDS)) {
+                if (creationRequest.cancel()) {
+                    mainHandler.removeCallbacks(createEngineTask)
+                    Log.e(TAG, "headless engine creation timed out; media command dropped")
+                    mediaCommandQueue.discardPending()
+                    return
+                }
+                // 任务已提交或已结束；保持命令派发有界，不在超时后无限等主线程。
+            }
+            val engine = createdEngine[0]
+            if (engine == null || !engine.dartExecutor.isExecutingDart()) {
+                mediaCommandQueue.discardPending()
+                return
+            }
             // 等待 Dart 端 PlayerProvider 完成状态恢复（本地歌曲快，在线歌曲走 API 较慢）
             for (i in 0 until 30) {
-                if (playerReadyReceived) break
+                if (playerReadyEngine === engine) break
                 Thread.sleep(1000)
             }
+            if (playerReadyEngine !== engine) {
+                Log.e(TAG, "playerReady timed out for current engine; media command dropped")
+                mediaCommandQueue.discardPending()
+                return
+            }
+            Log.i(
+                TAG,
+                "headless playerReady confirmed for engine=${System.identityHashCode(engine)}; dispatching pending media command",
+            )
             // playerReady 意味着 Dart main() 已跑完 runApp，Lyricon 反向 handler
             // 必然已注册，此时补发 auto_restored 事件才可靠（setupHeadlessChannels
             // 里那次可能因 Dart 尚未注册 handler 而丢消息）。幂等：register 已由
             // onCreate 完成，这里只负责把事件送达 Dart。
             restoreLyriconStateIfNeeded()
-            val method = takeMediaCommand() ?: return
-            dispatchOnce(engine, method)
-        } catch (_: Exception) {}
+            dispatchToDartWithRetry(engine)
+        } catch (e: Exception) {
+            Log.w(TAG, "headless media command dispatch failed: $e")
+            mediaCommandQueue.discardPending()
+        }
     }
 
     /// 在主线程通过 MethodChannel 派发一次命令到 Dart 端。
     /// 返回是否成功（Dart 端 handler 已注册且方法被处理）。
     /// 注意：handler 注册 ≠ PlayerProvider 就绪，play 命令的就绪时序由
     /// playerReady 信号保证（headless 场景）。
-    private fun dispatchOnce(engine: FlutterEngine, method: String): Boolean {
+    private fun dispatchOnce(
+        engine: FlutterEngine,
+        command: LatestMediaCommandQueue.Command,
+    ): Boolean {
         val latch = CountDownLatch(1)
         val dispatched = arrayOf(false)
         runOnMainThread {
@@ -1362,18 +1571,24 @@ class AudioPlaybackService : Service() {
                 MethodChannel(
                     engine.dartExecutor.binaryMessenger,
                     "com.md3music.md3music/floating_lyric"
-                ).invokeMethod(method, null, object : MethodChannel.Result {
-                    override fun success(result: Any?) {
-                        dispatched[0] = true
-                        latch.countDown()
-                    }
-                    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
-                        latch.countDown()
-                    }
-                    override fun notImplemented() {
-                        latch.countDown()
-                    }
-                })
+                ).invokeMethod(
+                    command.method,
+                    mapOf("commandId" to command.id),
+                    object : MethodChannel.Result {
+                        override fun success(result: Any?) {
+                            dispatched[0] = result == true
+                            latch.countDown()
+                        }
+
+                        override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                            latch.countDown()
+                        }
+
+                        override fun notImplemented() {
+                            latch.countDown()
+                        }
+                    },
+                )
             } catch (_: Exception) {
                 latch.countDown()
             }
@@ -1406,7 +1621,11 @@ class AudioPlaybackService : Service() {
             ).setMethodCallHandler { call, result ->
                 when (call.method) {
                     "playerReady" -> {
-                        playerReadyReceived = true
+                        playerReadyEngine = engine
+                        Log.i(
+                            TAG,
+                            "headless playerReady received for engine=${System.identityHashCode(engine)}",
+                        )
                         result.success(null)
                     }
                     "showNotification", "updateNotification" -> {
@@ -1486,11 +1705,16 @@ class AudioPlaybackService : Service() {
             registerLyriconChannel(engine)
             // SuperLyric channel 原生 handler 同样只能在 headless 场景下在此注册
             registerSuperLyricChannel(engine)
+            // 魅族状态栏歌词：headless 引擎同样需要，否则后台切歌时收不到歌词行推送
+            FlymeLyricBridge.registerChannel(engine, applicationContext)
             restoreLyriconStateIfNeeded()
             // 音量均衡通道：headless 引擎同样需要，播放/AudioService 在此 isolate 运行。
             registerVolumeNormalizationChannel(engine)
-            // Lyrico 外部编辑通道：UI 可能复用 headless 引擎，缺了会 MissingPluginException
-            ExternalEditorPlugin(applicationContext).register(engine)
+            // 后台引擎初始化期间，Dart 也会推送桌面小组件状态；与 Activity 共用同一 handler。
+            HomeWidgetChannel.register(applicationContext, engine.dartExecutor.binaryMessenger)
+            // Activity 与 headless 引擎共用播放插件，保证后台恢复设置通道已就绪。
+            MainActivity.registerPlaybackPlugins(applicationContext, engine)
+            ExternalMediaBridge.registerChannel(engine)
         } catch (_: Exception) {}
     }
 
@@ -1618,7 +1842,7 @@ class AudioPlaybackService : Service() {
         return try {
             val dir = File(cacheDir, COVER_CACHE_DIR)
             if (!dir.exists()) dir.mkdirs()
-            File(dir, artUrl.hashCode().toString() + ".jpg")
+            File(dir, artworkCacheFileName(artUrl))
         } catch (_: Exception) {
             null
         }
@@ -1626,13 +1850,17 @@ class AudioPlaybackService : Service() {
 
     /// 从缓存取封面：先内存后磁盘，命中即返回（同步、无需网络）。
     private fun getCachedCover(artUrl: String): Bitmap? {
-        coverMemoryCache[artUrl]?.let { return it }
+        coverMemoryCache.get(artUrl)?.let {
+            if (!it.isRecycled) return it
+            coverMemoryCache.remove(artUrl)
+        }
         val cacheFile = coverCacheFile(artUrl) ?: return null
         if (cacheFile.exists()) {
             return try {
-                val bmp = BitmapFactory.decodeFile(cacheFile.absolutePath)
+                val bmp = decodeSampledCoverFile(cacheFile)
                 if (bmp != null) {
-                    coverMemoryCache[artUrl] = bmp
+                    coverMemoryCache.put(artUrl, bmp)
+                    ArtworkDiskCache.touch(cacheFile)
                     Log.d(TAG, "封面磁盘缓存命中 url=$artUrl")
                 }
                 bmp
@@ -1646,7 +1874,7 @@ class AudioPlaybackService : Service() {
     /// 将封面写入磁盘缓存 + 内存缓存；超过上限时清理最旧文件。
     private fun putCoverCache(artUrl: String, bmp: Bitmap) {
         try {
-            coverMemoryCache[artUrl] = bmp
+            coverMemoryCache.put(artUrl, bmp)
             val cacheFile = coverCacheFile(artUrl) ?: return
             if (!cacheFile.exists()) {
                 FileOutputStream(cacheFile).use { out ->
@@ -1654,16 +1882,8 @@ class AudioPlaybackService : Service() {
                     out.flush()
                 }
             }
-            // 限制磁盘缓存数量：清空最旧文件
-            try {
-                val dir = File(cacheDir, COVER_CACHE_DIR)
-                val files = dir.listFiles()?.filter { it.isFile } ?: emptyList()
-                if (files.size > COVER_CACHE_MAX) {
-                    files.sortedBy { it.lastModified() }
-                        .take(files.size - COVER_CACHE_MAX)
-                        .forEach { it.delete() }
-                }
-            } catch (_: Exception) {}
+            // 限制磁盘缓存数量，只清理正式封面文件，不碰并发下载的临时文件。
+            ArtworkDiskCache.trim(File(cacheDir, COVER_CACHE_DIR), COVER_CACHE_MAX)
         } catch (_: Exception) {}
     }
 
@@ -1671,27 +1891,7 @@ class AudioPlaybackService : Service() {
     private fun prefetchCover(artUrl: String?) {
         if (artUrl.isNullOrEmpty()) return
         if (!artUrl.startsWith("http://") && !artUrl.startsWith("https://")) return
-        if (getCachedCover(artUrl) != null) return  // 已缓存，无需下载
-        // 网路线程下载并写入缓存，不阻塞播放
-        Thread {
-            try {
-                val conn = java.net.URL(artUrl).openConnection() as java.net.HttpURLConnection
-                conn.connectTimeout = 3000
-                conn.readTimeout = 5000
-                conn.instanceFollowRedirects = true
-                try {
-                    val bmp = BitmapFactory.decodeStream(conn.inputStream)
-                    if (bmp != null) {
-                        val small = resizeBitmap(bmp, 512)
-                        if (small !== bmp) bmp.recycle()
-                        putCoverCache(artUrl, small)
-                        Log.d(TAG, "封面预取完成 url=$artUrl")
-                    }
-                } finally {
-                    conn.disconnect()
-                }
-            } catch (_: Exception) {}
-        }.start()
+        enqueueCoverPrefetch(applicationContext, artUrl)
     }
 
     /// 根据 URI 类型加载封面 Bitmap，支持：
@@ -1704,16 +1904,16 @@ class AudioPlaybackService : Service() {
     private fun loadArtworkBitmap(artUri: String, fallbackFilePath: String?): Bitmap? {
         // 1. http(s):// 在线封面（方案A：优先本地缓存，命中免下载秒显）
         if (artUri.startsWith("http://") || artUri.startsWith("https://")) {
-            // 缓存命中：内存或磁盘，直接返回（切歌空档的根治关键）
-            getCachedCover(artUri)?.let { return it }
-            return try {
-                // P0: HttpURLConnection 显式设置超时，避免慢响应导致线程永久阻塞
-                val conn = java.net.URL(artUri).openConnection() as java.net.HttpURLConnection
-                conn.connectTimeout = 5000
-                conn.readTimeout = 10000
-                conn.instanceFollowRedirects = true
-                try {
-                    val bmp = BitmapFactory.decodeStream(conn.inputStream)
+            synchronized(coverDownloadLock(artUri)) {
+                // 缓存命中：内存或磁盘，直接返回（切歌空档的根治关键）
+                getCachedCover(artUri)?.let { return it }
+                return try {
+                    val bmp = downloadSampledCover(
+                        artUri,
+                        File(cacheDir, COVER_CACHE_DIR),
+                        connectTimeoutMs = 5000,
+                        readTimeoutMs = 10000
+                    )
                     if (bmp != null) {
                         Log.i(TAG, "封面 http 下载成功 ${bmp.width}x${bmp.height} url=$artUri")
                         // 写入本地缓存，下次切到同歌秒显
@@ -1722,13 +1922,11 @@ class AudioPlaybackService : Service() {
                         Log.w(TAG, "封面 http 解码失败(响应非图片/空流) url=$artUri")
                     }
                     bmp
-                } finally {
-                    conn.disconnect()
+                } catch (e: Exception) {
+                    // 封面链路日志：网络波动/超时会造成这里 null→MediaSession 无 bitmap，正是偶现失效点
+                    Log.w(TAG, "封面 http 下载异常 ${e.message} url=$artUri")
+                    null
                 }
-            } catch (e: Exception) {
-                // 封面链路日志：网络波动/超时会造成这里 null→MediaSession 无 bitmap，正是偶现失效点
-                Log.w(TAG, "封面 http 下载异常 ${e.message} url=$artUri")
-                null
             }
         }
 
@@ -1737,7 +1935,7 @@ class AudioPlaybackService : Service() {
             try {
                 val uri = Uri.parse(artUri)
                 contentResolver.openInputStream(uri)?.use { input ->
-                    val bmp = BitmapFactory.decodeStream(input)
+                    val bmp = decodeSampledCoverStream(input, File(cacheDir, COVER_CACHE_DIR))
                     if (bmp != null) {
                         Log.i(TAG, "封面 content 加载成功 ${bmp.width}x${bmp.height} url=$artUri")
                     } else {
@@ -1772,7 +1970,7 @@ class AudioPlaybackService : Service() {
             lower.endsWith(".png") || lower.endsWith(".webp")
         ) {
             return try {
-                val bmp = BitmapFactory.decodeFile(filePath)
+                val bmp = decodeSampledCoverFile(File(filePath))
                 if (bmp != null) {
                     Log.i(TAG, "封面文件解码成功 ${bmp.width}x${bmp.height} path=$filePath")
                 } else {
@@ -1805,7 +2003,7 @@ class AudioPlaybackService : Service() {
             }
             val art = retriever.embeddedPicture
             if (art != null) {
-                val bmp = BitmapFactory.decodeByteArray(art, 0, art.size)
+                val bmp = decodeSampledCoverBytes(art)
                 if (bmp != null) {
                     Log.i(TAG, "内嵌封面提取成功 ${bmp.width}x${bmp.height} src=$filePath")
                 } else {
@@ -1877,7 +2075,7 @@ class AudioPlaybackService : Service() {
         // 本服务仍须 startForeground 保持前台（Android 8+ 硬性要求），故构建静默保活通知。
         // 使用最低重要度频道常驻（不 DETACH），并给出关闭入口提示。
         val builder = NotificationCompat.Builder(this, KEEPALIVE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_launcher_monochrome)
             .setContentTitle("")
             .setContentText(KEEPALIVE_NOTIFICATION_TEXT)
             .setContentIntent(pendingIntent)
@@ -1920,7 +2118,7 @@ class AudioPlaybackService : Service() {
                         // 缓存时返回的是 coverMemoryCache 里的共享对象，recycle 它会污染缓存，
                         // 导致后续 loadArtworkBitmap / injectCover 命中已回收位图 → 封面加载失败
                         // / resizeBitmap 抛 IllegalStateException。
-                        val sharedCacheEntry = coverMemoryCache[effectiveArtUrl]
+                        val sharedCacheEntry = coverMemoryCache.get(effectiveArtUrl)
                         if (displayBitmap !== originalBitmap && originalBitmap !== sharedCacheEntry) {
                             originalBitmap.recycle()
                         }
@@ -2200,10 +2398,9 @@ class AudioPlaybackService : Service() {
         // MD3Music fork: 取消原子随身听 25s 重发定时器
         vivoAtomicHandler.removeCallbacksAndMessages(null)
         releaseWakeLock()
-        // 释放缓存的封面 bitmap
-        lastArtBitmap?.let { if (!it.isRecycled) it.recycle() }
+        // lastArtBitmap 可能仍由 MediaSession 或桌面组件引用，销毁服务时不能 recycle。
         lastArtBitmap = null
-        lastArtThumb?.let { if (!it.isRecycled) it.recycle() }
+        // 缩略图同样可能已被媒体元数据借用；解除本地引用后交给 GC 回收。
         lastArtThumb = null
         // 方案B阶段1：解除媒体3会话承载服务绑定，并让 fork 注销 host
         if (media3ServiceBound) {

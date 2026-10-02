@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/layout/ui_density.dart';
 import '../core/services/custom_font_loader.dart';
 import '../core/theme/app_theme.dart';
+import '../data/repositories/settings_repository.dart';
 
 class ThemeProvider extends ChangeNotifier {
   static const String _key = 'theme_mode';
@@ -27,9 +28,14 @@ class ThemeProvider extends ChangeNotifier {
   static const String _artistPhotoOpacityKey = 'artist_photo_opacity';
   static const String _lyricDoubleTapToJumpKey = 'lyric_double_tap_to_jump';
   // 自定义背景图片（全局界面背景）
-  static const String _bgImageEnabledKey = 'use_background_image';
+  static const String backgroundImageEnabledPreferenceKey =
+      'use_background_image';
+  static const String _bgImageEnabledKey =
+      backgroundImageEnabledPreferenceKey;
   static const String _bgImagePathKey = 'background_image_path';
   static const String _bgBlurKey = 'background_blur';
+  // AM 播放器模糊封面背景强度（高斯模糊 sigma，0~30）
+  static const String _amPlayerBlurKey = 'am_player_blur';
   static const String _bgOpacityKey = 'background_opacity';
   // 按背景图莫奈取色开关（默认开启）
   static const String _bgMonetKey = 'use_background_monet';
@@ -62,11 +68,13 @@ class ThemeProvider extends ChangeNotifier {
   double _artistPhotoOpacity = 0.55;
   // AM 风格播放器歌词双击跳转开关（默认关闭，开启后需双击歌词才能跳转位置）
   bool _lyricDoubleTapToJump = false;
-  // 自定义背景图片（全局界面背景）；默认开启，未选择图片时回落到内置默认壁纸
-  bool _useBackgroundImage = true;
+  // 自定义背景图片（全局界面背景）；默认关闭，开启后未选择图片时回落到内置默认壁纸
+  bool _useBackgroundImage = false;
   String? _backgroundImagePath;
   double _backgroundBlur = 20.0;
-  double _backgroundOpacity = 0.4;
+  // AM 播放器背景模糊（sigma 0~30，默认 30 = 原硬编码值）
+  double _amPlayerBlur = 30.0;
+  double _backgroundOpacity = 0.2;
   // 按背景图莫奈取色（默认开启；关闭后背景图仍显示但不参与主题色）
   bool _useBackgroundMonet = true;
   // 文字阴影（默认关闭）：给全局文字加轮廓阴影，改善背景图上的可读性。
@@ -76,6 +84,8 @@ class ThemeProvider extends ChangeNotifier {
   double _textShadowBlur = AppTheme.defaultTextShadowBlur;
   // 从背景图片提取的主色（运行时，作为莫奈取色种子）
   Color? _backgroundSeedColor;
+  // 强调排版（M3E Emphasized Typography）：默认开启，关闭后回退常规字重
+  bool _emphasizedTypography = true;
 
   ThemeMode get themeMode => _themeMode;
   bool get useDynamicColor => _useDynamicColor;
@@ -96,11 +106,13 @@ class ThemeProvider extends ChangeNotifier {
   bool get useBackgroundImage => _useBackgroundImage;
   String? get backgroundImagePath => _backgroundImagePath;
   double get backgroundBlur => _backgroundBlur;
+  double get amPlayerBlur => _amPlayerBlur;
   double get backgroundOpacity => _backgroundOpacity;
   bool get useBackgroundMonet => _useBackgroundMonet;
   bool get useTextShadow => _useTextShadow;
   double get textShadowBlur => _textShadowBlur;
   Color? get backgroundSeedColor => _backgroundSeedColor;
+  bool get emphasizedTypographyEnabled => _emphasizedTypography;
 
   /// 文字阴影是否实际生效：开关本身开启 **且** 已启用自定义背景图片。
   /// 未启用背景图时纯色主题自带足够对比度，阴影只会让文字发虚，故不生效。
@@ -143,7 +155,10 @@ class ThemeProvider extends ChangeNotifier {
     }
   }
 
-  ThemeProvider() {
+  ThemeProvider({bool? initialUseBackgroundImage}) {
+    if (initialUseBackgroundImage != null) {
+      _useBackgroundImage = initialUseBackgroundImage;
+    }
     _loadThemeMode();
     _loadDynamicColor();
     _loadUseCoverSeedColor();
@@ -156,6 +171,8 @@ class ThemeProvider extends ChangeNotifier {
     _loadArtistPhotoBackground();
     _loadLyricDoubleTapToJump();
     _loadBackgroundImage();
+    _loadAmPlayerBlur();
+    _loadEmphasizedTypography();
   }
 
   Future<void> _loadThemeMode() async {
@@ -386,6 +403,22 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.setBool(_oledBlackKey, enabled);
   }
 
+  /// 加载「强调排版」开关持久化值（M3E Emphasized Typography），默认开启。
+  Future<void> _loadEmphasizedTypography() async {
+    _emphasizedTypography =
+        await SettingsRepository().getEmphasizedTypographyEnabled();
+    notifyListeners();
+  }
+
+  /// 切换「强调排版」开关并持久化。
+  /// 开启时全局 TextTheme 走 M3ETypography.emphasized；关闭后回退常规字重。
+  Future<void> setEmphasizedTypographyEnabled(bool enabled) async {
+    if (_emphasizedTypography == enabled) return;
+    _emphasizedTypography = enabled;
+    notifyListeners();
+    await SettingsRepository().setEmphasizedTypographyEnabled(enabled);
+  }
+
   /// 加载「显示大小」档位，默认 [kDefaultDisplayScale]（设备真实 dp）。
   ///
   /// 顺带清掉旧键 `ui_scale`：那是已删除的逐元素缩放实现留下的，值域 0.5~5.0，
@@ -514,17 +547,27 @@ class ThemeProvider extends ChangeNotifier {
   // ============== 自定义背景图片 ==============
 
   /// 加载背景图片相关持久化值（开关 / 路径 / 模糊 / 透明度 / 莫奈取色 / 文字阴影），
-  /// 默认开启（无用户图片时用内置默认壁纸）/ 莫奈取色默认开启 / 文字阴影默认开启。
+  /// 默认关闭（无用户图片时用内置默认壁纸）/ 莫奈取色默认开启 / 文字阴影默认开启。
   Future<void> _loadBackgroundImage() async {
     final prefs = await SharedPreferences.getInstance();
-    _useBackgroundImage = prefs.getBool(_bgImageEnabledKey) ?? true;
+    _useBackgroundImage = prefs.getBool(_bgImageEnabledKey) ?? false;
     _backgroundImagePath = prefs.getString(_bgImagePathKey);
     _backgroundBlur = prefs.getDouble(_bgBlurKey) ?? 20.0;
-    _backgroundOpacity = prefs.getDouble(_bgOpacityKey) ?? 0.4;
+    _backgroundOpacity = prefs.getDouble(_bgOpacityKey) ?? 0.2;
     _useBackgroundMonet = prefs.getBool(_bgMonetKey) ?? true;
     _useTextShadow = prefs.getBool(_textShadowKey) ?? false;
     _textShadowBlur =
         prefs.getDouble(_textShadowBlurKey) ?? AppTheme.defaultTextShadowBlur;
+    notifyListeners();
+  }
+
+  /// 加载 AM 播放器背景模糊强度（默认 30，与历史硬编码视觉一致）。
+  ///
+  /// 无持久化值时保持 [_amPlayerBlur] 当前值：构造函数的异步加载可能在
+  /// [setAmPlayerBlur] 之后才完成，硬写 30 会把用户刚设置的值覆盖掉。
+  Future<void> _loadAmPlayerBlur() async {
+    final prefs = await SharedPreferences.getInstance();
+    _amPlayerBlur = prefs.getDouble(_amPlayerBlurKey) ?? _amPlayerBlur;
     notifyListeners();
   }
 
@@ -600,6 +643,16 @@ class ThemeProvider extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_bgBlurKey, clamped);
+  }
+
+  /// 设置 AM 播放器背景模糊强度（高斯模糊 sigma，0~30；0 = 不模糊）。
+  Future<void> setAmPlayerBlur(double blur) async {
+    final clamped = blur.clamp(0.0, 30.0);
+    if (_amPlayerBlur == clamped) return;
+    _amPlayerBlur = clamped;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_amPlayerBlurKey, clamped);
   }
 
   /// 设置背景图片透明度（0.2~1.0，1.0 完全显示图片）。

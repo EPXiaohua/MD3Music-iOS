@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../providers/theme_provider.dart';
@@ -152,12 +153,12 @@ class _OnboardingPageState extends State<OnboardingPage>
 
   Widget _buildTopBar(ColorScheme colorScheme) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Padding(
-            padding: const EdgeInsets.only(left: 16),
+            padding: const EdgeInsets.only(left: AppSpacing.lg),
             child: Text(
               'MD3Music',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
@@ -221,17 +222,17 @@ class _OnboardingPageState extends State<OnboardingPage>
     Animation<double> animation,
   ) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxl),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           OnboardingIllustration(pageIndex: index, animation: animation),
           const SizedBox(height: 40),
           _buildTitle(page.title, animation, isCenter: true),
-          const SizedBox(height: 16),
+          const Gap(AppSpacing.lg),
           _buildDescription(page.description, animation, isCenter: true),
           if (page.highlights.isNotEmpty) ...[
-            const SizedBox(height: 24),
+            const Gap(AppSpacing.xl),
             _buildHighlights(page.highlights),
           ],
         ],
@@ -245,22 +246,22 @@ class _OnboardingPageState extends State<OnboardingPage>
     Animation<double> animation,
   ) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 48),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxxl),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           OnboardingIllustration(pageIndex: index, animation: animation),
-          const SizedBox(width: 48),
+          const Gap(AppSpacing.xxxl),
           Expanded(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 _buildTitle(page.title, animation, isCenter: false),
-                const SizedBox(height: 16),
+                const Gap(AppSpacing.lg),
                 _buildDescription(page.description, animation, isCenter: false),
                 if (page.highlights.isNotEmpty) ...[
-                  const SizedBox(height: 24),
+                  const Gap(AppSpacing.xl),
                   _buildHighlights(page.highlights, isCenter: false),
                 ],
               ],
@@ -340,7 +341,7 @@ class _OnboardingPageState extends State<OnboardingPage>
             _buildHiddenOpItem(ops[i], colorScheme, i),
             if (i < ops.length - 1)
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
                 child: Divider(
                   height: 1,
                   color: colorScheme.outlineVariant
@@ -354,7 +355,7 @@ class _OnboardingPageState extends State<OnboardingPage>
 
     if (isLandscape) {
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 48),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxxl),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.center,
@@ -365,13 +366,13 @@ class _OnboardingPageState extends State<OnboardingPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildTitle(page.title, animation, isCenter: false),
-                  const SizedBox(height: 8),
+                  const Gap(AppSpacing.sm),
                   _buildDescription(
                     page.description, animation, isCenter: false),
                 ],
               ),
             ),
-            const SizedBox(width: 32),
+            const Gap(AppSpacing.xxl),
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 340),
               child: listWidget,
@@ -382,14 +383,14 @@ class _OnboardingPageState extends State<OnboardingPage>
     }
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 24),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           _buildTitle(page.title, animation, isCenter: true),
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           _buildDescription(page.description, animation, isCenter: true),
-          const SizedBox(height: 24),
+          const Gap(AppSpacing.xl),
           ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 360),
             child: listWidget,
@@ -405,7 +406,7 @@ class _OnboardingPageState extends State<OnboardingPage>
     int index,
   ) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: 10),
       child: Row(
         children: [
           // 图标圆形背景
@@ -429,10 +430,10 @@ class _OnboardingPageState extends State<OnboardingPage>
                     // 手势标签
                     Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 6, vertical: 2),
+                        horizontal: 6, vertical: AppSpacing.xxs),
                       decoration: BoxDecoration(
                         color: colorScheme.secondaryContainer,
-                        borderRadius: BorderRadius.circular(4),
+                        borderRadius: AppRadius.xsAll,
                       ),
                       child: Text(
                         op.gesture,
@@ -443,7 +444,7 @@ class _OnboardingPageState extends State<OnboardingPage>
                         ),
                       ),
                     ),
-                    const SizedBox(width: 8),
+                    const Gap(AppSpacing.sm),
                     Flexible(
                       child: Text(
                         op.target,
@@ -541,7 +542,7 @@ class _OnboardingPageState extends State<OnboardingPage>
 
     if (isLandscape) {
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 48),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxxl),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.center,
@@ -552,21 +553,21 @@ class _OnboardingPageState extends State<OnboardingPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildTitle(page.title, animation, isCenter: false),
-                  const SizedBox(height: 12),
+                  const Gap(AppSpacing.md),
                   _buildDescription(page.description, animation, isCenter: false),
                   if (page.highlights.isNotEmpty) ...[
-                    const SizedBox(height: 16),
+                    const Gap(AppSpacing.lg),
                     _buildHighlights(page.highlights, isCenter: false),
                   ],
                 ],
               ),
             ),
-            const SizedBox(width: 32),
+            const Gap(AppSpacing.xxl),
             Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 colorGrid,
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 SizedBox(width: 200, child: hint),
               ],
             ),
@@ -576,16 +577,16 @@ class _OnboardingPageState extends State<OnboardingPage>
     }
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxl),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           _buildTitle(page.title, animation, isCenter: true),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           _buildDescription(page.description, animation, isCenter: true),
           const SizedBox(height: 28),
           colorGrid,
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           hint,
           if (page.highlights.isNotEmpty) ...[
             const SizedBox(height: 20),
@@ -619,13 +620,13 @@ class _OnboardingPageState extends State<OnboardingPage>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       _buildTitle(page.title, animation, isCenter: false),
-                      const SizedBox(height: 12),
+                      const Gap(AppSpacing.md),
                       _buildDescription(
                         page.description, animation, isCenter: false),
                     ],
                   ),
                 ),
-                const SizedBox(width: 32),
+                const Gap(AppSpacing.xxl),
                 _buildStyleCards(colorScheme, animation),
               ],
             )
@@ -633,9 +634,9 @@ class _OnboardingPageState extends State<OnboardingPage>
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 _buildTitle(page.title, animation, isCenter: true),
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 _buildDescription(page.description, animation, isCenter: true),
-                const SizedBox(height: 32),
+                const Gap(AppSpacing.xxl),
                 _buildStyleCards(colorScheme, animation),
               ],
             ),
@@ -656,7 +657,7 @@ class _OnboardingPageState extends State<OnboardingPage>
             onTap: () => setState(() => _useAmStylePlayer = false),
             preview: _Md3StylePreview(colorScheme: colorScheme),
           ),
-          const SizedBox(width: 16),
+          const Gap(AppSpacing.lg),
           _buildStyleCard(
             colorScheme: colorScheme,
             title: 'Apple Music',
@@ -687,7 +688,7 @@ class _OnboardingPageState extends State<OnboardingPage>
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
           color: colorScheme.surfaceContainerLow,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: AppRadius.lgAll,
           border: Border.all(
             color: isSelected ? colorScheme.primary : colorScheme.outlineVariant,
             width: isSelected ? 2.5 : 1,
@@ -714,7 +715,7 @@ class _OnboardingPageState extends State<OnboardingPage>
                     : colorScheme.onSurface,
               ),
             ),
-            const SizedBox(height: 2),
+            const Gap(AppSpacing.xxs),
             Text(
               subtitle,
               style: TextStyle(
@@ -806,12 +807,12 @@ class _OnboardingPageState extends State<OnboardingPage>
   Widget _buildBottomControls(ColorScheme colorScheme) {
     final isLastPage = _currentPage == onboardingPages.length - 1;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxl, vertical: AppSpacing.lg),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           _buildPageIndicator(colorScheme),
-          const SizedBox(height: 32),
+          const Gap(AppSpacing.xxl),
           SizedBox(
             width: double.infinity,
             height: 56,
@@ -819,7 +820,7 @@ class _OnboardingPageState extends State<OnboardingPage>
               onPressed: isLastPage ? _completeOnboarding : _nextPage,
               style: FilledButton.styleFrom(
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: AppRadius.lgAll,
                 ),
               ),
               child: AnimatedSwitcher(
@@ -856,7 +857,7 @@ class _OnboardingPageState extends State<OnboardingPage>
             return AnimatedContainer(
               duration: M3ExpressiveMotion.defaultDuration,
               curve: M3ExpressiveMotion.expressiveEasing,
-              margin: const EdgeInsets.symmetric(horizontal: 4),
+              margin: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
               width: isActive ? lerpDouble(8, 24, activeness)! : 8,
               height: 8,
               decoration: BoxDecoration(
@@ -867,7 +868,7 @@ class _OnboardingPageState extends State<OnboardingPage>
                         activeness,
                       )
                     : colorScheme.outlineVariant,
-                borderRadius: BorderRadius.circular(4),
+                borderRadius: AppRadius.xsAll,
               ),
             );
           }),
@@ -897,7 +898,7 @@ class _Md3StylePreview extends StatelessWidget {
           Container(
             height: 32,
             color: colorScheme.surfaceContainer,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
             alignment: Alignment.centerLeft,
             child: Row(
               children: [
@@ -912,7 +913,7 @@ class _Md3StylePreview extends StatelessWidget {
           // 封面
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(AppSpacing.md),
               child: Column(
                 children: [
                   // 专辑封面
@@ -921,7 +922,7 @@ class _Md3StylePreview extends StatelessWidget {
                     child: Container(
                       decoration: BoxDecoration(
                         color: colorScheme.primaryContainer,
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: AppRadius.smAll,
                       ),
                       child: Center(
                         child: Icon(
@@ -1017,7 +1018,7 @@ class _AmStylePreview extends StatelessWidget {
                     size: 14, color: colorScheme.onSurface),
               ],
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             // 逐字歌词区域
             Expanded(
               child: Column(
@@ -1037,7 +1038,7 @@ class _AmStylePreview extends StatelessWidget {
                 ],
               ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             // 底部封面 + 控件
             Row(
               children: [
@@ -1046,7 +1047,7 @@ class _AmStylePreview extends StatelessWidget {
                   height: 28,
                   decoration: BoxDecoration(
                     color: colorScheme.primary.withValues(alpha: 0.7),
-                    borderRadius: BorderRadius.circular(4),
+                    borderRadius: AppRadius.xsAll,
                   ),
                   child: Icon(
                     Icons.music_note,
@@ -1067,7 +1068,7 @@ class _AmStylePreview extends StatelessWidget {
                           borderRadius: BorderRadius.circular(3),
                         ),
                       ),
-                      const SizedBox(height: 2),
+                      const Gap(AppSpacing.xxs),
                       Container(
                         height: 3,
                         width: 30,
@@ -1097,7 +1098,7 @@ class _AmStylePreview extends StatelessWidget {
         width: width,
         decoration: BoxDecoration(
           color: color.withValues(alpha: opacity),
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: AppRadius.xsAll,
         ),
       ),
     );

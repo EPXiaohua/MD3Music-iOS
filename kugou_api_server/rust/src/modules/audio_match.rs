@@ -14,7 +14,11 @@ pub fn handle(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
         "useid": userid,
         "multi_result": 1,
     });
-    let body = ctx.body_bytes.clone().unwrap_or_default();
+    let body = ctx
+        .body_bytes
+        .as_deref()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
 
     let opts = RequestOptions::new("/fingerprint.service/v1/music_trackid_mulit")
         .post("/fingerprint.service/v1/music_trackid_mulit")

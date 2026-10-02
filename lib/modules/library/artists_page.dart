@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/layout/adaptive_navigator.dart';
 import '../../data/models/artist.dart';
 import '../../data/models/song.dart';
 import '../../providers/library_provider.dart';
@@ -8,6 +9,7 @@ import '../../providers/player_provider.dart';
 import '../../widgets/artist_tile.dart';
 import '../../widgets/app_animation.dart';
 import '../../widgets/song_list_item.dart';
+import '../player/secondary_mini_player.dart';
 
 class ArtistsPage extends StatelessWidget {
   final List<Artist> artists;
@@ -36,13 +38,11 @@ class ArtistsPage extends StatelessWidget {
           onTap: () {
             final library = context.read<LibraryProvider>();
             final songs = library.getSongsByArtist(artists[index].name);
-            Navigator.push(
+            AdaptiveNav.openDetail(
               context,
-              MaterialPageRoute(
-                builder: (_) => ArtistSongsPage(
-                  artist: artists[index],
-                  songs: songs,
-                ),
+              (_) => ArtistSongsPage(
+                artist: artists[index],
+                songs: songs,
               ),
             );
           },
@@ -73,7 +73,8 @@ class ArtistSongsPage extends StatelessWidget {
               ),
         ),
       ),
-      body: songs.isEmpty
+      body: SecondaryMiniPlayerHost(
+        child: songs.isEmpty
           ? Center(
               child: Text(
                 '此歌手暂无歌曲',
@@ -125,6 +126,7 @@ class ArtistSongsPage extends StatelessWidget {
                 ),
               ],
             ),
+      ),
     );
   }
 }

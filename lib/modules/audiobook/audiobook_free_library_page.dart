@@ -1,3 +1,4 @@
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
@@ -117,38 +118,6 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
     );
   }
 
-  Future<void> _pickOption(
-    String title,
-    List<(int, String)> options,
-    int current,
-    ValueChanged<int> onChanged,
-  ) async {
-    final sel = await showModalBottomSheet<int>(
-      context: context,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-              child: Text(title, style: Theme.of(sheetContext).textTheme.titleMedium),
-            ),
-            for (final (value, label) in options)
-              ListTile(
-                title: Text(label),
-                trailing: value == current ? const Icon(Icons.check) : null,
-                onTap: () => Navigator.of(sheetContext).pop(value),
-              ),
-          ],
-        ),
-      ),
-    );
-    if (sel != null && sel != current) {
-      setState(() => onChanged(sel));
-      _reload();
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final kugou = context.watch<KugouProvider>();
@@ -181,34 +150,45 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
               },
             ),
           ),
-          // 排序 / 性别 / 状态
+          // 排序 / 性别 / 状态（M3E 下拉字段，选中即重新拉取）
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _FilterButton(
-                  label: '排序 · ${_labelOf(_sortOptions, _sort)}',
-                  onTap: () =>
-                      _pickOption('排序', _sortOptions, _sort, (v) => _sort = v),
-                ),
-                const SizedBox(width: 8),
-                _FilterButton(
-                  label: _labelOf(_genderOptions, _gender),
-                  onTap: () => _pickOption(
-                    '性别',
-                    _genderOptions,
-                    _gender,
-                    (v) => _gender = v,
+                Expanded(
+                  child: _LabeledDropdown(
+                    label: '排序',
+                    options: _sortOptions,
+                    current: _sort,
+                    onPicked: (v) {
+                      setState(() => _sort = v);
+                      _reload();
+                    },
                   ),
                 ),
                 const SizedBox(width: 8),
-                _FilterButton(
-                  label: '状态 · ${_labelOf(_statusOptions, _status)}',
-                  onTap: () => _pickOption(
-                    '状态',
-                    _statusOptions,
-                    _status,
-                    (v) => _status = v,
+                Expanded(
+                  child: _LabeledDropdown(
+                    label: '性别',
+                    options: _genderOptions,
+                    current: _gender,
+                    onPicked: (v) {
+                      setState(() => _gender = v);
+                      _reload();
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _LabeledDropdown(
+                    label: '状态',
+                    options: _statusOptions,
+                    current: _status,
+                    onPicked: (v) {
+                      setState(() => _status = v);
+                      _reload();
+                    },
                   ),
                 ),
               ],
@@ -262,47 +242,68 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
       ),
     );
   }
-
-  String _labelOf(List<(int, String)> options, int value) {
-    for (final (v, label) in options) {
-      if (v == value) return label;
-    }
-    return '';
-  }
 }
 
-/// 排序/性别/状态筛选按钮。
-class _FilterButton extends StatelessWidget {
+/// 第二行筛选：小标签 + M3E 下拉字段。
+///
+/// 选项由上级传入（值 + 文本），单选即当前筛选值；选中后由调用方重新拉取。
+/// 做成 StatefulWidget 是为了在「再次点当前项导致上游取消选中」时就地重建，
+/// 让字段继续显示当前值（不回调上级，避免重复拉取）。
+class _LabeledDropdown extends StatefulWidget {
   final String label;
-  final VoidCallback onTap;
+  final List<(int, String)> options;
+  final int current;
+  final ValueChanged<int> onPicked;
 
-  const _FilterButton({required this.label, required this.onTap});
+  const _LabeledDropdown({
+    required this.label,
+    required this.options,
+    required this.current,
+    required this.onPicked,
+  });
 
   @override
+  State<_LabeledDropdown> createState() => _LabeledDropdownState();
+}
+
+class _LabeledDropdownState extends State<_LabeledDropdown> {
+  @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tt = Theme.of(context).textTheme;
-    return Material(
-      color: cs.surfaceContainerLow,
-      borderRadius: BorderRadius.circular(8),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                label,
-                style: tt.labelMedium?.copyWith(color: cs.onSurfaceVariant),
+    final textTheme = Theme.of(context).textTheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(widget.label, style: textTheme.bodySmall),
+        const SizedBox(height: 2),
+        M3EDropdownMenu<int>(
+          items: [
+            for (final (value, text) in widget.options)
+              M3EDropdownItem<int>(
+                label: text,
+                value: value,
+                selected: value == widget.current,
               ),
-              const SizedBox(width: 2),
-              Icon(Icons.arrow_drop_down, size: 18, color: cs.onSurfaceVariant),
-            ],
+          ],
+          singleSelect: true,
+          showChipAnimation: false,
+          fieldStyle: const M3EDropdownFieldStyle(
+            padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           ),
+          // 回调只在上游挂载时登记一次，因此这里读 widget.current / widget.onPicked
+          // 取实时值，不要捕获按值传入的局部变量
+          onSelectionChanged: (selected) {
+            // 单选下再次点当前项会被取消选中：强制重建以恢复显示当前值
+            if (selected.isEmpty) {
+              setState(() {});
+              return;
+            }
+            final value = selected.first.value;
+            if (value == widget.current) return;
+            widget.onPicked(value);
+          },
         ),
-      ),
+      ],
     );
   }
 }

@@ -10,7 +10,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 /// 「已购」页：单曲 / 专辑两个 Tab。
 ///
@@ -271,7 +271,7 @@ class _PurchasedPageState extends State<PurchasedPage> {
           ),
         ),
       ),
-      body: _buildBody(cs),
+      body: SecondaryMiniPlayerHost(child: _buildBody(cs)),
     );
   }
 
@@ -296,7 +296,6 @@ class _PurchasedPageState extends State<PurchasedPage> {
               },
             ),
           ),
-          const MiniPlayer(),
         ],
       );
     }
@@ -317,7 +316,6 @@ class _PurchasedPageState extends State<PurchasedPage> {
             itemBuilder: (context, i) => _buildAlbumCard(cs, i),
           ),
         ),
-        const MiniPlayer(),
       ],
     );
   }

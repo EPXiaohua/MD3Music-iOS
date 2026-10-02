@@ -6,6 +6,7 @@ import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
 import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
+import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/song_list_item.dart';
 
 enum SongSortBy { title, artist, dateAdded }
@@ -135,100 +136,6 @@ class _SongsPageState extends State<SongsPage> {
     return songs;
   }
 
-  void _showSortDialog() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        // 共用的单行选项组件：当前选中且方向匹配时显示箭头。
-        Widget buildOption({
-          required IconData icon,
-          required String label,
-          required SongSortBy type,
-        }) {
-          final isSelected = _sortBy == type;
-          // 二次点击同一排序项：切换升/降序。
-          return SimpleDialogOption(
-            onPressed: () {
-              setState(() {
-                if (isSelected) {
-                  // 同一排序项再次点击 → 切换方向
-                  _sortDescending = !_sortDescending;
-                } else {
-                  // 切换到新的排序项 → 重置为正序
-                  _sortBy = type;
-                  _sortDescending = false;
-                }
-              });
-              // 记忆排序选择：切到其它页面再回来仍保持本次选择
-              _saveSortPreference();
-              Navigator.pop(context);
-            },
-            child: Row(
-              children: [
-                Icon(
-                  icon,
-                  color: isSelected
-                      ? Theme.of(context).colorScheme.primary
-                      : null,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    label,
-                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                          color: isSelected
-                              ? Theme.of(context).colorScheme.primary
-                              : null,
-                        ),
-                  ),
-                ),
-                if (isSelected)
-                  Icon(
-                    _sortDescending
-                        ? Icons.arrow_downward_rounded
-                        : Icons.arrow_upward_rounded,
-                    color: Theme.of(context).colorScheme.primary,
-                    size: 18,
-                  ),
-              ],
-            ),
-          );
-        }
-
-        return SimpleDialog(
-          title: const Text('排序方式'),
-          children: [
-            buildOption(
-              icon: Icons.sort_by_alpha,
-              label: '按标题',
-              type: SongSortBy.title,
-            ),
-            buildOption(
-              icon: Icons.person,
-              label: '按歌手',
-              type: SongSortBy.artist,
-            ),
-            buildOption(
-              icon: Icons.schedule,
-              label: '按添加时间',
-              type: SongSortBy.dateAdded,
-            ),
-            // 提示：再次点击当前项可切换方向
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 4, 24, 12),
-              child: Text(
-                '再次点击当前选项可切换升序/降序',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
   /// 一起听房主在房间里：本地音乐不能本地起播。
   ///
   /// 本地文件没有可上报上游的 hash，房主起播后成员跟着拿到无法解析的曲目。
@@ -294,15 +201,32 @@ class _SongsPageState extends State<SongsPage> {
                     ? () => _scrollToCurrentSong(currentIndex)
                     : null,
               ),
-              IconButton(
-                icon: Icon(
-                  // 排序按钮上根据当前方向显示箭头标识
-                  _sortDescending
-                      ? Icons.arrow_downward_rounded
-                      : Icons.arrow_upward_rounded,
-                ),
+              M3ESortButton<SongSortBy>(
                 tooltip: '排序',
-                onPressed: _showSortDialog,
+                // 排序按钮上根据当前方向显示箭头标识
+                icon: _sortDescending
+                    ? Icons.arrow_downward_rounded
+                    : Icons.arrow_upward_rounded,
+                current: _sortBy,
+                options: const [
+                  (value: SongSortBy.title, label: '按标题'),
+                  (value: SongSortBy.artist, label: '按歌手'),
+                  (value: SongSortBy.dateAdded, label: '按添加时间'),
+                ],
+                onPicked: (value, repeated) {
+                  setState(() {
+                    if (repeated) {
+                      // 再次点当前项 → 切换升/降序
+                      _sortDescending = !_sortDescending;
+                    } else {
+                      // 切到新的排序项 → 重置为正序
+                      _sortBy = value;
+                      _sortDescending = false;
+                    }
+                  });
+                  // 记忆排序选择：切到其它页面再回来仍保持本次选择
+                  _saveSortPreference();
+                },
               ),
             ],
           ),

@@ -6,7 +6,7 @@ import '../../data/models/song.dart';
 import '../../data/repositories/history_repository.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 class PlayHistoryPage extends StatefulWidget {
   /// 可选扩展：对显示列表应用变换（默认关闭，由私有构建注入，用于筛选等）。
@@ -171,7 +171,8 @@ class _PlayHistoryPageState extends State<PlayHistoryPage> {
                   ),
               ],
       ),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _songs.isEmpty
           ? _buildEmpty()
@@ -202,9 +203,9 @@ class _PlayHistoryPageState extends State<PlayHistoryPage> {
                     },
                   ),
                 ),
-                const MiniPlayer(),
               ],
             ),
+        ),
         );
       },
     );

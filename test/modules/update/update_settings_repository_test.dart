@@ -15,6 +15,18 @@ void main() {
     expect(await repo.getUpdateReminderEnabled(), isFalse);
   });
 
+  test('旧版应用图标默认关闭', () async {
+    SharedPreferences.setMockInitialValues({});
+    expect(await SettingsRepository().getLegacyAppIconEnabled(), isFalse);
+  });
+
+  test('旧版应用图标开关写入后可读回', () async {
+    SharedPreferences.setMockInitialValues({});
+    final repo = SettingsRepository();
+    await repo.setLegacyAppIconEnabled(true);
+    expect(await repo.getLegacyAppIconEnabled(), isTrue);
+  });
+
   test('上次检查时间为空时返回 0', () async {
     SharedPreferences.setMockInitialValues({});
     expect(await SettingsRepository().getUpdateLastCheckMs(), 0);

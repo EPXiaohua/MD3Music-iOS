@@ -4,6 +4,8 @@ import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/services/equalizer_service.dart';
+import '../../core/services/viper_master_service.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 
@@ -537,21 +539,34 @@ class _SoundsPageState extends State<SoundsPage> {
   }
 
   Future<void> _apply(KugouSoundItem item) async {
-    final eq = EqualizerService.instance;
     final preset = mapPreset(item);
-    await eq.setEnabled(true);
-    await eq.applyPreset(preset);
+    String route;
+    if (ViperMasterService.instance.enabled) {
+      // 母带链开启：路由到蝰蛇 10 段曲线（mapPreset 的键与 viperCurves 对齐）
+      await ViperMasterService.instance.applyPreset(preset);
+      route = '蝰蛇母带 10 段：$preset';
+    } else {
+      // 既有路径：系统 5 段均衡器预设
+      final eq = EqualizerService.instance;
+      await eq.setEnabled(true);
+      await eq.applyPreset(preset);
+      route = '均衡器预设：$preset';
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('sound_applied_id', item.id);
     await prefs.setString('sound_applied_name', item.name);
     if (!mounted) return;
     setState(() => _appliedId = item.id);
-    showToast('已应用「${item.name}」· 均衡器预设：$preset');
+    showToast('已应用「${item.name}」· $route');
   }
 
   Future<void> _unapply() async {
-    final eq = EqualizerService.instance;
-    await eq.applyPreset('正常');
+    if (ViperMasterService.instance.enabled) {
+      await ViperMasterService.instance.applyPreset('正常');
+    } else {
+      final eq = EqualizerService.instance;
+      await eq.applyPreset('正常');
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('sound_applied_id');
     await prefs.remove('sound_applied_name');
@@ -632,10 +647,10 @@ class _SoundsPageState extends State<SoundsPage> {
       );
     }
     return ListView(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
       children: [
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.xs),
           child: Text(
             '匹配到 ${_searchResults.length} 个音效',
             style: Theme.of(
@@ -678,13 +693,13 @@ class _SoundsPageState extends State<SoundsPage> {
         SliverToBoxAdapter(
           child: _loadingMore
               ? const Padding(
-                  padding: EdgeInsets.all(16),
+                  padding: EdgeInsets.all(AppSpacing.lg),
                   child: Center(child: M3ELoadingIndicator()),
                 )
               : (_hasMore
-                    ? const SizedBox(height: 24)
+                    ? const Gap(AppSpacing.xl)
                     : Padding(
-                        padding: const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(AppSpacing.lg),
                         child: Center(
                           child: Text(
                             list.isEmpty ? '暂无音效' : '没有更多了',
@@ -723,11 +738,11 @@ class _SoundsPageState extends State<SoundsPage> {
       widgets.add(
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+            padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.xs),
             child: Row(
               children: [
                 Text(tag, style: Theme.of(context).textTheme.titleSmall),
-                const SizedBox(width: 8),
+                const Gap(AppSpacing.sm),
                 Text(
                   '${items.length}',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -754,7 +769,7 @@ class _SoundsPageState extends State<SoundsPage> {
   Widget _buildFilterPanel(ColorScheme cs) {
     return Container(
       color: cs.surfaceContainer.withValues(alpha: 0.5),
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.md, AppSpacing.lg, AppSpacing.sm),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -769,7 +784,7 @@ class _SoundsPageState extends State<SoundsPage> {
                   (_SoundCatalog.earphone, '耳机'),
                 ])
                   Padding(
-                    padding: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.only(right: AppSpacing.sm),
                     child: ChoiceChip(
                       label: Text(entry.$2),
                       selected: _catalog == entry.$1,
@@ -780,7 +795,7 @@ class _SoundsPageState extends State<SoundsPage> {
             ),
           ),
           if (_catalog == _SoundCatalog.earphone) ...[
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             if (_brands.isEmpty)
               Text(
                 '暂无品牌数据',
@@ -795,7 +810,7 @@ class _SoundsPageState extends State<SoundsPage> {
                   scrollDirection: Axis.horizontal,
                   children: [
                     Padding(
-                      padding: const EdgeInsets.only(right: 8),
+                      padding: const EdgeInsets.only(right: AppSpacing.sm),
                       child: FilterChip(
                         label: const Text('全部'),
                         selected: _selectedBrandId == null,
@@ -804,7 +819,7 @@ class _SoundsPageState extends State<SoundsPage> {
                     ),
                     for (final brand in _brands)
                       Padding(
-                        padding: const EdgeInsets.only(right: 8),
+                        padding: const EdgeInsets.only(right: AppSpacing.sm),
                         child: FilterChip(
                           avatar: brand.logo == null
                               ? null
@@ -823,7 +838,7 @@ class _SoundsPageState extends State<SoundsPage> {
               ),
           ],
           if (_catalog == _SoundCatalog.community) ...[
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             SegmentedButton<int?>(
               segments: const [
                 ButtonSegment(value: null, label: Text('全部')),
@@ -837,7 +852,7 @@ class _SoundsPageState extends State<SoundsPage> {
               }),
             ),
           ],
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           if (_catalog == _SoundCatalog.community)
             SizedBox(
               height: 40,
@@ -845,7 +860,7 @@ class _SoundsPageState extends State<SoundsPage> {
                 scrollDirection: Axis.horizontal,
                 children: [
                   Padding(
-                    padding: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.only(right: AppSpacing.sm),
                     child: FilterChip(
                       label: const Text('全部分类'),
                       selected: _tag == null,
@@ -854,7 +869,7 @@ class _SoundsPageState extends State<SoundsPage> {
                   ),
                   for (final t in _availableTags)
                     Padding(
-                      padding: const EdgeInsets.only(right: 8),
+                      padding: const EdgeInsets.only(right: AppSpacing.sm),
                       child: FilterChip(
                         label: Text(t),
                         selected: _tag == t,
@@ -864,7 +879,7 @@ class _SoundsPageState extends State<SoundsPage> {
                 ],
               ),
             ),
-          const SizedBox(height: 4),
+          const Gap(AppSpacing.xs),
           Text(
             '已过滤需会员或仅 VPF 的音效；应用即时生效并持久化，重启后自动恢复。',
             style: Theme.of(
@@ -878,11 +893,11 @@ class _SoundsPageState extends State<SoundsPage> {
 
   void _showDetail(KugouSoundItem item) {
     final cs = Theme.of(context).colorScheme;
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       showDragHandle: true,
       builder: (ctx) => Padding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, AppSpacing.xl),
         child: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -891,7 +906,7 @@ class _SoundsPageState extends State<SoundsPage> {
               Row(
                 children: [
                   _SoundIcon(item: item, size: 56),
-                  const SizedBox(width: 12),
+                  const Gap(AppSpacing.md),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -900,13 +915,13 @@ class _SoundsPageState extends State<SoundsPage> {
                           item.name,
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
-                        const SizedBox(height: 4),
+                        const Gap(AppSpacing.xs),
                         Text(
                           '${item.sourceLabel} · ${item.tagName} · ${item.author}',
                           style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: cs.onSurfaceVariant),
                         ),
-                        const SizedBox(height: 4),
+                        const Gap(AppSpacing.xs),
                         Text(
                           '${_formatUserCount(item.userCount)}人使用',
                           style: Theme.of(context).textTheme.bodySmall
@@ -918,7 +933,7 @@ class _SoundsPageState extends State<SoundsPage> {
                 ],
               ),
               if (item.labels.isNotEmpty) ...[
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 Wrap(
                   spacing: 6,
                   runSpacing: 6,
@@ -933,7 +948,7 @@ class _SoundsPageState extends State<SoundsPage> {
                 ),
               ],
               if (item.intro.isNotEmpty) ...[
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 Text(item.intro, style: Theme.of(context).textTheme.bodySmall),
               ],
               const SizedBox(height: 20),
@@ -980,7 +995,7 @@ class _SoundIcon extends StatelessWidget {
         height: size,
         decoration: BoxDecoration(
           color: cs.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: AppRadius.mdAll,
         ),
         child: Icon(
           Icons.spatial_audio_off,
@@ -990,7 +1005,7 @@ class _SoundIcon extends StatelessWidget {
       );
     }
     return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: AppRadius.mdAll,
       child: CachedNetworkImage(
         imageUrl: iconUrl,
         width: size,
@@ -1031,11 +1046,11 @@ class _SoundTile extends StatelessWidget {
     return InkWell(
       onTap: onTap,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
         child: Row(
           children: [
             _SoundIcon(item: item),
-            const SizedBox(width: 12),
+            const Gap(AppSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1055,7 +1070,7 @@ class _SoundTile extends StatelessWidget {
                           margin: const EdgeInsets.only(left: 6),
                           padding: const EdgeInsets.symmetric(
                             horizontal: 6,
-                            vertical: 2,
+                            vertical: AppSpacing.xxs,
                           ),
                           decoration: BoxDecoration(
                             color: cs.primaryContainer,
@@ -1071,7 +1086,7 @@ class _SoundTile extends StatelessWidget {
                         ),
                     ],
                   ),
-                  const SizedBox(height: 4),
+                  const Gap(AppSpacing.xs),
                   Text(
                     '${item.sourceLabel} · ${item.tagName} · ${item.author} · ${_formatUserCount(item.userCount)}人使用',
                     maxLines: 1,

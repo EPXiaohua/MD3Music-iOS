@@ -10,6 +10,8 @@
 /// 详见 spec.md "Requirement: 统一歌词模型" 与 tasks.md Task 5.3。
 library;
 
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/apple_lyrics/parsers/krc_parser.dart';
@@ -32,14 +34,17 @@ class LyricParserChain {
   static final RegExp _krcLineRegex = RegExp(r'^\[\d+,\d+\]');
 
   /// LRC/增强型 LRC 行首时间戳正则：`[mm:ss.xx]` / `[mm:ss.xxx]` 或 `<mm:ss.xx>` 后接任意内容。
-  static final RegExp _lrcLineRegex =
-      RegExp(r'^[\[<]\d{2}:\d{2}\.\d{2,3}[\]>]');
+  static final RegExp _lrcLineRegex = RegExp(
+    r'^[\[<]\d{2}:\d{2}\.\d{2,3}[\]>]',
+  );
 
   /// 通用 KRC/LRC 元数据文本头正则：`[字母开头的文本标识符:...]`。
   ///
   /// 覆盖所有字母型文本头（[id:、[ar:、[ti:、[total:、[language:[manualoffset:] 等），
   /// 避免枚举遗漏导致格式误判。以数字开头的行（KRC `[123,456]`、LRC `[01:02.03]`）不会命中。
-  static final RegExp _metadataHeaderRegex = RegExp(r'^\[[A-Za-z][A-Za-z0-9]*:');
+  static final RegExp _metadataHeaderRegex = RegExp(
+    r'^\[[A-Za-z][A-Za-z0-9]*:',
+  );
 
   /// 元数据行前缀列表（KRC 与 LRC 合并去重，两者完全一致）。
   ///
@@ -70,8 +75,11 @@ class LyricParserChain {
   /// 各行。容差 500ms；翻译文本无时间戳时降级为按行序号顺序匹配。
   ///
   /// [romaText] 同理，但合并到 [LyricLine.roma] 字段（与 translation 并列）。
-  static List<LyricLine> parse(String text,
-      {String? translationText, String? romaText}) {
+  static List<LyricLine> parse(
+    String text, {
+    String? translationText,
+    String? romaText,
+  }) {
     try {
       final format = detectFormat(text);
       var lines = _delegate(text, format);
@@ -97,8 +105,12 @@ class LyricParserChain {
   /// 各行。容差 500ms；翻译文本无时间戳时降级为按行序号顺序匹配。
   ///
   /// [romaText] 同理，但合并到 [LyricLine.roma] 字段。
-  static List<LyricLine> parseAs(String text, LyricFormat format,
-      {String? translationText, String? romaText}) {
+  static List<LyricLine> parseAs(
+    String text,
+    LyricFormat format, {
+    String? translationText,
+    String? romaText,
+  }) {
     try {
       var lines = _delegate(text, format);
       if (translationText != null && translationText.isNotEmpty) {
@@ -117,7 +129,7 @@ class LyricParserChain {
   ///
   /// 算法：
   /// 1. 用 [LrcParser] 解析 text 得到 [List<LyricLine>]（仅取 startTime + text）
-  /// 2. 对每个原文行，查找时间戳差值最小且 <= 500ms 的翻译行
+  /// 2. 在线性时间内查找时间戳差值最小且 <= 500ms 的翻译行
   /// 3. 命中则用 [LyricLine.copyWith] 替换原文行的 translation 或 roma 字段
   ///
   /// 容差 500ms 用于吸收 KRC（毫秒）vs LRC 翻译（百分秒）轻微错位。
@@ -125,13 +137,18 @@ class LyricParserChain {
   ///
   /// [isRoma] 为 true 时写入 [LyricLine.roma]，否则写入 [LyricLine.translation]。
   static List<LyricLine> _mergeField(
-      List<LyricLine> lines, String text, {required bool isRoma}) {
+    List<LyricLine> lines,
+    String text, {
+    required bool isRoma,
+  }) {
     final fieldLines = LrcParser.parse(text);
     final fieldLabel = isRoma ? 'roma' : 'translation';
-    debugPrint('[LyriconDebug._mergeField] '
-        'lines.len=${lines.length}, $fieldLabel.len=${text.length}, '
-        'fieldLines.len=${fieldLines.length}, '
-        'hasTimestamps=${fieldLines.any((l) => l.startTime > 0)}');
+    debugPrint(
+      '[LyriconDebug._mergeField] '
+      'lines.len=${lines.length}, $fieldLabel.len=${text.length}, '
+      'fieldLines.len=${fieldLines.length}, '
+      'hasTimestamps=${fieldLines.any((l) => l.startTime > 0)}',
+    );
     if (fieldLines.isEmpty) return lines;
 
     // 降级判断：若解析后所有行 startTime 都是 0，说明是纯文本（无时间戳），
@@ -140,17 +157,28 @@ class LyricParserChain {
 
     final List<LyricLine> result = [];
     int matchedCount = 0;
+    var timestampCursor = 0;
     for (int i = 0; i < lines.length; i++) {
       String? matched;
       if (hasTimestamps) {
-        // 最近邻：找时间戳差值最小且 <= 500ms 的行
-        int bestDelta = 501; // 容差 +1 作为哨兵
-        for (final tl in fieldLines) {
-          final delta = (tl.startTime - lines[i].startTime).abs();
-          if (delta <= 500 && delta < bestDelta) {
-            bestDelta = delta;
-            matched = tl.text;
+        // 两侧歌词均按时间排序：游标只向前移动即可找到最近邻，
+        // 避免长歌词对每一主行都重新扫描全部翻译（O(n*m)）。
+        while (timestampCursor + 1 < fieldLines.length) {
+          final currentDelta =
+              (fieldLines[timestampCursor].startTime - lines[i].startTime)
+                  .abs();
+          final nextDelta =
+              (fieldLines[timestampCursor + 1].startTime - lines[i].startTime)
+                  .abs();
+          if (nextDelta < currentDelta) {
+            timestampCursor++;
+          } else {
+            break;
           }
+        }
+        final candidate = fieldLines[timestampCursor];
+        if ((candidate.startTime - lines[i].startTime).abs() <= 500) {
+          matched = candidate.text;
         }
       } else {
         // 降级：按行序号匹配
@@ -159,13 +187,17 @@ class LyricParserChain {
         }
       }
       if (matched != null) matchedCount++;
-      result.add(matched == null
-          ? lines[i]
-          : isRoma
-              ? lines[i].copyWith(roma: matched)
-              : lines[i].copyWith(translation: matched));
+      result.add(
+        matched == null
+            ? lines[i]
+            : isRoma
+            ? lines[i].copyWith(roma: matched)
+            : lines[i].copyWith(translation: matched),
+      );
     }
-    debugPrint('[LyriconDebug._mergeField] $fieldLabel matched=$matchedCount/${lines.length}');
+    debugPrint(
+      '[LyriconDebug._mergeField] $fieldLabel matched=$matchedCount/${lines.length}',
+    );
     return result;
   }
 
@@ -187,8 +219,7 @@ class LyricParserChain {
     // 避免 LRC 正文任意位置出现 "<tt " 或 ttml 命名空间字符串而误判。
     if (_looksLikeTtml(text)) return LyricFormat.ttml;
 
-    final lines = text.split(RegExp(r'\r?\n'));
-    for (final rawLine in lines) {
+    for (final rawLine in LineSplitter.split(text)) {
       final line = rawLine.trim();
 
       // 空行跳过

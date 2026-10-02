@@ -28,11 +28,7 @@ void main() {
     int duration = 1000,
     String text = '运',
   }) {
-    return LyricWord(
-      startTime: startTime,
-      duration: duration,
-      text: text,
-    );
+    return LyricWord(startTime: startTime, duration: duration, text: text);
   }
 
   group('shouldEmphasize', () {
@@ -232,31 +228,52 @@ void main() {
         LyricLine(startTime: 0, duration: 2000, text: text);
 
     test('作词：李宗盛 → true（元数据行）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('作词：李宗盛')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('作词：李宗盛')),
+        isTrue,
+      );
     });
 
     test('作曲:黄韵玲 → true（半角冒号）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('作曲:黄韵玲')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('作曲:黄韵玲')),
+        isTrue,
+      );
     });
 
     test('编曲：陈志远 → true', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('编曲：陈志远')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('编曲：陈志远')),
+        isTrue,
+      );
     });
 
     test('制作人：林迈可 → true', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('制作人：林迈可')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('制作人：林迈可')),
+        isTrue,
+      );
     });
 
     test('混音：XXX → true', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('混音：张三')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('混音：张三')),
+        isTrue,
+      );
     });
 
     test('OP：环球音乐 → true', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('OP：环球音乐')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('OP：环球音乐')),
+        isTrue,
+      );
     });
 
     test('OP: Universal → true（半角冒号）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('OP: Universal')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('OP: Universal')),
+        isTrue,
+      );
     });
 
     test('空行 → true', () {
@@ -264,24 +281,39 @@ void main() {
     });
 
     test('纯空白行 → true', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('   ')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('   ')),
+        isTrue,
+      );
     });
 
     test('月亮代表我的心 → false（正常歌词）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('月亮代表我的心')), isFalse);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('月亮代表我的心')),
+        isFalse,
+      );
     });
 
     test('I love you → false（英文歌词）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('I love you')), isFalse);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('I love you')),
+        isFalse,
+      );
     });
 
     test('男：你好 → false（对唱歌词行，不跳过整行）', () {
       // 男：你好 不应整行跳过，只应跳过 "男：" 这个 word → 字级与行级过滤分工
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('男：你好')), isFalse);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('男：你好')),
+        isFalse,
+      );
     });
 
     test('  作词：李宗盛  → true（带前后空格）', () {
-      expect(EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('  作词：李宗盛  ')), isTrue);
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('  作词：李宗盛  ')),
+        isTrue,
+      );
     });
   });
 
@@ -484,18 +516,33 @@ void main() {
       //   wordIndex=2：wordDe=533.3,  bump t=(1000-533.3)/2000=0.233 → 更小
       // → 从左到右 scale 依次递减（左字先放大，右字后放大）
       final word = makeWord(duration: 2000, text: '运');
-      final double s0 = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 3,
-      ).scale;
-      final double s1 = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 1, anchorCharCount: 3,
-      ).scale;
-      final double s2 = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 2, anchorCharCount: 3,
-      ).scale;
+      final double s0 = effect
+          .computeState(
+            word: word,
+            currentTimeMs: 1000,
+            isLastWord: false,
+            wordIndex: 0,
+            anchorCharCount: 3,
+          )
+          .scale;
+      final double s1 = effect
+          .computeState(
+            word: word,
+            currentTimeMs: 1000,
+            isLastWord: false,
+            wordIndex: 1,
+            anchorCharCount: 3,
+          )
+          .scale;
+      final double s2 = effect
+          .computeState(
+            word: word,
+            currentTimeMs: 1000,
+            isLastWord: false,
+            wordIndex: 2,
+            anchorCharCount: 3,
+          )
+          .scale;
       expect(s0, greaterThan(s1));
       expect(s1, greaterThan(s2));
     });
@@ -506,12 +553,18 @@ void main() {
       //   wordIndex=2：offsetXEm = -transX*0.03*amount*(3/2-2) > 0（向右）
       final word = makeWord(duration: 2000, text: '运');
       final EmphasizeState s0 = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 3,
+        word: word,
+        currentTimeMs: 1000,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 3,
       );
       final EmphasizeState s2 = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 2, anchorCharCount: 3,
+        word: word,
+        currentTimeMs: 1000,
+        isLastWord: false,
+        wordIndex: 2,
+        anchorCharCount: 3,
       );
       expect(s0.offsetXEm, lessThan(0));
       expect(s2.offsetXEm, greaterThan(0));
@@ -520,16 +573,25 @@ void main() {
     test('上浮随凸起涨落：t=0 无上浮、t=0.5 最大、t=1 回落', () {
       final word = makeWord(duration: 2000, text: '运');
       final EmphasizeState s0 = effect.computeState(
-        word: word, currentTimeMs: 0, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 0,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       final EmphasizeState sMid = effect.computeState(
-        word: word, currentTimeMs: 1000, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 1000,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       final EmphasizeState sEnd = effect.computeState(
-        word: word, currentTimeMs: 2000, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 2000,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       // 上浮为负值（向上），t=0.5 时最上
       expect(s0.offsetYEm, closeTo(0.0, 1e-9));
@@ -543,8 +605,11 @@ void main() {
       //   floatX = (300-(-400))/1400 = 0.5 → floatYEm = -sin(π/2)*0.05 = -0.05（最大上浮）
       final word = makeWord(duration: 1000, text: '运');
       final EmphasizeState peak = effect.computeState(
-        word: word, currentTimeMs: 300, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 300,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       expect(peak.floatYEm, closeTo(-0.05, 1e-9));
     });
@@ -556,16 +621,25 @@ void main() {
       //   bumpPhase=0.2（≥0.15）：edgeFade=1 → 完整浮层
       final word = makeWord(duration: 1000, text: '运');
       final EmphasizeState s0 = effect.computeState(
-        word: word, currentTimeMs: 0, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 0,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       final EmphasizeState sFade = effect.computeState(
-        word: word, currentTimeMs: 100, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 100,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       final EmphasizeState sFull = effect.computeState(
-        word: word, currentTimeMs: 200, isLastWord: false,
-        wordIndex: 0, anchorCharCount: 1,
+        word: word,
+        currentTimeMs: 200,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
       );
       // 切入瞬间无跳变上移
       expect(s0.floatYEm, closeTo(0.0, 1e-9));
@@ -577,11 +651,17 @@ void main() {
 
   group('cubicBezier', () {
     test('t=0 返回 0', () {
-      expect(EmphasizeEffect.cubicBezier(0, 0.2, 0.4, 0.58, 1.0), closeTo(0.0, 1e-9));
+      expect(
+        EmphasizeEffect.cubicBezier(0, 0.2, 0.4, 0.58, 1.0),
+        closeTo(0.0, 1e-9),
+      );
     });
 
     test('t=1 返回 1', () {
-      expect(EmphasizeEffect.cubicBezier(1, 0.2, 0.4, 0.58, 1.0), closeTo(1.0, 1e-9));
+      expect(
+        EmphasizeEffect.cubicBezier(1, 0.2, 0.4, 0.58, 1.0),
+        closeTo(1.0, 1e-9),
+      );
     });
 
     test('t=0.5 返回值在 (0, 1) 之间', () {
@@ -594,11 +674,23 @@ void main() {
 
     test('bezIn 与 bezOut 在 t=0/1 端点一致（均为 0 或 1）', () {
       // bezIn(0) = 0, bezIn(1) = 1
-      expect(EmphasizeEffect.cubicBezier(0, 0.2, 0.4, 0.58, 1.0), closeTo(0.0, 1e-9));
-      expect(EmphasizeEffect.cubicBezier(1, 0.2, 0.4, 0.58, 1.0), closeTo(1.0, 1e-9));
+      expect(
+        EmphasizeEffect.cubicBezier(0, 0.2, 0.4, 0.58, 1.0),
+        closeTo(0.0, 1e-9),
+      );
+      expect(
+        EmphasizeEffect.cubicBezier(1, 0.2, 0.4, 0.58, 1.0),
+        closeTo(1.0, 1e-9),
+      );
       // bezOut(0) = 0, bezOut(1) = 1
-      expect(EmphasizeEffect.cubicBezier(0, 0.3, 0.0, 0.58, 1.0), closeTo(0.0, 1e-9));
-      expect(EmphasizeEffect.cubicBezier(1, 0.3, 0.0, 0.58, 1.0), closeTo(1.0, 1e-9));
+      expect(
+        EmphasizeEffect.cubicBezier(0, 0.3, 0.0, 0.58, 1.0),
+        closeTo(0.0, 1e-9),
+      );
+      expect(
+        EmphasizeEffect.cubicBezier(1, 0.3, 0.0, 0.58, 1.0),
+        closeTo(1.0, 1e-9),
+      );
     });
 
     test('bezier 单调递增（p1/p2 均在 [0,1] 且 p1<=p2 时）', () {
@@ -741,11 +833,7 @@ void main() {
     LyricLine makeKrcLine(List<int> durations) {
       final words = List<LyricWord>.generate(
         durations.length,
-        (i) => LyricWord(
-          startTime: 0,
-          duration: durations[i],
-          text: '运',
-        ),
+        (i) => LyricWord(startTime: 0, duration: durations[i], text: '运'),
       );
       return LyricLine(
         startTime: 0,
@@ -756,50 +844,38 @@ void main() {
     }
 
     /// 构造 LRC 行（无逐字时间戳）。
-    LyricLine makeLrcLine(String text) => LyricLine(
-          startTime: 0,
-          duration: 1000,
-          text: text,
-        );
+    LyricLine makeLrcLine(String text) =>
+        LyricLine(startTime: 0, duration: 1000, text: text);
 
-    test('songBpm=120 → 阈值 800（一字一拍 500ms × 1.6）', () {
-      expect(
-        EmphasizeEffect.resolveThresholdMs(songBpm: 120),
-        800,
-      );
+    test('songBpm=120 → 阈值 600（一字一拍 500ms × 默认系数 1.2）', () {
+      expect(EmphasizeEffect.resolveThresholdMs(songBpm: 120), 600);
     });
 
-    test('songBpm=80 → 阈值 1200（一字一拍 750ms × 1.6）', () {
-      expect(
-        EmphasizeEffect.resolveThresholdMs(songBpm: 80),
-        1200,
-      );
+    test('songBpm=80 → 阈值 900（一字一拍 750ms × 默认系数 1.2）', () {
+      expect(EmphasizeEffect.resolveThresholdMs(songBpm: 80), 900);
     });
 
-    test('无 BPM，KRC 字长中位数 400 → 阈值 640（快歌自适应）', () {
+    test('无 BPM，KRC 字长中位数 400 → 阈值 480（快歌自适应）', () {
       final lines = [makeKrcLine(List.filled(30, 400))];
-      expect(EmphasizeEffect.resolveThresholdMs(lines: lines), 640);
+      expect(EmphasizeEffect.resolveThresholdMs(lines: lines), 480);
     });
 
-    test('无 BPM，KRC 字长中位数 800 → 阈值 1280（慢歌自适应）', () {
+    test('无 BPM，KRC 字长中位数 800 → 阈值 960（慢歌自适应）', () {
       final lines = [makeKrcLine(List.filled(30, 800))];
-      expect(EmphasizeEffect.resolveThresholdMs(lines: lines), 1280);
+      expect(EmphasizeEffect.resolveThresholdMs(lines: lines), 960);
     });
 
     test('阈值随字长连续变化（无固定档位）', () {
       final lines500 = [makeKrcLine(List.filled(30, 500))];
       final lines600 = [makeKrcLine(List.filled(30, 600))];
       final lines700 = [makeKrcLine(List.filled(30, 700))];
-      expect(EmphasizeEffect.resolveThresholdMs(lines: lines500), 800);
-      expect(EmphasizeEffect.resolveThresholdMs(lines: lines600), 960);
-      expect(EmphasizeEffect.resolveThresholdMs(lines: lines700), 1120);
+      expect(EmphasizeEffect.resolveThresholdMs(lines: lines500), 600);
+      expect(EmphasizeEffect.resolveThresholdMs(lines: lines600), 720);
+      expect(EmphasizeEffect.resolveThresholdMs(lines: lines700), 840);
     });
 
     test('无 BPM 且纯 LRC（无逐字）→ 兜底默认 500', () {
-      final lines = [
-        makeLrcLine('第一行'),
-        makeLrcLine('第二行'),
-      ];
+      final lines = [makeLrcLine('第一行'), makeLrcLine('第二行')];
       expect(EmphasizeEffect.resolveThresholdMs(lines: lines), 500);
     });
 
@@ -809,25 +885,23 @@ void main() {
     });
 
     test('songBpm 优先于歌词统计', () {
-      // 歌词字长中位数 800（本应得 1280），但显式 BPM=120 → 800 优先
+      // 歌词字长中位数 800（本应得 960），但显式 BPM=120 → 600 优先
       final lines = [makeKrcLine(List.filled(30, 800))];
       expect(
         EmphasizeEffect.resolveThresholdMs(lines: lines, songBpm: 120),
-        800,
+        600,
       );
     });
 
     test('阈值系数可显式传入（设置项 1.0~2.0 映射到阈值）', () {
       final lines = [makeKrcLine(List.filled(30, 400))];
-      // 系数 1.0 → 400；1.6（默认）→ 640；2.0 → 800
+      // 系数 1.0 → 400；1.2（默认）→ 480；2.0 → 800
       expect(
-        EmphasizeEffect.resolveThresholdMs(
-            lines: lines, thresholdFactor: 1.0),
+        EmphasizeEffect.resolveThresholdMs(lines: lines, thresholdFactor: 1.0),
         400,
       );
       expect(
-        EmphasizeEffect.resolveThresholdMs(
-            lines: lines, thresholdFactor: 2.0),
+        EmphasizeEffect.resolveThresholdMs(lines: lines, thresholdFactor: 2.0),
         800,
       );
     });
@@ -837,23 +911,14 @@ void main() {
     test('thresholdMs=1000 时 500ms 字不触发、1000ms 字触发', () {
       final fast = makeWord(duration: 500, text: '运');
       final slow = makeWord(duration: 1000, text: '运');
-      expect(
-        EmphasizeEffect.shouldEmphasize(fast, thresholdMs: 1000),
-        isFalse,
-      );
-      expect(
-        EmphasizeEffect.shouldEmphasize(slow, thresholdMs: 1000),
-        isTrue,
-      );
+      expect(EmphasizeEffect.shouldEmphasize(fast, thresholdMs: 1000), isFalse);
+      expect(EmphasizeEffect.shouldEmphasize(slow, thresholdMs: 1000), isTrue);
     });
 
     test('thresholdMs=500（默认）时 500ms 字触发', () {
       final word = makeWord(duration: 500, text: '运');
       expect(EmphasizeEffect.shouldEmphasize(word), isTrue);
-      expect(
-        EmphasizeEffect.shouldEmphasize(word, thresholdMs: 500),
-        isTrue,
-      );
+      expect(EmphasizeEffect.shouldEmphasize(word, thresholdMs: 500), isTrue);
     });
   });
 }

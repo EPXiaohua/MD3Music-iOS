@@ -93,6 +93,7 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
 
   /// 是否有解析正在进行（避免 resumed 与 song 变化叠加触发重复初始化）
   bool _resolving = false;
+  bool _resolveAgain = false;
 
   @override
   void initState() {
@@ -158,10 +159,19 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
 
   /// 解析入口（带并发去重）：切歌 / 开关变化 / 回前台都走这里。
   Future<void> _resolve() async {
-    if (_resolving) return;
+    if (_resolving) {
+      // 当前请求可能正在等视频初始化；切歌/前后台事件使其结果过期，
+      // 当前请求收尾后再按最新widget状态解析，不能静默丢掉这次更新。
+      _resolveAgain = true;
+      _loadVersion++;
+      return;
+    }
     _resolving = true;
     try {
-      await _resolveNow();
+      do {
+        _resolveAgain = false;
+        await _resolveNow();
+      } while (_resolveAgain && mounted);
     } finally {
       _resolving = false;
     }
@@ -240,21 +250,38 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
   }
 
   Future<bool> _init(VideoPlayerController Function() create, int version) async {
+    // 在状态接纳前由本地变量拥有；初始化/静音/循环任一步失败都必须释放。
+    VideoPlayerController? candidate;
     try {
       final controller = create();
+      candidate = controller;
       await controller.initialize();
       // 静音：动态封面只做视觉，绝不出声、不申请音频焦点
       await controller.setVolume(0);
       await controller.setLooping(true);
       if (!mounted || version != _loadVersion) {
+        candidate = null;
         await controller.dispose();
         return false;
       }
       _controller = controller;
       controller.addListener(_onControllerChanged);
       _syncPlayback();
+      // 到这里由State负责后续释放。
+      candidate = null;
       return true;
     } catch (e) {
+      final failed = candidate;
+      candidate = null;
+      if (failed != null) {
+        if (identical(_controller, failed)) {
+          _controller = null;
+          failed.removeListener(_onControllerChanged);
+        }
+        try {
+          await failed.dispose();
+        } catch (_) {}
+      }
       debugPrint('[DynamicCover] init failed: $e');
       return false;
     }

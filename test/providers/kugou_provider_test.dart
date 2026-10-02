@@ -1,11 +1,14 @@
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/providers/kugou_provider.dart';
 import 'package:md3music/services/kugou_api/kugou_api_client.dart';
 import 'package:md3music/services/kugou_api/kugou_models.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../test_helpers/fake_secure_storage.dart';
 
 /// KugouProvider 歌词 getter 行为测试（Task 16）。
 ///
@@ -27,6 +30,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// （`full_player.dart:91` 调用 `kugouProvider.getLyric(songId, songName: song.title)`，
 /// 任何签名变更都会导致编译失败）。
 void main() {
+  late HttpClientAdapter originalApiAdapter;
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+    installFakeSecureStorage();
+    final apiClient = KugouApiClient();
+    originalApiAdapter = apiClient.dio.httpClientAdapter;
+    apiClient.dio.httpClientAdapter = _SuccessfulApiAdapter();
+  });
+  tearDown(() {
+    KugouApiClient().dio.httpClientAdapter = originalApiAdapter;
+    uninstallFakeSecureStorage();
+  });
+
   group('KugouProvider 歌词 getter (Task 16)', () {
     late KugouProvider provider;
 
@@ -38,17 +54,14 @@ void main() {
       provider.dispose();
     });
 
-    test('SubTask 16.2: 暴露 krcLyric 与 lrcLyric 两个 getter，返回 KugouLyric?',
-        () {
+    test('SubTask 16.2: 暴露 krcLyric 与 lrcLyric 两个 getter，返回 KugouLyric?', () {
       // 初始状态：两个新 getter 都应返回 null
       // 返回类型 KugouLyric? 由 getter 声明静态保证，无需运行时校验
       expect(provider.krcLyric, isNull);
       expect(provider.lrcLyric, isNull);
     });
 
-    test(
-        'SubTask 16.3: 保留现有 lyric getter 兼容旧代码（返回 krcLyric ?? lrcLyric）',
-        () {
+    test('SubTask 16.3: 保留现有 lyric getter 兼容旧代码（返回 krcLyric ?? lrcLyric）', () {
       // 初始时三个 getter 均为 null，关系 lyric == krcLyric ?? lrcLyric 成立
       expect(provider.lyric, isNull);
       expect(provider.lyric, equals(provider.krcLyric ?? provider.lrcLyric));
@@ -100,10 +113,7 @@ void main() {
       expect(bothLyric.displayLrcLyric, lrcText);
 
       // 仅 LRC：displayLyric 降级返回 LRC
-      final lrcOnlyLyric = KugouLyric(
-        content: 'raw',
-        decodedContent: lrcText,
-      );
+      final lrcOnlyLyric = KugouLyric(content: 'raw', decodedContent: lrcText);
       expect(lrcOnlyLyric.displayLyric, lrcText);
       expect(lrcOnlyLyric.displayKrcLyric, isNull);
       expect(lrcOnlyLyric.displayLrcLyric, lrcText);
@@ -123,6 +133,8 @@ void main() {
     TestWidgetsFlutterBinding.ensureInitialized();
 
     late KugouProvider provider;
+    late Dio clientDio;
+    late HttpClientAdapter originalAdapter;
 
     setUp(() async {
       // 重置本地存储 + 标记本地服务器就绪（避免测试内等待 8s / 真实网络）
@@ -133,24 +145,28 @@ void main() {
       // 其内部用 path_provider 拿临时目录，测试环境无插件实现会抛未处理异常
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(
-        const MethodChannel('plugins.flutter.io/path_provider'),
-        (call) async => switch (call.method) {
-          'getTemporaryDirectory' ||
-          'getApplicationSupportDirectory' ||
-          'getApplicationDocumentsDirectory' ||
-          'getDownloadsDirectory' =>
-            Directory.systemTemp.path,
-          _ => null,
-        },
-      );
+            const MethodChannel('plugins.flutter.io/path_provider'),
+            (call) async => switch (call.method) {
+              'getTemporaryDirectory' ||
+              'getApplicationSupportDirectory' ||
+              'getApplicationDocumentsDirectory' ||
+              'getDownloadsDirectory' => Directory.systemTemp.path,
+              _ => null,
+            },
+          );
 
-      provider = KugouProvider();
+      final apiClient = KugouApiClient();
+      clientDio = apiClient.dio;
+      originalAdapter = clientDio.httpClientAdapter;
+      clientDio.httpClientAdapter = _SuccessfulApiAdapter();
       // 清除之前测试残留的单例内存账号列表（_accounts 跨测试共享）
-      await provider.apiClient.clearCookies();
+      await apiClient.clearCookies();
+      provider = KugouProvider();
     });
 
     tearDown(() {
       provider.dispose();
+      clientDio.httpClientAdapter = originalAdapter;
     });
 
     test('savedAccounts 暴露已保存的账号列表', () async {
@@ -185,10 +201,28 @@ void main() {
     test('switchAccount 切换到指定账号并更新当前账号', () async {
       await provider.apiClient.setLoginCookies('token_a', 'user_a');
       await provider.apiClient.setLoginCookies('token_b', 'user_b');
-      final ok = await provider.switchAccount('user_a');
-      expect(ok, isTrue);
+      final result = await provider.switchAccount('user_a');
+      expect(result, SwitchAccountResult.success);
       expect(provider.apiClient.userid, 'user_a');
       expect(provider.isLoggedIn, isTrue);
     });
   });
+}
+
+class _SuccessfulApiAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async => ResponseBody.fromString(
+    '{"status":1,"data":{"userid":"test-user","user_name":"测试用户"}}',
+    200,
+    headers: {
+      Headers.contentTypeHeader: ['application/json'],
+    },
+  );
+
+  @override
+  void close({bool force = false}) {}
 }

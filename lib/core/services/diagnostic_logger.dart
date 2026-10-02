@@ -138,9 +138,35 @@ class DiagnosticLogger {
     return lines.map((line) => '$prefix$line').join('\n');
   }
 
+  /// 写入或导出诊断材料前移除可直接定位资源或账号的值。
+  /// 日志仍保留事件上下文，但不保存完整网络/本地 URI、认证头和凭证字段。
+  static String sanitizeDiagnosticText(String value) {
+    final withoutUris = value.replaceAllMapped(
+      RegExp(r'''(?:https?|file|content)://[^\s"'<>]+''', caseSensitive: false),
+      (match) {
+        final uri = Uri.tryParse(match.group(0)!);
+        if (uri == null ||
+            (uri.scheme != 'http' && uri.scheme != 'https') ||
+            uri.host.isEmpty) {
+          return '[URI_REDACTED]';
+        }
+        return '${uri.scheme}://${uri.host}/[URI_REDACTED]';
+      },
+    );
+    return withoutUris.replaceAllMapped(
+      RegExp(
+        r'(["]?(?:authorization|proxy-authorization|cookie|set-cookie|access[_-]?token|refresh[_-]?token|token|password|passwd|dfid|mid|user[_-]?id)["]?\s*[:=]\s*["]?)(?:(?:Bearer|Basic)\s+)?[^\s,;&}"]+',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}[REDACTED]',
+    );
+  }
+
   void _append(DiagnosticLogLevel level, String message) {
     if (!_initialized || _logDir == null) return;
-    _pending.writeln(formatLine(DateTime.now(), level, message));
+    _pending.writeln(
+      formatLine(DateTime.now(), level, sanitizeDiagnosticText(message)),
+    );
     if (_pending.length >= _flushBufferThreshold) {
       unawaited(flush());
     }

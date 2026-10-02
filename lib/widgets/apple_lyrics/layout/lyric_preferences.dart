@@ -179,6 +179,24 @@ class LyricPreferences extends ChangeNotifier {
   /// - false：历史行为，从视口顶部行开始逐行累加错峰（上方行也错峰）。
   static const bool defaultStaggerFromCurrentLine = true;
 
+  // ============== 歌词模糊强度 ==============
+
+  /// 歌词模糊强度倍数下限。
+  ///
+  /// 0.5 时非当前行几乎清晰，是"关闭模糊观感"与"保留距离分级"的折中下限。
+  static const double minBlurIntensity = 0.5;
+
+  /// 歌词模糊强度倍数上限。
+  ///
+  /// 2.0 时最远行 sigma 达 10（原上限 5），再大会让整屏文字不可辨认，
+  /// 且离屏渲染的模糊图尺寸（padding=σ×3）显著膨胀。
+  static const double maxBlurIntensity = 2.0;
+
+  /// 歌词模糊强度倍数默认值。
+  ///
+  /// 1.0 = 历史行为（sigma 等于距离分级值 1~5），确保升级后视觉不变。
+  static const double defaultBlurIntensity = 1.0;
+
   // ============== 按设备类型的默认值（手机 / Pad） ==============
 
   /// 按设备类型的字号默认：手机 29px，Pad 40px。
@@ -204,6 +222,7 @@ class LyricPreferences extends ChangeNotifier {
   static const String _keyLineSpacing = 'lyric_line_spacing';
   static const String _keyFontWeight = 'lyric_font_weight';
   static const String _keyUseGaussianBlur = 'lyric_use_gaussian_blur';
+  static const String _keyBlurIntensity = 'lyric_blur_intensity';
   static const String _keyUseGlowEffect = 'lyric_use_glow_effect';
   static const String _keyUseFlowingBackground = 'lyric_use_flowing_background';
   static const String _keyFontSource = 'lyric_font_source';
@@ -229,6 +248,8 @@ class LyricPreferences extends ChangeNotifier {
   double _lineSpacing = defaultLineSpacing;
   int _fontWeight = defaultFontWeight;
   bool _useGaussianBlur = false;
+  // 歌词模糊强度倍数（默认 1.0 = 历史行为）
+  double _blurIntensity = defaultBlurIntensity;
   bool _useGlowEffect = true;
   bool _useFlowingBackground = false;
   bool _useDuetLayout = false;
@@ -267,6 +288,13 @@ class LyricPreferences extends ChangeNotifier {
   /// 歌词字重对应 [FontWeight]（供 TextStyle 使用）。
   FontWeight get fontWeight => FontWeight(_fontWeight);
   bool get useGaussianBlur => _useGaussianBlur;
+
+  /// 歌词模糊强度倍数（范围 [minBlurIntensity]~[maxBlurIntensity]）。
+  ///
+  /// 非当前行模糊图的 sigma = 距离分级值 × 本倍数，见
+  /// AppleLyricsView._blurGeometry。倍数保持"离当前行越远越糊"的相对关系。
+  double get blurIntensity => _blurIntensity;
+
   bool get useGlowEffect => _useGlowEffect;
   bool get useFlowingBackground => _useFlowingBackground;
   bool get useDuetLayout => _useDuetLayout;
@@ -357,6 +385,9 @@ class LyricPreferences extends ChangeNotifier {
         (prefs.getInt(_keyFontWeight) ?? _deviceDefaultFontWeight)
             .clamp(minFontWeight, maxFontWeight);
     _useGaussianBlur = prefs.getBool(_keyUseGaussianBlur) ?? false;
+    _blurIntensity =
+        (prefs.getDouble(_keyBlurIntensity) ?? defaultBlurIntensity)
+            .clamp(minBlurIntensity, maxBlurIntensity);
     _useGlowEffect = prefs.getBool(_keyUseGlowEffect) ?? true;
     _useFlowingBackground = prefs.getBool(_keyUseFlowingBackground) ?? false;
     _useDuetLayout = prefs.getBool(_keyUseDuetLayout) ?? false;
@@ -434,6 +465,16 @@ class LyricPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyUseGaussianBlur, enabled);
+  }
+
+  /// 设置歌词模糊强度倍数并持久化。
+  Future<void> setBlurIntensity(double value) async {
+    final clamped = value.clamp(minBlurIntensity, maxBlurIntensity);
+    if (clamped == _blurIntensity) return;
+    _blurIntensity = clamped;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keyBlurIntensity, _blurIntensity);
   }
 
   /// 设置辉光效果开关并持久化。
@@ -674,6 +715,7 @@ class LyricPreferences extends ChangeNotifier {
     _lineSpacing = _deviceDefaultLineSpacing;
     _fontWeight = _deviceDefaultFontWeight;
     _useGaussianBlur = false;
+    _blurIntensity = defaultBlurIntensity;
     _useGlowEffect = true;
     _useFlowingBackground = false;
     _useDuetLayout = false;
@@ -698,6 +740,7 @@ class LyricPreferences extends ChangeNotifier {
     await prefs.setDouble(_keyLineSpacing, _lineSpacing);
     await prefs.setInt(_keyFontWeight, _fontWeight);
     await prefs.setBool(_keyUseGaussianBlur, _useGaussianBlur);
+    await prefs.remove(_keyBlurIntensity);
     await prefs.setBool(_keyUseGlowEffect, _useGlowEffect);
     await prefs.setBool(_keyUseFlowingBackground, _useFlowingBackground);
     await prefs.setBool(_keyUseDuetLayout, _useDuetLayout);

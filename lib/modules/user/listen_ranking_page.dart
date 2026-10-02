@@ -5,7 +5,7 @@ import 'package:provider/provider.dart';
 import '../../data/repositories/history_repository.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/song_list_item.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 
 /// 听歌排行页面（本地实现）
 ///
@@ -73,7 +73,8 @@ class _ListenRankingPageState extends State<ListenRankingPage> {
           ),
         ),
       ),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _rankedSongs.isEmpty
               ? _buildEmpty(cs)
@@ -88,9 +89,9 @@ class _ListenRankingPageState extends State<ListenRankingPage> {
                         },
                       ),
                     ),
-                    const MiniPlayer(),
                   ],
                 ),
+      ),
     );
   }
 

@@ -5,11 +5,13 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../core/theme/app_dimens.dart';
 import '../core/utils/app_toast.dart';
 import '../providers/kugou_provider.dart';
 import '../providers/comment_display_provider.dart';
 import '../services/kugou_api/kugou_api_client.dart';
 import '../services/kugou_api/kugou_models.dart';
+import '../services/kugou_api/comment_delete.dart';
 import '../services/kugou_api/comment_reply_target.dart';
 import '../services/kugou_api/comment_send_result.dart';
 import '../services/kugou_api/comment_sort.dart';
@@ -17,6 +19,7 @@ import '../modules/login/login_page.dart';
 import 'comment_composer.dart';
 import 'comment_image_grid.dart';
 import 'comment_image_viewer.dart';
+import 'md3_pull_to_refresh.dart';
 
 /// 楼层评论状态
 class _FloorState {
@@ -95,6 +98,35 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
 
   /// 评论发送在途：禁用输入框，防止连点造成重复公开评论。
   bool _sendingComment = false;
+
+  /// 删除在途的评论 id（含楼中楼回复）：在途时忽略再次长按，防止重复删除。
+  final Set<String> _deletingCommentIds = {};
+
+  /// 评论区 id（响应顶层 `childrenid`，即评论池的 special id）。
+  ///
+  /// 删除评论必须用它定位资源——页面入参 [PlaylistCommentsView.specialId] 是
+  /// 歌单 `global_collection_id`，不是评论池的 special id，不能混用。
+  String _childrenId = '';
+
+  /// 范围筛选：全部 / 歌手 / 我的（客户端过滤已加载数据，
+  /// 上游无按用户筛选的评论接口；「加载更多」照常可用）。
+  CommentScope _scope = CommentScope.all;
+
+  /// 下拉菜单条目。**必须是稳定实例**（理由见 comments_view 同名字段注释：
+  /// 每帧新列表会让 M3EDropdownMenu 恒走 setItems → build 期间回调
+  /// _onSelectionChange → 语义树无限互递归 → 真机 ANR）。
+  late final List<M3EDropdownItem<CommentScope>> _scopeItems = [
+    for (final scope in CommentScope.values)
+      M3EDropdownItem(
+        label: switch (scope) {
+          CommentScope.all => '全部评论',
+          CommentScope.singer => '歌手评论',
+          CommentScope.mine => '我的评论',
+        },
+        value: scope,
+        selected: scope == CommentScope.all,
+      ),
+  ];
 
   /// 评论项 GlobalKey（按评论 ID 索引），用于收起楼中楼后定位滚动
   final Map<String, GlobalKey> _commentItemKeys = {};
@@ -181,6 +213,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
         if (result != null) {
           _comments = result.comments;
           _hotComments = result.hotComments;
+          _childrenId = result.childrenId;
           _currentPage = 1;
           _hasMore = result.comments.length >= 20;
         } else {
@@ -412,6 +445,76 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     if (mounted) setState(() {});
   }
 
+  /// 长按删除自己的评论（顶层或楼中楼回复）。
+  ///
+  /// 流程：归属校验 → 确认弹窗 → 调用 /comment/music/del → 刷新。
+  /// 不自动重试（删除成功不可撤销）；在途时忽略再次长按。
+  Future<void> _deleteOwnComment(
+    KugouComment comment, {
+    KugouComment? floorRoot,
+  }) async {
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) return;
+    if (_deletingCommentIds.contains(comment.id)) return;
+
+    final args = buildCommentDeleteArgs(
+      comment: comment,
+      floorRoot: floorRoot,
+      resourceType: widget.commentType,
+      // 注意：必须用评论区的 childrenid（评论池 special id），
+      // 不能用页面的 global_collection_id
+      fallbackSpecialId: _childrenId.isEmpty ? null : _childrenId,
+    );
+    if (args == null) return;
+
+    final errorColor = Theme.of(context).colorScheme.error;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除评论'),
+        content: const Text('删除后无法恢复，确定要删除这条评论吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: errorColor),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _deletingCommentIds.add(comment.id));
+    try {
+      final result = await api.deleteComment(
+        cid: args.cid,
+        specialId: args.specialId,
+        tid: args.tid,
+        resourceType: args.resourceType,
+        code: args.code,
+      );
+      if (!mounted) return;
+      if (result.ok) {
+        showToast('评论已删除');
+        if (floorRoot == null) {
+          await _fetchComments(silent: true);
+        } else {
+          // 保持该楼层展开并重新拉取，列表里立刻看不到已删的回复
+          _getFloorState(floorRoot.id).expanded = true;
+          await _fetchFloorReplies(floorRoot, reset: true, silent: true);
+        }
+      } else {
+        showToast(result.message, long: true);
+      }
+    } finally {
+      if (mounted) setState(() => _deletingCommentIds.remove(comment.id));
+    }
+  }
+
   /// 计算评论项顶部相对视口顶部的偏移（负数表示在视口上方）。
   double? _commentTopInViewport(String commentId) {
     final rb = _keyForComment(commentId).currentContext?.findRenderObject();
@@ -507,23 +610,51 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     });
   }
 
-  /// 排序选择器（m3e_core 分段按钮）。
+  /// 排序选择器（m3e_core 分段按钮）+ 右侧「我的」筛选。
   Widget _buildSortSelector() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: M3EToggleButtonGroup(
-        actions: const [
-          M3EToggleButtonGroupAction(label: Text('最热')),
-          M3EToggleButtonGroupAction(label: Text('最新')),
-          M3EToggleButtonGroupAction(label: Text('最早')),
+      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, 0),
+      child: Row(
+        children: [
+          M3EToggleButtonGroup(
+            actions: const [
+              M3EToggleButtonGroupAction(label: Text('最热')),
+              M3EToggleButtonGroupAction(label: Text('最新')),
+              M3EToggleButtonGroupAction(label: Text('最早')),
+            ],
+            size: M3EButtonSize.xs,
+            density: M3EButtonGroupDensity.compact,
+            selectedIndex: _displayedSortMode.index,
+            onSelectedIndexChanged: (index) {
+              if (index == null) return;
+              _onSortModeChanged(CommentSortMode.values[index]);
+            },
+          ),
+          const SizedBox(width: 8),
+          // Flexible：极窄屏下被钳制、字段文字自动省略，避免整行溢出
+          Flexible(
+            child: SizedBox(
+              width: 112,
+              child: M3EDropdownMenu<CommentScope>(
+              items: _scopeItems,
+              singleSelect: true,
+              showChipAnimation: false,
+              onSelectionChanged: (selected) {
+                if (selected.isEmpty) return;
+                final scope = selected.first.value;
+                // setItems（父级任何重建都会触发）也会回调到这里：
+                // 同值直接忽略，避免 build 期间 setState
+                if (scope == _scope) return;
+                HapticFeedback.selectionClick();
+                setState(() => _scope = scope);
+              },
+              fieldStyle: const M3EDropdownFieldStyle(
+                padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              ),
+            ),
+          ),
+          ),
         ],
-        size: M3EButtonSize.xs,
-        density: M3EButtonGroupDensity.compact,
-        selectedIndex: _displayedSortMode.index,
-        onSelectedIndexChanged: (index) {
-          if (index == null) return;
-          _onSortModeChanged(CommentSortMode.values[index]);
-        },
       ),
     );
   }
@@ -556,7 +687,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     if (_isLoading && _comments.isEmpty && _hotComments.isEmpty) {
       return const Center(
         child: Padding(
-          padding: EdgeInsets.all(32),
+          padding: EdgeInsets.all(AppSpacing.xxl),
           child: M3ELoadingIndicator(),
         ),
       );
@@ -565,7 +696,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     if (_error != null && _comments.isEmpty && _hotComments.isEmpty) {
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(32),
+          padding: const EdgeInsets.all(AppSpacing.xxl),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -574,14 +705,14 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                 size: 40,
                 color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
               ),
-              const SizedBox(height: 12),
+              const Gap(AppSpacing.md),
               Text(
                 '加载评论失败',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: colorScheme.onSurfaceVariant,
                 ),
               ),
-              const SizedBox(height: 12),
+              const Gap(AppSpacing.md),
               TextButton(onPressed: _fetchComments, child: const Text('重试')),
             ],
           ),
@@ -592,7 +723,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     if (_comments.isEmpty && _hotComments.isEmpty) {
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(32),
+          padding: const EdgeInsets.all(AppSpacing.xxl),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -601,7 +732,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                 size: 40,
                 color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
               ),
-              const SizedBox(height: 12),
+              const Gap(AppSpacing.md),
               Text(
                 '暂无评论',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -618,23 +749,97 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     // 主列表里也可能带 isStar 的歌手评论，而「歌手评论」栏只来自
     // star_cmts/hot_list，不一定包含它（可能为空）。统一把主列表里的歌手
     // 评论补进「歌手评论」栏（按 id 去重），并从主列表移除。
-    final hotFromComments = _comments.where((c) => c.isStar).toList();
+    // 范围筛选：mine 只保留自己的评论、singer 只保留歌手评论（均为客户端过滤）
+    final mine = _scope == CommentScope.mine;
+    final singer = _scope == CommentScope.singer;
+    final ownUserid = mine ? KugouApiClient().userid : null;
+    final hotFromComments = mine
+        ? const <KugouComment>[]
+        : _comments.where((c) => c.isStar).toList();
     // 歌单/专辑的 cmtlist 上游是加权混排，排序全部在客户端做
-    final regularComments = sortCommentsForDisplay(
+    final baseRegular = sortCommentsForDisplay(
       _comments.where((c) => !c.isStar).toList(),
       _sortMode,
     );
-    final mainSectionLabel = switch (_displayedSortMode) {
-      CommentSortMode.hottest => '最热评论',
-      CommentSortMode.timeDesc => '最新评论',
-      CommentSortMode.timeAsc => '最早评论',
-    };
+    final regularComments = mine
+        ? baseRegular.where((c) => isOwnComment(c, ownUserid)).toList()
+        : (singer ? const <KugouComment>[] : baseRegular);
+    final mainSectionLabel = mine
+        ? '我的评论'
+        : switch (_displayedSortMode) {
+            CommentSortMode.hottest => '最热评论',
+            CommentSortMode.timeDesc => '最新评论',
+            CommentSortMode.timeAsc => '最早评论',
+          };
     final starFromHot = _hotComments.where((c) => c.isStar).toSet();
-    final singerComments = <KugouComment>[
-      ..._hotComments,
-      for (final c in hotFromComments)
-        if (!starFromHot.any((s) => s.id == c.id)) c,
-    ];
+    final singerComments = mine
+        ? const <KugouComment>[]
+        : <KugouComment>[
+            ..._hotComments,
+            for (final c in hotFromComments)
+              if (!starFromHot.any((s) => s.id == c.id)) c,
+          ];
+
+    // 筛选下没有任何自己的评论：给可操作的提示（而不是空列表 + 加载更多）
+    if (mine && regularComments.isEmpty) {
+      final loggedIn = KugouApiClient().isLoggedIn;
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.xxl),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.person_outline,
+                size: 40,
+                color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+              ),
+              const Gap(AppSpacing.md),
+              Text(
+                loggedIn ? '暂无你的评论' : '登录后可查看自己的评论',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const Gap(AppSpacing.sm),
+              Text(
+                '仅筛选已加载的 ${_comments.length} 条评论，可通过「加载更多」继续查找',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // 「歌手」下没有歌手评论
+    if (singer && singerComments.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.xxl),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.star_outline,
+                size: 40,
+                color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+              ),
+              const Gap(AppSpacing.md),
+              Text(
+                '暂无歌手评论',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
     final displayItems = <_CommentDisplayItem>[];
 
@@ -654,15 +859,17 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     return Column(
       children: [
         Expanded(
-          child: ListView.builder(
+          child: Md3PullToRefresh(
+            onRefresh: () => _fetchComments(silent: true),
+            child: ListView.builder(
             controller: _scrollController,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
             itemCount: displayItems.length + (_hasMore ? 1 : 0),
             itemBuilder: (context, index) {
               if (index == displayItems.length) {
                 return Center(
                   child: Padding(
-                    padding: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.all(AppSpacing.lg),
                     child: _isLoadingMore
                         ? const M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24))
                         : TextButton(onPressed: _loadMore, child: const Text('加载更多')),
@@ -681,6 +888,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                 replyFontSize,
               );
             },
+            ),
           ),
         ),
         CommentComposer(
@@ -698,7 +906,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
 
   Widget _buildSectionHeader(String title, ColorScheme colorScheme) {
     return Padding(
-      padding: const EdgeInsets.only(top: 16, bottom: 8),
+      padding: const EdgeInsets.only(top: AppSpacing.lg, bottom: AppSpacing.sm),
       child: Text(
         title,
         style: Theme.of(context).textTheme.labelLarge?.copyWith(
@@ -716,14 +924,14 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     double replyFontSize,
   ) {
     final floorState = _floorStates[comment.id];
-    return Padding(
+    final Widget item = Padding(
       key: _keyForComment(comment.id),
-      padding: const EdgeInsets.symmetric(vertical: 12),
+      padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildAvatar(comment, colorScheme),
-          const SizedBox(width: 12),
+          const Gap(AppSpacing.md),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -750,7 +958,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                       const SizedBox(width: 6),
                       _buildBadge('热门', colorScheme),
                     ],
-                    const SizedBox(width: 8),
+                    const Gap(AppSpacing.sm),
                     Text(
                       _formatTime(comment.time),
                       style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -761,7 +969,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 4),
+                const Gap(AppSpacing.xs),
                 // 评论内容（长评论展开/收起，带动画）
                 AnimatedSize(
                   duration: const Duration(milliseconds: 200),
@@ -792,7 +1000,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                           alpha: 0.5,
                         ),
                       ),
-                      const SizedBox(width: 4),
+                      const Gap(AppSpacing.xs),
                       Text(
                         _formatLike(comment.likes),
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -804,7 +1012,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                     ],
                     // 回复按钮
                     if (comment.replyCount > 0) ...[
-                      const SizedBox(width: 16),
+                      const Gap(AppSpacing.lg),
                       GestureDetector(
                         onTap: () => _toggleFloor(comment),
                         child: Row(
@@ -818,7 +1026,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                                 color: colorScheme.primary,
                               ),
                             ),
-                            const SizedBox(width: 4),
+                            const Gap(AppSpacing.xs),
                             Text(
                               floorState?.expanded == true
                                   ? '收起回复'
@@ -830,7 +1038,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                         ),
                       ),
                     ],
-                    const SizedBox(width: 16),
+                    const Gap(AppSpacing.lg),
                     GestureDetector(
                       onTap: () {
                         HapticFeedback.selectionClick();
@@ -839,7 +1047,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                       child: Row(
                         children: [
                           Icon(Icons.reply, size: 14, color: colorScheme.primary),
-                          const SizedBox(width: 4),
+                          const Gap(AppSpacing.xs),
                           Text(
                             '回复',
                             style: Theme.of(context)
@@ -869,7 +1077,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                                     .withValues(alpha: 0.28),
                                 iconColor: colorScheme.primary,
                               ),
-                              const SizedBox(width: 8),
+                              const Gap(AppSpacing.sm),
                               Expanded(
                                 child: _buildFloorReplies(
                                   comment,
@@ -888,6 +1096,17 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           ),
         ],
       ),
+    );
+
+    // 自己的评论支持长按删除；非本人评论不响应长按
+    if (!isOwnComment(comment, KugouApiClient().userid)) return item;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        _deleteOwnComment(comment);
+      },
+      child: item,
     );
   }
 
@@ -1035,10 +1254,10 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
   ) {
     return Container(
       margin: const EdgeInsets.only(top: 10),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
       decoration: BoxDecoration(
         color: colorScheme.onSurfaceVariant.withValues(alpha: 0.06),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: AppRadius.mdAll,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1049,7 +1268,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           // 加载中
           if (state.loading)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
               child: Center(
                 child: M3ELoadingIndicator(
                   constraints: BoxConstraints.tightFor(width: 16, height: 16),
@@ -1060,7 +1279,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           // 空状态
           if (!state.loading && state.initialized && state.replies.isEmpty)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
               child: Center(
                 child: Text(
                   state.message.isNotEmpty ? state.message : '暂无回复',
@@ -1090,7 +1309,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           if (!state.hasMore && !state.loading && state.replies.isNotEmpty)
             Center(
               child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
+                padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
                 child: Text(
                   '已加载全部回复',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -1128,13 +1347,13 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     double fontSize,
     String ownerName,
   ) {
-    return Padding(
+    final Widget item = Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildSmallAvatar(reply, colorScheme),
-          const SizedBox(width: 8),
+          const Gap(AppSpacing.sm),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1163,7 +1382,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 2),
+                const Gap(AppSpacing.xxs),
                 Text(
                   _cleanFloorReplyContent(reply.content, ownerName),
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -1184,7 +1403,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                   ),
                 ],
                 // 楼中楼：回复某条具体回复（pid=该回复，is_t=0）
-                const SizedBox(height: 2),
+                const Gap(AppSpacing.xxs),
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () {
@@ -1212,6 +1431,17 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           ),
         ],
       ),
+    );
+
+    // 自己的回复支持长按删除；非本人回复不响应长按
+    if (!isOwnComment(reply, KugouApiClient().userid)) return item;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        _deleteOwnComment(reply, floorRoot: top);
+      },
+      child: item,
     );
   }
 

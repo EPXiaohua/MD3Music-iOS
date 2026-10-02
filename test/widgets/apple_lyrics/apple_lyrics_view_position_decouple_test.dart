@@ -40,6 +40,7 @@ void main() {
     final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
     expect(state.authorityTimeMsForTest, 1500);
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
     position.dispose();
   });
 
@@ -61,6 +62,7 @@ void main() {
     await tester.pump();
     final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
     expect(state.authorityTimeMsForTest, 500);
+    await tester.pumpWidget(const SizedBox.shrink());
     position.dispose();
   });
 
@@ -78,6 +80,7 @@ void main() {
     final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
     expect(state.authorityTimeMsForTest, 1500);
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets('大跳变（切歌/seek）不抛异常', (tester) async {
@@ -95,6 +98,7 @@ void main() {
     position.value = const Duration(milliseconds: 60000);
     await tester.pump(const Duration(milliseconds: 50));
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
     position.dispose();
   });
 }

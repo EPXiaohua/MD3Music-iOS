@@ -154,8 +154,7 @@ No timestamps here
       const lrcInput = '''[00:01.00]First line
 [00:05.50]Second line
 ''';
-      final result =
-          LyricParserChain.parseAs(lrcInput, LyricFormat.krc);
+      final result = LyricParserChain.parseAs(lrcInput, LyricFormat.krc);
 
       // KRC 解析器无法识别 LRC 时间戳格式，返回空列表
       expect(result, isEmpty);
@@ -165,8 +164,7 @@ No timestamps here
       // 内容实际是 KRC，但强制指定为 LRC
       // LrcParser 不识别 [12500,4200] 格式，会返回空列表
       const krcInput = '[12500,4200]<0,300,0>運<300,400,0>命';
-      final result =
-          LyricParserChain.parseAs(krcInput, LyricFormat.lrc);
+      final result = LyricParserChain.parseAs(krcInput, LyricFormat.lrc);
 
       expect(result, isEmpty);
     });
@@ -174,8 +172,7 @@ No timestamps here
     test('7c. parseAs(plaintext) 强制走纯文本，即使内容是 KRC', () {
       // 内容是 KRC，但强制按纯文本解析
       const krcInput = '[12500,4200]<0,300,0>運<300,400,0>命';
-      final result =
-          LyricParserChain.parseAs(krcInput, LyricFormat.plaintext);
+      final result = LyricParserChain.parseAs(krcInput, LyricFormat.plaintext);
 
       // 纯文本解析器把整行当作一个 LyricLine，不做时间戳解析
       expect(result, hasLength(1));
@@ -361,6 +358,40 @@ Plain again
     test('17. 纯尖括号开头行（无行首方括号）→ 也应识别为 lrc', () {
       const input = '<02:04.818>Wait<02:09.158>and';
       expect(LyricParserChain.detectFormat(input), LyricFormat.lrc);
+    });
+
+    test('17b. 最近邻同距时保留较早翻译，超容差不匹配', () {
+      final parsed = LyricParserChain.parse(
+        '[00:01.00]first\n[00:03.00]second',
+        translationText: '[00:00.50]earlier\n[00:01.50]later',
+      );
+
+      expect(parsed.first.translation, 'earlier');
+      expect(parsed.last.translation, isNull);
+    });
+
+    test('18. 大型同时间戳翻译歌词线性匹配且保持首尾行', () {
+      const count = 20000;
+      final main = StringBuffer();
+      final translation = StringBuffer();
+      for (var i = 0; i < count; i++) {
+        main.writeln('[00:01.00]original-$i');
+        translation.writeln('[00:01.00]translated-$i');
+      }
+
+      final parsed = LyricParserChain.parse(
+        main.toString(),
+        translationText: translation.toString(),
+      );
+
+      expect(parsed, hasLength(count));
+      final selectedTranslation = parsed.first.translation;
+      expect(selectedTranslation, startsWith('translated-'));
+      // 同时间戳行的排序次序不稳定；但每一主行应沿用同一个首选翻译。
+      expect(
+        parsed.every((line) => line.translation == selectedTranslation),
+        isTrue,
+      );
     });
   });
 }

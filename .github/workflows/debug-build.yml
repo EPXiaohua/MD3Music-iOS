@@ -13,6 +13,14 @@ on:
           - debug
           - release
         default: 'debug'
+      flavor:
+        description: 'flavor：standard（无 3D 封面）/ depth3d（3D 全量，仅 arm64-v8a）'
+        required: true
+        type: choice
+        options:
+          - standard
+          - depth3d
+        default: 'standard'
       notes:
         description: '构建说明（可选）'
         required: false
@@ -29,7 +37,7 @@ concurrency:
 
 jobs:
   build-debug:
-    name: Build Android ${{ inputs.build_type == 'release' && 'Release' || 'Debug' }} APK
+    name: Build Android ${{ inputs.flavor }} ${{ inputs.build_type == 'release' && 'Release' || 'Debug' }} APK
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -81,26 +89,81 @@ jobs:
       - name: Flutter analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
+      - name: Check 3D assets (depth3d flavor only)
+        if: inputs.flavor == 'depth3d'
+        run: |
+          set -euo pipefail
+          # depth3d flavor 依赖自编 onnxruntime AAR（arm64-v8a）+ 深度模型资产
+          if ! compgen -G "android/app/libs/onnxruntime-*.aar" > /dev/null; then
+            echo "::error::当前树缺少 android/app/libs/onnxruntime-*.aar，无法构建 depth3d flavor"
+            echo "（公开导出树若未携带该 AAR，请改用 standard flavor，或在私有树构建）"
+            exit 1
+          fi
+          echo "3D 资产在位：$(ls -lh android/app/libs/onnxruntime-*.aar | awk '{print $9, $5}')"
+
       - name: Flutter build APK
-        run: flutter build apk --${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+          # flavor 化之后必须显式 --flavor：定义 productFlavors 后 AGP 不再生成 assembleRelease
+          extra=""
+          if [[ "${{ inputs.flavor }}" == "depth3d" ]]; then
+            # 3D 功能受编译期开关控制，必须显式打开
+            extra="--dart-define=ENABLE_DEPTH_3D=true --target-platform android-arm64"
+          fi
+          flutter build apk --${{ inputs.build_type }} --flavor ${{ inputs.flavor }} $extra
+
+      # ============================================================
+      # 产物改名为中文（便于区分）
+      # ============================================================
+      # 命名规则与 scripts/lib/common.ps1 的 Get-ApkDisplayName 必须同步。
+      # 本工作流未按 ABI 拆分（多 ABI 合一），故 ABI 段固定用「通用」。
+      - name: Rename APK to Chinese display name
+        run: |
+          set -euo pipefail
+          apk_dir="build/app/outputs/flutter-apk"
+          ver="$(grep -m1 '^version:' pubspec.yaml | sed 's/^version:[[:space:]]*//' | cut -d+ -f1)"
+          case "${{ inputs.flavor }}" in
+            standard) flavor_cn="标准版" ;;
+            depth3d)  flavor_cn="3D封面版" ;;
+            *)        flavor_cn="${{ inputs.flavor }}" ;;
+          esac
+          src="$apk_dir/app-${{ inputs.flavor }}-${{ inputs.build_type }}.apk"
+          if [[ ! -f "$src" ]]; then echo "::error::未找到构建产物 $src"; exit 1; fi
+          dst="$apk_dir/MD3音乐-${ver}-${flavor_cn}-通用-${{ inputs.build_type }}.apk"
+          mv "$src" "$dst"
+          {
+            echo "APK_FILE=$(basename "$dst")"
+            echo "FLAVOR_CN=${flavor_cn}"
+          } >> "$GITHUB_ENV"
+          echo "=== 重命名后的产物 ==="
+          ls -lh "$apk_dir"/
 
       - name: Verify APK
         run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/${APK_FILE}"
           ls -lh build/app/outputs/flutter-apk/
-          for f in build/app/outputs/flutter-apk/*.apk; do
-            echo "=== $f ==="
-            if unzip -l "$f" > /dev/null; then
-              echo "  OK ($(du -h "$f" | cut -f1))"
-            else
-              echo "  CORRUPTED"
-              exit 1
+          if ! unzip -l "$apk" > /dev/null; then
+            echo "::error::产物损坏：$apk"; exit 1
+          fi
+          echo "OK ($(du -h "$apk" | cut -f1))"
+          if [[ "${{ inputs.flavor }}" == "depth3d" ]]; then
+            unzip -l "$apk" | grep -q 'lib/arm64-v8a/libonnxruntime.so' \
+              || { echo "::error::depth3d 包缺 lib/onnxruntime.so"; exit 1; }
+            n=$(unzip -l "$apk" | grep -cE 'assets/models/.*\.onnx' || true)
+            [[ "$n" -eq 2 ]] || { echo "::error::depth3d 包的深度模型数量=$n（期望 2）"; exit 1; }
+            echo "depth3d 包校验通过：ORT so + ${n} 个深度模型"
+          else
+            if unzip -l "$apk" | grep -qE 'libonnxruntime|assets/models/'; then
+              echo "::error::standard 包含有 3D 资产（flavor 隔离失效）"; exit 1
             fi
-          done
+            echo "standard 包校验通过：无 3D 资产"
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-${{ inputs.build_type }}
-          path: build/app/outputs/flutter-apk/app-${{ inputs.build_type }}.apk
+          name: MD3音乐-${{ env.FLAVOR_CN }}-${{ inputs.build_type }}
+          path: build/app/outputs/flutter-apk/${{ env.APK_FILE }}
           if-no-files-found: error
           retention-days: 7

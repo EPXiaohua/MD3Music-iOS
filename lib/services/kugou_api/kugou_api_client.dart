@@ -12,7 +12,9 @@ import '../../data/models/kugou_account.dart';
 import '../../data/models/mv_models.dart';
 import 'kugou_endpoints.dart';
 import 'kugou_models.dart';
+import 'lyric_lookup_result.dart';
 import 'comment_send_result.dart';
+import '../local_server_lifecycle.dart';
 
 /// 一次广告领取（/youth/vip → /youth/v1/ad/play_report）的判定结果。
 enum AdClaimOutcome {
@@ -24,6 +26,31 @@ enum AdClaimOutcome {
 
   /// 领取失败（其他错误码或响应为空），停止并上报
   failure,
+}
+
+enum _LyricApiFailure { transient, invalidData }
+
+/// 播放URL请求失败在本地API边界上的可恢复分类。
+enum PlaybackUrlLocalFailure { serverBusy, serverUnavailable }
+
+class _LyricFailureTracker {
+  bool sawTransient = false;
+  bool sawInvalidData = false;
+
+  void record(_LyricApiFailure failure) {
+    if (failure == _LyricApiFailure.transient) {
+      sawTransient = true;
+    } else {
+      sawInvalidData = true;
+    }
+  }
+
+  LyricLookupResult noMatchResult() {
+    return LyricLookupResult.noMatch(
+      sawTransientFailure: sawTransient,
+      sawInvalidData: sawInvalidData,
+    );
+  }
 }
 
 class KugouApiClient {
@@ -53,7 +80,7 @@ class KugouApiClient {
         onError: (e, handler) {
           // 只有连接类错误才算"服务端不可达"；
           // 4xx/5xx 业务错误（如未登录）仍然代表网络可达
-          if (e is DioException && _isConnectionError(e)) {
+          if (_isConnectionError(e)) {
             networkReachable.value = false;
           }
           handler.next(e);
@@ -116,39 +143,34 @@ class KugouApiClient {
     return list;
   }
 
-  /// 本地 API 服务器（Rust）就绪信号。
-  ///
-  /// P0: main.dart 已改为「runApp 不等待服务器启动」——so 加载与 UI 首帧并行。
-  /// 首屏请求（发现页等）在服务器就绪前发出会连接拒绝失败，因此
-  /// 拦截器在 `_serverReady` 完成前 await 它，就绪后自动放行。
-  /// 由 [KugouApiServer] 在 TCP 探测成功（_waitForReady）后调用 [markServerReady]。
-  static final Completer<void> _serverReady = Completer<void>();
-  static bool _serverReadyMarked = false;
+  /// 服务状态与等待者按启动代次隔离，避免一次性Completer在重启后残留ready。
+  static final LocalServerLifecycle _serverLifecycle = LocalServerLifecycle();
 
-  /// 本地 API 服务器启动已明确失败（桌面缺 kugou_server.dll、端口 10 次全部
-  /// 占用等）。此时 [_serverReady] 永远不会完成，若仍逐请求 await 其 8s 超时，
-  /// 每个请求都要白等满 8 秒才失败（观感即"延迟极高"）。置位后直接快速失败。
-  static bool _serverStartFailed = false;
+  static int markServerStarting() => _serverLifecycle.beginStart();
 
-  /// 标记本地 API 服务器已就绪（幂等，可重复调用）。
-  static void markServerReady() {
-    // restart() 成功时清除失败态，重新按就绪信号放行。
-    _serverStartFailed = false;
-    localServerAvailable.value = true;
-    if (_serverReadyMarked) return;
-    _serverReadyMarked = true;
-    _serverReady.complete();
+  static void markServerReady([int? generation]) {
+    if (_serverLifecycle.markReady(generation ?? _serverLifecycle.generation)) {
+      localServerAvailable.value = true;
+    }
   }
 
-  /// 标记本地 API 服务器启动失败。由 [KugouApiServer] 在所有启动路径都失败后
-  /// 调用；已就绪时忽略（restart 中途的瞬时失败不该让已可用的服务器被判死）。
-  static void markServerStartFailed() {
-    if (_serverReadyMarked) return;
-    _serverStartFailed = true;
-    // 判据与拦截器短路一致：_applyPort 先于 TCP 就绪探测写入 baseUrl，
-    // 慢设备上"探测超时但端口有效"的请求仍会成功，不该弹提示；
-    // 只有连端口都没拿到（dlopen 失败等）才是真的不可用。
-    localServerAvailable.value = KugouEndpoints.hasBaseUrl;
+  static void markServerStartFailed([int? generation]) {
+    if (_serverLifecycle.markFailed(
+      generation ?? _serverLifecycle.generation,
+    )) {
+      localServerAvailable.value = false;
+    }
+  }
+
+  static int markServerStopping() {
+    localServerAvailable.value = false;
+    return _serverLifecycle.beginStop();
+  }
+
+  static void markServerStopped(int generation) {
+    if (_serverLifecycle.markStopped(generation)) {
+      localServerAvailable.value = false;
+    }
   }
 
   /// 本地 API 服务器可用性。启动失败（桌面缺 kugou_server.dll、端口全占用等）
@@ -157,8 +179,8 @@ class KugouApiClient {
   /// 初值 true：正常启动过程中不闪提示。
   static final ValueNotifier<bool> localServerAvailable = ValueNotifier(true);
 
-  /// 服务器就绪 Future（带超时保护：启动失败时请求不会永久挂起）。
-  static Future<void> get serverReady => _serverReady.future;
+  static LocalServerState get localServerState => _serverLifecycle.state;
+  static int get localServerGeneration => _serverLifecycle.generation;
 
   void _onRequest(
     RequestOptions options,
@@ -168,14 +190,36 @@ class KugouApiClient {
       await _initCompleter?.future;
     }
 
-    // P0: 等待本地 API 服务器就绪。带 8s 超时：
-    // 服务器异常时继续请求（失败由调用方处理），避免首屏永久转圈。
-    // 启动已明确失败时跳过等待：_serverReady 永不完成，逐请求 await 会让
-    // 每个请求都白等满 8s（Windows 缺 dll 时的"延迟极高"就是这么来的）。
-    if (!_serverReadyMarked && !_serverStartFailed) {
-      try {
-        await serverReady.timeout(const Duration(seconds: 8));
-      } catch (_) {}
+    // 启动失败/停止/ready超时均快速拒绝，不把请求放到旧端口或默认端口。
+    final readiness = _serverLifecycle.waitUntilCurrentReady(
+      timeout: const Duration(seconds: 8),
+    );
+    final cancelToken = options.cancelToken;
+    final ready = cancelToken == null
+        ? await readiness
+        : await Future.any<bool>([
+            readiness,
+            cancelToken.whenCancel.then((_) => false),
+          ]);
+    if (cancelToken?.isCancelled ?? false) {
+      handler.reject(
+        DioException(
+          requestOptions: options,
+          type: DioExceptionType.cancel,
+          message: '请求在等待本地服务就绪时已取消',
+        ),
+      );
+      return;
+    }
+    if (!ready) {
+      handler.reject(
+        DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionError,
+          message: '本地音乐服务尚未就绪',
+        ),
+      );
+      return;
     }
 
     // 登录等全部请求统一走本地 API 服务器（Rust），不再依赖第三方云端
@@ -244,31 +288,90 @@ class KugouApiClient {
     String path, {
     Map<String, dynamic>? queryParameters,
     bool noCache = false,
+    CancelToken? cancelToken,
+    void Function(_LyricApiFailure failure)? onLyricFailure,
+    void Function(PlaybackUrlLocalFailure failure)? onPlaybackLocalFailure,
   }) async {
     try {
       final response = await _dio.get(
         path,
         queryParameters: queryParameters,
         options: Options(extra: {'noCache': noCache}),
+        cancelToken: cancelToken,
       );
       if (response.statusCode == 200) {
         if (response.data is Map<String, dynamic>) {
           return response.data as Map<String, dynamic>;
         }
+        onLyricFailure?.call(_LyricApiFailure.invalidData);
+      } else {
+        onLyricFailure?.call(_lyricHttpFailure(response.statusCode));
+        final localFailure = _playbackLocalFailure(
+          response.statusCode,
+          response.data,
+        );
+        if (localFailure != null) onPlaybackLocalFailure?.call(localFailure);
       }
       print(
         '[API _get] Non-200 or non-map: path=$path status=${response.statusCode} data=${response.data}',
       );
       return null;
     } on DioException catch (e) {
+      final response = e.response;
+      if (response != null) {
+        if (response.statusCode == 200 &&
+            response.data is! Map<String, dynamic>) {
+          onLyricFailure?.call(_LyricApiFailure.invalidData);
+        } else {
+          onLyricFailure?.call(_lyricHttpFailure(response.statusCode));
+        }
+        final localFailure = _playbackLocalFailure(
+          response.statusCode,
+          response.data,
+        );
+        if (localFailure != null) onPlaybackLocalFailure?.call(localFailure);
+      } else if (e.type != DioExceptionType.cancel &&
+          cancelToken?.isCancelled != true &&
+          _isLocalApiUri(e.requestOptions.uri)) {
+        onPlaybackLocalFailure?.call(PlaybackUrlLocalFailure.serverUnavailable);
+        onLyricFailure?.call(_LyricApiFailure.transient);
+      } else {
+        onLyricFailure?.call(_LyricApiFailure.transient);
+      }
       print(
         '[API _get] DioException: url=${e.requestOptions.uri} err=${e.type} response=${e.response?.statusCode} ${e.response?.data}',
       );
       return null;
     } catch (e) {
+      onLyricFailure?.call(_LyricApiFailure.invalidData);
       print('[API _get] Error: $e');
       return null;
     }
+  }
+
+  PlaybackUrlLocalFailure? _playbackLocalFailure(
+    int? statusCode,
+    dynamic responseData,
+  ) {
+    if (statusCode != 503 || responseData is! Map) return null;
+    if (responseData['error'] == 'local_server_busy' &&
+        responseData['retryable'] == true) {
+      return PlaybackUrlLocalFailure.serverBusy;
+    }
+    return null;
+  }
+
+  bool _isLocalApiUri(Uri uri) =>
+      uri.host == '127.0.0.1' || uri.host == 'localhost' || uri.host == '::1';
+
+  _LyricApiFailure _lyricHttpFailure(int? statusCode) {
+    if (statusCode == null ||
+        statusCode >= 500 ||
+        statusCode == 408 ||
+        statusCode == 429) {
+      return _LyricApiFailure.transient;
+    }
+    return _LyricApiFailure.invalidData;
   }
 
   /// 允许非 200 状态码的 GET（用于登录等场景：Rust 服务端把上游业务错误
@@ -713,11 +816,6 @@ class KugouApiClient {
     } catch (e) {}
   }
 
-  bool _hasCandidates(Map<String, dynamic> json) {
-    final candidates = json['candidates'];
-    return candidates is List && candidates.isNotEmpty;
-  }
-
   // ==================== Search ====================
 
   Future<KugouSearchResult?> search(
@@ -960,6 +1058,8 @@ class KugouApiClient {
     String? albumAudioId,
     bool downgrade = true,
     String? ppageId,
+    CancelToken? cancelToken,
+    void Function(PlaybackUrlLocalFailure failure)? onLocalFailure,
   }) async {
     final params = <String, dynamic>{
       'hash': hash.toLowerCase(),
@@ -979,19 +1079,31 @@ class KugouApiClient {
         quality: quality,
         albumId: albumId,
         albumAudioId: albumAudioId,
+        cancelToken: cancelToken,
+        onLocalFailure: onLocalFailure,
       );
       if (vipUrl != null) return vipUrl;
       // 不再直接 return null，继续走 /song/url 兜底
     }
 
-    var json = await _get(KugouEndpoints.songUrl, queryParameters: params);
+    var json = await _get(
+      KugouEndpoints.songUrl,
+      queryParameters: params,
+      cancelToken: cancelToken,
+      onPlaybackLocalFailure: onLocalFailure,
+    );
     if (json == null) {
       // 非标准音质请求失败（如听书章节只有 128k 免费部分，320 音质上游返回
       // 31863 no free part info / 502）→ 降级到标准音质重试一次。
       // 过滤已按 fail_process 判断可播，此处解决"可播但音质不可用"的播放失败。
       if (downgrade && quality != KugouQuality.standard) {
         params['quality'] = KugouQuality.standard;
-        json = await _get(KugouEndpoints.songUrl, queryParameters: params);
+        json = await _get(
+          KugouEndpoints.songUrl,
+          queryParameters: params,
+          cancelToken: cancelToken,
+          onPlaybackLocalFailure: onLocalFailure,
+        );
       }
       if (json == null) return null;
     }
@@ -1003,7 +1115,12 @@ class KugouApiClient {
       await registerDevice();
       if (_dfid == null) return null;
 
-      json = await _get(KugouEndpoints.songUrl, queryParameters: params);
+      json = await _get(
+        KugouEndpoints.songUrl,
+        queryParameters: params,
+        cancelToken: cancelToken,
+        onPlaybackLocalFailure: onLocalFailure,
+      );
       if (json == null) return null;
       data = _extractData(json['data'] ?? json);
     }
@@ -1023,10 +1140,17 @@ class KugouApiClient {
             quality: quality,
             albumId: albumId,
             albumAudioId: albumAudioId,
+            cancelToken: cancelToken,
+            onLocalFailure: onLocalFailure,
           );
           if (vipUrl != null) return vipUrl;
         }
-        json = await _get(KugouEndpoints.songUrl, queryParameters: params);
+        json = await _get(
+          KugouEndpoints.songUrl,
+          queryParameters: params,
+          cancelToken: cancelToken,
+          onPlaybackLocalFailure: onLocalFailure,
+        );
         if (json == null) return null;
         data = _extractData(json['data'] ?? json);
         if (data['url'] != null) {
@@ -1051,7 +1175,12 @@ class KugouApiClient {
         if (downgrade) {
           // 降级到标准音质重新请求
           params['quality'] = KugouQuality.standard;
-          json = await _get(KugouEndpoints.songUrl, queryParameters: params);
+          json = await _get(
+            KugouEndpoints.songUrl,
+            queryParameters: params,
+            cancelToken: cancelToken,
+            onPlaybackLocalFailure: onLocalFailure,
+          );
           if (json != null) {
             final fallbackData = _extractData(json['data'] ?? json);
             if (fallbackData['url'] != null) {
@@ -1086,6 +1215,8 @@ class KugouApiClient {
       final freeJson = await _get(
         KugouEndpoints.songUrl,
         queryParameters: freeParams,
+        cancelToken: cancelToken,
+        onPlaybackLocalFailure: onLocalFailure,
       );
       if (freeJson != null) {
         final freeData = _extractData(freeJson['data'] ?? freeJson);
@@ -1116,6 +1247,8 @@ class KugouApiClient {
     String quality = KugouQuality.standard,
     String? albumId,
     String? albumAudioId,
+    CancelToken? cancelToken,
+    void Function(PlaybackUrlLocalFailure failure)? onLocalFailure,
   }) async {
     final query = <String, dynamic>{
       'hash': hash.toLowerCase(),
@@ -1127,6 +1260,8 @@ class KugouApiClient {
       final json = await _get(
         KugouEndpoints.songUrlNew,
         queryParameters: query,
+        cancelToken: cancelToken,
+        onPlaybackLocalFailure: onLocalFailure,
       );
       if (json == null) {
         return null;
@@ -1171,10 +1306,20 @@ class KugouApiClient {
     return null;
   }
 
-  /// 根据请求音质返回降级链。
+  /// 根据请求音质返回降级链（static，便于单元测试）。
   /// 例如 'high' → ['high', 'flac', '320', '128']
-  List<String> _getDowngradeChain(String quality) {
+  /// 'viper_tape' → ['viper_tape', 'high', 'flac', '320', '128']
+  /// （母带不可用时逐级回退；非 VIP 请求 viper_tape 失败也由本链兜底）
+  static List<String> downgradeChain(String quality) {
     switch (quality) {
+      case KugouQuality.viperTape: // 'viper_tape'
+        return [
+          KugouQuality.viperTape,
+          KugouQuality.hires,
+          KugouQuality.lossless,
+          KugouQuality.high,
+          KugouQuality.standard,
+        ];
       case KugouQuality.hires: // 'high'
         return [
           KugouQuality.hires,
@@ -1195,9 +1340,11 @@ class KugouApiClient {
     }
   }
 
-  /// 音质档位排序，用于比较哪一次尝试的结果更好。
-  int _qualityRank(String q) {
+  /// 音质档位排序，用于比较哪一次尝试的结果更好（static，便于单元测试）。
+  static int qualityRank(String q) {
     switch (q) {
+      case KugouQuality.viperTape: // 'viper_tape'
+        return 4;
       case KugouQuality.hires: // 'high'
         return 3;
       case KugouQuality.lossless: // 'flac'
@@ -1211,7 +1358,7 @@ class KugouApiClient {
 
   /// 带自动降级的获取播放链接。
   ///
-  /// 逐层降级：Hi-Res → 无损 → 320 → 128，每一档都核对**实际**音质。
+  /// 逐层降级：蝰蛇母带 → Hi-Res → 无损 → 320 → 128，每一档都核对**实际**音质。
   /// 上游在请求音质不可用时常常静默返回一个更低音质的链接（不在 fail_process
   /// 里标记），所以"拿到了链接"不等于"拿到了请求的音质"——只有实际音质与请求
   /// 档位一致才采用，否则继续往下一档尝试，避免选了 Hi-Res 却直接掉到标准音质。
@@ -1221,85 +1368,113 @@ class KugouApiClient {
     String quality = KugouQuality.standard,
     String? albumId,
     String? albumAudioId,
+    Duration totalTimeout = const Duration(seconds: 45),
+    void Function(PlaybackUrlLocalFailure failure)? onLocalFailure,
   }) async {
-    final chain = _getDowngradeChain(quality);
+    final cancelToken = CancelToken();
+    final deadline = Timer(totalTimeout, () {
+      cancelToken.cancel('playback URL resolution deadline exceeded');
+    });
+    void stopAfterLocalFailure(PlaybackUrlLocalFailure failure) {
+      if (!cancelToken.isCancelled) {
+        cancelToken.cancel('local playback API ${failure.name}');
+      }
+      onLocalFailure?.call(failure);
+    }
 
-    KugouPlayUrl? best;
-    for (final q in chain) {
+    try {
+      final chain = downgradeChain(quality);
+
+      KugouPlayUrl? best;
+      for (final q in chain) {
+        if (cancelToken.isCancelled) break;
+        try {
+          final result = await getSongUrl(
+            hash,
+            quality: q,
+            albumId: albumId,
+            albumAudioId: albumAudioId,
+            downgrade: false,
+            cancelToken: cancelToken,
+            onLocalFailure: stopAfterLocalFailure,
+          );
+          // 跳过试听结果：非 VIP 用户在高等级音质请求时，getSongUrl 内部的
+          // free_part=1 兜底可能返回 30s 试听 URL。如果在此处接受试听结果，
+          // 降级链会被短路——更低音质的完整播放链接永远不会被尝试。
+          // 试听兜底统一在本方法末尾（所有音质都尝试完毕后）执行。
+          if (result == null || result.url.isEmpty || result.isTrial) {
+            continue;
+          }
+          // quality 取服务端回写的实际音质，而不是请求值：
+          // /song/url/new 的上游不接收 quality，用请求值会让 UI 虚标音质。
+          if (result.quality == q) {
+            return KugouPlayUrl(
+              url: result.url,
+              fileSize: result.fileSize,
+              bitRate: result.bitRate,
+              quality: q,
+              isTrial: false,
+            );
+          }
+          if (best == null ||
+              qualityRank(result.quality) > qualityRank(best.quality)) {
+            best = result;
+          }
+        } catch (_) {
+          // 单档失败允许继续降级，除非整个请求已超时/取消。
+        }
+      }
+
+      if (best != null) {
+        return KugouPlayUrl(
+          url: best.url,
+          fileSize: best.fileSize,
+          bitRate: best.bitRate,
+          quality: best.quality,
+          isTrial: false,
+        );
+      }
+
+      // 已收藏无版权歌曲兜底：用 ppage_id=356753938（收藏页）尝试获取完整播放链接。
+      // 酷狗约定：歌曲被收藏后，即便无版权也可通过该 page_id 解锁播放。
+      // 必须放在 free_part 试听兜底之前，否则试听 URL 会抢先返回 30s 片段。
+      // 参考 EchoMusic 的 resolver.ts 中 getSongUrl(track.hash, '', 356753938) 实现。
+      if (cancelToken.isCancelled) return null;
       try {
         final result = await getSongUrl(
           hash,
-          quality: q,
+          quality: KugouQuality.standard,
           albumId: albumId,
           albumAudioId: albumAudioId,
           downgrade: false,
+          ppageId: '356753938',
+          cancelToken: cancelToken,
+          onLocalFailure: stopAfterLocalFailure,
         );
-        // 跳过试听结果：非 VIP 用户在高等级音质请求时，getSongUrl 内部的
-        // free_part=1 兜底可能返回 30s 试听 URL。如果在此处接受试听结果，
-        // 降级链会被短路——更低音质的完整播放链接永远不会被尝试。
-        // 试听兜底统一在本方法末尾（所有音质都尝试完毕后）执行。
-        if (result == null || result.url.isEmpty || result.isTrial) {
-          continue;
-        }
-        // quality 取服务端回写的实际音质，而不是请求值：
-        // /song/url/new 的上游不接收 quality，用请求值会让 UI 虚标音质。
-        if (result.quality == q) {
-          return KugouPlayUrl(
-            url: result.url,
-            fileSize: result.fileSize,
-            bitRate: result.bitRate,
-            quality: q,
-            isTrial: false,
-          );
-        }
-        if (best == null ||
-            _qualityRank(result.quality) > _qualityRank(best.quality)) {
-          best = result;
+        if (result != null && result.url.isNotEmpty && !result.isTrial) {
+          return result;
         }
       } catch (_) {}
+
+      // 最后尝试带降级的 standard 请求
+      // （会走 free_part=1 的 30s 试听兜底）
+      if (cancelToken.isCancelled) return null;
+      try {
+        return await getSongUrl(
+          hash,
+          quality: KugouQuality.standard,
+          albumId: albumId,
+          albumAudioId: albumAudioId,
+          downgrade: true,
+          cancelToken: cancelToken,
+          onLocalFailure: stopAfterLocalFailure,
+        );
+      } catch (_) {}
+
+      return null;
+    } finally {
+      deadline.cancel();
     }
-
-    if (best != null) {
-      return KugouPlayUrl(
-        url: best.url,
-        fileSize: best.fileSize,
-        bitRate: best.bitRate,
-        quality: best.quality,
-        isTrial: false,
-      );
-    }
-
-    // 已收藏无版权歌曲兜底：用 ppage_id=356753938（收藏页）尝试获取完整播放链接。
-    // 酷狗约定：歌曲被收藏后，即便无版权也可通过该 page_id 解锁播放。
-    // 必须放在 free_part 试听兜底之前，否则试听 URL 会抢先返回 30s 片段。
-    // 参考 EchoMusic 的 resolver.ts 中 getSongUrl(track.hash, '', 356753938) 实现。
-    try {
-      final result = await getSongUrl(
-        hash,
-        quality: KugouQuality.standard,
-        albumId: albumId,
-        albumAudioId: albumAudioId,
-        downgrade: false,
-        ppageId: '356753938',
-      );
-      if (result != null && result.url.isNotEmpty) {
-        return result;
-      }
-    } catch (_) {}
-
-    // 最后尝试带降级的 standard 请求
-    // （会走 free_part=1 的 30s 试听兜底）
-    try {
-      return await getSongUrl(
-        hash,
-        quality: KugouQuality.standard,
-        albumId: albumId,
-        albumAudioId: albumAudioId,
-        downgrade: true,
-      );
-    } catch (_) {}
-
-    return null;
   }
 
   /// 查询歌曲实际可用的音质集合。
@@ -1489,7 +1664,26 @@ class KugouApiClient {
     String? songName,
     String fmt = 'lrc',
     bool decode = true,
+  }) async => (await getLyricResult(
+    hash,
+    accesskey: accesskey,
+    songName: songName,
+    fmt: fmt,
+    decode: decode,
+  )).lyric;
+
+  /// 保留歌词边界的传输/数据语义；通用API仍使用原nullable契约。
+  Future<LyricLookupResult> getLyricResult(
+    String hash, {
+    String? accesskey,
+    String? songName,
+    String fmt = 'lrc',
+    bool decode = true,
   }) async {
+    final failures = _LyricFailureTracker();
+    if (hash.trim().isEmpty && (songName == null || songName.trim().isEmpty)) {
+      return const LyricLookupResult.invalidData();
+    }
     String? lyricId;
     String? lyricAccesskey;
     Map<String, dynamic>? searchResult;
@@ -1503,12 +1697,32 @@ class KugouApiClient {
     void resolveCandidate(Map<String, dynamic>? result) {
       if (result == null) return;
       final candidates = result['candidates'];
-      if (candidates is List && candidates.isNotEmpty) {
-        final first = candidates.first as Map<String, dynamic>;
-        lyricId = first['id']?.toString();
-        lyricAccesskey = first['accesskey']?.toString();
-        lyricCandidates.addAll(candidates.cast<Map<String, dynamic>>());
+      if (candidates is! List) {
+        failures.record(_LyricApiFailure.invalidData);
+        return;
       }
+      if (candidates.isEmpty) return;
+
+      final validCandidates = <Map<String, dynamic>>[];
+      for (final candidate in candidates) {
+        if (candidate is Map<String, dynamic>) {
+          validCandidates.add(candidate);
+        } else if (candidate is Map) {
+          validCandidates.add(Map<String, dynamic>.from(candidate));
+        } else {
+          failures.record(_LyricApiFailure.invalidData);
+        }
+      }
+      if (validCandidates.isEmpty) return;
+      final first = validCandidates.first;
+      final id = first['id']?.toString();
+      if (id == null || id.isEmpty) {
+        failures.record(_LyricApiFailure.invalidData);
+        return;
+      }
+      lyricId = id;
+      lyricAccesskey = first['accesskey']?.toString();
+      lyricCandidates.addAll(validCandidates);
     }
 
     // man=yes 才会返回带翻译/罗马音的完整候选列表；man=no 只返回官方主版本，
@@ -1518,8 +1732,9 @@ class KugouApiClient {
       final byHash = await _get(
         KugouEndpoints.searchLyric,
         queryParameters: {'hash': hash.toLowerCase(), 'man': 'yes'},
+        onLyricFailure: failures.record,
       );
-      if (byHash != null && _hasCandidates(byHash)) {
+      if (byHash != null) {
         searchResult = byHash;
         resolveCandidate(searchResult);
       }
@@ -1532,7 +1747,7 @@ class KugouApiClient {
         hash.isNotEmpty &&
         songName != null &&
         songName.isNotEmpty) {
-      final recovered = await _recoverLyricIdBySongSearch(songName);
+      final recovered = await _recoverLyricIdBySongSearch(songName, failures);
       if (recovered != null) {
         lyricId = recovered.$1;
         lyricAccesskey = recovered.$2;
@@ -1546,12 +1761,13 @@ class KugouApiClient {
       searchResult = await _get(
         KugouEndpoints.searchLyric,
         queryParameters: {'keywords': songName, 'man': 'yes'},
+        onLyricFailure: failures.record,
       );
       resolveCandidate(searchResult);
     }
 
     if (lyricId == null) {
-      return null;
+      return failures.noMatchResult();
     }
 
     // 闭包内赋值使类型仍为 String?，此处已确认非空，断言收窄
@@ -1564,28 +1780,46 @@ class KugouApiClient {
     if (dualRequest) {
       // 并发双请求：Future.wait 同时发起，每个请求独立 try/catch 防止单点失败
       final results = await Future.wait([
-        _fetchLyricContent(resolvedLyricId, resolvedAccesskey, 'lrc', decode),
-        _fetchLyricContent(resolvedLyricId, resolvedAccesskey, 'krc', decode),
+        _fetchLyricContent(
+          resolvedLyricId,
+          resolvedAccesskey,
+          'lrc',
+          decode,
+          onFailure: failures.record,
+        ),
+        _fetchLyricContent(
+          resolvedLyricId,
+          resolvedAccesskey,
+          'krc',
+          decode,
+          onFailure: failures.record,
+        ),
       ]);
       final lrcJson = results[0];
       final krcJson = results[1];
       final merged = mergeLyricResponses(lrcJson, krcJson);
-      if (merged == null) return null;
+      if (!_hasLyricText(merged)) {
+        failures.record(_LyricApiFailure.invalidData);
+        return failures.noMatchResult();
+      }
+      final validMerged = merged!;
       // 主候选无翻译（官方推荐可能只有罗马音，翻译是独立 id）→ 从其他候选回退补翻译
-      final trans = merged.translatedContent;
+      final trans = validMerged.translatedContent;
       if (trans == null || trans.trim().isEmpty) {
         final fallback = await _resolveTranslationFallback(lyricCandidates);
         if (fallback.translation != null) {
-          return KugouLyric(
-            content: merged.content,
-            decodedContent: merged.decodedContent,
-            decodedKrcContent: merged.decodedKrcContent,
-            translatedContent: fallback.translation,
-            romaContent: merged.romaContent ?? fallback.roma,
+          return LyricLookupResult.found(
+            KugouLyric(
+              content: validMerged.content,
+              decodedContent: validMerged.decodedContent,
+              decodedKrcContent: validMerged.decodedKrcContent,
+              translatedContent: fallback.translation,
+              romaContent: validMerged.romaContent ?? fallback.roma,
+            ),
           );
         }
       }
-      return merged;
+      return LyricLookupResult.found(validMerged);
     }
 
     // 单请求路径（显式 fmt=krc 等非 lrc 场景）
@@ -1594,14 +1828,31 @@ class KugouApiClient {
       resolvedAccesskey,
       fmt,
       decode,
+      onFailure: failures.record,
     );
-    if (json == null) return null;
+    if (json == null) return failures.noMatchResult();
     try {
-      return KugouLyric.fromJson(json);
+      final lyric = KugouLyric.fromJson(json);
+      if (!_hasLyricText(lyric)) {
+        failures.record(_LyricApiFailure.invalidData);
+        return failures.noMatchResult();
+      }
+      return LyricLookupResult.found(lyric);
     } catch (e) {
-      return null;
+      failures.record(_LyricApiFailure.invalidData);
+      return failures.noMatchResult();
     }
   }
+
+  bool _hasLyricText(KugouLyric? lyric) =>
+      lyric != null &&
+      <String?>[
+        lyric.content,
+        lyric.decodedContent,
+        lyric.decodedKrcContent,
+        lyric.translatedContent,
+        lyric.romaContent,
+      ].any((text) => text != null && text.trim().isNotEmpty);
 
   /// 抽取的私有方法：发起单个歌词下载请求，返回响应中的 data 节点。
   /// 任何异常都吞掉返回 null，确保并发场景下单个请求失败不影响另一个。
@@ -1609,8 +1860,9 @@ class KugouApiClient {
     String lyricId,
     String? lyricAccesskey,
     String fmt,
-    bool decode,
-  ) async {
+    bool decode, {
+    void Function(_LyricApiFailure failure)? onFailure,
+  }) async {
     try {
       final params = <String, dynamic>{
         'id': lyricId,
@@ -1618,11 +1870,21 @@ class KugouApiClient {
         'decode': decode.toString(),
       };
       if (lyricAccesskey != null) params['accesskey'] = lyricAccesskey;
-      final json = await _get(KugouEndpoints.lyric, queryParameters: params);
+      final json = await _get(
+        KugouEndpoints.lyric,
+        queryParameters: params,
+        onLyricFailure: onFailure,
+      );
       if (json == null) return null;
-      return json['data'] as Map<String, dynamic>? ?? json;
+      final data = json['data'];
+      if (data == null) return json;
+      if (data is Map<String, dynamic>) return data;
+      if (data is Map) return Map<String, dynamic>.from(data);
+      onFailure?.call(_LyricApiFailure.invalidData);
+      return null;
     } catch (e) {
       // 单点失败不影响另一个并发请求
+      onFailure?.call(_LyricApiFailure.invalidData);
       return null;
     }
   }
@@ -1633,10 +1895,34 @@ class KugouApiClient {
   /// 返回 `(lyricId, lyricAccesskey?)`；找不到返回 null。
   Future<(String, String?)?> _recoverLyricIdBySongSearch(
     String songName,
+    _LyricFailureTracker failures,
   ) async {
     try {
-      final searchResult = await search(songName, pagesize: 5);
-      if (searchResult == null || searchResult.songs.isEmpty) {
+      final params = <String, dynamic>{
+        'keywords': songName,
+        'page': 1,
+        'pagesize': 5,
+        'type': 'song',
+      };
+      if (_token != null && _userid != null) {
+        final cookieParts = <String>['token=$_token', 'userid=$_userid'];
+        if (_dfid != null) cookieParts.add('dfid=$_dfid');
+        params['cookie'] = cookieParts.join(';');
+      }
+      final searchJson = await _get(
+        KugouEndpoints.search,
+        queryParameters: params,
+        onLyricFailure: failures.record,
+      );
+      if (searchJson == null) return null;
+      late final KugouSearchResult searchResult;
+      try {
+        searchResult = KugouSearchResult.fromJson(searchJson);
+      } catch (_) {
+        failures.record(_LyricApiFailure.invalidData);
+        return null;
+      }
+      if (searchResult.songs.isEmpty) {
         return null;
       }
       // 取第一首歌的 FileHash 作为正确 hash
@@ -1645,18 +1931,28 @@ class KugouApiClient {
       final lyricSearch = await _get(
         KugouEndpoints.searchLyric,
         queryParameters: {'hash': correctHash.toLowerCase(), 'man': 'yes'},
+        onLyricFailure: failures.record,
       );
       if (lyricSearch != null) {
         final candidates = lyricSearch['candidates'];
-        if (candidates is List && candidates.isNotEmpty) {
-          final first = candidates.first as Map<String, dynamic>;
-          final id = first['id']?.toString();
-          if (id != null && id.isNotEmpty) {
-            return (id, first['accesskey']?.toString());
-          }
+        if (candidates is! List) {
+          failures.record(_LyricApiFailure.invalidData);
+          return null;
         }
+        if (candidates.isEmpty) return null;
+        final first = candidates.first;
+        if (first is! Map) {
+          failures.record(_LyricApiFailure.invalidData);
+          return null;
+        }
+        final id = first['id']?.toString();
+        if (id != null && id.isNotEmpty) {
+          return (id, first['accesskey']?.toString());
+        }
+        failures.record(_LyricApiFailure.invalidData);
       }
     } catch (_) {
+      failures.record(_LyricApiFailure.invalidData);
       return null;
     }
     return null;
@@ -2138,6 +2434,37 @@ class KugouApiClient {
     return CommentSendResult.fromJson(json);
   }
 
+  /// 删除自己在歌曲、专辑或歌单评论池中的评论（底层 `commentsv2/delcomment`）。
+  ///
+  /// [cid] 为评论列表返回的评论 id；[specialId] 必须取列表项的 `special_child_id`
+  /// （**不要**用发送评论响应里的 `special_id`）；只传 [mixsongid] 时服务端会先
+  /// 查一次歌曲评论自动反查 special_id，最可靠。删除楼中楼回复时必须传 [tid]
+  /// （所属顶层评论 id）。
+  ///
+  /// 与发送接口同样的硬约束：不自动重试（删除成功不可撤销）。
+  Future<CommentSendResult> deleteComment({
+    required String cid,
+    String? mixsongid,
+    String? specialId,
+    String? tid,
+    String resourceType = 'song',
+    String? code,
+  }) async {
+    final json = await _post(
+      KugouEndpoints.commentMusicDel,
+      queryParameters: compactQueryParams({
+        'cid': cid,
+        'mixsongid': mixsongid,
+        'special_id': specialId,
+        'tid': tid,
+        'resource_type': resourceType,
+        'code': code,
+      }),
+      noCache: true,
+    );
+    return CommentSendResult.fromJson(json);
+  }
+
   // ==================== Playlist ====================
 
   Future<KugouPlaylistCategory?> getPlaylist({
@@ -2517,6 +2844,43 @@ class KugouApiClient {
     }
   }
 
+  // ==================== Home ====================
+
+  /// 首页「刷歌」推荐（/home/discover → POST /homediscoverrec/v1/client/home_discover_rec）。
+  ///
+  /// 这个接口**没有 page/offset 参数**，唯一的翻页依据是 [todayPlayNum]（今日已播
+  /// 歌曲数，服务端拿它排除已推过的歌）。所以「刷到第几」是调用方的责任：把已消费
+  /// 的歌曲总数原样传进来，列表才能一直往下走。
+  ///
+  /// [page] 是给无限滚动预留的探针位（上游文档没有它），为 null 时根本不会出现在
+  /// query 里，因此不传与传 null 完全等价。
+  ///
+  /// [noCache] 的理由与 [getPersonalFm] 相同且更硬：滑动与播放补货每一批的参数都
+  /// 不同，apicache 虽按 URL 缓存、命中率不高，但一旦命中就会把同一批歌原样回放，
+  /// 表现为「滑到底部反复给同一首歌」。留空则按默认 5 分钟 TTL 走。
+  Future<List<KugouSongDetail>?> getHomeDiscover({
+    int pagesize = 4,
+    int todayPlayNum = 0,
+    String recallType = 'song',
+    int? page,
+    bool noCache = false,
+  }) async {
+    final params = <String, dynamic>{
+      'pagesize': pagesize,
+      'today_play_num': todayPlayNum,
+      'recall_type': recallType,
+    };
+    if (page != null) params['page'] = page;
+
+    final json = await _get(
+      KugouEndpoints.homeDiscover,
+      queryParameters: params,
+      noCache: noCache,
+    );
+    if (json == null) return null;
+    return parseHomeDiscoverSongs(json);
+  }
+
   // ==================== Scene ====================
 
   /// 场景音乐列表（/scene/lists → GET /scene/v1/scene/list）。
@@ -2661,11 +3025,20 @@ class KugouApiClient {
     String artistId, {
     int page = 1,
     int pagesize = 30,
+    String sort = 'hot',
     bool noCache = false,
   }) async {
+    final query = <String, dynamic>{
+      'id': artistId,
+      'page': page,
+      'pagesize': pagesize,
+    };
+    if (sort.isNotEmpty) {
+      query['sort'] = sort;
+    }
     final json = await _get(
       KugouEndpoints.artistAudios,
-      queryParameters: {'id': artistId, 'page': page, 'pagesize': pagesize},
+      queryParameters: query,
       noCache: noCache,
     );
     if (json == null) return null;
@@ -2835,10 +3208,7 @@ class KugouApiClient {
     int page = 1,
     int pagesize = 100,
   }) async {
-    final params = <String, dynamic>{
-      'page': page,
-      'pagesize': pagesize,
-    };
+    final params = <String, dynamic>{'page': page, 'pagesize': pagesize};
     if (videoId != null && videoId.isNotEmpty) {
       params['video_id'] = videoId;
     } else if (hash != null && hash.isNotEmpty) {

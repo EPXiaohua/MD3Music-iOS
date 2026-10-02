@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import 'bottom_chrome_scope.dart';
 
+import '../utils/app_haptics.dart';
 import '../../providers/device_provider.dart';
 import '../../providers/theme_provider.dart';
 
@@ -39,6 +40,79 @@ bool isPadLayout(BuildContext context) {
     case DeviceType.pad:
       return true;
   }
+}
+
+/// 桌面外壳（侧栏 + 顶部工具栏）总开关。
+///
+/// 由设置页「桌面布局」开关驱动、启动时从 `SettingsRepository.getDesktopModeEnabled`
+/// 载入。**默认 false**：无论横竖屏都走常规响应式布局（[ResponsiveScaffold]）；
+/// 用户手动开启后，无论横屏还是竖屏都强制使用桌面外壳。
+///
+/// 用全局 [ValueNotifier] 而非 Provider：因 [isDesktopLayout] 也会在返回键回调等
+/// 非 build 上下文里被调用（`context.watch` 会抛异常），值型订阅更安全；顶层
+/// `_MainLayout` 监听它触发整棵子树重建（与 `kCoverFlowImmersive` 同模式）。
+final ValueNotifier<bool> kDesktopModeEnabled = ValueNotifier<bool>(false);
+
+/// 播放器形态总开关（SecondaryMiniPlayerHost 渲染悬浮条还是底部常驻条）。
+///
+/// 默认关闭（底部常驻形态）。开启后**主页与二级页面**均使用悬浮播放条；关闭后
+/// 统一改用底部常驻播放条（主页由 shell 承载，二级页面由宿主补上同一条）。
+///
+/// 与 [kDesktopModeEnabled] 同为"外壳/播放栏形态"开关，放同一处便于查找。
+/// 宿主用 [ValueListenableBuilder] 直接订阅即可即时生效，无需整棵子树重建。
+final ValueNotifier<bool> kSecondaryPlayerEnabled = ValueNotifier<bool>(false);
+
+/// 悬浮播放器折叠态（圆盘）的停靠位。
+enum SecondaryPlayerDockSide {
+  left,
+  center,
+  right;
+
+  /// 从持久化原始字符串解析；非法/为空返回 null（调用方回退默认值）。
+  static SecondaryPlayerDockSide? tryParse(String? raw) {
+    if (raw == null) return null;
+    for (final v in values) {
+      if (v.name == raw) return v;
+    }
+    return null;
+  }
+}
+
+/// 悬浮播放器折叠态圆盘的水平停靠位。
+///
+/// 拖拽松手吸附后写入并持久化；未持久化过时由启动装载按设备形态给默认值
+/// （手机 [SecondaryPlayerDockSide.center]、Pad [SecondaryPlayerDockSide.right]）。
+/// 全局通知器而非实例状态：每个页面的悬浮播放器各有独立 State，
+/// 停靠位必须跨页面一致。
+final ValueNotifier<SecondaryPlayerDockSide> kSecondaryPlayerDock =
+    ValueNotifier<SecondaryPlayerDockSide>(SecondaryPlayerDockSide.center);
+
+/// 是否使用「桌面音乐软件式」外壳（侧栏 + 顶部工具栏 + 中央内容 + 全宽底部
+/// 播放栏）。
+///
+/// 全项目桌面化分支的**唯一判定源**。现由用户设置 [kDesktopModeEnabled] 决定，
+/// 不再自动按方向/尺寸切换：
+/// - 关闭（默认）→ 恒返回 false，无论横竖屏都用 [ResponsiveScaffold]
+///   （竖屏底部导航栏、横屏侧边 [NavigationRail]）；
+/// - 开启 → 恒返回 true，无论横竖屏都用桌面外壳。
+///
+/// 保留 [context] 形参仅为兼容既有调用点签名。
+bool isDesktopLayout(BuildContext context) => kDesktopModeEnabled.value;
+
+/// 按容器**局部宽度**推导网格列数（计划 4.7 宽屏密度）。
+///
+/// 分栏 / 双栏会改变可用宽度，列数必须按面板内 [LayoutBuilder] 的局部宽度
+/// 测量，而非全局 [MediaQuery]——否则窄详情/主列面板会塞进过多列。按每列
+/// 目标宽度 [targetExtent] 均分，结果夹在 [min, max]。
+int gridColumnsForWidth(
+  double width, {
+  double targetExtent = 200,
+  int min = 2,
+  int max = 6,
+}) {
+  if (width <= 0 || targetExtent <= 0) return min;
+  final n = (width / targetExtent).floor();
+  return n.clamp(min, max);
 }
 
 class ResponsiveLayout extends StatelessWidget {
@@ -140,7 +214,9 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold> {
   /// 点击 destination 完成后的统一入口：先触发该 tab 胶囊自驱动的水平
   /// 超出回弹（点击已选中项时），再转发原生选择回调（不改变原有切换行为；
   /// 切换选中项时胶囊由 _CapsuleBounce 的 didUpdateWidget 自动播放）。
+  /// 选择类震动（EFFECT_TICK）：竖屏 NavigationBar / 横屏 NavigationRail 共用。
   void _handleDestinationSelected(int index) {
+    AppHaptics.tick();
     _bounceKeys[index].currentState?.playBounce();
     _selectedBounceKeys[index].currentState?.playBounce();
     widget.onDestinationSelected(index);
@@ -220,57 +296,63 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold> {
     return Scaffold(
       key: _scaffoldKey,
       appBar: widget.appBar,
-      body: Row(
-        children: [
-          // Visibility(maintainState) 内部用 Offstage 隐藏：元素树结构保持稳定，
-          // hideNavigation 切换时 body（Expanded 子项）不会卸载重建，避免页面
-          // dispose→重建死循环导致横屏无法滑动/点击。
-          Visibility(
-            visible: !widget.hideNavigation,
-            maintainState: true,
-            child: NavigationRail(
-              selectedIndex: widget.selectedIndex,
-              onDestinationSelected: _handleDestinationSelected,
-              // 每个 tab 的图标外包自定义胶囊（icon 与 selectedIcon 各占一个
-              // key 槽位，同一时刻只有其一在树中；选中时显示胶囊，
-              // 点击/切换后胶囊水平超出回弹，图标不动）
-              destinations: [
-                for (int i = 0; i < widget.railDestinations.length; i++)
-                  NavigationRailDestination(
-                    icon: _CapsuleBounce(
-                      key: _bounceKeys[i],
-                      selected: widget.selectedIndex == i,
-                      child: widget.railDestinations[i].icon,
+      // 横屏左右安全区：侧栏与内容避开异形屏/圆角屏的左右 cutout（刘海横置）。
+      // 只保护左右，上下留给页面自身的 AppBar / body 处理。
+      body: SafeArea(
+        top: false,
+        bottom: false,
+        child: Row(
+          children: [
+            // Visibility(maintainState) 内部用 Offstage 隐藏：元素树结构保持稳定，
+            // hideNavigation 切换时 body（Expanded 子项）不会卸载重建，避免页面
+            // dispose→重建死循环导致横屏无法滑动/点击。
+            Visibility(
+              visible: !widget.hideNavigation,
+              maintainState: true,
+              child: NavigationRail(
+                selectedIndex: widget.selectedIndex,
+                onDestinationSelected: _handleDestinationSelected,
+                // 每个 tab 的图标外包自定义胶囊（icon 与 selectedIcon 各占一个
+                // key 槽位，同一时刻只有其一在树中；选中时显示胶囊，
+                // 点击/切换后胶囊水平超出回弹，图标不动）
+                destinations: [
+                  for (int i = 0; i < widget.railDestinations.length; i++)
+                    NavigationRailDestination(
+                      icon: _CapsuleBounce(
+                        key: _bounceKeys[i],
+                        selected: widget.selectedIndex == i,
+                        child: widget.railDestinations[i].icon,
+                      ),
+                      selectedIcon: _CapsuleBounce(
+                        key: _selectedBounceKeys[i],
+                        selected: widget.selectedIndex == i,
+                        child: widget.railDestinations[i].selectedIcon,
+                      ),
+                      label: widget.railDestinations[i].label,
                     ),
-                    selectedIcon: _CapsuleBounce(
-                      key: _selectedBounceKeys[i],
-                      selected: widget.selectedIndex == i,
-                      child: widget.railDestinations[i].selectedIcon,
-                    ),
-                    label: widget.railDestinations[i].label,
-                  ),
-              ],
-              leading: widget.floatingActionButton,
-              labelType: labelType,
-              // 原生胶囊已由 theme 关闭（indicatorColor transparent），
-              // 胶囊统一由 _CapsuleBounce 绘制
-              indicatorColor: Colors.transparent,
-              // 图标组垂直居中排列（groupAlignment 0 = 居中，-1 = 顶部）。
-              // tab 过多时 NavigationRail 内部自动滚动。宽度/间距均为原生固定规格。
-              groupAlignment: 0.0,
+                ],
+                leading: widget.floatingActionButton,
+                labelType: labelType,
+                // 原生胶囊已由 theme 关闭（indicatorColor transparent），
+                // 胶囊统一由 _CapsuleBounce 绘制
+                indicatorColor: Colors.transparent,
+                // 图标组垂直居中排列（groupAlignment 0 = 居中，-1 = 顶部）。
+                // tab 过多时 NavigationRail 内部自动滚动。宽度/间距均为原生固定规格。
+                groupAlignment: 0.0,
+              ),
             ),
-          ),
-          Visibility(
-            visible: !widget.hideNavigation,
-            maintainState: true,
-            child: VerticalDivider(
-              thickness: 1,
-              width: 1,
-              color: Theme.of(context).colorScheme.outlineVariant,
+            Visibility(
+              visible: !widget.hideNavigation,
+              maintainState: true,
+              child: VerticalDivider(
+                thickness: 1,
+                width: 1,
+                color: Theme.of(context).colorScheme.outlineVariant,
+              ),
             ),
-          ),
-          Expanded(child: widget.mediumBody ?? widget.body),
-        ],
+            Expanded(child: widget.mediumBody ?? widget.body),
+          ],
+        ),
       ),
     );
   }

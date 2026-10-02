@@ -5,6 +5,7 @@ import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/kugou_provider.dart';
 import 'vip_status.dart';
@@ -47,7 +48,12 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
               await kugou.getVipMonthRecord();
             },
             child: ListView(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 80),
+              padding: const EdgeInsets.fromLTRB(
+                AppSpacing.lg,
+                AppSpacing.lg,
+                AppSpacing.lg,
+                80,
+              ),
               children: [_buildVipCalendar(cs, tt, kugou, context)],
             ),
           );
@@ -118,9 +124,9 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _buildCalendarHeader(cs, tt, monthLabel, kugou, context),
-              const SizedBox(height: 16),
+              const Gap(AppSpacing.lg),
               _buildWeekdayHeader(cs),
-              const SizedBox(height: 8),
+              const Gap(AppSpacing.sm),
               _buildCalendarGrid(
                 cs,
                 curYear,
@@ -132,7 +138,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
               ),
               const SizedBox(height: 20),
               _buildStatFooter(cs, tt, receivedDays.length),
-              const SizedBox(height: 12),
+              const Gap(AppSpacing.md),
               _buildVipExpirySection(cs, tt, kugou),
             ],
           ),
@@ -149,7 +155,10 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
     BuildContext context,
   ) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.xs,
+        vertical: AppSpacing.xs,
+      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -166,7 +175,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
               ),
             ],
           ),
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -174,7 +183,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                 style: FilledButton.styleFrom(
                   visualDensity: VisualDensity.compact,
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
+                    horizontal: AppSpacing.sm,
                     vertical: 6,
                   ),
                   minimumSize: const Size(0, 32),
@@ -196,12 +205,12 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                     : const Icon(Icons.check_circle_outline, size: 16),
                 label: Text(kugou.manualSignInRunning ? '签到中' : '签到'),
               ),
-              const SizedBox(width: 8),
+              const Gap(AppSpacing.sm),
               FilledButton.tonalIcon(
                 style: FilledButton.styleFrom(
                   visualDensity: VisualDensity.compact,
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
+                    horizontal: AppSpacing.sm,
                     vertical: 6,
                   ),
                   minimumSize: const Size(0, 32),
@@ -223,12 +232,12 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                     : const Icon(Icons.headphones, size: 16),
                 label: Text(kugou.listenClaimRunning ? '领取中' : '听歌领取'),
               ),
-              const SizedBox(width: 8),
+              const Gap(AppSpacing.sm),
               FilledButton.tonalIcon(
                 style: FilledButton.styleFrom(
                   visualDensity: VisualDensity.compact,
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
+                    horizontal: AppSpacing.sm,
                     vertical: 6,
                   ),
                   minimumSize: const Size(0, 32),
@@ -252,7 +261,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const Gap(AppSpacing.xs),
           // 仅签到异常时点击 —— 提示语
           Text(
             '仅签到异常时点击',
@@ -344,7 +353,10 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
           children: [
             // 标题栏 + 关闭按钮（验证码弹不出时用户可退出，避免白框卡死）
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.md,
+                vertical: AppSpacing.xs,
+              ),
               child: Row(
                 children: [
                   Expanded(
@@ -386,7 +398,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
     const labels = ['一', '二', '三', '四', '五', '六', '日'];
     final tt = Theme.of(context).textTheme;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xxs),
       child: Row(
         children: [
           for (final l in labels)
@@ -412,10 +424,13 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
     final progress = receivedCount / daysInMonth;
 
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 16),
+      padding: const EdgeInsets.symmetric(
+        vertical: AppSpacing.lg,
+        horizontal: AppSpacing.lg,
+      ),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: AppRadius.lgAll,
       ),
       child: Row(
         children: [
@@ -447,7 +462,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
               ],
             ),
           ),
-          const SizedBox(width: 16),
+          const Gap(AppSpacing.lg),
           // 文字统计
           Expanded(
             child: Column(
@@ -457,7 +472,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                   '本月已打卡',
                   style: tt.labelMedium?.copyWith(color: cs.onSurfaceVariant),
                 ),
-                const SizedBox(height: 2),
+                const Gap(AppSpacing.xxs),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.baseline,
                   textBaseline: TextBaseline.alphabetic,
@@ -469,7 +484,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const SizedBox(width: 4),
+                    const Gap(AppSpacing.xs),
                     Text(
                       '/ $daysInMonth 天',
                       style: tt.labelMedium?.copyWith(
@@ -497,7 +512,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
                     size: 14,
                     color: cs.onSecondaryContainer,
                   ),
-                  const SizedBox(width: 4),
+                  const Gap(AppSpacing.xs),
                   Text(
                     '坚持中',
                     style: tt.labelSmall?.copyWith(
@@ -521,10 +536,13 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
   ) {
     final busiList = kugou.vipInfo?.busiVipList;
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 16),
+      padding: const EdgeInsets.symmetric(
+        vertical: AppSpacing.lg,
+        horizontal: AppSpacing.lg,
+      ),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: AppRadius.lgAll,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -533,14 +551,14 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
             '会员到期时间',
             style: tt.labelMedium?.copyWith(color: cs.onSurfaceVariant),
           ),
-          const SizedBox(height: 12),
+          const Gap(AppSpacing.md),
           _buildExpiryRow(
             tt,
             cs,
             '畅听会员',
             findActiveBusiVip(busiList, 'tvip'),
           ),
-          const SizedBox(height: 8),
+          const Gap(AppSpacing.sm),
           _buildExpiryRow(
             tt,
             cs,
@@ -575,7 +593,7 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
             color: dimmed ? cs.onSurfaceVariant : null,
           ),
         ),
-        const SizedBox(width: 8),
+        const Gap(AppSpacing.sm),
         Expanded(
           child: Text(
             status,

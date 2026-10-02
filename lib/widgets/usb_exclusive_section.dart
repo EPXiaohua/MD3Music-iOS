@@ -2,17 +2,31 @@ import 'dart:async';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
+import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../core/services/output_mode_coordinator.dart';
 import '../core/services/usb_audio_service.dart';
 import '../core/utils/app_toast.dart';
 import '../core/utils/audio_format_utils.dart';
 import '../providers/player_provider.dart';
+import 'direct_pcm_section.dart';
 
-/// USB 独占输出设置板块（设置页 / 歌曲信息页共用，保证信息与开关一致）。
+/// USB bit-perfect 输出设置板块（设置页 / 歌曲信息页共用，保证信息与开关一致）。
+///
+/// **两层开关**（见 [OutputModeCoordinator]）：
+/// 1. 外层「USB 独占输出」总开关 —— 关闭即全部走系统默认。未检测到 USB 音频设备时
+///    置灰不可点（下方状态卡会说明原因）。
+/// 2. 内层「改用系统 Direct PCM」—— **仅总开关打开时出现**，用于在
+///    「直写 USB（音质最好，挑设备）」与「系统 Direct PCM（兼容性更好）」之间选一种。
+///
+/// 两条路径共用同一个 AudioSink 出口，故只显示当前生效那一侧的详情：
+/// 直写侧见本类其余控件（MV 自动关独占 / TPDF / UAC 能力卡 / 输出格式强制 /
+/// USB 音量 / 格式链），Direct PCM 侧见 [DirectPcmSection]。
 ///
 /// 实时状态来自 [UsbAudioService.statusStream]（服务层每秒轮询一次原生状态）。
-/// 拔线检测：独占开启期间 deviceConnected 由 true→false 时提示并回调 [onAutoPause]。
+/// 拔线检测：总开关开启期间 deviceConnected 由 true→false 时关闭总开关并回调
+/// [onAutoPause]。
 class UsbExclusiveSection extends StatefulWidget {
   /// 拔线时自动暂停播放的回调（由宿主页面注入）。
   final VoidCallback? onAutoPause;
@@ -27,6 +41,9 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   Map<String, dynamic> _status = const {};
   bool _loading = false;
   bool _wasDeviceConnected = false;
+
+  /// 连续观测到「未连接」的次数（拔线去抖用，见 [_onStatus]）。
+  int _lostPolls = 0;
 
   /// USB 独占独立音量（0..1，独立记忆，仅独占生效）。本地副本用于 slider 拖动即时反馈。
   double _usbVolume = 1.0;
@@ -62,12 +79,21 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   StreamSubscription<Map<String, dynamic>>? _statusSub;
   Timer? _pollTimer;
 
+  /// 监听协调器的外层/内层开关变化（切方案、独占失败回退、拔线自动关闭）。
+  VoidCallback? _modeListener;
+
   @override
   void initState() {
     super.initState();
     _status = UsbAudioService.instance.lastStatus;
     _statusSub = UsbAudioService.instance.statusStream.listen(_onStatus);
     _wasDeviceConnected = _status['deviceConnected'] == true;
+    // 两层开关的状态由协调器持有（外层开关不能读 native：内层选中 Direct PCM 时
+    // 直写并未开启，但外层仍应为 ON）。故本组件要跟随协调器重建。
+    _modeListener = () {
+      if (mounted) setState(() {});
+    };
+    OutputModeCoordinator.instance.addListener(_modeListener!);
     // 从服务恢复已持久化的 USB 音量（服务启动时已从 SharedPreferences 读取）
     _usbVolume = (UsbAudioService.instance.usbVolumePercent / 100).clamp(0.0, 1.0);
     // 从服务恢复输出格式强制值
@@ -93,6 +119,10 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   void dispose() {
     _pollTimer?.cancel();
     _statusSub?.cancel();
+    if (_modeListener != null) {
+      OutputModeCoordinator.instance.removeListener(_modeListener!);
+      _modeListener = null;
+    }
     super.dispose();
   }
 
@@ -140,36 +170,81 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     if (!mounted) return;
     setState(() => _status = s);
     _reconcileOverrides();
-    // 拔线检测：独占开启中设备断开 → 提示 + 自动暂停
+    // 拔线检测：总开关开启中设备断开 → 关闭总开关回到系统默认 + 自动暂停。
+    // 判定读协调器而非 native `enabled`：内层选中系统 Direct PCM 时直写并未开启，
+    // 但用户「在 USB DAC 上做 bit-perfect」的意图同样随设备断开而消失。
     final nowConnected = s['deviceConnected'] == true;
-    final enabled = s['enabled'] == true;
-    if (enabled && _wasDeviceConnected && !nowConnected) {
-      widget.onAutoPause?.call();
-      if (mounted) {
-        showToast('USB DAC 已断开，独占输出已自动关闭');
+    if (nowConnected) {
+      _lostPolls = 0;
+    } else if (_wasDeviceConnected) {
+      // **必须去抖**：释放独占时 DAC 会短暂掉线再重连（真机日志
+      // `devices-removed` 紧跟 `devices-added`）。不抖动的话，切换方案时那一下
+      // 会被当成拔线，把用户刚打开的总开关又关掉。要求连续 2 次（约 1s）未连接。
+      _lostPolls++;
+      if (_lostPolls >= 2 && OutputModeCoordinator.instance.enabled) {
+        widget.onAutoPause?.call();
+        // 关闭走协调器（会连带关直写/关 Direct PCM/恢复效果链与音量）；
+        // 提示文案由协调器写入 lastFallbackNotice。
+        OutputModeCoordinator.instance.onDeviceLost();
+        _lostPolls = 0;
       }
     }
     _wasDeviceConnected = nowConnected;
   }
 
+  /// 外层「USB 独占输出」总开关。
+  ///
+  /// **必须走 [OutputModeCoordinator]**：直接调 `UsbAudioService.enableExclusive()`
+  /// 会让 native 状态与协调器脱节 —— 效果链旁路、交叉淡化互斥、unity 音量等判定
+  /// 全读协调器，绕过它会出现「独占已开但 DSP 仍被旁路」这类不一致。
   Future<void> _toggle(bool value) async {
     setState(() => _loading = true);
     try {
-      if (value) {
-        await UsbAudioService.instance.enableExclusive();
-      } else {
-        await UsbAudioService.instance.disableExclusive();
+      await OutputModeCoordinator.instance.setEnabled(value);
+      // 开启失败时协调器保持关闭并记下原因（见 _enterUsbdevfs）。在这里消费掉，
+      // 免得再被 PlayerProvider 的监听器弹一次同样的 toast。
+      if (value && !OutputModeCoordinator.instance.enabled) {
+        if (mounted) {
+          showToast(OutputModeCoordinator.instance.consumeFallbackNotice() ??
+              'USB 独占不可用，已恢复普通输出',
+              long: true);
+        } else {
+          OutputModeCoordinator.instance.consumeFallbackNotice();
+        }
       }
-      // 立即拉一次最新状态刷新 UI
       final s = await UsbAudioService.instance.getStatus();
       if (mounted) setState(() => _status = s);
-    } on UsbAudioException catch (e) {
-      if (mounted) {
-        showToast('USB 独占开启失败：${e.message}', long: true);
-      }
     } catch (e) {
       if (mounted) {
         showToast('USB 独占操作失败：$e', long: true);
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  /// 内层「改用系统 Direct PCM」方案开关（仅外层打开时可见）。
+  ///
+  /// 切回直写若开启失败，协调器会**关闭外层**回到系统默认（不自动换到 Direct PCM）
+  /// 并记下原因，同样在本处消费提示。
+  Future<void> _toggleViaSystem(bool value) async {
+    setState(() => _loading = true);
+    try {
+      await OutputModeCoordinator.instance.setViaSystem(value);
+      if (!OutputModeCoordinator.instance.enabled) {
+        if (mounted) {
+          showToast(OutputModeCoordinator.instance.consumeFallbackNotice() ??
+              'USB 独占不可用，已恢复普通输出',
+              long: true);
+        } else {
+          OutputModeCoordinator.instance.consumeFallbackNotice();
+        }
+      }
+      final s = await UsbAudioService.instance.getStatus();
+      if (mounted) setState(() => _status = s);
+    } catch (e) {
+      if (mounted) {
+        showToast('切换输出方案失败：$e', long: true);
       }
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -185,6 +260,11 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     final connected = _status['deviceConnected'] == true;
     final alive = _status['streamAlive'] == true;
     final deviceName = _status['deviceName'] as String? ?? '未知设备';
+    // 两层开关（协调器持有；外层开关**不能**读 native `enabled`）
+    final mode = OutputModeCoordinator.instance;
+    final modeEnabled = mode.enabled;
+    final viaSystem = mode.viaSystem;
+    final viaSystemActive = mode.isDirectPcmActive;
     // UAC1 / UAC2（AudioControl 描述符 bcdADC）——未读取到时为空，不显示徽标
     final uacLabel = _status['uacLabel'] as String? ?? '';
     // 输出格式可选项：全部来自接入 DAC 的能力（无能力时只有"自适应"且禁用）
@@ -256,13 +336,38 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // ── 外层总开关：USB 独占输出 ─────────────────────────────
+        // 未检测到 USB 音频设备时置灰不可点；下方状态卡会说明原因
+        // （静默不可点会让用户困惑，不知道为什么点不动）。
         // search: usb dac 独占 音频
         SwitchListTile(
           secondary: Icon(Icons.usb, color: colorScheme.primary),
           title: const Text('USB 独占输出'),
-          value: enabled,
-          onChanged: _loading ? null : _toggle,
+          subtitle: Text(_outerSubtitle(
+            modeEnabled: modeEnabled,
+            viaSystem: viaSystem,
+            connected: connected,
+          )),
+          value: modeEnabled,
+          onChanged: (!connected || _loading) ? null : _toggle,
         ),
+        // ── 内层方案开关：仅外层打开时出现 ──────────────────────
+        if (modeEnabled) ...[
+          // search: 系统 direct pcm bit perfect 无损 直通 备用
+          SwitchListTile(
+            secondary: Icon(Icons.graphic_eq, color: colorScheme.primary),
+            title: const Text('改用系统 Direct PCM'),
+            subtitle: const Text(
+                '不直写 USB，改用系统 AudioTrack；兼容性好，采样率与 DAC 原生率一致时达成 bit-perfect'),
+            value: viaSystem,
+            onChanged: _loading ? null : _toggleViaSystem,
+          ),
+        ],
+        // 只显示当前生效那一侧：系统 Direct PCM 生效时，直写侧的控件全部隐藏
+        // （它们对系统 AudioTrack 无意义：没有 UAC 能力协商、没有直写流可强制格式）。
+        // 判据是 `viaSystemActive`（= 外层开 且 内层选中），**不是** `modeEnabled` ——
+        // 外层开 + 内层未选时仍然走直写，那一侧的详情必须照常显示。
+        if (viaSystemActive) const DirectPcmSection() else ...[
         // 播放 MV 时自动关闭独占（默认开启）：独占绕过 AudioFlinger，MV 无系统音频
         FutureBuilder<bool>(
           future: UsbAudioService.instance.getAutoDisableForMv(),
@@ -353,6 +458,10 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              // 三行格式下拉（率/位深/声道）原本靠 DropdownButton 自带的行高
+              // 撑开间距；换成 M3E 字段后行高变矮，需显式给定行距，
+              // 否则三行会挤在一起、与页内其它设置项的节奏不一致。
+              spacing: 12,
               children: [
                 // 可选项全部来自 DAC 能力；未读取到能力时禁用（避免写入 DAC 不支持的格式）
                 _formatDropdown(
@@ -360,6 +469,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                   icon: Icons.speed,
                   label: '输出采样率',
                   value: _outputRate,
+                  currentValue: () => _outputRate,
                   items: {
                     0: '自适应',
                     for (final r in rates) r: _rateLabel(r),
@@ -372,6 +482,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                   icon: Icons.high_quality,
                   label: '输出位深',
                   value: _outputBits,
+                  currentValue: () => _outputBits,
                   items: {
                     0: '自适应',
                     for (final b in bits) b: '$b-bit',
@@ -384,6 +495,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                   icon: Icons.surround_sound,
                   label: '输出声道',
                   value: _outputChannels,
+                  currentValue: () => _outputChannels,
                   items: {
                     0: '自适应',
                     for (final c in channels) c: _channelLabel(c),
@@ -509,15 +621,20 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                     ),
                   ],
                 ),
-                Slider(
+                M3ESlider(
                   value: _usbVolume,
+                  // 不传 divisions = 无级调节（无节点）
+                  decoration: const M3ESliderDecoration(
+                    // 显式给离散触觉配置：divisions 为空时组件默认取连续触觉
+                    //（10ms 最小间隔），拖动会高频走震动通道导致马达饱和
+                    haptic: M3EHapticFeedback.medium,
+                    hapticConfig: M3EHapticConfig.discrete(),
+                  ),
                   // 实时生效：拖动即下发原生，无需松手
                   onChanged: (v) {
                     setState(() => _usbVolume = v);
                     UsbAudioService.instance.setUsbVolume(v * 100);
                   },
-                  onChangeStart: (_) => HapticFeedback.lightImpact(),
-                  onChangeEnd: (_) => HapticFeedback.selectionClick(),
                 ),
                 Text(
                   enabled
@@ -584,8 +701,25 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             ],
           ),
         ),
+        ],
       ],
     );
+  }
+
+  /// 外层总开关的副标题：说明**当前实际生效**的是什么，避免「开关显示 ON 但其实
+  /// 没独占」的误解（内层选中时并没有 force-claim USB 接口）。
+  String _outerSubtitle({
+    required bool modeEnabled,
+    required bool viaSystem,
+    required bool connected,
+  }) {
+    if (modeEnabled) {
+      return viaSystem
+          ? '当前：经系统 AudioTrack 输出，不直写 USB（兼容性更好）'
+          : '当前：绕过 AudioFlinger 直写 USB DAC（音质最好，挑设备）';
+    }
+    if (!connected) return '未检测到 USB 音频设备，全部走系统默认输出';
+    return '开启后可在「直写 USB」与「系统 Direct PCM」两种方案间选择';
   }
 
   // ── 输出格式选择辅助 ─────────────────────────────────────────
@@ -764,10 +898,13 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     required int value,
     required Map<int, String> items,
     required ValueChanged<int?> onChanged,
+    required int Function() currentValue,
     bool enabled = true,
   }) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
+    // 传入值不在可选项内时回落到「自适应」(0)，与原 DropdownButton 一致
+    final effectiveValue = items.containsKey(value) ? value : 0;
     return Row(
       children: [
         Icon(icon,
@@ -782,17 +919,45 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             ),
           ),
         ),
-        DropdownButton<int>(
-          value: items.containsKey(value) ? value : 0,
-          underline: const SizedBox.shrink(),
-          items: items.entries
-              .map((e) => DropdownMenuItem<int>(
-                    value: e.key,
-                    child: Text(e.value, style: textTheme.bodyMedium),
-                  ))
-              .toList(),
-          // 未读取到 DAC 能力时禁用（只有"自适应"），避免下发 DAC 不支持的格式
-          onChanged: enabled ? onChanged : null,
+        // M3E 字段式下拉需要有限宽度：固定宽度保持行内「左侧图标+标签、
+        // 右侧控件」的布局骨架，取值过长时在字段内省略
+        SizedBox(
+          width: 150,
+          child: M3EDropdownMenu<int>(
+            items: [
+              for (final e in items.entries)
+                M3EDropdownItem(
+                  label: e.value,
+                  value: e.key,
+                  selected: e.key == effectiveValue,
+                ),
+            ],
+            singleSelect: true,
+            showChipAnimation: false,
+            // 未读取到 DAC 能力时禁用（只有"自适应"），避免下发 DAC 不支持的格式
+            enabled: enabled,
+            fieldStyle: M3EDropdownFieldStyle(
+              hintText: label,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              // 禁用时保持旧 DropdownButton 的灰化取值与箭头
+              foregroundColor: enabled ? null : colorScheme.outline,
+              selectedTextStyle: textTheme.bodyMedium?.copyWith(
+                color: enabled ? null : colorScheme.outline,
+              ),
+            ),
+            // currentValue 用函数而非按值捕获的局部变量：M3EDropdownMenu 只在
+            // 挂载时保存一次该回调，闭包捕获的局部变量会残留首帧旧值
+            onSelectionChanged: (selected) {
+              // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+              if (selected.isEmpty) {
+                setState(() {});
+                return;
+              }
+              final v = selected.first.value;
+              if (v == currentValue()) return;
+              onChanged(v);
+            },
+          ),
         ),
       ],
     );

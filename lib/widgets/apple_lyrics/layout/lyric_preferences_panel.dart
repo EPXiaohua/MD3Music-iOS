@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:m3e_core/m3e_core.dart';
 
 import '../../../core/services/custom_font_loader.dart';
 import '../../../core/utils/app_toast.dart';
@@ -47,20 +48,16 @@ class LyricPreferencesPanel extends StatelessWidget {
               const SizedBox(height: 8),
               // 字号滑块
               Text('字号：${prefs.fontSize.round()} px'),
-              Slider(
+              M3ESlider(
                 min: LyricPreferences.minFontSize,
                 max: LyricPreferences.maxFontSize,
-                divisions:
-                    (LyricPreferences.maxFontSize -
-                            LyricPreferences.minFontSize)
-                        .round(),
                 value: prefs.fontSize,
                 onChanged: prefs.setFontSize,
               ),
               const SizedBox(height: 8),
               // 字重滑块
               Text('字重：${_fontWeightLabel(prefs.fontWeightValue)}'),
-              Slider(
+              M3ESlider(
                 min: LyricPreferences.minFontWeight.toDouble(),
                 max: LyricPreferences.maxFontWeight.toDouble(),
                 divisions: ((LyricPreferences.maxFontWeight -
@@ -72,7 +69,7 @@ class LyricPreferencesPanel extends StatelessWidget {
               const SizedBox(height: 8),
               // 行间距滑块
               Text('行间距：${prefs.lineSpacing.toStringAsFixed(1)} ×'),
-              Slider(
+              M3ESlider(
                 min: LyricPreferences.minLineSpacing,
                 max: LyricPreferences.maxLineSpacing,
                 divisions: ((LyricPreferences.maxLineSpacing -
@@ -140,7 +137,7 @@ class LyricPreferencesPanel extends StatelessWidget {
 
   /// 弹出歌词字体来源选择面板（与全局字体选择解耦）。
   void _showFontSourceSheet(BuildContext context, LyricPreferences prefs) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       showDragHandle: true,
       builder: (ctx) {

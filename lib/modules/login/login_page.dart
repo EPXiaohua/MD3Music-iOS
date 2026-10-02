@@ -536,7 +536,7 @@ class _LoginPageState extends State<LoginPage>
       return;
     }
 
-    final selected = await showModalBottomSheet<KugouLoginAccount>(
+    final selected = await showM3EModalBottomSheet<KugouLoginAccount>(
       context: context,
       showDragHandle: true,
       builder: (ctx) {

@@ -13,17 +13,165 @@ use crate::modules::{Ctx, ModuleFn};
 use crate::request::{BodyValue, ModuleResponse};
 use crate::util::{json_stringify, percent_decode_preserve_plus};
 use serde_json::{json, Map, Value};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::OnceLock;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// apicache '2 minutes' = 120000 ms.
 const CACHE_DURATION: f64 = 120.0;
 const CACHE_DURATION_MS: u64 = 120_000;
+/// 有界请求线程数；动态封面长流共享总额，但单独限额以留出普通API容量。
+const MAX_ACTIVE_REQUESTS: usize = 32;
+const MAX_ACTIVE_MEDIA_STREAMS: usize = 2;
+const MAX_ACTIVE_UPLOADS: usize = 1;
+const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GENERIC_BODY_BYTES: usize = 1024 * 1024;
+const MAX_BINARY_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CLOUD_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
-static PORT: AtomicU16 = AtomicU16::new(0);
+struct RunningServer {
+    generation: u64,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    listener_thread: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ServerState {
+    generation: u64,
+    active: Option<RunningServer>,
+}
+
+static SERVER_STATE: OnceLock<Mutex<ServerState>> = OnceLock::new();
+static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_MEDIA_STREAMS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+
+struct UploadGuard;
+
+impl UploadGuard {
+    fn try_acquire() -> Option<Self> {
+        increment_if_below(&ACTIVE_UPLOADS, MAX_ACTIVE_UPLOADS).then(|| Self)
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPLOADS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ActiveRequestGuard<'a> {
+    active_requests: &'a AtomicUsize,
+    active_media_streams: Option<&'a AtomicUsize>,
+}
+
+impl ActiveRequestGuard<'static> {
+    fn enter(is_media_stream: bool) -> Option<Self> {
+        Self::enter_with(
+            &ACTIVE_REQUESTS,
+            &ACTIVE_MEDIA_STREAMS,
+            is_media_stream,
+            MAX_ACTIVE_REQUESTS,
+            MAX_ACTIVE_MEDIA_STREAMS,
+        )
+    }
+}
+
+impl<'a> ActiveRequestGuard<'a> {
+    fn enter_with(
+        active_requests: &'a AtomicUsize,
+        active_media_streams: &'a AtomicUsize,
+        is_media_stream: bool,
+        max_requests: usize,
+        max_media_streams: usize,
+    ) -> Option<Self> {
+        if !increment_if_below(active_requests, max_requests) {
+            return None;
+        }
+        if is_media_stream && !increment_if_below(active_media_streams, max_media_streams) {
+            active_requests.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            active_requests,
+            active_media_streams: is_media_stream.then_some(active_media_streams),
+        })
+    }
+}
+
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::AcqRel);
+        if let Some(counter) = self.active_media_streams {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn increment_if_below(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn request_body_limit(path: &str, content_type: &str) -> usize {
+    if path == "/user/cloud/upload" && content_type.contains("application/octet-stream") {
+        MAX_CLOUD_UPLOAD_BYTES
+    } else if content_type.contains("application/octet-stream") {
+        MAX_BINARY_BODY_BYTES
+    } else if content_type.contains("application/json")
+        || content_type.contains("application/x-www-form-urlencoded")
+    {
+        MAX_JSON_BODY_BYTES
+    } else {
+        MAX_GENERIC_BODY_BYTES
+    }
+}
+
+fn body_exceeds_declared_limit(
+    headers: &std::collections::HashMap<String, String>,
+    limit: usize,
+) -> bool {
+    headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+}
+
+fn read_bounded_body(reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut body)?;
+    if body.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request body exceeds configured limit",
+        ));
+    }
+    Ok(body)
+}
+
+fn server_state() -> MutexGuard<'static, ServerState> {
+    SERVER_STATE
+        .get_or_init(|| Mutex::new(ServerState::default()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 /// data_dir（持久化 device_info.json），start() 时写入。
 static DATA_DIR: OnceLock<String> = OnceLock::new();
@@ -65,8 +213,11 @@ fn session_dev() -> String {
 ///
 /// 返回 Some(实际端口) 表示启动成功（或已在运行），None 表示失败。
 pub fn start(port: u16, data_dir: String) -> Option<u16> {
-    if RUNNING.load(Ordering::SeqCst) {
-        return Some(PORT.load(Ordering::SeqCst));
+    let mut state = server_state();
+    if let Some(active) = state.active.as_ref() {
+        if active.generation == state.generation && !active.stop.load(Ordering::SeqCst) {
+            return Some(active.port);
+        }
     }
     let _ = DATA_DIR.set(data_dir.clone());
     let _ = DeviceConfig::instance().load_cached(&data_dir);
@@ -87,9 +238,25 @@ pub fn start(port: u16, data_dir: String) -> Option<u16> {
         }
     };
 
-    PORT.store(chosen, Ordering::SeqCst);
-    RUNNING.store(true, Ordering::SeqCst);
-    std::thread::spawn(move || run_loop(server, data_dir));
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let listener_thread = match std::thread::Builder::new()
+        .name("kugou-http-listener".into())
+        .spawn(move || run_loop(server, data_dir, loop_stop))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("[server] listener thread spawn failed: {error}");
+            return None;
+        }
+    };
+    state.generation = state.generation.wrapping_add(1);
+    state.active = Some(RunningServer {
+        generation: state.generation,
+        port: chosen,
+        stop,
+        listener_thread,
+    });
     Some(chosen)
 }
 
@@ -99,31 +266,79 @@ fn random_port() -> u16 {
 }
 
 pub fn stop() {
-    RUNNING.store(false, Ordering::SeqCst);
-    PORT.store(0, Ordering::SeqCst);
+    // Hold the lifecycle lock through listener join so a concurrent start cannot
+    // bind a new generation while the old listener still owns its socket.
+    let mut state = server_state();
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(active) = state.active.take() {
+        let RunningServer {
+            stop,
+            listener_thread,
+            ..
+        } = active;
+        stop.store(true, Ordering::SeqCst);
+        if let Err(error) = listener_thread.join() {
+            eprintln!("[server] listener thread panicked during stop: {error:?}");
+        }
+    }
 }
 
 pub fn is_running() -> bool {
-    RUNNING.load(Ordering::SeqCst)
+    let state = server_state();
+    state
+        .active
+        .as_ref()
+        .is_some_and(|active| active.generation == state.generation)
 }
 
 pub fn get_port() -> u16 {
-    PORT.load(Ordering::SeqCst)
+    let state = server_state();
+    state
+        .active
+        .as_ref()
+        .filter(|active| active.generation == state.generation)
+        .map(|active| active.port)
+        .unwrap_or(0)
 }
 
-fn run_loop(server: Server, data_dir: String) {
-    while RUNNING.load(Ordering::SeqCst) {
-        match server.recv_timeout(Duration::from_millis(500)) {
+/// 当前所有服务代次中仍在处理的请求数。旧代请求完成前继续占用计数。
+pub fn active_request_count() -> usize {
+    ACTIVE_REQUESTS.load(Ordering::Acquire)
+}
+
+fn run_loop(server: Server, data_dir: String, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::SeqCst) {
+        match server.recv_timeout(Duration::from_millis(50)) {
             Ok(Some(request)) => {
+                if stop.load(Ordering::SeqCst) {
+                    let _ = request.respond(Response::empty(503));
+                    break;
+                }
                 // 每个请求独立线程处理：云盘上传等耗时请求（分片串行可达数十秒）
                 // 不再阻塞其他请求（如列表刷新、搜索），避免串行排队造成"卡住"。
                 // 全局状态（CACHE/DeviceConfig/session 常量）均持锁或 OnceLock，并发安全。
                 // P0: 减小线程栈（默认 2MB → 256KB），100 并发从 ~200MB 降到 ~25MB。
+                let is_media_stream =
+                    request.url().split('?').next() == Some("/album/dycover/media");
+                let Some(request_guard) = ActiveRequestGuard::enter(is_media_stream) else {
+                    let mut response = Response::from_data(
+                        br#"{"error":"local_server_busy","retryable":true}"#.to_vec(),
+                    )
+                    .with_status_code(503);
+                    if let Ok(header) =
+                        make_header("Content-Type", "application/json; charset=utf-8")
+                    {
+                        response = response.with_header(header);
+                    }
+                    let _ = request.respond(response);
+                    continue;
+                };
                 let dd = data_dir.clone();
                 if let Err(e) = std::thread::Builder::new()
                     .name("req".into())
                     .stack_size(256 * 1024)
                     .spawn(move || {
+                        let _request_guard = request_guard;
                         if let Err(e) = handle_request(request, &dd) {
                             eprintln!("[server] handler error: {}", e);
                         }
@@ -144,7 +359,6 @@ struct Req {
     /// originalUrl = path + query.
     original_url: String,
     headers: std::collections::HashMap<String, String>,
-    body: Vec<u8>,
 }
 
 fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
@@ -217,17 +431,56 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         return crate::modules::dycover::handle_media_proxy(request, &url);
     }
 
-    // ---- body parse ----
-    let mut body_bytes: Vec<u8> = Vec::new();
-    {
-        let reader = request.as_reader();
-        let _ = reader.read_to_end(&mut body_bytes);
-    }
+    // ---- body parse (route-aware hard limit; chunked/unknown bodies are bounded too) ----
     let ct = headers
         .get("content-type")
         .cloned()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let is_cloud_upload = path == "/user/cloud/upload" && ct.contains("application/octet-stream");
+    let body_limit = request_body_limit(&path, &ct);
+    let _upload_guard = if is_cloud_upload {
+        let Some(guard) = UploadGuard::try_acquire() else {
+            let mut response = Response::from_data(
+                br#"{"error":"upload_busy","retryable":true}"#.to_vec(),
+            )
+            .with_status_code(503);
+            for (k, v) in &cors_headers {
+                response = response.with_header(make_header(k, v)?);
+            }
+            request.respond(response).map_err(|e| e.to_string())?;
+            return Ok(());
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    if body_exceeds_declared_limit(&headers, body_limit) {
+        let mut response = Response::from_data(
+            br#"{"error":"request_body_too_large","retryable":false}"#.to_vec(),
+        )
+        .with_status_code(413);
+        for (k, v) in &cors_headers {
+            response = response.with_header(make_header(k, v)?);
+        }
+        request.respond(response).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let body_bytes = match read_bounded_body(request.as_reader(), body_limit) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let mut response = Response::from_data(
+                br#"{"error":"request_body_too_large","retryable":false}"#.to_vec(),
+            )
+            .with_status_code(413);
+            for (k, v) in &cors_headers {
+                response = response.with_header(make_header(k, v)?);
+            }
+            request.respond(response).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        Err(error) => return Err(format!("read request body: {error}")),
+    };
     let body_value: Option<Value> = if ct.contains("application/json") {
         match parse_json_body(&body_bytes) {
             Ok(v) => Some(v),
@@ -345,8 +598,8 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
     let req = Req {
         original_url: url.clone(),
         headers,
-        body: body_bytes,
     };
+    let binary_body: Option<Arc<[u8]>> = body_is_buffer.then(|| Arc::from(body_bytes));
 
     let query = build_query(&req, &cookies, &body_value, body_is_buffer);
     let no_cookie = query_truthy(&query, "noCookie");
@@ -357,7 +610,7 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         if prefix_match(route, &path) {
             let ctx = Ctx {
                 ip: String::new(),
-                body_bytes: if body_is_buffer { req.body.clone().into() } else { None },
+                body_bytes: binary_body.clone(),
             };
             let result = module_fn(&query, &ctx);
             return respond_module(request, result, &cors_headers, &mut set_cookies, no_cookie, &cache_key, bypass, *route == "/register/dev");
@@ -720,4 +973,137 @@ fn build_query(
     }
 
     Value::Object(query)
+}
+
+#[cfg(test)]
+mod request_capacity_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn request_bodies_use_route_specific_limits_and_bounded_reads() {
+        assert_eq!(
+            request_body_limit("/user/cloud/upload", "application/octet-stream"),
+            MAX_CLOUD_UPLOAD_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/audio/match", "application/octet-stream"),
+            MAX_BINARY_BODY_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/playlist/add", "application/json"),
+            MAX_JSON_BODY_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/other", "text/plain"),
+            MAX_GENERIC_BODY_BYTES
+        );
+
+        assert_eq!(read_bounded_body(&b"1234"[..], 4).unwrap(), b"1234");
+        assert_eq!(
+            read_bounded_body(&b"12345"[..], 4).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn declared_oversized_request_is_rejected_before_body_read() {
+        let headers = HashMap::from([("content-length".to_string(), "5".to_string())]);
+        assert!(body_exceeds_declared_limit(&headers, 4));
+        assert!(!body_exceeds_declared_limit(&headers, 5));
+        assert!(!body_exceeds_declared_limit(&HashMap::new(), 4));
+    }
+
+    #[test]
+    fn cloud_upload_permit_is_exclusive_and_released_on_drop() {
+        let first = UploadGuard::try_acquire().expect("first upload is admitted");
+        assert!(UploadGuard::try_acquire().is_none());
+        drop(first);
+        assert!(UploadGuard::try_acquire().is_some());
+    }
+
+    #[test]
+    fn request_permits_bound_total_work_and_reserve_api_capacity() {
+        let requests = AtomicUsize::new(0);
+        let media = AtomicUsize::new(0);
+
+        let stream = ActiveRequestGuard::enter_with(&requests, &media, true, 3, 1).unwrap();
+        assert!(ActiveRequestGuard::enter_with(&requests, &media, true, 3, 1).is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        assert_eq!(media.load(Ordering::Acquire), 1);
+
+        let api_one = ActiveRequestGuard::enter_with(&requests, &media, false, 3, 1).unwrap();
+        let api_two = ActiveRequestGuard::enter_with(&requests, &media, false, 3, 1).unwrap();
+        assert!(ActiveRequestGuard::enter_with(&requests, &media, false, 3, 1).is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 3);
+
+        drop(stream);
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        assert_eq!(media.load(Ordering::Acquire), 0);
+        let replacement_stream =
+            ActiveRequestGuard::enter_with(&requests, &media, true, 3, 1).unwrap();
+
+        drop(api_one);
+        drop(api_two);
+        drop(replacement_stream);
+        assert_eq!(requests.load(Ordering::Acquire), 0);
+        assert_eq!(media.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn mixed_concurrent_load_never_exceeds_request_or_media_budgets() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const REQUEST_LIMIT: usize = 6;
+        const MEDIA_LIMIT: usize = 2;
+        const WORKERS: usize = 16;
+        const ITERATIONS: usize = 600;
+
+        let requests = AtomicUsize::new(0);
+        let media = AtomicUsize::new(0);
+        let peak_requests = AtomicUsize::new(0);
+        let peak_media = AtomicUsize::new(0);
+        let start = Arc::new(Barrier::new(WORKERS));
+        let request_counter = &requests;
+        let media_counter = &media;
+        let request_peak = &peak_requests;
+        let media_peak = &peak_media;
+
+        thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let start = Arc::clone(&start);
+                let is_media = worker % 2 == 0;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..ITERATIONS {
+                        if let Some(_permit) = ActiveRequestGuard::enter_with(
+                            request_counter,
+                            media_counter,
+                            is_media,
+                            REQUEST_LIMIT,
+                            MEDIA_LIMIT,
+                        ) {
+                            let active_requests = request_counter.load(Ordering::Acquire);
+                            let active_media = media_counter.load(Ordering::Acquire);
+                            request_peak.fetch_max(active_requests, Ordering::AcqRel);
+                            media_peak.fetch_max(active_media, Ordering::AcqRel);
+                            assert!(active_requests <= REQUEST_LIMIT);
+                            assert!(active_media <= MEDIA_LIMIT);
+                            thread::yield_now();
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
+
+        assert!(peak_requests.load(Ordering::Acquire) > 1);
+        assert!(peak_requests.load(Ordering::Acquire) <= REQUEST_LIMIT);
+        assert!(peak_media.load(Ordering::Acquire) > 0);
+        assert!(peak_media.load(Ordering::Acquire) <= MEDIA_LIMIT);
+        assert_eq!(requests.load(Ordering::Acquire), 0);
+        assert_eq!(media.load(Ordering::Acquire), 0);
+    }
 }

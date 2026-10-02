@@ -47,7 +47,9 @@ class PlayerFrameDriver {
     // 拷贝快照：回调内可能增删订阅（如收敛停帧）
     final List<VoidCallback> snapshot = List<VoidCallback>.of(_listeners);
     for (final VoidCallback cb in snapshot) {
-      cb();
+      // 同一拍较早的回调可能销毁另一个订阅者；跳过已移除项，避免对已卸载
+      // Widget 再触发一次 setState。
+      if (_listeners.contains(cb)) cb();
     }
   }
 }

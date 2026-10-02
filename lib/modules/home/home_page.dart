@@ -5,6 +5,7 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
 import '../../core/layout/responsive_layout.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../data/models/album.dart';
 import '../../data/models/playlist.dart';
 import '../../data/models/song.dart';
@@ -14,6 +15,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/album_card.dart';
 import '../../widgets/song_list_item.dart';
 import '../login/login_page.dart';
+import '../player/secondary_mini_player.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -95,7 +97,7 @@ class _HomePageState extends State<HomePage> {
               final isLoggedIn = kugouProvider.isLoggedIn;
 
               return Padding(
-                padding: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.only(right: AppSpacing.sm),
                 child: Tooltip(
                   message: isLoggedIn ? (userInfo?.nickname ?? '用户') : '登录',
                   child: IconButton(
@@ -114,7 +116,12 @@ class _HomePageState extends State<HomePage> {
           slivers: [
             SliverToBoxAdapter(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.lg,
+                  AppSpacing.xl,
+                  AppSpacing.lg,
+                  AppSpacing.sm,
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -122,7 +129,7 @@ class _HomePageState extends State<HomePage> {
                       _getGreeting(),
                       style: textTheme.headlineMedium,
                     ),
-                    const SizedBox(height: 4),
+                    const Gap(AppSpacing.xs),
                     Text(
                       '发现你喜欢的音乐',
                       style: textTheme.bodyLarge?.copyWith(
@@ -163,7 +170,7 @@ class _HomePageState extends State<HomePage> {
                 child: _SectionTitle(title: '每日推荐'),
               ),
               SliverPadding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
                 sliver: _buildDailyRecommendations(context),
               ),
             ],
@@ -222,7 +229,7 @@ class _HomePageState extends State<HomePage> {
     final colorScheme = Theme.of(context).colorScheme;
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(32),
+        padding: const EdgeInsets.all(AppSpacing.xxl),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -231,14 +238,14 @@ class _HomePageState extends State<HomePage> {
               size: 48,
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpacing.md),
             Text(
               '加载失败',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                   ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               error,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -246,7 +253,7 @@ class _HomePageState extends State<HomePage> {
                   ),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             FilledButton.tonal(
               onPressed: onRetry,
               child: const Text('重试'),
@@ -265,7 +272,7 @@ class _HomePageState extends State<HomePage> {
       height: 200,
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         itemCount: _playlists.length,
         itemBuilder: (context, index) {
           final pl = _playlists[index];
@@ -295,12 +302,12 @@ class _HomePageState extends State<HomePage> {
       height: 200,
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         itemCount: _rankAlbums.length,
         itemBuilder: (context, index) {
           final album = _rankAlbums[index];
           return Padding(
-            padding: const EdgeInsets.only(right: 12),
+            padding: const EdgeInsets.only(right: AppSpacing.md),
             child: SizedBox(
               width: 150,
               child: AlbumCard(
@@ -342,57 +349,61 @@ class _HomePageState extends State<HomePage> {
       );
     }
 
-    final screenType = getScreenTypeFromContext(context);
-    int crossAxisCount;
-    switch (screenType) {
-      case ScreenType.compact:
-        crossAxisCount = 1;
-        break;
-      case ScreenType.medium:
-        crossAxisCount = 2;
-        break;
-      case ScreenType.expanded:
-        crossAxisCount = 4;
-    }
+    // 大屏「重组而非拉伸」：按面板实际宽度平滑决定列数，而非粗档 1/2/4。
+    // 窄屏（手机竖屏）保持单列列表；变宽后按 ~360dp 目标列宽递增到多列网格，
+    // Pad / 横屏得到随宽度自适应的列数，元素不被拉长。
+    return SliverLayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.crossAxisExtent;
+        final crossAxisCount = width < 520
+            ? 1
+            : gridColumnsForWidth(
+                width,
+                targetExtent: 360,
+                min: 2,
+                max: 5,
+              );
 
-    if (crossAxisCount == 1) {
-      return SliverList(
-        delegate: SliverChildBuilderDelegate(
-          (context, index) {
-            final song = _dailyRecommendations[index];
-            return SongListItem(
-              song: song,
-              onTap: () {
-                context.read<PlayerProvider>().playOnlinePlaylist(_dailyRecommendations, index);
+        if (crossAxisCount == 1) {
+          return SliverList(
+            delegate: SliverChildBuilderDelegate(
+              (context, index) {
+                final song = _dailyRecommendations[index];
+                return SongListItem(
+                  song: song,
+                  onTap: () {
+                    context.read<PlayerProvider>().playOnlinePlaylist(_dailyRecommendations, index);
+                  },
+                  onMoreTap: () {},
+                );
               },
-              onMoreTap: () {},
-            );
-          },
-          childCount: _dailyRecommendations.length,
-        ),
-      );
-    }
-
-    return SliverGrid(
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: crossAxisCount,
-        childAspectRatio: 3.5,
-        crossAxisSpacing: 8,
-        mainAxisSpacing: 4,
-      ),
-      delegate: SliverChildBuilderDelegate(
-        (context, index) {
-          final song = _dailyRecommendations[index];
-          return SongListItem(
-            song: song,
-            onTap: () {
-              context.read<PlayerProvider>().playOnlinePlaylist(_dailyRecommendations, index);
-            },
-            onMoreTap: () {},
+              childCount: _dailyRecommendations.length,
+            ),
           );
-        },
-        childCount: _dailyRecommendations.length,
-      ),
+        }
+
+        return SliverGrid(
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            childAspectRatio: 3.5,
+            crossAxisSpacing: AppSpacing.sm,
+            mainAxisSpacing: AppSpacing.xs,
+          ),
+          delegate: SliverChildBuilderDelegate(
+            (context, index) {
+              final song = _dailyRecommendations[index];
+              return SongListItem(
+                song: song,
+                onTap: () {
+                  context.read<PlayerProvider>().playOnlinePlaylist(_dailyRecommendations, index);
+                },
+                onMoreTap: () {},
+              );
+            },
+            childCount: _dailyRecommendations.length,
+          ),
+        );
+      },
     );
   }
 
@@ -414,7 +425,12 @@ class _SectionTitle extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.lg,
+        AppSpacing.xl,
+        AppSpacing.lg,
+        AppSpacing.sm,
+      ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -455,7 +471,7 @@ class _PlaylistHorizontalCard extends StatelessWidget {
         width: 150,
         child: Material(
           color: colorScheme.surfaceContainerLow,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: AppRadius.lgAll,
           clipBehavior: Clip.antiAlias,
           child: InkWell(
             onTap: onTap,
@@ -499,7 +515,10 @@ class _PlaylistHorizontalCard extends StatelessWidget {
                 SizedBox(
                   height: 44,
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.sm,
+                      vertical: AppSpacing.xs,
+                    ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -547,7 +566,8 @@ class _PlaylistDetailPageState extends State<_PlaylistDetailPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text(widget.playlist.name)),
-      body: Consumer<KugouProvider>(
+      body: SecondaryMiniPlayerHost(
+        child: Consumer<KugouProvider>(
         builder: (context, kugouProvider, child) {
           if (kugouProvider.isLoading) {
             return const Center(child: M3ELoadingIndicator());
@@ -569,7 +589,7 @@ class _PlaylistDetailPageState extends State<_PlaylistDetailPage> {
             );
           }
           return ListView.builder(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(AppSpacing.lg),
             itemCount: songs.length,
             itemBuilder: (context, index) {
               final song = songs[index].toSong();
@@ -586,6 +606,7 @@ class _PlaylistDetailPageState extends State<_PlaylistDetailPage> {
             },
           );
         },
+      ),
       ),
     );
   }
@@ -614,7 +635,8 @@ class _RankDetailPageState extends State<_RankDetailPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text(widget.rankName)),
-      body: Consumer<KugouProvider>(
+      body: SecondaryMiniPlayerHost(
+        child: Consumer<KugouProvider>(
         builder: (context, kugouProvider, child) {
           if (kugouProvider.isLoading) {
             return const Center(child: M3ELoadingIndicator());
@@ -636,7 +658,7 @@ class _RankDetailPageState extends State<_RankDetailPage> {
             );
           }
           return ListView.builder(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(AppSpacing.lg),
             itemCount: songs.length,
             itemBuilder: (context, index) {
               final song = songs[index].toSong();
@@ -653,6 +675,7 @@ class _RankDetailPageState extends State<_RankDetailPage> {
             },
           );
         },
+      ),
       ),
     );
   }

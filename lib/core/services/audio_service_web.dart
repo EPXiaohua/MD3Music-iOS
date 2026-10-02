@@ -2,6 +2,9 @@ import 'dart:html' as html;
 
 import 'package:just_audio/just_audio.dart';
 
+import 'diagnostic_logger.dart';
+import 'playback_command_dispatcher.dart';
+
 class AudioService {
   static final AudioService _instance = AudioService._internal();
 
@@ -10,6 +13,8 @@ class AudioService {
   AudioService._internal();
 
   final AudioPlayer _player = AudioPlayer();
+  int get diagnosticPlayerCount => 1;
+  String get diagnosticActiveEngine => 'main';
   final ConcatenatingAudioSource _playlistSource = ConcatenatingAudioSource(
     children: [],
   );
@@ -23,6 +28,8 @@ class AudioService {
   Stream<bool> get playingStream => _player.playingStream;
 
   Stream<PlayerState> get playerStateStream => _player.playerStateStream;
+
+  ProcessingState get processingState => _player.processingState;
 
   Stream<SequenceState?> get sequenceStateStream => _player.sequenceStateStream;
 
@@ -49,6 +56,27 @@ class AudioService {
 
   Future<void> play() async {
     await _player.play();
+  }
+
+  /// 派发播放命令后立即返回，并接收底层播放Future稍后抛出的错误。
+  Future<void> playCommand({
+    void Function(Object error, StackTrace stackTrace)? onError,
+  }) async {
+    await dispatchPlaybackCommand(
+      _player.play(),
+      onError: (error, stackTrace) {
+        DiagnosticLogger.instance.e(
+          '[Playback] play command future failed: ${error.runtimeType}',
+        );
+        try {
+          onError?.call(error, stackTrace);
+        } catch (callbackError) {
+          DiagnosticLogger.instance.e(
+            '[Playback] play error handler failed: ${callbackError.runtimeType}',
+          );
+        }
+      },
+    );
   }
 
   Future<void> pause() async {
@@ -160,6 +188,13 @@ class AudioService {
     await _player.setVolume(volume.clamp(0.0, 1.0));
   }
 
+  // —— 响度归一：Web 无实现（依赖 Android 侧 LoudnessEnhancer 与
+  // NormalizationGainAudioSink），保持与 io 版同样的接口，上层无需分平台判断。
+  Future<void> setVolumeNormalization({bool? enabled, double? referenceLufs}) async {}
+
+  /// AutoMix 实测响度补给（io 版用它填补上游缺失的响度）；Web 无响度通路。
+  Future<void> applyMeasuredLoudness(double? measuredDbfs) async {}
+
   // —— 交叉淡化：Web 不支持（需要第二个播放器与 Media3 层的会话共享），
   // 保持与 io 版同样的接口，上层无需分平台判断。
   bool get isCrossfading => false;
@@ -175,8 +210,7 @@ class AudioService {
     String? artUri,
     double? loudnessLufs,
     double? loudnessPeakDb,
-  }) async =>
-      false;
+  }) async => false;
 
   void discardPreparedCrossfade() {}
 
@@ -186,7 +220,7 @@ class AudioService {
     void Function()? onCrossover,
   }) async {}
 
-  void abortCrossfade() {}
+  void abortCrossfade({bool keepVolume = false}) {}
 
   Future<void> dispose() async {
     await _player.dispose();

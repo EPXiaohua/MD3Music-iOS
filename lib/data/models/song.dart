@@ -184,6 +184,7 @@ class Song {
     bool? isLongAudio,
     double? loudnessLufs,
     double? loudnessPeakDb,
+    bool clearUrl = false,
   }) {
     return Song(
       id: id ?? this.id,
@@ -191,7 +192,7 @@ class Song {
       artist: artist ?? this.artist,
       album: album ?? this.album,
       duration: duration ?? this.duration,
-      url: url ?? this.url,
+      url: clearUrl ? null : url ?? this.url,
       localPath: localPath ?? this.localPath,
       artworkUri: artworkUri ?? this.artworkUri,
       isOnline: isOnline ?? this.isOnline,

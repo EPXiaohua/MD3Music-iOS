@@ -136,7 +136,7 @@ pub fn handle_cloud_upload(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Modul
     let bucket = "musicclound".to_string();
 
     // 文件二进制数据（octet-stream body）
-    let file_data = ctx.body_bytes.clone().unwrap_or_default();
+    let file_data = ctx.body_bytes.as_deref().unwrap_or_default();
     if file_data.is_empty() {
         return Err(ModuleResponse {
             status: 400,

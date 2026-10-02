@@ -1,3 +1,4 @@
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
@@ -107,6 +108,7 @@ class AppTheme {
   static ThemeData lightThemeFromSeed(
     Color seedColor, {
     String? fontFamily,
+    bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
   }) {
@@ -118,6 +120,7 @@ class AppTheme {
       colorScheme,
       Brightness.light,
       fontFamily: fontFamily,
+      emphasized: emphasized,
       labelBehavior: labelBehavior,
     );
   }
@@ -134,6 +137,7 @@ class AppTheme {
     Color seedColor, {
     bool useOledBlack = false,
     String? fontFamily,
+    bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
   }) {
@@ -158,6 +162,7 @@ class AppTheme {
       colorScheme,
       Brightness.dark,
       fontFamily: fontFamily,
+      emphasized: emphasized,
       labelBehavior: labelBehavior,
     );
   }
@@ -166,6 +171,7 @@ class AppTheme {
     ColorScheme colorScheme,
     Brightness brightness, {
     String? fontFamily,
+    bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
   }) {
@@ -342,8 +348,31 @@ class AppTheme {
       ),
       // 显式把 fontFamily 注入 textTheme：发现页"每日推荐"标题、搜索页"搜索历史"/"热门搜索"标题
       // 都用 Theme.of(context).textTheme.titleLarge/titleMedium，必须显式 apply 才能跟随自定义字体
-      textTheme: _buildTextTheme(colorScheme, fontFamily: fontFamily),
-      primaryTextTheme: _buildTextTheme(colorScheme, fontFamily: fontFamily),
+      textTheme: _buildTextTheme(
+        colorScheme,
+        fontFamily: fontFamily,
+        emphasized: emphasized,
+      ),
+      primaryTextTheme: _buildTextTheme(
+        colorScheme,
+        fontFamily: fontFamily,
+        emphasized: emphasized,
+      ),
+      // 全局 M3E 弹层主题：背景跟随 colorScheme（OLED 纯黑等覆盖自动生效），
+      // 并把默认 24px 内边距置零，避免各弹层被内缩。
+      // 97% 不透明度与公开版 `_applyBackgroundOverrides` 里的 bottomSheetTheme
+      // 保持一致（让背景图透出）；若在此处写死为全不透明，弹层会比其它 surface 更实。
+      extensions: <ThemeExtension<dynamic>>[
+        M3EBottomSheetThemeData(
+          style: M3EBottomSheetStyle(
+            backgroundColor: colorScheme.surfaceContainerLow.withValues(
+              alpha: 0.97,
+            ),
+            borderRadius: 28,
+            padding: EdgeInsets.zero,
+          ),
+        ),
+      ],
     );
   }
 
@@ -440,8 +469,12 @@ class AppTheme {
     );
   }
 
-  static TextTheme _buildTextTheme(ColorScheme colorScheme, {String? fontFamily}) {
-    return TextTheme(
+  static TextTheme _buildTextTheme(
+    ColorScheme colorScheme, {
+    String? fontFamily,
+    bool emphasized = true,
+  }) {
+    final base = TextTheme(
       displayLarge: TextStyle(
         fontSize: 57,
         fontWeight: FontWeight.w400,
@@ -563,5 +596,8 @@ class AppTheme {
         fontFamily: fontFamily,
       ),
     );
+    // M3E 强调排版：统一提升字重并写入 wght/opsz 字轴。
+    // rond 固定 0：不引入圆角字轴，避免改变字形。
+    return emphasized ? M3ETypography.emphasized(base, rond: 0) : base;
   }
 }

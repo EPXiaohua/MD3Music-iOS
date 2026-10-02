@@ -8,10 +8,12 @@ import 'package:quick_actions/quick_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app.dart';
+import 'core/layout/responsive_layout.dart';
 import 'core/services/desktop_lyric_service.dart';
 import 'core/services/diagnostic_logger.dart';
 import 'modules/recognition/floating_recognition_service.dart';
 import 'core/services/equalizer_service.dart';
+import 'core/services/viper_master_service.dart';
 import 'core/services/lyricon_provider_service.dart';
 import 'core/services/listening_grade_service.dart';
 import 'core/services/listen_report_service.dart';
@@ -19,6 +21,7 @@ import 'core/services/media_notification_service.dart';
 import 'core/services/usb_audio_service.dart';
 import 'core/services/wakelock_service.dart';
 import 'data/repositories/settings_repository.dart';
+import 'providers/theme_provider.dart';
 import 'modules/update/update_check_service.dart';
 import 'modules/onboarding/user_agreement_page.dart';
 import 'services/kugou_server.dart';
@@ -48,12 +51,17 @@ Future<void> main() async {
 }
 
 Future<void> _main() async {
-  final (needsOnboarding, needsUserAgreement) = await runBootstrap();
+  final (
+    needsOnboarding,
+    needsUserAgreement,
+    initialUseBackgroundImage,
+  ) = await runBootstrap();
 
   runApp(
     MyApp(
       showOnboarding: needsOnboarding,
       showUserAgreement: needsUserAgreement,
+      initialUseBackgroundImage: initialUseBackgroundImage,
     ),
   );
 
@@ -71,17 +79,46 @@ Future<void> _main() async {
 }
 
 /// 启动引导：并行初始化无依赖服务、恢复偏好、预取 SharedPreferences。
-/// 返回 `(needsOnboarding, needsUserAgreement)`。
+/// 返回 onboarding / 用户协议状态，以及首帧使用的背景图开关值。
 /// 公开入口（main）与私有入口（lib/private/main_private）复用同一流程，
 /// 私有入口在此基础上安装扩展钩子后 runApp。
-Future<(bool, bool)> runBootstrap() async {
+Future<(bool, bool, bool)> runBootstrap() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final startupClock = Stopwatch()..start();
+  void markStartup(String phase) {
+    final elapsedMs = startupClock.elapsedMilliseconds;
+    final message = '[Startup] phase=$phase elapsed_ms=$elapsedMs';
+    DiagnosticLogger.instance.i(message);
+    // 启动阶段日志便于设备采样时区分 Dart bootstrap 与原生窗口首显；
+    // 仅包含阶段名和耗时，不输出偏好值、端口或请求信息。
+    debugPrint(message);
+    if (phase == 'first_frame') {
+      debugPrint('[StartupFrame] elapsed_ms=$elapsedMs');
+    }
+  }
 
   // 诊断日志尽早初始化（滚动文件 + 全局错误钩子），保证启动期异常也被记录。
   // 内部自带失败兜底，不会中断启动。
   await DiagnosticLogger.instance.init();
+  markStartup('diagnostics_ready');
+  // 在runBootstrap注册，公开与私有入口都可记录真正的首帧时间。
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    markStartup('first_frame');
+  });
+
+  // 全局 ErrorWidget 兜底：release 版默认 ErrorWidget 是纯灰块，横竖屏切换时
+  // 某个 widget 构建异常会让整屏变纯灰且无任何线索（问题③）。改为可读占位
+  // （非灰、带图标与提示），并把异常写入诊断日志，便于 adb logcat / 导出定位。
+  // 双入口（main / main_private）共用 runBootstrap，一处生效两端。
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    DiagnosticLogger.instance.e(
+      'ErrorWidget: ${details.exceptionAsString()}\n${details.stack}',
+    );
+    return _FallbackErrorWidget(details: details);
+  };
 
   await initializeDateFormatting('zh_CN');
+  markStartup('date_format_ready');
 
   // P0: 无依赖的初始化并行执行，替代串行 await，缩短 runApp 前的阻塞时间。
   // 同时预取 SharedPreferences（onboarding / 用户协议检查复用）。
@@ -95,6 +132,8 @@ Future<(bool, bool)> runBootstrap() async {
     WakelockService.instance.init().catchError((_) {}),
     // 初始化均衡器服务（恢复偏好设置，监听播放状态自动绑定）
     EqualizerService.instance.init().catchError((_) {}),
+    // 初始化蝰蛇母带服务（恢复开关与 10 段增益并推送原生处理链）
+    ViperMasterService.instance.init().catchError((_) {}),
     // 恢复蓝牙歌词开关 + 实时歌词推送协议（Lyricon/SuperLyric/LyricInfo 三选一）：
     // 让歌词服务定时器在需要时启动、启用选中协议。
     // 原生端 AudioPlaybackService.onCreate 会自行从 SharedPreferences 恢复开关。
@@ -102,6 +141,7 @@ Future<(bool, bool)> runBootstrap() async {
     // 恢复全屏播放器横屏沉浸开关（全局变量，播放器同步读取）
     _restoreLandscapeImmersivePref(),
   ]);
+  markStartup('local_preferences_ready');
 
   // 注册通知栏/悬浮窗回调（悬浮窗内按钮 → DesktopLyricService；通知栏桌面歌词按钮 → toggle）
   MediaNotificationService.initCallbacks();
@@ -127,12 +167,28 @@ Future<(bool, bool)> runBootstrap() async {
   // DynamicLibrary.open('libkugou_server.so')（dlopen，so 可达 10MB+）与
   // 服务器初始化可能耗时数秒 → 用户看到长时间启动画面/白屏。
   // 现在首帧立即渲染；发现页等首屏请求通过 KugouApiClient 的
-  // serverReady 信号等待服务器就绪后再放行，不会因服务器未启动而失败。
+  // 按本地服务启动代次等待ready；启动失败或停止时请求快速失败，不触碰旧端口。
   // 桌面与 Android 都启动本地服务器（桌面走 dart:ffi 加载 kugou_server.dll）。
   // LocalHttpServer（DLNA 拉流）不再无条件启动：仅投屏本地歌曲时由
   // DlnaProvider.castSong 懒启动，避免 App 常驻一个局域网监听 socket。
   if (!kIsWeb) {
-    unawaited(KugouApiServer.start().catchError((_) {}));
+    final serverClock = Stopwatch()..start();
+    unawaited(
+      KugouApiServer.start()
+          .then((_) {
+            DiagnosticLogger.instance.i(
+              '[Startup] phase=api_ready elapsed_ms=${startupClock.elapsedMilliseconds} '
+              'server_ms=${serverClock.elapsedMilliseconds}',
+            );
+          })
+          .catchError((Object error) {
+            DiagnosticLogger.instance.e(
+              '[Startup] phase=api_failed elapsed_ms=${startupClock.elapsedMilliseconds} '
+              'server_ms=${serverClock.elapsedMilliseconds} '
+              'error_type=${error.runtimeType}',
+            );
+          }),
+    );
   }
 
   // 注册长按应用图标 Shortcut 回调（Android App Shortcut / iOS Quick Actions）。
@@ -153,13 +209,22 @@ Future<(bool, bool)> runBootstrap() async {
 
   // 检测是否需要显示首次启动引导页（仅新安装/未完成教程时弹出）
   bool needsOnboarding = false;
+  var initialUseBackgroundImage = true;
   try {
     final prefs = await prefsFuture;
     needsOnboarding = !(prefs.getBool('onboarding_completed') ?? false);
+    initialUseBackgroundImage =
+        prefs.getBool(ThemeProvider.backgroundImageEnabledPreferenceKey) ??
+            true;
+    kSecondaryPlayerEnabled.value =
+        prefs.getBool(SettingsRepository.secondaryPlayerEnabledPreferenceKey) ??
+            false;
   } catch (_) {}
+  markStartup('onboarding_state_ready');
 
   // 检测是否需要展示用户协议（首次启动）
   final needsUserAgreement = !(await isUserAgreementAccepted());
+  markStartup('agreement_state_ready');
 
   // 启动后静默检查 GitHub Release：发现新版本仅 toast 提醒。
   // 首次启动引导 / 用户协议未确认时抑制，避免与首启流程争夺注意力。
@@ -168,7 +233,8 @@ Future<(bool, bool)> runBootstrap() async {
     suppress: needsOnboarding || needsUserAgreement,
   );
 
-  return (needsOnboarding, needsUserAgreement);
+  markStartup('bootstrap_ready');
+  return (needsOnboarding, needsUserAgreement, initialUseBackgroundImage);
 }
 
 /// 恢复蓝牙歌词开关 + 实时歌词推送协议（Lyricon/SuperLyric/LyricInfo 三选一 + 关闭）。
@@ -187,7 +253,19 @@ Future<void> _restoreLyricPushPref() async {
     // （样式全部跟随 AM 歌词偏好，与播放页 Zen 沉浸模式一致）
     final lockScreenLyricEnabled = await settings.getLockScreenLyricEnabled();
     // ignore: discarded_futures
-    DesktopLyricService.instance.setLockScreenLyricEnabled(lockScreenLyricEnabled);
+    DesktopLyricService.instance.setLockScreenLyricEnabled(
+      lockScreenLyricEnabled,
+    );
+
+    // 魅族 Flyme 状态栏歌词（独立开关）：冷启动/后台唤醒后无需进设置页即可继续推送
+    // 顺序有讲究：先灌提前量再开开关。开启会立刻回灌当前行，
+    // 若此时提前量还是 0，第一行就按未提前的时间轴显示，要等到下次翻行才对。
+    final flymeAdvance = await settings.getFlymeLyricAdvanceMs();
+    // ignore: discarded_futures
+    DesktopLyricService.instance.setFlymeAdvanceMs(flymeAdvance);
+    final flymeLyricEnabled = await settings.getFlymeStatusBarLyricEnabled();
+    // ignore: discarded_futures
+    DesktopLyricService.instance.setFlymeStatusBarLyricEnabled(flymeLyricEnabled);
 
     // 实时歌词推送协议
     final protocol = await settings.getLyricPushProtocol();
@@ -208,7 +286,9 @@ Future<void> _restoreLyricPushPref() async {
     // 启用选中协议
     if (protocol == 'lyricon') {
       try {
-        await LyriconProviderService.instance.setDisplayTranslation(translation);
+        await LyriconProviderService.instance.setDisplayTranslation(
+          translation,
+        );
         await LyriconProviderService.instance.setDisplayRoma(roma);
         await LyriconProviderService.instance.setEnabled(true);
       } catch (_) {}
@@ -236,8 +316,8 @@ Future<void> _restoreLyricPushPref() async {
 /// 必须在 runApp 前完成：播放器 didChangeDependencies 首次应用系统栏时同步读取该变量。
 Future<void> _restoreLandscapeImmersivePref() async {
   try {
-    kLandscapeImmersiveEnabled =
-        await SettingsRepository().getLandscapeImmersiveEnabled();
+    kLandscapeImmersiveEnabled = await SettingsRepository()
+        .getLandscapeImmersiveEnabled();
   } catch (_) {}
 }
 
@@ -256,8 +336,8 @@ void handleShortcut(String shortcutType) {
   shortcutTabRequest.value = tabId;
 }
 
-/// 请求运行时权限（通知 / 媒体 / 管理外部存储）。
-/// 公开入口与私有入口共用；私有入口的下载功能依赖其中的存储权限。
+/// 请求启动后立即需要的运行时权限（通知）。
+/// 音频库权限在用户打开本地曲库时按需请求；下载默认使用应用专属目录。
 Future<void> requestPermissions() async {
   // Web 平台不支持 permission_handler，跳过所有权限请求
   if (kIsWeb) return;
@@ -272,12 +352,51 @@ Future<void> requestPermissions() async {
       print('Notification permission request failed: $e');
     }
   }
-  // Android 14+ 媒体权限
-  if (await Permission.audio.isDenied) {
-    try {
-      await Permission.audio.request();
-    } catch (e) {
-      print('Audio permission request failed: $e');
-    }
+}
+
+/// 全局 ErrorWidget 兜底占位（替代 release 默认的纯灰块）。
+///
+/// 仅在某个 widget 构建/布局抛异常时由 [ErrorWidget.builder] 使用；
+/// 用中性可读外观（surface 背景 + 图标 + 简短提示）替代整屏纯灰，
+/// 让用户知道是局部错误而非崩溃，同时异常已写入 [DiagnosticLogger]。
+/// 无 MaterialApp 上下文时也能独立渲染（用 Directionality + 直接取色），
+/// 因为它可能在 widget 树任意位置替换出错子树。
+class _FallbackErrorWidget extends StatelessWidget {
+  const _FallbackErrorWidget({required this.details});
+
+  final FlutterErrorDetails details;
+
+  @override
+  Widget build(BuildContext context) {
+    // 尽量取当前主题色；拿不到时回退到中性深灰（仍非纯灰全屏）。
+    //
+    // 此处用 findAncestorWidgetOfExactType 而非 Theme.of：本仓库依赖的
+    // material_ui 未提供 Theme.maybeOf（只有 of/brightnessOf/maybeBrightnessOf），
+    // 而 Theme.of 在无 Theme 祖先时会回退到 ThemeData.fallback()（浅色），与下方
+    // 「中性深灰」意图相反。MaterialApp 无论是否走 AnimatedTheme，最终都会构建
+    // Theme widget，故这里能取到与 Theme.maybeOf 等价的 ThemeData，无祖先时为 null。
+    final theme = context.findAncestorWidgetOfExactType<Theme>()?.data;
+    final bg = theme?.colorScheme.surface ?? const Color(0xFF1C1B1F);
+    final fg = theme?.colorScheme.onSurfaceVariant ?? const Color(0xFFCAC4D0);
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Container(
+        color: bg,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.broken_image_outlined, size: 40, color: fg),
+            const SizedBox(height: 12),
+            Text(
+              '此处内容加载出错',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: fg, fontSize: 14),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

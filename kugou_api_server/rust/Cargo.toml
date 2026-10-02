@@ -28,6 +28,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # log 为日志门面：Android 由 android_logger 输出到 logcat；桌面未接 logger 时宏为 no-op
 log = "0.4"
 
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
+
 # jni 仅 Android 需要（JNI 导出符号），桌面构建不引入，避免无谓编译与符号污染
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

@@ -376,6 +376,13 @@ public final class UsbAudioSinkController {
     /** 开启独占。应用侧须先完成：打开设备 → 创建流 → 按 xHCI 时序 setAlt/SET_CUR/start。 */
     public static synchronized boolean enable(UsbAudioSink stream, int dacBitDepth,
                                               int sampleRate, int channelCount) {
+        // 互斥：USB 独占与系统 Direct PCM 共用同一个 AudioSink 出口，不能同时生效。
+        // 应用侧 OutputModeCoordinator 已在切档时互斥，这里是最后一道防线
+        // （例如切档请求尚未落地而 enable 先到）。
+        if (DirectPcmController.isEnabled()) {
+            logE(TAG, "enable: rejected — Direct PCM 已开启（两档互斥）");
+            return false;
+        }
         if (stream == null || !stream.isReady()) {
             logE(TAG, "enable: stream not ready");
             return false;

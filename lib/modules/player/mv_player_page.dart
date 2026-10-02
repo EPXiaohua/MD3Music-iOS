@@ -658,7 +658,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
 
   void _showQualitySheet() {
     if (_qualities.isEmpty) return;
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       // 横屏可用高度很小：默认的半屏上限装不下「标题 + 多档清晰度」，
       // Column 会报 bottom overflowed。因此放开高度限制 + 内容可滚动 + 限高。
@@ -1133,7 +1133,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             if (isCasting) {
               dlna.stop();
             } else if (_currentVideoUrl != null) {
-              showModalBottomSheet(
+              showM3EModalBottomSheet(
                 context: context,
                 isScrollControlled: true,
                 builder: (_) => DlnaCastSheet(

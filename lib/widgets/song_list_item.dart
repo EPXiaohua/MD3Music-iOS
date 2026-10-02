@@ -1,3 +1,4 @@
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
@@ -9,8 +10,26 @@ import '../modules/player/mv_player_page.dart';
 import '../providers/favorites_provider.dart';
 import '../providers/local_favorites_provider.dart';
 import '../providers/player_provider.dart';
+import 'add_to_playlist_dialog.dart';
 import 'playing_spectrum_indicator.dart';
 import 'smart_artwork_image.dart';
+import 'song_menu_header.dart';
+
+/// 歌曲行右侧操作区的呈现策略。
+///
+/// 不同场景只改变尾部操作，不改变歌曲行整体的视觉结构，从而保持跨页面一致性。
+/// 用明确的枚举而非堆叠多个零散布尔参数（见改版计划三）。
+enum SongTrailingActions {
+  /// 默认完整操作：时长（受 [SongListItem.showDuration] 控制）+ 收藏 + 更多菜单。
+  full,
+
+  /// 每日推荐：右侧仅收藏按钮，不显示时长与更多菜单。
+  favoriteOnly,
+
+  /// 搜索结果：MV + 详情（三个点，收藏并入详情面板），不显示时长与独立收藏按钮。
+  /// MV 在前、三个点在最右；云盘歌曲不显示不可用的 MV 按钮。
+  detailAndMv,
+}
 
 class SongListItem extends StatelessWidget {
   /// 可选扩展：歌曲更多菜单的额外条目（默认关闭，由私有构建注入）。
@@ -23,6 +42,13 @@ class SongListItem extends StatelessWidget {
   final VoidCallback? onMoreTap;
   final bool showDuration;
   final bool forceFavorited;
+
+  /// 右侧操作区呈现策略，默认完整操作（见 [SongTrailingActions]）。
+  final SongTrailingActions trailingActions;
+
+  /// 可选副标题覆盖：非空时替换默认的「歌手 - 专辑」行
+  /// （如歌词搜索结果用于显示命中的歌词片段）。
+  final Widget? subtitleOverride;
 
   /// 多选模式：显示圆形复选框替代封面，点击切换选中而非播放。
   final bool isSelectMode;
@@ -37,6 +63,8 @@ class SongListItem extends StatelessWidget {
     this.onMoreTap,
     this.showDuration = true,
     this.forceFavorited = false,
+    this.trailingActions = SongTrailingActions.full,
+    this.subtitleOverride,
     this.isSelectMode = false,
     this.isSelected = false,
     this.onLongPress,
@@ -44,18 +72,37 @@ class SongListItem extends StatelessWidget {
   });
 
   void _showMoreMenu(BuildContext context) {
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            ListTile(
-              leading: const Icon(Icons.music_note),
-              title: Text(song.displayName),
-              subtitle: Text(song.artist),
-            ),
+            // 头部：圆角矩形封面 + 歌名/歌手/专辑（原 music_note ListTile）
+            SongMenuHeader(song: song),
             const Divider(height: 1),
+            // 收藏 / 取消收藏：详情面板内实时状态。搜索结果的收藏入口即在此
+            // （列表行不再放独立收藏按钮），其他场景作为附加操作也无害。
+            Consumer2<FavoritesProvider, LocalFavoritesProvider>(
+              builder: (ctx2, favorites, localFavorites, _) {
+                final favorited = forceFavorited
+                    ? true
+                    : (song.isOnline
+                        ? favorites.isFavorite(song.id)
+                        : localFavorites.isFavorite(song.id));
+                final cs = Theme.of(ctx2).colorScheme;
+                return ListTile(
+                  leading: Icon(
+                    favorited ? Icons.favorite : Icons.favorite_border,
+                    color: favorited ? cs.error : null,
+                  ),
+                  title: Text(favorited ? '取消收藏' : '收藏'),
+                  onTap: () => song.isOnline
+                      ? favorites.toggleFavorite(song)
+                      : localFavorites.toggleFavorite(song.id),
+                );
+              },
+            ),
             // 本地音乐（有本地文件路径）：提供 Lyrico 外部编辑入口（公开功能）
             if (!song.isOnline && song.localPath != null)
               ListTile(
@@ -86,6 +133,15 @@ class SongListItem extends StatelessWidget {
             // 可选扩展：私有构建注入的额外菜单条目（默认无）
             ...?SongListItem.extraMenuTilesBuilder?.call(ctx, song),
             ListTile(
+              // 与紧邻的「下一首播放」(playlist_add) 区分图标，避免同图标相邻
+              leading: const Icon(Icons.add_to_queue_outlined),
+              title: const Text('添加到歌单'),
+              onTap: () {
+                Navigator.pop(ctx);
+                showAddToPlaylistDialog(context, song);
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.playlist_add),
               title: const Text('下一首播放'),
               onTap: () {
@@ -113,15 +169,26 @@ class SongListItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final playerProvider = context.watch<PlayerProvider>();
-    final favoritesProvider = context.watch<FavoritesProvider>();
-    final localFavoritesProvider = context.watch<LocalFavoritesProvider>();
-    final isCurrentSong = playerProvider.currentSong?.id == song.id;
+    // 列表行只订阅实际影响自身外观的状态，避免播放器或收藏集合的
+    // 无关通知让所有可见歌曲行一起重建。
+    final playbackRowState = context.select<PlayerProvider, (bool, bool)>((
+      provider,
+    ) {
+      final isCurrent = provider.currentSong?.id == song.id;
+      // 非当前行不展示播放动画，不需要跟随全局播放/暂停状态重建。
+      return (isCurrent, isCurrent && provider.isPlaying);
+    });
+    final isCurrentSong = playbackRowState.$1;
+    final isPlaying = playbackRowState.$2;
     final isFavorited = forceFavorited
         ? true
         : (song.isOnline
-            ? favoritesProvider.isFavorite(song.id)
-            : localFavoritesProvider.isFavorite(song.id));
+              ? context.select<FavoritesProvider, bool>(
+                  (provider) => provider.isFavorite(song.id),
+                )
+              : context.select<LocalFavoritesProvider, bool>(
+                  (provider) => provider.isFavorite(song.id),
+                ));
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
@@ -167,16 +234,17 @@ class SongListItem extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 2),
-                  Text(
-                    '${song.artist} - ${song.album}',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: textTheme.labelSmall?.copyWith(
-                      color: isCurrentSong
-                          ? colorScheme.primary.withValues(alpha: 0.7)
-                          : colorScheme.onSurfaceVariant,
-                    ),
-                  ),
+                  subtitleOverride ??
+                      Text(
+                        '${song.artist} - ${song.album}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: textTheme.labelSmall?.copyWith(
+                          color: isCurrentSong
+                              ? colorScheme.primary.withValues(alpha: 0.7)
+                              : colorScheme.onSurfaceVariant,
+                        ),
+                      ),
                 ],
               ),
             ),
@@ -196,40 +264,116 @@ class SongListItem extends StatelessWidget {
                       child: PlayingSpectrumIndicator(
                         color: colorScheme.primary,
                         size: 14,
-                        isPlaying: playerProvider.isPlaying,
+                        isPlaying: isPlaying,
                       ),
                     ),
-                  if (showDuration)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 4),
-                      child: Text(song.displayDuration, style: textTheme.labelSmall),
-                    ),
-                  GestureDetector(
-                    onTap: () => song.isOnline
-                        ? favoritesProvider.toggleFavorite(song)
-                        : localFavoritesProvider.toggleFavorite(song.id),
-                    behavior: HitTestBehavior.opaque,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
-                      child: Icon(
-                        isFavorited ? Icons.favorite : Icons.favorite_border,
-                        size: 18,
-                        color: isFavorited ? colorScheme.error : colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                  GestureDetector(
-                    onTap: () => _showMoreMenu(context),
-                    behavior: HitTestBehavior.opaque,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
-                      child: Icon(Icons.more_vert, size: 18, color: colorScheme.onSurfaceVariant),
-                    ),
+                  ..._buildTrailingActions(
+                    context,
+                    colorScheme,
+                    textTheme,
+                    isFavorited,
+                    context.read<FavoritesProvider>(),
+                    context.read<LocalFavoritesProvider>(),
                   ),
                 ],
               ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 按 [trailingActions] 策略构建右侧操作。不同页面只改变尾部操作，
+  /// 不改变歌曲行整体结构，保持跨页面一致性。
+  List<Widget> _buildTrailingActions(
+    BuildContext context,
+    ColorScheme colorScheme,
+    TextTheme textTheme,
+    bool isFavorited,
+    FavoritesProvider favoritesProvider,
+    LocalFavoritesProvider localFavoritesProvider,
+  ) {
+    switch (trailingActions) {
+      case SongTrailingActions.favoriteOnly:
+        return [
+          _favoriteButton(
+            colorScheme,
+            isFavorited,
+            favoritesProvider,
+            localFavoritesProvider,
+          ),
+        ];
+      case SongTrailingActions.detailAndMv:
+        return [
+          // MV 在前，详情（三个点）在最右：与「更多菜单」全局一致用 more_vert，
+          // 且与 MV 按钮顺序对调（见改版计划补充一）。
+          // 云盘歌曲无 MV；仅在线非云盘歌曲显示 MV 入口。
+          if (song.isOnline && !song.isCloud)
+            _iconAction(
+              colorScheme,
+              Icons.music_video_outlined,
+              () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
+              ),
+            ),
+          _iconAction(
+            colorScheme,
+            Icons.more_vert,
+            () => _showMoreMenu(context),
+          ),
+        ];
+      case SongTrailingActions.full:
+        return [
+          if (showDuration)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Text(song.displayDuration, style: textTheme.labelSmall),
+            ),
+          _favoriteButton(
+            colorScheme,
+            isFavorited,
+            favoritesProvider,
+            localFavoritesProvider,
+          ),
+          _iconAction(colorScheme, Icons.more_vert, () => _showMoreMenu(context)),
+        ];
+    }
+  }
+
+  Widget _favoriteButton(
+    ColorScheme colorScheme,
+    bool isFavorited,
+    FavoritesProvider favoritesProvider,
+    LocalFavoritesProvider localFavoritesProvider,
+  ) {
+    return GestureDetector(
+      onTap: () => song.isOnline
+          ? favoritesProvider.toggleFavorite(song)
+          : localFavoritesProvider.toggleFavorite(song.id),
+      behavior: HitTestBehavior.opaque,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+        child: Icon(
+          isFavorited ? Icons.favorite : Icons.favorite_border,
+          size: 18,
+          color: isFavorited ? colorScheme.error : colorScheme.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+
+  Widget _iconAction(
+    ColorScheme colorScheme,
+    IconData icon,
+    VoidCallback onTap,
+  ) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+        child: Icon(icon, size: 18, color: colorScheme.onSurfaceVariant),
       ),
     );
   }

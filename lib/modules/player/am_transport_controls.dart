@@ -67,7 +67,8 @@ class AMTransportControls extends StatefulWidget {
 
 class _AMTransportControlsState extends State<AMTransportControls> {
   /// play↔pause 形变触发器：play() 正向、stop() 反向（animateBack）。
-  final IconicAnimatedIconController _morphCtrl = IconicAnimatedIconController();
+  final IconicAnimatedIconController _morphCtrl =
+      IconicAnimatedIconController();
 
   /// prev / next 按压描边动画的触发控制器。
   final IconicAnimatedIconController _prevCtrl = IconicAnimatedIconController();
@@ -100,6 +101,7 @@ class _AMTransportControlsState extends State<AMTransportControls> {
       mainAxisSize: MainAxisSize.min,
       children: [
         IconButton(
+          tooltip: '上一首',
           iconSize: widget.skipIconSize,
           onPressed: widget.onPrevious == null
               ? null
@@ -121,6 +123,7 @@ class _AMTransportControlsState extends State<AMTransportControls> {
         // Apple Music 标志性白色圆形播放按钮：内部为 play↔pause 形状形变，
         // 共享的左竖线在两个状态间保持静止，消除错位。
         IconButton.filled(
+          tooltip: widget.isPlaying ? '暂停' : '播放',
           iconSize: widget.playIconSize,
           onPressed: widget.onPlayPause,
           style: IconButton.styleFrom(
@@ -141,6 +144,7 @@ class _AMTransportControlsState extends State<AMTransportControls> {
         ),
         SizedBox(width: widget.spacing),
         IconButton(
+          tooltip: '下一首',
           iconSize: widget.skipIconSize,
           onPressed: widget.onNext == null
               ? null

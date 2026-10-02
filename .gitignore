@@ -54,12 +54,18 @@ app.*.map.json
 
 # Project archive snapshot
 /md3Music-rust-local-force.zip
+/md3Music-5.7.0.zip
+/md3Music-5.8.0.zip
+/_up580_tmp/
+/_merge580.py
 
 # 上游版本源码 dump（仅本地参考，不入库）
 /md3Music-5.5.0/
 /md3Music-5.6.0/
 /md3Music-5.6.5/
 /md3Music-5.7.0/
+# iOS 图标设计源文件（icon 工程目录，不入库）
+/Untitled.icon/
 
 # Gradle / Kotlin 构建缓存（任何位置）
 **/.gradle/

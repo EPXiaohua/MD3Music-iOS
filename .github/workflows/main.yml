@@ -242,23 +242,50 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Flutter build APK (split per ABI)
+      # 3D 资产探测：depth3d flavor 依赖 android/app/libs/onnxruntime-*.aar。
+      # 公开树若未携带该 AAR，则跳过 depth3d 构建并显式告警，避免整条发布流程失败。
+      - name: Probe 3D assets (ONNX Runtime AAR)
+        id: assets3d
         run: |
-          flutter build apk --release --split-per-abi \
+          if compgen -G "android/app/libs/onnxruntime-*.aar" > /dev/null; then
+            echo "has_aar=true" >> "$GITHUB_OUTPUT"
+            echo "3D 资产在位：将额外构建 depth3d flavor"
+          else
+            echo "has_aar=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未找到 android/app/libs/onnxruntime-*.aar —— 本次发布不含 3D 封面（已跳过 depth3d flavor）"
+          fi
+
+      # flavor 化之后必须显式 --flavor：定义 productFlavors 后 AGP 不再生成 assembleRelease，
+      # 缺少该参数会直接报 "You must specify a --flavor option to select one of them"。
+      - name: Flutter build APK (standard, split per ABI)
+        run: |
+          flutter build apk --release --flavor standard --split-per-abi \
+            --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
+            --build-name=${{ steps.version.outputs.version }} \
+            --build-number=${{ steps.version.outputs.versionCode }}
+
+      # depth3d flavor：3D 全量包（内置 onnxruntime so + 深度模型），仅 arm64-v8a。
+      # 必须显式打开 ENABLE_DEPTH_3D，否则 3D 功能在编译期被裁掉。
+      - name: Flutter build APK (depth3d, arm64-v8a)
+        if: steps.assets3d.outputs.has_aar == 'true'
+        run: |
+          flutter build apk --release --flavor depth3d \
+            --dart-define=ENABLE_DEPTH_3D=true --split-per-abi --target-platform android-arm64 \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
             --build-name=${{ steps.version.outputs.version }} \
             --build-number=${{ steps.version.outputs.versionCode }}
 
       # 原子随身听按包名识别合作应用：额外构建一个 arm64-v8a 兼容包。
       # 只覆盖 applicationId，namespace / Kotlin 包路径 / MethodChannel 均保持原样。
-      - name: Flutter build Apple Music package APK (arm64-v8a)
+      # 兼容包固定用 standard flavor —— 不含 3D 封面（无 ORT so / 深度模型）。
+      - name: Flutter build Apple Music package APK (standard flavor, arm64-v8a)
         run: |
           set -euo pipefail
           apk_dir="build/app/outputs/flutter-apk"
-          standard_apk="$apk_dir/app-arm64-v8a-release.apk"
-          standard_backup="$RUNNER_TEMP/app-arm64-v8a-release.apk"
+          standard_apk="$apk_dir/app-arm64-v8a-standard-release.apk"
+          standard_backup="$RUNNER_TEMP/app-arm64-v8a-standard-release.apk"
           cp "$standard_apk" "$standard_backup"
-          flutter build apk --release --split-per-abi \
+          flutter build apk --release --flavor standard --split-per-abi \
             --target-platform android-arm64 \
             --android-project-arg=md3ApplicationId=com.apple.android.music \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
@@ -267,11 +294,40 @@ jobs:
           mv "$standard_apk" "$apk_dir/app-apple-music-arm64-v8a-release.apk"
           mv "$standard_backup" "$standard_apk"
 
+      # ============================================================
+      # 6.5 产物改名为发布名（ASCII）
+      # ============================================================
+      # Flutter CLI 按固定名 app-<abi>-<flavor>-<type>.apk 查找产物（flutter_tools 的
+      # gradle.dart listApkPaths），**不能在 Gradle 层改名**，故在构建完成后统一重命名。
+      # ⚠️ GitHub Release 会把 asset 文件名中的非 ASCII 字符规范化为 '.'（下载名由
+      # GitHub 控制，softprops/action-gh-release 只能尽量恢复展示 label，带全角括号
+      # 的文件恢复 label 还会 404 导致整条 job 失败），因此发布名必须使用纯 ASCII。
+      # 中文含义映射见 release notes 的 Downloads 列表。
+      - name: Rename APKs to release-ready names
+        run: |
+          set -euo pipefail
+          apk_dir="build/app/outputs/flutter-apk"
+          ver="${{ steps.version.outputs.version }}"
+          # $1=原文件名 $2=flavor 键 $3=abi 键
+          rename_apk() {
+            local src="$apk_dir/$1"
+            if [[ ! -f "$src" ]]; then return 0; fi
+            mv "$src" "$apk_dir/MD3Music-${ver}-$2-$3.apk"
+          }
+          rename_apk app-arm64-v8a-standard-release.apk    standard    arm64-v8a
+          rename_apk app-armeabi-v7a-standard-release.apk  standard    armeabi-v7a
+          rename_apk app-x86_64-standard-release.apk       standard    x86_64
+          rename_apk app-arm64-v8a-depth3d-release.apk     depth3d     arm64-v8a
+          rename_apk app-apple-music-arm64-v8a-release.apk apple-music arm64-v8a
+          echo "=== 重命名后的产物 ==="
+          ls -lh "$apk_dir"/
+
       - name: Verify APKs
         run: |
           set -euo pipefail
-          ls -lh build/app/outputs/flutter-apk/
-          for f in build/app/outputs/flutter-apk/*.apk; do
+          apk_dir="build/app/outputs/flutter-apk"
+          ls -lh "$apk_dir"/
+          for f in "$apk_dir"/*.apk; do
             echo ""
             echo "=== $f ==="
             # 简单验证 apk 完整性
@@ -282,11 +338,32 @@ jobs:
               exit 1
             fi
           done
+
           aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          standard_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
-          apple_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-apple-music-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
-          test "$standard_id" = "com.md3music.md3music"
-          test "$apple_id" = "com.apple.android.music"
+          apk_id() { "$aapt2" dump badging "$1" | sed -n "s/^package: name='\([^']*\)'.*/\1/p"; }
+          # 产物已在上一步改为 ASCII 发布名（规则与本文件 Rename 步骤同步）
+          ver="${{ steps.version.outputs.version }}"
+          std_apk="$apk_dir/MD3Music-${ver}-standard-arm64-v8a.apk"
+          d3d_apk="$apk_dir/MD3Music-${ver}-depth3d-arm64-v8a.apk"
+          am_apk="$apk_dir/MD3Music-${ver}-apple-music-arm64-v8a.apk"
+          test "$(apk_id "$std_apk")" = "com.md3music.md3music"
+          test "$(apk_id "$am_apk")" = "com.apple.android.music"
+
+          # flavor 隔离：standard 包不得含 ORT so / 深度模型
+          if unzip -l "$std_apk" | grep -qE 'libonnxruntime|assets/models/'; then
+            echo "::error::standard 包含有 3D 资产（flavor 隔离失效）"
+            exit 1
+          fi
+          echo "standard 包校验通过：无 3D 资产"
+
+          # depth3d 包必须含 ORT so + 2 个深度模型（仅在本次构建了它时校验）
+          if [[ -f "$d3d_apk" ]]; then
+            unzip -l "$d3d_apk" | grep -q 'lib/arm64-v8a/libonnxruntime.so' \
+              || { echo "::error::depth3d 包缺 lib/arm64-v8a/libonnxruntime.so"; exit 1; }
+            n_models=$(unzip -l "$d3d_apk" | grep -cE 'assets/models/.*\.onnx' || true)
+            [[ "$n_models" -eq 2 ]] || { echo "::error::depth3d 包的深度模型数量=$n_models（期望 2）"; exit 1; }
+            echo "depth3d 包校验通过：ORT so + ${n_models} 个深度模型"
+          fi
 
       # ============================================================
       # 7. 生成更新日志
@@ -382,10 +459,13 @@ jobs:
             echo "_Built: $(date -u '+%Y-%m-%d %H:%M UTC')_"
             echo ""
             echo "### Downloads"
-            echo "- **app-arm64-v8a-release.apk** — 推荐：大多数现代 Android 设备"
-            echo "- **app-armeabi-v7a-release.apk** — 较旧的 32 位设备"
-            echo "- **app-x86_64-release.apk** — Android 模拟器"
-            echo "- **app-apple-music-arm64-v8a-release.apk** — Vivo 原子随身听兼容包（包名 \`com.apple.android.music\`）"
+            echo "- **MD3Music-${VERSION}-standard-arm64-v8a.apk** — （推荐）标准版-64位：大多数现代 Android 设备"
+            if [ "${{ steps.assets3d.outputs.has_aar }}" = "true" ]; then
+              echo "- **MD3Music-${VERSION}-depth3d-arm64-v8a.apk** — 3D封面版-64位：同上，并内置 3D 深度封面（体积更大）"
+            fi
+            echo "- **MD3Music-${VERSION}-standard-armeabi-v7a.apk** — 标准版-32位：较旧的 32 位设备"
+            echo "- **MD3Music-${VERSION}-standard-x86_64.apk** — 标准版-模拟器：Android 模拟器"
+            echo "- **MD3Music-${VERSION}-apple-music-arm64-v8a.apk** — 随身听兼容版-64位：Vivo 原子随身听兼容包（包名 \`com.apple.android.music\`，不含 3D 封面）"
             echo ""
             echo "### 更新内容 (${RANGE:-最近 20 条})"
             echo ""
@@ -429,10 +509,7 @@ jobs:
           prerelease: false
           append_body: false  # 默认行为：用自动生成的 changelog 替换 release 描述
           files: |
-            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
-            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
-            build/app/outputs/flutter-apk/app-x86_64-release.apk
-            build/app/outputs/flutter-apk/app-apple-music-arm64-v8a-release.apk
+            build/app/outputs/flutter-apk/*MD3Music-*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
@@ -365,22 +366,22 @@ class _PersonalFmPageState extends State<PersonalFmPage>
         controller: _scrollController,
         // 底部叠加系统手势条（小横条）高度，避免末项被压住
         padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          top: 16,
-          bottom: 16 + MediaQuery.paddingOf(context).bottom,
+          left: AppSpacing.lg,
+          right: AppSpacing.lg,
+          top: AppSpacing.lg,
+          bottom: AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '实时推荐会根据你的反馈持续更新',
               style: textTheme.bodyMedium?.copyWith(
                 color: cs.onSurfaceVariant.withValues(alpha: 0.58),
               ),
             ),
-            const SizedBox(height: 16),
+            const Gap(AppSpacing.lg),
             if (isLoggedIn) _buildToolbar(cs, textTheme),
             const SizedBox(height: 18),
             isLoggedIn
@@ -425,7 +426,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
                 fontWeight: FontWeight.w600,
               ),
             ),
-            const SizedBox(height: 8),
+            const Gap(AppSpacing.sm),
             Text(
               '猜你喜欢和实时推荐需要登录状态',
               style: textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
@@ -1109,7 +1110,7 @@ class _PersonalFmPageState extends State<PersonalFmPage>
                           vertical: isSmallScreen ? 3 : 4,
                         ),
                         decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(8),
+                          borderRadius: AppRadius.smAll,
                           color: cs.primaryContainer,
                         ),
                         child: Text(

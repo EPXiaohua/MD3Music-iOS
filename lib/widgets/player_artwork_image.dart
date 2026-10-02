@@ -207,6 +207,24 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
 void preloadPlayerArtwork(String? url) {
   if (url == null || url.isEmpty) return;
   if (url.startsWith('http://') || url.startsWith('https://')) {
-    CachedNetworkImageProvider(url).resolve(const ImageConfiguration());
+    preloadArtworkImage(CachedNetworkImageProvider(url));
+  }
+}
+
+/// 预热封面时始终监听ImageStream，网络/解码失败属于可回退的封面错误，
+/// 不应作为未处理的Flutter异步错误上抛。
+@visibleForTesting
+void preloadArtworkImage(ImageProvider<Object> provider) {
+  try {
+    final stream = provider.resolve(const ImageConfiguration());
+    late final ImageStreamListener listener;
+    void removeListener() => stream.removeListener(listener);
+    listener = ImageStreamListener(
+      (_, _) => removeListener(),
+      onError: (_, _) => removeListener(),
+    );
+    stream.addListener(listener);
+  } catch (_) {
+    // resolve失败与ImageStream失败同样不影响当前播放器或占位图。
   }
 }

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -100,7 +101,7 @@ class _BrushVerticalPageState extends State<BrushVerticalPage> {
 
   Future<void> _loadMore() async {
     if (_loadingMore) return;
-    _loadingMore = true;
+    setState(() => _loadingMore = true);
     try {
       final more = await widget.fetchMore!();
       if (!mounted) return;
@@ -113,7 +114,7 @@ class _BrushVerticalPageState extends State<BrushVerticalPage> {
     } catch (_) {
       // 加载更多失败静默忽略，下次滑动再试
     } finally {
-      _loadingMore = false;
+      if (mounted) setState(() => _loadingMore = false);
     }
   }
 
@@ -121,7 +122,7 @@ class _BrushVerticalPageState extends State<BrushVerticalPage> {
   void _openCast() {
     final url = _currentVideoUrl;
     if (url == null || url.isEmpty) return;
-    showModalBottomSheet(
+    showM3EModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (_) => DlnaCastSheet(mvUrl: url, mvTitle: _currentTitle),
@@ -203,6 +204,25 @@ class _BrushVerticalPageState extends State<BrushVerticalPage> {
                         ],
                       ),
                     ],
+                  ),
+                ),
+              ),
+            ),
+          // 上划加载更多指示器：与下拉刷新同款 M3E contained 指示器。
+          // 黑底视频上用半透明白容器 + 白色指示色保证可见；
+          // 画中画只保留视频本身，横屏全屏与竖屏都要显示（滑动加载在两种方向都存在）。
+          if (_loadingMore && !_inPip)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: MediaQuery.paddingOf(context).bottom + 24,
+              child: const Center(
+                child: IgnorePointer(
+                  child: M3EContainedLoadingIndicator(
+                    width: 48,
+                    height: 48,
+                    containerColor: Colors.white24,
+                    indicatorColor: Colors.white,
                   ),
                 ),
               ),

@@ -57,6 +57,9 @@ class _BrushPageState extends State<BrushPage> {
 
   @override
   void dispose() {
+    // 先摘监听再 dispose：controller 在 dispose 之后任何一次 scroll 通知都会
+    // 反过来摸已销毁的 controller。
+    _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
   }
@@ -66,6 +69,41 @@ class _BrushPageState extends State<BrushPage> {
     if (_scrollController.position.pixels >=
         _scrollController.position.maxScrollExtent - 200) {
       _loadMore();
+    }
+  }
+
+  /// 列表装不满一屏时主动补批，直到它真的能滚。
+  ///
+  /// 刷刷 feed 每次只随机返回 0~3 条（见 [_fetchPages] 的 maxPages 说明），
+  /// 首屏 [_load] 又只保证凑到 minCount: 8 且按歌名去重后可能更少。条目一少，
+  /// 列表就矮于一屏、`maxScrollExtent` 为 0 —— 根本滚不动，[_onScroll] 永远
+  /// 不回调，[_loadMore] 于是永远不被调用。判定条件本身（`0 >= 0 - 200`）
+  /// 是成立的，只是没人去算它。
+  ///
+  /// 所以取下一批不能只挂在滚动上，得主动把列表补到能滚为止。
+  static const int _maxAutoFillRounds = 3;
+
+  /// 防止 [_loadMore] 末尾再调本方法时递归：[_fillUntilScrollable] 内部会调
+  /// [_loadMore]，后者又回调进来，没有这道闸就是无限自我调用。
+  bool _autoFilling = false;
+
+  Future<void> _fillUntilScrollable() async {
+    if (_autoFilling) return;
+    _autoFilling = true;
+    try {
+      for (var round = 0; round < _maxAutoFillRounds; round++) {
+        if (!mounted || _error != null) return;
+        // 等新卡片布局完再量，否则量到的还是补货前的 maxScrollExtent。
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+        if (_scrollController.hasClients &&
+            _scrollController.position.maxScrollExtent > 0) {
+          return;
+        }
+        await _loadMore();
+      }
+    } finally {
+      _autoFilling = false;
     }
   }
 
@@ -87,6 +125,7 @@ class _BrushPageState extends State<BrushPage> {
         _nextPage = 1 + res.consumed;
         _isLoading = false;
       });
+      await _fillUntilScrollable();
     } catch (e) {
       debugPrint('[Brush] error=$e');
       if (!mounted) return;
@@ -109,6 +148,7 @@ class _BrushPageState extends State<BrushPage> {
         _cards = _merge(_cards, res.cards);
         _nextPage += res.consumed;
       });
+      await _fillUntilScrollable();
     } catch (e) {
       debugPrint('[Brush] loadMore error=$e');
     } finally {

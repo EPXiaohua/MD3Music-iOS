@@ -4,12 +4,14 @@ import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
+import '../player/secondary_mini_player.dart';
 
 class ChartsPage extends StatefulWidget {
   const ChartsPage({super.key});
@@ -58,7 +60,7 @@ class _ChartsPageState extends State<ChartsPage> {
             tooltip: _isListMode ? '切换为网格布局' : '切换为列表布局',
             onPressed: () => setState(() => _isListMode = !_isListMode),
           ),
-          const SizedBox(width: 4),
+          const Gap(AppSpacing.xs),
         ],
       ),
       body: _isLoading
@@ -84,12 +86,12 @@ class _ChartsPageState extends State<ChartsPage> {
                   size: 48,
                   color: cs.onSurfaceVariant.withValues(alpha: 0.5),
                 ),
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 Text(
                   '暂无排行榜数据',
                   style: tt.titleMedium?.copyWith(color: cs.onSurfaceVariant),
                 ),
-                const SizedBox(height: 16),
+                const Gap(AppSpacing.lg),
                 FilledButton.tonal(
                   onPressed: () => context.read<KugouProvider>().getRankList(
                     forceRefresh: true,
@@ -105,20 +107,25 @@ class _ChartsPageState extends State<ChartsPage> {
               context.read<KugouProvider>().getRankList(forceRefresh: true),
           child: ListView.builder(
             controller: _scrollController,
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.sm,
+              AppSpacing.lg,
+              AppSpacing.lg,
+            ),
             itemCount: ranks.ranks.length,
             itemBuilder: (context, i) {
               final rank = ranks.ranks[i];
               return Container(
                 margin: const EdgeInsets.only(bottom: 10),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: AppRadius.lgAll,
                   color: cs.surfaceContainerLow,
                 ),
                 child: Material(
                   color: Colors.transparent,
                   child: InkWell(
-                    borderRadius: BorderRadius.circular(16),
+                    borderRadius: AppRadius.lgAll,
                     onTap: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => _RankSongPage(
@@ -129,8 +136,8 @@ class _ChartsPageState extends State<ChartsPage> {
                     ),
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 12,
+                        horizontal: AppSpacing.md,
+                        vertical: AppSpacing.md,
                       ),
                       child: Row(
                         children: [
@@ -155,10 +162,10 @@ class _ChartsPageState extends State<ChartsPage> {
                               ),
                             ),
                           ),
-                          const SizedBox(width: 12),
+                          const Gap(AppSpacing.md),
                           // 封面
                           ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
+                            borderRadius: AppRadius.mdAll,
                             child: SizedBox(
                               width: 52,
                               height: 52,
@@ -179,7 +186,7 @@ class _ChartsPageState extends State<ChartsPage> {
                                     ),
                             ),
                           ),
-                          const SizedBox(width: 12),
+                          const Gap(AppSpacing.md),
                           // 标题
                           Expanded(
                             child: Text(
@@ -224,14 +231,14 @@ class _ChartsPageState extends State<ChartsPage> {
                   size: 48,
                   color: cs.onSurfaceVariant.withValues(alpha: 0.5),
                 ),
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 Text(
                   '暂无排行榜数据',
                   style: Theme.of(
                     context,
                   ).textTheme.titleMedium?.copyWith(color: cs.onSurfaceVariant),
                 ),
-                const SizedBox(height: 16),
+                const Gap(AppSpacing.lg),
                 FilledButton.tonal(
                   onPressed: () => context.read<KugouProvider>().getRankList(
                     forceRefresh: true,
@@ -249,7 +256,7 @@ class _ChartsPageState extends State<ChartsPage> {
           // Pad 模式下双指捏合可动态调整列数，非 Pad 模式仍固定 2 列
           child: PinchableGridView(
             controller: _scrollController,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
             spacing: 12.0,
             childAspectRatio: 0.78,
             itemCount: ranks.ranks.length,
@@ -293,7 +300,7 @@ class _RankGridCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: AppRadius.mdAll,
       clipBehavior: Clip.antiAlias,
       child: Material(
         color: colorScheme.surfaceContainerLow,
@@ -317,7 +324,7 @@ class _RankGridCard extends StatelessWidget {
                     : _buildPlaceholder(colorScheme),
               ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+                padding: const EdgeInsets.fromLTRB(10, AppSpacing.sm, 10, AppSpacing.sm),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -331,7 +338,7 @@ class _RankGridCard extends StatelessWidget {
                       ),
                     ),
                     if (songCount > 0) ...[
-                      const SizedBox(height: 2),
+                      const Gap(AppSpacing.xxs),
                       Text(
                         '$songCount 首',
                         maxLines: 1,
@@ -396,7 +403,8 @@ class _RankSongPageState extends State<_RankSongPage> {
           style: tt.titleLarge?.copyWith(fontWeight: FontWeight.w600),
         ),
       ),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : Selector<KugouProvider, List<KugouSongDetail>>(
               selector: (_, kugou) => kugou.rankSongs,
@@ -411,14 +419,14 @@ class _RankSongPageState extends State<_RankSongPage> {
                           size: 48,
                           color: cs.onSurfaceVariant.withValues(alpha: 0.5),
                         ),
-                        const SizedBox(height: 12),
+                        const Gap(AppSpacing.md),
                         Text(
                           '暂无数据',
                           style: tt.titleMedium?.copyWith(
                             color: cs.onSurfaceVariant,
                           ),
                         ),
-                        const SizedBox(height: 16),
+                        const Gap(AppSpacing.lg),
                         FilledButton.tonal(
                           onPressed: () async {
                             setState(() => _isLoading = true);
@@ -435,7 +443,12 @@ class _RankSongPageState extends State<_RankSongPage> {
                   );
                 }
                 return ListView.builder(
-                  padding: const EdgeInsets.all(16),
+                  padding: EdgeInsets.fromLTRB(
+                    AppSpacing.lg,
+                    AppSpacing.lg,
+                    AppSpacing.lg,
+                    AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                  ),
                   itemCount: songs.length,
                   itemBuilder: (context, i) {
                     final song = songs[i].toSong();
@@ -452,6 +465,7 @@ class _RankSongPageState extends State<_RankSongPage> {
                 );
               },
             ),
+      ),
     );
   }
 }

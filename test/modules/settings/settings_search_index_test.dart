@@ -8,8 +8,9 @@ import 'package:flutter_test/flutter_test.dart';
 import '../../../scripts/tools/gen_settings_search_index.dart';
 
 void main() {
+  final root = Directory.current.path.replaceAll(r'\', '/');
+
   test('settings_search_index.g.dart 与设置页源码一致', () {
-    final root = Directory.current.path.replaceAll(r'\', '/');
     final expected = generateSettingsSearchIndexSource(projectRoot: root);
     final actual = File('$root/$kIndexOutputRelPath').readAsStringSync();
     expect(
@@ -20,13 +21,24 @@ void main() {
     );
   });
 
-  test('索引条目非空且字段完整', () {
-    final root = Directory.current.path.replaceAll(r'\', '/');
+  test('索引条目非空且四元组字段完整', () {
     final entries = collectSettingsSearchEntries(projectRoot: root);
     expect(entries, isNotEmpty);
     for (final entry in entries) {
       expect(entry.label.trim(), isNotEmpty);
       expect(entry.category.trim(), isNotEmpty);
+      // subpage 允许为空串（二级页内联项），但不允许 null
+      expect(entry.subpage, isA<String>());
+      expect(entry.aliases, isA<String>());
+    }
+  });
+
+  test('未下钻分类的设置项 subpage 一律为空串', () {
+    final entries = collectSettingsSearchEntries(projectRoot: root);
+    for (final entry in entries.where(
+      (e) => e.category == '缓存与数据' || e.category == '关于',
+    )) {
+      expect(entry.subpage, isEmpty, reason: '${entry.label} 不应带三级页归属');
     }
   });
 }

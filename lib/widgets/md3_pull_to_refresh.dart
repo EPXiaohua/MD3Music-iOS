@@ -1,5 +1,8 @@
 import 'package:material_ui/material_ui.dart';
-import 'package:m3e_core/m3e_core.dart';
+// 隐藏官方版本，改用本地 fork：fork 修复了「Overscroll 通知 dragDetails
+// 为 null 导致拖拽提前结束」的问题，与下方 minDisplay 闪回修复叠加生效。
+import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
+import 'm3e_pull_to_refresh_fixed.dart';
 
 /// 修复 [M3EPullToRefreshIndicator] 松手后"闪回"的下拉刷新包装器。
 ///

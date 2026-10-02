@@ -80,12 +80,17 @@ bool get isFullPlayerOnTop => playerExpansion.value > 0.5;
 /// - 播放页在栈中但被其它页面盖住 → 回退到它（不再新建）
 /// - 不存在 → push 新路由
 void openFullPlayer(BuildContext context) {
-  // 车机模式：播放器已常驻在侧边面板，任何「打开全屏播放页」的入口都忽略。
+  // 车机模式：播放器已常驻在面板里，任何「打开全屏播放页」的入口都忽略。
   // 否则会在面板之外再 push 一个播放页 —— 两个实例各自驱动歌词/进度等动画，
   // 整页帧率翻倍。
-  if (context.read<CarModeProvider>().enabled) return;
+  // active 含自动检测：命中车机屏同样忽略。
+  if (context.read<CarModeProvider>().active) return;
 
-  final NavigatorState navigator = Navigator.of(context);
+  // rootNavigator: true —— 桌面布局下内容区是嵌套 Navigator，若走最近的
+  // Navigator 会把完整播放页 push 进中央内容区（只盖住内容区、盖不住侧栏与
+  // 底部播放栏）。改用根 Navigator 让播放页覆盖整个 shell。手机布局下根
+  // Navigator 即唯一 Navigator，行为不变。
+  final NavigatorState navigator = Navigator.of(context, rootNavigator: true);
   final DraggablePlayerRoute? existing = activePlayerRoute;
   if (existing != null) {
     if (existing.isActive && !existing.isCurrent) {
@@ -378,6 +383,11 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
               playerExpansion.value = pos;
             });
           }
+          // 注意：这里**不能**再乘 player_drag_overlay 的那条 `fade`（越展开越透明）。
+          // 那条淡出只属于「跟手覆盖层」——覆盖层在拖拽预览期跟随手指显示，随进度
+          // 提前淡出把显示权交给本路由层。本路由层自身用 `opacity`（越展开越不透明）
+          // 淡入即可；若也乘 fade，则 pos→1（全屏/顶栏拖拽起点/点击封面误触微拖拽）
+          // 时整页透明，opaque=false 下透出下层页面，表现为「点击封面闪回上一级」。
           return Opacity(
             opacity: opacity,
             child: Transform.translate(offset: Offset(0, dy), child: child),

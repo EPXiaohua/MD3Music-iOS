@@ -40,6 +40,12 @@ class UsbAudioService {
   /// 旧 usb HAL 输出流被独占 force disconnect 杀死，需重建 AudioTrack 才能重新出声）。
   void Function()? onExclusiveDisabled;
 
+  /// 直写开启失败回调（原生 `onExclusiveFailed` 事件）。
+  ///
+  /// 由 `OutputModeCoordinator` 注册：关闭外层「USB 独占输出」总开关，整体回到
+  /// 系统默认输出（**不**自动改用系统 Direct PCM —— 那是另一个用户没选的方案）。
+  void Function(String code, String message)? onExclusiveFailed;
+
   /// USB 独占独立音量（0..100），独立持久化（key: usb_volume），仅独占生效。
   double _usbVolumePercent = 100;
 
@@ -264,8 +270,25 @@ class UsbAudioService {
     }
   }
 
-  /// 接收原生 onStatusChanged 事件（ATTACHED/DETACHED/enable/disable 完成点推送）。
+  /// 接收原生事件：
+  /// - `onStatusChanged`：ATTACHED/DETACHED/enable/disable 完成点推送
+  /// - `onExclusiveFailed`：独占开启失败（含拔插广播的自动恢复失败 —— 那种情况
+  ///   没有 MethodChannel result 可依赖，只能靠事件通知 Dart 侧关闭总开关）
   Future<void> _handleNativeCall(MethodCall call) async {
+    if (call.method == 'onExclusiveFailed') {
+      try {
+        final s = Map<String, dynamic>.from(
+          (call.arguments as Map?) ?? const <String, dynamic>{},
+        );
+        final code = s['code']?.toString() ?? 'ENABLE_FAILED';
+        final message = s['message']?.toString() ?? code;
+        _debug('exclusive failed($code): $message');
+        onExclusiveFailed?.call(code, message);
+      } catch (e) {
+        _debug('onExclusiveFailed parse failed: $e');
+      }
+      return;
+    }
     if (call.method != 'onStatusChanged') return;
     try {
       final s = Map<String, dynamic>.from(

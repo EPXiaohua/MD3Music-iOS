@@ -9,7 +9,9 @@ import '../data/repositories/settings_repository.dart';
 /// [decrement] 调整列数。
 class GridColumnsProvider extends ChangeNotifier {
   static const int minColumns = 2;
-  static const int maxColumns = 4;
+  // 桌面/平板横屏放宽到 6 栏（计划 4.7 提列上限、提密度）；手机端不用此值
+  // （PinchableGridView 固定 2 栏）。默认仍 4 栏，捏合可增至 6。
+  static const int maxColumns = 6;
 
   // Pad 端默认 4 栏，手机端不使用此值（固定 2 栏）
   int _gridColumns = 4;

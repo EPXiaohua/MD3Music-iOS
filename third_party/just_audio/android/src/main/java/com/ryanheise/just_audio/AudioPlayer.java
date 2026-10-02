@@ -13,7 +13,8 @@ import android.os.Handler;
 import android.os.Looper;
 import androidx.media3.common.C;
 import androidx.media3.exoplayer.AudioFocusManager;
-import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl;import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl;
+import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.LivePlaybackSpeedControl;
@@ -31,6 +32,8 @@ import androidx.media3.common.TrackSelectionParameters;
 import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.exoplayer.audio.AudioSink;
+import androidx.media3.datasource.HttpDataSource;
+import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.NoSampleRenderer;
 import androidx.media3.exoplayer.Renderer;
 import androidx.media3.exoplayer.RenderersFactory;
@@ -523,6 +526,11 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             sb.append('\n').append(stack);
             UsbAudioSinkController.logE("ExoPlayerError", sb.toString());
         } catch (Exception ignored) { }
+        final Integer httpStatusCode = findHttpStatusCode(error);
+        final String errorMessage = httpStatusCode == null
+                ? error.getMessage()
+                : (error.getMessage() == null ? "" : error.getMessage())
+                    + " [http_status=" + httpStatusCode + "]";
         if (error instanceof ExoPlaybackException) {
             final ExoPlaybackException exoError = (ExoPlaybackException)error;
             switch (exoError.type) {
@@ -541,12 +549,34 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             default:
                 Log.e(TAG, "default ExoPlaybackException: " + exoError.getUnexpectedException().getMessage());
             }
-            // TODO: send both errorCode and type
-            sendError(exoError.type, exoError.getMessage(), mapOf("index", currentIndex));
+            // Dart 侧需要 Media3 的原因码区分可恢复网络错误与确定性格式错误；
+            // ExoPlaybackException.type 仍通过 details 保留，供诊断使用。
+            Map<String, Object> details = mapOf(
+                "index", currentIndex,
+                "type", exoError.type
+            );
+            if (httpStatusCode != null) details.put("httpStatusCode", httpStatusCode);
+            sendError(error.errorCode, errorMessage, details);
         } else {
             Log.e(TAG, "default PlaybackException: " + error.getMessage());
-            sendError(error.errorCode, error.getMessage(), mapOf("index", currentIndex));
+            Map<String, Object> details = mapOf("index", currentIndex);
+            if (httpStatusCode != null) details.put("httpStatusCode", httpStatusCode);
+            sendError(error.errorCode, errorMessage, details);
         }
+    }
+
+    /** 从Media3异常链提取HTTP状态码，不记录URL、响应体或鉴权信息。 */
+    private Integer findHttpStatusCode(Throwable error) {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 12; depth++) {
+            if (current instanceof HttpDataSource.InvalidResponseCodeException) {
+                return ((HttpDataSource.InvalidResponseCodeException) current).responseCode;
+            }
+            Throwable cause = current.getCause();
+            if (cause == current) break;
+            current = cause;
+        }
+        return null;
     }
 
     private void completeSeek() {
@@ -979,9 +1009,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 @Override
                 public AudioSink buildAudioSink(
                         Context ctx, boolean enableFloatOutput, boolean enableAudioTrackPlaybackParams) {
-                    AudioSink defaultSink = super.buildAudioSink(
-                            ctx, enableFloatOutput, enableAudioTrackPlaybackParams);
-                    return UsbAudioSinkController.wrap(defaultSink, ctx);
+                    // MD3Music fork: 自建 DefaultAudioSink（参数与 super.buildAudioSink 逐项一致，
+                    // 见 DefaultRenderersFactory:640-646），仅追加蝰蛇母带处理链。
+                    // float 输出在本 fork 恒为关闭（drf.setEnableAudioFloatOutput(false)），
+                    // 处理链输入恒为 16bit PCM；链位于 silence-skip/sonic 之前。
+                    AudioSink defaultSink = new DefaultAudioSink.Builder(ctx)
+                            .setEnableFloatOutput(enableFloatOutput)
+                            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                            .setAudioProcessorChain(
+                                    new DefaultAudioSink.DefaultAudioProcessorChain(
+                                            new ViperMasterProcessor()))
+                            .build();
+                    // MD3Music fork: 系统 Direct PCM 档的拦截层。必须放在
+                    // UsbAudioSinkController.wrap 之内（即更靠近 delegate），因为
+                    // DirectPcmSink.configure 记录的格式应是 delegate 实际收到的格式；
+                    // 且 DirectPcmController 需要 AudioManager 才能探测原生输出率。
+                    DirectPcmController.attachContext(ctx);
+                    return new DirectPcmSink(UsbAudioSinkController.wrap(defaultSink, ctx));
                 }
             };
             // MD3Music fork: float 输出曾用于让 24/32bit 高规格音频走高解析，
@@ -1117,11 +1161,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                         MediaSession session, MediaSession.ControllerInfo controller,
                         @Player.Command int playerCommand) {
                     final CustomActionListener listener = sCustomActionListener;
+                    Log.i("AudioFocusFork", "onPlayerCommandRequest command=" + playerCommand
+                            + " playWhenReady=" + player.getPlayWhenReady()
+                            + " listener=" + (listener != null));
                     if (listener == null) {
                         // 默认实现即返回 RESULT_SUCCESS，此处直接返回等价
                         return SessionResult.RESULT_SUCCESS;
                     }
                     switch (playerCommand) {
+                        case Player.COMMAND_PLAY_PAUSE:
+                            // 系统通知/媒体键的暂停可能发生在 Dart 侧换源 Future 等待期间。
+                            // 先把明确的暂停意图送回 PlayerProvider，使其取消旧请求；
+                            // 返回 SUCCESS 保留 Media3 原生即时暂停，避免等待 Dart channel。
+                            if (player.getPlayWhenReady()) {
+                                Log.i("AudioFocusFork", "onPlayerCommandRequest PAUSE -> App intent");
+                                listener.onPause();
+                            }
+                            return SessionResult.RESULT_SUCCESS;
                         case Player.COMMAND_SEEK_TO_NEXT:
                         case Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM:
                             Log.i("AudioFocusFork", "onPlayerCommandRequest SEEK_TO_NEXT -> App next");
@@ -1465,6 +1521,12 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
      * 从 lyricInfo JSON 提取可用于 Vivo 车机的整段 LRC：
      * 取 "lyric" 字段，并把 ELRC 词级时间标签 {@code <mm:ss.xxx>} 过滤成纯行级 LRC
      * （车机 LRC 解析器会把词级标签当文本渲染）。无歌词返回 null。
+     *
+     * MD3Music fork 修复（2026-09-23）：非中文歌曲车机定位到翻译行而非原文行。
+     * lyricInfo 的 lyric 字段开启翻译推送时（includeTranslation）每行原文后追加
+     * 同时间戳翻译行；车机 LRC 解析对同时间戳行取「最后一行」作主句高亮，
+     * 于是英文/日文歌的当前行永远落在中文翻译上（原文反而被当次行淡显）。
+     * 修复：按时间戳去重只保留首行（原文），翻译不推给车机。
      */
     public static String extractCarLyricsFromLyricInfo(String lyricInfo) {
         if (lyricInfo == null || lyricInfo.isEmpty()) return null;
@@ -1474,10 +1536,54 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             if (lyric == null || lyric.isEmpty()) return null;
             // 去词级时间标签：<mm:ss.xxx> / <m:ss.x> 等
             String lrc = lyric.replaceAll("<\\d{1,2}:\\d{1,2}(?:\\.\\d{1,3})?>", "");
+            // 同时间戳去重：原文在前、翻译在后（同戳追加），只保留原文行
+            lrc = keepFirstLinePerTimestamp(lrc);
             return lrc.trim().isEmpty() ? null : lrc.trim();
         } catch (Exception e) {
             Log.w("AudioFocusFork", "extractCarLyricsFromLyricInfo failed: " + e);
             return null;
+        }
+    }
+
+    /** LRC 行首时间标签：[mm:ss(.frac)]，分钟可三位数（超长曲目）。 */
+    private static final java.util.regex.Pattern LRC_LINE_TAG_PATTERN =
+            java.util.regex.Pattern.compile(
+                    "^\\s*\\[(\\d{1,3}):(\\d{1,2}(?:\\.\\d{1,3})?)\\]");
+
+    /**
+     * 同时间戳去重：保留每个时间戳的首个 LRC 行（原文），丢弃其后同戳行（翻译）。
+     * 时间戳按毫秒归一（[00:12.5] 与 [00:12.050] 视为同一时间）。
+     * 无时间标签的行（元数据/空行）原样保留。
+     */
+    static String keepFirstLinePerTimestamp(String lrc) {
+        if (lrc == null || lrc.indexOf('\n') < 0 && !LRC_LINE_TAG_PATTERN.matcher(lrc).find()) {
+            return lrc;
+        }
+        java.util.Set<Long> seen = new java.util.HashSet<>();
+        StringBuilder out = new StringBuilder(lrc.length());
+        for (String raw : lrc.split("\n", -1)) {
+            java.util.regex.Matcher m = LRC_LINE_TAG_PATTERN.matcher(raw);
+            if (m.find()) {
+                long minutes = Long.parseLong(m.group(1));
+                String[] secParts = m.group(2).split("\\.", 2);
+                long seconds = Long.parseLong(secParts[0]);
+                long millis = secParts.length > 1 ? fracToMillis(secParts[1]) : 0L;
+                long key = minutes * 60_000L + seconds * 1_000L + millis;
+                if (!seen.add(key)) continue; // 同时间戳后续行（翻译行）丢弃
+            }
+            if (out.length() > 0) out.append('\n');
+            out.append(raw);
+        }
+        return out.toString();
+    }
+
+    /** 小数毫秒段 ".5" / ".05" / ".050" → 500 / 50 / 50 ms（补齐三位精度）。 */
+    private static long fracToMillis(String frac) {
+        try {
+            String padded = (frac + "000").substring(0, 3);
+            return Long.parseLong(padded);
+        } catch (NumberFormatException e) {
+            return 0L;
         }
     }
 
@@ -1514,6 +1620,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         // 原生 PREVIOUS/NEXT 命令拦截后回调，走 App 自有切歌逻辑。
         void onPrevious();
         void onNext();
+        void onPause();
     }
 
     private static volatile CustomActionListener sCustomActionListener;

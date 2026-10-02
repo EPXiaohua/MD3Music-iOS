@@ -67,7 +67,11 @@ class DiagnosticExporter {
       for (final entity in logDir.listSync()) {
         if (entity is File) {
           try {
-            entity.copySync('${workDir.path}/${_baseName(entity.path)}');
+            final content = entity.readAsStringSync();
+            File('${workDir.path}/${_baseName(entity.path)}').writeAsStringSync(
+              DiagnosticLogger.sanitizeDiagnosticText(content),
+              flush: true,
+            );
           } catch (_) {
             // 单文件复制失败（占用/轮转竞争）不中断其余日志收集
           }
@@ -76,13 +80,17 @@ class DiagnosticExporter {
     }
 
     if (androidLogs.isNotEmpty) {
-      File(
-        '${workDir.path}/android.log',
-      ).writeAsStringSync(androidLogs, flush: true);
+      File('${workDir.path}/android.log').writeAsStringSync(
+        DiagnosticLogger.sanitizeDiagnosticText(androidLogs),
+        flush: true,
+      );
     }
     // USB 独占链路内部日志（app 侧内存环形 + native 传输层）。
     if (usbLogs.isNotEmpty) {
-      File('${workDir.path}/usb.log').writeAsStringSync(usbLogs, flush: true);
+      File('${workDir.path}/usb.log').writeAsStringSync(
+        DiagnosticLogger.sanitizeDiagnosticText(usbLogs),
+        flush: true,
+      );
     }
 
     // 4. 生成分级摘要，排查时可先看 WARNING / ERROR，再按文件定位原文。
@@ -121,10 +129,12 @@ class DiagnosticExporter {
   /// 经系统分享面板导出报告。
   static Future<void> shareReport() async {
     final zip = await buildReport();
-    await Share.shareXFiles(
-      [XFile(zip.path)],
-      subject: 'MD3Music 诊断日志',
-      text: 'MD3Music 诊断日志（包含设备信息，不包含账号数据）',
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [XFile(zip.path)],
+        subject: 'MD3Music 诊断日志',
+        text: 'MD3Music 诊断日志（包含设备信息，不包含账号数据）',
+      ),
     );
   }
 

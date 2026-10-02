@@ -4,6 +4,7 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
@@ -11,7 +12,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
 import '../login/login_page.dart';
-import '../player/mini_player.dart';
+import '../player/secondary_mini_player.dart';
 import 'channel_story_detail_page.dart';
 
 /// 音乐故事条目（/youth/channel/song 列表项）。
@@ -468,14 +469,14 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
         title: _name,
         scrollController: _scrollController,
       ),
-      bottomNavigationBar: const MiniPlayer(),
-      body: _isLoading
+      body: SecondaryMiniPlayerHost(
+        child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : Md3PullToRefresh(
               onRefresh: () => _load(showLoading: false),
               child: ListView(
                 controller: _scrollController,
-                padding: const EdgeInsets.only(bottom: 24),
+                padding: const EdgeInsets.only(bottom: AppSpacing.xl),
                 children: [
                   _buildHeader(context),
                   if (!_amway.isEmpty) _buildAmway(context),
@@ -485,7 +486,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                   ),
                   if (_loadingMore)
                     const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 12),
+                      padding: EdgeInsets.symmetric(vertical: AppSpacing.md),
                       child: Center(
                         child: SizedBox(
                           width: 24,
@@ -498,6 +499,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                 ],
               ),
             ),
+      ),
     );
   }
 
@@ -505,12 +507,12 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
     return Padding(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(AppSpacing.lg),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           ClipRRect(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: AppRadius.lgAll,
             child: _coverUrl != null
                 ? CachedNetworkImage(
                     imageUrl: _coverUrl!,
@@ -523,7 +525,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                   )
                 : _coverPlaceholder(cs),
           ),
-          const SizedBox(width: 16),
+          const Gap(AppSpacing.lg),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -545,7 +547,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                     ),
                   ),
                 ],
-                const SizedBox(height: 12),
+                const Gap(AppSpacing.md),
                 _subscribed
                     ? OutlinedButton.icon(
                         onPressed: _toggleSubscribe,
@@ -585,7 +587,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.sm),
           child: Text(
             _amway.title,
             style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
@@ -593,18 +595,18 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
         ),
         if (_amway.content.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
             child: Card(
               margin: EdgeInsets.zero,
               color: cs.surfaceContainerLow,
               child: Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     if (_amway.coverUrl != null) ...[
                       ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: AppRadius.mdAll,
                         child: CachedNetworkImage(
                           imageUrl: _amway.coverUrl!,
                           memCacheWidth: 1080,
@@ -631,7 +633,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
           ),
         if (_amway.songs.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(top: 4),
+            padding: const EdgeInsets.only(top: AppSpacing.xs),
             child: Column(
               children: _amway.songs.asMap().entries.map((e) {
                 final i = e.key;
@@ -654,7 +656,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
   Widget _buildStoriesHeader(BuildContext context) {
     final tt = Theme.of(context).textTheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.xs),
       child: Text(
         _stories.isEmpty ? '暂无音乐故事' : '音乐故事',
         style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
@@ -668,7 +670,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
     final playable = story.song != null;
     return ListTile(
       leading: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: AppRadius.smAll,
         child: story.coverUrl != null
             ? CachedNetworkImage(
                 imageUrl: story.coverUrl!,
@@ -734,7 +736,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 20, AppSpacing.lg, AppSpacing.sm),
           child: Text(
             '相似频道',
             style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
@@ -744,9 +746,9 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
           height: 160,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
             itemCount: _similar.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 12),
+            separatorBuilder: (_, _) => const Gap(AppSpacing.md),
             itemBuilder: (context, i) => _SimilarChannelCard(
               channel: _similar[i],
               onTap: () {
@@ -779,13 +781,13 @@ class _SimilarChannelCard extends StatelessWidget {
     return SizedBox(
       width: 110,
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: AppRadius.lgAll,
         onTap: onTap,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             ClipRRect(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: AppRadius.lgAll,
               child: channel.coverUrl != null
                   ? CachedNetworkImage(
                       imageUrl: channel.coverUrl!,

@@ -316,15 +316,33 @@ class _SongPickerSheetState extends State<SongPickerSheet> {
               if (_source == _PickerSource.created || _source == _PickerSource.favorites)
                 Padding(
                   padding: const EdgeInsets.all(12),
-                  child: DropdownButton<KugouPlaylistBrief>(
-                    isExpanded: true,
-                    value: _selectedPlaylist,
-                    hint: const Text('选择歌单'),
-                    items: _playlists
-                        .map((p) => DropdownMenuItem(value: p, child: Text(p.name, overflow: TextOverflow.ellipsis)))
-                        .toList(),
-                    onChanged: (p) {
-                      if (p == null) return;
+                  // M3EDropdownMenu 没有 initialSelection 参数：初始选中值由
+                  // M3EDropdownItem.selected 表达，每次 build 按 _selectedPlaylist 重建
+                  child: M3EDropdownMenu<KugouPlaylistBrief>(
+                    items: [
+                      for (final p in _playlists)
+                        M3EDropdownItem(
+                          label: p.name,
+                          value: p,
+                          selected: _selectedPlaylist == p,
+                        ),
+                    ],
+                    singleSelect: true,
+                    // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+                    showChipAnimation: false,
+                    fieldStyle: const M3EDropdownFieldStyle(
+                      hintText: '选择歌单',
+                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    ),
+                    onSelectionChanged: (selected) {
+                      // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+                      if (selected.isEmpty) {
+                        setState(() {});
+                        return;
+                      }
+                      final p = selected.first.value;
+                      // 未变化时不下发：避免 items 刷新回调重复拉取歌单
+                      if (p == _selectedPlaylist) return;
                       setState(() {
                         _selectedPlaylist = p;
                         _selectedKeys.clear();

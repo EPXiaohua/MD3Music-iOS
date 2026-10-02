@@ -53,6 +53,29 @@ class VolumeNormalizationService {
     return gainDb.clamp(_minGainDb, _maxGainDb);
   }
 
+  /// 把 AutoMix 自测的响度（dBFS）折算成音量均衡可直接使用的响度值。
+  ///
+  /// **为什么需要这条通路**：真机上酷狗 `/song/url` 不返回 `volume` 字段
+  /// （`KugouPlayUrl.volumeLufs` 恒为 null），现有「音量均衡」拿不到任何数据、
+  /// 形同虚设 —— 于是相邻曲目的原始响度差会原样透出，实测可达 **13.7 dB**
+  /// （约 4.8 倍音量），表现为「切歌时音量突然变大」。
+  /// AutoMix 会为每首歌解码 25s 音频并实测出 `loudnessDbfs`，正好补这个缺口。
+  ///
+  /// **口径说明（重要）**：两者并不等价，属于工程近似：
+  /// - `loudnessDbfs`：未加权 RMS 的 90 分位，无门限；
+  /// - LUFS：K-weighting 频率加权 + 门限，通常比未加权 RMS 低 1~3 dB。
+  /// 对「消除切歌响度跳变」这一用途，2~3 dB 的口径误差可接受
+  /// （被补偿的原始差已达 13.7 dB 量级）。
+  ///
+  /// 落在 [calcGainDb] 合法区间外的值一律丢弃 —— 垃圾数据不能把音量算飞。
+  static double? loudnessFromMeasuredDbfs(double? measuredDbfs) {
+    if (measuredDbfs == null || !measuredDbfs.isFinite) return null;
+    if (measuredDbfs <= _minTrackLufs || measuredDbfs >= _maxTrackLufs) {
+      return null;
+    }
+    return measuredDbfs;
+  }
+
   /// 将 dB 增益换算为线性增益。
   static double dbToLinear(double db) => math.pow(10, db / 20).toDouble();
 

@@ -69,6 +69,10 @@ import androidx.media3.extractor.MpegAudioUtil;
 import androidx.media3.extractor.OpusUtil;
 // MD3Music fork: 32bit 播放开关的实时标志（DefaultAudioSink 每 configure 读取，切歌即生效）。
 import com.ryanheise.just_audio.UsbAudioSinkController;
+// MD3Music fork: 系统 Direct PCM 档的实时标志（float 强制 / 低延迟 / 缓冲），
+// 以及 @hide API（setPerformanceMode / getLatency）的反射封装。
+import com.ryanheise.just_audio.DirectPcmController;
+import com.ryanheise.just_audio.DirectPcmCapabilities;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.lang.annotation.Documented;
@@ -779,17 +783,53 @@ public final class DefaultAudioSink implements AudioSink {
       bitrate = DtsUtil.DTS_EXPRESS_MAX_RATE_BITS_PER_SECOND;
     }
 
-    int bufferSize =
-        specifiedBufferSize != 0
-            ? specifiedBufferSize
-            : audioTrackBufferSizeProvider.getBufferSizeInBytes(
-                getAudioTrackMinBufferSize(outputSampleRate, outputChannelConfig, outputEncoding),
-                outputEncoding,
-                outputMode,
-                outputPcmFrameSize != C.LENGTH_UNSET ? outputPcmFrameSize : 1,
-                outputSampleRate,
-                bitrate,
-                enableAudioTrackPlaybackParams ? MAX_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
+    // MD3Music fork: 注意保持原有的调用边界 —— getAudioTrackMinBufferSize 内部有
+    // Assertions.checkState（ERROR_BAD_VALUE 会抛），原来只在 specifiedBufferSize == 0
+    // 分支里调用，改造后不能让它在 else 分支也被触发。
+    int bufferSize;
+    if (specifiedBufferSize != 0) {
+      bufferSize = specifiedBufferSize;
+    } else {
+      int minAudioTrackBufferSize =
+          getAudioTrackMinBufferSize(outputSampleRate, outputChannelConfig, outputEncoding);
+      bufferSize =
+          audioTrackBufferSizeProvider.getBufferSizeInBytes(
+              minAudioTrackBufferSize,
+              outputEncoding,
+              outputMode,
+              outputPcmFrameSize != C.LENGTH_UNSET ? outputPcmFrameSize : 1,
+              outputSampleRate,
+              bitrate,
+              enableAudioTrackPlaybackParams ? MAX_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
+      // MD3Music fork: 系统 Direct PCM 的低延迟档 —— 把 AudioTrack 缓冲砍半以争取
+      // fast 通道（AOSP 要求 track 帧数不超过 fastTrackBufferSize）。
+      //
+      // 地板必须是 `getMinBufferSize / 2` 而不是 `getMinBufferSize`：
+      // HyperOS 对音乐流报出的 minBufferSize 本身就很大（实测 44100Hz/16bit/stereo
+      // 与 192000Hz/float/stereo 都是 160ms），而 Media3 的 provider 返回
+      // max(minBufferSize, 时长目标) —— 若以 minBufferSize 为地板，砍半的结果会被
+      // 地板原样拉回，缓冲一点都减不掉（踩过一次）。
+      // 地板取一半是给 HAL 留余量；再小会明显 underrun，届时看 onUnderrun 计数。
+      if (DirectPcmController.isLowLatencyEnabled() && Util.SDK_INT >= 26) {
+        int halved = Math.max(1, bufferSize / 2);
+        int floor = Math.max(1, minAudioTrackBufferSize / 2);
+        int reduced = Math.max(floor, halved);
+        Log.i(
+            TAG,
+            "Direct PCM buffer: "
+                + bufferSize
+                + "fr -> "
+                + reduced
+                + "fr (min="
+                + minAudioTrackBufferSize
+                + "fr, "
+                + (outputSampleRate > 0 ? (reduced * 1000L / outputSampleRate) : 0)
+                + "ms @"
+                + outputSampleRate
+                + "Hz)");
+        bufferSize = reduced;
+      }
+    }
     offloadDisabledUntilNextConfiguration = false;
     Configuration pendingConfiguration =
         new Configuration(
@@ -1683,9 +1723,17 @@ public final class DefaultAudioSink implements AudioSink {
    * （native 仍需转 DAC 位深），且部分设备 float 解码输出异常（噪音/变速，见
    * AudioPlayer 的 setEnableAudioFloatOutput(false) 注释）。独占恒走整数 RAW 路径。
    */
-  private boolean floatOutputRequested() {
+   private boolean floatOutputRequested() {
     if (UsbAudioSinkController.isEnabled()) {
       return false;
+    }
+    // MD3Music fork: 系统 Direct PCM 档 —— 强制 float32 输出。
+    // 这是该档 bit-perfect 的第一前提：默认路径下 24/32bit 源会被
+    // ToInt16PcmAudioProcessor 降为 16bit（DefaultAudioSink:586-588 的 int 管线），
+    // Hi-Res 直接损失 8 bit。float32 尾数 24 bit，对 16/24bit 源数学无损。
+    // 「高规格输出」子开关关闭时退回原逻辑，仍尊重「32bit 播放支持」开关。
+    if (DirectPcmController.isHighPrecisionOutputEnabled()) {
+      return true;
     }
     return enableFloatOutput || UsbAudioSinkController.isFloatOutputEnabled();
   }
@@ -2283,14 +2331,52 @@ public final class DefaultAudioSink implements AudioSink {
           Util.getAudioFormat(outputSampleRate, outputChannelConfig, outputEncoding);
       android.media.AudioAttributes audioTrackAttributes =
           getAudioTrackAttributesV21(audioAttributes, tunneling);
-      return new AudioTrack.Builder()
-          .setAudioAttributes(audioTrackAttributes)
-          .setAudioFormat(audioFormat)
-          .setTransferMode(AudioTrack.MODE_STREAM)
-          .setBufferSizeInBytes(bufferSize)
-          .setSessionId(audioSessionId)
-          .setOffloadedPlayback(outputMode == OUTPUT_MODE_OFFLOAD)
-          .build();
+      AudioTrack audioTrack =
+          new AudioTrack.Builder()
+              .setAudioAttributes(audioTrackAttributes)
+              .setAudioFormat(audioFormat)
+              .setTransferMode(AudioTrack.MODE_STREAM)
+              .setBufferSizeInBytes(bufferSize)
+              .setSessionId(audioSessionId)
+              .setOffloadedPlayback(outputMode == OUTPUT_MODE_OFFLOAD)
+              .build();
+      boolean lowLatencyRequested = DirectPcmController.isLowLatencyEnabled();
+      applyDirectPcmPerformanceMode(audioTrack);
+      // MD3Music fork: 回填 AudioTrack 实测值（率/缓冲/延迟/performanceMode），
+      // 状态面板与 logcat 摘要据此显示「实际」而非「请求了什么」。
+      DirectPcmController.onAudioTrackCreated(audioTrack, lowLatencyRequested);
+      return audioTrack;
+    }
+
+    /**
+     * MD3Music fork: 系统 Direct PCM —— 请求 AudioTrack 低延迟（fast 通道的必要条件之一）。
+     *
+     * <p>AOSP 选 fast mixer 需同时满足：设备被 HAL 标记 fast、track 格式 == native mix
+     * 格式、缓冲不超阈值、无 offload、以及 {@code getPerformanceMode() == LOW_LATENCY}。
+     * 缺最后一条时即便前四条都满足也只能落到普通 mixer 线程。
+     *
+     * <p>实现注意：{@code AudioTrack.setPerformanceMode(int)} 是 **@hide**（公开 android.jar
+     * 里没有），必须反射；{@code PERFORMANCE_MODE_LOW_LATENCY} 常量与
+     * {@code getPerformanceMode()} 是公开的。整体在 SDK_INT >= 26（该 API 的最低版本）
+     * 才尝试，失败只意味着拿不到低延迟，绝不影响播放。
+     */
+    private static void applyDirectPcmPerformanceMode(AudioTrack audioTrack) {
+      if (!DirectPcmController.isLowLatencyEnabled()) {
+        DirectPcmController.setLowLatencyRequestApplied(0);
+        return;
+      }
+      if (Util.SDK_INT < 26) {
+        DirectPcmController.setLowLatencyRequestApplied(0);
+        return;
+      }
+      boolean ok = DirectPcmCapabilities.requestLowLatency(audioTrack);
+      DirectPcmController.setLowLatencyRequestApplied(ok ? 1 : -1);
+      Log.i(
+          TAG,
+          "Direct PCM low-latency request: "
+              + (ok
+                  ? ("applied, mode=" + DirectPcmCapabilities.isLowLatencyActive(audioTrack))
+                  : "failed"));
     }
 
     @RequiresApi(21)
