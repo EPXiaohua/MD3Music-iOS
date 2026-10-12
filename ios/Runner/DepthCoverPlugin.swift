@@ -1182,9 +1182,21 @@ private enum PullPushFiller {
   /// - .last：非预乘（splitLayer 的半透明边缘直通，PNG 编码保持直通 alpha）
   /// - .premultipliedLast：位图渲染源（renderToRGBA 的上下文即此格式）
   private func cgImage(from rgba: [UInt8], w: Int, h: Int, alpha: CGImageAlphaInfo) -> CGImage? {
-    var data = rgba
-    let cfData = Data(data) as CFData
-    guard let provider = CGDataProvider(data: cfData) else { return nil }
+    // CGDataProvider(data:) 是 Get 语义、不持有 CFData —— 局部 Data 释放后
+    // provider 悬垂，绘制/PNG 编码时 SIGSEGV。用 dataInfo + releaseData 回调
+    // 把 Data 生命周期绑定到 provider（CGImage 持有 provider，最后自动释放）。
+    let nsData = Data(rgba) as NSData
+    guard let provider = CGDataProvider(
+      dataInfo: Unmanaged.passRetained(nsData).toOpaque(),
+      data: nsData.bytes,
+      size: nsData.length,
+      releaseData: { info, _, _ in
+        if let info = info { Unmanaged<NSData>.fromOpaque(info).release() }
+      })
+    else {
+      Unmanaged.passRetained(nsData).release() // 创建失败时手动归还所有权
+      return nil
+    }
     return CGImage(
       width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
       space: CGColorSpaceCreateDeviceRGB(),
