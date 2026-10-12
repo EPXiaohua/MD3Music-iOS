@@ -115,6 +115,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 3D 变体：下载 ONNX Runtime 静态库（设备 arm64 slice）并覆写链接配置，
+      # 启用 DEPTH_3D_LINKED 编译条件（标准构建已在上一步用占位空配置完成）
+      - name: Prepare ONNX Runtime for 3D variant
+        run: |
+          curl -fL --retry 3 -o /tmp/ort.zip https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.22.0.zip
+          mkdir -p /tmp/ort_extract ios/ort
+          cd /tmp/ort_extract
+          unzip -q /tmp/ort.zip
+          LIB="onnxruntime.xcframework/ios-arm64/onnxruntime.framework/onnxruntime"
+          test -f "$LIB"
+          cp "$LIB" "$GITHUB_WORKSPACE/ios/ort/libonnxruntime.a"
+          cat > "$GITHUB_WORKSPACE/ios/ort/ort_link.xcconfig" <<'EOF'
+          LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/ort
+          OTHER_LDFLAGS = $(inherited) -lonnxruntime -lc++ -lz -framework CoreML
+          OTHER_SWIFT_FLAGS = $(inherited) -DDEPTH_3D_LINKED
+          EOF
+          ls -la "$GITHUB_WORKSPACE/ios/ort"
+
       - name: Build iOS 3D cover variant (no codesign, ENABLE_DEPTH_3D=true)
         run: flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true
 
@@ -124,6 +142,11 @@ jobs:
           rm -rf Payload
           mkdir -p Payload
           cp -R Runner.app Payload/Runner.app
+          # 注入 3D 封面模型（与 Android depth3d flavor 同源资产，
+          # 原生侧经 Bundle.main.path(inDirectory: "models") 定位）
+          mkdir -p Payload/Runner.app/models
+          cp "$GITHUB_WORKSPACE"/android/app/src/depth3d/assets/models/*.onnx Payload/Runner.app/models/
+          ls -la Payload/Runner.app/models
           zip -qry ../MD3Music-3D-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
@@ -151,7 +174,7 @@ jobs:
             未签名 IPA：下载后自行签名安装（侧载工具均可）。
 
             - `MD3Music-unsigned.ipa`：标准版（无 3D 封面，推荐）
-            - `MD3Music-3D-unsigned.ipa`：含 3D 封面支持版（设置中显示 3D 封面选项；当前 iOS 端深度推理未接入，生成失败时自动回退平面封面）
+            - `MD3Music-3D-unsigned.ipa`：含 3D 封面支持版（内置 Depth Anything V2 深度模型与 MI-GAN 修补模型，设置中开启 3D 封面即可；生成失败时自动回退平面封面，包体约 +40MB）
 
             本项目为上游安卓版 [zzyoxml/md3Music](https://github.com/zzyoxml/md3Music) 的 iOS 移植。
           files: |

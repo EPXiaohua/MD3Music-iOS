@@ -1,0 +1,10 @@
+// ORT 链接条件配置（占位空实现）。
+//
+// 标准包：本文件保持为空 —— Runner 不链接 onnxruntime，DepthCoverPlugin.swift
+// 因未定义 DEPTH_3D_LINKED 编译为空翻译单元，零体积零依赖。
+//
+// 3D 包：CI（.github/workflows/ios-build.yml）构建 3D IPA 前把本文件覆写为：
+//   LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/ort
+//   OTHER_LDFLAGS = $(inherited) -lonnxruntime -lc++ -lz -framework CoreML
+//   OTHER_SWIFT_FLAGS = $(inherited) -DDEPTH_3D_LINKED
+// 并把 libonnxruntime.a 放到 ios/ort/ 下（.a 不入库，见 .gitignore）。

@@ -12,6 +12,7 @@ import '../../core/layout/display_space.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/layout/tv_player_bar_focus_bridge.dart';
 import '../../core/layout/ui_density.dart';
+import '../../core/services/desktop_lyric_service.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../core/utils/app_haptics.dart';

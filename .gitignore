@@ -48,6 +48,8 @@ app.*.map.json
 /kugou_api_server/rust/target/
 # iOS Rust static lib（构建时由 kugou_api_server/rust/build_ios.sh 生成）
 /ios/rustlib/
+# iOS 3D 封面 ONNX Runtime 静态库（CI 构建时下载，不入库）
+/ios/ort/*.a
 
 # Widget Preview related
 .widget_preview/

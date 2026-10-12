@@ -84,6 +84,13 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     SongRecognitionPipManager.shared.attach(messenger: messenger)
 
+    // iOS 3D 封面（Depth Anything V2 推理 + push-pull/MI-GAN 修补 + 三层切割）。
+    // 仅 3D 包定义 DEPTH_3D_LINKED（CI 写入链接 xcconfig）；标准包此段编译为空，
+    // Dart 侧 MissingPluginException 走平面封面回退。
+#if DEPTH_3D_LINKED
+    DepthCoverPlugin.shared.attach(messenger: messenger)
+#endif
+
     channelsConfigured = true
     NSLog("[MD3Music] picker MethodChannels registered on FlutterViewController")
   }

@@ -1,1 +1,2 @@
 #include "Generated.xcconfig"
+#include "../ort/ort_link.xcconfig"
