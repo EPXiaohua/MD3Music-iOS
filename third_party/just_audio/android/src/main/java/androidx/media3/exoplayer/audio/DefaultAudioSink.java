@@ -73,6 +73,7 @@ import com.ryanheise.just_audio.UsbAudioSinkController;
 // 以及 @hide API（setPerformanceMode / getLatency）的反射封装。
 import com.ryanheise.just_audio.DirectPcmController;
 import com.ryanheise.just_audio.DirectPcmCapabilities;
+import com.ryanheise.just_audio.OutputLatencyProbe;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.lang.annotation.Documented;
@@ -868,6 +869,9 @@ public final class DefaultAudioSink implements AudioSink {
     }
 
     audioTrack = buildAudioTrackWithRetry();
+    // MD3Music fork: 把新轨道交给输出延迟探针（字节→帧换算用 outputPcmFrameSize）。
+    // 探针只旁路计数，不参与任何播放决策。
+    OutputLatencyProbe.attach(audioTrack, configuration.outputPcmFrameSize);
     if (isOffloadedPlayback(audioTrack)) {
       registerStreamEventCallbackV29(audioTrack);
       if (configuration.enableOffloadGapless) {
@@ -1535,6 +1539,8 @@ public final class DefaultAudioSink implements AudioSink {
         onRoutingChangedListener = null;
       }
       releaseAudioTrackAsync(audioTrack, releasingConditionVariable, listener, oldAudioTrackConfig);
+      // MD3Music fork: 轨道释放前先摘探针，避免旧轨道的尾巴写入被计入新轨道
+      OutputLatencyProbe.detach();
       audioTrack = null;
     }
     writeExceptionPendingExceptionHolder.clear();
@@ -1889,7 +1895,10 @@ public final class DefaultAudioSink implements AudioSink {
 
   @RequiresApi(21)
   private static int writeNonBlockingV21(AudioTrack audioTrack, ByteBuffer buffer, int size) {
-    return audioTrack.write(buffer, size, AudioTrack.WRITE_NON_BLOCKING);
+    final int result = audioTrack.write(buffer, size, AudioTrack.WRITE_NON_BLOCKING);
+    // MD3Music fork: 记录真正写进去的字节（失败时 result < 0，探针内部会忽略）
+    OutputLatencyProbe.onBytesWritten(audioTrack, result);
+    return result;
   }
 
   @RequiresApi(21)
@@ -1897,8 +1906,11 @@ public final class DefaultAudioSink implements AudioSink {
       AudioTrack audioTrack, ByteBuffer buffer, int size, long presentationTimeUs) {
     if (Util.SDK_INT >= 26) {
       // The underlying platform AudioTrack writes AV sync headers directly.
-      return audioTrack.write(
+      final int result = audioTrack.write(
           buffer, size, AudioTrack.WRITE_NON_BLOCKING, presentationTimeUs * 1000);
+      // MD3Music fork: 同上，累计实际写入字节（主路径）
+      OutputLatencyProbe.onBytesWritten(audioTrack, result);
+      return result;
     }
     if (avSyncHeader == null) {
       avSyncHeader = ByteBuffer.allocate(16);

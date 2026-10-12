@@ -5,8 +5,13 @@ import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../core/build_flags.dart';
+import '../core/remote/remote_slider.dart';
+import '../core/theme/app_dimens.dart';
 import '../core/services/output_mode_coordinator.dart';
 import '../core/services/usb_audio_service.dart';
+import '../core/utils/app_haptics.dart';
+import '../core/utils/app_text_context_menu.dart';
 import '../core/utils/app_toast.dart';
 import '../core/utils/audio_format_utils.dart';
 import '../providers/player_provider.dart';
@@ -379,7 +384,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
               title: const Text('播放 MV 时自动关闭独占'),
               value: autoClose,
               onChanged: (v) async {
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 await UsbAudioService.instance.setAutoDisableForMv(v);
                 if (mounted) setState(() {});
               },
@@ -395,7 +400,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
           subtitle: const Text('独占输出降位(如 32→24)时加三角抖动，消除截断失真；噪底略升。立即生效'),
           value: _ditherEnabled,
           onChanged: (v) async {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _ditherEnabled = v);
             await UsbAudioService.instance.setDither(v);
           },
@@ -621,21 +626,33 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                     ),
                   ],
                 ),
-                M3ESlider(
-                  value: _usbVolume,
-                  // 不传 divisions = 无级调节（无节点）
-                  decoration: const M3ESliderDecoration(
-                    // 显式给离散触觉配置：divisions 为空时组件默认取连续触觉
-                    //（10ms 最小间隔），拖动会高频走震动通道导致马达饱和
-                    haptic: M3EHapticFeedback.medium,
-                    hapticConfig: M3EHapticConfig.discrete(),
-                  ),
-                  // 实时生效：拖动即下发原生，无需松手
-                  onChanged: (v) {
-                    setState(() => _usbVolume = v);
-                    UsbAudioService.instance.setUsbVolume(v * 100);
-                  },
-                ),
+                // tv: TV 构建换 RemoteSlider——M3ESlider 自带 Focus 吞四方向键；
+                // TV 分支丢 M3ESliderDecoration 触觉参数（P-C）
+                kTvBuild
+                    ? RemoteSlider(
+                        value: _usbVolume,
+                        // 不传 divisions = 无级调节（无节点）
+                        // 实时生效：拖动即下发原生，无需松手
+                        onChanged: (v) {
+                          setState(() => _usbVolume = v);
+                          UsbAudioService.instance.setUsbVolume(v * 100);
+                        },
+                      )
+                    : M3ESlider(
+                        value: _usbVolume,
+                        // 不传 divisions = 无级调节（无节点）
+                        decoration: const M3ESliderDecoration(
+                          // 显式给离散触觉配置：divisions 为空时组件默认取连续触觉
+                          //（10ms 最小间隔），拖动会高频走震动通道导致马达饱和
+                          haptic: M3EHapticFeedback.medium,
+                          hapticConfig: M3EHapticConfig.discrete(),
+                        ),
+                        // 实时生效：拖动即下发原生，无需松手
+                        onChanged: (v) {
+                          setState(() => _usbVolume = v);
+                          UsbAudioService.instance.setUsbVolume(v * 100);
+                        },
+                      ),
                 Text(
                   enabled
                       ? '已生效：DAC 音量 = 系统音量 × USB 音量'
@@ -689,10 +706,11 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                       _status.entries
                           .map((e) => '${e.key}: ${e.value}')
                           .join('\n'),
+                      contextMenuBuilder: buildAppTextContextMenu,
                       style: textTheme.bodySmall?.copyWith(
                         color: colorScheme.onSurfaceVariant,
                         fontFamily: 'monospace',
-                        fontSize: 10,
+                        fontSize: 11,
                       ),
                     ),
                   ],
@@ -726,7 +744,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
 
   /// 更新输出格式（持久化 + 下发原生；独占开启中原生会立即重建流）。
   void _updateFormat({int? rate, int? bits, int? channels}) {
-    HapticFeedback.selectionClick();
+    AppHaptics.selectionClick(HapticCategory.control);
     final r = rate ?? _outputRate;
     final b = bits ?? _outputBits;
     final c = channels ?? _outputChannels;
@@ -976,11 +994,15 @@ class _StatusChip extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: BorderRadius.circular(AppRadius.full),
       ),
+      // 字号走 labelSmall（11sp，与原裸值同大小），不再绕开字阶体系。
       child: Text(
         label,
-        style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600),
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: color,
+          fontWeight: FontWeight.w600,
+        ),
       ),
     );
   }

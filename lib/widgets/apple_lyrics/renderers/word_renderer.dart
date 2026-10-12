@@ -17,9 +17,11 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/widgets.dart';
 
+import '../../../core/build_flags.dart';
 import '../layout/duet_layout.dart';
 import '../layout/lyric_layout.dart';
 import '../layout/lyric_preferences.dart';
+import 'package:md3music/core/utils/lyric_wrap_plan.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'emphasize_effect.dart';
 
@@ -270,12 +272,6 @@ class WordRenderer {
   /// 预计算的每个 word 在行内的起始 X 坐标（相对于行首）。
   /// 在 [_ensureBound] 时一次性计算，避免每帧 O(n²) 循环累加。
   List<double> _wordStartXs = const <double>[];
-
-  /// 缓存的上次换行扫描的 maxWidth，用于判断是否需要重算 _cachedVisualLineWidths。
-  double _cachedMaxWidth = -1;
-
-  /// 缓存的每条视觉行的 word 累计宽度，避免每帧重新分配 List。
-  List<double> _cachedVisualLineWidths = const <double>[];
 
   // ============== 状态查询 ==============
 
@@ -751,12 +747,12 @@ class WordRenderer {
   /// 通过逐字 alpha 区分已播 / 未播。
   ///
   /// [maxWidth] 为该行可用最大文字宽度（视口宽 - 左右 1em 边距）。
-  /// 当 word 累加 dx 超过 [maxWidth] 且 dx > 0 时换行：
-  /// dx 归零，currentY += mainLineHeight × wrapLineHeightFactor（0.8x 行高）。
+  /// 断点由换行计划给出（[wrapPlan] 注入，缺省时现场取同一份计划）：走到计划标记的
+  /// 行起点才换行，dx 归零，currentY += mainLineHeight × wrapLineHeightFactor（0.8x 行高）。
   ///
   /// **性能优化**：
   /// - word 宽度用 [_wordWidths] 缓存（[_ensureBound] 时一次性测量），
-  ///   换行判断不再每帧创建 TextPainter + layout
+  ///   换行断点由 [LyricWrapPlanner] 的结果缓存提供，两者都不再每帧 layout
   /// - **v4 优化**：per-word TextPainter 实例 + alpha 缓存。
   ///   仅在 alpha 变化时才 set text + layout，alpha 不变时直接 paint。
   ///   这与 v3 Task 1 共享 painter 不同：每个 word 独占一个 TextPainter 实例，
@@ -769,13 +765,27 @@ class WordRenderer {
     double maxWidth = double.infinity,
     DuetAlignment alignment = DuetAlignment.defaultAlign,
     double viewportWidth = 0,
+    LyricWrapPlan? wrapPlan,
+    LyricWrapPlan? auxPlan,
   }) {
+    // 断点唯一来源：外部（AppleLyricsView 的行高重算处）注入的计划；
+    // 未注入时现场取同一份计划兜底。本方法内**禁止**再自行判断换行条件，
+    // 否则测量与绘制会岔开（历史重叠 bug 的根因）。
+    final bool balanced = LyricPreferences.instance.lineBalance;
+    final LyricWrapPlan plan =
+        wrapPlan ??
+        LyricWrapPlanner.forLine(
+          line,
+          LyricLayout.mainStyle(fontSize),
+          maxWidth,
+          balanced: balanced,
+        );
     // 临时调试：行切换时打印换行分析（定位歌词重叠）
     final bool isNewLine =
         !identical(_boundLine, line) || _boundFontSize != fontSize;
     _ensureBound(line, fontSize);
     if (isNewLine) {
-      _debugLogWrap(line, fontSize, maxWidth);
+      _debugLogWrap(line, fontSize, maxWidth, plan);
     }
 
     // 解析当前行实际文字颜色：动态字体颜色（仅当前行）优先，否则回退主题默认色。
@@ -822,14 +832,19 @@ class WordRenderer {
         maxWidth: maxWidth,
         alignment: alignment,
         viewportWidth: viewportWidth,
+        plan: plan,
       );
       return;
     }
 
-    // 对唱对齐：预扫描每视觉行的 word 宽度，换行时重算 baseX
-    // _visualLineWidths[i] = 第 i 条视觉行的 word 累计宽度
-    final List<double> visualLineWidths = _computeVisualLineWidths(maxWidth);
+    // 每视觉行的宽度来自计划（供换行后重算 baseX 对齐）
+    final List<double> visualLineWidths = plan.rowWidths;
     int visualLineIndex = 0;
+    // 下一个「行起点」的 word 下标；超出即本行到行尾
+    final int firstNextRowStart = plan.rowCount > 1
+        ? plan.rowStarts[1]
+        : line.words.length;
+    int nextRowStart = firstNextRowStart;
     double baseX = _alignX(
       alignment,
       offset.dx,
@@ -872,17 +887,16 @@ class WordRenderer {
       final LyricWord word = line.words[i];
       // AMLL 上浮特效：当前字 Y 偏移（上浮）
       final double yOffset = i < _wordYOffsets.length ? _wordYOffsets[i] : 0;
-      // 用缓存宽度做换行判断（避免每帧 TextPainter.layout 测量）
+      // 用缓存宽度推进 dx 并给渐变/矩形定位（换行断点由计划给出，不再用宽度判断）
       final double width = i < _wordWidths.length ? _wordWidths[i] : 0;
-      // 自动换行：累计宽度超过 maxWidth 且本视觉行已有 word 时换行
-      if (dx + width > maxWidth && dx > 0) {
+      // 走到计划标记的行起点才换行（断点由 LyricWrapPlanner 决定）
+      if (i == nextRowStart) {
         dx = 0;
         // 第一个换行行从主行底部（offset.dy + mainLineHeight）开始，
-        // 后续换行行之间 0.8x 行高（与 measureLineHeight 一致，避免行盒重叠）
+        // 后续换行行之间 0.8x 行高（与 lineHeightForRows 一致，避免行盒重叠）
         currentY = visualLineIndex == 0
             ? offset.dy + mainLineHeight
             : currentY + wrapLineHeight;
-        // 换行后重算对齐 baseX
         visualLineIndex++;
         if (visualLineIndex < visualLineWidths.length) {
           baseX = _alignX(
@@ -892,6 +906,9 @@ class WordRenderer {
             viewportWidth,
           );
         }
+        nextRowStart = visualLineIndex + 1 < plan.rowStarts.length
+            ? plan.rowStarts[visualLineIndex + 1]
+            : line.words.length;
       }
 
       // 换行行用 0.8x 行盒（行盒=行距，避免行盒重叠）；主行用完整行高
@@ -1074,8 +1091,19 @@ class WordRenderer {
       // 先布局副行文本，再按**实际视觉行数**取副行高度：副行过长换行时高度随行数
       // 增长，与 AppleLyricsView 的逐行副行预留（LyricLayout.auxSubHeight）严格同式，
       // 否则预留槽位与副行终点错位（多出来的行压到下一行歌词上）。
+      // 副行同样只认计划：把计划的行文本用 \n 连起来绘制，行数直接取 rowCount，
+      // 于是「副行占位（AppleLyricsView._auxSubHeights）」与「副行绘制终点」必然同式。
+      // 关闭平衡时计划即 painterWrap，\n 的位置就是原来的自动换行位置，观感不变。
+      final LyricWrapPlan resolvedAuxPlan =
+          auxPlan ??
+          LyricWrapPlanner.forText(
+            auxText,
+            LyricLayout.auxStyle(fontSize),
+            maxWidth,
+            balanced: balanced,
+          );
       _translationPainter.text = TextSpan(
-        text: auxText,
+        text: resolvedAuxPlan.rowTexts.join('\n'),
         style: TextStyle(
           color: Color.fromRGBO(textRed, textGreen, textBlue, transAlpha),
           fontSize: transFontSize,
@@ -1087,10 +1115,7 @@ class WordRenderer {
       _translationPainter.layout(
         maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
       );
-      final int subRows = max(
-        1,
-        _translationPainter.computeLineMetrics().length,
-      );
+      final int subRows = resolvedAuxPlan.rowCount;
       final double subH = LyricLayout.auxSubHeight(fontSize, subRows);
       final double transY =
           currentY +
@@ -1330,8 +1355,8 @@ class WordRenderer {
               rowHeight,
             );
             _glowBlurPaint.imageFilter = ImageFilter.blur(
-              sigmaX: blurSigma,
-              sigmaY: blurSigma,
+              sigmaX: tvBlurSigma(blurSigma),
+              sigmaY: tvBlurSigma(blurSigma),
             );
             _glowBlurPaint.colorFilter = ColorFilter.matrix(<double>[
               1,
@@ -1554,32 +1579,6 @@ class WordRenderer {
     return bright + (dark - bright) * t;
   }
 
-  /// 按换行逻辑预扫描，计算每条视觉行的 word 累计宽度。
-  /// 与 paintLine 循环中的换行判断一致：dx + width > maxWidth 且 dx > 0 时换行。
-  /// 性能优化：缓存结果，maxWidth 不变时直接返回缓存。
-  List<double> _computeVisualLineWidths(double maxWidth) {
-    if (maxWidth == _cachedMaxWidth && _cachedVisualLineWidths.isNotEmpty) {
-      return _cachedVisualLineWidths;
-    }
-    _cachedMaxWidth = maxWidth;
-    final List<double> widths = <double>[];
-    double dx = 0;
-    double lineW = 0;
-    for (int i = 0; i < _wordWidths.length; i++) {
-      final w = _wordWidths[i];
-      if (dx + w > maxWidth && dx > 0) {
-        widths.add(lineW);
-        dx = 0;
-        lineW = 0;
-      }
-      dx += w;
-      lineW += w;
-    }
-    if (lineW > 0) widths.add(lineW);
-    _cachedVisualLineWidths = widths;
-    return widths;
-  }
-
   /// 根据对唱对齐方式计算文本起始 x 坐标。
   /// [leftPadding] 为左侧 1em 边距（即 offset.dx），右侧对称留白。
   double _alignX(
@@ -1617,7 +1616,8 @@ class WordRenderer {
 
   /// 整行降级绘制（无 word 时间戳时使用）。
   ///
-  /// [maxWidth] 用于自动换行（默认 [double.infinity] 不换行）。
+  /// 断点一律来自 [plan]（与行高测量同源），本方法内不再自行判断换行；
+  /// [maxWidth] 仅保留给调用方签名一致，不参与断行。
   /// 用临时 TextPainter 实例（仅在 fallback 路径，频率低不缓存）。
   void _paintSolidFallback(
     Canvas canvas,
@@ -1627,6 +1627,7 @@ class WordRenderer {
     double maxWidth = double.infinity,
     DuetAlignment alignment = DuetAlignment.defaultAlign,
     double viewportWidth = 0,
+    required LyricWrapPlan plan,
   }) {
     if (line.text.isEmpty) return;
     final double alpha = dynamicDarkAlpha;
@@ -1634,33 +1635,42 @@ class WordRenderer {
     final int colorValue = (_isActive && _activeColorValue != null)
         ? _activeColorValue!
         : LyricLayout.textColorValue;
+    final int textRed = (colorValue >> 16) & 0xFF;
+    final int textGreen = (colorValue >> 8) & 0xFF;
+    final int textBlue = colorValue & 0xFF;
+
+    // 与 LineRenderer._paintMultiLineAligned 同一套行盒模型：主行完整行高、
+    // 换行行 0.8x 行高且从主行底部起，与 lineHeightForRows 的预留严格对应。
+    final double mainLineHeight = fontSize * LyricLayout.lineHeight;
+    final double wrapLineHeight =
+        mainLineHeight * LyricLayout.wrapLineHeightFactor;
     final painter = TextPainter(textDirection: TextDirection.ltr);
-    painter.text = TextSpan(
-      text: line.text,
-      style: TextStyle(
-        color: Color.fromRGBO(
-          (colorValue >> 16) & 0xFF,
-          (colorValue >> 8) & 0xFF,
-          colorValue & 0xFF,
-          alpha,
+    for (int i = 0; i < plan.rowTexts.length; i++) {
+      final bool isFirstRow = i == 0;
+      painter.text = TextSpan(
+        text: plan.rowTexts[i],
+        style: TextStyle(
+          color: Color.fromRGBO(textRed, textGreen, textBlue, alpha),
+          fontSize: fontSize,
+          height: isFirstRow
+              ? LyricLayout.lineHeight
+              : LyricLayout.lineHeight * LyricLayout.wrapLineHeightFactor,
+          fontFamily: LyricLayout.fontFamily,
+          fontWeight: LyricLayout.fontWeight,
         ),
-        fontSize: fontSize,
-        height: LyricLayout.lineHeight,
-        // 显式注入歌词 fontFamily，与 paintLine 路径保持一致
-        fontFamily: LyricLayout.fontFamily,
-        fontWeight: LyricLayout.fontWeight,
-      ),
-    );
-    painter.layout(
-      maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
-    );
-    final double x = _alignX(
-      alignment,
-      offset.dx,
-      painter.width,
-      viewportWidth,
-    );
-    painter.paint(canvas, Offset(x, offset.dy));
+      );
+      painter.layout(maxWidth: double.infinity);
+      final double x = _alignX(
+        alignment,
+        offset.dx,
+        painter.width,
+        viewportWidth,
+      );
+      final double y = isFirstRow
+          ? offset.dy
+          : offset.dy + mainLineHeight + (i - 1) * wrapLineHeight;
+      painter.paint(canvas, Offset(x, y));
+    }
     painter.dispose();
   }
 
@@ -1795,7 +1805,10 @@ class WordRenderer {
       glowCanvas.saveLayer(
         Rect.fromLTWH(0, 0, imgW.toDouble(), imgH.toDouble()),
         Paint()
-          ..imageFilter = ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+          ..imageFilter = ui.ImageFilter.blur(
+            sigmaX: tvBlurSigma(sigma),
+            sigmaY: tvBlurSigma(sigma),
+          ),
       );
       textPainter.paint(glowCanvas, Offset(pad, pad));
       textPainter.dispose();
@@ -1803,6 +1816,8 @@ class WordRenderer {
 
       final picture = recorder.endRecording();
       final image = await picture.toImage(imgW, imgH);
+      // toImage 经 native 回调栅格化，future 完成后 Picture 不再被引用，此刻释放才安全。
+      picture.dispose();
       return image;
     } catch (_) {
       return null;
@@ -1884,6 +1899,8 @@ class WordRenderer {
       textPainter.dispose();
       final picture = recorder.endRecording();
       final image = await picture.toImage(imgW, imgH);
+      // toImage 经 native 回调栅格化，future 完成后 Picture 不再被引用，此刻释放才安全。
+      picture.dispose();
       return image;
     } catch (_) {
       return null;
@@ -1891,24 +1908,23 @@ class WordRenderer {
   }
 
   /// 临时调试：打印行换行分析（word 累加 vs TextPainter 行数），定位歌词重叠。
-  void _debugLogWrap(LyricLine line, double fontSize, double maxWidth) {
+  void _debugLogWrap(
+    LyricLine line,
+    double fontSize,
+    double maxWidth,
+    LyricWrapPlan plan,
+  ) {
+    // 诊断日志仅在 debug 构建产出：layout + computeLineMetrics 有实打实的开销，
+    // release 包不应为一条被丢弃的 print 付这笔账。
+    if (!kDebugMode) return;
     final StringBuffer sb = StringBuffer();
     sb.write(
       '[LyricWrap] WR hasWord=${line.hasWordTiming} '
       'text="${line.text}" maxW=${maxWidth.toStringAsFixed(1)} fs=$fontSize',
     );
     if (line.hasWordTiming) {
-      // word 累加行数（与 paintLine / measureLineHeight 一致）
-      double dx = 0;
-      int rows = 1;
-      for (int i = 0; i < _wordWidths.length; i++) {
-        if (dx + _wordWidths[i] > maxWidth && dx > 0) {
-          dx = 0;
-          rows++;
-        }
-        dx += _wordWidths[i];
-      }
-      sb.write(' wordRows=$rows');
+      // 行数/断点来自换行计划（与 paintLine / measureLineHeight 同源）
+      sb.write(' planRows=${plan.rowCount} starts=${plan.rowStarts}');
       // TextPainter 整行自动换行行数
       final TextPainter tp = TextPainter(
         text: TextSpan(
@@ -2141,8 +2157,6 @@ class WordRenderer {
     _boundLineHeight = -1;
     _wordWidths = const <double>[];
     _wordStartXs = const <double>[];
-    _cachedMaxWidth = -1;
-    _cachedVisualLineWidths = const <double>[];
     _currentWordIdx = -1;
     _intraWordProgress = 0.0;
     _maskX = -1.0;

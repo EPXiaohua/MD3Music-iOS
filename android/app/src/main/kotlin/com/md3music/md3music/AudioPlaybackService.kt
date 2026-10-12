@@ -1350,6 +1350,8 @@ class AudioPlaybackService : Service() {
             "pause", "stop" -> "pause"
             "next" -> "next"
             "previous" -> "previous"
+            "seekForward" -> "seekForward"
+            "seekBack" -> "seekBack"
             else -> "play"
         }
         if (mediaCommandQueue.offer(method)) launchMediaCommandDispatcher()

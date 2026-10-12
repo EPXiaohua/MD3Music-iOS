@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../../widgets/tv_dropdown_menu.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -8,7 +9,9 @@ import 'package:image_picker/image_picker.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/tab_snap_physics.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 
@@ -437,6 +440,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
           ),
           Expanded(
             child: TabBarView(
+              physics: const TabSnapPhysics(),
               children: [
                 _buildLinkTab(),
                 _buildImageTab(),
@@ -463,6 +467,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
         const Gap(AppSpacing.lg),
         TextField(
           controller: _urlController,
+          contextMenuBuilder: buildAppTextContextMenu,
           maxLines: 3,
           minLines: 1,
           decoration: const InputDecoration(
@@ -550,6 +555,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
                   padding: const EdgeInsets.only(left: AppSpacing.lg),
                   child: TextField(
                     controller: _listNameController,
+                    contextMenuBuilder: buildAppTextContextMenu,
                     decoration: const InputDecoration(
                       hintText: '新歌单名称（可选）',
                       border: OutlineInputBorder(),
@@ -573,7 +579,7 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
             padding: const EdgeInsets.only(left: AppSpacing.lg),
             // M3EDropdownMenu 没有 initialSelection 参数：初始选中值由
             // M3EDropdownItem.selected 表达，每次 build 按 _selectedPlaylist 重建
-            child: M3EDropdownMenu<KugouPlaylistBrief>(
+            child: TvDropdownMenu<KugouPlaylistBrief>(
               items: [
                 for (final p in _existingPlaylists)
                   M3EDropdownItem(

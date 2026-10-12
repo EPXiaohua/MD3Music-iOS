@@ -128,7 +128,7 @@ class _SceneVideoListPageState extends State<SceneVideoListPage> {
       isOnline: true,
       artworkUri: video.coverUrl,
     );
-    Navigator.of(context).push(
+    Navigator.of(context, rootNavigator: true).push(
       MaterialPageRoute(
         builder: (_) => MvPlayerPage(song: song, directVideoUrl: url),
       ),
@@ -163,7 +163,8 @@ class _SceneVideoListPageState extends State<SceneVideoListPage> {
                               child: SizedBox(
                                 width: 24,
                                 height: 24,
-                                child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2),
+                                child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2,
+                              ),
                               ),
                             ),
                           )

@@ -3,7 +3,10 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:md3music/core/utils/lyric_wrap_plan.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/duet_layout.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/apple_lyrics/renderers/line_renderer.dart';
 
@@ -432,13 +435,77 @@ void main() {
         closeTo(mainLineHeight, 1e-6),
         reason: 'KRC 行第 2 行也应从主行底开始',
       );
-      // 关键断言：与 WordRenderer 当前行行数一致（此处用 word 累加行数直接断言）
-      final int wordRows = _wordAccumulateForTest(krcLine, 15, 90);
+      // 关键断言：渲染行数必须等于「换行计划」行数——测量与绘制同源，
+      // 不再复刻任何一份贪心公式（换行算法变更时这里不需要跟着改）。
+      final int planRows = LyricWrapPlanner.forLine(
+        krcLine,
+        LyricLayout.mainStyle(15),
+        90,
+        balanced: LyricPreferences.instance.lineBalance,
+      ).rowCount;
       expect(
         ys.length,
-        wordRows,
-        reason: 'LineRenderer 非当前行行数必须等于 word 累加行数（当前行/测量）',
+        planRows,
+        reason: 'LineRenderer 非当前行行数必须等于换行计划行数（当前行/测量同源）',
       );
+    });
+
+    test('整行绘制的分组与对齐宽度必须等于换行计划', () {
+      // 7 个单字 word，Ahem 15/字，maxWidth=55 → DP 分组 [2,2,3]（rowStarts [0,2,4]），贪心 [3,3,1]
+      const seven = LyricLine(
+        startTime: 0,
+        duration: 4000,
+        text: '一二三四五六七',
+        words: [
+          LyricWord(startTime: 0, duration: 100, text: '一'),
+          LyricWord(startTime: 100, duration: 100, text: '二'),
+          LyricWord(startTime: 200, duration: 100, text: '三'),
+          LyricWord(startTime: 300, duration: 100, text: '四'),
+          LyricWord(startTime: 400, duration: 100, text: '五'),
+          LyricWord(startTime: 500, duration: 100, text: '六'),
+          LyricWord(startTime: 600, duration: 100, text: '七'),
+        ],
+      );
+      const fontSize = 15.0;
+      const maxWidth = 55.0;
+      const viewportWidth = 200.0;
+      final plan = LyricWrapPlanner.forLine(
+        seven,
+        LyricLayout.mainStyle(fontSize),
+        maxWidth,
+        balanced: true,
+      );
+      expect(plan.rowStarts, <int>[0, 2, 4]);
+
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      final canvas = RecordingCanvas();
+      renderer.paintLine(
+        canvas,
+        ui.Offset.zero,
+        seven,
+        fontSize,
+        maxWidth: maxWidth,
+        alignment: DuetAlignment.center,
+        viewportWidth: viewportWidth,
+      );
+
+      // 每视觉行一个 drawParagraph：行数与绘制起点都要跟计划走
+      final ys = canvas.drawParagraphOffsets.map((o) => o.dy).toList();
+      final xs = canvas.drawParagraphOffsets.map((o) => o.dx).toList();
+      expect(ys.length, plan.rowCount);
+      final mainLineHeight = fontSize * LyricLayout.lineHeight;
+      final wrapLineHeight = mainLineHeight * LyricLayout.wrapLineHeightFactor;
+      expect(ys[0], closeTo(0, 1e-6));
+      expect(ys[1], closeTo(mainLineHeight, 1e-6));
+      expect(ys[2], closeTo(mainLineHeight + wrapLineHeight, 1e-6));
+      // 居中锚点用「计划里的行宽」算：分组错一行，x 就对不上
+      for (int r = 0; r < plan.rowCount; r++) {
+        expect(
+          xs[r],
+          closeTo((viewportWidth - plan.rowWidths[r]) / 2, 0.5),
+          reason: '第 $r 行应按计划行宽居中，实际行宽来自贪心残留',
+        );
+      }
     });
   });
 
@@ -672,28 +739,129 @@ void main() {
       );
     });
   });
-}
 
-/// 测试用：复刻 measureLineHeight 的 word 累加行数计算（与渲染一致）。
-int _wordAccumulateForTest(LyricLine line, double fontSize, double maxWidth) {
-  double dx = 0;
-  int rows = 1;
-  for (final w in line.words) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: w.text,
-        style: TextStyle(fontSize: fontSize, height: LyricLayout.lineHeight),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    final ww = tp.width;
-    if (dx + ww > maxWidth && dx > 0) {
-      dx = 0;
-      rows++;
+  // ==================== 11. 折行布局缓存（折行掉帧修复） ====================
+  group('折行布局缓存', () {
+    // Ahem 测试字体每字符宽 = fontSize = 15，maxWidth=60 → 每视觉行 4 字，多行
+    const longLine = LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '这是一段足够长的中文歌词用于测试自动换行',
+      words: [],
+    );
+    const otherLongLine = LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '另一段同样足够长的中文歌词内容用于验证重排',
+      words: [],
+    );
+    const double fontSize = 15;
+    const double maxWidth = 60;
+
+    int planRows(LyricLine l) => LyricWrapPlanner.forLine(
+      l,
+      LyricLayout.mainStyle(fontSize),
+      maxWidth,
+      balanced: LyricPreferences.instance.lineBalance,
+    ).rowCount;
+
+    /// 收敛到稳态 alpha（当前行），让 alpha 守卫不再逐帧翻转。
+    void settle() {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      for (int i = 0; i < 200; i++) {
+        renderer.tick(0.016);
+      }
     }
-    dx += ww;
-  }
-  return rows;
+
+    test('首帧按视觉行数布局，同态第二帧零重排（缓存命中）', () {
+      settle();
+      final int rows = planRows(longLine);
+      expect(rows, greaterThan(1), reason: '该文本在窄视口下必须折行');
+
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        longLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      final int afterFirst = renderer.debugRowLayoutCount;
+      expect(afterFirst, rows, reason: '首帧每个视觉行各布局一次');
+
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        longLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      expect(
+        renderer.debugRowLayoutCount,
+        afterFirst,
+        reason: '同态第二帧必须全部命中槽位缓存，零重排（折行掉帧根因修复）',
+      );
+    });
+
+    test('alpha 变化后重新布局（颜色烘焙在 TextStyle 内）', () {
+      settle();
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        longLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      final int afterFirst = renderer.debugRowLayoutCount;
+
+      // 切到非当前行并 tick 让 alpha 明显偏离，颜色变化必须触发重排
+      renderer.setLineState(
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        blurActive: false,
+      );
+      for (int i = 0; i < 20; i++) {
+        renderer.tick(0.016);
+      }
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        longLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      expect(
+        renderer.debugRowLayoutCount,
+        greaterThan(afterFirst),
+        reason: 'alpha 变化必须重排（颜色随 alpha 变化）',
+      );
+    });
+
+    test('换到不同折行行后重新布局，且行数等于各自计划', () {
+      settle();
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        longLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      final int afterFirst = renderer.debugRowLayoutCount;
+      expect(afterFirst, planRows(longLine));
+
+      renderer.paintLine(
+        RecordingCanvas(),
+        ui.Offset.zero,
+        otherLongLine,
+        fontSize,
+        maxWidth: maxWidth,
+      );
+      expect(
+        renderer.debugRowLayoutCount - afterFirst,
+        planRows(otherLongLine),
+        reason: '换行（不同 rowTexts）应重排，且重排次数 = 新行视觉行数',
+      );
+    });
+  });
 }
 
 /// 记录 [ui.Canvas.drawParagraph] 位置与画布变换的测试画布（其余方法走 noSuchMethod 兜底）。

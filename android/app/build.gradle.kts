@@ -22,16 +22,36 @@ android {
     // 产品 flavor（3D 深度封面）:
     //   standard - 不含 3D 封面：无 onnxruntime so、无深度模型资产，体积最小
     //   depth3d  - 3D 全量包：内置 ONNX Runtime so + Depth Anything V2 模型资产
+    //   tv       - TV 版独立包体：dpad 遥控导航 + 排除 3D/USB 独占/歌词推送
     // 两 flavor 共用同一 applicationId/签名，depth3d 包可直接覆盖安装 standard 包。
     flavorDimensions += "feature"
     productFlavors {
         create("standard") {}
         create("depth3d") {}
+        // TV 版独立包体：dpad 遥控导航 + 排除 3D/USB 独占/歌词推送。
+        // 后缀与手机版并存互不覆盖（TV 设备上只装 TV 版）。
+        create("tv") {
+            dimension = "feature"
+            applicationIdSuffix = ".tv"
+            buildConfigField("boolean", "FEATURE_TV", "true")
+            // 不编译 USB 独占输出 C++ 驱动（TV 包内无 libusb_audio_driver.so）
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DUSB_DRIVER=OFF")
+                }
+            }
+        }
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // TV flavor 用 BuildConfig.FEATURE_TV 门控 USB 独占/Direct PCM 原生插件注册。
+    // AGP 9 默认不生成 BuildConfig，必须显式开启。
+    buildFeatures {
+        buildConfig = true
     }
 
 
@@ -44,9 +64,12 @@ android {
         targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // 渲染引擎固定为 skia（EnableImpeller=false，兼容优先）。Flutter 3.44 只认
-        // manifest 静态值。仅此一处、无 flavor：保证 split-per-abi 产物名不含引擎标识。
-        manifestPlaceholders["enableImpeller"] = "false"
+        // TV 版 = tv flavor（true）；standard/depth3d 为 false。
+        buildConfigField("boolean", "FEATURE_TV", "false")
+        // 渲染引擎 manifest 静态开关，默认 Impeller（true）。Flutter 3.44 只认
+        // manifest 静态值；构建 Skia 版用 -Pmd3EnableImpeller=false
+        // （见 scripts/tasks/android_skia.ps1）。仅此一处、无 flavor，产物名不含引擎标识。
+        manifestPlaceholders["enableImpeller"] = providers.gradleProperty("md3EnableImpeller").getOrElse("true")
         // USB 独占输出 C++ 驱动：只编译与 jniLibs 相同的 4 个 ABI
         externalNativeBuild {
             cmake {

@@ -1,13 +1,17 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../player/secondary_mini_player.dart';
 import '../playlist/playlist_page.dart';
@@ -34,6 +38,11 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
   final ScrollController _scrollController = ScrollController();
   bool _isLoading = true;
 
+  /// 页头真实封面是否已拿到加载完成的图片。喂给 `PlaylistCoverHero.destReady`：
+  /// 进场飞行落位要等它变 true 才撤走，否则交接瞬间露出页头兜底占位
+  /// （卡片按 540 解码、页头按 360 解码是两个缓存键）。
+  final ValueNotifier<bool> _headerCoverReady = ValueNotifier<bool>(false);
+
   /// 按 content_type 分组的 tag（记录所属 module_id，audio 列表需要）
   List<({String moduleId, KugouSceneTag tag})> _musicTags = [];
   List<({String moduleId, KugouSceneTag tag})> _collectionTags = [];
@@ -43,6 +52,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
   @override
   void dispose() {
     _scrollController.dispose();
+    _headerCoverReady.dispose();
     super.dispose();
   }
 
@@ -152,30 +162,38 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
         scrollController: _scrollController,
       ),
       body: SecondaryMiniPlayerHost(
-        child: _isLoading
-          ? const Center(child: M3ELoadingIndicator())
-          : Md3PullToRefresh(
-              onRefresh: () => _load(showLoading: false),
-              child: ListView(
-                controller: _scrollController,
-                padding: const EdgeInsets.only(bottom: AppSpacing.xxl),
-                children: [
-                  _buildHeader(context),
-                  if (_musicTags.isNotEmpty)
-                    _buildTagSection(context, '音乐', _musicTags),
-                  if (_collectionTags.isNotEmpty)
-                    _buildTagSection(context, '歌单', _collectionTags),
-                  if (_videoTags.isNotEmpty)
-                    _buildTagSection(context, '视频', _videoTags),
-                  if (_discusses.isNotEmpty) _buildDiscussSection(context),
-                  if (_musicTags.isEmpty &&
-                      _collectionTags.isEmpty &&
-                      _videoTags.isEmpty &&
-                      _discusses.isEmpty)
-                    _buildEmpty(context),
-                ],
-              ),
-            ),
+        // 页头恒渲染：封面连贯过渡的终点必须在进场转场期间就存在，
+        // 否则飞行无落点（与专辑/听书详情页同一口径）；加载态降级为
+        // 页头下方的占位，不再整页替换。
+        child: Md3PullToRefresh(
+          onRefresh: () => _load(showLoading: false),
+          child: ListView(
+            controller: _scrollController,
+            padding: const EdgeInsets.only(bottom: AppSpacing.xxl),
+            children: [
+              _buildHeader(context),
+              if (_isLoading)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 48),
+                  child: Center(child: M3ELoadingIndicator()),
+                )
+              else ...[
+                if (_musicTags.isNotEmpty)
+                  _buildTagSection(context, '音乐', _musicTags),
+                if (_collectionTags.isNotEmpty)
+                  _buildTagSection(context, '歌单', _collectionTags),
+                if (_videoTags.isNotEmpty)
+                  _buildTagSection(context, '视频', _videoTags),
+                if (_discusses.isNotEmpty) _buildDiscussSection(context),
+                if (_musicTags.isEmpty &&
+                    _collectionTags.isEmpty &&
+                    _videoTags.isEmpty &&
+                    _discusses.isEmpty)
+                  _buildEmpty(context),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -188,17 +206,39 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.sm),
       child: Row(
         children: [
-          ClipRRect(
-            borderRadius: AppRadius.lgAll,
-            child: SizedBox(
-              width: 120,
-              height: 120,
+          SizedBox(
+            width: 120,
+            height: 120,
+            child: PlaylistCoverHero(
+              tag: sceneCoverHeroTag(widget.scene.id),
+              radius: AppRadius.lgAll,
+              destReady: _headerCoverReady,
               child: widget.scene.coverUrl != null
                   ? CachedNetworkImage(
                       imageUrl: widget.scene.coverUrl!,
                       memCacheWidth: 360,
                       memCacheHeight: 360,
                       fit: BoxFit.cover,
+                      // 共享元素过渡本身就是动画，两端都不要再做渐变。
+                      fadeOutDuration: Duration.zero,
+                      fadeInDuration: Duration.zero,
+                      imageBuilder: (context, provider) {
+                        if (!_headerCoverReady.value) {
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted) _headerCoverReady.value = true;
+                          });
+                        }
+                        // 与 CachedNetworkImage 内部同键（memCache 会包一层
+                        // ResizeImage），不会多解码一份。
+                        return Image(
+                          image: ResizeImage(
+                            provider,
+                            width: 360,
+                            height: 360,
+                          ),
+                          fit: BoxFit.cover,
+                        );
+                      },
                       errorWidget: (_, _, _) => Container(
                         color: cs.surfaceContainerHighest,
                         child: Icon(
@@ -243,15 +283,19 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm,
+          ),
           child: Text(
             title,
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
+            style: Theme.of(context).textTheme.titleLarge),
         ),
         SizedBox(
           height: 130,
-          child: ListView.builder(
+          child: TvScrollRegion(
+            // 三块标签带（音乐/歌单/视频）各占一份记忆位：共用一个 key 会让
+            // dpad 的 region 记忆互相覆盖，从任一带离开再回来都落回同一条带。
+            memoryKey: 'tv/scene-tags/$title',
+            child: ListView.builder(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
             itemCount: items.length,
@@ -265,6 +309,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
                 ),
               );
             },
+            ),
           ),
         ),
       ],
@@ -293,7 +338,7 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
           title: item.tag.name,
         );
     }
-    Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
+    AdaptiveNav.openDetail(context, (_) => page);
   }
 
   /// 讨论区：用户动态流
@@ -306,11 +351,11 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm,
+          ),
           child: Text(
             '讨论区',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
+            style: Theme.of(context).textTheme.titleLarge),
         ),
         for (final d in items)
           Padding(
@@ -326,10 +371,8 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
               onCollectionTap: () {
                 final c = d.collection;
                 if (c == null) return;
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => PlaylistPage(playlist: c.toPlaylist()),
-                  ),
+                AdaptiveNav.openDetail(context,
+                  (_) => PlaylistPage(playlist: c.toPlaylist()),
                 );
               },
             ),
@@ -375,7 +418,7 @@ class _TagCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return SizedBox(
+    final card = SizedBox(
       width: 110,
       child: ClipRRect(
         borderRadius: AppRadius.lgAll,
@@ -412,6 +455,14 @@ class _TagCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    // tv: 场景标签（音乐/歌单/视频）卡片单停点（OK = 进入对应列表页）。
+    // 带子只包了 TvScrollRegion 时，裸 InkWell 卡遥控选不中（2026-10-08 真机）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'scene-tag-card',
+      child: card,
     );
   }
 

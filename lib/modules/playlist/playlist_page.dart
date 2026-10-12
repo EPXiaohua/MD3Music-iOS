@@ -2,16 +2,22 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/layout/adaptive_navigator.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/entry_transition_gate.dart';
+import '../../core/utils/app_haptics.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/widgets/app_background.dart';
 import '../../data/models/playlist.dart';
 import '../../data/models/song.dart';
 import '../../data/repositories/collected_playlist_store.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
+import '../../data/repositories/history_repository.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/playlist_collection_notifier.dart';
@@ -19,8 +25,10 @@ import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
+import '../../utils/playlist_song_sort.dart';
 import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/playlist_comments_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/keyboard_expand_sheet.dart';
 import '../player/secondary_mini_player.dart';
 import 'playlist_songs_loader.dart';
@@ -73,8 +81,6 @@ class PlaylistPage extends StatefulWidget {
   State<PlaylistPage> createState() => _PlaylistPageState();
 }
 
-enum _SortBy { time, title, duration }
-
 class _PlaylistPageState extends State<PlaylistPage> {
   bool _isLoading = true;
   List<Song> _songs = [];
@@ -84,11 +90,25 @@ class _PlaylistPageState extends State<PlaylistPage> {
   String? _collectedListId;
 
   // 排序
-  _SortBy _sortBy = _SortBy.time;
+  PlaylistSongSort _sortBy = PlaylistSongSort.time;
   bool _sortAscending = false; // 默认降序（最新在前 / Z→A / 长→短）
+
+  /// 切到新维度时的默认方向表：其余维度默认升序。
+  static const Set<PlaylistSongSort> _descendingByDefault = {
+    PlaylistSongSort.time,
+    PlaylistSongSort.playCount,
+    PlaylistSongSort.lastPlayed,
+  };
+
+  // 播放次数/最近播放数据（选择对应排序时按需从 HistoryRepository 加载）
+  Map<String, int> _playCounts = const {};
+  Map<String, int> _lastPlayTimes = const {};
 
   // 歌单内搜索
   bool _isSearching = false;
+  /// 页头真实封面是否已拿到加载完成的图片。喂给 `PlaylistCoverHero.destReady`：
+  /// 进场飞行落位要等它变 true 才撤走，否则交接瞬间露出的是页头的兜底占位。
+  final ValueNotifier<bool> _headerCoverReady = ValueNotifier<bool>(false);
   String _searchQuery = '';
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
@@ -118,7 +138,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 顶栏折叠阈值：原渐变区间 offset ∈ [224, 284]（224 = 280 - kToolbarHeight，
   /// +60 为渐变完成点）。改为阈值切换 + 动画过渡后，SliverAppBar 只在跨越
   /// 该阈值时重建一次（而非每帧），滚动中主线程不再承担 SliverAppBar 重建。
-  static const double _appBarFoldThreshold = 280 - kToolbarHeight + 60;
+  double get _appBarFoldThreshold =>
+      DetailPaneContent.headerHeight(context, 280 ) - kToolbarHeight + 60;
 
   /// 折叠状态（offset 越过 [_appBarFoldThreshold] 后为 true）：
   /// ValueNotifier 只在该状态翻转时通知，SliverAppBar 仅重建 1-2 次/滚屏。
@@ -126,9 +147,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   @override
   void dispose() {
+    PlaylistPage.songFilterListenable?.removeListener(_onFilterChanged);
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _appBarCollapsed.dispose();
+    _headerCoverReady.dispose();
     _searchController.dispose();
     _searchFocusNode.dispose();
     super.dispose();
@@ -137,21 +160,61 @@ class _PlaylistPageState extends State<PlaylistPage> {
   @override
   void initState() {
     super.initState();
+    // ignore: avoid_print
+    print('[FlashTrace] PlaylistPage initState id=${widget.playlist.id} '
+        'name=${widget.playlist.name} hash=$hashCode');
+    // 筛选缓存的失效挂在监听上：放在 build 里会让每次页面重建都重排整个歌单
+    PlaylistPage.songFilterListenable?.addListener(_onFilterChanged);
     _scrollController.addListener(_onScroll);
+    _loadSortPreference();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      // 转场动画对象必须在任何 await 之前抓好：后续的让路逻辑不再碰 context。
+      _entryAnim = ModalRoute.of(context)?.animation;
       _checkCollected();
       // 页面恢复滚动位置（如返回上一页）时校正顶栏折叠状态
       if (_scrollController.hasClients) {
         _appBarCollapsed.value =
             _scrollController.offset >= _appBarFoldThreshold;
       }
-      // 「我的收藏」里的歌单：先 await 缓存就位（避免 dio 失败先于
-      // SharedPreferences 读到 cache，导致 _error 覆盖了缓存歌曲列表）
-      if (widget.isInMyFavorites) {
-        await _loadCachedSongs();
-      }
-      _fetchSongs();
+      await _startLoadingAfterEntry();
     });
+  }
+
+  /// 进场转场动画（首个帧末捕获；见 _startLoadingAfterEntry 的让路逻辑）。
+  Animation<double>? _entryAnim;
+
+  /// 进场转场收敛后才开始拉列表（真机反馈：歌曲列表加载会阻塞进入动画）。
+  ///
+  /// 拉取 = 分页 HTTP + JSON→Song 映射，再叠加全量排序与列表首屏构建，全部跑在
+  /// UI 线程上；原来在 initState 的帧末回调里立刻开跑，正好把 300ms 的进入动画
+  /// （以及骑在它上面的封面连贯过渡）顶停。动画期间页面上只有页头和加载占位，
+  /// 列表晚约 300ms 出现没有可感知损失，动画却不再掉帧。
+  /// 「永远不加载」不可能发生：[waitUntilEntrySettled] 有超时兜底。
+  ///
+  /// 转场收敛后**还要让过底栏收起动画**（约 260ms，二级上报推迟到转场后才触发，
+  /// 见 [waitUntilBottomChromeSettled]）：否则列表首屏构建正好撞上收起动画
+  /// （真机反馈卡顿）。
+  Future<void> _startLoadingAfterEntry() async {
+    final waited = await waitUntilEntrySettled(_entryAnim);
+    if (!mounted) return;
+    // completed 回调跑在帧的动画阶段，再让出一帧，首屏构建才不会挤进转场最后一帧。
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    if (waited > 0) {
+      // ignore: avoid_print
+      print('[FlashTrace] PlaylistPage 让路转场 ${waited}ms '
+          'id=${widget.playlist.id}');
+    }
+    await waitUntilBottomChromeSettled(context);
+    if (!mounted) return;
+    // 「我的收藏」里的歌单：先 await 缓存就位（避免 dio 失败先于
+    // SharedPreferences 读到 cache，导致 _error 覆盖了缓存歌曲列表）
+    if (widget.isInMyFavorites) {
+      await _loadCachedSongs();
+    }
+    if (!mounted) return;
+    await _fetchSongs();
   }
 
   /// 「我的收藏」歌单的本地缓存读取。无网络时立即显示。失败忽略。
@@ -198,7 +261,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 缓存的过滤/排序结果，避免每次 build 重新计算
   List<Song>? _cachedDisplaySongs;
   String? _lastSearchQuery;
-  _SortBy? _lastSortBy;
+  PlaylistSongSort? _lastSortBy;
   bool? _lastSortAscending;
 
   /// 筛选结果缓存（叠加在 [_cachedDisplaySongs] 之上）：
@@ -227,6 +290,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
     return filter == null ? list : filter('playlist', list);
   }
 
+  /// 筛选开关切换：只丢弃筛选结果缓存。排序结果与筛选无关，重排是浪费。
+  void _onFilterChanged() {
+    _cachedFilteredSongs = null;
+  }
+
   void _rebuildDisplaySongs() {
     List<Song> list;
     if (_searchQuery.isEmpty) {
@@ -239,23 +307,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
             (s.album?.toLowerCase().contains(q) ?? false);
       }).toList();
     }
-    list.sort((a, b) {
-      int cmp;
-      switch (_sortBy) {
-        case _SortBy.time:
-          cmp = _songs.indexOf(a).compareTo(_songs.indexOf(b));
-          break;
-        case _SortBy.title:
-          cmp = a.displayName.toLowerCase().compareTo(
-            b.displayName.toLowerCase(),
-          );
-          break;
-        case _SortBy.duration:
-          cmp = a.duration.compareTo(b.duration);
-          break;
-      }
-      return _sortAscending ? cmp : -cmp;
-    });
+    sortPlaylistSongs(
+      list,
+      baseOrder: _songs,
+      sort: _sortBy,
+      ascending: _sortAscending,
+      playCounts: _playCounts,
+      lastPlayTimes: _lastPlayTimes,
+    );
     _cachedDisplaySongs = list;
     _lastSearchQuery = _searchQuery;
     _lastSortBy = _sortBy;
@@ -266,6 +325,67 @@ class _PlaylistPageState extends State<PlaylistPage> {
   void _invalidateDisplaySongs() {
     _cachedDisplaySongs = null;
     _cachedFilteredSongs = null;
+  }
+
+  /// 播放次数/最近播放数据只在首次选中对应维度时加载一次；
+  /// 加载完成后使缓存失效重排。并发调用由 _sortDataLoading 去重。
+  bool _sortDataLoading = false;
+  bool _playCountsLoaded = false;
+  bool _lastPlayTimesLoaded = false;
+
+  Future<void> _ensureSortData(PlaylistSongSort sort) async {
+    final needCounts = sort == PlaylistSongSort.playCount && !_playCountsLoaded;
+    final needTimes =
+        sort == PlaylistSongSort.lastPlayed && !_lastPlayTimesLoaded;
+    if ((!needCounts && !needTimes) || _sortDataLoading) return;
+    _sortDataLoading = true;
+    final repo = HistoryRepository();
+    Map<String, int>? counts;
+    Map<String, int>? times;
+    try {
+      if (needCounts) counts = await repo.getPlayCounts();
+      if (needTimes) times = await repo.getLastPlayTimestamps();
+    } finally {
+      _sortDataLoading = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      if (counts != null) {
+        _playCounts = counts;
+        _playCountsLoaded = true;
+      }
+      if (times != null) {
+        _lastPlayTimes = times;
+        _lastPlayTimesLoaded = true;
+      }
+      _invalidateDisplaySongs();
+    });
+  }
+
+  /// 排序选择持久化（全局一份，所有歌单共用；与本地音乐页口径一致）。
+  static const String _kSortByKey = 'playlist_song_sort_by';
+  static const String _kSortAscKey = 'playlist_song_sort_asc';
+
+  Future<void> _loadSortPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final restored = PlaylistSongSort.values.firstWhere(
+      (e) => e.name == prefs.getString(_kSortByKey),
+      orElse: () => PlaylistSongSort.time,
+    );
+    setState(() {
+      _sortBy = restored;
+      _sortAscending = prefs.getBool(_kSortAscKey) ?? false;
+      _invalidateDisplaySongs();
+    });
+    // 恢复的维度若依赖播放数据，立即补加载
+    _ensureSortData(restored);
+  }
+
+  Future<void> _saveSortPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kSortByKey, _sortBy.name);
+    await prefs.setBool(_kSortAscKey, _sortAscending);
   }
 
   // ==================== 批量选择模式 ====================
@@ -317,6 +437,51 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   // ==================== 批量下载（未移植：公开库不包含下载功能） ====================
+
+  // tv: TV 构建下歌曲行的 OK 键激活（播放 / 多选切换选中）。与触屏
+  // SliverM3ESegmentedList.onTap 完全同一逻辑，供 TV SliverList 分支复用。
+  void _activateSongRow(int index) {
+    AppHaptics.tick(HapticCategory.listItem);
+    final song = _displaySongs[index];
+    if (_isMultiSelectMode) {
+      _toggleSongSelection(song.id);
+    } else {
+      context.read<PlayerProvider>().playOnlinePlaylist(_displaySongs, index);
+    }
+  }
+
+  /// 歌曲行（触屏分段列表与 TV SliverList 分支共用）：定位 GlobalKey、
+  /// 高亮底色与 SongListItem 装配保持一致。
+  ///
+  /// tv: TV 构建下整行手势交由 SongListItem 承担（其内部 DpadFocusable 提供
+  /// 单停点：OK=播放/切换选中、OK 长按=进多选）；触屏构建保持空手势，
+  /// 点击/长按仍由 SliverM3ESegmentedList 列表级接管（行为零变化）。
+  Widget _buildSongRow(BuildContext context, int index) {
+    final song = _displaySongs[index];
+    final isHighlighted = _highlightSongId == song.id;
+    final isSelected = _selectedSongIds.contains(song.id);
+    final colorScheme = Theme.of(context).colorScheme;
+    return AnimatedContainer(
+      // 定位目标项挂 GlobalKey，供 ensureVisible 精确对齐
+      key: index == _targetScrollIndex ? _targetItemKey : null,
+      duration: const Duration(milliseconds: 300),
+      color: isHighlighted && !_isMultiSelectMode
+          ? colorScheme.primaryContainer.withValues(alpha: 0.5)
+          : Colors.transparent,
+      child: SongListItem(
+        song: song,
+        isSelectMode: _isMultiSelectMode,
+        isSelected: isSelected,
+        onMoreTap: () {},
+        // tv: 仅 TV 构建挂整行手势；触屏构建保持 null（列表级手势接管，原样）。
+        onTap: kTvBuild ? () => _activateSongRow(index) : null,
+        onLongPress: kTvBuild ? () => _enterMultiSelectMode(song.id) : null,
+        onContextMenuOverride: kTvBuild
+            ? () => _enterMultiSelectMode(song.id)
+            : null,
+      ),
+    );
+  }
 
   Future<void> _deleteSelectedSongs() async {
     if (_selectedSongIds.isEmpty) return;
@@ -913,10 +1078,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
           PlaylistPage.songFilterListenable ??
           const AlwaysStoppedAnimation<Object?>(null),
       builder: (context, _) {
-        // 筛选开关切换（songFilterListenable 通知）时失效筛选缓存；
-        // 滚动偏移走 ValueNotifier 不再触发本 builder，此处仅在
-        // 筛选切换/页面重建时执行，重算一次筛选即可。
-        _invalidateDisplaySongs();
+        // 本 builder 只负责「筛选切换时重建」；缓存失效在 _onFilterChanged
+        // （initState 注册）。在此处失效会让每次页面重建都重排整个歌单。
         return PopScope(
           canPop: !_isMultiSelectMode,
           onPopInvokedWithResult: (didPop, _) {
@@ -926,17 +1089,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
             body: SecondaryMiniPlayerHost(
               child: Column(
               children: [
-                if (_isLoading)
-                  const Expanded(child: Center(child: M3ELoadingIndicator()))
-                else ...[
-                  // 加载失败时显示顶部 banner（不再完全覆盖 UI，
-                  // 歌单的元数据/封面/描述仍可见）
-                  if (_error != null)
-                    _buildErrorBanner(context, colorScheme, textTheme),
-                  if (_isMultiSelectMode)
-                    _buildMultiSelectBar(colorScheme, textTheme),
-                  Expanded(
-                    child: CustomScrollView(
+                // 加载失败时显示顶部 banner（不再完全覆盖 UI，
+                // 歌单的元数据/封面/描述仍可见）
+                if (_error != null)
+                  _buildErrorBanner(context, colorScheme, textTheme),
+                if (_isMultiSelectMode)
+                  _buildMultiSelectBar(colorScheme, textTheme),
+                Expanded(
+                  child: CustomScrollView(
                       controller: _scrollController,
                       slivers: [
                         if (!_isMultiSelectMode)
@@ -974,7 +1134,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                 },
                                 child: Container(
                                   width: double.infinity,
-                                  padding: const EdgeInsets.all(AppSpacing.md),
+                                  padding: const EdgeInsets.all(AppSpacing.md,
+                                    ),
                                   decoration: BoxDecoration(
                                     color: colorScheme.surfaceContainerHighest
                                         .withValues(alpha: 0.5),
@@ -1058,6 +1219,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                               child: TextField(
                                 controller: _searchController,
                                 focusNode: _searchFocusNode,
+                                contextMenuBuilder: buildAppTextContextMenu,
                                 decoration: InputDecoration(
                                   hintText: '搜索歌单内的歌曲...',
                                   prefixIcon: const Icon(Icons.search),
@@ -1094,7 +1256,18 @@ class _PlaylistPageState extends State<PlaylistPage> {
                               ),
                             ),
                           ),
-                        if (!_isMultiSelectMode)
+                        // 加载中：歌曲区先占位，加载完再挂列表（页头/介绍/按钮
+                        // 首帧即渲染——原实现整页加载闸门期间只显示转圈，页头
+                        // （含封面连贯过渡的终点实体）要等歌单加载完才存在，观感
+                        // 变成「先看加载、再看到动画」，转场与页面各走各的）。
+                        if (_isLoading)
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(vertical: 48),
+                              child: Center(child: M3ELoadingIndicator()),
+                            ),
+                          )
+                        else if (!_isMultiSelectMode)
                           SliverToBoxAdapter(
                             child: Padding(
                               padding: const EdgeInsets.symmetric(
@@ -1130,7 +1303,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                           )..shuffle();
                                           context
                                               .read<PlayerProvider>()
-                                              .playOnlinePlaylist(shuffled, 0);
+                                              .playOnlinePlaylist(shuffled, 0,
+                                                );
                                         }
                                       },
                                       icon: const Icon(Icons.shuffle),
@@ -1160,6 +1334,19 @@ class _PlaylistPageState extends State<PlaylistPage> {
                               ),
                             ),
                           ),
+                        // tv: TV 构建下退回普通 SliverList——m3e 分段项自身持有
+                        // 可遍历 Focus（m3e 包不支持关闭行级焦点），会与
+                        // SongListItem 的整行 DpadFocusable 形成双重停点；
+                        // 退回后单停点由 SongListItem 承担（OK=播放/切换选中，
+                        // OK 长按=进多选），触屏路径不变。
+                        if (kTvBuild)
+                          SliverList(
+                            delegate: SliverChildBuilderDelegate(
+                              _buildSongRow,
+                              childCount: _displaySongs.length,
+                            ),
+                          )
+                        else
                         // 歌曲列表：改用 m3e_core 分段列表（试点）。
                         // 这里用 sliver 变体 SliverM3ESegmentedList 替换原 SliverList：
                         // 它同样基于 SliverChildBuilderDelegate 懒构建、不引入嵌套
@@ -1184,53 +1371,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           ),
                           // 聚焦不铺底色（聚焦反馈由 M3E 焦点环提供）
                           focusColor: Colors.transparent,
-                          // 点击/长按统一由列表级手势接管（分段项 InkWell 负责
-                          // M3E 触觉）：行内不再挂手势，否则行内 InkWell 会在
-                          // gesture arena 中胜出，列表级回调永远不会触发。
-                          // enableFeedback: false 关闭 InkWell 自带的平台反馈，
-                          // 保证一次点击只发一次 M3E light 触觉（与原来一致）。
+                          // 点击/长按统一由列表级手势接管：行内不再挂手势，否则行内
+                          // InkWell 会在 gesture arena 中胜出，列表级回调永远不会触发。
+                          // enableFeedback: false 关闭 InkWell 自带的平台反馈。
+                          // 触觉不再交给 m3e：m3e 的 haptic 走 m3e_haptics 原生通道，
+                          // 只能被「滑块调节」闸门整体拦下（见 MainActivity HapticsGate），
+                          // 列表行必须由 Dart 侧声明成 listItem，否则「列表条目」开关对
+                          // 最常用的歌单列表失效。
                           enableFeedback: false,
-                          haptic: M3EHapticFeedback.light,
-                          onTap: (index) {
-                            final song = _displaySongs[index];
-                            if (_isMultiSelectMode) {
-                              _toggleSongSelection(song.id);
-                            } else {
-                              context
-                                  .read<PlayerProvider>()
-                                  .playOnlinePlaylist(_displaySongs, index);
-                            }
-                          },
+                          haptic: M3EHapticFeedback.none,
+                          onTap: _activateSongRow,
                           onLongPress: (index) =>
                               _enterMultiSelectMode(_displaySongs[index].id),
-                          itemBuilder: (context, index) {
-                            final song = _displaySongs[index];
-                            final isHighlighted = _highlightSongId == song.id;
-                            final isSelected = _selectedSongIds.contains(
-                              song.id,
-                            );
-                            return AnimatedContainer(
-                              // 定位目标项挂 GlobalKey，供 ensureVisible 精确对齐
-                              key: index == _targetScrollIndex
-                                  ? _targetItemKey
-                                  : null,
-                              duration: const Duration(milliseconds: 300),
-                              color: isHighlighted && !_isMultiSelectMode
-                                  ? colorScheme.primaryContainer.withValues(
-                                      alpha: 0.5,
-                                    )
-                                  : Colors.transparent,
-                              child: SongListItem(
-                                song: song,
-                                isSelectMode: _isMultiSelectMode,
-                                isSelected: isSelected,
-                                onMoreTap: () {},
-                              ),
-                            );
-                          },
+                          itemBuilder: _buildSongRow,
                         ),
                         // 搜索无结果提示
-                        if (!_isMultiSelectMode &&
+                        if (!_isLoading &&
+                            !_isMultiSelectMode &&
                             _isSearching &&
                             _displaySongs.isEmpty &&
                             _songs.isNotEmpty)
@@ -1257,14 +1414,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
                             ),
                           ),
                         // 离线/首次打开无缓存时：歌单歌曲为空状态
-                        if (!_isMultiSelectMode && _songs.isEmpty)
+                        if (!_isLoading &&
+                            !_isMultiSelectMode &&
+                            _songs.isEmpty)
                           SliverToBoxAdapter(
-                            child: _buildEmptySongsHint(colorScheme, textTheme),
+                            child: _buildEmptySongsHint(colorScheme, textTheme,
+                              ),
                           ),
                       ],
                     ),
                   ),
-                ],
               ],
             ),
               ),
@@ -1287,7 +1446,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     bool collapsed,
   ) {
     return SliverAppBar(
-      expandedHeight: 280,
+      expandedHeight: DetailPaneContent.headerHeight(context, 280),
       pinned: true,
       // 背景图模式：顶栏恒透明——flexibleSpace 是普通 Stack
       // （非 FlexibleSpaceBar，折叠时不产生视差位移，壁纸层顶部
@@ -1327,13 +1486,20 @@ class _PlaylistPageState extends State<PlaylistPage> {
             tooltip: '相似歌单',
           ),
         if (_songs.isNotEmpty)
-          M3ESortButton<_SortBy>(
+          M3ESortButton<PlaylistSongSort>(
             tooltip: '排序',
+            // 图标随升/降序切换（与本地音乐页一致）
+            icon: _sortAscending
+                ? Icons.arrow_upward_rounded
+                : Icons.arrow_downward_rounded,
             current: _sortBy,
             options: const [
-              (value: _SortBy.time, label: '添加时间'),
-              (value: _SortBy.title, label: '歌曲名称'),
-              (value: _SortBy.duration, label: '时长'),
+              (value: PlaylistSongSort.time, label: '添加时间'),
+              (value: PlaylistSongSort.title, label: '歌曲名称'),
+              (value: PlaylistSongSort.artist, label: '歌手名'),
+              (value: PlaylistSongSort.duration, label: '时长'),
+              (value: PlaylistSongSort.playCount, label: '播放次数'),
+              (value: PlaylistSongSort.lastPlayed, label: '最近播放'),
             ],
             onPicked: (value, repeated) {
               setState(() {
@@ -1342,10 +1508,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
                   _sortAscending = !_sortAscending;
                 } else {
                   _sortBy = value;
-                  _sortAscending = value == _SortBy.time ? false : true;
+                  _sortAscending = !_descendingByDefault.contains(value);
                 }
                 _invalidateDisplaySongs();
               });
+              _saveSortPreference();
+              _ensureSortData(_sortBy);
             },
           ),
       ],
@@ -1461,16 +1629,50 @@ class _PlaylistPageState extends State<PlaylistPage> {
                       child: Row(
                         crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
-                          ClipRRect(
-                            borderRadius: AppRadius.mdAll,
-                            child: SizedBox(
-                              width: coverSize,
-                              height: coverSize,
+                          SizedBox(
+                            width: coverSize,
+                            height: coverSize,
+                            child: PlaylistCoverHero(
+                              tag: playlistCoverHeroTag(displayPlaylist.id),
+                              radius: AppRadius.mdAll,
+                              // 落位保持到真实封面拿到图片为止（信号来自下面那张图的
+                              // imageBuilder，它只在图片加载完成后才被调用）。
+                              destReady: _headerCoverReady,
                               child: displayPlaylist.artworkUri != null
                                   ? CachedNetworkImage(
                                       imageUrl: displayPlaylist.artworkUri!,
                                       memCacheWidth: 420,
                                       memCacheHeight: 420,
+                                      // 兜底占位淡出默认 1s、**图片淡入默认 500ms**
+                                      // （OctoImage 两个独立参数）。飞行层每挂一次航班
+                                      // 都要新建一份封面元素：只要不是同帧同步命中缓存，
+                                      // 它就会带着 500ms 的透明度爬坡——这就是「飞行途中/
+                                      // 落位时暗一下」。共享元素过渡本身就是动画，占位与
+                                      // 图片都不该再做渐变。
+                                      fadeOutDuration: Duration.zero,
+                                      fadeInDuration: Duration.zero,
+                                      // 真实封面的就绪信号：imageBuilder 只在图片加载
+                                      // 完成后被调用，此时占位图已经不会再出现了。
+                                      imageBuilder: (context, provider) {
+                                        if (!_headerCoverReady.value) {
+                                          WidgetsBinding.instance
+                                              .addPostFrameCallback((_) {
+                                                if (mounted) {
+                                                  _headerCoverReady.value = true;
+                                                }
+                                              });
+                                        }
+                                        // 与 CachedNetworkImage 内部同键（memCache
+                                        // 会包一层 ResizeImage），不会多解码一份。
+                                        return Image(
+                                          image: ResizeImage(
+                                            provider,
+                                            width: 420,
+                                            height: 420,
+                                          ),
+                                          fit: BoxFit.cover,
+                                        );
+                                      },
                                       fit: BoxFit.cover,
                                       placeholder: (_, _) => Container(
                                         color:
@@ -1927,6 +2129,15 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
         ),
       );
     }
+    // Hero tag 唯一性防护：相似歌单来自服务端，可能出现重复 id；
+    // 只给每个 id 的首次出现挂 Hero（重复 tag 会在转场收集阶段抛 FlutterError）。
+    final firstIndexById = <String, int>{};
+    for (var i = 0; i < _playlists.length; i++) {
+      firstIndexById.putIfAbsent(
+        _playlists[i].globalCollectionId ?? _playlists[i].id,
+        () => i,
+      );
+    }
     return ListView.builder(
       controller: widget.scrollController,
       padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
@@ -1935,11 +2146,15 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
         final pl = _playlists[i];
         final cleanName = pl.name.replaceAll(RegExp(r'<[^>]*>'), '');
         return ListTile(
-          leading: ClipRRect(
-            borderRadius: AppRadius.smAll,
-            child: SizedBox(
-              width: 48,
-              height: 48,
+          leading: SizedBox(
+            width: 48,
+            height: 48,
+            child: PlaylistCoverHero(
+              tag: firstIndexById[pl.globalCollectionId ?? pl.id] == i
+                  ? playlistCoverHeroTag(pl.globalCollectionId ?? pl.id)
+                  : playlistCoverHeroTag(
+                      'dup-${pl.globalCollectionId ?? pl.id}-$i'),
+              radius: AppRadius.smAll,
               child: pl.coverUrl != null
                   ? CachedNetworkImage(
                       imageUrl: pl.coverUrl!,
@@ -1953,7 +2168,7 @@ class _SimilarPlaylistsViewState extends State<_SimilarPlaylistsView> {
           subtitle: pl.songCount > 0 ? Text('${pl.songCount} 首歌曲') : null,
           onTap: () {
             final target = pl.toPlaylist();
-            if (isDesktopLayout(context)) {
+            if (isDesktopLayout(context)|| DetailPaneContent.isTwoPaneOf(context)) {
               // 桌面双栏：在详情 pane 内前进到相似歌单，浏览器式前进/后退接管；
               // 不在 pane 作用域时 openDetail 自动回落为中央 Navigator push。
               AdaptiveNav.openDetail(

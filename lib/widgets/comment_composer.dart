@@ -1,6 +1,8 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
-import 'package:flutter/services.dart';
+
+import '../core/utils/app_haptics.dart';
+import '../core/utils/app_text_context_menu.dart';
 
 /// 评论输入框（歌曲 / 歌单 / 专辑评论页共用）。
 ///
@@ -127,9 +129,24 @@ class _CommentComposerState extends State<CommentComposer> {
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                    InkWell(
-                      onTap: widget.onCancelReply,
-                      child: Icon(Icons.close, size: 16, color: hintColor),
+                    Semantics(
+                      button: true,
+                      label: '取消回复',
+                      child: InkWell(
+                        onTap: widget.onCancelReply,
+                        // 图标 16，触控盒补齐到 44×44
+                        child: SizedBox(
+                          width: 44,
+                          height: 44,
+                          child: Center(
+                            child: Icon(
+                              Icons.close,
+                              size: 16,
+                              color: hintColor,
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                   ],
                 ),
@@ -140,6 +157,7 @@ class _CommentComposerState extends State<CommentComposer> {
                   child: TextField(
                     controller: _controller,
                     focusNode: _focusNode,
+                    contextMenuBuilder: buildAppTextContextMenu,
                     enabled: !widget.sending,
                     autofocus: widget.autofocus,
                     maxLines: 4,
@@ -169,7 +187,7 @@ class _CommentComposerState extends State<CommentComposer> {
                   key: const ValueKey('comment_composer_send'),
                   onPressed: _canSubmit
                       ? () {
-                          HapticFeedback.selectionClick();
+                          AppHaptics.selectionClick(HapticCategory.control);
                           _submit();
                         }
                       : null,

@@ -1,7 +1,8 @@
 import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/scheduler.dart';
+
+import '../core/services/player_frame_driver.dart';
 
 /// MD3 Expressive 风格 Loading 指示器。
 ///
@@ -87,9 +88,15 @@ class MD3ELoadingIndicator extends StatefulWidget {
 }
 
 class _MD3ELoadingIndicatorState extends State<MD3ELoadingIndicator>
-    with SingleTickerProviderStateMixin {
-  late final Ticker _ticker;
-  Duration _lastElapsed = Duration.zero;
+    with WidgetsBindingObserver {
+  /// 是否已挂在共享 60fps 帧驱动上（见 [_syncDriver]）。
+  bool _driverBound = false;
+
+  /// [TickerMode] 是否被关闭（被不透明路由覆盖 / 切走 tab）。
+  bool _tickerModeMuted = false;
+
+  /// App 是否退到后台（引擎不产帧，Timer 空转纯属唤醒浪费）。
+  bool _appSuspended = false;
 
   /// 时间累积通过 [ValueNotifier] 驱动 [CustomPainter] 重绘，
   /// 避免 _onTick 每帧 setState 触发 widget 重建（性能优化策略，
@@ -108,6 +115,7 @@ class _MD3ELoadingIndicatorState extends State<MD3ELoadingIndicator>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 随机起始形状：把偏移换算为时间秒数。
     // _morphCycleSeconds / 7 = 每个形状持续时间
     // 乘以随机形状索引得到该形状的起始时间。
@@ -118,22 +126,62 @@ class _MD3ELoadingIndicatorState extends State<MD3ELoadingIndicator>
         : 0;
     _startShapeOffset =
         randomShapeIndex * (morphCycleSeconds / shapeCount);
-    _ticker = createTicker(_onTick);
-    _ticker.start();
+    _syncDriver();
   }
 
-  void _onTick(Duration elapsed) {
-    final dt = (elapsed - _lastElapsed).inMicroseconds / 1000000.0;
-    _lastElapsed = elapsed;
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.valuesOf(context).enabled;
+    if (muted == _tickerModeMuted) return;
+    _tickerModeMuted = muted;
+    _syncDriver();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
+    _syncDriver();
+  }
+
+  /// 唯一收口：仅在「可见 + 前台」时挂共享 60fps 节拍（幂等）。
+  ///
+  /// 用共享节拍步进数值而不是裸 [Ticker]：Ticker 每 vsync 都会 scheduleFrame，
+  /// 120Hz 屏上即便本组件只是装饰性动画也会让**整页**保持 120fps
+  ///（AGENTS.md §10.1.1 / §10.4.1）。
+  void _syncDriver() {
+    final bool shouldRun = !_tickerModeMuted && !_appSuspended;
+    if (shouldRun == _driverBound) return;
+    if (shouldRun) {
+      PlayerFrameDriver.instance.addListener(_onTick);
+    } else {
+      PlayerFrameDriver.instance.removeListener(_onTick);
+    }
+    _driverBound = shouldRun;
+  }
+
+  /// 共享节拍回调：固定 16ms 步进推进时间（不 setState，painter 自动重绘）。
+  void _onTick() {
     // 首帧注入起始形状偏移，让动画从随机形状开始
     final offset = _isFirstTick ? _startShapeOffset : 0.0;
-    _tNotifier.value = _tNotifier.value + dt + offset;
+    _tNotifier.value +=
+        PlayerFrameDriver.step.inMicroseconds / 1000000.0 + offset;
     _isFirstTick = false;
   }
 
   @override
   void dispose() {
-    _ticker.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    if (_driverBound) {
+      PlayerFrameDriver.instance.removeListener(_onTick);
+      _driverBound = false;
+    }
     _tNotifier.dispose();
     super.dispose();
   }

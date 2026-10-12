@@ -116,3 +116,9 @@
 # ai.onnxruntime 包内类，R8 混淆重命名后 GetMethodID 返回 null 直接 SIGABRT。
 -keep class ai.onnxruntime.** { *; }
 -dontwarn ai.onnxruntime.**
+
+# ── 频谱 PCM 采集：内部实现包通过反射/JNI 场景少，但 R8 全量混淆后
+#    崩溃栈无法定位，且 SpectrumPlugin 的匿名 OnDataCaptureListener 属于
+#    这类「只在回调里出现」的内部类，历史上踩过 ClassNotFoundException。 ──
+-keep class com.md3music.md3music.spectrum.** { *; }
+-keep class com.md3music.md3music.SpectrumPlugin$* { *; }

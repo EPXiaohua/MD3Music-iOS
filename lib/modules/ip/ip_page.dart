@@ -1,13 +1,16 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/models/playlist.dart';
 import '../../providers/kugou_provider.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../playlist/playlist_page.dart';
 import 'ip_detail_page.dart';
@@ -140,6 +143,16 @@ class _IpPageState extends State<IpPage> {
     TextTheme tt,
     List<dynamic> items,
   ) {
+    // 区块内可能出现重复 gid（同一棵路由子树内 tag 必须唯一）。
+    final gidFirstById = firstIndexById([
+      for (final item in items)
+        if (item is Map<String, dynamic> &&
+            _pickIpId(item) == null &&
+            _pickGlobalCollectionId(item) != null)
+          _pickGlobalCollectionId(item)!
+        else
+          '',
+    ]);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -162,9 +175,18 @@ class _IpPageState extends State<IpPage> {
             if (item is! Map<String, dynamic>) {
               return const SizedBox.shrink();
             }
+            // 只有「进 PlaylistPage」的那一类（无 ip_id、有 gid）才有终点。
+            // 终点 tag 是 playlistCoverHeroTag(displayPlaylist.id)，而
+            // _openPickItem 用 Playlist(id: gid, ...) 构造 → 口径必须同为 gid。
+            final gid = _pickIpId(item) == null
+                ? _pickGlobalCollectionId(item)
+                : null;
             return _PicksCard(
               title: _stringOf(item, 'title', fallback: 'name'),
               coverUrl: _pickCover(item),
+              heroTag: gid != null && gid.isNotEmpty && gidFirstById[gid] == i
+                  ? playlistCoverHeroTag(gid)
+                  : null,
               onTap: () => _openPickItem(item),
             );
           },
@@ -220,26 +242,22 @@ class _IpPageState extends State<IpPage> {
     final title = _stringOf(item, 'title', fallback: 'name');
     final ipId = _pickIpId(item);
     if (ipId != null) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => IpDetailPage(ipId: ipId, title: title),
-        ),
+      AdaptiveNav.openDetail(context,
+        (_) => IpDetailPage(ipId: ipId, title: title),
       );
       return;
     }
     // 歌单项（/top/ip 中 type=1，extra 含 global_collection_id / specialid）
     final gid = _pickGlobalCollectionId(item);
     if (gid != null) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => PlaylistPage(
+      AdaptiveNav.openDetail(context,
+        (_) => PlaylistPage(
             playlist: Playlist(
               id: gid,
               name: title,
               artworkUri: _pickCover(item),
               songCount: 0,
               songs: const [],
-            ),
           ),
         ),
       );
@@ -258,10 +276,8 @@ class _IpPageState extends State<IpPage> {
       return;
     }
     if (!mounted) return;
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => IpDetailPage(ipId: ipId, title: title),
-      ),
+    AdaptiveNav.openDetail(context,
+      (_) => IpDetailPage(ipId: ipId, title: title),
     );
   }
 
@@ -382,7 +398,16 @@ class _PicksCard extends StatelessWidget {
   final String? coverUrl;
   final VoidCallback? onTap;
 
-  const _PicksCard({required this.title, this.coverUrl, this.onTap});
+  /// 非空时封面参与封面连贯过渡。**只有进 PlaylistPage 的 gid 项才给**
+  /// （进 IpDetailPage 的条目没有页头封面终点，见 ip_detail_page.dart:228-247）。
+  final String? heroTag;
+
+  const _PicksCard({
+    required this.title,
+    this.coverUrl,
+    this.onTap,
+    this.heroTag,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -398,17 +423,35 @@ class _PicksCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
-                child: coverUrl != null
-                    ? CachedNetworkImage(
-                        imageUrl: coverUrl!,
-                        memCacheWidth: 540,
-                        memCacheHeight: 540,
-                        fit: BoxFit.cover,
-                        width: double.infinity,
-                        placeholder: (_, _) => _coverPlaceholder(cs),
-                        errorWidget: (_, _, _) => _coverPlaceholder(cs),
-                      )
-                    : _coverPlaceholder(cs),
+                // 卡片外层 ClipRRect(12) 圆整卡四角，封面只占上部 → 可见圆角仅上两角。
+                // child 传未裁剪内容，圆角交给 PlaylistCoverHero。
+                child: coverUrl == null
+                    ? _coverPlaceholder(cs)
+                    : heroTag == null
+                        ? CachedNetworkImage(
+                            imageUrl: coverUrl!,
+                            memCacheWidth: 540,
+                            memCacheHeight: 540,
+                            fit: BoxFit.cover,
+                            width: double.infinity,
+                            placeholder: (_, _) => _coverPlaceholder(cs),
+                            errorWidget: (_, _, _) => _coverPlaceholder(cs),
+                          )
+                        : PlaylistCoverHero(
+                            tag: heroTag!,
+                            radius: const BorderRadius.vertical(
+                              top: Radius.circular(AppRadius.md),
+                            ),
+                            child: CachedNetworkImage(
+                              imageUrl: coverUrl!,
+                              memCacheWidth: 540,
+                              memCacheHeight: 540,
+                              fit: BoxFit.cover,
+                              width: double.infinity,
+                              placeholder: (_, _) => _coverPlaceholder(cs),
+                              errorWidget: (_, _, _) => _coverPlaceholder(cs),
+                            ),
+                          ),
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),

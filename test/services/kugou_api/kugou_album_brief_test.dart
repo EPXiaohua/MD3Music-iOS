@@ -72,5 +72,78 @@ void main() {
       expect(album.songCount, 0);
       expect(album.year, 2024);
     });
+
+    test('cover/pic 是裸文件名时必须跳过，取 sizable_cover', () {
+      // 真机取证的 /artist/albums 载荷：cover 与 pic 只有文件名，
+      // 绝对地址在 sizable_cover（还带 {size} 占位符）。
+      // 旧实现按顺序命中 cover 就返回，列表封面全裂（详情页反而正常）。
+      final brief = KugouAlbumBrief.fromJson({
+        'album_id': 7547427,
+        'album_name': '太平盛世',
+        'author_name': '陶喆',
+        'sizable_cover': 'http://imge.kugou.com/stdmusic/{size}/20260909/20260909032931659085.jpg',
+        'cover': '20260909032931659085.jpg',
+        'pic': '20260909032931659085.jpg',
+        'publish_date': '2005-01-21',
+      });
+      expect(
+        brief.coverUrl,
+        'http://imge.kugou.com/stdmusic/400/20260909/20260909032931659085.jpg',
+      );
+      expect(brief.id, '7547427');
+      expect(brief.year, 2005);
+    });
+
+    test('没有任何绝对 URL 时封面为 null（不把裸文件名当 URL 用）', () {
+      final brief = KugouAlbumBrief.fromJson({
+        'albumid': 1,
+        'albumname': 'x',
+        'cover': 'bare-name.jpg',
+        'pic': '',
+      });
+      expect(brief.coverUrl, isNull);
+    });
+  });
+
+  group('KugouArtistAlbums.fromJson', () {
+    test('data 是数组：不再抛 TypeError（真机 /artist/albums 就是这个形态）', () {
+      final result = KugouArtistAlbums.fromJson({
+        'total': 29,
+        'error_code': 0,
+        'data': [
+          {
+            'album_id': 7547427,
+            'album_name': '太平盛世',
+            'sizable_cover': 'http://imge.kugou.com/stdmusic/{size}/a.jpg',
+          },
+          {
+            'album_id': 111,
+            'album_name': '另一张',
+            'sizable_cover': 'http://imge.kugou.com/stdmusic/{size}/b.jpg',
+          },
+        ],
+      });
+      expect(result.albums, hasLength(2));
+      expect(result.albums.first.id, '7547427');
+      expect(
+        result.albums.first.coverUrl,
+        'http://imge.kugou.com/stdmusic/400/a.jpg',
+      );
+      // total 只在根节点，数组形态下也要拿到
+      expect(result.total, 29);
+    });
+
+    test('data 是对象时仍走 list/albums/info 口径', () {
+      final result = KugouArtistAlbums.fromJson({
+        'data': {
+          'list': [
+            {'album_id': 1, 'album_name': 'x'},
+          ],
+          'total': 8,
+        },
+      });
+      expect(result.albums, hasLength(1));
+      expect(result.total, 8);
+    });
   });
 }

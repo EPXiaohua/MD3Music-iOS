@@ -1,3 +1,7 @@
+import 'dart:math';
+
+import 'mcp_prompt.dart';
+import 'mcp_resource.dart';
 import 'mcp_tool.dart';
 
 /// JSON-RPC 2.0 标准错误码。MCP 在此基础上保留 -32000 段给业务错误，
@@ -7,6 +11,7 @@ const int kJsonRpcInvalidRequest = -32600;
 const int kJsonRpcMethodNotFound = -32601;
 const int kJsonRpcInvalidParams = -32602;
 const int kJsonRpcInternalError = -32603;
+const int kJsonRpcResourceNotFound = -32002;
 
 class JsonRpcError implements Exception {
   const JsonRpcError(this.code, this.message, [this.data]);
@@ -46,6 +51,8 @@ class McpDispatcher {
     required this.serverVersion,
     required this.tools,
     this.instructions,
+    this.resources = const <McpResource>[],
+    this.prompts = const <McpPrompt>[],
   });
 
   static const List<String> supportedProtocolVersions = <String>[
@@ -59,11 +66,28 @@ class McpDispatcher {
   final String serverVersion;
   final McpToolRegistry tools;
   final String? instructions;
+  final List<McpResource> resources;
+  final List<McpPrompt> prompts;
 
   String _protocolVersion = latestProtocolVersion;
 
   /// 最近一次 initialize 协商出的版本（HTTP 层写 MCP-Protocol-Version 头用）。
   String get protocolVersion => _protocolVersion;
+
+  String? _session;
+
+  /// 当前会话 id（initialize 时生成；HTTP 层把它写进 Mcp-Session-Id 响应头后
+  /// 会调 [clearSession] 交出所有权，会话登记转由 HTTP 层维护）。
+  String? get session => _session;
+
+  void clearSession() => _session = null;
+
+  String _newSessionId() {
+    final rnd = Random.secure();
+    return List.generate(
+            16, (_) => rnd.nextInt(256).toRadixString(16).padLeft(2, '0'))
+        .join();
+  }
 
   /// 返回待序列化响应体：`Map`（单条）/ `List`（批量）/ `null`（通知，202 空包）。
   Future<Object?> handle(Object? message) async {
@@ -120,6 +144,18 @@ class McpDispatcher {
         return _toolsList();
       case 'tools/call':
         return _toolsCall(params);
+      case 'resources/list':
+        return <String, Object?>{
+          'resources': resources.map((r) => r.toJson()).toList(growable: false),
+        };
+      case 'resources/read':
+        return _resourcesRead(params);
+      case 'prompts/list':
+        return <String, Object?>{
+          'prompts': prompts.map((p) => p.toJson()).toList(growable: false),
+        };
+      case 'prompts/get':
+        return _promptsGet(params);
       case 'notifications/initialized':
       case 'notifications/cancelled':
       case 'notifications/progress':
@@ -135,10 +171,15 @@ class McpDispatcher {
     _protocolVersion = requested != null && supportedProtocolVersions.contains(requested)
         ? requested
         : latestProtocolVersion;
+    // 同一 dispatcher 实例只发一次；server 每次重启新建 dispatcher，
+    // 等效每服务周期新会话空间。
+    _session ??= _newSessionId();
     return <String, Object?>{
       'protocolVersion': _protocolVersion,
       'capabilities': <String, Object?>{
         'tools': <String, Object?>{'listChanged': false},
+        if (resources.isNotEmpty) 'resources': <String, Object?>{},
+        if (prompts.isNotEmpty) 'prompts': <String, Object?>{},
       },
       'serverInfo': <String, Object?>{
         'name': serverName,
@@ -172,5 +213,57 @@ class McpDispatcher {
       ],
       'isError': result.isError,
     };
+  }
+
+  Future<Map<String, Object?>> _resourcesRead(Object? params) async {
+    final uri = params is Map ? params['uri'] as String? : null;
+    if (uri == null) {
+      throw const JsonRpcError(kJsonRpcInvalidParams, 'Missing "uri"');
+    }
+    for (final r in resources) {
+      if (r.uri == uri) {
+        return <String, Object?>{
+          'contents': <Object?>[
+            <String, Object?>{
+              'uri': r.uri,
+              'mimeType': r.mimeType,
+              'text': await r.read(),
+            },
+          ],
+        };
+      }
+    }
+    throw JsonRpcError(kJsonRpcResourceNotFound, 'Resource not found: $uri');
+  }
+
+  Map<String, Object?> _promptsGet(Object? params) {
+    // 计划原文写 `params['arguments']`：params 是 Object? 不会被提升，编译不过；
+    // 与 _toolsCall 一致先收窄成局部 map 再取值。
+    final map = params is Map ? params as Map<String, dynamic> : null;
+    final name = map?['name'] as String?;
+    if (name == null) {
+      throw const JsonRpcError(kJsonRpcInvalidParams, 'Missing "name"');
+    }
+    for (final p in prompts) {
+      if (p.name == name) {
+        final raw = map?['arguments'];
+        final args = <String, String>{
+          if (raw is Map)
+            for (final e in raw.entries)
+              if (e.value != null) e.key.toString(): e.value.toString(),
+        };
+        for (final a in p.arguments) {
+          if (a.required && (args[a.name] == null || args[a.name]!.isEmpty)) {
+            throw JsonRpcError(
+                kJsonRpcInvalidParams, 'Missing argument "${a.name}"');
+          }
+        }
+        return <String, Object?>{
+          'description': p.description,
+          'messages': p.messages(args),
+        };
+      }
+    }
+    throw JsonRpcError(kJsonRpcInvalidParams, 'Unknown prompt: $name');
   }
 }

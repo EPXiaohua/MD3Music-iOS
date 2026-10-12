@@ -8,16 +8,27 @@ import 'package:provider/provider.dart';
 import '../../core/services/usb_audio_service.dart';
 import '../../core/utils/audio_format_utils.dart';
 import '../../core/utils/audio_scanner.dart' show audioExtensions;
+import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../providers/player_provider.dart';
+import '../../providers/song_match_provider.dart';
 import '../../widgets/player_artwork_image.dart';
-import '../../widgets/usb_exclusive_section.dart';
+import '../album/album_detail_page.dart';
+import '../artist/artist_detail_page.dart';
+import '../library/song_match_sheet.dart';
+import 'comments_view.dart';
+import 'song_accompany_sheet.dart';
+import 'song_ranking_sheet.dart';
 
 /// 歌曲信息页：展示当前播放歌曲的音频格式（采样频率/位深/码率/声道）与
-/// USB 独占输出开关（与设置页使用同一 [UsbExclusiveSection]，信息保持一致）。
+/// USB 独占设备状态（仅在USB 独占开启时才有内容）。
 ///
 /// 频率/位深/码率/声道取自 ExoPlayer 实际解码输出格式（原生 UsbAudioSinkController
 /// 在 configure() 时捕获，无论是否开启独占都会更新）。
+///
+/// 注：原页尾的「USB 独占」开关整块已移除（依赖 Android USB Host + native cpp，
+/// 桌面端不可用）。若日后要恢复，需同时恢复 `UsbExclusiveSection` 的 import，
+/// 并沿用 `supportsUsbExclusive` 门控（见 lib/core/platform_capabilities.dart）。
 class SongInfoPage extends StatefulWidget {
   const SongInfoPage({super.key});
 
@@ -184,14 +195,27 @@ class _SongInfoPageState extends State<SongInfoPage> {
       body: ListView(
         children: [
           _buildSongHeader(song, colorScheme, textTheme),
+          // 本地歌曲：在线信息（匹配记忆 / 专辑 / 歌手 / 评论入口）
+          if (song != null && !song.isOnline) ...[
+            const SizedBox(height: 8),
+            _buildSectionHeader('在线信息'),
+            _buildOnlineMatchCard(song, colorScheme),
+          ],
           const SizedBox(height: 8),
           _buildSectionHeader('音频格式'),
           _buildFormatCard(colorScheme),
-          const SizedBox(height: 8),
-          _buildSectionHeader('USB 独占'),
-          UsbExclusiveSection(
-            onAutoPause: () => context.read<PlayerProvider>().pause(),
-          ),
+          // USB 独占整块已从歌曲信息页移除（原本用 if (supportsUsbExclusive) 门控，
+          // 但该区块含 USB 独占输出 / TPDF 抖动降位 / 输出采样率 / 输出位深，
+          // 桌面端全部不可用，留着只是噪音）。
+          // 保留注释便于日后需要时恢复；恢复时需同时保留 settings_page 的同款门控。
+          //
+          // if (supportsUsbExclusive) ...[
+          //   const SizedBox(height: 8),
+          //   _buildSectionHeader('USB 独占'),
+          //   UsbExclusiveSection(
+          //     onAutoPause: () => context.read<PlayerProvider>().pause(),
+          //   ),
+          // ],
           const SizedBox(height: 32),
         ],
       ),
@@ -207,6 +231,122 @@ class _SongInfoPageState extends State<SongInfoPage> {
           color: Theme.of(context).colorScheme.primary,
         ),
       ),
+    );
+  }
+
+  /// 本地歌曲的在线信息卡：已匹配展示专辑/歌手（可跳详情页）+ 评论/管理入口；
+  /// 未匹配给出引导与「去匹配」。
+  Widget _buildOnlineMatchCard(Song song, ColorScheme colorScheme) {
+    final textTheme = Theme.of(context).textTheme;
+    return Consumer<SongMatchProvider>(
+      builder: (ctx, match, _) {
+        final matchedSong = match.matchedSongFor(song);
+        final isMatched = matchedSong != null;
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            children: [
+              if (!isMatched)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '匹配在线歌曲后可查看评论区、补充封面与歌词',
+                      style: textTheme.bodySmall
+                          ?.copyWith(color: colorScheme.onSurfaceVariant),
+                    ),
+                  ),
+                )
+              else ...[
+                ListTile(
+                  leading: const Icon(Icons.album_outlined),
+                  title: const Text('专辑'),
+                  subtitle: Text(
+                    matchedSong.album.isEmpty ? '—' : matchedSong.album,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  onTap: matchedSong.albumId == null ||
+                          matchedSong.albumId!.isEmpty
+                      ? null
+                      : () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => AlbumDetailPage(
+                                album: Album(
+                                  id: matchedSong.albumId!,
+                                  name: matchedSong.album,
+                                  artist: matchedSong.artist,
+                                  artworkUri: matchedSong.artworkUri,
+                                  songCount: 0,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.person_outline),
+                  title: const Text('歌手'),
+                  subtitle: Text(
+                    matchedSong.artist.isEmpty ? '—' : matchedSong.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  onTap: matchedSong.artistId == null ||
+                          matchedSong.artistId!.isEmpty
+                      ? null
+                      : () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => ArtistDetailPage(
+                                artistId: matchedSong.artistId!,
+                                artistName: matchedSong.artist,
+                              ),
+                            ),
+                          );
+                        },
+                ),
+              ],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    if (isMatched)
+                      TextButton(
+                        onPressed: () =>
+                            showSongRankingSheet(context, matchedSong),
+                        child: const Text('看成绩单'),
+                      ),
+                    if (isMatched)
+                      TextButton(
+                        onPressed: () =>
+                            showSongAccompanySheet(context, matchedSong),
+                        child: const Text('获取伴奏'),
+                      ),
+                    if (isMatched)
+                      TextButton(
+                        onPressed: () =>
+                            showSongCommentsSheet(context, song),
+                        child: const Text('看评论'),
+                      ),
+                    TextButton(
+                      onPressed: () => showSongMatchSheet(context, song),
+                      child: Text(isMatched ? '管理匹配' : '去匹配'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 

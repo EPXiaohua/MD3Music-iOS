@@ -1,7 +1,9 @@
 import 'package:material_ui/material_ui.dart';
+import '../../../widgets/tv_dropdown_menu.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../../core/utils/app_text_context_menu.dart';
 import '../../../core/utils/app_toast.dart';
 import '../../../data/models/song.dart';
 import '../../../data/repositories/history_repository.dart';
@@ -295,6 +297,7 @@ class _SongPickerSheetState extends State<SongPickerSheet> {
                   padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
                   child: TextField(
                     controller: _filterCtrl,
+                    contextMenuBuilder: buildAppTextContextMenu,
                     onChanged: (v) => setState(() => _filter = v.trim()),
                     decoration: InputDecoration(
                       hintText: '过滤当前列表（歌名/歌手）',
@@ -318,7 +321,7 @@ class _SongPickerSheetState extends State<SongPickerSheet> {
                   padding: const EdgeInsets.all(12),
                   // M3EDropdownMenu 没有 initialSelection 参数：初始选中值由
                   // M3EDropdownItem.selected 表达，每次 build 按 _selectedPlaylist 重建
-                  child: M3EDropdownMenu<KugouPlaylistBrief>(
+                  child: TvDropdownMenu<KugouPlaylistBrief>(
                     items: [
                       for (final p in _playlists)
                         M3EDropdownItem(
@@ -359,6 +362,7 @@ class _SongPickerSheetState extends State<SongPickerSheet> {
                       Expanded(
                         child: TextField(
                           controller: _searchCtrl,
+                          contextMenuBuilder: buildAppTextContextMenu,
                           decoration: const InputDecoration(
                             hintText: '搜索歌名或歌手', isDense: true, border: OutlineInputBorder()),
                           onSubmitted: (_) => _search(),

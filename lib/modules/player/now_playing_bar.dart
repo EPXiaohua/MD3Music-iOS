@@ -1,6 +1,12 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/layout/bottom_chrome_dimens.dart';
+import '../../core/remote/remote_slider.dart';
+import '../../core/theme/app_dimens.dart';
+import '../../core/theme/motion_constants.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/player_provider.dart';
@@ -19,13 +25,18 @@ import 'full_player_route.dart';
 class NowPlayingBar extends StatelessWidget {
   const NowPlayingBar({super.key});
 
-  static const double _kHeight = 72.0;
+  /// 栏高：跨文件底栏几何常量（与 `PlayerPanelSignal.fallbackBarHeight` 同源）。
+  static const double _kHeight = BottomChromeDimens.nowPlayingBarHeight;
 
   @override
   Widget build(BuildContext context) {
     final player = context.watch<PlayerProvider>();
     final song = player.currentSong;
     final cs = Theme.of(context).colorScheme;
+    // 系统「移除动画」：整栏收合瞬时完成（不播 240ms 尺寸补间，见计划 §1.3 矩阵）。
+    // 本组件是 StatelessWidget，没有 didChangeDependencies 可缓存，故 build 内直读：
+    // 直读建立的 MediaQuery 依赖正是「设置翻转即重建」所需。
+    final bool reduceMotion = MediaQuery.disableAnimationsOf(context);
 
     // 完整播放页展开时整栏淡出（与 MiniPlayer 同一 playerExpansion 规则）。
     return ValueListenableBuilder<double>(
@@ -35,8 +46,10 @@ class NowPlayingBar extends StatelessWidget {
         return IgnorePointer(ignoring: exp > 0.5, child: Opacity(opacity: opacity, child: child));
       },
       child: AnimatedSize(
-        duration: const Duration(milliseconds: 240),
-        curve: Curves.easeOutCubic,
+        duration: reduceMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 240),
+        curve: M3ExpressiveMotion.barVisibilityCurve,
         alignment: Alignment.bottomCenter,
         child: song == null
             ? const SizedBox(width: double.infinity)
@@ -94,9 +107,9 @@ class _NowPlayingInfo extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return InkWell(
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: AppRadius.smAll,
       onTap: () {
-        AppHaptics.click();
+        AppHaptics.click(HapticCategory.navigation);
         openFullPlayer(context);
       },
       child: Padding(
@@ -104,7 +117,7 @@ class _NowPlayingInfo extends StatelessWidget {
         child: Row(
           children: [
             ClipRRect(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: AppRadius.coverAll,
               child: SizedBox(
                 width: 48,
                 height: 48,
@@ -113,7 +126,7 @@ class _NowPlayingInfo extends StatelessWidget {
                   fallbackFilePath: song.localPath,
                   songId: song.id,
                   size: 48,
-                  borderRadius: 6,
+                  borderRadius: AppRadius.cover,
                 ),
               ),
             ),
@@ -172,29 +185,40 @@ class _NowPlayingControls extends StatelessWidget {
               icon: const Icon(Icons.skip_previous),
               tooltip: '上一首',
               onPressed: () {
-                AppHaptics.click();
+                AppHaptics.click(HapticCategory.transport);
                 player.previous();
               },
             ),
             const SizedBox(width: 4),
-            IconButton.filled(
-              icon: Icon(player.isPlaying ? Icons.pause : Icons.play_arrow),
+            // 批次 4c（计划 §6.3）：主播放钮换 M3EFilledButton。
+            // 取色/阴影走组件默认 token（filled = primary/onPrimary、静置 elevation 0，
+            // 见 button_tokens_adapter），与 IconButton.filled 同量级；40x40 保持替换前
+            // 视觉尺寸（传输行仍是裸 IconButton 的 48dp，72dp 栏高内不溢出）；
+            // 按压圆→方形变属「跟手」例外档，按钮系源码零 AnimationController/repeat
+            //（帧源审计见计划 §7.5 第 17 项）。参考既有写法：artist_detail_page 写真 header。
+            M3EFilledButton(
               tooltip: player.isPlaying ? '暂停' : '播放',
+              shape: M3EButtonShape.round,
+              decoration: const M3EButtonDecoration(
+                fixedSize: Size(40, 40),
+                padding: EdgeInsets.zero,
+              ),
               onPressed: () {
-                AppHaptics.click();
+                AppHaptics.click(HapticCategory.transport);
                 if (player.isPlaying) {
                   player.pause();
                 } else {
                   player.resume();
                 }
               },
+              child: Icon(player.isPlaying ? Icons.pause : Icons.play_arrow),
             ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.skip_next),
               tooltip: '下一首',
               onPressed: () {
-                AppHaptics.click();
+                AppHaptics.click(HapticCategory.transport);
                 player.next();
               },
             ),
@@ -220,23 +244,39 @@ class _NowPlayingControls extends StatelessWidget {
                   ),
                 ),
                 Expanded(
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 3,
-                      thumbShape:
-                          const RoundSliderThumbShape(enabledThumbRadius: 6),
-                      overlayShape:
-                          const RoundSliderOverlayShape(overlayRadius: 12),
-                    ),
-                    child: Slider(
-                      value: maxMs > 0 ? value : 0.0,
-                      max: maxMs > 0 ? maxMs : 1.0,
-                      onChanged: maxMs > 0
-                          ? (v) => player
-                              .seek(Duration(milliseconds: v.round()), forceNotify: true)
-                          : null,
-                    ),
-                  ),
+                  // tv: TV 构建换 RemoteSlider——原生 Slider 吞四方向键（P-C；
+                  // SliderTheme 装饰参数无法透传，TV 分支走 Material 默认样式）
+                  // 批次 4c 评估：非 TV 分支不换 M3ESlider——组件 LayoutBuilder 硬编码
+                  // 最小行高 48dp（m3e_slider.dart:492-497，thumbRippleRadius*2，
+                  // M3ESliderDecoration 无字段可调），本栏 72dp 减去传输行 48dp 仅剩
+                  // 24dp 槽位，替换必现 RenderFlex 溢出；保持 SliderTheme+Slider，需人决策。
+                  child: kTvBuild
+                      ? RemoteSlider(
+                          value: maxMs > 0 ? value : 0.0,
+                          max: maxMs > 0 ? maxMs : 1.0,
+                          onChanged: maxMs > 0
+                              ? (v) => player.seek(
+                                  Duration(milliseconds: v.round()),
+                                  forceNotify: true)
+                              : null,
+                        )
+                      : SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 3,
+                            thumbShape:
+                                const RoundSliderThumbShape(enabledThumbRadius: 6),
+                            overlayShape:
+                                const RoundSliderOverlayShape(overlayRadius: 12),
+                          ),
+                          child: Slider(
+                            value: maxMs > 0 ? value : 0.0,
+                            max: maxMs > 0 ? maxMs : 1.0,
+                            onChanged: maxMs > 0
+                                ? (v) => player
+                                    .seek(Duration(milliseconds: v.round()), forceNotify: true)
+                                : null,
+                          ),
+                        ),
                 ),
                 SizedBox(
                   width: 44,
@@ -289,7 +329,7 @@ class _NowPlayingExtras extends StatelessWidget {
             color: isFav ? cs.primary : null,
           ),
           onPressed: () {
-            AppHaptics.click();
+            AppHaptics.click(HapticCategory.transport);
             favorites.toggleFavorite(song);
           },
         ),
@@ -302,7 +342,7 @@ class _NowPlayingExtras extends StatelessWidget {
                 : null,
           ),
           onPressed: () {
-            AppHaptics.click();
+            AppHaptics.click(HapticCategory.transport);
             player.cyclePlayMode();
           },
         ),

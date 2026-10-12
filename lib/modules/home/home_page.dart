@@ -5,6 +5,8 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
 import '../../core/layout/responsive_layout.dart';
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../data/models/album.dart';
 import '../../data/models/playlist.dart';
@@ -270,7 +272,9 @@ class _HomePageState extends State<HomePage> {
     }
     return SizedBox(
       height: 200,
-      child: ListView.builder(
+      child: TvScrollRegion(
+        memoryKey: 'tv/home-row-1',
+        child: ListView.builder(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         itemCount: _playlists.length,
@@ -290,6 +294,7 @@ class _HomePageState extends State<HomePage> {
             },
           );
         },
+        ),
       ),
     );
   }
@@ -300,7 +305,9 @@ class _HomePageState extends State<HomePage> {
     }
     return SizedBox(
       height: 200,
-      child: ListView.builder(
+      child: TvScrollRegion(
+        memoryKey: 'tv/home-row-2',
+        child: ListView.builder(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
         itemCount: _rankAlbums.length,
@@ -323,6 +330,7 @@ class _HomePageState extends State<HomePage> {
             ),
           );
         },
+        ),
       ),
     );
   }
@@ -465,7 +473,12 @@ class _PlaylistHorizontalCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
 
-    return Padding(
+    // tv: 卡片单停点（OK = 原 onTap）；本卡是首页横向带的裸 InkWell 卡，
+    // 只包了 TvScrollRegion 时遥控落不到卡上（2026-10-08 TV 真机同类缺陷）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'home-playlist-card',
+      child: Padding(
       padding: const EdgeInsets.only(right: 12),
       child: SizedBox(
         width: 150,
@@ -539,6 +552,7 @@ class _PlaylistHorizontalCard extends StatelessWidget {
             ),
           ),
         ),
+      ),
       ),
     );
   }

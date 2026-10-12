@@ -1,3 +1,5 @@
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 /// Android 原生文件夹选择器：通过 SAF (Storage Access Framework) 打开系统目录选择界面。
@@ -13,11 +15,21 @@ class FolderPickerService {
   /// 可直接用于文件操作。
   static Future<String?> pickFolder() async {
     try {
+      // 按**目标平台**判断，不用 Platform.isWindows：后者在 Windows 宿主上跑
+      // `flutter test` 时也为 true（测试目标其实是 android），会把测试里的选择器
+      // 短路成桌面实现，MethodChannel 一次都不走。
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.windows) {
+        final path = await getDirectoryPath();
+        return path;
+      }
       final uri = await _channel.invokeMethod<String>('pickFolder');
       if (uri == null) return null;
       // 将 SAF URI 转换为实际文件路径
       return _uriToPath(uri);
-    } catch (_) {
+    } catch (error) {
+      // 静默失败会让用户只看到"点了没反应"，这里留日志便于定位
+      // （Windows 上 fluttertoast 无实现，弹窗提示走不通）。
+      debugPrint('[FolderPickerService] 选择文件夹失败: $error');
       return null;
     }
   }

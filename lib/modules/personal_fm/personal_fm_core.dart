@@ -8,7 +8,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '_fm_refill.dart';
 
 /// 一个具名电台：把 API 的 (mode, songPoolId) 包成用户看得懂的一档。
-/// 接口共 9 种组合，这里只取 3 组，要全部组合的走完整 FM 页。
+/// 接口共 9 种组合，这里只取 4 组，要全部组合的走完整 FM 页。
 class FmStation {
   const FmStation({
     required this.label,
@@ -49,6 +49,15 @@ const List<FmStation> kFmStations = [
     songPoolId: 1,
     description: '冷门但对味的作品',
   ),
+  // 追加在末尾：档位下标同时持久化在 SharedPreferences（[kFmStationPrefKey]）、
+  // 续播会话（fm_refill_station）和原生小部件里，0~2 一旦挪动老用户的档位就错位。
+  FmStation(
+    label: '电台',
+    icon: Icons.radio,
+    mode: 'radio',
+    songPoolId: 0,
+    description: '换个频道，整台连着听',
+  ),
 ];
 
 const String kFmStationPrefKey = 'discover_fm_station_index';
@@ -64,6 +73,107 @@ const int kFmPrefetchThreshold = 3;
 const int kFmQueueEndRetries = 3;
 const Duration kFmQueueEndBackoff = Duration(milliseconds: 600);
 
+/// 电台行为回报（红心 / 取消红心 / 播放完成）的唯一出口。
+///
+/// 三条路径都走它：发现页区块的收藏按钮、桌面小部件的收藏按钮、[FmRefill] 的切歌
+/// 与队列到底。写在一处而不是抄三遍，是为了把「静默 + 日志留痕」这条口径钉死：
+/// 回报失败**不弹 toast**（一次点击的反馈已经归本地收藏那次写，再弹一条就是打扰），
+/// 但发了什么参数必须能在 logcat 里查到，否则真机上无法判断上游收到了什么。
+///
+/// [KugouProvider.reportPersonalFmAction] 只转发——不动电台列表、不转
+/// loading、不写错误态，所以调用方一律 fire-and-forget，本函数也不向上抛异常。
+Future<void> reportFmFeedback({
+  required KugouProvider kugou,
+  required String action,
+  required String mode,
+  required int songPoolId,
+  required KugouSongDetail track,
+  int? playtime,
+  bool isOverplay = false,
+}) async {
+  // curMark 缺失 = 这首歌没带回推荐令牌（模型没解析到，或上游就没给），上游只能按
+  // (mode, songPoolId) 粗粒度记账。单独打一行，是为了在真机上一眼分辨这两种情况。
+  debugPrint(
+    '[PersonalFm] action=$action curMark=${track.curMark ?? 'missing'} '
+    'hash=${track.hash}',
+  );
+  try {
+    await kugou.reportPersonalFmAction(
+      action: action,
+      mode: mode,
+      songPoolId: songPoolId,
+      hash: track.hash,
+      songId: track.songId,
+      curMark: track.curMark,
+      playtime: playtime,
+      isOverplay: isOverplay,
+    );
+  } catch (e) {
+    debugPrint('[PersonalFm] action=$action failed: $e');
+  }
+}
+
+/// 「不喜欢」的唯一出口：上报 garbage，并把上游带回的替换批次接进电台列表与播放队列。
+///
+/// 两条调用路径共用它（完整 FM 页与发现页区块）——两边的业务语义必须逐字一致，抄
+/// 两遍必然会漂。返回值分三态，调用方据此决定要不要提示：
+/// - `null`：**上报请求本身**失败（`_get` 吞掉一切错误返回 null）。调用方 toast，
+///   但**仍然要推进**：不喜欢不能被一次反馈 ping 卡住。
+/// - 空列表：上报成功，上游只回了 ack、没带回替换批次。属于成功，误报会让每次
+///   不喜欢都像坏了。
+/// - 非空：已按 hash 去重写进 [KugouProvider.personalFmSongs] 与播放队列的新歌。
+///
+/// 上报失败不抛异常（与 [reportFmFeedback] 同一口径），调用方无需 try。
+Future<List<KugouSongDetail>?> dislikeFmTrack({
+  required KugouProvider kugou,
+  required PlayerProvider player,
+  required KugouSongDetail track,
+  required String mode,
+  required int songPoolId,
+}) async {
+  debugPrint(
+    '[PersonalFm] action=garbage hash=${track.hash} curMark=${track.curMark}',
+  );
+  final List<KugouSongDetail>? result;
+  try {
+    result = await kugou.reportPersonalFmAction(
+      action: 'garbage',
+      mode: mode,
+      songPoolId: songPoolId,
+      hash: track.hash,
+      songId: track.songId,
+      curMark: track.curMark,
+    );
+  } catch (e) {
+    debugPrint('[PersonalFm] garbage failed: $e');
+    return null;
+  }
+  if (result == null) {
+    debugPrint('[PersonalFm] garbage failed: request returned null');
+    return null;
+  }
+  if (result.isEmpty) {
+    debugPrint('[PersonalFm] garbage ok, no replacement batch');
+    return const <KugouSongDetail>[];
+  }
+  // 整批都听过的可能：去重后为空仍算上报成功，调用方不该 toast。
+  final currentSongs = kugou.personalFmSongs;
+  final fresh = result
+      .where((s) => !currentSongs.any((c) => c.hash == s.hash))
+      .toList();
+  if (fresh.isEmpty) return const <KugouSongDetail>[];
+  kugou.appendFmSongs(fresh);
+  try {
+    await player.appendPlaylist(fresh.map((e) => e.toSong()).toList());
+  } catch (e) {
+    // 与 [FmRefill._append] 同一降级口径：真实实现是先把歌塞进 _playlist、再去动
+    // audio_service 队列，后半段抛异常时队列其实已经能继续放了。这里不能报失败，
+    // 否则发现页会把这批已经生效的替换批次当成没接上。
+    debugPrint('[PersonalFm] garbage append failed: $e');
+  }
+  return fresh;
+}
+
 /// 电台续播器：把「无限电台」需要的一切收在这里，不引用任何 UI。
 ///
 /// 补货必须比区块活得久——发现页切走一次就 dispose（AnimatedSwitcher 按 tab id
@@ -73,6 +183,9 @@ const Duration kFmQueueEndBackoff = Duration(milliseconds: 600);
 ///
 /// 它不需要谁来持有：换档重新起播时新的续播器会占掉 `onPlaylistEnd`，旧的在下一次
 /// 通知里发现槽位不是自己的就 [retire] 退场。
+///
+/// 它还替电台把「上一首听了多久」报回去（切歌与队列到底各一次 [reportFmFeedback]），
+/// 复用同一条播放器通知，不另起 Timer / 不订阅 positionStream（AGENTS §10）。
 ///
 /// 所有权的判据是 [_owned]：本续播器亲手灌进队列的那些 hash。不去问
 /// [KugouProvider.personalFmSongs]，因为换档 / 下拉刷新会把那个列表整体替换掉，
@@ -120,6 +233,18 @@ class FmRefill {
   /// 上一次提前补货时的播放下标，避免停在同一首上反复请求。
   int _lastPrefetchIndex = -1;
 
+  /// 上一次通知时播放器停在本续播器的哪一首、那一刻采到的位置与总时长。
+  /// 切歌时要拿它们给**上一首**补一次 play 回报（见 [_reportPreviousTrack]）。
+  String? _lastTrackId;
+  int _lastPosSeconds = 0;
+  Duration? _lastDuration;
+
+  /// 本条电台会话里已经报过 play 的歌。队列到底那条路径里，补货成功时的
+  /// `appendPlaylist` 通知会把 [_lastTrackId] 重新设成刚按「听完」报过的那首，
+  /// 随后 `next()` 的切歌检测就会照着同一首再报一遍（而且第二回 playtime 更小、
+  /// is_overplay 还会翻成 false）。按下标记账是唯一能钉死「每首只报一次」的办法。
+  final Set<String> _reportedTracks = {};
+
   /// [onQueueEnd] 的重试全部用尽后置位：那一刻队列已经放到底、播放器 pause 在
   /// 最后一首上，再没有谁会调 [PlayerProvider.next]。之后任何一次补货成功都要
   /// 自己补推一把 next()，否则这条队列永远不会再往前走。
@@ -152,12 +277,27 @@ class FmRefill {
     }
   }
 
+  /// 认领一批**不是本续播器自己要来**的电台歌（发现页「不喜欢」带回的替换批次）。
+  ///
+  /// 所有权集合 [_owned] 是退场判据（见 [_ownsQueue] 与 [_onPlayerChanged]）：这批歌
+  /// 由 [dislikeFmTrack] 直接写进列表与队列，不在这里登记的话，电台随后播到它们时
+  /// 会被判成「队列换主」而当场 [retire]，这条电台从此不再补货——用户看到的就是
+  /// 「点了几次不喜欢，电台就放完了」。
+  ///
+  /// 游标 [_cursor] **不动**：替换批次与续播请求的批次是两条独立的召回窗口，拿它
+  /// 当游标只会把下一次要歌推到不相干的位置。集合并集，重复调用幂等。
+  void adopt(List<KugouSongDetail> songs) {
+    if (_retired) return;
+    _owned.addAll(songs.map((s) => s.hash));
+  }
+
   /// 队列快见底时提前补货：[PlayerProvider] 一次只把一首歌灌进 audio_service，
   /// 队列末尾没有预加载。
   void _onPlayerChanged() {
     if (_retired) return;
     // 别人抢了槽位（完整 FM 页、或换档后重新起播），本续播器该退场了。
     if (player.onPlaylistEnd != onQueueEnd) {
+      _flushPendingReport();
       retire();
       return;
     }
@@ -165,9 +305,27 @@ class FmRefill {
     // 起播过程中会有一瞬间没有当前曲目，那不代表队列换主了。
     if (playingId == null) return;
     if (!_owned.contains(playingId)) {
+      // 换成了别人的歌：先把本续播器欠着的那首报掉再退场。「听完一首电台歌再去点
+      // 普通歌单」是最常见的路径，不在这里收尾就永远少一次收听时长回报。
+      _flushPendingReport();
       retire();
       return;
     }
+    // 切歌了：先把上一首的 play 回报补掉，再刷新采样。放在提前补货那几行 return
+    // 之前——那几个 return 只关心队列长度，不该把回报一起挡掉。能走到这里说明
+    // playingId 归本续播器管，而 _lastTrackId 只可能是更早一次同样过了所有权检查
+    // 的 id，所以「只报自己灌进队列的歌」这条判据不用再写第二遍。
+    if (playingId != _lastTrackId) {
+      final previousId = _lastTrackId;
+      _lastTrackId = playingId;
+      if (previousId != null) _reportPreviousTrack(previousId);
+    }
+    // 只能采「本次通知那一刻」的位置：播放器的高频位置更新走 positionNotifier，
+    // 不触发 notifyListeners，为它再起一路定时器和 §10 的限帧约定冲突。暂停、
+    // seek、播放态迁移都会进到本回调，所以自动切歌时这个值可能偏小——少报好过
+    // 多引一路常驻刷新。
+    _lastPosSeconds = player.position.inSeconds;
+    _lastDuration = player.duration;
     final index = player.currentIndex;
     if (index < 0) return;
     if (player.playlist.length - index > kFmPrefetchThreshold) return;
@@ -197,6 +355,7 @@ class FmRefill {
       retire();
       return;
     }
+    _reportQueueEndTrack();
     for (var attempt = 0; attempt < kFmQueueEndRetries; attempt++) {
       if (attempt > 0) {
         await Future.delayed(kFmQueueEndBackoff * attempt);
@@ -215,6 +374,76 @@ class FmRefill {
     // 重新试，补上了由 [_onPlayerChanged] 推 next()。
     _stalledAtQueueEnd = true;
     _lastPrefetchIndex = -1;
+  }
+
+  /// 按 hash 在电台列表里找那首歌。换过档或列表被整体刷新过就可能找不到，
+  /// 找不到由调用方决定跳过——绝不拿别的歌的 curMark 顶替。
+  KugouSongDetail? _trackByHash(String hash) {
+    for (final s in kugou.personalFmSongs) {
+      if (s.hash == hash) return s;
+    }
+    return null;
+  }
+
+  /// 上一首的 play 回报：已播时长用最后一次采到的位置，`is_overplay` 按
+  /// 「距总时长 2 秒内」判——播放器到末尾的收尾常有几百毫秒的误差，卡太严会
+  /// 把听完整首歌也报成没听完。总时长优先用播放器报过的 [_lastDuration]，
+  /// 一次都没采到就退回列表里声明的时长。
+  void _reportPreviousTrack(String previousId) {
+    final previous = _trackByHash(previousId);
+    if (previous == null) return;
+    // 每首只报一次：队列到底时已经按「听完」报过这一首，之后补货的 appendPlaylist
+    // 与 next() 各会通知一次播放器，光靠 [_lastTrackId] 销账会被这些通知重新武装，
+    // 于是同一首歌又补出一笔 playtime 更小、is_overplay 还翻成 false 的回报。
+    if (!_reportedTracks.add(previousId)) return;
+    final total = _lastDuration?.inSeconds ?? previous.duration;
+    // ignore: discarded_futures
+    reportFmFeedback(
+      kugou: kugou,
+      action: 'play',
+      mode: mode,
+      songPoolId: songPoolId,
+      track: previous,
+      playtime: _lastPosSeconds,
+      isOverplay: total > 0 && _lastPosSeconds >= total - 2,
+    );
+  }
+
+  /// 把「还没回报过的当前曲」补报一次并销账。[_lastTrackId] 非空即代表这一首
+  /// 已经采样过进度但还没走到切歌那一步；退场（换主/丢槽位）时必须先收尾，
+  /// 否则这次收听对上游就是空的。
+  void _flushPendingReport() {
+    final pendingId = _lastTrackId;
+    if (pendingId == null) return;
+    _lastTrackId = null;
+    _reportPreviousTrack(pendingId);
+  }
+
+  /// 队列到底：最后这一首是真的放完了，直接按 `is_overplay: true` 报，已播时长
+  /// 取总时长（这一刻它就是已播的全部），不走切歌那条差 2 秒的判定。
+  /// fire-and-forget：本回调被播放器 await，等一次网络往返会把补货整条链路拖住。
+  ///
+  /// 报完必须把 [_lastTrackId] 清空：紧接着 [onQueueEnd] 会推 [PlayerProvider.next]
+  /// 接上新歌，那次切歌的「上一首」还是这一首，不清空就会同一条歌报两回 play，
+  /// 而且第二回的 playtime 更小、is_overplay 还会翻成 false。
+  void _reportQueueEndTrack() {
+    final lastId = player.currentSong?.id;
+    if (lastId == null) return;
+    final lastTrack = _trackByHash(lastId);
+    if (lastTrack == null) return;
+    if (!_reportedTracks.add(lastId)) return;
+    final total = _lastDuration?.inSeconds ?? lastTrack.duration;
+    _lastTrackId = null;
+    // ignore: discarded_futures
+    reportFmFeedback(
+      kugou: kugou,
+      action: 'play',
+      mode: mode,
+      songPoolId: songPoolId,
+      track: lastTrack,
+      playtime: total > 0 ? total : null,
+      isOverplay: true,
+    );
   }
 
   /// 向电台列表和播放队列各接一批新歌，返回是否真的接上了。
@@ -272,7 +501,8 @@ class FmRefill {
 /// 动作链路：小部件 → AudioPlaybackService → MethodChannel →
 /// MediaNotificationService 静态回调 →（FmWidgetSync 包装后）本类。
 /// 各方法与 [PersonalFmSection]（personal_fm_section.dart）的对应逻辑保持
-/// 行为一致：起播路径都走共享的 [FmRefill] 续播器，两边调整时必须同步维护。
+/// 行为一致：起播路径都走共享的 [FmRefill] 续播器，收藏那一步两边都是「先写本地
+/// 收藏、再 [reportFmFeedback] 静默补一次电台红心回报」，调整任一侧必须同步另一侧。
 class PersonalFmWidgetActions {
   PersonalFmWidgetActions._();
 
@@ -398,7 +628,7 @@ class PersonalFmWidgetActions {
   }
 
   /// 小部件收藏按钮：对卡片渲染的那一首（与发现页 currentIndex 同一套计算）
-  /// 切换收藏。
+  /// 切换收藏，随后与发现页同一口径补一次电台红心回报。
   static Future<void> handleToggleFavorite({
     required KugouProvider kugou,
     required PlayerProvider player,
@@ -411,7 +641,38 @@ class PersonalFmWidgetActions {
         ? -1
         : songs.indexWhere((s) => s.hash == playingId);
     final currentIndex = playingIndex >= 0 ? playingIndex : 0;
-    await favorites.toggleFavorite(songs[currentIndex].toSong());
+    final track = songs[currentIndex];
+    // action 取切换**前**的状态：已经红心 → 这一次点的是取消红心。
+    final isFavorite = favorites.isFavorite(track.hash);
+    await favorites.toggleFavorite(track.toSong());
+    // ignore: discarded_futures
+    _reportStationFeedback(
+      kugou: kugou,
+      action: isFavorite ? 'cancel_red' : 'click_red',
+      track: track,
+    );
+  }
+
+  /// 按持久化档位补一次行为回报。本类没有 BuildContext，档位只能读 prefs
+  /// （与周围方法同一套 [restoreStationIndex]）；prefs 读取也一起裹进 try，
+  /// 免得这个 fire-and-forget 的 Future 带着没人处理的错误落地。
+  static Future<void> _reportStationFeedback({
+    required KugouProvider kugou,
+    required String action,
+    required KugouSongDetail track,
+  }) async {
+    try {
+      final station = kFmStations[await restoreStationIndex()];
+      await reportFmFeedback(
+        kugou: kugou,
+        action: action,
+        mode: station.mode,
+        songPoolId: station.songPoolId,
+        track: track,
+      );
+    } catch (e) {
+      debugPrint('[PersonalFm] action=$action failed: $e');
+    }
   }
 
   /// 小部件档位切换：存 prefs + 重拉列表，不自动开播（与发现页 _selectStation

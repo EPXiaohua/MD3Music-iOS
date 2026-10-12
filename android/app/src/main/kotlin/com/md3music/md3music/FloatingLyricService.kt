@@ -18,7 +18,12 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -30,11 +35,14 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import kotlin.math.roundToInt
 
 /// 单个字的卡拉OK时间戳（text 为该字文本，供原生按 paint 测量字宽）
 class WordTiming(val text: String, val startMs: Long, val durMs: Long)
@@ -45,8 +53,12 @@ private const val KARAOKE_LOG = "KaraokeDebug"
 class FloatingLyricService : Service() {
     private var windowManager: WindowManager? = null
     private var rootView: LinearLayout? = null
-    private var collapsedPanel: View? = null
-    private var expandedPanel: View? = null
+    /** 面板上区：歌词预览，常驻可见。 */
+    private var lyricArea: View? = null
+    /** 面板下区的外层容器：展开/收起动画就作用在它的高度上（负责"露出多少"）。 */
+    private var controlHolder: FrameLayout? = null
+    /** 面板下区的真实内容：按钮行 + 进度条 + 设置面板。 */
+    private var controlInner: View? = null
     private var lyricText1: GradientTextView? = null
     private var lyricText2: GradientTextView? = null
     private var params: WindowManager.LayoutParams? = null
@@ -59,6 +71,11 @@ class FloatingLyricService : Service() {
     private var isDragging = false
     private var dragStartTime = 0L
     private var expanded = false
+    /// 下区高度动画。重复触发必须先 cancel —— 否则两个 animator 同时改同一份
+    /// layoutParams.height，窗口高度会来回跳。
+    private var heightAnimator: ValueAnimator? = null
+    /// 本次按下的落点是否在上区（歌词预览）；只有落在上区的轻点才展开/收起。
+    private var touchOnLyricArea = false
     private var locked = false
 
     // config
@@ -68,10 +85,10 @@ class FloatingLyricService : Service() {
     // 只在 setTextSize 时乘上本系数，避免往返放大 / 撞上 12~32sp 的钳制区间。
     private var displayScale = 1f
     private var doubleLine = false
-    private var opacity = 80
+    private var opacity = 50
     private var gradientStart = 0xFF00E5FF.toInt()
     private var gradientEnd = 0xFFFF00FF.toInt()
-    private var unplayedColor = 0xFF666666.toInt()
+    private var unplayedColor = 0xFFFFFFFF.toInt()
     private var isPlayingFlag = false
     // 当前悬浮窗宽度与歌词换行最大宽度（旋转时随 displayMetrics 重算）
     private var windowWidthPx = 0
@@ -80,10 +97,50 @@ class FloatingLyricService : Service() {
     // views
     private var lockButton: ImageView? = null
     private var playPauseButton: ImageView? = null
+    /** 设置按钮：面板收起时是「设置」图标，展开时换成「关闭」（X）。 */
+    private var settingsButton: ImageView? = null
     private var progressBar: LyricProgressBar? = null
     private var settingsPanel: View? = null
     private var colorPanel: View? = null
     private var colorMode = 0
+
+    // 设置面板重做（2026-10-10）后需要回填选中态与读数的控件引用。
+    // 原生 View 没有数据绑定，只能显式持有引用在 applyConfig / 回调里刷新。
+    private var colorModeSeg: SegmentControl? = null
+    private var lineCountSeg: SegmentControl? = null
+    /** 四个预设色块的外框 + 第 5 个「自定义」外框：选中时点亮描边环。 */
+    private var presetFrames: List<View> = emptyList()
+    /** 「自定义」色块的渐变本体：随自定义槽位实时重画。 */
+    private var customSwatchView: View? = null
+    // 自定义配色槽位。拖色相/未唱写这里，**不写** gradientStart 那份 ——
+    // 预设是常量不能被拖坏，第 5 个「自定义」色块读的就是这份。
+    private var customStart = 0xFF00E5FF.toInt()
+    private var customEnd = 0xFFFF00FF.toInt()
+    private var customUnplayed = 0xFFFFFFFF.toInt()
+
+    // ===== 面板内容反色（背景不透明度 < 50 时整套面板切深色，见 applyPanelTheme）=====
+    // 悬浮窗读不到下层像素（跨应用无免权限方案），无法按背景亮度自适应；
+    // 但深色底一旦透明，下层十有八九是浅色壁纸/浅色应用，白字必然不可读 ——
+    // 用户拍板：不透明度低于 50 就直接反色，这是能落地的最优规则。
+    private var panelDarkContent = false
+    private val themedValueViews = mutableListOf<TextView>()
+    private val themedLabelViews = mutableListOf<TextView>()
+    private val themedIconViews = mutableListOf<ImageView>()
+    private val themedTextButtons = mutableListOf<TextView>()
+    private val themedThumbs = mutableListOf<SeekBar>()
+    private val themedSegments = mutableListOf<SegmentControl>()
+    /**
+     * 最近一次选中的预设下标（**记忆**，不是"当前亮哪个环"）。
+     *
+     * 环点亮哪一个由 [matchedPresetIndex] 按真实颜色值算出来；本字段只用于
+     * 「切回预设配色时恢复哪一组」—— 进入自调颜色后**不清零**，
+     * 否则用户切回来时没有任何依据可恢复。
+     */
+    private var lastPresetIndex = 0
+    private var fontSizeValue: TextView? = null
+    private var opacityValue: TextView? = null
+    private var sungHueValue: TextView? = null
+    private var unsungHueValue: TextView? = null
 
     companion object {
         private const val TAG = "FloatingLyricService"
@@ -132,6 +189,14 @@ class FloatingLyricService : Service() {
         const val EXTRA_GRADIENT_START = "gradientStart"
         const val EXTRA_GRADIENT_END = "gradientEnd"
         const val EXTRA_UNPLAYED_COLOR = "unplayedColor"
+        /** 配色模式：0 = 预设配色，1 = 自调颜色（与 Dart 侧 kColorMode* 一致）。 */
+        const val EXTRA_COLOR_MODE = "colorMode"
+        /** 最近选中的预设下标；切回预设配色时据此恢复。 */
+        const val EXTRA_PRESET_INDEX = "activePreset"
+        /** 自定义配色槽位：拖色相/未唱写这里，预设永远是常量。 */
+        const val EXTRA_CUSTOM_GRAD_START = "customStart"
+        const val EXTRA_CUSTOM_GRAD_END = "customEnd"
+        const val EXTRA_CUSTOM_UNPLAYED = "customUnplayed"
         const val EXTRA_IS_PLAYING = "isPlaying"
 
         val PRESETS = listOf(
@@ -140,6 +205,10 @@ class FloatingLyricService : Service() {
             0xFF00E676.toInt() to 0xFF00B0FF.toInt(),
             0xFFFFFFFF.toInt() to 0xFFFFFFFF.toInt()
         )
+
+        /// 预设自带的未唱色。卡拉OK二分色里"未唱"就该是白的，否则和已唱分不开；
+        /// 选任何预设都会把未唱色重置回这个值（用户要求：预设的未唱为白色）。
+        const val PRESET_UNPLAYED = 0xFFFFFFFF.toInt()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -229,7 +298,12 @@ class FloatingLyricService : Service() {
                     intent.getBooleanExtra(EXTRA_LOCKED, locked),
                     intent.getIntExtra(EXTRA_GRADIENT_START, gradientStart),
                     intent.getIntExtra(EXTRA_GRADIENT_END, gradientEnd),
-                    intent.getIntExtra(EXTRA_UNPLAYED_COLOR, unplayedColor)
+                    intent.getIntExtra(EXTRA_UNPLAYED_COLOR, unplayedColor),
+                    intent.getIntExtra(EXTRA_COLOR_MODE, colorMode),
+                    intent.getIntExtra(EXTRA_PRESET_INDEX, lastPresetIndex),
+                    intent.getIntExtra(EXTRA_CUSTOM_GRAD_START, customStart),
+                    intent.getIntExtra(EXTRA_CUSTOM_GRAD_END, customEnd),
+                    intent.getIntExtra(EXTRA_CUSTOM_UNPLAYED, customUnplayed)
                 )
             }
             ACTION_SET_PLAYING -> {
@@ -271,7 +345,9 @@ class FloatingLyricService : Service() {
     /// 可空参数 = 字段不变（保持与 intent extra 缺省语义一致）
     fun handleSetConfig(fontSize: Float?, displayScale: Float?, doubleLine: Boolean?,
                         opacity: Int?, locked: Boolean?,
-                        gradientStart: Int?, gradientEnd: Int?, unplayedColor: Int?) {
+                        gradientStart: Int?, gradientEnd: Int?, unplayedColor: Int?,
+                        colorMode: Int?, activePreset: Int?,
+                        customStart: Int?, customEnd: Int?, customUnplayed: Int?) {
         fontSize?.let { fontSizeSp = it }
         displayScale?.let { this.displayScale = it }
         doubleLine?.let { this.doubleLine = it }
@@ -285,6 +361,11 @@ class FloatingLyricService : Service() {
         gradientStart?.let { this.gradientStart = it }
         gradientEnd?.let { this.gradientEnd = it }
         unplayedColor?.let { this.unplayedColor = it }
+        colorMode?.let { this.colorMode = if (it == 1) 1 else 0 }
+        activePreset?.let { this.lastPresetIndex = it.coerceIn(0, PRESETS.size - 1) }
+        customStart?.let { this.customStart = it }
+        customEnd?.let { this.customEnd = it }
+        customUnplayed?.let { this.customUnplayed = it }
         applyConfig()
     }
 
@@ -311,8 +392,7 @@ class FloatingLyricService : Service() {
 
         if (locked) {
             // Collapse expanded panel when locking
-            expanded = false
-            expandedPanel?.visibility = View.GONE
+            setExpanded(false, animate = false)
 
             // Add FLAG_NOT_TOUCHABLE for click-through
             p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -348,12 +428,18 @@ class FloatingLyricService : Service() {
         (rootView?.background as? GradientDrawable)?.apply {
             setColor(bgColor)
         }
+        // GradientDrawable.setColor 只改 Drawable 自身状态，**不会让宿主重绘**；
+        // 而末尾的 updateLyric 在歌词文本未变时是幂等的（不 setText、不 invalidate）。
+        // 两条路都不重绘 ⇒ 从设置页改不透明度时悬浮窗"没反应"。必须补这一刀。
+        rootView?.invalidate()
 
-        // Contrast optimization: pass opacity to text views for shadow adjustment
-        lyricText1?.setOpacityForContrast(opacity)
-        lyricText2?.setOpacityForContrast(opacity)
+        // 背景不透明度跨越 50% 阈值时整套面板内容反色（白 ↔ 深色）
+        applyPanelTheme()
 
         progressBar?.setGradient(gradientStart, gradientEnd, unplayedColor)
+        // 面板读数与选中态跟着配置走：Dart 侧下发新配置时，悬浮窗内的面板
+        // 也不会停留在旧值上（两端共用同一份状态是本项目的既有约定）。
+        refreshPanelReadouts()
         updateLyric(lyricText1?.text?.toString() ?: "", lyricText2?.text?.toString())
     }
 
@@ -464,28 +550,39 @@ class FloatingLyricService : Service() {
     private fun createFloatingView(): Boolean {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
+        // ===== 唯一容器 =====
+        // 背景 / 圆角 / 描边 / 内边距只在这一层定义，上下两区都是它的直接子视图。
+        // 之前是「rootView 半透明底」+「展开区再叠一层实心黑底」两层叠加，真机上
+        // 被看成上下割裂的两块（一块透、一块黑），故合并成单层（2026-10-10）。
+        // 不透明度仍然只作用于这唯一一层底色 —— 那本来就是这项设置的语义。
         rootView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = dp(16).toFloat()
                 setColor(0xCC000000.toInt())
+                // 不描边：那圈 1dp 白色轮廓线在浅色壁纸上很扎眼（用户要求去掉）
             }
             setPadding(dp(20), dp(12), dp(20), dp(12))
             gravity = Gravity.CENTER_HORIZONTAL
-            setOnClickListener { toggleExpanded() }
         }
         val root = rootView as LinearLayout
 
-        // ===== collapsed panel: lyric only =====
-        collapsedPanel = LinearLayout(this).apply {
+        // ===== 上区：歌词预览，常驻可见 =====
+        // 注意：这里**不能** setOnClickListener —— 一旦可点击，View.onTouchEvent
+        // 就会消费掉整条事件序列，歌词区上按住拖动悬浮窗就失效了（拖动监听挂在 root
+        // 上，靠子视图不消费才收得到）。展开/收起改由 root 的触摸监听按下点落在
+        // 哪个区来决定，见 setupTouchListener。
+        lyricArea = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        val col = collapsedPanel as LinearLayout
+        val col = lyricArea as LinearLayout
 
         // 窗口宽度固定：随文字变化宽度会触发 WindowManager 重定位
         // （先瞬移后动画回中）。固定后 gravity 居中恒成立，永不跳动。
-        windowWidthPx = resources.displayMetrics.widthPixels - dp(32)
+        // 只留 16dp 边距：5 个色块（预设×4 + 自定义）+ 分段控件要在内容区排下，
+        // 32dp 时第 5 个色块被裁掉（2026-10-10 用户反馈）。
+        windowWidthPx = resources.displayMetrics.widthPixels - dp(16)
         val fixedWindowWidth = windowWidthPx
 
         // 歌词文本最大宽度：窗口宽减去根 padding(20×2)，LinearLayout 约束实际生效，
@@ -513,13 +610,24 @@ class FloatingLyricService : Service() {
         col.addView(lyricText2)
         root.addView(col)
 
-        // ===== expanded panel =====
-        expandedPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
+        // ===== 下区：操作面板 =====
+        // 两层结构：外层 controlHolder 承担"露出多少"（高度动画的作用点），
+        // 内层 controlInner 是真实内容。收缩时内层保持自然高度、被外层裁掉，
+        // 于是观感是"从上往下展开"；把动画直接作用在内层会让它被压扁，
+        // 按钮行和滑块会在动画中途变形抖动。
+        val holder = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0
+            )
+            setClipChildren(true)
             visibility = View.GONE
         }
-        val exp = expandedPanel as LinearLayout
+        controlHolder = holder
+        controlInner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val exp = controlInner as LinearLayout
 
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -532,9 +640,12 @@ class FloatingLyricService : Service() {
         val prevButton = makeIconButton(android.R.drawable.ic_media_previous) { sendAction("previous") }
         playPauseButton = makeIconButton(android.R.drawable.ic_media_play) { sendAction("play") }
         val nextButton = makeIconButton(android.R.drawable.ic_media_next) { sendAction("next") }
-        val settingsButton = makeIconButton(android.R.drawable.ic_menu_preferences) { toggleSettingsPanel() }
+        val settingsBtn = makeIconButton(android.R.drawable.ic_menu_preferences) { toggleSettingsPanel() }
+        // 存引用：设置面板开合时这颗按钮要在「设置」与「关闭」之间换图标，
+        // 见 applySettingsButtonIcon()。
+        settingsButton = settingsBtn
 
-        listOf(lockButton, prevButton, playPauseButton, nextButton, settingsButton).forEach {
+        listOf(lockButton, prevButton, playPauseButton, nextButton, settingsBtn).forEach {
             val lp = LinearLayout.LayoutParams(iconSize + iconPad * 2, iconSize + iconPad * 2)
             lp.setMargins(dp(6), 0, dp(6), 0)
             buttonRow.addView(it, lp)
@@ -552,7 +663,14 @@ class FloatingLyricService : Service() {
         settingsPanel = createSettingsPanel()
         exp.addView(settingsPanel)
 
-        root.addView(expandedPanel)
+        holder.addView(
+            exp,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(holder)
 
         setupTouchListener(root)
 
@@ -602,7 +720,8 @@ class FloatingLyricService : Service() {
         val p = params ?: return
         val wm = windowManager ?: return
 
-        val newWidth = resources.displayMetrics.widthPixels - dp(32)
+        // 与 createFloatingView 的初始宽度保持同一条规则（screen - 16dp）
+        val newWidth = resources.displayMetrics.widthPixels - dp(16)
         val newMaxWidth = newWidth - dp(40)
         windowWidthPx = newWidth
         lyricMaxWidthPx = newMaxWidth
@@ -627,12 +746,156 @@ class FloatingLyricService : Service() {
     private fun toggleExpanded() {
         if (isDragging) return
         if (locked) return  // Can't expand when locked
-        expanded = !expanded
-        expandedPanel?.visibility = if (expanded) View.VISIBLE else View.GONE
+        setExpanded(!expanded, animate = true)
+    }
+
+    /// 展开 / 收起下区。
+    ///
+    /// 动画只改 [controlHolder] 的高度，窗口本身是 `gravity=TOP + WRAP_CONTENT`，
+    /// 高度变化时顶边不动、底边延伸 —— 面板整体位置稳定，不会上下跳。
+    private fun setExpanded(expand: Boolean, animate: Boolean) {
+        expanded = expand
+        val holder = controlHolder ?: return
+        val natural = measureControlHeight()
+        val from = if (holder.visibility == View.GONE) 0 else currentControlHeight()
+        val to = if (expand) natural else 0
+
+        cancelHeightAnimation()
+        if (!animate || natural <= 0 || from == to) {
+            applyControlHeight(to)
+            holder.visibility = if (expand) View.VISIBLE else View.GONE
+            holder.alpha = 1f
+            releaseControlHeight(holder, to == 0)
+            return
+        }
+
+        runControlHeightAnimation(from, to, natural) {
+            if (to == 0) holder.visibility = View.GONE
+            holder.alpha = 1f
+            releaseControlHeight(holder, to == 0)
+        }
     }
 
     private fun toggleSettingsPanel() {
-        settingsPanel?.visibility = if (settingsPanel?.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        val panel = settingsPanel ?: return
+        panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        applySettingsButtonIcon()
+        // 设置面板开合会改变下区高度，同样走高度动画，避免窗口高度瞬跳
+        syncControlHeight()
+    }
+
+    /// 底部那颗「设置」按钮的图标跟着设置面板的开合走：收起 → 设置（扳手），
+    /// 展开 → X。
+    ///
+    /// 同一个按钮既是入口也是出口 —— 面板展开后满屏都是滑块，用户第一反应是
+    /// 回到刚才那个按钮上把它关掉；图标不变的话没人知道它现在就是"关闭"。
+    private fun applySettingsButtonIcon() {
+        val opened = settingsPanel?.visibility == View.VISIBLE
+        settingsButton?.setImageResource(
+            if (opened) android.R.drawable.ic_menu_close_clear_cancel
+            else android.R.drawable.ic_menu_preferences
+        )
+    }
+
+    /// 下区内容高度变了（开合设置面板 / 自调颜色区、配色模式切换）之后，
+    /// 把 [controlHolder] 的高度重新对齐到内容自然高度，走同一套动画。
+    ///
+    /// 收起态（[expanded] == false）直接返回：此时 holder 本就该是 GONE/0，
+    /// 而 [measureControlHeight] 量的是内容自然高度，套上去会把收起态撑开。
+    private fun syncControlHeight(animate: Boolean = true) {
+        if (!expanded) return
+        val target = measureControlHeight()
+        val current = currentControlHeight()
+        if (current == target) return
+        if (!animate) {
+            applyControlHeight(target)
+            controlHolder?.let { releaseControlHeight(it, false) }
+            return
+        }
+        runControlHeightAnimation(current, target, target) {
+            controlHolder?.let { releaseControlHeight(it, false) }
+        }
+    }
+
+    /// 下区当前的实际高度。
+    ///
+    /// 展开稳定态下 `layoutParams.height` 是 `WRAP_CONTENT(-2)`，直接拿它当动画
+    /// 起点会得到 -2 —— 必须退回实测高度。
+    private fun currentControlHeight(): Int {
+        val holder = controlHolder ?: return 0
+        val lp = holder.layoutParams ?: return 0
+        return if (lp.height >= 0) lp.height else holder.measuredHeight
+    }
+
+    /// 把 [controlHolder] 的高度设为 [h] 并请求重排。
+    private fun applyControlHeight(h: Int) {
+        val holder = controlHolder ?: return
+        val lp = holder.layoutParams
+            ?: LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, h
+            ).also { holder.layoutParams = it }
+        lp.height = h
+        holder.requestLayout()
+    }
+
+    /// 动画期间 [controlInner] 被钉成固定高度（外层裁切而非压缩），
+    /// 结束后交还给 WRAP_CONTENT —— 否则之后开合设置面板就长不高了。
+    private fun releaseControlHeight(holder: FrameLayout, collapsed: Boolean) {
+        controlInner?.layoutParams?.height = ViewGroup.LayoutParams.WRAP_CONTENT
+        holder.layoutParams?.height =
+            if (collapsed) 0 else ViewGroup.LayoutParams.WRAP_CONTENT
+        holder.requestLayout()
+    }
+
+    /// 中断在跑的高度动画。
+    ///
+    /// `cancel()` 会补触发一次 `onAnimationEnd`，如果回调还挂着，旧动画的收尾逻辑
+    /// （设 GONE / 交还 WRAP_CONTENT）会抢在新动画前面执行 —— 必须先摘回调再 cancel。
+    private fun cancelHeightAnimation() {
+        heightAnimator?.apply {
+            removeAllListeners()
+            removeAllUpdateListeners()
+            cancel()
+        }
+        heightAnimator = null
+    }
+
+    private fun runControlHeightAnimation(from: Int, to: Int, natural: Int, onEnd: () -> Unit) {
+        val holder = controlHolder ?: return
+        val inner = controlInner ?: return
+        cancelHeightAnimation()
+
+        holder.visibility = View.VISIBLE
+        // 钉住内层高度：这样外层收缩时只是裁掉它，不会把内容压扁
+        inner.layoutParams?.height = natural
+        inner.requestLayout()
+
+        val expanding = to > from
+        heightAnimator = ValueAnimator.ofInt(from, to).apply {
+            duration = 220
+            interpolator = AccelerateDecelerateInterpolator()
+            addUpdateListener {
+                applyControlHeight(it.animatedValue as Int)
+                holder.alpha = if (expanding) it.animatedFraction else 1f
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    applyControlHeight(to)
+                    onEnd()
+                }
+            })
+            start()
+        }
+    }
+
+    /// 量出下区在**当前内容**下的自然高度（设置面板开合会改变它）。
+    private fun measureControlHeight(): Int {
+        val inner = controlInner ?: return 0
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(
+            (windowWidthPx - dp(40)).coerceAtLeast(0), View.MeasureSpec.EXACTLY
+        )
+        inner.measure(widthSpec, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+        return inner.measuredHeight
     }
 
     private fun createSettingsPanel(): View {
@@ -642,44 +905,73 @@ class FloatingLyricService : Service() {
             visibility = View.GONE
         }
 
-        val modeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+        // ---- 配色模式：分段控件（原来是两个外观完全一致的胶囊按钮，
+        //      没有任何选中态，用户在真机上根本看不出当前处于哪个模式）----
+        val modeSeg = SegmentControl(listOf("预设配色", "自调颜色")) { index ->
+            switchColorMode(index)
         }
-        val presetBtn = makeTextButton("预设配色") { switchColorMode(0) }
-        val customBtn = makeTextButton("自调颜色") { switchColorMode(1) }
-        modeRow.addView(presetBtn)
-        modeRow.addView(customBtn)
-        root.addView(modeRow)
+        colorModeSeg = modeSeg
+        root.addView(modeSeg)
 
+        // ---- 预设色板 ----
         val presetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(8))
+            setPadding(0, dp(10), 0, dp(6))
         }
-        PRESETS.forEach { (start, end) ->
-            val v = View(this).apply {
-                val size = dp(32)
-                layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                    setMargins(dp(6), 0, dp(6), 0)
+        // 四个预设是**常量**，色块永远画 PRESETS 里的颜色 —— 拖色相写的是
+        // 自定义槽位，绝不会污染这里（用户要求：预设色不能改）。
+        val presetList = PRESETS.mapIndexed { index, pair ->
+            val start = pair.first
+            val end = pair.second
+            // 外层 FrameLayout 只负责"选中环"，内层才是渐变块本身。
+            // 原实现在同一个 GradientDrawable 上先 setColor(start) 又换 background，
+            // 结果真机上四个色块全是单色，双色渐变压根没渲染出来。
+            val frame = FrameLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(46), dp(46)).apply {
+                    setMargins(dp(4), 0, dp(4), 0)
                 }
-                background = GradientDrawable().apply {
-                    cornerRadius = dp(6).toFloat()
-                    setColor(start)
-                    val g = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(start, end))
-                    g.cornerRadius = dp(6).toFloat()
-                    background = g
-                }
-                setOnClickListener {
-                    gradientStart = start
-                    gradientEnd = end
-                    sendConfigUpdate()
-                    applyConfig()
-                }
+                setOnClickListener { selectPreset(index) }
             }
-            presetRow.addView(v)
+            val swatch = View(this).apply {
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    intArrayOf(start, end)
+                ).apply { cornerRadius = dp(9).toFloat() }
+            }
+            frame.addView(
+                swatch,
+                FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER)
+            )
+            presetRow.addView(frame)
+            frame
         }
+
+        // ---- 第 5 个：自定义 ----
+        // 画的是**自定义槽位**当前的颜色，随自调结果实时重画（refreshCustomSwatch）；
+        // 点击 = 应用自定义槽位并切到「自调颜色」。
+        val customFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(46), dp(46)).apply {
+                setMargins(dp(4), 0, dp(4), 0)
+            }
+            setOnClickListener { applyCustomColors() }
+        }
+        customSwatchView = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                intArrayOf(customStart, customEnd)
+            ).apply { cornerRadius = dp(9).toFloat() }
+        }
+        customFrame.addView(
+            customSwatchView,
+            FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER)
+        )
+        presetRow.addView(customFrame)
+
+        // 选中环的下标空间 = 4 个预设 + 1 个自定义（index == PRESETS.size）
+        presetFrames = presetList + customFrame
         root.addView(presetRow)
+        refreshPresetSelection()
 
         colorPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -688,108 +980,295 @@ class FloatingLyricService : Service() {
         }
         val cp = colorPanel as LinearLayout
 
-        val sungRow = makeColorSeekRow("已唱", gradientStart, onColor = { color ->
-            // 拖动中仅预览（赋值+重绘），松手才 sendConfigUpdate 持久化
+        // 自调颜色：拖动「已唱」会把渐变两端并成同一个色（渐变异构为单色），
+        // 这是既有行为，面板不做改变，但读数会如实反映当前色相。
+        val sungPair = makeColorSeekRow("已唱", gradientStart, onColor = { color ->
+            // 拖动中仅预览（赋值+重绘），松手才 sendConfigUpdate 持久化。
+            // 写的是**自定义槽位** + 当前生效渐变；预设是常量，永远不会被这里改到。
             gradientStart = color
             gradientEnd = color
+            customStart = color
+            customEnd = color
+            colorMode = 1
             applyConfig()
         }, onCommitted = {
             sendConfigUpdate()
         })
-        val unsungRow = makeColorSeekRow("未唱", unplayedColor, onColor = { color ->
+        val unsungPair = makeColorSeekRow("未唱", unplayedColor, onColor = { color ->
+            // 未唱色也是自调的一部分：预设模式下的未唱固定为白，
+            // 拖这个滑块就等于进入「自调颜色」。
             unplayedColor = color
+            customUnplayed = color
+            colorMode = 1
             applyConfig()
         }, onCommitted = {
             sendConfigUpdate()
         })
-        cp.addView(sungRow)
-        cp.addView(unsungRow)
+        sungHueValue = sungPair.second
+        unsungHueValue = unsungPair.second
+        cp.addView(sungPair.first)
+        cp.addView(unsungPair.first)
         root.addView(cp)
 
-        // Opacity slider
-        val opacityRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        val opacityLabel = TextView(this).apply {
-            text = "透明度"
-            setTextColor(0xFFCCCCCC.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            layoutParams = LinearLayout.LayoutParams(dp(50), ViewGroup.LayoutParams.WRAP_CONTENT)
-        }
-        val opacitySeek = SeekBar(this).apply {
-            max = 100
-            progress = opacity
-            progressDrawable = GradientDrawable().apply {
-                setColor(0xFF888888.toInt())
-                cornerRadius = dp(2).toFloat()
-            }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        // 拖动中仅实时预览：持久化在松手时一次性完成
-                        // （每次移动都 sendConfigUpdate 会触发通道往返+写盘风暴）
-                        opacity = progress
-                        applyConfig()
-                    }
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    sendConfigUpdate()
-                }
-            })
-        }
-        opacityRow.addView(opacityLabel)
-        opacityRow.addView(opacitySeek)
-        root.addView(opacityRow)
+        // ---- 不透明度 ----
+        // 轨道从"全透"渐变到"近全黑"，滑块停在哪、悬浮窗背景就是哪个值。
+        // 原来是一条灰色矩形，看不出和透明度有什么关系。
+        val opacityPair = makeValueSeekRow(
+            label = "不透明度",
+            max = 100,
+            initial = opacity,
+            trackColors = intArrayOf(0x00000000, 0xEB000000.toInt()),
+            format = { "$it%" },
+            onValue = { value ->
+                // 拖动中仅实时预览：持久化在松手时一次性完成
+                // （每次移动都 sendConfigUpdate 会触发通道往返 + 写盘风暴）
+                opacity = value
+                applyConfig()
+            },
+            onCommitted = { sendConfigUpdate() }
+        )
+        opacityValue = opacityPair.second
+        root.addView(opacityPair.first)
 
-        // Font size + double line
-        val bottomRow = LinearLayout(this).apply {
+        // ---- 字号：A− / 当前值 / A+ ----
+        // 中间常驻读数。原来只有两个按钮，拖到一半完全不知道当前是几号字。
+        val fontRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(8), 0, dp(4))
         }
-        bottomRow.addView(makeTextButton("A-") {
+        fontRow.addView(makeTextButton("A−") {
             fontSizeSp = (fontSizeSp - 2f).coerceAtLeast(12f)
             sendConfigUpdate()
             applyConfig()
         })
-        bottomRow.addView(makeTextButton("A+") {
+        fontSizeValue = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            themedValueViews.add(this)
+        }
+        fontRow.addView(
+            fontSizeValue,
+            LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+        fontRow.addView(makeTextButton("A+") {
             fontSizeSp = (fontSizeSp + 2f).coerceAtMost(32f)
             sendConfigUpdate()
             applyConfig()
         })
-        val doubleBtn = makeTextButton(if (doubleLine) "单行" else "双行") {
-            doubleLine = !doubleLine
-            (it as TextView).text = if (doubleLine) "单行" else "双行"
+        root.addView(fontRow)
+
+        // ---- 行式：分段控件 ----
+        // 原来是一个按钮，文案写的是"点一下会变成什么"（当前单行时它写着「双行」），
+        // 极易读反；换成显示"当前是什么"的分段控件。
+        val lineSeg = SegmentControl(listOf("单行", "双行")) { index ->
+            doubleLine = index == 1
             sendConfigUpdate()
             applyConfig()
         }
-        bottomRow.addView(doubleBtn)
-        root.addView(bottomRow)
+        lineSeg.select(if (doubleLine) 1 else 0, notify = false)
+        lineCountSeg = lineSeg
+        root.addView(
+            lineSeg,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(4), 0, 0) }
+        )
 
         return root
     }
 
+    /// 切换配色模式。
+    ///
+    /// 「预设配色」→ 恢复 [lastPresetIndex] 那一组（未唱 = 白）；
+    /// 「自调颜色」→ 恢复自定义槽位。两个方向都可逆，且不会出现
+    /// "模式显示 A、颜色却是 B"的错位。
     private fun switchColorMode(mode: Int) {
-        colorMode = mode
-        colorPanel?.visibility = if (mode == 1) View.VISIBLE else View.GONE
+        colorMode = if (mode == 1) 1 else 0
+        if (colorMode == 0) {
+            val pair = PRESETS[lastPresetIndex.coerceIn(0, PRESETS.size - 1)]
+            gradientStart = pair.first
+            gradientEnd = pair.second
+            unplayedColor = PRESET_UNPLAYED
+        } else {
+            gradientStart = customStart
+            gradientEnd = customEnd
+            unplayedColor = customUnplayed
+        }
+        applyColorModeUi()
+        syncControlHeight()
+        applyConfig()
+        sendConfigUpdate()
     }
 
-    /// 颜色滑杆：拖动中实时预览颜色（仅赋值+重绘），松手才提交（sendConfigUpdate）
-    private fun makeColorSeekRow(label: String, initialColor: Int, onColor: (Int) -> Unit, onCommitted: () -> Unit): LinearLayout {
+    /// 选中一组预设：未唱色一并重置为白，同时把配色模式切回「预设配色」。
+    ///
+    /// 预设是**常量** —— 这里只读 [PRESETS]，拖色相产生的一切都进自定义槽位。
+    /// 「未唱为白」也是预设的一部分，不重置的话卡拉OK已唱/未唱分不开。
+    private fun selectPreset(index: Int) {
+        val pair = PRESETS.getOrNull(index) ?: return
+        lastPresetIndex = index
+        colorMode = 0
+        gradientStart = pair.first
+        gradientEnd = pair.second
+        unplayedColor = PRESET_UNPLAYED
+        applyColorModeUi()
+        // 点预设会把「自调颜色」区收起来（那属于自调模式），下区高度随之缩短
+        syncControlHeight()
+        applyConfig()
+        sendConfigUpdate()
+    }
+
+    /// 应用自定义槽位（第 5 个「自定义」色块 / 切到「自调颜色」）。
+    private fun applyCustomColors() {
+        colorMode = 1
+        gradientStart = customStart
+        gradientEnd = customEnd
+        unplayedColor = customUnplayed
+        applyColorModeUi()
+        // 从预设模式切过来会把「自调颜色」区展开，下区高度随之变长
+        syncControlHeight()
+        applyConfig()
+        sendConfigUpdate()
+    }
+
+    /// 把 [colorMode] 落到分段控件与「自调颜色」区的可见性上。
+    /// 这是一个纯 UI 回填动作，任何改动模式的路径都必须过它，避免两处各写一份。
+    private fun applyColorModeUi() {
+        colorModeSeg?.select(colorMode, notify = false)
+        colorPanel?.visibility = if (colorMode == 1) View.VISIBLE else View.GONE
+    }
+
+    /// 回填"当前命中哪个预设"的选中环。
+    ///
+    /// 选中态跟**配色模式**走（模式才是唯一真相）：
+    ///   - 预设配色 → 按真实颜色值匹配四个预设（理论上恒命中 lastPresetIndex）；
+    ///   - 自调颜色 → 只亮第 5 个「自定义」，且要求当前渐变确实等于自定义槽位。
+    /// 这样 Dart 侧改颜色下发过来时环会自动跟着动，两端不会各亮各的。
+    private fun refreshPresetSelection() {
+        presetFrames.forEachIndexed { index, frame ->
+            val selected = if (colorMode == 0) {
+                index < PRESETS.size && index == matchedPresetIndex()
+            } else {
+                index == PRESETS.size &&
+                    gradientStart == customStart && gradientEnd == customEnd
+            }
+            frame.background = GradientDrawable().apply {
+                cornerRadius = dp(13).toFloat()
+                setColor(Color.TRANSPARENT)
+                if (selected) {
+                    // 选中环跟面板主题走：反色态用深色，浅色壁纸上才可见
+                    setStroke(dp(2), panelMainColor())
+                }
+            }
+        }
+    }
+
+    /// 重画「自定义」色块：画的是自定义槽位当前的颜色，随自调结果实时变。
+    private fun refreshCustomSwatch() {
+        customSwatchView?.background = GradientDrawable(
+            GradientDrawable.Orientation.LEFT_RIGHT,
+            intArrayOf(customStart, customEnd)
+        ).apply { cornerRadius = dp(9).toFloat() }
+    }
+
+    /// 当前渐变**实际等于**哪一组预设；都不等（自定义配色）时返回 -1。
+    private fun matchedPresetIndex(): Int =
+        PRESETS.indexOfFirst {
+            it.first == gradientStart && it.second == gradientEnd
+        }
+
+    /// 面板内容主色（文字 / 图标 / 滑块 / 选中环）：反色态深灰，常态白。
+    private fun panelMainColor(): Int =
+        if (panelDarkContent) 0xFF1B1B1B.toInt() else 0xFFFFFFFF.toInt()
+
+    /// 面板标签次要色：反色态深灰，常态浅灰。
+    private fun panelLabelColor(): Int =
+        if (panelDarkContent) 0xFF666666.toInt() else 0xFFCCCCCC.toInt()
+
+    /// 面板内容反色：背景不透明度 < 50 时，深色底几乎全透，白字落在浅色
+    /// 壁纸上完全不可读 —— 此时整套面板内容（文字 / 图标 / 滑块 / 分段控件 /
+    /// 选中环 / 根容器描边）切深色。只在**跨越 50% 阈值**时重刷一次，
+    /// 拖动不透明度滑块不会反复重设 thumb（thumb 重设会让拖动中的 SeekBar 跳）。
+    private fun applyPanelTheme() {
+        val dark = opacity < 50
+        if (dark == panelDarkContent) return
+        panelDarkContent = dark
+        val main = panelMainColor()
+        val label = panelLabelColor()
+        themedValueViews.forEach { it.setTextColor(main) }
+        themedLabelViews.forEach { it.setTextColor(label) }
+        themedIconViews.forEach { it.setColorFilter(main) }
+        themedTextButtons.forEach { btn ->
+            btn.setTextColor(main)
+            btn.background = GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(if (dark) 0x33000000 else 0x33FFFFFF)
+                setStroke(
+                    1,
+                    android.content.res.ColorStateList.valueOf(
+                        if (dark) 0x55000000 else 0x55FFFFFF
+                    )
+                )
+            }
+        }
+        themedThumbs.forEach { it.thumb = sliderThumb(main) }
+        themedSegments.forEach { it.applyTheme(dark) }
+        refreshPresetSelection()
+    }
+
+    /// 刷新面板上所有读数（字号 / 不透明度 / 色相 / 行式）。
+    ///
+    /// 由 [applyConfig] 统一调用 —— 这样 Dart 侧改配置下发过来时，
+    /// 悬浮窗内的面板读数也会跟着变，不会出现"两边显示不一致"。
+    private fun refreshPanelReadouts() {
+        fontSizeValue?.text = "${fontSizeSp.roundToInt()} sp"
+        opacityValue?.text = "$opacity%"
+        val sungHsv = FloatArray(3)
+        Color.colorToHSV(gradientStart, sungHsv)
+        val unsungHsv = FloatArray(3)
+        Color.colorToHSV(unplayedColor, unsungHsv)
+        sungHueValue?.text = "${sungHsv[0].roundToInt().coerceIn(0, 360)}°"
+        unsungHueValue?.text = "${unsungHsv[0].roundToInt().coerceIn(0, 360)}°"
+        lineCountSeg?.select(if (doubleLine) 1 else 0, notify = false)
+        // 模式与预设选中环同样跟着配置走：Dart 侧换了配色/模式，原生面板的
+        // 分段控件、自调区开合、色板选中环必须一起动，否则两端显示不一致。
+        applyColorModeUi()
+        refreshPresetSelection()
+        // 「自定义」色块画的是自定义槽位的颜色，Dart 侧自调后要跟着重画
+        refreshCustomSwatch()
+    }
+
+    /// 颜色滑杆：拖动中实时预览颜色（仅赋值+重绘），松手才提交（sendConfigUpdate）。
+    ///
+    /// 返回 (行, 色相读数 TextView)，调用方持有读数，交给 [refreshPanelReadouts]
+    /// 统一回填 —— Dart 侧改配置下发过来时读数才会跟着动。
+    private fun makeColorSeekRow(
+        label: String,
+        initialColor: Int,
+        onColor: (Int) -> Unit,
+        onCommitted: () -> Unit
+    ): Pair<LinearLayout, TextView> {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(4), 0, dp(4))
         }
         val tv = TextView(this).apply {
             text = label
             setTextColor(0xFFCCCCCC.toInt())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            layoutParams = LinearLayout.LayoutParams(dp(50), ViewGroup.LayoutParams.WRAP_CONTENT)
+            layoutParams = LinearLayout.LayoutParams(dp(52), ViewGroup.LayoutParams.WRAP_CONTENT)
+            themedLabelViews.add(this)
+        }
+        val value = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT)
+            themedValueViews.add(this)
         }
         // Convert ARGB color to HSV hue (0-360) for SeekBar initial position
         val hsv = FloatArray(3)
@@ -802,15 +1281,19 @@ class FloatingLyricService : Service() {
             val rainbow = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(
                 Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED
             ))
-            rainbow.cornerRadius = dp(2).toFloat()
-            progressDrawable = rainbow
+            rainbow.cornerRadius = dp(4).toFloat()
+            progressDrawable = insetTrack(rainbow)
+            thumb = sliderThumb(0xFFFFFFFF.toInt())
+            splitTrack = false
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            themedThumbs.add(this)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
                         val newHsv = floatArrayOf(progress.toFloat(), 1f, 1f)
                         onColor(Color.HSVToColor(newHsv))
                     }
+                    value.text = "${progress.coerceIn(0, 360)}°"
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
@@ -820,7 +1303,144 @@ class FloatingLyricService : Service() {
         }
         row.addView(tv)
         row.addView(seek)
-        return row
+        row.addView(value)
+        return row to value
+    }
+
+    /// SeekBar 的细轨道：GradientDrawable 本身没有固有高度，SeekBar 会把它
+    /// 拉伸到与 thumb 等高（真机上表现为一条很粗的色带）。套一层 InsetDrawable
+    /// 留出上下内边距，就能画出"细轨道 + 圆滑块"的现代外观。
+    private fun insetTrack(inner: Drawable): Drawable =
+        InsetDrawable(inner, 0, dp(5), 0, dp(5))
+
+    /// SeekBar 的圆滑块。系统默认 thumb 是 48dp 高的老式胶囊，必须换掉。
+    private fun sliderThumb(color: Int): Drawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setSize(dp(18), dp(18))
+        setColor(color)
+        setStroke(dp(2), 0x59000000)
+    }
+
+    /// 通用"标签 + 滑杆 + 读数"行（不透明度用）。
+    ///
+    /// [trackColors] 直接决定轨道外观：不透明度那条是从全透明渐变到近全黑的，
+    /// 滑块停在哪、悬浮窗背景就是哪个值 —— 比原来那条灰条诚实得多。
+    private fun makeValueSeekRow(
+        label: String,
+        max: Int,
+        initial: Int,
+        trackColors: IntArray,
+        format: (Int) -> String,
+        onValue: (Int) -> Unit,
+        onCommitted: () -> Unit
+    ): Pair<LinearLayout, TextView> {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        val tv = TextView(this).apply {
+            text = label
+            setTextColor(0xFFCCCCCC.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT)
+            themedLabelViews.add(this)
+        }
+        val value = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT)
+            themedValueViews.add(this)
+        }
+        val seek = SeekBar(this).apply {
+            this.max = max
+            progress = initial
+            val track = GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                trackColors
+            ).apply { cornerRadius = dp(4).toFloat() }
+            progressDrawable = insetTrack(track)
+            thumb = sliderThumb(0xFFFFFFFF.toInt())
+            splitTrack = false
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            themedThumbs.add(this)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) onValue(progress)
+                    value.text = format(progress)
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    onCommitted()
+                }
+            })
+        }
+        row.addView(tv)
+        row.addView(seek)
+        row.addView(value)
+        return row to value
+    }
+
+    /// 分段控件：一个圆角容器里并排若干等宽项，选中项填实底。
+    ///
+    /// 用来替代原来那排"长得一模一样、看不出选没选"的胶囊按钮（模式切换与
+    /// 行式切换）。原生没有现成组件，这里自己拼。
+    private inner class SegmentControl(
+        labels: List<String>,
+        private val onSelected: (Int) -> Unit
+    ) : LinearLayout(this@FloatingLyricService) {
+
+        private val items = mutableListOf<TextView>()
+        private var selectedIndex = 0
+
+        init {
+            orientation = HORIZONTAL
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            labels.forEachIndexed { index, label ->
+                val item = TextView(context).apply {
+                    text = label
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    gravity = Gravity.CENTER
+                    setPadding(dp(12), dp(7), dp(12), dp(7))
+                    setOnClickListener { select(index) }
+                }
+                addView(item, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+                items.add(item)
+            }
+            themedSegments.add(this)
+            applyTheme(panelDarkContent)
+        }
+
+        /** [notify] = false 用于程序化同步选中态，不会反过来触发业务回调。 */
+        fun select(index: Int, notify: Boolean = true) {
+            selectedIndex = index.coerceIn(0, items.size - 1)
+            applyTheme(panelDarkContent)
+            if (notify) onSelected(selectedIndex)
+        }
+
+        /// 按 [dark] 主题重画容器底与各选项；选中态填实底、未选中透底。
+        /// 反色（dark = 不透明度 < 50）时白系换成黑系，浅色壁纸上才看得清。
+        fun applyTheme(dark: Boolean) {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(19).toFloat()
+                setColor(if (dark) 0x2B000000 else 0x2BFFFFFF)
+            }
+            items.forEachIndexed { index, item ->
+                val on = index == selectedIndex
+                item.setTextColor(
+                    if (dark) (if (on) 0xFF1B1B1B.toInt() else 0xB3000000.toInt())
+                    else (if (on) 0xFFFFFFFF.toInt() else 0xB3FFFFFF.toInt())
+                )
+                item.background = GradientDrawable().apply {
+                    cornerRadius = dp(16).toFloat()
+                    setColor(
+                        if (on) (if (dark) 0x59000000 else 0x59FFFFFF)
+                        else Color.TRANSPARENT
+                    )
+                }
+            }
+        }
     }
 
     private fun makeTextButton(text: String, onClick: (View) -> Unit): TextView {
@@ -839,6 +1459,7 @@ class FloatingLyricService : Service() {
             val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             lp.setMargins(dp(6), 0, dp(6), 0)
             layoutParams = lp
+            themedTextButtons.add(this)
             setOnClickListener { onClick(this) }
         }
     }
@@ -848,6 +1469,7 @@ class FloatingLyricService : Service() {
             setImageResource(resId)
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setColorFilter(0xFFFFFFFF.toInt())
+            themedIconViews.add(this)
             setOnClickListener { onClick() }
         }
     }
@@ -871,9 +1493,18 @@ class FloatingLyricService : Service() {
             "doubleLine" to doubleLine,
             "opacity" to opacity,
             "locked" to locked,
-            "gradientStart" to gradientStart,
-            "gradientEnd" to gradientEnd,
-            "unplayedColor" to unplayedColor
+            // 颜色以**无符号 Long** 下发：Kotlin Int 的 ARGB 是负数
+            // （0xFFFF00FF.toInt() = -65281），直接放 map 到 Dart 侧就是负数，
+            // 回灌进 SharedPreferences / Color() 全是错色。转 Long（INT64 编码）
+            // 后 Dart 收到的是正确的无符号值。
+            "gradientStart" to (gradientStart.toLong() and 0xFFFFFFFFL),
+            "gradientEnd" to (gradientEnd.toLong() and 0xFFFFFFFFL),
+            "unplayedColor" to (unplayedColor.toLong() and 0xFFFFFFFFL),
+            "colorMode" to colorMode,
+            "activePreset" to lastPresetIndex,
+            "customStart" to (customStart.toLong() and 0xFFFFFFFFL),
+            "customEnd" to (customEnd.toLong() and 0xFFFFFFFFL),
+            "customUnplayed" to (customUnplayed.toLong() and 0xFFFFFFFFL)
         )
         if (engine != null) {
             io.flutter.plugin.common.MethodChannel(
@@ -894,6 +1525,11 @@ class FloatingLyricService : Service() {
                     initialTouchY = event.rawY
                     isDragging = false
                     dragStartTime = System.currentTimeMillis()
+                    // 记下按在哪个区：只有按在上区（歌词预览）的轻点才展开/收起，
+                    // 按下区（按钮行 / 进度条 / 设置面板）的空白处不该把面板收起来。
+                    touchOnLyricArea = lyricArea?.let {
+                        event.y >= it.top && event.y <= it.bottom
+                    } ?: false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -917,8 +1553,10 @@ class FloatingLyricService : Service() {
                                 .apply()
                         }
                     }
-                    if (!isDragging && System.currentTimeMillis() - dragStartTime < 300) {
-                        view.performClick()
+                    if (!isDragging && System.currentTimeMillis() - dragStartTime < 300 &&
+                        touchOnLyricArea
+                    ) {
+                        toggleExpanded()
                     }
                     isDragging = false
                     true
@@ -955,14 +1593,13 @@ class FloatingLyricService : Service() {
 /// Gradient text view with contrast optimization for low opacity
 ///
 /// 逐字二分色支持（KRC）：当前行携带 KRC 字级时间戳（karaokeActive 为 true）时，
-/// onDraw 中先画整行灰色（未唱色），再 clipRect 已唱宽度画渐变色，实现
-/// "已唱渐变 / 未唱灰"的二分色效果；无逐字时间戳（LRC/纯文本）时整行渐变色（保持原行为）
+/// onDraw 中先画整行白色（未唱色），再 clipRect 已唱宽度画渐变色，实现
+/// "已唱渐变 / 未唱白"的二分色效果；无逐字时间戳（LRC/纯文本）时整行渐变色（保持原行为）
 class GradientTextView(context: Context) : TextView(context) {
     private var startColor = 0xFF00E5FF.toInt()
     private var endColor = 0xFFFF00FF.toInt()
-    private var bgOpacity = 80
-    // 未唱色（灰色），用于逐字二分色模式下绘制未唱部分
-    private var unplayedColor = 0xFF666666.toInt()
+    // 未唱色（白色），用于逐字二分色模式下绘制未唱部分
+    private var unplayedColor = 0xFFFFFFFF.toInt()
 
     // P0: 缓存 LinearGradient shader，避免 onDraw 每帧新建对象引发 GC 卡顿。
     // shader 只与颜色和宽度相关，仅在它们变化时重建
@@ -1002,7 +1639,12 @@ class GradientTextView(context: Context) : TextView(context) {
 
     private val karaokeTickRunnable = Runnable {
         if (!karaokeActive) return@Runnable
-        invalidate()
+        // 熄屏时悬浮窗必然不可见（锁屏歌词是独立的 LockScreenLyricActivity，
+        // 不用本视图），跳过这次重绘可省掉整条 View 遍历 + 合成。
+        // 时钟不冻结：位置仍按 elapsedRealtime 估算，亮屏后下一拍直接补上正确
+        // 进度，无需额外同步（Dart 侧熄屏停 tick 见 desktop_lyric_service
+        // 的 _tickNeeded / onScreenStateChanged）。
+        if (FloatingLyricService.screenOn) invalidate()
         scheduleKaraokeTick()
     }
 
@@ -1071,14 +1713,15 @@ class GradientTextView(context: Context) : TextView(context) {
     }
 
     private fun scheduleKaraokeTick() {
-        if (!karaokeActive) return
+        if (!karaokeActive || karaokePaused) return
         removeCallbacks(karaokeTickRunnable)
-        val pos = estimatedKaraokePos()
-        val nextBoundary = karaokeWords
-            .firstOrNull { it.startMs + it.durMs > pos }
-            ?.let { it.startMs + it.durMs }
-            ?: return
-        postDelayed(karaokeTickRunnable, (nextBoundary - pos).coerceAtLeast(16))
+        // 平滑逐字 sweep：旧实现只在**字边界** postDelayed 一次，两帧之间
+        // 没有任何重绘，sungKaraokeWidth 的当前字线性插值根本没机会显示 ——
+        // 视觉上就是一个字一个字硬跳（用户反馈"像蹦出来的"）。
+        // 改为卡拉OK进行中固定 ~30fps 连续重绘；插值本身是精确的，
+        // 30fps 扫过单个字（200~500ms 宽）完全平滑。熄屏时 tick runnable
+        // 会跳过 invalidate，暂停时这里直接 return，均无空转。
+        postDelayed(karaokeTickRunnable, 32)
     }
 
     /// 按估算位置计算已唱像素宽度（已完成字累加 + 当前字线性插值）。
@@ -1118,11 +1761,6 @@ class GradientTextView(context: Context) : TextView(context) {
         invalidate()
     }
 
-    fun setOpacityForContrast(opacity: Int) {
-        bgOpacity = opacity
-        invalidate()
-    }
-
     /// 获取（按需重建）整行渐变 shader。宽度未变化时复用上一帧实例
     private fun ensureGradientShader(): LinearGradient? {
         if (width <= 0) return null
@@ -1145,34 +1783,8 @@ class GradientTextView(context: Context) : TextView(context) {
     override fun onDraw(canvas: Canvas) {
         val width = measuredWidth.toFloat()
 
-        // Contrast optimization: add dark shadow/stroke when background opacity is low
-        // This ensures text remains readable even on light backgrounds
-        val shadowEnabled: Boolean
-        val shadowRadius: Float
-        val shadowColor: Int
-
-        if (bgOpacity < 30) {
-            // Very transparent background — strong shadow for readability
-            shadowEnabled = true
-            shadowRadius = 4f * resources.displayMetrics.density
-            shadowColor = 0xCC000000.toInt()
-        } else if (bgOpacity < 60) {
-            // Semi-transparent — moderate shadow
-            shadowEnabled = true
-            shadowRadius = 2.5f * resources.displayMetrics.density
-            shadowColor = 0x99000000.toInt()
-        } else {
-            // Opaque enough — subtle shadow for depth
-            shadowEnabled = true
-            shadowRadius = 1.5f * resources.displayMetrics.density
-            shadowColor = 0x66000000.toInt()
-        }
-
-        if (shadowEnabled) {
-            paint.setShadowLayer(shadowRadius, 0f, 1f * resources.displayMetrics.density, shadowColor)
-        } else {
-            paint.clearShadowLayer()
-        }
+        // 只画文字本身：已唱用渐变色，未唱用未唱色。不描边、不投影、不铺底板
+        // —— 用户要求去掉一切多余样式，可读性交给「不透明度」这一项设置。
 
         val text = text?.toString() ?: ""
         val enableKrcMode = karaokeActive && text.isNotEmpty()
@@ -1229,8 +1841,6 @@ class GradientTextView(context: Context) : TextView(context) {
                         canvas.clipPath(krcClipPath)
                         // P0: 复用缓存的 shader，避免每帧新建 LinearGradient
                         paint.shader = ensureGradientShader()
-                        // 已唱部分不要 shadow（避免双重 shadow），清掉再画
-                        paint.clearShadowLayer()
                         super.onDraw(canvas)
                         canvas.restore()
                     }
@@ -1247,9 +1857,6 @@ class GradientTextView(context: Context) : TextView(context) {
             }
             super.onDraw(canvas)
         }
-
-        // Reset shadow after draw to avoid affecting other draws
-        paint.clearShadowLayer()
     }
 }
 
@@ -1259,7 +1866,7 @@ class LyricProgressBar(context: Context) : View(context) {
     private var duration = 0L
     private var gradientStart = 0xFF00E5FF.toInt()
     private var gradientEnd = 0xFFFF00FF.toInt()
-    private var unplayedColor = 0xFF666666.toInt()
+    private var unplayedColor = 0xFFFFFFFF.toInt()
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val playedPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val unplayedPaint = Paint(Paint.ANTI_ALIAS_FLAG)

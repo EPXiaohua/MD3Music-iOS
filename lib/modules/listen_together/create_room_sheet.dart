@@ -2,6 +2,9 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/remote/remote_slider.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/listen_together_provider.dart';
@@ -116,6 +119,7 @@ class _CreateRoomSheetState extends State<CreateRoomSheet> {
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: TextField(
                 controller: _nameCtrl,
+                contextMenuBuilder: buildAppTextContextMenu,
                 maxLength: 20,
                 decoration: const InputDecoration(
                   labelText: '房间名称',
@@ -164,16 +168,30 @@ class _CreateRoomSheetState extends State<CreateRoomSheet> {
                   children: [
                     Text('人数上限', style: TextStyle(color: cs.onSurfaceVariant)),
                     Expanded(
-                      child: M3ESlider(
-                        value: _capacity.toDouble(),
-                        min: 2,
-                        max: 10,
-                        divisions: 8,
-                        label: '$_capacity 人',
-                        onChanged: (v) => setState(() => _capacity = v.toInt()),
-                        // 离散档位自带触觉反馈（M3ESlider 在 divisions 非 null
-                        // 时按档位触发），无需额外 haptic 配置
-                      ),
+                      // tv: TV 构建换 RemoteSlider——M3ESlider 自带 Focus 的
+                      // _handleKeyEvent 把上下左右全部消费为调值（与
+                      // navigationMode 无关），D-pad 落上去焦点无法移出（P-C）
+                      child: kTvBuild
+                          ? RemoteSlider(
+                              value: _capacity.toDouble(),
+                              min: 2,
+                              max: 10,
+                              divisions: 8,
+                              label: '$_capacity 人',
+                              onChanged: (v) =>
+                                  setState(() => _capacity = v.toInt()),
+                            )
+                          : M3ESlider(
+                              value: _capacity.toDouble(),
+                              min: 2,
+                              max: 10,
+                              divisions: 8,
+                              label: '$_capacity 人',
+                              onChanged: (v) =>
+                                  setState(() => _capacity = v.toInt()),
+                              // 离散档位自带触觉反馈（M3ESlider 在 divisions 非 null
+                              // 时按档位触发），无需额外 haptic 配置
+                            ),
                     ),
                     Text('$_capacity 人'),
                   ],

@@ -1,14 +1,20 @@
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
+
+import '../core/build_flags.dart';
 
 /// 上一曲/暂停/下一曲三按钮联合动画控件。
 ///
 /// 视觉行为：
 /// - 静止时：3 个圆角矩形按钮水平排列，中央 play/pause 更大（72dp）
-/// - 按下时：被按按钮颜色加深 + 图标下沉缩小（120ms ease-out）
+/// - 按下侧键：颜色加深 + 图标下沉缩小（120ms ease-out）
+/// - 按下 play/pause：中央按钮向两边扩大（1.0→1.08），把 prev/next 挤压
+///   （等比压扁 ×0.94 + 外推 0.4×spacing）；图标仍下沉
+/// - 松开 play/pause：压力 120ms 衰减（扩大与挤压同步回落），
+///   play 再经 phase3 一次轻微内缩（1.0→0.98→1.0）落定
 /// - 松开 next：play 向左被挤压形变成 prev，next 向左滑到中央变成 play/pause，
 ///   右侧新 next 从外侧拉入。200ms ease-in-out-cubic
 /// - 松开 prev：镜像对称（旧 prev → 新 play，旧 play → 新 next，右侧新 prev 拉入）
-/// - 松开 play/pause：按钮先挤压到 0.92，再两段插值（0.92→1.05→1.0）
 ///
 /// 业务回调在动画**开始时立即调用**（不等动画完成），消除 400ms 感知延迟。
 
@@ -76,13 +82,20 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
   /// 按下反馈动画时长
   static const Duration _pressDuration = Duration(milliseconds: 120);
 
+  /// 中央按钮按下时的扩大倍数：点下去"向两边扩大"，物理性推挤 prev/next
+  /// （本次修正的主方向；旧行为是缩到 0.92 与期望相反）
+  static const double _playPressExpand = 1.08;
+
+  /// 侧键被中央按钮挤压时的等比缩放（<1 = 被压扁）
+  static const double _neighborSquishScale = 0.94;
+
+  /// 侧键被中央按钮扩大推开的距离（spacing 的倍数）
+  static const double _neighborPush = 0.4;
+
   // ===== 动画控制器 =====
 
   /// 共享时间轴：3 段 Interval 划分 [挤压 / 形变 / 回弹]
   late final AnimationController _controller;
-
-  /// 阶段 1：[0.00, 0.22] 挤压启动
-  late final Animation<double> _phase1;
 
   /// 阶段 2：[0.22, 0.55] 形变移位
   late final Animation<double> _phase2;
@@ -116,33 +129,43 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
   /// 动画完成时（completed）解除冻结为 null。
   bool? _frozenIsPlaying;
 
-  /// playBounce 的额外缩放系数（1.0=无缩放），用于 play 按钮圆心居中缩放
+  /// playBounce 的额外回弹系数（1.0=无缩放），用于 play 按钮圆心回弹。
   ///
   /// 阶段分布（按 _controller.value）：
-  /// - [0.00, 0.22] phase1：1.0 → 0.92（挤压）
-  /// - [0.22, 0.55] phase2：保持 0.92（短暂稳定）
-  /// - [0.55, 1.00] phase3：两段插值 0.92 → 1.05 → 1.0（单一过冲 + 平滑归位）
-  ///
-  /// 注意：phase3 用 Curves.linear + 手动两段插值，避免 easeOutBack
-  /// 在 _phase3.value 上产生多重 overshoot 造成"闪现归位"。
+  /// - [0.00, 0.55] phase1/2：保持 1.0 —— 按下时 1.08 的回落由
+  ///   _pressController.reverse() 的 120ms 衰减承担（与本 getter 相乘），
+  ///   不再重复缩小（旧版这里先压到 0.92 正是"点下去反而缩小"的来源）
+  /// - [0.55, 1.00] phase3：两段插值 1.0 → 0.98 → 1.0（轻微内缩回弹后落定）
   double get _playBounceScale {
     if (_activeTransition != _Transition.playBounce) return 1.0;
-    if (_phase3.value > 0) {
-      // phase3：两段线性插值，前半过冲、后半归位
-      // _phase3.value ∈ [0, 1]
-      //   [0.0, 0.5] 0.92 → 1.05（过冲）
-      //   [0.5, 1.0] 1.05 → 1.0（归位）
-      final t = _phase3.value;
-      if (t < 0.5) {
-        return 0.92 + (t * 2) * 0.13; // 0.92 → 1.05
-      }
-      return 1.05 - ((t - 0.5) * 2) * 0.05; // 1.05 → 1.0
+    final t = _phase3.value;
+    if (t <= 0) return 1.0;
+    if (t < 0.5) {
+      return 1.0 - t * 2 * 0.02; // 1.0 → 0.98
     }
-    // phase1/2 期间：缩到 0.92（_phase1.value 0→1）
-    if (_phase1.value > 0) {
-      return 1.0 - _phase1.value * 0.08; // 1.0 → 0.92
+    return 0.98 + (t - 0.5) * 2 * 0.02; // 0.98 → 1.0
+  }
+
+  /// 中央按钮对侧键的挤压力：按下期间 0→1（_pressController.forward），
+  /// 松开后随 reverse() 在 120ms 内衰减回 0。playBounce 期间仍读它，
+  /// 使"挤压 → 回弹"连成一气（旧版用 phase1 反向外滑 + 加宽，方向错误）。
+  double get _playPressure {
+    if (_pressedButton == _Button.play ||
+        _activeTransition == _Transition.playBounce) {
+      return _pressColor.value;
     }
-    return 1.0;
+    return 0.0;
+  }
+
+  /// 各槽位按「视觉身份」决定的按压缩放：
+  /// - play 身份：按下时向两边扩大（1.0→1.08），再乘 playBounce 回弹
+  /// - 侧键身份：自身按下沿用 0.92 下沉；被中央挤压时再乘 0.94 压扁
+  double _slotPressScale(_Button visualId, bool isPressed, double pressT) {
+    if (visualId == _Button.play) {
+      return (1.0 + (_playPressExpand - 1.0) * pressT) * _playBounceScale;
+    }
+    final own = isPressed ? _pressScale.value : 1.0;
+    return own * (1.0 - (1.0 - _neighborSquishScale) * _playPressure);
   }
 
   // ===== 生命周期 =====
@@ -153,10 +176,6 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     _controller = AnimationController(
       vsync: this,
       duration: _transitionDuration,
-    );
-    _phase1 = CurvedAnimation(
-      parent: _controller,
-      curve: const Interval(0.00, 0.22, curve: Curves.easeIn),
     );
     _phase2 = CurvedAnimation(
       parent: _controller,
@@ -463,7 +482,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         // 在容器中的位置，避免 Row 布局约束对动画造成干扰
         final totalWidth = _nextLeft + widget.sideButtonSize;
 
-        return SizedBox(
+        final row = SizedBox(
           width: totalWidth,
           height: widget.playButtonSize,
           child: Stack(
@@ -479,6 +498,14 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
             ],
           ),
         );
+
+        // tv: 槽位显隐/形变切换会让几何遍历在动画中跨组乱跳（P-F），TV 构建
+        // 下把三按钮收进同一遍历组，左右键按视觉位置在组内排序；触屏构建
+        // 不包，widget 树与改动前完全一致。
+        if (kTvBuild) {
+          return FocusTraversalGroup(child: row);
+        }
+        return row;
       },
     );
   }
@@ -543,9 +570,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         iconOverride = effectiveIsPlaying ? Icons.pause : Icons.play_arrow;
         break;
       case _Transition.playBounce:
-        // playBounce 时 prev 右边框被拉（border shift 轻微扩张 + 左移）
-        currentWidth = widget.sideButtonSize * (1.0 + _phase1.value * 0.04);
-        left = _prevLeft - widget.spacing * 0.5 * _phase1.value;
+        // prev 的挤压位移改由 _playPressure 统一驱动（按下期间即生效，
+        // 方向改为「压扁 + 被推外」，见下方 pressure 块），这里不再动 width/left。
         break;
       case _Transition.none:
         break;
@@ -554,6 +580,16 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 按压配色跟随当前视觉身份（settled 状态下原 slot 可能接管别处显示别的形态）
     final colorScheme = Theme.of(context).colorScheme;
     final visualId = _visualIdentityOf(_Button.prev);
+    // 中央按钮按下/回弹期间：侧键身份被推向外侧（方向跟视觉身份，不跟槽位——
+    // settled 状态下本槽位可能显示 play 形态，此时不位移）
+    final pressure = _playPressure;
+    if (visualId != _Button.play && pressure > 0) {
+      left +=
+          (visualId == _Button.prev ? -1.0 : 1.0) *
+          widget.spacing *
+          _neighborPush *
+          pressure;
+    }
     final pressColors = _resolvePressColors(visualId, colorScheme);
     final normalBg = pressColors.normalBg;
     final normalFg = pressColors.normalFg;
@@ -582,7 +618,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         opacity: opacity,
         isPressed: isPressed,
         iconOffset: isPressed ? _pressIconOffset.value : 0,
-        pressScale: isPressed ? _pressScale.value : 1.0,
+        pressScale: _slotPressScale(visualId, isPressed, pressT),
         onTapDown: interaction.onTapDown,
         onTapUp: interaction.onTapUp,
         onTapCancel: _handlePressCancel,
@@ -687,6 +723,16 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 按压配色跟随当前视觉身份（settled 状态下原 play slot 可能接管 _prevLeft/_nextLeft）
     final colorScheme = Theme.of(context).colorScheme;
     final visualId = _visualIdentityOf(_Button.play);
+    // 中央按钮按下/回弹期间：若本槽位显示的是侧键形态，同样被推向外侧
+    // （settled 状态下原 play 槽位显示的是侧键形态，被挤压时也要位移）
+    final pressure = _playPressure;
+    if (visualId != _Button.play && pressure > 0) {
+      left +=
+          (visualId == _Button.prev ? -1.0 : 1.0) *
+          widget.spacing *
+          _neighborPush *
+          pressure;
+    }
     final pressColors = _resolvePressColors(visualId, colorScheme);
     final normalBg = pressColors.normalBg;
     final normalFg = pressColors.normalFg;
@@ -716,8 +762,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         opacity: 1.0,
         isPressed: isPressed,
         iconOffset: isPressed ? _pressIconOffset.value : 0,
-        // playBounce 的圆心缩放与按下反馈缩放相乘
-        pressScale: (isPressed ? _pressScale.value : 1.0) * _playBounceScale,
+        // playBounce 的圆心缩放与按下扩大/侧键挤压已统一由 _slotPressScale 分派
+        pressScale: _slotPressScale(visualId, isPressed, pressT),
         onTapDown: interaction.onTapDown,
         onTapUp: interaction.onTapUp,
         onTapCancel: _handlePressCancel,
@@ -788,9 +834,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         opacity = 0;
         break;
       case _Transition.playBounce:
-        // next 左边框被拉（轻微扩张 + 右移）
-        currentWidth = widget.sideButtonSize * (1.0 + _phase1.value * 0.04);
-        left = _nextLeft + widget.spacing * 0.5 * _phase1.value;
+        // next 的挤压位移改由 _playPressure 统一驱动（按下期间即生效，
+        // 方向改为「压扁 + 被推外」，见下方 pressure 块），这里不再动 width/left。
         break;
       case _Transition.none:
         break;
@@ -799,6 +844,16 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 按压配色跟随当前视觉身份（settled 状态下原 next slot 可能接管 _playLeft 显示 play）
     final colorScheme = Theme.of(context).colorScheme;
     final visualId = _visualIdentityOf(_Button.next);
+    // 中央按钮按下/回弹期间：侧键身份被推向外侧（方向跟视觉身份，不跟槽位——
+    // settled 状态下本槽位可能显示 play 形态，此时不位移）
+    final pressure = _playPressure;
+    if (visualId != _Button.play && pressure > 0) {
+      left +=
+          (visualId == _Button.prev ? -1.0 : 1.0) *
+          widget.spacing *
+          _neighborPush *
+          pressure;
+    }
     final pressColors = _resolvePressColors(visualId, colorScheme);
     final normalBg = pressColors.normalBg;
     final normalFg = pressColors.normalFg;
@@ -827,7 +882,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         opacity: opacity,
         isPressed: isPressed,
         iconOffset: isPressed ? _pressIconOffset.value : 0,
-        pressScale: isPressed ? _pressScale.value : 1.0,
+        pressScale: _slotPressScale(visualId, isPressed, pressT),
         onTapDown: interaction.onTapDown,
         onTapUp: interaction.onTapUp,
         onTapCancel: _handlePressCancel,
@@ -875,7 +930,14 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 按压反馈：此 slot 固定显示 prev 形态
     final bool isPressed = _pressedButton == _Button.prev;
     final double pressT = isPressed ? _pressColor.value : 0.0;
-    final double pressScale = isPressed ? _pressScale.value : 1.0;
+    // 中央按钮按下/回弹期间：新 prev 也被推向外侧并压扁
+    final pressure = _playPressure;
+    final double pressScale =
+        (isPressed ? _pressScale.value : 1.0) *
+        (1.0 - (1.0 - _neighborSquishScale) * pressure);
+    if (pressure > 0) {
+      left -= widget.spacing * _neighborPush * pressure;
+    }
     final double iconOffset = isPressed ? _pressIconOffset.value : 0;
     // 按压配色跟随当前视觉形态（prev 形态 = primaryContainer ↔ primary）
     final cs = Theme.of(context).colorScheme;
@@ -959,7 +1021,14 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     // 按压反馈：此 slot 固定显示 next 形态
     final bool isPressed = _pressedButton == _Button.next;
     final double pressT = isPressed ? _pressColor.value : 0.0;
-    final double pressScale = isPressed ? _pressScale.value : 1.0;
+    // 中央按钮按下/回弹期间：新 next 也被推向外侧并压扁
+    final pressure = _playPressure;
+    final double pressScale =
+        (isPressed ? _pressScale.value : 1.0) *
+        (1.0 - (1.0 - _neighborSquishScale) * pressure);
+    if (pressure > 0) {
+      left += widget.spacing * _neighborPush * pressure;
+    }
     final double iconOffset = isPressed ? _pressIconOffset.value : 0;
     // 按压配色跟随当前视觉形态（next 形态 = primaryContainer ↔ primary）
     final cs = Theme.of(context).colorScheme;
@@ -1026,7 +1095,7 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
 
     // 用 Center + SizedBox 包裹按钮，Transform.scale 默认以中心为锚点，
     // 这样 playBounce 的缩放就是"以圆心居中缩放"，不会从左上角漂移。
-    return Opacity(
+    final body = Opacity(
       opacity: opacity,
       child: Semantics(
         button: true,
@@ -1067,5 +1136,26 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         ),
       ),
     );
+
+    // tv: 三按钮 D-pad 可达（P-A）。OK/Enter 激活 = 模拟一次按下+松开
+    // （_handlePressDown/_handlePressUp 被 _isAnimating 守卫，与一次点击完全
+    // 等价，业务回调照常在动画中途触发）；onSelect 恒非 null（disabled 时
+    // onTapDown/onTapUp 为 null，调用为 no-op），保证动画期间焦点不丢。
+    // 隐藏槽位（opacity≈0，如 settled 后被顶掉的原槽位）与禁用槽位对遍历
+    // 不可用，避免焦点落在看不见的按钮上。DpadFocusable 默认
+    // excludeChildFocus，内层 GestureDetector 不产生第二个停点。
+    // 非 TV 构建原样返回 body，触屏路径零变化。
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'transport_$label',
+        enabled: enabled && opacity > 0.01,
+        onSelect: () {
+          onTapDown?.call();
+          onTapUp?.call();
+        },
+        child: body,
+      );
+    }
+    return body;
   }
 }

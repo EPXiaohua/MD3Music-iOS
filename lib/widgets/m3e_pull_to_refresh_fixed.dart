@@ -3,6 +3,8 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:motor/motor.dart';
 
+import '../core/utils/app_haptics.dart';
+
 /// 本地 fork 版 [M3EPullToRefreshIndicator]（m3e_core 1.1.4 原样复制 +
 /// 一处修复），供收藏页歌单 tab 等对 touch 通知链敏感的场景使用。
 ///
@@ -149,11 +151,6 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
       widget.style?.springMotion ??
       M3EMotion.expressiveSpatialDefault;
 
-  M3EHapticFeedback get _effectiveHapticFeedback =>
-      widget.hapticFeedback ??
-      widget.style?.hapticFeedback ??
-      M3EHapticFeedback.medium;
-
   double get _effectiveDragResistance =>
       widget.dragResistance ?? widget.style?.dragResistance ?? 0.55;
 
@@ -298,7 +295,7 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
     if (_rawDistancePulled >= _effectiveTriggerDistance &&
         !_hasTriggeredHaptic) {
       _hasTriggeredHaptic = true;
-      applyHaptic(_effectiveHapticFeedback);
+      AppHaptics.click(HapticCategory.gesture);
     } else if (_rawDistancePulled < _effectiveTriggerDistance) {
       _hasTriggeredHaptic = false;
     }

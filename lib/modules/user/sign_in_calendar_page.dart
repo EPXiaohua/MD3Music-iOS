@@ -3,7 +3,7 @@ import 'package:intl/intl.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
-import 'package:webview_flutter/webview_flutter.dart';
+import '../../widgets/verify_captcha_dialog.dart';
 
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
@@ -303,94 +303,17 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
     KugouProvider kugou,
     VerifyCaptchaRequest pending,
   ) async {
-    final controller = WebViewController();
-    controller
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel(
-        'CaptchaChannel',
-        onMessageReceived: (message) {
-          final data = message.message;
-          print('[CAPTCHA] channel: $data');
-          if (data == '__READY__') {
-            // 页面 JS 就绪信号：注入 txappid 拉起验证码（比 onPageFinished 更可靠）
-            controller.runJavaScript(
-              'window.initCaptcha && initCaptcha(${pending.txappid})',
-            );
-            return;
-          }
-          if (data == '__CANCEL__' || data == '__ERROR__') {
-            kugou.cancelVerifyCaptcha();
-          } else {
-            kugou.completeVerifyCaptcha(data);
-          }
-          if (context.mounted) Navigator.of(context).pop();
-        },
-      )
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageFinished: (_) {
-            // 页面加载完成后注入 txappid 并拉起腾讯验证码
-            controller.runJavaScript(
-              'window.initCaptcha && initCaptcha(${pending.txappid})',
-            );
-          },
-          onWebResourceError: (_) {
-            // 页面/资源加载失败：取消验证，避免白框卡死
-            kugou.cancelVerifyCaptcha();
-            if (context.mounted) Navigator.of(context).pop();
-          },
-        ),
-      )
-      ..loadFlutterAsset('assets/web/verify_captcha.html');
-
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) => Dialog(
-        clipBehavior: Clip.antiAlias,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // 标题栏 + 关闭按钮（验证码弹不出时用户可退出，避免白框卡死）
-            Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppSpacing.md,
-                vertical: AppSpacing.xs,
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '安全验证',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close),
-                    tooltip: '取消验证',
-                    onPressed: () {
-                      kugou.cancelVerifyCaptcha();
-                      Navigator.of(dialogContext).pop();
-                    },
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            SizedBox(
-              width: 360,
-              height: 400,
-              child: WebViewWidget(controller: controller),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    _captchaDialogShowing = false;
-    // 弹窗关闭但验证仍未完成（流程中断/超时）→ 取消，避免 completer 悬挂
-    if (kugou.pendingVerifyCaptcha != null) {
-      kugou.cancelVerifyCaptcha();
+    try {
+      final code = await showVerifyCaptchaDialog(context,
+        txappid: pending.txappid);
+      if (code == null) {
+        kugou.cancelVerifyCaptcha();
+      } else {
+        kugou.completeVerifyCaptcha(code);
+      }
+    } finally {
+      _captchaDialogShowing = false;
+      if (!pending.completer.isCompleted) kugou.cancelVerifyCaptcha();
     }
   }
 

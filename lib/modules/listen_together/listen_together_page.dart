@@ -1,9 +1,13 @@
 import 'dart:async';
 
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/utils/app_haptics.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/listen_together_provider.dart';
@@ -310,6 +314,7 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
             child: TextField(
+              contextMenuBuilder: buildAppTextContextMenu,
               decoration: const InputDecoration(
                 hintText: '搜索房间名 / 房主 / 正在播放',
                 isDense: true,
@@ -329,22 +334,75 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
                       style: Theme.of(context).textTheme.bodyLarge,
                     ),
                   )
-                : M3ESegmentedList.builder(
-                    itemCount: filteredRooms.length,
-                    itemBuilder: (context, index) =>
-                        _RoomTile(room: filteredRooms[index]),
-                    margin: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    padding: const EdgeInsets.all(14),
-                    outerRadius: 20,
-                    innerRadius: 6,
-                    gap: 3,
-                    haptic: M3EHapticFeedback.light,
-                    onTap: (index) => _previewThenOpen(
-                        filteredRooms[index].roomId, filteredRooms[index].name),
+                : _tvActivateWrap(
+                    M3ESegmentedList.builder(
+                      itemCount: filteredRooms.length,
+                      itemBuilder: (context, index) =>
+                          _RoomTile(room: filteredRooms[index]),
+                      margin: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                      padding: const EdgeInsets.all(14),
+                      outerRadius: 20,
+                      innerRadius: 6,
+                      gap: 3,
+                      // 房间行的触觉不走 m3e（它的 haptic 只经 m3e_haptics 原生通道，
+                      // 只能被「滑块调节」闸门整体拦下），改由 Dart 侧声明为 listItem。
+                      haptic: M3EHapticFeedback.none,
+                      onTap: (index) => _openRoomAt(filteredRooms, index),
+                      // tv: 记住当前行，OK 键按下时由 _tvActivateWrap 取用
+                      onFocusChange: (index, focused) {
+                        if (focused) _focusedRoomIndex = index;
+                      },
+                    ),
+                    (index) => _openRoomAt(filteredRooms, index),
                   ),
           ),
         ],
       ),
+    );
+  }
+
+  /// 打开第 [index] 个房间：触屏 `onTap` 与 TV 的 OK 键共用同一条路径。
+  void _openRoomAt(List<MusicRoomBrief> rooms, int index) {
+    if (index < 0 || index >= rooms.length) return;
+    AppHaptics.tick(HapticCategory.listItem);
+    _previewThenOpen(rooms[index].roomId, rooms[index].name);
+  }
+
+  /// tv: 当前聚焦的房间行下标（由 [M3ESegmentedList.onFocusChange] 回填），
+  /// 供 OK 键（[ActivateIntent]）取用。
+  int _focusedRoomIndex = 0;
+
+  /// tv: 给「自带焦点节点但不响应 OK 键」的列表补 [ActivateIntent]。
+  ///
+  /// ## 为什么不能像别处那样包 [DpadFocusable]
+  ///
+  /// [M3ESegmentedList] 的每个 item **自带**一个 `M3ESegmentedItem_N` 焦点
+  /// 节点（m3e_core `m3e_segmented_item.dart:398`），且它位于 itemBuilder
+  /// 内容的**外层**。包在 itemBuilder 里的 DpadFocusable 是内层节点，dpad 的
+  /// 几何候选会先选中外层那个 —— 实测按下键后 `primaryFocus=M3ESegmentedItem_0`
+  /// 而非 `room0`，`room0.hasFocus == false`（tmp 探针复现）。
+  ///
+  /// ## 那为什么按 OK 还是没反应
+  ///
+  /// 列表自带的节点只把 **Enter / Space 字面键**映射到 onTap
+  /// （`_handleCardKeyEvent`），遥控器的 OK 是 DPAD_CENTER →
+  /// `LogicalKeyboardKey.select` → `ActivateIntent`，而列表没有注册对应的
+  /// Action —— 焦点落得上去、按 OK 毫无反应（2026-10-05 实测）。
+  ///
+  /// 故这里用列表自己的 `onFocusChange` 记住当前行，再把 ActivateIntent
+  /// 接到 [onActivate] 上。触屏的 `onTap` 原样保留、零变化。
+  Widget _tvActivateWrap(Widget child, ValueChanged<int> onActivate) {
+    if (!kTvBuild) return child;
+    return Actions(
+      actions: <Type, Action<Intent>>{
+        ActivateIntent: CallbackAction<ActivateIntent>(
+          onInvoke: (ActivateIntent intent) {
+            onActivate(_focusedRoomIndex);
+            return null;
+          },
+        ),
+      },
+      child: child,
     );
   }
 
@@ -393,21 +451,40 @@ class _ListenTogetherPageState extends State<ListenTogetherPage> {
       children: [
         ?detachBanner,
         Expanded(
-          child: M3ESegmentedList.builder(
-            itemCount: rooms.length,
-            itemBuilder: (context, index) => _RoomTile(room: rooms[index], mine: true),
-            margin: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-            padding: const EdgeInsets.all(14),
-            outerRadius: 20,
-            innerRadius: 6,
-            gap: 3,
-            haptic: M3EHapticFeedback.light,
-            onTap: (index) => _previewThenOpen(rooms[index].roomId, rooms[index].name),
+          child: _tvActivateWrap(
+            M3ESegmentedList.builder(
+              itemCount: rooms.length,
+              itemBuilder: (context, index) =>
+                  _RoomTile(room: rooms[index], mine: true),
+              margin: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              padding: const EdgeInsets.all(14),
+              outerRadius: 20,
+              innerRadius: 6,
+              gap: 3,
+              // 同上：房间行触觉由 Dart 侧按 listItem 发出
+              haptic: M3EHapticFeedback.none,
+              onTap: (index) => _openRoomAt(rooms, index),
+              // tv: 同上，记住当前行
+              onFocusChange: (index, focused) {
+                if (focused) _focusedRoomIndex = index;
+              },
+            ),
+            (index) => _openRoomAt(rooms, index),
           ),
         ),
       ],
     );
   }
+}
+
+/// tv: [DpadFocusable] 包装器（非 TV 构建原样返回，触屏路径零变化）。
+Widget _tvFocusableButton(VoidCallback? action, Widget child) {
+  if (!kTvBuild) return child;
+  return DpadFocusable(
+    onSelect: action,
+    enabled: action != null,
+    child: child,
+  );
 }
 
 /// 底部固定的操作按钮栏：与列表互不遮挡。
@@ -437,36 +514,45 @@ class _CreateRoomBar extends StatelessWidget {
               child: Row(
                 children: [
                   // 左右等宽：创建房间与房间号加入同为一级操作
+                  // tv: M3E 按钮不带焦点节点，TV 下包成 DpadFocusable 才能选中。
+                  // 点击仍走按钮自身的 onPressed（内层手势优先于外层
+                  // DpadFocusable 的 GestureDetector），onSelect 只服务 OK 键。
                   Expanded(
-                    child: M3EFilledButton(
-                      onPressed: onCreate,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          Icon(Icons.add),
-                          SizedBox(width: 8),
-                          Text('创建房间'),
-                        ],
+                    child: _tvFocusableButton(
+                      onCreate,
+                      M3EFilledButton(
+                        onPressed: onCreate,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(Icons.add),
+                            SizedBox(width: 8),
+                            Text('创建房间'),
+                          ],
+                        ),
                       ),
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
-                    child: M3EOutlinedButton(
-                      onPressed: onJoin,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          Icon(Icons.dialpad, size: 18),
-                          SizedBox(width: 6),
-                          Flexible(
-                            child: Text(
-                              '房间号加入',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                    child: _tvFocusableButton(
+                      onJoin,
+                      M3EOutlinedButton(
+                        onPressed: onJoin,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(Icons.dialpad, size: 18),
+                            SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                '房间号加入',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ),

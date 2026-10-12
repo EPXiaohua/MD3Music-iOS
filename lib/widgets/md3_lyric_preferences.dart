@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'apple_lyrics/layout/lyric_layout.dart';
+
 /// MD3 风格播放页歌词字体来源枚举。
 ///
 /// 与 Apple Music 风格播放页的 [LyricFontSource] 解耦，持久化到独立的
@@ -75,6 +77,7 @@ class Md3LyricPreferences extends ChangeNotifier {
   static const String _keyCustomFontPath = 'md3_lyric_custom_font_path';
   static const String _keyShowAuxiliary = 'md3_lyric_show_auxiliary';
   static const String _keyDisplayMode = 'md3_lyric_display_mode';
+  static const String _keyLineBalance = 'md3_lyric_line_balance';
 
   // ============== 当前值 ==============
 
@@ -83,13 +86,19 @@ class Md3LyricPreferences extends ChangeNotifier {
   int _fontWeight = defaultFontWeight;
   Md3LyricFontSource _fontSource = Md3LyricFontSource.system;
   bool _showAuxiliary = true;
+  // 平衡行换行（默认开启）：长歌词行按 DP 均衡断点插入硬换行，见 LyricWrapPlanner
+  bool _lineBalance = true;
   Md3LyricDisplayMode _displayMode = Md3LyricDisplayMode.translation;
   String? _customFontPath;
   // 运行时加载成功后填充的 family（仅 custom 模式且加载成功时非 null）
   String? _loadedCustomFontFamily;
   bool _loaded = false;
 
-  double get fontSize => _fontSize;
+  /// 生效字号：按本文件实际施加的当前行字重（[fontWeight]）钳可读下限（细体 <w400 → 13px）。
+  double get fontSize => LyricLayout.clampReadableFontSize(
+    _fontSize,
+    fontWeightValue: _fontWeight,
+  );
   double get lineSpacing => _lineSpacing;
 
   /// 当前行字重（FontWeight.value 数值，范围 [minFontWeight]~[maxFontWeight]）。
@@ -103,6 +112,9 @@ class Md3LyricPreferences extends ChangeNotifier {
       FontWeight((_fontWeight - 200).clamp(minFontWeight, maxFontWeight));
   Md3LyricFontSource get fontSource => _fontSource;
   bool get showAuxiliary => _showAuxiliary;
+
+  /// 平衡行换行是否开启（默认开启）；关闭时退回 Text 的自动换行。
+  bool get lineBalance => _lineBalance;
   Md3LyricDisplayMode get displayMode => _displayMode;
   String? get customFontPath => _customFontPath;
 
@@ -137,6 +149,7 @@ class Md3LyricPreferences extends ChangeNotifier {
             .clamp(minFontWeight, maxFontWeight);
     _fontSource = _fontSourceFromName(prefs.getString(_keyFontSource));
     _showAuxiliary = prefs.getBool(_keyShowAuxiliary) ?? true;
+    _lineBalance = prefs.getBool(_keyLineBalance) ?? true;
     _displayMode = _displayModeFromName(prefs.getString(_keyDisplayMode));
     _customFontPath = prefs.getString(_keyCustomFontPath);
     _loaded = true;
@@ -195,6 +208,15 @@ class Md3LyricPreferences extends ChangeNotifier {
     await prefs.setBool(_keyShowAuxiliary, enabled);
   }
 
+  /// 设置平衡行换行开关并持久化。
+  Future<void> setLineBalance(bool enabled) async {
+    if (_lineBalance == enabled) return;
+    _lineBalance = enabled;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyLineBalance, enabled);
+  }
+
   /// 设置副歌词模式并持久化。
   Future<void> setDisplayMode(Md3LyricDisplayMode mode) async {
     if (_displayMode == mode) return;
@@ -226,6 +248,7 @@ class Md3LyricPreferences extends ChangeNotifier {
     _fontWeight = defaultFontWeight;
     _fontSource = Md3LyricFontSource.system;
     _showAuxiliary = true;
+    _lineBalance = true;
     _displayMode = Md3LyricDisplayMode.translation;
     _customFontPath = null;
     _loadedCustomFontFamily = null;
@@ -236,6 +259,7 @@ class Md3LyricPreferences extends ChangeNotifier {
     await prefs.remove(_keyFontWeight);
     await prefs.remove(_keyFontSource);
     await prefs.remove(_keyShowAuxiliary);
+    await prefs.remove(_keyLineBalance);
     await prefs.remove(_keyDisplayMode);
     await prefs.remove(_keyCustomFontPath);
   }

@@ -56,8 +56,10 @@ app.*.map.json
 /md3Music-rust-local-force.zip
 /md3Music-5.7.0.zip
 /md3Music-5.8.0.zip
+/md3Music-6.0.0.zip
 /_up580_tmp/
 /_merge580.py
+/_up600_tmp/
 
 # 上游版本源码 dump（仅本地参考，不入库）
 /md3Music-5.5.0/

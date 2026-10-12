@@ -1,13 +1,14 @@
 import 'dart:ui' show lerpDouble;
 
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/theme/app_dimens.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/motion_constants.dart';
+import '../../core/utils/app_haptics.dart';
+import '../../main.dart' show requestPermissions;
 import '../../providers/theme_provider.dart';
 import 'onboarding_content.dart';
 import '../player/car_mode_panel.dart';
@@ -80,6 +81,9 @@ class _OnboardingPageState extends State<OnboardingPage>
   Future<void> _completeOnboarding() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(kOnboardingCompletedKey, true);
+    // 首启流程到此走完，才轮到请求通知权限（不 await：系统授权窗不能挡住跳转）
+    // ignore: discarded_futures
+    requestPermissions();
 
     // 将播放器风格选择应用到 ThemeProvider
     if (mounted) {
@@ -501,7 +505,7 @@ class _OnboardingPageState extends State<OnboardingPage>
           for (final color in AppTheme.presetSeedColors)
             GestureDetector(
               onTap: () {
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 // 写入 ThemeProvider（内部持久化 + notifyListeners），设置页「主题色」随之同步
                 themeProvider.setManualSeedColor(color);
               },

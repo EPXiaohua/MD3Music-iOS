@@ -1,5 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 
+import '../core/services/player_frame_driver.dart';
+
 class FadeInUp extends StatefulWidget {
   final Widget child;
   final int delayMs;
@@ -186,20 +188,81 @@ class ShimmerLoading extends StatefulWidget {
 }
 
 class _ShimmerLoadingState extends State<ShimmerLoading>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  /// 一轮扫光的时长。
+  static const Duration _period = Duration(milliseconds: 1500);
+
+  /// 仅作「进度值容器」：其 Ticker 永不启动（见 [_onTick]），
+  /// 帧生产由共享 60fps 节拍限制（AGENTS.md §10.4.1）。
   late AnimationController _controller;
+
+  /// 是否已挂在共享 60fps 帧驱动上（见 [_syncDriver]）。
+  bool _driverBound = false;
+
+  /// [TickerMode] 是否被关闭（被不透明路由覆盖 / 切走 tab）。
+  bool _tickerModeMuted = false;
+
+  /// App 是否退到后台（引擎不产帧，Timer 空转纯属唤醒浪费）。
+  bool _appSuspended = false;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1500),
-    )..repeat();
+    WidgetsBinding.instance.addObserver(this);
+    _controller = AnimationController(vsync: this, duration: _period);
+    _syncDriver();
+  }
+
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.valuesOf(context).enabled;
+    if (muted == _tickerModeMuted) return;
+    _tickerModeMuted = muted;
+    _syncDriver();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
+    _syncDriver();
+  }
+
+  /// 唯一收口：仅在「可见 + 前台」时挂共享 60fps 节拍（幂等）。
+  ///
+  /// 原实现用 `repeat()`：控制器 Ticker 每帧 scheduleFrame，120Hz 屏上骨架屏
+  /// 会让整页保持 120fps（AGENTS.md §10.1.1 / §10.4.1）。
+  void _syncDriver() {
+    final bool shouldRun = !_tickerModeMuted && !_appSuspended;
+    if (shouldRun == _driverBound) return;
+    if (shouldRun) {
+      PlayerFrameDriver.instance.addListener(_onTick);
+    } else {
+      PlayerFrameDriver.instance.removeListener(_onTick);
+    }
+    _driverBound = shouldRun;
+  }
+
+  /// 共享节拍回调：按一轮时长步进进度（0→1 循环）。
+  void _onTick() {
+    _controller.value = (_controller.value +
+            PlayerFrameDriver.step.inMilliseconds / _period.inMilliseconds) %
+        1.0;
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    if (_driverBound) {
+      PlayerFrameDriver.instance.removeListener(_onTick);
+      _driverBound = false;
+    }
     _controller.dispose();
     super.dispose();
   }

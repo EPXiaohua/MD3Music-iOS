@@ -70,9 +70,7 @@ pub fn build_list_params(q: &Value) -> Map<String, Value> {
     // JS `...getListAuthParams(params)`：kugouid/ver/clienttoken/appid/clientver/
     // mid/clienttime/key/uuid/dfid（key = signParamsKey(clienttime)）。
     let id = identity(q);
-    for (k, v) in list_auth_params(&id) {
-        params.insert(k.to_string(), v);
-    }
+    params.extend(list_auth_params(q, &id));
 
     params
 }

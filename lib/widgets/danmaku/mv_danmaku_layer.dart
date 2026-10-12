@@ -77,7 +77,7 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
     _rebuildTimeline();
     widget.controller.addListener(_onPlayerTick);
     _ticker = createTicker(_onFrame);
-    if (widget.enabled) _ticker.start();
+    _syncTicker();
   }
 
   @override
@@ -93,13 +93,33 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
       _sampleElapsed = Duration.zero;
       _sampled = false;
     }
-    if (oldWidget.enabled != widget.enabled) {
-      if (widget.enabled) {
-        if (!_ticker.isActive) _ticker.start();
-      } else {
-        if (_ticker.isActive) _ticker.stop();
-        _renderController?.clear();
-      }
+    if (oldWidget.enabled != widget.enabled ||
+        !identical(oldWidget.controller, widget.controller)) {
+      if (!widget.enabled) _renderController?.clear();
+      _syncTicker();
+    }
+  }
+
+  /// 唯一收口：仅在「开启 + 已采样 + 真正在播（非缓冲）」时跑帧。
+  ///
+  /// 原实现只要 `enabled` 就常驻跑，暂停/缓冲只在 [_onFrame] 里早退 —— 早退
+  /// 省不掉 Ticker 每 vsync 的 `scheduleFrame`（§10.4.6）。顺带把渲染器的
+  /// 跑/停从 [_onFrame] 挪到这里：停止外推时一并停掉弹幕滚动，避免暂停期间
+  /// 弹幕继续飘。
+  void _syncTicker() {
+    final v = widget.controller.value;
+    final bool shouldRun = widget.enabled &&
+        v.isInitialized &&
+        v.isPlaying &&
+        !v.isBuffering &&
+        _sampled;
+    if (shouldRun == _ticker.isActive) return;
+    if (shouldRun) {
+      _ticker.start();
+    } else {
+      _ticker.stop();
+      final controller = _renderController;
+      if (controller != null && controller.isRunning()) controller.pause();
     }
   }
 
@@ -114,7 +134,7 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
     _timeline = DanmakuBuckets(widget.entries);
   }
 
-  /// 播放器周期刷新（500ms）到点：刷新外推基准。
+  /// 播放器周期刷新（500ms）到点：刷新外推基准，并按播放态起停帧驱动。
   void _onPlayerTick() {
     final v = widget.controller.value;
     if (!v.isInitialized) return;
@@ -123,9 +143,13 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
       _sampleElapsed = _clock.elapsed;
       _sampled = true;
     }
+    _syncTicker();
   }
 
   /// 每帧推进：外推位置 → 桶投递 → 同步播放/暂停。
+  ///
+  /// 只在 [Ticker] 运行时被调用，而 [_syncTicker] 已把「播放中且非缓冲」作为
+  /// 跑帧条件；这里仍保留一次防御性判断（控制器状态可能晚一拍到达）。
   void _onFrame(Duration _) {
     if (!widget.enabled || !_sampled) return;
     final controller = _renderController;
@@ -151,10 +175,8 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
       debugPrint('[MvDanmaku] 时间轴回退（判定为 seek），清屏');
       controller.clear();
     }
-    if (!v.isPlaying || v.isBuffering) {
-      if (controller.isRunning()) controller.pause();
-      return;
-    }
+    if (!v.isPlaying || v.isBuffering) return;
+    // 渲染器可能在本层开始播放之后才创建（build 期间回调），此处幂等自愈
     if (!controller.isRunning()) controller.resume();
     for (final entry in result.due) {
       controller.addDanmaku(toContentItem(entry));

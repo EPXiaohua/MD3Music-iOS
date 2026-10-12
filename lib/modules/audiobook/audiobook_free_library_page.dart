@@ -1,3 +1,7 @@
+import '../../core/layout/page_layout.dart';
+import '../../widgets/tv_dropdown_menu.dart';
+import '../../core/layout/adaptive_content_grid.dart';
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
@@ -5,6 +9,7 @@ import 'package:provider/provider.dart';
 import '../../providers/kugou_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/smart_artwork_image.dart';
 import 'audiobook_album_detail_page.dart';
 
@@ -123,17 +128,21 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
     final kugou = context.watch<KugouProvider>();
     final albums = kugou.longAudioFreeAlbums;
     final loadingMore = kugou.longAudioFreeLoading;
+    // 同一 id 只有首次出现的条目参与飞行（避免同子树重复 tag）。
+    final heroFirstIndex = firstIndexById(albums.map((a) => a.id));
 
     return Scaffold(
       appBar: AppBar(title: const Text('免费听书库')),
-      body: Column(
+      body: ContentWidth(
+        child: Column(
         children: [
           // 分类横向 chips（动态来自分类接口 + 首位「全部」）
           SizedBox(
             height: 44,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6,
+                ),
               itemCount: _tagOptions(kugou).length,
               separatorBuilder: (_, _) => const SizedBox(width: 8),
               itemBuilder: (context, i) {
@@ -202,9 +211,14 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
                     ? _EmptyHint(hint: '该筛选条件下暂无免费听书')
                     : Md3PullToRefresh(
                         onRefresh: _reload,
-                        child: ListView.builder(
+                        child: CustomScrollView(
                           controller: _scrollController,
-                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          slivers: [
+                          SliverPadding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            sliver: SliverAdaptiveContentGrid(
+                              targetExtent: 360,
+                              childAspectRatio: 3,
                           itemCount: albums.length + (loadingMore ? 1 : 0),
                           itemBuilder: (context, i) {
                             if (i >= albums.length) {
@@ -224,12 +238,14 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
                             final album = albums[i];
                             return _FreeAlbumTile(
                               album: album,
+                              // 与听书专辑详情页头（audiobookCoverHeroTag）配对。
+                              heroTag: heroFirstIndex[album.id] == i
+                                  ? audiobookCoverHeroTag(album.id)
+                                  : null,
                               onTap: () {
-                                Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) => AudiobookAlbumDetailPage(
+                                AdaptiveNav.openDetail(context,
+                                      (_) => AudiobookAlbumDetailPage(
                                       album: album,
-                                    ),
                                   ),
                                 );
                               },
@@ -237,8 +253,12 @@ class _AudiobookFreeLibraryPageState extends State<AudiobookFreeLibraryPage> {
                           },
                         ),
                       ),
-          ),
+          ],
+                      ),
+                    ),
+            ),
         ],
+        ),
       ),
     );
   }
@@ -276,7 +296,7 @@ class _LabeledDropdownState extends State<_LabeledDropdown> {
       children: [
         Text(widget.label, style: textTheme.bodySmall),
         const SizedBox(height: 2),
-        M3EDropdownMenu<int>(
+        TvDropdownMenu<int>(
           items: [
             for (final (value, text) in widget.options)
               M3EDropdownItem<int>(
@@ -313,7 +333,14 @@ class _FreeAlbumTile extends StatelessWidget {
   final KugouLongAudioAlbum album;
   final VoidCallback onTap;
 
-  const _FreeAlbumTile({required this.album, required this.onTap});
+  /// 非空时行封面参与封面连贯过渡（audiobookCoverHeroTag 命名空间）。
+  final String? heroTag;
+
+  const _FreeAlbumTile({
+    required this.album,
+    required this.onTap,
+    this.heroTag,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -327,10 +354,21 @@ class _FreeAlbumTile extends StatelessWidget {
         child: SizedBox(
           width: 64,
           height: 64,
-          child: SmartArtworkImage(
-            artworkUri: album.coverUrl,
-            size: double.infinity,
-          ),
+          child: heroTag == null
+              ? SmartArtworkImage(
+                  artworkUri: album.coverUrl,
+                  size: double.infinity,
+                )
+              : PlaylistCoverHero(
+                  // 圆角移交 hero（与静止态 10 一致），图片自身不再裁剪。
+                  tag: heroTag!,
+                  radius: BorderRadius.circular(10),
+                  child: SmartArtworkImage(
+                    artworkUri: album.coverUrl,
+                    size: double.infinity,
+                    borderRadius: 0,
+                  ),
+                ),
         ),
       ),
       title: Text(

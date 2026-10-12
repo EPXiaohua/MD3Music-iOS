@@ -96,6 +96,18 @@ pub(crate) fn with_overrides(q: &Value, overrides: &[(&str, Value)]) -> Value {
     out
 }
 
+/// JS 顶层透传参数（`source`/`extdata` 等）：原值经 `compact` 语义
+/// （null/空串丢弃，其余原样）后插入，缺省时该键不出现。
+pub(crate) fn insert_passthrough(params: &mut Map<String, Value>, q: &Value, key: &str) {
+    match q.get(key) {
+        Some(Value::Null) | None => {}
+        Some(Value::String(s)) if s.is_empty() => {}
+        Some(v) => {
+            params.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 身份与签名
 // ---------------------------------------------------------------------------
@@ -137,9 +149,15 @@ pub fn identity(q: &Value) -> Identity {
         }
     };
     let mid = {
-        let m = c_str(q, "KUGOU_API_MID");
-        // 与 request.rs 的默认口径一致（cookie 无 MID 时用 "-"）
-        if m.is_empty() { "-".to_string() } else { m }
+        // JS `firstValue(params.mid, cookie.KUGOU_API_MID)`；都没有时沿用
+        // request.rs 的默认口径（"-"）
+        let p = q_str(q, "mid", "");
+        if !p.is_empty() {
+            p
+        } else {
+            let m = c_str(q, "KUGOU_API_MID");
+            if m.is_empty() { "-".to_string() } else { m }
+        }
     };
     Identity {
         clienttime,
@@ -151,12 +169,15 @@ pub fn identity(q: &Value) -> Identity {
     }
 }
 
-/// 写接口的公共鉴权参数（JS `buildCommentSendConfig` / `buildCommentReplyConfig`
-/// 里那段显式 params），`key` 由调用方按各自签名输入传入。
-pub(crate) fn auth_params(id: &Identity, key: &str) -> Vec<(&'static str, Value)> {
-    vec![
+/// JS `buildCommentSendConfig` / `buildCommentReplyConfig` 里那段显式 params，
+/// `key` 由调用方按各自签名输入传入。
+///
+/// 返回值已按 JS `compact` 语义处理（null/空串丢弃，数字 0 如 kugouid 保留），
+/// 因此空 token 时 `clienttoken` 不下发，与 JS 一致。
+pub(crate) fn auth_params(q: &Value, id: &Identity, key: &str) -> Map<String, Value> {
+    compact_map(vec![
         ("kugouid", json!(id.userid)),
-        ("ver", json!(COMMENT_VER)),
+        ("ver", ver_value(q)),
         ("clienttoken", json!(id.token)),
         ("appid", json!(3116)),
         ("clientver", json!(11440)),
@@ -165,15 +186,25 @@ pub(crate) fn auth_params(id: &Identity, key: &str) -> Vec<(&'static str, Value)
         ("key", json!(key)),
         ("uuid", json!(id.uuid)),
         ("dfid", json!(id.dfid)),
-    ]
+    ])
+}
+
+/// JS `firstValue(params.ver, 6)`：显式传入原样透传（含数字 0 这类真值边界），
+/// 缺省/空串取 6。
+fn ver_value(q: &Value) -> Value {
+    match q.get("ver") {
+        Some(Value::String(s)) if s.is_empty() => json!(COMMENT_VER),
+        Some(v) if !matches!(v, Value::Null) => v.clone(),
+        _ => json!(COMMENT_VER),
+    }
 }
 
 /// 列表侧公共鉴权参数（JS `getListAuthParams`）：与写接口 `auth_params` 仅 `key` 的输入不同
 /// —— 列表用 `signParamsKey(clienttime)`，写用 `signParamsKey(clienttime+mid+data)`。
 /// 复用 `auth_params`，不重造。
-pub(crate) fn list_auth_params(id: &Identity) -> Vec<(&'static str, Value)> {
+pub(crate) fn list_auth_params(q: &Value, id: &Identity) -> Map<String, Value> {
     let key = sign_params_key(&id.clienttime.to_string(), "", "");
-    auth_params(id, &key)
+    auth_params(q, id, &key)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +222,13 @@ pub fn send_options(
 ) -> RequestOptions {
     let id = identity(q);
 
-    // body 键序固定 content → album_audio_id → images（JS JSON.stringify 逐字节对齐）
+    // body 键序固定 content → album_audio_id → title → extdata → images
+    // （JS JSON.stringify 逐字节对齐）；title/extdata(=content_extdata) 经 compact
+    // 缺省丢弃，images 非数组时归 []（空数组保留，与 JS compact 一致）。
+    let images = match q.get("images") {
+        Some(Value::Array(a)) => json!(a),
+        _ => json!([]),
+    };
     let body_json = json!({
         "data": compact_map(vec![
             ("content", json!(content)),
@@ -199,7 +236,9 @@ pub fn send_options(
                 "album_audio_id",
                 if mixsongid.is_empty() { Value::Null } else { json!(mixsongid) }
             ),
-            ("images", json!([])),
+            ("title", q.get("title").cloned().unwrap_or(Value::Null)),
+            ("extdata", q.get("content_extdata").cloned().unwrap_or(Value::Null)),
+            ("images", images),
         ]),
     });
     let data = crate::util::json_stringify(&body_json);
@@ -215,9 +254,8 @@ pub fn send_options(
         ("childrenid", json!(children_id)),
         ("childrenname", json!(name)),
     ]);
-    for (k, v) in auth_params(&id, &key) {
-        params.insert(k.to_string(), v);
-    }
+    params.extend(auth_params(q, &id, &key));
+    insert_passthrough(&mut params, q, "source");
 
     RequestOptions::new(COMMENT_URL)
         .post(COMMENT_URL)
@@ -240,23 +278,25 @@ pub fn reply_options(
     tid: &str,
 ) -> RequestOptions {
     let id = identity(q);
-    let pid: Value = {
-        let raw = q.get("pid").cloned().unwrap_or(Value::Null);
-        if matches!(&raw, Value::Null) {
-            json!(0)
-        } else {
-            raw
-        }
+    // JS `pid = firstValue(params.pid, 0)`：null/空串取 0，其余（含数字 0）原样
+    let pid: Value = match q.get("pid") {
+        Some(Value::String(s)) if s.is_empty() => json!(0),
+        Some(v) if !matches!(v, Value::Null) => v.clone(),
+        _ => json!(0),
     };
-    // JS：is_t 缺省时 pid == '0' → 1，否则 0
+    // JS：显式 is_t / isT 原样透传；都缺省时 pid == '0' → 1，否则 0
     let is_t: Value = {
-        let t = q.get("is_t").cloned().unwrap_or(Value::Null);
-        match &t {
-            Value::Null => {
-                if pid.to_string().trim_matches('"') == "0" { json!(1) } else { json!(0) }
-            }
-            _ => t,
-        }
+        let explicit = [q.get("is_t"), q.get("isT")]
+            .into_iter()
+            .flatten()
+            .find_map(|v| match v {
+                Value::Null => None,
+                Value::String(s) if s.is_empty() => None,
+                other => Some(other.clone()),
+            });
+        explicit.unwrap_or_else(|| {
+            if pid.to_string().trim_matches('"') == "0" { json!(1) } else { json!(0) }
+        })
     };
 
     let key = sign_params_key(&format!("{}{}", id.clienttime, id.mid), "", "");
@@ -267,13 +307,14 @@ pub fn reply_options(
         ("childrenid", json!(children_id)),
         ("childrenname", json!(name)),
     ]);
-    for (k, v) in auth_params(&id, &key) {
-        params.insert(k.to_string(), v);
-    }
+    params.extend(auth_params(q, &id, &key));
     params.insert("content".to_string(), json!(content));
     params.insert("tid".to_string(), json!(tid));
     params.insert("is_t".to_string(), is_t);
     params.insert("pid".to_string(), pid);
+    // JS 透传 extdata / source（compact 丢空）
+    insert_passthrough(&mut params, q, "extdata");
+    insert_passthrough(&mut params, q, "source");
 
     RequestOptions::new(COMMENT_URL)
         .post(COMMENT_URL)
@@ -299,9 +340,7 @@ pub fn del_options(q: &Value, cid: &str, children_id: &str, code: &str, tid: &st
         ("cid", json!(cid)),
         ("tid", json!(tid)),
     ]);
-    for (k, v) in auth_params(&id, &key) {
-        params.insert(k.to_string(), v);
-    }
+    params.extend(auth_params(q, &id, &key));
 
     RequestOptions::new(COMMENT_URL)
         .get(COMMENT_URL)
@@ -361,6 +400,26 @@ pub fn with_quote_suffix(content: &str, reply_user_name: &str, reply_content: &s
         format!("{}//@{}:{}", content, reply_user_name, reply_content)
     } else {
         content.to_string()
+    }
+}
+
+/// JS `firstValue(params.reply_user_name, params.puser)` /
+/// `firstValue(params.reply_content, params.pcontent)`。
+pub fn reply_quote_fields(q: &Value) -> (String, String) {
+    (
+        first_param(q, &["reply_user_name", "puser"]),
+        first_param(q, &["reply_content", "pcontent"]),
+    )
+}
+
+/// JS `!firstValue(params.tid)` 的校验：仅缺失/空串拒绝（字符串 "0" 是真值，
+/// 与 JS 一致放行转发上游；JSON body 的数字 0 经 `q_str` 归空同样拒绝）。
+pub fn floor_tid(q: &Value) -> Result<String, ModuleResponse> {
+    let tid = q_str(q, "tid", "");
+    if tid.is_empty() {
+        Err(bad_request("tid 不能为空"))
+    } else {
+        Ok(tid)
     }
 }
 
@@ -498,14 +557,7 @@ pub fn handle_floor_send(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleR
         return Err(bad_request("special_id 不能为空"));
     }
 
-    // JS `firstValue(params.tid)` 的 truthiness：缺失/0 → 参数错误
-    let tid = {
-        let t = q_str(q, "tid", "");
-        if t.is_empty() { "0".to_string() } else { t }
-    };
-    if tid == "0" {
-        return Err(bad_request("tid 不能为空"));
-    }
+    let tid = floor_tid(q)?;
 
     let code = resolve_code(q);
     let mut name = first_param(q, &["name", "song_name", "album_name", "playlist_name", "childrenname"]);
@@ -525,11 +577,8 @@ pub fn handle_floor_send(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleR
         name = resolved_name;
     }
 
-    let content = with_quote_suffix(
-        &content,
-        &q_str(q, "reply_user_name", ""),
-        &q_str(q, "reply_content", ""),
-    );
+    let (reply_user_name, reply_content) = reply_quote_fields(q);
+    let content = with_quote_suffix(&content, &reply_user_name, &reply_content);
     let opts = reply_options(q, &content, &special_id, &name, &code, &tid);
     let result = ctx.send(&opts);
     log_send("floor", &code, &special_id, &result);

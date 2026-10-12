@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:material_color_utilities/material_color_utilities.dart';
@@ -105,6 +107,32 @@ class ThemeProvider extends ChangeNotifier {
   bool get lyricDoubleTapToJump => _lyricDoubleTapToJump;
   bool get useBackgroundImage => _useBackgroundImage;
   String? get backgroundImagePath => _backgroundImagePath;
+
+  /// 壁纸是否**用上了用户自己的图片**（而非内置默认壁纸）。
+  ///
+  /// ⚠️ **只用于"需要真实图片才有意义"的场合**，例如从壁纸取主色
+  /// （背景莫奈取色）。**不要**用它判断"要不要渲染壁纸层"——
+  /// 那是 [useBackgroundImage] 的职责。
+  ///
+  /// 原因：[backgroundImageProvider]（`core/widgets/app_background.dart`）
+  /// 在路径为空 / 失效时会**回落到内置默认壁纸**，所以
+  /// 「开关开着但用户还没选图」是一个完全正常的状态，此时就该显示壁纸
+  /// （默认那张）。判据必须与这个兜底保持一致。
+  ///
+  /// 历史教训：2026-10-11 曾把它当作"是否渲染壁纸"的判据，替换了 14 处
+  /// 渲染分支，结果 Android 与Windows 两侧在"开关开 + 无图"时
+  /// **完全不渲染壁纸层**，页面退回不透明纯色 —— 两条回归。
+  bool get isBackgroundImageEffective {
+    if (!_useBackgroundImage) return false;
+    final path = _backgroundImagePath;
+    if (path == null || path.isEmpty) return false;
+    // dart:io 不可用于 Web；这里只做存在性判断，失败时保守视为无效。
+    try {
+      return File(path).existsSync();
+    } catch (_) {
+      return false;
+    }
+  }
   double get backgroundBlur => _backgroundBlur;
   double get amPlayerBlur => _amPlayerBlur;
   double get backgroundOpacity => _backgroundOpacity;
@@ -442,24 +470,44 @@ class ThemeProvider extends ChangeNotifier {
   }
 
   /// 加载底部导航栏文字显示行为的持久化值，默认始终不显示。
+  ///
+  /// 存储口径从「enum index」迁移为「enum name」（见 [setNavLabelBehavior]）：
+  /// - 读到 String 即新格式，按 name 匹配档位；
+  /// - 读到 Int 即迁移前旧存量，按 index 解析后**就地覆写一次 name**
+  ///   （同 key 直接 `setString` 覆盖旧 Int 值；SharedPreferences 一个 key 只有
+  ///   一个值，覆盖后类型即变 String，无需 remove——remove 会连新值一起删掉）；
+  /// - 其余（无值 / 越界 index / 无法匹配的 name）保持默认 alwaysHide。
+  ///   迁移幂等：迁移后下次加载读到 String，不再触发写。
+  /// 必须用**不做类型转换**的 [SharedPreferences.get] 读原始值：`getString` 对 Int
+  /// 存量、`getInt` 对 String 存量都会**抛类型转换异常**（不是返回 null），
+  /// 先调其中一个会让另一形态的老用户存量直接抛错、迁移永不执行。
   Future<void> _loadNavLabelBehavior() async {
     final prefs = await SharedPreferences.getInstance();
-    final index = prefs.getInt(_navLabelBehaviorKey);
-    if (index != null &&
-        index >= 0 &&
-        index < NavigationDestinationLabelBehavior.values.length) {
-      _navLabelBehavior = NavigationDestinationLabelBehavior.values[index];
+    final Object? raw = prefs.get(_navLabelBehaviorKey);
+    if (raw is String) {
+      for (final value in NavigationDestinationLabelBehavior.values) {
+        if (value.name == raw) {
+          _navLabelBehavior = value;
+          break;
+        }
+      }
+    } else if (raw is int &&
+        raw >= 0 &&
+        raw < NavigationDestinationLabelBehavior.values.length) {
+      // 回落：迁移前老版本按 index 写的 Int 存量；解析后就地迁移到 name。
+      _navLabelBehavior = NavigationDestinationLabelBehavior.values[raw];
+      await prefs.setString(_navLabelBehaviorKey, _navLabelBehavior.name);
     }
     notifyListeners();
   }
 
-  /// 设置底部导航栏文字显示行为并持久化。
+  /// 设置底部导航栏文字显示行为并持久化（存 enum 的 name，不再存 index）。
   Future<void> setNavLabelBehavior(NavigationDestinationLabelBehavior value) async {
     if (_navLabelBehavior == value) return;
     _navLabelBehavior = value;
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_navLabelBehaviorKey, value.index);
+    await prefs.setString(_navLabelBehaviorKey, value.name);
   }
 
   void toggleTheme() {
@@ -511,15 +559,20 @@ class ThemeProvider extends ChangeNotifier {
 
   /// 设置自定义字体文件路径并立即尝试加载注册。
   /// 传 null 清除路径并卸载已加载的字体（实际效果降级到 system）。
+  ///
+  /// **不能**用 `if (_customFontPath == path) return;` 短路：Windows 端选字体
+  /// 统一落到 `fonts/user_custom.<ext>` 这个**固定文件名**，用户连续换字体
+  /// 时新旧路径完全相同 → 短路命中后直接返回，新字体永远注册不上，
+  /// 表现为"第二次选还是第一次那个字体"。故路径相同也强制重新加载注册。
   Future<void> setCustomFontPath(String? path) async {
-    if (_customFontPath == path) return;
+    final pathChanged = _customFontPath != path;
     _customFontPath = path;
     final prefs = await SharedPreferences.getInstance();
     if (path != null) {
       await prefs.setString(_customFontPathKey, path);
-      // 立即尝试加载（路径变化时重新注册）
-      await _tryLoadCustomFont();
-    } else {
+      // 路径变化或路径相同（内容被覆盖）都要重新注册新字体
+      await _tryLoadCustomFont(force: true);
+    } else if (pathChanged) {
       await prefs.remove(_customFontPathKey);
       _loadedCustomFontFamily = null;
       notifyListeners();
@@ -536,10 +589,14 @@ class ThemeProvider extends ChangeNotifier {
   /// 内部：尝试用 FontLoader 加载 [_customFontPath] 指向的字体文件。
   /// 加载成功则填充 [_loadedCustomFontFamily] 并 notifyListeners。
   /// 失败时 [_loadedCustomFontFamily] 置 null，UI 自然降级为 system 行为。
-  Future<void> _tryLoadCustomFont() async {
+  ///
+  /// [force] 为 true 时即使 [CustomFontLoader.loadIfAvailable] 返回了与上次
+  /// 相同的 family 名也强制通知 —— 同一路径下的字体文件内容已被换掉，
+  /// UI 必须重建才能应用新字形。
+  Future<void> _tryLoadCustomFont({bool force = false}) async {
     final path = _customFontPath;
     final family = await CustomFontLoader.loadIfAvailable(path);
-    final changed = family != _loadedCustomFontFamily;
+    final changed = force || family != _loadedCustomFontFamily;
     _loadedCustomFontFamily = family;
     if (changed) notifyListeners();
   }
@@ -645,9 +702,9 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.setDouble(_bgBlurKey, clamped);
   }
 
-  /// 设置 AM 播放器背景模糊强度（高斯模糊 sigma，0~30；0 = 不模糊）。
+  /// 设置 AM 播放器背景模糊强度（高斯模糊 sigma，0~200；0 = 不模糊）。
   Future<void> setAmPlayerBlur(double blur) async {
-    final clamped = blur.clamp(0.0, 30.0);
+    final clamped = blur.clamp(0.0, 200.0);
     if (_amPlayerBlur == clamped) return;
     _amPlayerBlur = clamped;
     notifyListeners();

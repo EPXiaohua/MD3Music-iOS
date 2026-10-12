@@ -69,4 +69,53 @@ class PlayerProviderBackedControl implements McpPlayerControl {
 
   @override
   Future<void> enqueue(Song song) => _player.insertAfterCurrent(<Song>[song]);
+
+  @override
+  Future<void> setLoopMode(String mode) {
+    final AppLoopMode m = switch (mode) {
+      'one' => AppLoopMode.one,
+      'all' => AppLoopMode.all,
+      _ => AppLoopMode.off,
+    };
+    return _player.setLoopMode(m);
+  }
+
+  @override
+  Future<void> setShuffle(bool enabled) => _player.setShuffle(enabled);
+
+  @override
+  Future<void> playAt(int index) => _player.playSongAt(index);
+
+  @override
+  Future<void> removeFromQueue(int index) => _player.removeFromPlaylist(index);
+
+  @override
+  Future<void> reorderQueue(int from, int to) =>
+      _player.reorderPlaylist(from, to);
+
+  @override
+  Future<void> clearQueue() => _player.clearPlaylist();
+
+  @override
+  Future<void> playOnlinePlaylist(List<Song> songs, int startIndex) =>
+      _player.playOnlinePlaylist(songs, startIndex);
+
+  @override
+  Future<String?> waitForEvent(McpWatchEvent event, Duration timeout) async {
+    final base = snapshot();
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      final now = snapshot();
+      switch (event) {
+        case McpWatchEvent.trackChange:
+          if (now.song?.id != base.song?.id) return 'track_changed';
+        case McpWatchEvent.play:
+          if (!base.playing && now.playing) return 'playback_started';
+        case McpWatchEvent.pause:
+          if (base.playing && !now.playing) return 'playback_paused';
+      }
+    }
+    return null;
+  }
 }

@@ -95,6 +95,43 @@ void main() {
     }
   });
 
+  test('共享歌词请求及中途加入的消费者都立即收到正文首包', () async {
+    SharedPreferences.setMockInitialValues({});
+    installFakeSecureStorage();
+    final client = KugouApiClient();
+    await client.clearCookies();
+    final originalBaseUrl = KugouEndpoints.baseUrl;
+    final originalAdapter = client.dio.httpClientAdapter;
+    final adapter = _DeduplicatedLyricAdapter(progressive: true);
+    client.updateBaseUrl('http://provider-lyric-progress.invalid');
+    client.dio.httpClientAdapter = adapter;
+    KugouApiClient.markServerReady();
+    final provider = KugouProvider(registerDeviceOnStart: false);
+    final firstProgress = Completer<void>();
+    final secondProgress = Completer<void>();
+    try {
+      final first = provider.getLyricResult('shared-hash', onProgress: (_) {
+        if (!firstProgress.isCompleted) firstProgress.complete();
+      });
+      await firstProgress.future.timeout(const Duration(seconds: 2));
+      final second = provider.getLyricResult('shared-hash', onProgress: (_) {
+        if (!secondProgress.isCompleted) secondProgress.complete();
+      });
+      await secondProgress.future.timeout(const Duration(seconds: 2));
+      expect(provider.lyric?.decodedContent, contains('First lyric'));
+      expect(adapter.searchRequestCount, 1);
+      adapter.completeLyric();
+      expect((await first).isFound, isTrue);
+      expect((await second).isFound, isTrue);
+      expect(adapter.lyricRequestCount, 2);
+    } finally {
+      provider.dispose();
+      client.updateBaseUrl(originalBaseUrl);
+      client.dio.httpClientAdapter = originalAdapter;
+      uninstallFakeSecureStorage();
+    }
+  });
+
   test('无词负缓存命中且forceRefresh会重新请求', () async {
     SharedPreferences.setMockInitialValues({});
     installFakeSecureStorage();
@@ -296,6 +333,8 @@ class _AbaLyricAdapter implements HttpClientAdapter {
 }
 
 class _DeduplicatedLyricAdapter implements HttpClientAdapter {
+  _DeduplicatedLyricAdapter({this.progressive = false});
+  final bool progressive;
   final Completer<void> lyricRequested = Completer<void>();
   final Completer<ResponseBody> _lyricResponse = Completer<ResponseBody>();
   int searchRequestCount = 0;
@@ -317,6 +356,9 @@ class _DeduplicatedLyricAdapter implements HttpClientAdapter {
     }
     if (options.path == KugouEndpoints.lyric) {
       lyricRequestCount++;
+      if (progressive && options.queryParameters['fmt'] == 'lrc') {
+        return _response({'data': {'decodeContent': '[00:01.00]First lyric'}});
+      }
       lyricRequested.complete();
       return _lyricResponse.future;
     }

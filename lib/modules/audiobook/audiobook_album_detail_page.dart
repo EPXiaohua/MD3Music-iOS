@@ -1,15 +1,22 @@
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
 import '../../data/models/song.dart';
+import '../../core/build_flags.dart';
+import '../../core/layout/adaptive_navigator.dart';
+import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
+import '../../core/utils/entry_transition_gate.dart';
 import '../../core/widgets/app_background.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/m3e_sort_sheet.dart';
-import '../../widgets/smart_artwork_image.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/song_list_item.dart';
 import '../player/secondary_mini_player.dart';
 
@@ -33,6 +40,14 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
   bool _isLoading = true;
   bool _isIntroExpanded = false;
   String? _error;
+
+  /// 页头真实封面是否已拿到加载完成的图片。喂给 `PlaylistCoverHero.destReady`：
+  /// 进场飞行落位要等它变 true 才撤走，否则交接瞬间露出的是页头兜底占位
+  /// （卡片按 540 解码、页头按 420 解码是两个缓存键）。
+  final ValueNotifier<bool> _headerCoverReady = ValueNotifier<bool>(false);
+
+  /// 进场转场动画（在任何 await 之前捕获，见 [_startLoadingAfterEntry]）。
+  Animation<double>? _entryAnim;
 
   /// 本地章节数据副本（避免搜索/排序污染全局 Provider 状态）
   List<KugouLongAudioAudio> _audios = [];
@@ -71,9 +86,36 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _load();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      // 转场动画对象必须在任何 await 之前抓好：让路逻辑之后不再碰 context。
+      _entryAnim = ModalRoute.of(context)?.animation;
+      await _startLoadingAfterEntry();
     });
+  }
+
+  /// 进场转场收敛后才开始拉专辑详情/章节。
+  ///
+  /// `_load` 是两次 HTTP + 逐章 `_buildSongs` 映射，之后还会接一个 `_loadAllAudios`
+  /// 循环翻页；全部跑在 UI 线程上，落在转场那几十帧里会把封面连贯过渡顶停（与
+  /// 歌单/专辑详情页同一教训，见 `lib/core/utils/entry_transition_gate.dart`）。
+  /// 页头现在转场期间即渲染，所以动画期间页面并不空。超时兜底由
+  /// `waitUntilEntrySettled` 保证，不会不加载。转场后还要让过底栏收起动画
+  /// （同 playlist_page，见 `waitUntilBottomChromeSettled`）。
+  Future<void> _startLoadingAfterEntry() async {
+    final waited = await waitUntilEntrySettled(_entryAnim);
+    if (!mounted) return;
+    // completed 回调跑在帧的动画阶段，再让出一帧，首屏章节构建才不挤进转场末帧。
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    if (waited > 0) {
+      // ignore: avoid_print
+      print('[FlashTrace] AudiobookAlbumDetailPage 让路转场 ${waited}ms '
+          'id=${widget.album.id}');
+    }
+    await waitUntilBottomChromeSettled(context);
+    if (!mounted) return;
+    await _load();
   }
 
   @override
@@ -82,6 +124,7 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
     _scrollController.dispose();
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _headerCoverReady.dispose();
     super.dispose();
   }
 
@@ -373,9 +416,11 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
 
     return Scaffold(
       body: SecondaryMiniPlayerHost(
-        child: _isLoading
-          ? const Center(child: M3ELoadingIndicator())
-          : Column(
+        // 页头恒渲染：封面连贯过渡的**终点**必须在进场转场期间就存在，否则飞行只能
+        // 等页面滑完之后单独补飞（与 playlist_page / album_detail_page 同一教训）。
+        // 加载态降级成章节区的占位 sliver（见下方 `if (_isLoading)`），不再整页替换；
+        // 加载失败仍是「页头 + 顶部 banner」，观感与改动前一致。
+        child: Column(
               children: [
                 // 加载失败顶部 banner：专辑元数据仍可看
                 if (_error != null)
@@ -386,6 +431,14 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                     physics: const AlwaysScrollableScrollPhysics(),
                     slivers: [
                       _buildSliverAppBar(cs, tt, useBackgroundImage),
+                      // 加载中：章节区只挂占位（页头/错误横幅照常渲染）。
+                      if (_isLoading)
+                        const SliverToBoxAdapter(
+                          child: Padding(
+                            padding: EdgeInsets.symmetric(vertical: 48),
+                            child: Center(child: M3ELoadingIndicator()),
+                          ),
+                        ),
                       // 简介（默认折叠，带动画）
                       if (intro != null)
                         SliverToBoxAdapter(
@@ -399,6 +452,7 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                             child: TextField(
                               controller: _searchController,
                               focusNode: _searchFocusNode,
+                              contextMenuBuilder: buildAppTextContextMenu,
                               decoration: InputDecoration(
                                 hintText: '搜索章节...',
                                 prefixIcon: const Icon(Icons.search),
@@ -435,7 +489,8 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                             ),
                           ),
                         ),
-                      // 播放全部 + 随机播放
+                      // 播放全部 + 随机播放（加载期不渲染：按钮文案此刻无意义）
+                      if (!_isLoading)
                       SliverToBoxAdapter(
                         child: Padding(
                           padding: const EdgeInsets.symmetric(
@@ -471,9 +526,13 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                           ),
                         ),
                       ),
-                      const SliverToBoxAdapter(child: Divider(height: 1)),
-                      // 章节列表
-                      if (displaySongs.isEmpty)
+                      if (!_isLoading)
+                        const SliverToBoxAdapter(child: Divider(height: 1)),
+                      // 章节列表：加载期两个分支都不渲染（否则会先闪一帧「暂无章节」
+                      // 空态）。占位 sliver 只用来占住 if/else 链的首分支。
+                      if (_isLoading)
+                        const SliverToBoxAdapter(child: SizedBox.shrink())
+                      else if (displaySongs.isEmpty)
                         SliverToBoxAdapter(
                           child: Padding(
                             padding: const EdgeInsets.all(40),
@@ -535,11 +594,24 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
     );
   }
 
+  /// 页头封面兜底：与列表卡片/其它详情页头同形（surfaceContainerHighest + 图标），
+  /// 图标用 `menu_book_outlined` 贴合听书语义。
+  Widget _headerCoverPlaceholder(ColorScheme cs) {
+    return Container(
+      color: cs.surfaceContainerHighest,
+      child: Center(
+        child: Icon(Icons.menu_book_outlined, size: 48, color: cs.onSurfaceVariant),
+      ),
+    );
+  }
+
   /// SliverAppBar：pinned 大头部（渐变背景）+ 滚动 fade-in 专辑名 + 操作按钮
   Widget _buildSliverAppBar(ColorScheme cs, TextTheme tt, bool useBackgroundImage) {
     final displaySongs = _displaySongs;
+    // 双栏窄面板时头部降为 220（与歌单/专辑详情页一致），折叠 offset 数学同步跟随
+    final headerH = DetailPaneContent.headerHeight(context, 280);
     return SliverAppBar(
-      expandedHeight: 280,
+      expandedHeight: headerH,
       pinned: true,
       // 背景图模式：顶栏恒透明——flexibleSpace 是普通 Stack
       // （非 FlexibleSpaceBar，折叠时不产生视差位移，壁纸层顶部固定裁剪），
@@ -549,7 +621,7 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
           : Color.lerp(
               Colors.transparent,
               cs.surface,
-              (_scrollOffset - (280 - kToolbarHeight))
+              (_scrollOffset - (headerH - kToolbarHeight))
                   .clamp(0.0, 60.0) / 60,
             )!,
       surfaceTintColor: Colors.transparent,
@@ -592,7 +664,8 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
           ),
       ],
       title: Opacity(
-        opacity: ((_scrollOffset - (280 - kToolbarHeight)) / 60.0).clamp(0.0, 1.0),
+        opacity: ((_scrollOffset - (headerH - kToolbarHeight)) / 60.0)
+            .clamp(0.0, 1.0),
         child: Text(
           widget.album.name,
           maxLines: 1,
@@ -604,80 +677,159 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
       // 滚动中始终与主体背景对齐。显式 ClipRect：全屏壁纸层仅靠 Stack
       // 默认 hardEdge 裁剪可能失效，必须显式裁剪，否则壁纸会溢出覆盖歌曲列表
       flexibleSpace: ClipRect(
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            if (useBackgroundImage) const WallpaperHeaderBackground(),
-            Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [
-                // 开启壁纸时主题色渐变半透明叠加在壁纸上，
-                // 渐变可见且壁纸透出；未开启时实色渐变
-                useBackgroundImage
-                    ? cs.primaryContainer.withValues(alpha: 0.35)
-                    : cs.primaryContainer,
-                // 底部渐变到透明：与歌单详情页一致，启用全局背景图时不形成接缝穿帮
-                cs.surface.withValues(alpha: 0),
-              ],
-            ),
-          ),
-          child: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 48, 24, 16),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(16),
-                    child: SizedBox(
-                      width: 140,
-                      height: 140,
-                      child: SmartArtworkImage(
-                        artworkUri: widget.album.coverUrl,
-                        size: 140,
-                        borderRadius: 0,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 20),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.end,
-                      children: [
-                        Text(
-                          widget.album.name,
-                          maxLines: 4,
-                          overflow: TextOverflow.ellipsis,
-                          style: tt.headlineSmall?.copyWith(
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          [
-                            if (widget.album.author != null &&
-                                widget.album.author!.isNotEmpty)
-                              widget.album.author!,
-                          ].join(' · '),
-                          style: tt.labelMedium?.copyWith(
-                            color: cs.onSurfaceVariant,
-                          ),
-                        ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // 折叠时 flexibleSpace 高度缩到 0：封面随可用高度平滑缩放
+            // （140 → 0）而非固定 140 被视口上边界截断，同时不触发
+            // RenderFlex overflow；可用高度不足以容纳封面+文字时文字淡出。
+            // 可用高度需同时扣除 SafeArea 顶部 inset（状态栏）与 padding 上下
+            // 64（48+16），否则折叠过程中 coverSize 会按偏大的高度计算，
+            // 超出 Row 真实可用高度触发 RenderFlex overflow（黄条）。
+            // 与歌单详情页（playlist_page.dart）的防溢出方案保持一致。
+            final safeTop = MediaQuery.paddingOf(context).top;
+            final availH = (constraints.maxHeight - 64 - safeTop)
+                .clamp(0.0, constraints.maxHeight);
+            final coverSize = availH.clamp(0.0, 140.0);
+            // 标题透明度连续映射：可用高度充足时全显示（1.0），折叠到阈值
+            // 以下时淡出（0.0），实现平滑淡出而非折叠瞬间直接消失。
+            final textOpacity = ((availH - 100) / 22).clamp(0.0, 1.0);
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                if (useBackgroundImage) const WallpaperHeaderBackground(),
+                Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        // 开启壁纸时主题色渐变半透明叠加在壁纸上，
+                        // 渐变可见且壁纸透出；未开启时实色渐变
+                        useBackgroundImage
+                            ? cs.primaryContainer.withValues(alpha: 0.35)
+                            : cs.primaryContainer,
+                        // 底部渐变到透明：与歌单详情页一致，启用全局背景图时不形成接缝穿帮
+                        cs.surface.withValues(alpha: 0),
                       ],
                     ),
                   ),
-                ],
-              ),
-            ),
-          ),
+                  child: SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 48, 24, 16),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          SizedBox(
+                            width: coverSize,
+                            height: coverSize,
+                            child: PlaylistCoverHero(
+                              // tag 一律取 widget.album.id：与听书主页卡片
+                              // （audiobook_page.dart 的 _buildAlbumCard）拿到的是
+                              // 同一个 KugouLongAudioAlbum 对象，天然对齐。
+                              tag: audiobookCoverHeroTag(widget.album.id),
+                              radius: AppRadius.lgAll,
+                              // 落位保持到真实封面拿到图片为止（信号来自下面那张图的
+                              // imageBuilder，它只在图片加载完成后才被调用）。
+                              destReady: _headerCoverReady,
+                              child: widget.album.coverUrl != null
+                                  ? CachedNetworkImage(
+                                      imageUrl: widget.album.coverUrl!,
+                                      // 解码尺寸必须恒定：随折叠变化的 coverSize 会让
+                                      // 每帧都是新缓存键、图片逐帧重新下载导致闪烁
+                                      // （原 SmartArtworkImage 固定 size:140 同理，
+                                      // 缩小由外层 SizedBox 的 tight 约束 + BoxFit.cover
+                                      // 完成）。
+                                      memCacheWidth: 420,
+                                      memCacheHeight: 420,
+                                      // 兜底占位淡出默认 1s、**图片淡入默认 500ms**。
+                                      // 共享元素过渡本身就是动画，两端都不要再做渐变，
+                                      // 否则飞行途中/落位时会暗一下。
+                                      fadeOutDuration: Duration.zero,
+                                      fadeInDuration: Duration.zero,
+                                      imageBuilder: (context, provider) {
+                                        if (!_headerCoverReady.value) {
+                                          WidgetsBinding.instance
+                                              .addPostFrameCallback((_) {
+                                            if (mounted) {
+                                              _headerCoverReady.value = true;
+                                            }
+                                          });
+                                        }
+                                        // 与 CachedNetworkImage 内部同键
+                                        // （memCache 会包一层 ResizeImage），不多解码。
+                                        return Image(
+                                          image: ResizeImage(
+                                            provider,
+                                            width: 420,
+                                            height: 420,
+                                          ),
+                                          fit: BoxFit.cover,
+                                        );
+                                      },
+                                      fit: BoxFit.cover,
+                                      placeholder: (_, _) =>
+                                          _headerCoverPlaceholder(cs),
+                                      errorWidget: (_, _, _) =>
+                                          _headerCoverPlaceholder(cs),
+                                    )
+                                  : _headerCoverPlaceholder(cs),
+                            ),
+                          ),
+                          const SizedBox(width: 20),
+                          Expanded(
+                            // 文字区可视高度随 availH 收缩：超出部分由 ClipRect
+                            // 裁掉并配合淡出（opacity），封面缩小时不会残留文字
+                            // 超出 Row 实际高度而触发 RenderFlex overflow（黄条）。
+                            child: SizedBox(
+                              height: availH,
+                              child: Align(
+                                alignment: Alignment.bottomLeft,
+                                child: ClipRect(
+                                  child: Opacity(
+                                    opacity: textOpacity,
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          widget.album.name,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.fade,
+                                          style: tt.headlineSmall?.copyWith(
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          [
+                                            if (widget.album.author != null &&
+                                                widget.album.author!.isNotEmpty)
+                                              widget.album.author!,
+                                          ].join(' · '),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: tt.labelMedium?.copyWith(
+                                            color: cs.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
         ),
-        ],
       ),
-    ),
     );
   }
 
@@ -690,41 +842,60 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
   ) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: GestureDetector(
-        onTap: () => setState(() => _isIntroExpanded = !_isIntroExpanded),
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+      // tv: TV 构建下简介卡单停点（GestureDetector 不可聚焦，D-pad 原生
+      // 遍历到不了；OK=展开/收起简介）
+      child: kTvBuild
+          ? DpadFocusable(
+              onSelect: () =>
+                  setState(() => _isIntroExpanded = !_isIntroExpanded),
+              child: _buildIntroCardBody(context, cs, tt, intro),
+            )
+          : GestureDetector(
+              onTap: () => setState(() => _isIntroExpanded = !_isIntroExpanded),
+              child: _buildIntroCardBody(context, cs, tt, intro),
+            ),
+    );
+  }
+
+  Widget _buildIntroCardBody(
+    BuildContext context,
+    ColorScheme cs,
+    TextTheme tt,
+    String intro,
+  ) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
             children: [
-              Row(
-                children: [
-                  Icon(
-                    Icons.info_outline,
-                    size: 16,
-                    color: cs.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    '简介',
-                    style: tt.labelLarge?.copyWith(
-                      color: cs.onSurfaceVariant,
-                    ),
-                  ),
-                  const Spacer(),
-                  AnimatedRotation(
-                    turns: _isIntroExpanded ? 0.5 : 0,
-                    duration: const Duration(milliseconds: 200),
-                    child: Icon(
-                      Icons.keyboard_arrow_down,
-                      size: 20,
-                      color: cs.onSurfaceVariant,
-                    ),
+              Icon(
+                Icons.info_outline,
+                size: 16,
+                color: cs.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '简介',
+                style: tt.labelLarge?.copyWith(
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+              const Spacer(),
+              AnimatedRotation(
+                turns: _isIntroExpanded ? 0.5 : 0,
+                duration: const Duration(milliseconds: 200),
+                child: Icon(
+                  Icons.keyboard_arrow_down,
+                  size: 20,
+                  color: cs.onSurfaceVariant,
+                ),
                   ),
                 ],
               ),
@@ -747,8 +918,6 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
               ),
             ],
           ),
-        ),
-      ),
     );
   }
 

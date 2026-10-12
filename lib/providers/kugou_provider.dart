@@ -63,6 +63,22 @@ enum SwitchAccountResult {
   tokenExpired,
 }
 
+/// 热搜榜单卡的加载状态（独立于全局 `_isLoading`/`_error`，
+/// 见 KugouProvider.loadHotSearch 的隔离说明）。
+enum HotSearchStatus { idle, loading, ready, failed }
+
+class HotSearchState {
+  final HotSearchStatus status;
+  final List<HotSearchBoard> boards;
+  final String? error;
+
+  const HotSearchState({
+    this.status = HotSearchStatus.idle,
+    this.boards = const [],
+    this.error,
+  });
+}
+
 class KugouProvider extends ChangeNotifier {
   // —— 歌词持久化可选扩展点（默认关闭）——
   // 由私有构建（lib/private）注入实现：歌词的读取/存储旁路。
@@ -106,6 +122,8 @@ class KugouProvider extends ChangeNotifier {
 
       if (_apiClient.isLoggedIn) {
         _isLoggedIn = true;
+        // 已保存凭证的恢复不依赖用户资料接口成功。
+        notifyListeners();
         // 重启后按当前账号重载签到日历（构造函数里的首次加载可能在
         // _initFromStorage 完成前，此时 userid 尚不可用）
         _localSignedDays.clear();
@@ -122,7 +140,8 @@ class KugouProvider extends ChangeNotifier {
   KugouApiClient get apiClient => _apiClient;
 
   KugouSearchResult? _searchResults;
-  List<String> _hotSearchKeywords = [];
+  final ValueNotifier<HotSearchState> _hotSearch =
+      ValueNotifier(const HotSearchState());
   KugouRankList? _rankList;
   List<KugouSongDetail> _recommendSongs = [];
 
@@ -144,6 +163,18 @@ class KugouProvider extends ChangeNotifier {
   static const HomeDiscoverProgressStore _homeDiscoverStore =
       HomeDiscoverProgressStore();
 
+  // ==================== 新歌速递（/top/song） ====================
+  //
+  // 与刷歌不同：这个榜有真正的 page 分页，所以翻页进度只需记「取到了第几页」，
+  // 不用游标 + 断点落盘那一套。seen 只是客户端去重兜底（榜面刷新时相邻两页
+  // 可能重叠），丢掉了顶多多一首歌，不像刷歌那样会影响后续取数。
+  List<KugouSongDetail> _newSongs = [];
+  int _newSongPage = 0;
+  bool _newSongHasMore = true;
+  bool _newSongLoadingMore = false;
+  final Set<String> _newSongSeen = <String>{};
+  static const int newSongPageSize = 30;
+
   KugouPlaylist? _playlistDetail;
   KugouArtistDetail? _artistDetail;
   KugouAlbumDetail? _albumDetail;
@@ -157,6 +188,9 @@ class KugouProvider extends ChangeNotifier {
   // 播放页 / 桌面歌词链路 / Lyricon 三通道共享，命中不再发网络请求
   // （fmt='lrc' 实际是 LRC+KRC 并发双请求，重复拉取代价翻倍）。
   final Map<LyricRequestKey, KugouLyric> _lyricCache = {};
+  // 共享请求的各消费者都能收到正文首包；中途加入时也能立即展示已到的正文。
+  final Map<LyricRequestKey, Set<void Function(KugouLyric)>> _lyricProgressListeners = {};
+  final Map<LyricRequestKey, KugouLyric> _lyricPartialResults = {};
   final LyricRequestDeduplicator<LyricLookupResult> _lyricRequests =
       LyricRequestDeduplicator<LyricLookupResult>();
   final LyricNotFoundCache _lyricNotFoundCache = LyricNotFoundCache(
@@ -191,10 +225,10 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? _sheetData;
   Map<String, dynamic>? _everydayHistory;
   List<KugouAlbumBrief> _topAlbums = [];
-  Map<String, dynamic>? _topSongData;
   KugouUserVipDetail? _vipInfo;
   KugouGradeInfo? _gradeInfo;
   Map<String, dynamic>? _vipMonthRecord;
+  KugouUserPreference? _userPreference;
   // 本地打卡兜底：服务端 /youth/month/vip/record 有时不及时返回当天记录，
   // 用本地集合保证“今天签到后日历立即打勾”，并持久化跨重启。
   final Set<String> _localSignedDays = {};
@@ -321,7 +355,9 @@ class KugouProvider extends ChangeNotifier {
   }
 
   KugouSearchResult? get searchResults => _searchResults;
-  List<String> get hotSearchKeywords => _hotSearchKeywords;
+
+  /// 热搜榜单状态。UI 用 ValueListenableBuilder 订阅，避免整页 notifyListeners。
+  ValueListenable<HotSearchState> get hotSearchState => _hotSearch;
   KugouRankList? get rankList => _rankList;
   List<KugouSongDetail> get recommendSongs => _recommendSongs;
   KugouPlaylist? get playlistDetail => _playlistDetail;
@@ -374,9 +410,11 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? get sheetData => _sheetData;
   Map<String, dynamic>? get everydayHistory => _everydayHistory;
   List<KugouAlbumBrief> get topAlbums => _topAlbums;
-  Map<String, dynamic>? get topSongData => _topSongData;
+  List<KugouSongDetail> get newSongs => _newSongs;
+  bool get newSongHasMore => _newSongHasMore;
   KugouUserVipDetail? get vipInfo => _vipInfo;
   KugouGradeInfo? get gradeInfo => _gradeInfo;
+  KugouUserPreference? get userPreference => _userPreference;
 
   Map<String, dynamic>? get vipMonthRecord => _vipMonthRecord;
   Set<String> get localSignedDays => _localSignedDays;
@@ -592,6 +630,12 @@ class KugouProvider extends ChangeNotifier {
     // 刷歌只清展示列表：游标与 seen 是"刷到哪了"的权威态，保存在
     // HomeDiscoverProgressStore 里，一并清掉会让下拉刷新把刚刷过的歌重新端上来。
     _homeDiscoverSongs = [];
+    // 新歌速递整组回到「未取过」：分页页码与 seen 都是本页态，没有像刷歌那样
+    // 的持久化断点，清掉即可（_dataTimestamps 稍后整体 clear，TTL 一并失效）。
+    _newSongs = [];
+    _newSongSeen.clear();
+    _newSongPage = 0;
+    _newSongHasMore = true;
     _yuekuBanner = null;
     _themeMusicData = null;
     _sceneData = null;
@@ -796,20 +840,33 @@ class KugouProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> getHotSearch() async {
-    _beginLoading();
-    _error = null;
+  /// 加载热搜榜单。默认只在 `idle` 态发请求（进搜索页拉一次；失败也不自动重试，
+  /// 由卡内「重试」按钮带 forceRefresh 再打）。
+  ///
+  /// 刻意不使用 `_beginLoading()` / 不写 `_error`：热搜是进页后台请求，
+  /// 失败若污染全局 loading/error，搜索页结果区会被误判成「搜索失败」
+  /// （判据见 `search_page.dart` 的 `kugouProvider.error != null && 结果为空`）。
+  Future<void> loadHotSearch({bool forceRefresh = false}) async {
+    final current = _hotSearch.value;
+    if (current.status == HotSearchStatus.loading) return;
+    if (!forceRefresh && current.status != HotSearchStatus.idle) return;
+
+    _hotSearch.value = const HotSearchState(status: HotSearchStatus.loading);
     try {
-      final result = await _apiClient.getHotSearch();
-      if (result != null) {
-        _hotSearchKeywords = result;
+      final boards = await _apiClient.getHotSearch();
+      if (boards.isEmpty) {
+        _hotSearch.value =
+            const HotSearchState(status: HotSearchStatus.failed, error: '暂无热搜数据');
       } else {
-        _error = '获取热搜失败';
+        _hotSearch.value = HotSearchState(
+          status: HotSearchStatus.ready,
+          boards: boards,
+        );
       }
     } catch (e) {
-      _error = e.toString();
+      _hotSearch.value =
+          HotSearchState(status: HotSearchStatus.failed, error: e.toString());
     }
-    _endLoading();
   }
 
   Future<void> getRankList({bool forceRefresh = false}) async {
@@ -870,12 +927,14 @@ class KugouProvider extends ChangeNotifier {
     String fmt = 'lrc',
     String? localIdentity,
     bool forceRefresh = false,
+    void Function(KugouLyric lyric)? onProgress,
   }) async => (await getLyricResult(
     hash,
     songName: songName,
     fmt: fmt,
     localIdentity: localIdentity,
     forceRefresh: forceRefresh,
+    onProgress: onProgress,
   )).lyric;
 
   Future<LyricLookupResult> getLyricResult(
@@ -884,6 +943,7 @@ class KugouProvider extends ChangeNotifier {
     String fmt = 'lrc',
     String? localIdentity,
     bool forceRefresh = false,
+    void Function(KugouLyric lyric)? onProgress,
   }) async {
     // 本地歌曲优先以路径作为身份；没有路径时退回 songName，避免所有空 hash 共用一个键。
     final trackKey = hash.isEmpty
@@ -895,6 +955,20 @@ class KugouProvider extends ChangeNotifier {
       songName: songName,
     );
     final requestGeneration = ++_lyricRequestGeneration;
+    final clock = Stopwatch()..start();
+    var receivedFirst = false;
+    void deliverProgress(KugouLyric lyric) {
+      if (!receivedFirst) {
+        receivedFirst = true;
+        debugPrint('[LyricTiming] first=${clock.elapsedMilliseconds}ms track=$trackKey');
+      }
+      if (_lyricRequestGeneration == requestGeneration && _lyricSongId == trackKey) {
+        _lyric = lyric;
+        _error = null;
+        notifyListeners();
+      }
+      onProgress?.call(lyric);
+    }
     _lyricSongId = trackKey;
 
     // 正向 LRU 命中：回填 provider 状态后直接返回，不发网络请求。
@@ -930,6 +1004,9 @@ class KugouProvider extends ChangeNotifier {
     _lyricSongId = trackKey;
     notifyListeners();
     try {
+      _lyricProgressListeners.putIfAbsent(requestKey, () => {}).add(deliverProgress);
+      final partial = _lyricPartialResults[requestKey];
+      if (partial != null) deliverProgress(partial);
       // Task 15：默认 fmt='lrc' 时，API 客户端会并发发起 LRC + KRC 两个请求，
       // 返回的 KugouLyric 同时携带 decodedContent（LRC 明文）与
       // decodedKrcContent（KRC 明文）。任一请求失败不影响另一个。
@@ -947,7 +1024,15 @@ class KugouProvider extends ChangeNotifier {
           }
         }
         if (restored != null) return LyricLookupResult.found(restored);
-        return _apiClient.getLyricResult(hash, songName: songName, fmt: fmt);
+        return _apiClient.getLyricResult(hash, songName: songName, fmt: fmt,
+          onProgress: (lyric) {
+            _lyricPartialResults[requestKey] = lyric;
+            for (final listener in _lyricProgressListeners[requestKey]?.toList() ??
+                <void Function(KugouLyric)>[]) {
+              listener(lyric);
+            }
+          },
+        );
       });
       final isCurrentRequest =
           _lyricRequestGeneration == requestGeneration &&
@@ -985,6 +1070,13 @@ class KugouProvider extends ChangeNotifier {
       // 网络异常不写缓存：下次重试真实请求
       return const LyricLookupResult.transientFailure();
     } finally {
+      final listeners = _lyricProgressListeners[requestKey];
+      listeners?.remove(deliverProgress);
+      if (listeners?.isEmpty == true) {
+        _lyricProgressListeners.remove(requestKey);
+        _lyricPartialResults.remove(requestKey);
+      }
+      debugPrint('[LyricTiming] complete=${clock.elapsedMilliseconds}ms track=$trackKey');
       _endLoading();
     }
   }
@@ -1140,26 +1232,44 @@ class KugouProvider extends ChangeNotifier {
     _endLoading();
   }
 
+  /// [noCache] 透传给 [KugouApiClient.getPersonalFm]；首刷会自行置为 true
+  /// （见下），其余路径按调用方给的值走。
   Future<void> getPersonalFm({
     String? mode,
     int? songPoolId,
     String? hash,
     String? songId,
     String? action,
+    bool noCache = false,
     bool forceRefresh = false,
   }) async {
+    // isInteractive 只看调用方传进来的原始参数（在任何默认值之前算），
+    // 这样新鲜度短路与 _dataTimestamps['personalFm'] 的记账语义保持原样。
     final isInteractive = mode != null || action != null || hash != null;
     if (!isInteractive && !forceRefresh && _isDataFresh('personalFm')) return;
+    // 非交互的首刷补上 action=login，让上游按登录态出个性化批次；
+    // 必须同时 noCache，否则这批 login 会被本地 URL 缓存原样回放，改动等于没生效。
+    final isFirstPull = !isInteractive && action == null;
     _beginLoading();
     _error = null;
     try {
-      final result = await _apiClient.getPersonalFm(
+      var result = await _apiClient.getPersonalFm(
         mode: mode,
         songPoolId: songPoolId,
         hash: hash,
         songId: songId,
-        action: action,
+        action: isFirstPull ? 'login' : action,
+        noCache: isFirstPull ? true : noCache,
       );
+      // login 兜底：游客态或上游不认这个 action 时会回空批（_get 把错误吞成 null），
+      // 这时退回改动前的默认口径再要一次——与 FmRefill「带游标要不到就退回不带
+      // 游标再要一次」同一手法，宁可少一次个性化也不能把电台放成空的。
+      if (isFirstPull && (result == null || result.isEmpty)) {
+        result = await _apiClient.getPersonalFm(
+          songPoolId: songPoolId,
+          noCache: true,
+        );
+      }
       if (result != null) {
         _personalFmSongs = result;
         // 补全 albumName：红心 radio 接口不返回 album_name，但返回了 album_id，
@@ -1258,6 +1368,35 @@ class KugouProvider extends ChangeNotifier {
     );
   }
 
+  /// 私人 FM 行为回报（红心 / 取消红心 / 垃圾桶 / 播放完成），只做转发。
+  ///
+  /// 与 [getPersonalFm]、[fetchMorePersonalFm] 都不同：这是一次后台反馈 ping，
+  /// 所以**不动** [personalFmSongs]、不 [_beginLoading] / [_endLoading]、也不写
+  /// [_error]——否则一次静默回报会把页面转起圈来或顶出页面级错误。
+  /// 返回值原样透传（`garbage` 会带回替换批次，红心一类直接忽略）。
+  /// 参数与强制 noCache 的理由见 [KugouApiClient.reportPersonalFmAction]。
+  Future<List<KugouSongDetail>?> reportPersonalFmAction({
+    required String action,
+    String? mode,
+    int? songPoolId,
+    String? hash,
+    String? songId,
+    String? curMark,
+    int? playtime,
+    bool isOverplay = false,
+  }) {
+    return _apiClient.reportPersonalFmAction(
+      action: action,
+      mode: mode,
+      songPoolId: songPoolId,
+      hash: hash,
+      songId: songId,
+      curMark: curMark,
+      playtime: playtime,
+      isOverplay: isOverplay,
+    );
+  }
+
   Future<void> getPlaylist({
     String? categoryId,
     int page = 1,
@@ -1322,17 +1461,24 @@ class KugouProvider extends ChangeNotifier {
       if (result.status == 4 && result.token != null && result.userid != null) {
         // 登录新用户前，清除旧用户的头像缓存
         await _clearAvatarCacheIfUserChanged(result.userid!);
-        _isLoggedIn = true;
         await _apiClient.setLoginCookies(
           result.token!,
           result.userid!,
           vipToken: result.vipToken,
         );
-        await _fetchUserInfo();
+        _isLoggedIn = true;
         notifyListeners();
+        // 登录结果先交给页面，资料加载不阻塞扫码成功后的返回。
+        unawaited(refreshUserInfo());
+      } else if (result.status == 4) {
+        _error = '登录响应缺少凭证，请刷新二维码重试';
+        notifyListeners();
+        return null;
       }
       return result.status;
-    } catch (_) {
+    } catch (e) {
+      _error = '扫码登录失败，请重试';
+      notifyListeners();
       return null;
     }
   }
@@ -1442,6 +1588,7 @@ class KugouProvider extends ChangeNotifier {
     _vipInfo = null;
     _gradeInfo = null;
     _vipMonthRecord = null;
+    _userPreference = null;
     _qrKey = null;
     _qrData = null;
     await _fetchUserInfo();
@@ -1467,6 +1614,8 @@ class KugouProvider extends ChangeNotifier {
   }
 
   Future<void> refreshUserInfo() async {
+    _isLoggedIn = _apiClient.isLoggedIn;
+    notifyListeners();
     try {
       final userInfo = await _apiClient.getUserDetail();
       if (userInfo != null) {
@@ -1480,6 +1629,110 @@ class KugouProvider extends ChangeNotifier {
         notifyListeners();
       }
     } catch (_) {}
+  }
+
+  /// 修改个人资料（/user/update）。仅提交非 null 字段，
+  /// signature/birthday/tags 传空串表示清空。
+  /// 返回 (业务是否成功, 服务端 msg)；成功后自动刷新用户信息。
+  Future<(bool, String?)> updateUserProfile({
+    String? nickname,
+    int? sex,
+    String? birthday,
+    String? signature,
+    String? province,
+    String? city,
+    String? memo,
+    String? tags,
+  }) async {
+    Map<String, dynamic>? resp;
+    try {
+      resp = await _apiClient.updateUserProfile(
+        nickname: nickname,
+        sex: sex,
+        birthday: birthday,
+        signature: signature,
+        province: province,
+        city: city,
+        memo: memo,
+        tags: tags,
+      );
+    } catch (_) {
+      return (false, null);
+    }
+    if (resp == null) return (false, null);
+    final ok = KugouApiClient.isBizOk(resp);
+    final msg = resp['msg'] is String ? resp['msg'] as String : null;
+    if (ok) await refreshUserInfo();
+    return (ok, msg);
+  }
+
+  /// 修改头像（/user/update/avatar，相册图片字节）。
+  /// 返回 (业务是否成功, 服务端 msg)；成功后自动刷新用户信息。
+  /// 注意头像为异步审核制，写入成功不代表我的页立即显示新头像。
+  Future<(bool, String?)> updateUserAvatar(Uint8List bytes) async {
+    Map<String, dynamic>? resp;
+    try {
+      resp = await _apiClient.updateUserAvatar(bytes);
+    } catch (_) {
+      return (false, null);
+    }
+    if (resp == null) return (false, null);
+    final ok = KugouApiClient.isBizOk(resp);
+    final msg = resp['msg'] is String ? resp['msg'] as String : null;
+    if (ok) await refreshUserInfo();
+    return (ok, msg);
+  }
+
+  /// 拉取当前账号的听歌偏好（/user/preference）。
+  /// 返回拉到的偏好（失败/未登录返回 null，调用方自行提示）。
+  Future<KugouUserPreference?> getUserPreference() async {
+    try {
+      final r = await _apiClient.getUserPreference();
+      if (r != null) {
+        _userPreference = r;
+        notifyListeners();
+      }
+      return r;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 更新听歌偏好（/user/preference/update）。仅提交非 null 字段
+  /// （mode/gender/age 传 id、lang/style/songLang 传 JSON 字符串，空串=清除）。
+  /// 返回 (业务是否成功, 服务端 msg)；成功后回读一次，保证本地缓存与服务端一致。
+  Future<(bool, String?)> updateUserPreference({
+    String? mode,
+    String? gender,
+    String? age,
+    String? lang,
+    String? style,
+    String? songLang,
+  }) async {
+    Map<String, dynamic>? resp;
+    try {
+      resp = await _apiClient.updateUserPreference(
+        mode: mode,
+        gender: gender,
+        age: age,
+        lang: lang,
+        style: style,
+        songLang: songLang,
+      );
+    } catch (_) {
+      return (false, null);
+    }
+    if (resp == null) return (false, null);
+    final ok = KugouApiClient.isBizOk(resp);
+    final msg = resp['msg'] is String ? resp['msg'] as String : null;
+    if (ok) {
+      try {
+        final fresh = await _apiClient.getUserPreference();
+        if (fresh != null) _userPreference = fresh;
+      } catch (_) {}
+      notifyListeners();
+    }
+    return (ok, msg);
   }
 
   // 内部调用, 保留为下划线形式仅在类内使用
@@ -1507,6 +1760,7 @@ class KugouProvider extends ChangeNotifier {
     _vipMonthRecord = null;
     _userHistoryData = null;
     _everydayHistory = null;
+    _userPreference = null;
 
     // 头像缓存按账号隔离：账号变化时清空
     _clearAvatarCacheIfUserChanged(userid);
@@ -1557,6 +1811,7 @@ class KugouProvider extends ChangeNotifier {
       _vipMonthRecord = null;
       _userHistoryData = null;
       _everydayHistory = null;
+      _userPreference = null;
       _localSignedDays.clear();
       _resetHomeDiscoverProgress();
 
@@ -2388,14 +2643,95 @@ class KugouProvider extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> getTopSong({int page = 1}) async {
+  /// 新歌速递首屏（第 1 页）。
+  ///
+  /// 空结果**不**盖 `_dataTimestamps['newSong']`：请求本身成功、只是榜面为空，
+  /// 盖上时间戳等于让发现页接下来 5 分钟（TTL 内直接跳过取数）只显示一个空区块；
+  /// 不盖则下次进页还能重试。与 [getHomeDiscover] 的「空批不写时间戳」同一条纪律。
+  Future<void> getNewSongs({bool forceRefresh = false}) async {
+    if (!forceRefresh && _isDataFresh('newSong')) return;
+    _beginLoading();
+    _error = null;
     try {
-      final r = await _apiClient.getTopSong(page: page);
-      if (r != null) {
-        _topSongData = r;
-        notifyListeners();
+      final list = await _apiClient.getTopSong(
+        page: 1,
+        pagesize: newSongPageSize,
+      );
+      if (list == null) {
+        _error = '获取新歌速递失败';
+      } else if (list.isEmpty) {
+        _newSongHasMore = false;
+      } else {
+        _newSongSeen.clear();
+        _newSongs = [];
+        _newSongPage = 1;
+        _newSongs = _mergeNewSongs(list);
+        _newSongHasMore = list.length >= newSongPageSize;
+        _dataTimestamps['newSong'] = DateTime.now();
       }
-    } catch (_) {}
+    } catch (e) {
+      _error = e.toString();
+    }
+    _endLoading();
+  }
+
+  /// 追加下一页新歌速递，返回**真正新并进 [_newSongs] 的那些**
+  /// （契约与 [fetchMoreHomeDiscover] 一致：空列表就是「确实没有更多了」，
+  /// 调用方据此收口，不需要也不应该再往列表里塞一遍）。
+  Future<List<KugouSongDetail>> fetchMoreNewSongs() async {
+    if (_newSongLoadingMore || !_newSongHasMore) return const [];
+    _newSongLoadingMore = true;
+    // 声明在 try 之外：finally 里要靠它决定要不要通知订阅者。
+    final fresh = <KugouSongDetail>[];
+    try {
+      final next = _newSongPage + 1;
+      final list = await _apiClient.getTopSong(
+        page: next,
+        pagesize: newSongPageSize,
+      );
+      if (list == null || list.isEmpty) {
+        _newSongHasMore = false;
+        return const [];
+      }
+      _newSongPage = next;
+      fresh.addAll(_mergeNewSongs(list));
+      // 短页即榜单到底：上游不会给「还有更多」的显式标记，只能靠条数判断。
+      if (list.length < newSongPageSize) _newSongHasMore = false;
+      return fresh;
+    } catch (_) {
+      // 不翻转 [_newSongHasMore]：一次异常不该永久杀掉翻页，下次滑动还会再试。
+      return fresh;
+    } finally {
+      _newSongLoadingMore = false;
+      // 必须自己通知：本方法不走 [_beginLoading]/[_endLoading] 计数器（它是滑动
+      // 的增量路径，不该点亮整页的 loading 指示器），所以不能指望那对边沿通知
+      // 顺带把新批次推给 UI。
+      if (fresh.isNotEmpty) notifyListeners();
+    }
+  }
+
+  /// 按 hash 去重后把一批歌并进 [_newSongs]，返回真正新增的那些。
+  ///
+  /// 与 [_ingestHomeDiscoverSongs] 一样刻意**重新赋值**而不是原地 `add`：订阅方用
+  /// `Selector<KugouProvider, List<KugouSongDetail>>` 拿新旧值做 `==` 比较，同一个
+  /// List 实例原地改内容、引用没变、比较结果永远相等，于是新批次进了数据却永远
+  /// 画不出来。
+  ///
+  /// 与那里有一处**故意不同**：空 hash 的歌在这里保留（只是不拿它当去重键）。
+  /// 刷歌的 hash 是取数游标本身，空值必须丢；新歌榜的字段形态还没取证，照抄
+  /// 「空 hash 即丢弃」一旦碰上上游换键名就会让整块新区静默变空。
+  List<KugouSongDetail> _mergeNewSongs(List<KugouSongDetail> incoming) {
+    final merged = <KugouSongDetail>[];
+    for (final song in incoming) {
+      if (song.hash.isNotEmpty && !_newSongSeen.add(song.hash)) continue;
+      merged.add(song);
+    }
+    if (merged.isEmpty) return merged;
+    _newSongs = <KugouSongDetail>[
+      ..._newSongs,
+      ...merged,
+    ];
+    return merged;
   }
 
   // ==================== User (用户) ====================
@@ -2792,6 +3128,12 @@ class KugouProvider extends ChangeNotifier {
       _error = e.toString();
     }
     _setLoading(false);
+  }
+
+  @override
+  void dispose() {
+    _hotSearch.dispose();
+    super.dispose();
   }
 }
 

@@ -27,11 +27,11 @@ import com.ryanheise.just_audio.AudioPlayer
 class MD3MusicMediaSessionService : MediaSessionService() {
 
     override fun onCreate() {
+        // 所有机型都安装本 App 的媒体通知 Provider：底层仍是 media3 默认实现，额外做两件事
+        // —— 统一设单色小图标（所有机型保留）；仅 Flyme 系把歌词写进媒体通知的 tickerText。
         // 必须在 onCreate() 返回前设置（fork 源码 MediaSessionService:594 的约束）。
-        // 包一层 provider 才能拿到 Media3 真正生成的那条媒体通知（含 id 与 Notification
-        // 对象），把歌词贴到它的 tickerText 上 —— 另起通知会出两个播放器且 Flyme 不渲染。
         setMediaNotificationProvider(
-            FlymeNotificationProvider(
+            Md3MediaNotificationProvider(
                 DefaultMediaNotificationProvider.Builder(applicationContext).build(),
                 applicationContext
             )
@@ -47,12 +47,17 @@ class MD3MusicMediaSessionService : MediaSessionService() {
     }
 
     /**
-     * 委托给 media3 默认 provider，并在通知交出前把当前歌词注入 tickerText。
+     * 本 App 的媒体通知 Provider：委托给 media3 默认实现，额外做两件事 ——
+     * 1) 统一设置单色小图标（所有机型）；
+     * 2) 仅 Flyme 系（FlymeLyricBridge.isSupported()）把当前歌词原地写进媒体通知的
+     *    tickerText 并置 Flyme 私有 flag 位。非 Flyme 机型（vivo/iQOO 等）走纯透传，
+     *    不接触 Notification 对象，避免打断原子随身听对媒体通知的读取
+     *    （表现为卡片出现但无封面/无歌词/无进度）。
      *
      * fork 的 MediaSessionService 只有 onUpdateNotification(MediaSession[, boolean]) 两个
      * 重载，拿不到 Notification 对象与通知 id，所以只能在 provider 这一层挂钩。
      */
-    private class FlymeNotificationProvider(
+    private class Md3MediaNotificationProvider(
         private val delegate: DefaultMediaNotificationProvider,
         private val context: Context
     ) : MediaNotification.Provider {
@@ -64,6 +69,13 @@ class MD3MusicMediaSessionService : MediaSessionService() {
             onNotificationChangedCallback: MediaNotification.Provider.Callback
         ): MediaNotification {
             delegate.setSmallIcon(R.drawable.ic_launcher_monochrome)
+            // 按机型选择：非 Flyme 机型直接原样透传 Callback，语义与 media3 默认 Provider
+            // 完全一致（只多了上面那行小图标），绝不包装/改写通知对象。
+            if (!FlymeLyricBridge.isSupported()) {
+                return delegate.createNotification(
+                    mediaSession, customLayout, actionFactory, onNotificationChangedCallback
+                )
+            }
             // fork 的 MediaNotificationManager 会把这个 Callback 直接交给 delegate，
             // 封面图异步加载完成后它会被触发并绕过本包装层直接重发通知（见
             // MediaNotificationManager:167-176 → onNotificationUpdated → updateNotificationInternal）。

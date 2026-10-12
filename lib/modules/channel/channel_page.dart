@@ -1,11 +1,16 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../login/login_page.dart';
 import 'channel_detail_page.dart';
@@ -119,9 +124,10 @@ class _ChannelPageState extends State<ChannelPage> {
           TextButton(
             onPressed: () async {
               Navigator.of(ctx).pop();
-              await Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const LoginPage()),
-              );
+              await Navigator.of(context,
+                rootNavigator: true,
+              ).push(
+                MaterialPageRoute(builder: (_) => const LoginPage()));
               // 登录返回后重新加载
               if (mounted) _load();
             },
@@ -135,6 +141,7 @@ class _ChannelPageState extends State<ChannelPage> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final heroFirstIndex = firstIndexById(_channels.map((c) => c.id));
     return Scaffold(
       appBar: ScrollAwareAppBar(
         title: '频道',
@@ -148,24 +155,31 @@ class _ChannelPageState extends State<ChannelPage> {
               ? _buildEmpty(cs)
               : Md3PullToRefresh(
                   onRefresh: () => _load(showLoading: false),
-                  child: PinchableGridView(
+                  // tv: 频道网格补区域语义（此前零 TV 接线，网格内无从遍历）。
+                  child: TvScrollRegion(
+                    memoryKey: 'tv/channel-grid',
+                    horizontalEdge: DpadEdgeBehavior.leave,
+                    child: PinchableGridView(
                     controller: _scrollController,
                     itemCount: _channels.length,
                     childAspectRatio: 0.72,
                     padding: const EdgeInsets.all(16),
                     itemBuilder: (context, i) => _ChannelCard(
                       channel: _channels[i],
+                      // 该 id 首次出现的卡才参与飞行（避免同子树重复 tag）。
+                      heroTag: heroFirstIndex[_channels[i].id] == i
+                          ? channelCoverHeroTag(_channels[i].id)
+                          : null,
                       onTap: () async {
-                        await Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
+                        await AdaptiveNav.openDetail(context,
+                      (_) =>
                                 ChannelDetailPage(channel: _channels[i]),
-                          ),
                         );
                         // 返回后刷新（订阅状态可能变化）
                         if (mounted) _load();
                       },
                     ),
+                  ),
                   ),
                 ),
     );
@@ -192,9 +206,10 @@ class _ChannelPageState extends State<ChannelPage> {
             const SizedBox(height: 12),
             FilledButton.tonalIcon(
               onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const LoginPage()),
-                );
+                await Navigator.of(context,
+                  rootNavigator: true,
+                ).push(
+                  MaterialPageRoute(builder: (_) => const LoginPage()));
                 if (mounted) _load();
               },
               icon: const Icon(Icons.login),
@@ -212,13 +227,45 @@ class _ChannelCard extends StatelessWidget {
   final KugouYouthChannel channel;
   final VoidCallback? onTap;
 
-  const _ChannelCard({required this.channel, this.onTap});
+  /// 非空时封面参与封面连贯过渡（channelCoverHeroTag 命名空间）。
+  final String? heroTag;
+
+  const _ChannelCard({
+    required this.channel,
+    this.onTap,
+    this.heroTag,
+  });
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
-    return ClipRRect(
+    final cover = channel.coverUrl != null
+        ? CachedNetworkImage(
+            imageUrl: channel.coverUrl!,
+            memCacheWidth: 540,
+            memCacheHeight: 540,
+            fit: BoxFit.cover,
+            errorWidget: (_, _, _) => ColoredBox(
+              color: Colors.transparent,
+              child: Center(
+                child: Icon(
+                  Icons.dynamic_feed_outlined,
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+            ),
+          )
+        : ColoredBox(
+            color: Colors.transparent,
+            child: Center(
+              child: Icon(
+                Icons.dynamic_feed_outlined,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          );
+    final card = ClipRRect(
       borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: Material(
@@ -229,30 +276,15 @@ class _ChannelCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Expanded(
-                child: channel.coverUrl != null
-                    ? CachedNetworkImage(
-                        imageUrl: channel.coverUrl!,
-                        memCacheWidth: 540,
-                        memCacheHeight: 540,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, _, _) => ColoredBox(
-                          color: Colors.transparent,
-                          child: Center(
-                            child: Icon(
-                              Icons.dynamic_feed_outlined,
-                              color: cs.onSurfaceVariant,
-                            ),
-                          ),
+                // 卡外层 ClipRRect 全圆 16，封面只占上部 → 可见圆角仅上两角。
+                child: heroTag == null
+                    ? cover
+                    : PlaylistCoverHero(
+                        tag: heroTag!,
+                        radius: const BorderRadius.vertical(
+                          top: Radius.circular(16),
                         ),
-                      )
-                    : ColoredBox(
-                        color: Colors.transparent,
-                        child: Center(
-                          child: Icon(
-                            Icons.dynamic_feed_outlined,
-                            color: cs.onSurfaceVariant,
-                          ),
-                        ),
+                        child: cover,
                       ),
               ),
               Padding(
@@ -275,6 +307,14 @@ class _ChannelCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    // tv: 卡片单停点（OK = 进入频道详情）。网格此前零 TV 接线，
+    // 卡是裸 InkWell，遥控完全选不中（2026-10-08）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'channel-card',
+      child: card,
     );
   }
 }

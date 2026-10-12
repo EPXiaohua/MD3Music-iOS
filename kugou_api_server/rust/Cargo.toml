@@ -23,6 +23,10 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 libc = "0.2"
+# 小-MSS HTTPS 传输（mss_http.rs，黑名单大上行端点专用）：与 ureq 2.12 的
+# rustls 装配完全同版本/同特性（ring + webpki-roots），保证信任源一致
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
 qrcode = { version = "0.14.0", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # log 为日志门面：Android 由 android_logger 输出到 logcat；桌面未接 logger 时宏为 no-op

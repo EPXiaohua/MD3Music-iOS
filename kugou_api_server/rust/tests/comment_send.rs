@@ -5,8 +5,9 @@
 //! 任何签名/参数改动都必须能解释这些值为何不变。
 
 use kugou_server::modules::comment_send::{
-    del_options, extract_resolved_resource, identity, reply_options, resolve_code, send_options,
-    with_quote_suffix, ALBUM_CODE, PLAYLIST_CODE, SONG_CODE,
+    del_options, extract_resolved_resource, floor_tid, identity, reply_options,
+    reply_quote_fields, resolve_code, send_options, with_quote_suffix, ALBUM_CODE, PLAYLIST_CODE,
+    SONG_CODE,
 };
 use serde_json::json;
 
@@ -232,4 +233,149 @@ fn with_quote_suffix_appends_once() {
     // 缺任一字段 → 原样返回
     assert_eq!(with_quote_suffix("收到", "", "原评论"), "收到");
     assert_eq!(with_quote_suffix("收到", "小明", ""), "收到");
+}
+
+// ---------------------------------------------------------------------------
+// 镜像修正回归（对照 KuGouMusicApi module/_comment.js / comment_floor_send.js）
+// ---------------------------------------------------------------------------
+
+/// 空 cookie 样本（未登录/缺字段时验证 compact 行为）。
+fn bare_query() -> serde_json::Value {
+    json!({ "clienttime": 1758182400 })
+}
+
+#[test]
+fn reply_options_passes_extdata_and_source() {
+    let q = json!({
+        "clienttime": 1758182400,
+        "extdata": "ext-1",
+        "source": "android",
+        "cookie": { "KUGOU_API_MID": "abcdef1234567890", "userid": 1 }
+    });
+    let p = reply_options(&q, "x", "1", "n", SONG_CODE, "2").params;
+    assert_eq!(p["extdata"], json!("ext-1"), "extdata 原样透传");
+    assert_eq!(p["source"], json!("android"), "source 原样透传");
+
+    // 缺省时两个键都不出现（JS compact 语义）
+    let p2 = reply_options(&fixture_query(), "x", "1", "n", SONG_CODE, "2").params;
+    assert!(p2.get("extdata").is_none(), "缺省 extdata 不下发");
+    assert!(p2.get("source").is_none(), "缺省 source 不下发");
+}
+
+#[test]
+fn reply_options_accepts_is_t_alias() {
+    // JS firstValue(params.is_t, params.isT, ...)：isT 别名同样生效
+    let q = json!({
+        "clienttime": 1758182400,
+        "pid": "678433417",
+        "isT": "1",
+        "cookie": { "KUGOU_API_MID": "abcdef1234567890", "userid": 1 }
+    });
+    let p = reply_options(&q, "x", "1", "", SONG_CODE, "2").params;
+    assert_eq!(p["is_t"], json!("1"));
+}
+
+#[test]
+fn reply_options_empty_pid_becomes_zero() {
+    // JS firstValue(params.pid, 0)：空串 → 0（is_t 自动推断随之取 1）
+    let q = json!({
+        "clienttime": 1758182400,
+        "pid": "",
+        "cookie": { "KUGOU_API_MID": "abcdef1234567890", "userid": 1 }
+    });
+    let p = reply_options(&q, "x", "1", "", SONG_CODE, "2").params;
+    assert_eq!(p["pid"], json!(0));
+    assert_eq!(p["is_t"], json!(1));
+}
+
+#[test]
+fn identity_prefers_params_mid_over_cookie() {
+    let q = json!({
+        "mid": "M1",
+        "cookie": { "KUGOU_API_MID": "abcdef1234567890", "userid": 1 }
+    });
+    assert_eq!(identity(&q).mid, "M1");
+    // 未传 mid 参数时回落 cookie；再无则用 "-"（request.rs 默认口径）
+    assert_eq!(identity(&fixture_query()).mid, "abcdef1234567890");
+    assert_eq!(identity(&json!({})).mid, "-");
+}
+
+#[test]
+fn auth_params_drop_empty_clienttoken_but_keep_zero_kugouid() {
+    let p = reply_options(&bare_query(), "x", "1", "", SONG_CODE, "2").params;
+    assert!(
+        p.get("clienttoken").is_none(),
+        "空 token 必须被 compact 丢弃（JS compact 语义）"
+    );
+    assert_eq!(p["kugouid"], json!(0), "kugouid=0 是数字，compact 保留");
+}
+
+#[test]
+fn auth_params_allow_ver_override() {
+    let q = json!({ "clienttime": 1758182400, "ver": 7, "userid": 1 });
+    let p = reply_options(&q, "x", "1", "", SONG_CODE, "2").params;
+    assert_eq!(p["ver"], json!(7), "显式 ver 原样透传");
+
+    let p2 = reply_options(&fixture_query(), "x", "1", "", SONG_CODE, "2").params;
+    assert_eq!(p2["ver"], json!(6), "缺省 ver = 6");
+}
+
+#[test]
+fn reply_quote_fields_support_puser_pcontent_aliases() {
+    let q = json!({ "puser": "小明", "pcontent": "原评论" });
+    assert_eq!(reply_quote_fields(&q), ("小明".to_string(), "原评论".to_string()));
+
+    // 显式参数优先于别名
+    let q2 = json!({
+        "reply_user_name": "小红",
+        "reply_content": "内容",
+        "puser": "小明",
+        "pcontent": "原评论"
+    });
+    assert_eq!(reply_quote_fields(&q2), ("小红".to_string(), "内容".to_string()));
+
+    // 都缺省 → 空串（不拼引用后缀）
+    assert_eq!(reply_quote_fields(&json!({})), (String::new(), String::new()));
+}
+
+#[test]
+fn floor_tid_accepts_string_zero_and_rejects_empty() {
+    // JS "0" 是真值：放行转发上游
+    assert_eq!(floor_tid(&json!({ "tid": "0" })).unwrap(), "0");
+    assert_eq!(floor_tid(&json!({ "tid": "678433417" })).unwrap(), "678433417");
+    // 缺失/空串拒绝
+    assert!(floor_tid(&json!({})).is_err());
+    assert!(floor_tid(&json!({ "tid": "" })).is_err());
+    // JSON body 数字 0 → q_str 归空 → 拒绝（与 JS !firstValue(0) 一致）
+    assert!(floor_tid(&json!({ "tid": 0 })).is_err());
+}
+
+#[test]
+fn send_options_passes_title_extdata_images_source() {
+    let q = json!({
+        "clienttime": 1758182400,
+        "title": "歌名",
+        "content_extdata": "ed",
+        "images": ["https://img/1.png"],
+        "source": "app",
+        "cookie": { "KUGOU_API_MID": "abcdef1234567890", "userid": 1 }
+    });
+    let opts = send_options(&q, "评", "1", "n", SONG_CODE, "302362878");
+    let (body, is_buffer) = opts.data.sig_data();
+    assert!(!is_buffer);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"data":{"content":"评","album_audio_id":"302362878","title":"歌名","extdata":"ed","images":["https://img/1.png"]}}"#,
+        "body 键序与 JS JSON.stringify 一致，title/extdata 透传"
+    );
+    assert_eq!(opts.params["source"], json!("app"));
+
+    // 缺省时 body 与旧黄金值形态一致（title/extdata 不出现、images 归 []）、source 不下发
+    let opts2 = send_options(&bare_query(), "评", "1", "n", SONG_CODE, "302362878");
+    let (body2, _) = opts2.data.sig_data();
+    assert_eq!(
+        String::from_utf8(body2).unwrap(),
+        r#"{"data":{"content":"评","album_audio_id":"302362878","images":[]"#.to_string() + "}}"
+    );
+    assert!(opts2.params.get("source").is_none());
 }

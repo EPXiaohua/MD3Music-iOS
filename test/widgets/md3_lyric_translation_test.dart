@@ -34,6 +34,31 @@ Widget _buildLyricsView(List<LyricLine> lines) {
   );
 }
 
+Widget _buildRawLyricsView(String raw) {
+  return MaterialApp(
+    home: Scaffold(
+      body: SizedBox(
+        width: 320,
+        height: 520,
+        child: LyricsView(
+          lyrics: raw,
+          position: Duration.zero,
+          onSeek: (_) {},
+        ),
+      ),
+    ),
+  );
+}
+
+/// 匹配内容（去掉平衡换行插入的硬断点 \n 后）与 [expected] 逐字相等的 Text。
+///
+/// 「平衡行换行」默认开启后，长副行/长翻译会被 DP 断点落成 `\n`，
+/// `find.text(原文)` 的精确匹配随之失效。本 finder 保留原用例「完整内容都在、
+/// 没被省略号截断、副行归属正确」的意图，只容忍插入的换行符。
+Finder findLyricText(String expected) => find.byWidgetPredicate(
+  (Widget w) => w is Text && (w.data?.replaceAll('\n', '') ?? '') == expected,
+);
+
 void main() {
   testWidgets('MD3 翻译模式显示所有匹配译文', (tester) async {
     await _resetMd3Preferences();
@@ -120,16 +145,58 @@ void main() {
     await tester.pumpWidget(_buildLyricsView(lines));
     await tester.pump();
 
-    final translation = tester.widget<Text>(find.text(longTranslation));
+    final translation = tester.widget<Text>(findLyricText(longTranslation));
     expect(translation.maxLines, isNull);
     expect(translation.overflow, isNull);
     final container = find
         .ancestor(
-          of: find.text(longTranslation),
+          of: findLyricText(longTranslation),
           matching: find.byType(Container),
         )
         .first;
     expect(tester.getSize(container).height, greaterThan(80));
+  });
+
+  const dualLineLrc = '[00:19.25]今天我寒夜里看雪飘过\n'
+      '[00:19.25]gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3';
+
+  testWidgets('MD3 双行 LRC：第二行为副歌词而非独立主歌词行', (tester) async {
+    await _resetMd3Preferences();
+    await tester.pumpWidget(_buildRawLyricsView(dualLineLrc));
+    await tester.pump();
+
+    expect(find.text('今天我寒夜里看雪飘过'), findsOneWidget);
+    expect(
+      findLyricText('gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3'),
+      findsOneWidget,
+    );
+
+    // 判别性断言：关闭副歌词后粤拼必须消失。若它被当成独立主歌词行，
+    // 关闭副歌词开关也不会隐藏它。
+    await Md3LyricPreferences.instance.setShowAuxiliary(false);
+    await tester.pump();
+    expect(find.text('今天我寒夜里看雪飘过'), findsOneWidget);
+    expect(
+      findLyricText('gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3'),
+      findsNothing,
+    );
+  });
+
+  testWidgets('MD3 三行 LRC：第三行落到 roma 槽位', (tester) async {
+    await _resetMd3Preferences();
+    await Md3LyricPreferences.instance.setDisplayMode(Md3LyricDisplayMode.roma);
+
+    await tester.pumpWidget(
+      _buildRawLyricsView('$dualLineLrc\n[00:19.25]Today I watch the snow'),
+    );
+    await tester.pump();
+
+    expect(find.text('今天我寒夜里看雪飘过'), findsOneWidget);
+    expect(findLyricText('Today I watch the snow'), findsOneWidget);
+    expect(
+      findLyricText('gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3'),
+      findsNothing,
+    );
   });
 
   test('MD3 副歌词偏好独立持久化并可重置', () async {

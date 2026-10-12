@@ -4,11 +4,13 @@ import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../player/secondary_mini_player.dart';
@@ -515,45 +517,55 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
 
   Widget _buildPulseCircle(ColorScheme colorScheme) {
     return Center(
-      child: GestureDetector(
-        onTap: _toggleRecording,
-        child: ScaleTransition(
-          scale: _isRecording
-              ? _pulseAnimation
-              : const AlwaysStoppedAnimation(1.0),
-          child: Container(
-            width: 140,
-            height: 140,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: _isRecording
-                  ? colorScheme.error
-                  : _isLooping
-                  ? colorScheme.tertiary
-                  : colorScheme.primaryContainer,
-              boxShadow: _isRecording
-                  ? [
-                      BoxShadow(
-                        color: colorScheme.error.withValues(alpha: 0.3),
-                        blurRadius: 24,
-                        spreadRadius: 8,
-                      ),
-                    ]
-                  : null,
+      // tv: TV 构建下识别大圆钮单停点（GestureDetector 不可聚焦，D-pad 原生
+      // 遍历到不了；OK=开始/停止识别），并作为本页主操作抢占初始焦点
+      child: kTvBuild
+          ? DpadFocusable(
+              autofocus: kTvBuild,
+              onSelect: _toggleRecording,
+              child: _buildPulseCircleBody(colorScheme),
+            )
+          : GestureDetector(
+              onTap: _toggleRecording,
+              child: _buildPulseCircleBody(colorScheme),
             ),
-            child: Center(
-              child: Icon(
-                _isRecording
-                    ? Icons.mic
-                    : (_isLooping ? Icons.stop : Icons.mic_none),
-                size: 56,
-                color: _isRecording
-                    ? colorScheme.onError
-                    : _isLooping
-                    ? colorScheme.onTertiary
-                    : colorScheme.onPrimaryContainer,
-              ),
-            ),
+    );
+  }
+
+  Widget _buildPulseCircleBody(ColorScheme colorScheme) {
+    return ScaleTransition(
+      scale: _isRecording ? _pulseAnimation : const AlwaysStoppedAnimation(1.0),
+      child: Container(
+        width: 140,
+        height: 140,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: _isRecording
+              ? colorScheme.error
+              : _isLooping
+              ? colorScheme.tertiary
+              : colorScheme.primaryContainer,
+          boxShadow: _isRecording
+              ? [
+                  BoxShadow(
+                    color: colorScheme.error.withValues(alpha: 0.3),
+                    blurRadius: 24,
+                    spreadRadius: 8,
+                  ),
+                ]
+              : null,
+        ),
+        child: Center(
+          child: Icon(
+            _isRecording
+                ? Icons.mic
+                : (_isLooping ? Icons.stop : Icons.mic_none),
+            size: 56,
+            color: _isRecording
+                ? colorScheme.onError
+                : _isLooping
+                ? colorScheme.onTertiary
+                : colorScheme.onPrimaryContainer,
           ),
         ),
       ),

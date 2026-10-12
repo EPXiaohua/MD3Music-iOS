@@ -8,6 +8,8 @@
 /// - 字级 LRC：每行内嵌多个时间戳，形如 `[00:01.000]湘[00:01.242]女[00:02.233]多`
 ///   解析为单条 [LyricLine] 且 [LyricLine.words] 非空（[LyricLine.hasWordTiming] = true）
 /// - 元数据行过滤：`[ar:]`、`[ti:]`、`[al:]`、`[by:]`、`[offset:]` 等
+/// - 同时间戳多行：相邻多行时间戳相同时，第一行为主歌词，第二行为
+///   [LyricLine.translation]，第三行为 [LyricLine.roma]，其余丢弃
 ///
 /// 字级 LRC 与"一行多时间戳"的区分：后者时间戳之间无文本，
 /// 字级 LRC 时间戳之间有非空白文本（逐字时间戳）。
@@ -39,8 +41,6 @@ class LrcParser {
   static List<LyricLine> parse(String lrcText) {
     try {
       final List<LyricLine> result = [];
-      // 是否出现增强型 LRC 行（含尖括号逐字时间戳）
-      bool sawEnhanced = false;
 
       // 按行拆分，兼容 \n 与 \r\n
       final lines = lrcText.split(RegExp(r'\r?\n'));
@@ -77,7 +77,6 @@ class LrcParser {
           final enhancedLine = _parseEnhancedLine(line, matches, offsetMs);
           if (enhancedLine != null) {
             result.add(enhancedLine);
-            sawEnhanced = true;
           }
           continue;
         }
@@ -140,15 +139,19 @@ class LrcParser {
         }
       }
 
-      // 增强型 LRC：把同时间戳的"非逐字纯文本行"合并为主歌词行的翻译
-      // （参考 Lyrico separateLrcTracks：逐字行为主，其余为翻译/罗马音）。
-      // 仅当出现增强型行时启用，避免影响普通 LRC / 字级 LRC。
-      final merged = sawEnhanced ? _mergeEnhancedTranslations(result) : result;
+      // 同一时间戳的相邻行合并：第一行为主歌词，第二行为翻译，第三行为罗马音，
+      // 其余丢弃。必须在排序前执行：合并依赖源码中的相邻顺序，而 List.sort 不稳定。
+      final merged = _mergeDuplicateTimestampLines(result);
 
-      // 按 startTime 升序排序
-      merged.sort((a, b) => a.startTime.compareTo(b.startTime));
+      // 按 startTime 升序排序。List.sort 不保证稳定性，同时间戳行（主歌词与
+      // NBSP 占位行）必须保持源码相对顺序，因此带原始下标作为兜底比较键。
+      final indexed = merged.asMap().entries.toList()
+        ..sort((a, b) {
+          final byTime = a.value.startTime.compareTo(b.value.startTime);
+          return byTime != 0 ? byTime : a.key.compareTo(b.key);
+        });
 
-      return merged;
+      return indexed.map((e) => e.value).toList();
     } catch (_) {
       // 失败兜底：返回空列表，不抛异常
       return [];
@@ -317,50 +320,91 @@ class LrcParser {
     );
   }
 
-  /// 合并增强型 LRC 中同时间戳的"非逐字纯文本行"为主歌词行的翻译。
+  /// 合并源码中相邻且时间戳完全相同的行。
   ///
-  /// 增强型 LRC 常见形态：主歌词行带尖括号逐字时间戳，紧邻的同时间戳
-  /// 纯文本行为翻译（或罗马音）。参考 Lyrico separateLrcTracks：
-  /// 同 startTime 分组中，逐字行视为 original，其余（无逐字）视为副行。
+  /// 规则（产品需求）：同段第一行 = 主歌词，第二行 → [LyricLine.translation]，
+  /// 第三行 → [LyricLine.roma]，第四行及以后丢弃。
   ///
-  /// 这里只处理最典型的:一个翻译对应一个主歌词行。若一条纯文本行的
-  /// startTime 与某逐字主歌词行相同，则写入该行的 translation 并移除独立行；
-  /// 无对应主歌词行的纯文本行（如段落间隙的注释）保持原样。
-  static List<LyricLine> _mergeEnhancedTranslations(List<LyricLine> lines) {
-    final Map<int, int> mainIndexByStart = <int, int>{};
-    final Set<int> consumed = <int>{};
+  /// 只在**源码相邻**行之间合并：长歌词中时间戳可能周期性重复（例如每 300 行
+  /// 出现一次 `[00:00.00]`），按全局时间戳分组会错误吞并正常行。
+  ///
+  /// 因此必须在排序前调用（排序后相邻关系失去意义，且 `List.sort` 不稳定）。
+  static List<LyricLine> _mergeDuplicateTimestampLines(List<LyricLine> lines) {
+    final result = List<LyricLine>.of(lines);
+    final consumed = <int>{};
 
-    // 第一遍：建立 startTime → 逐字主歌词行索引
-    for (int i = 0; i < lines.length; i++) {
-      final l = lines[i];
-      if (l.hasWordTiming) mainIndexByStart[l.startTime] = i;
+    var i = 0;
+    while (i < lines.length) {
+      var end = i + 1;
+      while (end < lines.length && lines[end].startTime == lines[i].startTime) {
+        end++;
+      }
+      if (end - i > 1) {
+        _mergeDuplicateRun(lines, i, end, result, consumed);
+      }
+      i = end;
     }
 
-    final resulting = List<LyricLine>.of(lines);
-    // 第二遍：把纯文本行合并到同时间戳的主歌词行
-    for (int i = 0; i < lines.length; i++) {
-      final l = lines[i];
-      if (l.hasWordTiming) continue; // 主歌词行跳过
-      if (l.text.isEmpty || l.text == '\u00A0') continue; // 忽略无意义行
-      final mainIdx = mainIndexByStart[l.startTime];
-      if (mainIdx == null) continue; // 无对应主歌词行
-      final main = resulting[mainIdx];
-      // 只填充空的 translation，避免覆盖已有翻译
-      if (main.translation == null || main.translation!.isEmpty) {
-        resulting[mainIdx] = main.copyWith(
-          translation: l.text,
-          clearRoma: true,
-        );
-        consumed.add(i);
+    if (consumed.isEmpty) return result;
+    final out = <LyricLine>[];
+    for (var k = 0; k < result.length; k++) {
+      if (consumed.contains(k)) continue;
+      out.add(result[k]);
+    }
+    return out;
+  }
+
+  /// 合并 [start, end) 这段同时间戳的相邻行，写回 [result] 并登记 [consumed]。
+  static void _mergeDuplicateRun(
+    List<LyricLine> lines,
+    int start,
+    int end,
+    List<LyricLine> result,
+    Set<int> consumed,
+  ) {
+    // 主歌词行：优先取段内第一条带逐字时间戳的行（增强型 / 字级 LRC），
+    // 否则取段内第一条。
+    var mainIdx = start;
+    for (var k = start; k < end; k++) {
+      if (lines[k].hasWordTiming) {
+        mainIdx = k;
+        break;
       }
     }
 
-    // 按索引顺序重建，跳过被合并的独立翻译行
-    final out = <LyricLine>[];
-    for (int i = 0; i < resulting.length; i++) {
-      if (consumed.contains(i)) continue;
-      out.add(resulting[i]);
+    // 副行候选：除主行外文本非空、非占位 NBSP 的行，保持出现顺序
+    final aux = <int>[];
+    for (var k = start; k < end; k++) {
+      if (k == mainIdx) continue;
+      final text = lines[k].text;
+      if (text.isEmpty || text == '\u00A0') continue;
+      aux.add(k);
     }
-    return out;
+    if (aux.isEmpty) return;
+
+    // 只填空槽位：已有非空值不覆盖，对应候选行保留为独立行
+    final main = result[mainIdx];
+    var translation = main.translation;
+    var roma = main.roma;
+    final used = <int>[];
+    var changed = false;
+
+    if (translation == null || translation.isEmpty) {
+      translation = lines[aux[0]].text;
+      used.add(aux[0]);
+      changed = true;
+    }
+    if ((roma == null || roma.isEmpty) && aux.length > used.length) {
+      final next = aux[used.length];
+      roma = lines[next].text;
+      used.add(next);
+      changed = true;
+    }
+    if (!changed) return;
+
+    result[mainIdx] = main.copyWith(translation: translation, roma: roma);
+    // 两个槽位填满后仍多余的候选行（源码中的第 4 行及以后）无处安放，按规则丢弃
+    consumed.addAll(used);
+    consumed.addAll(aux.where((k) => !used.contains(k)));
   }
 }

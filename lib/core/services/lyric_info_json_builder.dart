@@ -1,13 +1,14 @@
 /// LyricInfo 歌词 JSON 构造（纯函数，供单测）。
 ///
 /// 支持两种输出模式：
-/// - 默认（colorOsMode=false）：兼容 limczhh LyricInfo / HyperLyric 系——
-///   `lyric` 为 ELRC（行标签 + 词级标签 + 同时间戳翻译行），带 `format:'elrc'`、
-///   有翻译时带 `translation:'lrc'`。
+/// - 默认（colorOsMode=false）：lidesheng LyricInfo 规范（HyperLyric 等消费方）——
+///   `lyric` 为原文逐行 LRC，`rawLyric` 为原文增强（仅存在真实逐字时输出），
+///   `translation`/`roma` 为互相独立的 lane，`album`/`songId` 仅在非空时写入；
+///   不输出 `format`（增强信息由 `rawLyric` 的 `<>` 标签自描述）。
 /// - ColorOS Bridge 模式（colorOsMode=true）：兼容
 ///   ColorOS-Live-Lyrics-Bridge（Andrea-lyz）开放协议——`lyric` 为纯 LRC 行级、
-///   `rawLyric` 为 ELRC 逐字（插件据此启用逐字高亮等增强），不输出
-///   format/translation 字段。
+///   `rawLyric` 为 ELRC 逐字（含末尾结束标签）、`translationLyric` 独立 lane，
+///   附 `lyricType`/`noLyric`/`provider`/`source`。
 library;
 
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -113,9 +114,34 @@ String buildPlainTranslationLrc(List<LyricLine> lines) {
   return buf.toString().trimRight();
 }
 
-/// 构造 Bridge 渲染 lane：逐字行保留真实增强时间轴，逐行歌词只写普通 LRC，
-/// 让 Bridge 建立 LINE_TIMED 模型而不伪造逐字扫光。
-String buildColorOsRawLyric(List<LyricLine> lines) {
+/// 构造罗马音 lane（规范 `roma`）：只输出罗马音/音译行，`[行时间]罗马音文本`。
+/// 与 [buildPlainTranslationLrc] 互相独立，二者都不合并进 `lyric`/`rawLyric`。
+String buildPlainRomaLrc(List<LyricLine> lines) {
+  final buf = StringBuffer();
+  for (final line in lines) {
+    final r = line.roma;
+    if (r != null && r.isNotEmpty) {
+      buf
+        ..write(lrcTagMs(line.startTime))
+        ..write(r)
+        ..write('\n');
+    }
+  }
+  return buf.toString().trimRight();
+}
+
+/// 构造「原文增强 lane」（规范 `rawLyric`）。
+///
+/// 逐字行输出 `[行时间]<字时间>字<字时间>字...`；只有行级时间的行保持普通 LRC
+/// 文本，**不伪造**词级标签（避免非逐字源被消费方误判为可扫光）。
+/// 翻译与罗马音是独立 lane，不写入本 lane。
+///
+/// [includeTrailingEndTag] 为 true 时逐字行末追加 `<末字结束时间>` 标签
+/// （ColorOS Bridge 4.0 逐字 lane 规则 4；lidesheng 规范无此要求，故默认 false）。
+String buildRawLyricLane(
+  List<LyricLine> lines, {
+  bool includeTrailingEndTag = false,
+}) {
   final buf = StringBuffer();
   for (final line in lines) {
     if (line.text.isEmpty) continue;
@@ -126,9 +152,11 @@ String buildColorOsRawLyric(List<LyricLine> lines) {
           ..write(elrcWordTag(word.startTime))
           ..write(word.text);
       }
-      final last = line.words.last;
-      if (last.duration > 0) {
-        buf.write(elrcWordTag(last.startTime + last.duration));
+      if (includeTrailingEndTag) {
+        final last = line.words.last;
+        if (last.duration > 0) {
+          buf.write(elrcWordTag(last.startTime + last.duration));
+        }
       }
     } else {
       buf.write(line.text);
@@ -138,15 +166,19 @@ String buildColorOsRawLyric(List<LyricLine> lines) {
   return buf.toString().trimRight();
 }
 
+/// ColorOS Bridge 4.0 的 rawLyric：在 [buildRawLyricLane] 基础上补逐字行末尾结束标签。
+String buildColorOsRawLyric(List<LyricLine> lines) =>
+    buildRawLyricLane(lines, includeTrailingEndTag: true);
+
 String _identityText(String value) => value
     .toLowerCase()
     .replaceAll(RegExp(r'\.(mp3|flac|wav|ape|m4a|ogg|aac|wma|opus)$'), '')
     .replaceAll(RegExp(r'[\s\-—–_·•|/\\（）()\[\]【】]+'), '');
 
-class _ColorOsLyricLines {
+class _LyricLanes {
   final List<LyricLine> main;
 
-  const _ColorOsLyricLines(this.main);
+  const _LyricLanes(this.main);
 }
 
 enum _LyricScript { latin, cjk, other }
@@ -182,16 +214,17 @@ _LyricScript _dominantPrimaryScript(List<LyricLine> lines) {
   return latin >= cjk ? _LyricScript.latin : _LyricScript.cjk;
 }
 
-/// 把解析器可能产出的“同时间戳主行 + 翻译独立行”归一成 v5 的主行与
-/// [LyricLine.translation]。歌词正文不做版权、来源或制作人员内容过滤。
-_ColorOsLyricLines _normalizeColorOsLyricLines(
-  List<LyricLine> lines, {
-  required bool includeTranslation,
-}) {
+/// 把解析器可能产出的“同时间戳主行 + 翻译独立行”归一成主行与
+/// [LyricLine.translation] / [LyricLine.roma]。歌词正文不做版权、来源或制作人员内容过滤。
+///
+/// 归一化恒保留翻译与罗马音数据；是否发布由 lane 构造处的
+/// `includeTranslation` / `includeRoma` 决定（两模式共用同一归一化规则，
+/// 保证原生侧 hasTranslation 能力位与实际 payload 一致）。
+_LyricLanes _normalizeLyricLanes(List<LyricLine> lines) {
   final filtered = lines
       .where((line) => line.text.isNotEmpty)
       .toList(growable: false);
-  if (filtered.isEmpty) return const _ColorOsLyricLines([]);
+  if (filtered.isEmpty) return const _LyricLanes([]);
 
   // 两组以上重复时间戳才视为双语结构，避免单个同唱/标题行被误当翻译。
   int bilingualGroupCount = 0;
@@ -222,12 +255,7 @@ _ColorOsLyricLines _normalizeColorOsLyricLines(
     }
     final group = filtered.sublist(start, end);
     if (!hasInlineBilingualLane || group.length == 1) {
-      normalized.addAll(
-        group.map(
-          (line) =>
-              includeTranslation ? line : line.copyWith(clearTranslation: true),
-        ),
-      );
+      normalized.addAll(group);
       start = end;
       continue;
     }
@@ -239,8 +267,8 @@ _ColorOsLyricLines _normalizeColorOsLyricLines(
         orElse: () => group.first,
       ),
     );
-    String? translation = includeTranslation ? primary.translation : null;
-    if (includeTranslation && (translation == null || translation.isEmpty)) {
+    String? translation = primary.translation;
+    if (translation == null || translation.isEmpty) {
       for (final candidate in group) {
         final text = candidate.text == '\u00A0'
             ? candidate.text
@@ -253,35 +281,38 @@ _ColorOsLyricLines _normalizeColorOsLyricLines(
         }
       }
     }
-    normalized.add(
-      primary.copyWith(
-        translation: translation,
-        clearTranslation: !includeTranslation,
-      ),
-    );
+    normalized.add(primary.copyWith(translation: translation));
     start = end;
   }
-  return _ColorOsLyricLines(normalized);
+  return _LyricLanes(normalized);
 }
 
-/// 当前推送配置下是否存在应发布到 ColorOS 的真实翻译。
+/// 当前推送配置下是否存在应发布的真实翻译（两种模式共用）。
 ///
-/// 与 ColorOS payload 使用同一归一化规则，保证按钮能力与实际 translationLyric 一致。
+/// 与 payload 使用同一归一化规则，保证按钮能力与实际翻译 lane 一致
+/// （ColorOS 模式为 `translationLyric`，规范模式为 `translation`）。
 bool hasPushableTranslation(
   List<LyricLine> lines, {
   required bool includeTranslation,
 }) {
   if (!includeTranslation) return false;
-  final normalized = _normalizeColorOsLyricLines(
-    lines,
-    includeTranslation: true,
-  );
-  return normalized.main.any((line) => line.translation?.isNotEmpty ?? false);
+  return _normalizeLyricLanes(lines)
+      .main
+      .any((line) => line.translation?.isNotEmpty ?? false);
 }
 
 /// 组装 lyricInfo JSON map（供 `MediaNotificationService.updateLyricInfo` jsonEncode）。
 ///
-/// [includeTranslation] 对应设置页共用「翻译歌词」开关。返回空 map 表示无有效歌词。
+/// [colorOsMode]=false（默认）：lidesheng LyricInfo 规范——`lyric` 为原文逐行 LRC，
+/// `rawLyric` 为原文增强（仅存在真实逐字时输出），`translation`/`roma` 为互相独立的
+/// lane；可选字段仅在有效非空时写入；`songName`/`artist`/`lyric` 任一无效时返回空 map。
+///
+/// [colorOsMode]=true：ColorOS-Live-Lyrics-Bridge 4.0 开放协议——`lyric` 纯 LRC +
+/// `rawLyric` 逐字（带末尾结束标签）+ `translationLyric`，附 `lyricType`/`noLyric`/
+/// `provider`/`source`；[includeRoma] 在该模式下被忽略。
+///
+/// [includeTranslation] 对应设置页共用「翻译歌词」开关，[includeRoma] 对应「罗马音歌词」
+/// 开关。返回空 map 表示无有效歌词（原生侧不做推送/保持移除状态）。
 Map<String, dynamic> buildLyricInfoJson({
   required String songName,
   required String artist,
@@ -289,15 +320,13 @@ Map<String, dynamic> buildLyricInfoJson({
   required List<LyricLine> lines,
   required bool includeTranslation,
   required bool colorOsMode,
+  bool includeRoma = false,
   String? album,
   String? trackKey,
   int? sessionGeneration,
 }) {
   if (colorOsMode) {
-    final normalized = _normalizeColorOsLyricLines(
-      lines,
-      includeTranslation: includeTranslation,
-    );
+    final normalized = _normalizeLyricLanes(lines);
     final mainLines = normalized.main;
     final lyric = buildPlainLrc(mainLines, includeTranslation: false);
     if (lyric.isEmpty) return const {};
@@ -322,23 +351,30 @@ Map<String, dynamic> buildLyricInfoJson({
         'sessionGeneration': sessionGeneration,
     };
   }
-  final elrc = buildElrcLyric(lines, includeTranslation: includeTranslation);
-  if (elrc.isEmpty) return const {};
-  var hasTranslation = false;
-  for (final line in lines) {
-    if (includeTranslation &&
-        line.translation != null &&
-        line.translation!.isNotEmpty) {
-      hasTranslation = true;
-      break;
-    }
+  // 规范模式：lyric=原文逐行 LRC，rawLyric=原文增强，translation/roma=独立 lane。
+  final mainLines = _normalizeLyricLanes(lines).main;
+  final trimmedSongName = songName.trim();
+  final trimmedArtist = artist.trim();
+  final lyric = buildPlainLrc(mainLines, includeTranslation: false);
+  if (lyric.isEmpty || trimmedSongName.isEmpty || trimmedArtist.isEmpty) {
+    return const {};
   }
+  final rawLyric = mainLines.any((line) => line.hasWordTiming)
+      ? buildRawLyricLane(mainLines)
+      : '';
+  final translationLrc =
+      includeTranslation ? buildPlainTranslationLrc(mainLines) : '';
+  final romaLrc = includeRoma ? buildPlainRomaLrc(mainLines) : '';
+  final trimmedSongId = songId.trim();
+  final trimmedAlbum = album?.trim() ?? '';
   return {
-    'songName': songName,
-    'artist': artist,
-    'songId': songId,
-    'lyric': elrc,
-    'format': 'elrc',
-    if (hasTranslation) 'translation': 'lrc',
+    'songName': trimmedSongName,
+    'artist': trimmedArtist,
+    'lyric': lyric,
+    if (trimmedSongId.isNotEmpty) 'songId': trimmedSongId,
+    if (trimmedAlbum.isNotEmpty) 'album': trimmedAlbum,
+    if (rawLyric.isNotEmpty) 'rawLyric': rawLyric,
+    if (translationLrc.isNotEmpty) 'translation': translationLrc,
+    if (romaLrc.isNotEmpty) 'roma': romaLrc,
   };
 }

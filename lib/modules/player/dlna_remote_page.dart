@@ -2,6 +2,8 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/remote/remote_slider.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../providers/dlna_provider.dart';
 
@@ -118,13 +120,23 @@ class _DlnaRemotePageState extends State<DlnaRemotePage> {
                   // 进度条（设备不支持 Seek 时降级为只读进度）
                   if (totalSeconds > 0) ...[
                     if (dlna.canSeek)
-                      Slider(
-                        value: positionSeconds.toDouble(),
-                        max: totalSeconds.toDouble(),
-                        onChanged: (v) {
-                          dlna.seek(Duration(seconds: v.round()));
-                        },
-                      )
+                      // tv: TV 构建换 RemoteSlider（原生 Slider 吞四方向键、
+                      // 焦点困死）；参数原样透传，触屏路径不变。
+                      kTvBuild
+                          ? RemoteSlider(
+                              value: positionSeconds.toDouble(),
+                              max: totalSeconds.toDouble(),
+                              onChanged: (v) {
+                                dlna.seek(Duration(seconds: v.round()));
+                              },
+                            )
+                          : Slider(
+                              value: positionSeconds.toDouble(),
+                              max: totalSeconds.toDouble(),
+                              onChanged: (v) {
+                                dlna.seek(Duration(seconds: v.round()));
+                              },
+                            )
                     else
                       M3ELinearProgressIndicator(
                         value: positionSeconds / totalSeconds,
@@ -158,7 +170,7 @@ class _DlnaRemotePageState extends State<DlnaRemotePage> {
                         iconSize: 48,
                         icon: const Icon(Icons.skip_previous),
                         onPressed: () {
-                          AppHaptics.click();
+                          AppHaptics.click(HapticCategory.transport);
                           dlna.castPreviousSong(context);
                         },
                       ),
@@ -183,7 +195,7 @@ class _DlnaRemotePageState extends State<DlnaRemotePage> {
                         iconSize: 48,
                         icon: const Icon(Icons.skip_next),
                         onPressed: () {
-                          AppHaptics.click();
+                          AppHaptics.click(HapticCategory.transport);
                           dlna.castNextSong(context);
                         },
                       ),
@@ -195,13 +207,22 @@ class _DlnaRemotePageState extends State<DlnaRemotePage> {
                     children: [
                       const Icon(Icons.volume_down),
                       Expanded(
-                        child: Slider(
-                          value: dlna.volume.toDouble(),
-                          max: 100,
-                          onChanged: (v) {
-                            dlna.setVolume(v.round());
-                          },
-                        ),
+                        // tv: TV 构建换 RemoteSlider（P-C 滑杆替换）；触屏原样。
+                        child: kTvBuild
+                            ? RemoteSlider(
+                                value: dlna.volume.toDouble(),
+                                max: 100,
+                                onChanged: (v) {
+                                  dlna.setVolume(v.round());
+                                },
+                              )
+                            : Slider(
+                                value: dlna.volume.toDouble(),
+                                max: 100,
+                                onChanged: (v) {
+                                  dlna.setVolume(v.round());
+                                },
+                              ),
                       ),
                       const Icon(Icons.volume_up),
                     ],

@@ -31,8 +31,11 @@ class _LocalServerDownBannerState extends State<LocalServerDownBanner> {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
+    // 文件名要跟本平台真实产物一致：Android 是 libkugou_server.so，.dll 只在 Windows 构建存在
     final hint = Platform.isWindows
         ? '本地数据接口未启动，在线内容不可用（可能缺少 kugou_server.dll）'
+        : Platform.isAndroid
+        ? '本地数据接口未启动，在线内容不可用（libkugou_server.so 没跑起来，点右边按钮再试一次）'
         : '本地数据接口未启动，在线内容不可用';
 
     return Material(

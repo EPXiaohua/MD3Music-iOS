@@ -21,8 +21,9 @@ class ListeningGradeService {
 
   static const Duration _interval = Duration(seconds: 30);
 
-  /// 「上传听歌时长」开关的 prefs key（与 SettingsRepository 的
+  /// 「听歌数据云同步」开关的 prefs key（与 SettingsRepository 的
   /// `settings_upload_listening_duration` 保持一致，两边任一侧改名需同步）。
+  /// 该开关同时总控听歌等级累计上报与云端播放历史上传（PlayHistorySyncService）。
   static const String _uploadEnabledPrefsKey = 'settings_upload_listening_duration';
 
   /// 累计达该秒数后触发一次上报
@@ -223,10 +224,11 @@ class ListeningGradeService {
     await _save();
   }
 
-  /// 「上传听歌时长」开关是否开启（默认关闭）。
+  /// 「听歌数据云同步」开关是否开启（默认开启，未显式写过 prefs 的老用户
+  /// 升级后即生效；显式关闭过的用户保持关闭）。
   Future<bool> _uploadEnabled() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool(_uploadEnabledPrefsKey) ?? false;
+    return prefs.getBool(_uploadEnabledPrefsKey) ?? true;
   }
 
   /// 从 grade 响应中安全提取服务器 d_sec（不存在/类型不符返回 0）。

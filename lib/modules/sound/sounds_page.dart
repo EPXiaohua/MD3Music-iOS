@@ -3,9 +3,11 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/services/equalizer_service.dart';
 import '../../core/services/viper_master_service.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 
@@ -607,6 +609,7 @@ class _SoundsPageState extends State<SoundsPage> {
   Widget _buildSearchField(ColorScheme cs) {
     return TextField(
       controller: _searchController,
+      contextMenuBuilder: buildAppTextContextMenu,
       autofocus: true,
       textInputAction: TextInputAction.search,
       onSubmitted: _doSearch,
@@ -775,7 +778,9 @@ class _SoundsPageState extends State<SoundsPage> {
         children: [
           SizedBox(
             height: 40,
-            child: ListView(
+            child: TvScrollRegion(
+              memoryKey: 'tv/sounds-row-1',
+              child: ListView(
               scrollDirection: Axis.horizontal,
               children: [
                 for (final entry in const [
@@ -793,6 +798,7 @@ class _SoundsPageState extends State<SoundsPage> {
                   ),
               ],
             ),
+            ),
           ),
           if (_catalog == _SoundCatalog.earphone) ...[
             const Gap(AppSpacing.sm),
@@ -806,7 +812,9 @@ class _SoundsPageState extends State<SoundsPage> {
             else
               SizedBox(
                 height: 40,
-                child: ListView(
+                child: TvScrollRegion(
+                  memoryKey: 'tv/sounds-row-2',
+                  child: ListView(
                   scrollDirection: Axis.horizontal,
                   children: [
                     Padding(
@@ -835,6 +843,7 @@ class _SoundsPageState extends State<SoundsPage> {
                       ),
                   ],
                 ),
+                ),
               ),
           ],
           if (_catalog == _SoundCatalog.community) ...[
@@ -856,7 +865,9 @@ class _SoundsPageState extends State<SoundsPage> {
           if (_catalog == _SoundCatalog.community)
             SizedBox(
               height: 40,
-              child: ListView(
+              child: TvScrollRegion(
+                memoryKey: 'tv/sounds-row-3',
+                child: ListView(
                 scrollDirection: Axis.horizontal,
                 children: [
                   Padding(
@@ -877,6 +888,7 @@ class _SoundsPageState extends State<SoundsPage> {
                       ),
                     ),
                 ],
+              ),
               ),
             ),
           const Gap(AppSpacing.xs),
@@ -1079,7 +1091,7 @@ class _SoundTile extends StatelessWidget {
                           child: Text(
                             '已应用',
                             style: TextStyle(
-                              fontSize: 10,
+                              fontSize: 11,
                               color: cs.onPrimaryContainer,
                             ),
                           ),

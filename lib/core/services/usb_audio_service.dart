@@ -95,15 +95,21 @@ class UsbAudioService {
   }
 
   /// 设置 USB 独占独立音量（0..100），实时生效并持久化（重启保留）。
-  Future<void> setUsbVolume(double percent) async {
+  ///
+  /// [persist] 为 false 时跳过 SharedPreferences 落盘（常驻音量条拖动中的高频
+  /// 路径），保留实时 `invokeMethod` 下发 —— 拖动必须即时生效；松手后由调用方
+  /// 再以 `persist: true` 调一次落盘。默认 true，行为与旧调用方完全一致。
+  Future<void> setUsbVolume(double percent, {bool persist = true}) async {
     _usbVolumePercent = percent.clamp(0.0, 100.0);
     try {
       await _channel.invokeMethod('setUsbVolume', {'percent': _usbVolumePercent});
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setDouble('usb_volume', _usbVolumePercent);
+      if (persist) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setDouble('usb_volume', _usbVolumePercent);
+      }
       // slider 拖动高频场景走本地即时广播（原生不为此推送事件）
       _emit(_lastStatus);
-      _debug('setUsbVolume: $_usbVolumePercent% (persisted)');
+      _debug('setUsbVolume: $_usbVolumePercent% (persisted: $persist)');
     } catch (e) {
       _debug('setUsbVolume failed: $e');
     }

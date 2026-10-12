@@ -1,10 +1,13 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/services/diagnostic_logger.dart';
 
 void main() {
+  // init() 会把自身挂到 WidgetsBinding 上收口生命周期（后台不排盘）。
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   late Directory tempDir;
 
   setUp(() {
@@ -111,5 +114,31 @@ void main() {
     expect(content, contains('[INFO] info-line'));
     expect(content, contains('[WARNING] warning-line'));
     expect(content, contains('[ERROR] error-line'));
+  });
+
+  test('后台不排盘，回到前台补刷一次', () async {
+    await DiagnosticLogger.instance.init(dir: tempDir);
+    // 清掉 init 自身那条日志，让后续断言只针对本次新增
+    await DiagnosticLogger.instance.flush();
+    final file = File('${tempDir.path}/app.log');
+
+    DiagnosticLogger.instance
+        .didChangeAppLifecycleState(AppLifecycleState.paused);
+    DiagnosticLogger.instance.i('held-while-paused');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(
+      await file.readAsString(),
+      isNot(contains('held-while-paused')),
+      reason: '后台期间不得排盘写入',
+    );
+
+    DiagnosticLogger.instance
+        .didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    expect(
+      await file.readAsString(),
+      contains('held-while-paused'),
+      reason: '回到前台必须补刷，后台攒下的日志不能丢',
+    );
   });
 }

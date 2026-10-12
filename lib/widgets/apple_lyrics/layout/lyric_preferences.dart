@@ -45,7 +45,8 @@ class LyricPreferences extends ChangeNotifier {
 
   // ============== 范围与默认值 ==============
 
-  /// 字号最小值（px）
+  /// 字号最小值（px）；缩放后的最终字号由
+  /// [LyricLayout.clampReadableFontSize] 兜可读下限，不靠此值。
   static const double minFontSize = 12;
 
   /// 字号最大值（px）
@@ -230,6 +231,7 @@ class LyricPreferences extends ChangeNotifier {
   static const String _keyShowTranslation = 'lyric_show_translation';
   static const String _keyDisplayMode = 'lyric_display_mode';
   static const String _keyUseDuetLayout = 'lyric_use_duet_layout';
+  static const String _keyLineBalance = 'lyric_line_balance';
   static const String _keyEcoMode = 'lyric_eco_mode';
   static const String _keyUseDynamicLyricColor = 'lyric_dynamic_color';
   static const String _keyGlowThresholdFactor = 'lyric_glow_threshold_factor';
@@ -253,6 +255,8 @@ class LyricPreferences extends ChangeNotifier {
   bool _useGlowEffect = true;
   bool _useFlowingBackground = false;
   bool _useDuetLayout = false;
+  // 平衡行换行（默认开启）：长歌词行用 DP 求均衡断点，见 LyricWrapPlanner
+  bool _lineBalance = true;
   bool _showTranslation = true;
   LyricDisplayMode _displayMode = LyricDisplayMode.translation;
   LyricFontSource _fontSource = LyricFontSource.system;
@@ -298,6 +302,12 @@ class LyricPreferences extends ChangeNotifier {
   bool get useGlowEffect => _useGlowEffect;
   bool get useFlowingBackground => _useFlowingBackground;
   bool get useDuetLayout => _useDuetLayout;
+
+  /// 平衡行换行是否开启（默认开启）。
+  ///
+  /// 开启后长歌词行的断点由 `LyricWrapPlanner` 用 DP 求「各行宽度最均匀」的方案；
+  /// 关闭则退回旧的「累加宽度超可用宽即换行」贪心（行为与改造前逐字一致）。
+  bool get lineBalance => _lineBalance;
   bool get showTranslation => _showTranslation;
   LyricDisplayMode get displayMode => _displayMode;
   LyricFontSource get fontSource => _fontSource;
@@ -391,6 +401,7 @@ class LyricPreferences extends ChangeNotifier {
     _useGlowEffect = prefs.getBool(_keyUseGlowEffect) ?? true;
     _useFlowingBackground = prefs.getBool(_keyUseFlowingBackground) ?? false;
     _useDuetLayout = prefs.getBool(_keyUseDuetLayout) ?? false;
+    _lineBalance = prefs.getBool(_keyLineBalance) ?? true;
     _showTranslation = prefs.getBool(_keyShowTranslation) ?? true;
     _displayMode = _displayModeFromName(prefs.getString(_keyDisplayMode));
     _fontSource = _fontSourceFromName(prefs.getString(_keyFontSource));
@@ -502,6 +513,15 @@ class LyricPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyUseDuetLayout, enabled);
+  }
+
+  /// 设置平衡行换行开关并持久化。
+  Future<void> setLineBalance(bool enabled) async {
+    if (_lineBalance == enabled) return;
+    _lineBalance = enabled;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyLineBalance, enabled);
   }
 
   /// 设置歌词省电模式开关并持久化。
@@ -719,6 +739,7 @@ class LyricPreferences extends ChangeNotifier {
     _useGlowEffect = true;
     _useFlowingBackground = false;
     _useDuetLayout = false;
+    _lineBalance = true;
     _showTranslation = true;
     _displayMode = LyricDisplayMode.translation;
     _fontSource = LyricFontSource.system;
@@ -744,6 +765,7 @@ class LyricPreferences extends ChangeNotifier {
     await prefs.setBool(_keyUseGlowEffect, _useGlowEffect);
     await prefs.setBool(_keyUseFlowingBackground, _useFlowingBackground);
     await prefs.setBool(_keyUseDuetLayout, _useDuetLayout);
+    await prefs.setBool(_keyLineBalance, _lineBalance);
     await prefs.setBool(_keyShowTranslation, _showTranslation);
     await prefs.setString(_keyDisplayMode, _displayMode.name);
     await prefs.remove(_keyEcoMode);

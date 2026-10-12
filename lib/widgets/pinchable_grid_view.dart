@@ -125,7 +125,18 @@ class _PinchableGridViewState extends State<PinchableGridView> {
     }
 
     // Pad 模式取 provider 列数（watch 以便列数变化时重建）
-    final columns = context.watch<GridColumnsProvider>().gridColumns;
+    final preferredColumns = context.watch<GridColumnsProvider>().gridColumns;
+
+    return LayoutBuilder(builder: (context, constraints) {
+      // 捏合偏好属于整个设备，实际列数必须受当前主列/详情列的局部宽度约束。
+      // 缩窄不写回偏好，恢复宽屏后仍使用用户原先的列数。
+      final localMax = gridColumnsForWidth(
+        constraints.maxWidth - widget.padding.horizontal,
+        targetExtent: _adaptiveTargetExtent,
+        min: GridColumnsProvider.minColumns,
+        max: GridColumnsProvider.maxColumns,
+      );
+      final columns = preferredColumns.clamp(GridColumnsProvider.minColumns, localMax);
 
     // AnimatedSwitcher + ValueKey 让列数变化时整体淡入淡出
     final gridContent = AnimatedSwitcher(
@@ -143,5 +154,7 @@ class _PinchableGridViewState extends State<PinchableGridView> {
       onScaleUpdate: _onScaleUpdate,
       child: gridContent,
     );
+  }
+);
   }
 }

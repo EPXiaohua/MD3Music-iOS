@@ -16,14 +16,16 @@ import 'playback_duration_tracker.dart';
 /// 1. **不重试**。上游超时也可能已记账，重试会造成重复上报，故只发一次；
 /// 2. **start/end 配对**由 [PlaybackDurationTracker] 保证（切歌时先补发前一首 end）；
 /// 3. 过短播放（默认 < 15s）**只发 start 不发 end**，避免噪声（无 end 即不入账）；
-/// 4. 开关复用 `settings_upload_listening_duration`（与差量链路同一开关，
-///    默认关闭，每次上报前重读 → 设置页切换即时生效）。
+/// 4. 开关复用 `settings_upload_listening_duration`（「听歌数据云同步」，与差量
+///    链路及 PlayHistorySyncService 云端播放历史上传同一开关，默认开启，
+///    每次上报前重读 → 设置页切换即时生效）。
 class ListenReportService {
   ListenReportService._();
 
   static final ListenReportService instance = ListenReportService._();
 
-  /// 「上传听歌时长」开关的 prefs key（与 SettingsRepository 保持一致）。
+  /// 「听歌数据云同步」开关的 prefs key（与 SettingsRepository 保持一致；
+  /// 同时总控 CSCC 上报、等级差量上报与云端播放历史上传）。
   static const String _uploadEnabledPrefsKey = 'settings_upload_listening_duration';
 
   /// end 事件的最小上报时长（毫秒）。低于此值视为无效播放，不发 end。
@@ -187,9 +189,10 @@ class ListenReportService {
     }
   }
 
-  /// 开关是否开启（默认关闭）；每次上报前重读，设置页切换即时生效。
+  /// 开关是否开启（「听歌数据云同步」，默认开启；每次上报前重读，
+  /// 设置页切换即时生效。未显式写过的老用户升级后默认开启）。
   Future<bool> _enabled() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool(_uploadEnabledPrefsKey) ?? false;
+    return prefs.getBool(_uploadEnabledPrefsKey) ?? true;
   }
 }

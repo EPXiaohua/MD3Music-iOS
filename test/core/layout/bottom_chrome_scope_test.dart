@@ -76,5 +76,78 @@ void main() {
         isTrue,
       );
     });
+
+    testWidgets('chromeCollapseOf：坞位在场时读到收起进度', (WidgetTester tester) async {
+      late double read;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: BottomChromeScope(
+            hasBottomChrome: true,
+            bottomChromeCollapse: 0.25,
+            child: Builder(
+              builder: (context) {
+                read = BottomChromeScope.chromeCollapseOf(context);
+                return const SizedBox();
+              },
+            ),
+          ),
+        ),
+      );
+      expect(read, closeTo(0.25, 0.001));
+    });
+
+    testWidgets('chromeCollapseOf：坞位不存在 / 无祖先时按 1（自身即屏幕最底部）', (WidgetTester tester) async {
+      late double noScope;
+      late double noChrome;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) {
+              noScope = BottomChromeScope.chromeCollapseOf(context);
+              return BottomChromeScope(
+                hasBottomChrome: false,
+                bottomChromeCollapse: 0.25,
+                child: Builder(
+                  builder: (context) {
+                    noChrome = BottomChromeScope.chromeCollapseOf(context);
+                    return const SizedBox();
+                  },
+                ),
+              );
+            },
+          ),
+        ),
+      );
+      expect(noScope, 1.0);
+      expect(noChrome, 1.0, reason: '坞位不存在时进度无意义，必须回到"最底部"口径');
+    });
+
+    test('updateShouldNotify 在收起进度变化时也通知', () {
+      const scope = BottomChromeScope(
+        hasBottomChrome: true,
+        bottomChromeCollapse: 0.5,
+        child: SizedBox(),
+      );
+      expect(
+        scope.updateShouldNotify(
+          const BottomChromeScope(
+            hasBottomChrome: true,
+            bottomChromeCollapse: 0.5,
+            child: SizedBox(),
+          ),
+        ),
+        isFalse,
+      );
+      expect(
+        scope.updateShouldNotify(
+          const BottomChromeScope(
+            hasBottomChrome: true,
+            bottomChromeCollapse: 0.75,
+            child: SizedBox(),
+          ),
+        ),
+        isTrue,
+      );
+    });
   });
 }

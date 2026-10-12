@@ -1,8 +1,8 @@
-import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/utils/app_haptics.dart';
 import '../../providers/tab_config_provider.dart';
 
 /// 统一的主页 Tab 图标映射。
@@ -128,7 +128,7 @@ class HomeTabManagerList extends StatelessWidget {
                 Switch(
                   value: !isHidden,
                   onChanged: (_) {
-                    HapticFeedback.lightImpact();
+                    AppHaptics.lightImpact(HapticCategory.control);
                     tabConfig.toggleTabVisibility(tab.id);
                   },
                 ),

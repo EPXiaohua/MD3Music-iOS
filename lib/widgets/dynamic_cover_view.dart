@@ -328,7 +328,9 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
     final isPlaying = context.select<PlayerProvider, bool>((p) => p.isPlaying);
     final c = _controller;
     // 出错（表面失效/解码器被抢占）时绝不渲染，直接露出下方静态封面
-    if (!_ready || c == null || !c.value.isInitialized || c.value.hasError) {
+    final active =
+        _ready && c != null && c.value.isInitialized && !c.value.hasError;
+    if (!active) {
       return const SizedBox.shrink();
     }
     if (c.value.isPlaying != isPlaying) {

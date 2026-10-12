@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/repositories/settings_repository.dart';
+import '../build_flags.dart';
 import 'audio_service.dart';
 import 'device_capabilities.dart';
 import 'direct_pcm_service.dart';
@@ -145,6 +146,8 @@ class OutputModeCoordinator extends ChangeNotifier {
   ///
   /// 关闭时恢复系统默认：关直写（若开着）+ 关 Direct PCM + 恢复效果链与音量。
   Future<void> setEnabled(bool value) async {
+    // TV 构建无 USB 独占（原生插件未注册、设置入口已剔除），防御性直接返回
+    if (kTvBuild) return;
     if (value == _enabled) return;
     if (value) {
       // 判定用**目标状态** `_viaSystem`，不能用 isUsbdevfsActive ——

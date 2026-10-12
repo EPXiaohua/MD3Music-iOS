@@ -72,12 +72,14 @@ void main() {
       }
     });
 
-    test('FM 三档对齐 kFmStations 的下标（红心 0 / 探索 1 / 小众 2）', () {
+    test('FM 四档对齐 kFmStations 的下标（红心 0 / 探索 1 / 小众 2 / 电台 3）', () {
       expect(StartupAutoPlaySource.fmHeart.fmStationIndex, 0);
       expect(StartupAutoPlaySource.fmExplore.fmStationIndex, 1);
       expect(StartupAutoPlaySource.fmNiche.fmStationIndex, 2);
+      expect(StartupAutoPlaySource.fmRadio.fmStationIndex, 3);
       expect(StartupAutoPlaySource.resume.fmStationIndex, isNull);
       expect(StartupAutoPlaySource.daily.fmStationIndex, isNull);
+      expect(StartupAutoPlaySource.homeDiscover.fmStationIndex, isNull);
     });
 
     test('value 唯一且非空，label 唯一（设置页下拉依赖这两条）', () {
@@ -91,8 +93,8 @@ void main() {
       }
     });
 
-    test('共 5 个音源', () {
-      expect(StartupAutoPlaySource.values, hasLength(5));
+    test('共 7 个音源', () {
+      expect(StartupAutoPlaySource.values, hasLength(7));
     });
   });
 

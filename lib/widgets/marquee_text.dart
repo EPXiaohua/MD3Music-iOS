@@ -47,6 +47,20 @@ class _GentleScrollingTextState extends State<GentleScrollingText>
   /// 是否已挂在共享 60fps 帧驱动上（见 [PlayerFrameDriver]）。
   bool _boundToDriver = false;
 
+  /// 渐隐遮罩 shader 缓存：`ShaderMask` 每次 paint 都会重新调用
+  /// `shaderCallback`，而滑动期间本层每帧都要重绘 —— 不缓存就是每帧新建一个
+  /// `LinearGradient` + shader。按 bounds 尺寸比对复用（对齐 AppleLyricsView
+  /// 的 `_fadeShaderFor`）。
+  Shader? _fadeShader;
+  Rect? _fadeShaderBounds;
+
+  /// 文本测量缓存：build 可能被父级高频触发，`TextPainter.layout()` 是纯排版
+  /// 开销，只在 (文本, 样式, 可用宽) 变化时重算。
+  TextPainter? _measurePainter;
+  String? _measuredText;
+  TextStyle? _measuredStyle;
+  double? _measuredMaxWidth;
+
   /// TickerMode 是否被关闭（被不透明路由覆盖 / TabBarView 切走）。
   bool _tickerModeMuted = false;
 
@@ -175,17 +189,64 @@ class _GentleScrollingTextState extends State<GentleScrollingText>
     _syncDriver();
   }
 
+  /// 复用缓存的渐隐遮罩 shader（按 bounds 尺寸比对）。
+  Shader _fadeShaderFor(Rect bounds) {
+    if (_fadeShader != null && bounds == _fadeShaderBounds) {
+      return _fadeShader!;
+    }
+    final fade = (widget.fadeWidth / bounds.width).clamp(0.0, 0.5);
+    final shader = LinearGradient(
+      begin: Alignment.centerLeft,
+      end: Alignment.centerRight,
+      colors: const [
+        Colors.transparent,
+        Colors.black,
+        Colors.black,
+        Colors.transparent,
+      ],
+      stops: [0.0, fade, 1 - fade, 1.0],
+    ).createShader(bounds);
+    _fadeShader = shader;
+    _fadeShaderBounds = bounds;
+    return shader;
+  }
+
+  /// 复用缓存的排版结果（按 文本 / 样式 / 可用宽 比对）。
+  TextPainter _measure(
+    TextStyle style,
+    double maxWidth,
+    TextDirection direction,
+  ) {
+    final cached = _measurePainter;
+    if (cached != null &&
+        _measuredText == widget.text &&
+        _measuredStyle == style &&
+        _measuredMaxWidth == maxWidth) {
+      return cached;
+    }
+    final painter = TextPainter(
+      text: TextSpan(text: widget.text, style: style),
+      maxLines: 1,
+      textDirection: direction,
+    )..layout();
+    _measurePainter = painter;
+    _measuredText = widget.text;
+    _measuredStyle = style;
+    _measuredMaxWidth = maxWidth;
+    return painter;
+  }
+
   @override
   Widget build(BuildContext context) {
     final effectiveStyle = widget.style ?? DefaultTextStyle.of(context).style;
     return LayoutBuilder(
       builder: (context, constraints) {
         final maxWidth = constraints.maxWidth;
-        final painter = TextPainter(
-          text: TextSpan(text: widget.text, style: effectiveStyle),
-          maxLines: 1,
-          textDirection: Directionality.of(context),
-        )..layout();
+        final painter = _measure(
+          effectiveStyle,
+          maxWidth,
+          Directionality.of(context),
+        );
         final overflow = painter.width - maxWidth;
         final bool overflows = overflow > 0.5 && maxWidth.isFinite;
 
@@ -220,34 +281,25 @@ class _GentleScrollingTextState extends State<GentleScrollingText>
         // （横屏左栏窄、dense，过长歌名/艺人/专辑更易触发，即“横屏过长时消失”的根因）。
         return SizedBox(
           height: painter.height,
-          child: ClipRect(
-            child: ShaderMask(
-              shaderCallback: (rect) {
-                final fade = (widget.fadeWidth / rect.width).clamp(0.0, 0.5);
-                return LinearGradient(
-                  begin: Alignment.centerLeft,
-                  end: Alignment.centerRight,
-                  colors: const [
-                    Colors.transparent,
-                    Colors.black,
-                    Colors.black,
-                    Colors.transparent,
-                  ],
-                  stops: [0.0, fade, 1 - fade, 1.0],
-                ).createShader(rect);
-              },
-              blendMode: BlendMode.dstIn,
-              child: AnimatedBuilder(
-                animation: _progress,
-                builder: (context, child) => OverflowBox(
-                  alignment: Alignment.centerLeft,
-                  maxWidth: double.infinity,
-                  child: Transform.translate(
-                    offset: Offset(-overflow * _progress.value, 0),
-                    child: child,
+          // 滑动期间每帧只动内部 Transform：独立绘制层把重绘限制在本组件内，
+          // 不让 60fps 的文本位移扩散到整个播放页（AGENTS.md §10）。
+          child: RepaintBoundary(
+            child: ClipRect(
+              child: ShaderMask(
+                shaderCallback: _fadeShaderFor,
+                blendMode: BlendMode.dstIn,
+                child: AnimatedBuilder(
+                  animation: _progress,
+                  builder: (context, child) => OverflowBox(
+                    alignment: Alignment.centerLeft,
+                    maxWidth: double.infinity,
+                    child: Transform.translate(
+                      offset: Offset(-overflow * _progress.value, 0),
+                      child: child,
+                    ),
                   ),
+                  child: textWidget,
                 ),
-                child: textWidget,
               ),
             ),
           ),

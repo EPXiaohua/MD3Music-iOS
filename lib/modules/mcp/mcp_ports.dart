@@ -45,10 +45,18 @@ class McpPlayerSnapshot {
   final int queueLength;
   final int currentIndex;
 
+  /// 当前曲目 hash（在线曲目即 Song.id；本地曲目为 null）。
+  String? get hash => (song?.isOnline ?? false) ? song?.id : null;
+
+  /// 音质档位（如 128 / flac），无则 null。
+  String? get quality => song?.quality;
+
   Map<String, Object?> toJson() => <String, Object?>{
         'title': song?.title,
         'artist': song?.artist,
         'album': song?.album,
+        'hash': hash,
+        'quality': quality,
         'playing': playing,
         'position_ms': positionMs,
         'duration_ms': durationMs,
@@ -60,6 +68,9 @@ class McpPlayerSnapshot {
         'current_index': currentIndex,
       };
 }
+
+/// 可等待的播放器事件。
+enum McpWatchEvent { trackChange, play, pause }
 
 /// 播放器控制端口。真实实现包装 PlayerProvider，测试用 FakePlayerControl。
 abstract interface class McpPlayerControl {
@@ -80,6 +91,30 @@ abstract interface class McpPlayerControl {
 
   /// 插入到当前曲目之后。
   Future<void> enqueue(Song song);
+
+  /// 设置循环模式（'off' | 'one' | 'all'，与快照 loop_mode 同名）。
+  Future<void> setLoopMode(String mode);
+
+  /// 设置随机播放。
+  Future<void> setShuffle(bool enabled);
+
+  /// 跳到队列第 [index] 首并播放。
+  Future<void> playAt(int index);
+
+  /// 移除队列第 [index] 首。
+  Future<void> removeFromQueue(int index);
+
+  /// 把第 [from] 首移动到第 [to] 的位置。
+  Future<void> reorderQueue(int from, int to);
+
+  /// 清空整个队列并停止播放。
+  Future<void> clearQueue();
+
+  /// 整单播放（在线歌单链路），从 [startIndex] 开始。
+  Future<void> playOnlinePlaylist(List<Song> songs, int startIndex);
+
+  /// 阻塞到事件发生或超时；发生返回事件描述（如 'track_changed'），超时返回 null。
+  Future<String?> waitForEvent(McpWatchEvent event, Duration timeout);
 }
 
 /// 曲库检索端口。真实实现包装 KugouApiClient。
@@ -91,4 +126,107 @@ abstract interface class McpLibrarySource {
 
   /// 返回 LRC 明文；无歌词时返回 null。
   Future<String?> getLyric(String hash);
+
+  /// 按关键词搜索专辑（limit 钳制由实现方负责）。
+  Future<List<KugouAlbumBrief>?> searchAlbums(String keyword, {int limit = 10});
+
+  /// 按关键词搜索歌手。
+  Future<List<KugouArtistBrief>?> searchArtists(String keyword, {int limit = 10});
+
+  /// 按关键词搜索歌单。
+  Future<List<KugouPlaylistBrief>?> searchPlaylists(String keyword, {int limit = 10});
+
+  /// 按歌单 global_collection_id 取第 1 页歌曲（最多 [limit] 首）。
+  Future<KugouPlaylistSongs?> getPlaylistSongs(String globalCollectionId,
+      {int limit = 30});
+
+  /// 每日推荐歌曲。
+  Future<List<KugouSongDetail>?> getDailyRecommend();
+
+  /// 私人 FM 一轮歌曲。
+  Future<List<KugouSongDetail>?> getPersonalFm();
+
+  /// 全部榜单（TOPList）。
+  Future<KugouRankList?> getRankList();
+
+  /// 指定榜单内歌曲。
+  Future<List<KugouSongDetail>?> getRankAudio(String rankId, {int limit = 30});
+
+  /// 听歌列表原始响应（酷狗侧结构文档缺失，交由工具层做防御式投影）。
+  Future<Map<String, dynamic>?> getUserListen({int type = 0});
+}
+
+/// 本地曲库端口（真实实现包装 LibraryProvider；测试用假源）。
+abstract interface class McpLocalLibrarySource {
+  List<Song> search(String keyword, {int limit = 10});
+
+  /// 按 Song.id 精确查找（本地曲库内）。
+  Song? findById(String id);
+}
+
+/// 曲库写操作端口（真实实现包装 [KugouApiClient] 既有的歌单写方法）。
+///
+/// 歌曲"收藏/取消收藏"上游酷狗不存在对应模块（Task 11 研究门控结论，
+/// 见 `tmp/collect-research.md`），故本端口不设收藏成员。
+/// `buildMcpTools` 的 `libraryWrite` 为 null 时整组工具缺席（条件装配）。
+abstract interface class McpLibraryWriteSource {
+  /// 把 [hash] 对应的歌曲加入 [listid] 歌单（listid 为歌单数字 ID）。
+  ///
+  /// 上游 data 契约为 `名称|hash|专辑id|mixsongid`，歌名/专辑信息由实现方
+  /// 经歌曲详情补齐；detail 拿不到或上游拒绝时抛异常（工具层转为可读错误）。
+  Future<void> addSongToPlaylist(String hash, String listid);
+
+  /// 新建名为 [name] 的歌单（需要登录）。
+  Future<void> createPlaylist(String name);
+}
+
+/// App 功能快照（睡眠定时/均衡器/桌面歌词/输出模式）。
+class McpAppFeaturesSnapshot {
+  const McpAppFeaturesSnapshot({
+    required this.sleepTimerMode,
+    required this.sleepTimerRemainingMs,
+    required this.eqEnabled,
+    required this.eqPresets,
+    required this.desktopLyricEnabled,
+    required this.outputMode,
+    required this.usbDeviceAvailable,
+  });
+
+  /// off | countdown | end_of_track
+  final String sleepTimerMode;
+  final int? sleepTimerRemainingMs;
+  final bool eqEnabled;
+
+  /// 可用预设名（系统 + 自定义）。
+  final List<String> eqPresets;
+  final bool desktopLyricEnabled;
+
+  /// usbdevfs | direct_pcm | system（只读，MCP 不提供切换）。
+  final String outputMode;
+  final bool usbDeviceAvailable;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'sleep_timer': <String, Object?>{
+          'mode': sleepTimerMode,
+          'remaining_ms': sleepTimerRemainingMs,
+        },
+        'eq': <String, Object?>{
+          'enabled': eqEnabled,
+          'presets': eqPresets,
+        },
+        'desktop_lyric_enabled': desktopLyricEnabled,
+        'output_mode': outputMode,
+        'usb_device_available': usbDeviceAvailable,
+      };
+}
+
+/// App 功能控制端口（真实实现见 mcp_app_features.dart）。
+abstract interface class McpAppFeaturesPort {
+  McpAppFeaturesSnapshot snapshot();
+
+  /// [duration] 为 null 表示取消（对齐 PlayerProvider.setSleepTimer）。
+  Future<void> setSleepTimer(Duration? duration);
+  Future<void> setEqEnabled(bool enabled);
+  Future<void> applyEqPreset(String name);
+  Future<void> setDesktopLyric(bool enabled);
 }

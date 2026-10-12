@@ -4,11 +4,14 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
 import '../login/login_page.dart';
@@ -76,6 +79,10 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
   // 头部
   String _name = '';
   String? _coverUrl;
+
+  /// 页头真实封面是否已拿到加载完成的图片。喂给 `PlaylistCoverHero.destReady`：
+  /// 详情接口可能替换 `_coverUrl`，落位要等首图真正画出再撤飞行封面。
+  final ValueNotifier<bool> _headerCoverReady = ValueNotifier<bool>(false);
   String? _desc;
   bool _subscribed = true;
 
@@ -98,6 +105,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
   @override
   void dispose() {
     _scrollController.dispose();
+    _headerCoverReady.dispose();
     super.dispose();
   }
 
@@ -422,9 +430,10 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const LoginPage()),
-              );
+              Navigator.of(context,
+                rootNavigator: true,
+              ).push(
+                MaterialPageRoute(builder: (_) => const LoginPage()));
             },
             child: const Text('去登录'),
           ),
@@ -470,8 +479,20 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
         scrollController: _scrollController,
       ),
       body: SecondaryMiniPlayerHost(
+        // 加载态页头照常渲染：封面连贯过渡的终点必须在进场转场期间就存在，
+        // 否则飞行无落点（与专辑/听书详情页同一口径）。
         child: _isLoading
-          ? const Center(child: M3ELoadingIndicator())
+          ? ListView(
+              controller: _scrollController,
+              padding: const EdgeInsets.only(bottom: AppSpacing.xl),
+              children: [
+                _buildHeader(context),
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 48),
+                  child: Center(child: M3ELoadingIndicator()),
+                ),
+              ],
+            )
           : Md3PullToRefresh(
               onRefresh: () => _load(showLoading: false),
               child: ListView(
@@ -482,8 +503,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                   if (!_amway.isEmpty) _buildAmway(context),
                   _buildStoriesHeader(context),
                   ..._stories.map(
-                    (s) => _buildStoryTile(context, s),
-                  ),
+                    (s) => _buildStoryTile(context, s)),
                   if (_loadingMore)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: AppSpacing.md),
@@ -491,7 +511,8 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                         child: SizedBox(
                           width: 24,
                           height: 24,
-                          child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2),
+                          child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2,
+                            ),
                         ),
                       ),
                     ),
@@ -511,19 +532,43 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          ClipRRect(
-            borderRadius: AppRadius.lgAll,
-            child: _coverUrl != null
-                ? CachedNetworkImage(
-                    imageUrl: _coverUrl!,
-                    memCacheWidth: 330,
-                    memCacheHeight: 330,
-                    width: 110,
-                    height: 110,
-                    fit: BoxFit.cover,
-                    errorWidget: (_, _, _) => _coverPlaceholder(cs),
-                  )
-                : _coverPlaceholder(cs),
+          SizedBox(
+            width: 110,
+            height: 110,
+            child: PlaylistCoverHero(
+              tag: channelCoverHeroTag(widget.channel.id),
+              radius: AppRadius.lgAll,
+              destReady: _headerCoverReady,
+              child: _coverUrl != null
+                  ? CachedNetworkImage(
+                      imageUrl: _coverUrl!,
+                      memCacheWidth: 330,
+                      memCacheHeight: 330,
+                      fit: BoxFit.cover,
+                      // 共享元素过渡本身就是动画，两端都不要再做渐变。
+                      fadeOutDuration: Duration.zero,
+                      fadeInDuration: Duration.zero,
+                      imageBuilder: (context, provider) {
+                        if (!_headerCoverReady.value) {
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted) _headerCoverReady.value = true;
+                          });
+                        }
+                        // 与 CachedNetworkImage 内部同键（memCache 会包一层
+                        // ResizeImage），不会多解码一份。
+                        return Image(
+                          image: ResizeImage(
+                            provider,
+                            width: 330,
+                            height: 330,
+                          ),
+                          fit: BoxFit.cover,
+                        );
+                      },
+                      errorWidget: (_, _, _) => _coverPlaceholder(cs),
+                    )
+                  : _coverPlaceholder(cs),
+            ),
           ),
           const Gap(AppSpacing.lg),
           Expanded(
@@ -732,6 +777,8 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
   /// 相似频道：横向滚动卡片
   Widget _buildSimilar(BuildContext context) {
     final tt = Theme.of(context).textTheme;
+    // 同一 id 只有首次出现的卡参与飞行（避免同子树重复 tag）。
+    final heroFirstIndex = firstIndexById(_similar.map((c) => c.id));
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -744,13 +791,19 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
         ),
         SizedBox(
           height: 160,
-          child: ListView.separated(
+          child: TvScrollRegion(
+            memoryKey: 'tv/channel-similar',
+            child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
             itemCount: _similar.length,
             separatorBuilder: (_, _) => const Gap(AppSpacing.md),
             itemBuilder: (context, i) => _SimilarChannelCard(
               channel: _similar[i],
+              heroTag: heroFirstIndex[_similar[i].id] == i &&
+                      _similar[i].coverUrl != null
+                  ? channelCoverHeroTag(_similar[i].id)
+                  : null,
               onTap: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
@@ -759,6 +812,7 @@ class _ChannelDetailPageState extends State<ChannelDetailPage> {
                   ),
                 );
               },
+            ),
             ),
           ),
         ),
@@ -772,13 +826,21 @@ class _SimilarChannelCard extends StatelessWidget {
   final KugouYouthChannel channel;
   final VoidCallback? onTap;
 
-  const _SimilarChannelCard({required this.channel, this.onTap});
+  /// 非空时封面参与封面连贯过渡：与目标频道详情页头（channelCoverHeroTag）
+  /// 配对，尺寸同为 110/lgAll，落位逐像素重合。
+  final String? heroTag;
+
+  const _SimilarChannelCard({
+    required this.channel,
+    this.onTap,
+    this.heroTag,
+  });
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
-    return SizedBox(
+    final card = SizedBox(
       width: 110,
       child: InkWell(
         borderRadius: AppRadius.lgAll,
@@ -789,21 +851,41 @@ class _SimilarChannelCard extends StatelessWidget {
             ClipRRect(
               borderRadius: AppRadius.lgAll,
               child: channel.coverUrl != null
-                  ? CachedNetworkImage(
-                      imageUrl: channel.coverUrl!,
-                      memCacheWidth: 330,
-                      memCacheHeight: 330,
-                      width: 110,
-                      height: 110,
-                      fit: BoxFit.cover,
-                      errorWidget: (_, _, _) => Container(
-                        color: cs.surfaceContainerHighest,
-                        child: Icon(
-                          Icons.dynamic_feed_outlined,
-                          color: cs.onSurfaceVariant,
-                        ),
-                      ),
-                    )
+                  ? (heroTag == null
+                      ? CachedNetworkImage(
+                          imageUrl: channel.coverUrl!,
+                          memCacheWidth: 330,
+                          memCacheHeight: 330,
+                          width: 110,
+                          height: 110,
+                          fit: BoxFit.cover,
+                          errorWidget: (_, _, _) => Container(
+                            color: cs.surfaceContainerHighest,
+                            child: Icon(
+                              Icons.dynamic_feed_outlined,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        )
+                      : PlaylistCoverHero(
+                          tag: heroTag!,
+                          radius: AppRadius.lgAll,
+                          child: CachedNetworkImage(
+                            imageUrl: channel.coverUrl!,
+                            memCacheWidth: 330,
+                            memCacheHeight: 330,
+                            width: 110,
+                            height: 110,
+                            fit: BoxFit.cover,
+                            errorWidget: (_, _, _) => Container(
+                              color: cs.surfaceContainerHighest,
+                              child: Icon(
+                                Icons.dynamic_feed_outlined,
+                                color: cs.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        ))
                   : Container(
                       width: 110,
                       height: 110,
@@ -824,6 +906,14 @@ class _SimilarChannelCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+
+    // tv: 相似频道卡片单停点（OK = 打开该频道详情）。这条带只包了
+    // TvScrollRegion、卡本身是裸 InkWell，所以遥控落不到卡上（2026-10-08 真机）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'channel-similar-card',
+      child: card,
     );
   }
 }

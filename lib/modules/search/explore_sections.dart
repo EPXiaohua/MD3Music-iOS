@@ -1,16 +1,21 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
 import '../../data/models/album.dart';
 import '../../core/layout/responsive_layout.dart';
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/album_card.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
 import '../charts/charts_page.dart';
@@ -76,58 +81,61 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
             const _SectionHeader(title: '主题歌单'),
             SizedBox(
               height: 166,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
-                itemCount: themes.length,
-                itemBuilder: (context, i) => Padding(
-                  padding: const EdgeInsets.only(right: AppSpacing.md),
-                  child: SizedBox(
-                    width: 130,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        borderRadius: AppRadius.lgAll,
-                        color: cs.surfaceContainerLow,
-                      ),
-                      clipBehavior: Clip.antiAlias,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          AspectRatio(
-                            aspectRatio: 1,
-                            child: CachedNetworkImage(
-                              imageUrl: themes[i].coverUrl ?? '',
-                              memCacheWidth: 390,
-                              memCacheHeight: 390,
-                              fit: BoxFit.cover,
-                              placeholder: (_, _) => _coverPlaceholder(cs),
-                              errorWidget: (_, _, _) => _coverPlaceholder(cs),
-                            ),
-                          ),
-                          Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 6,
+              child: TvScrollRegion(
+                memoryKey: 'tv/explore-themes-row',
+                child: ListView.builder(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                  itemCount: themes.length,
+                  itemBuilder: (context, i) => Padding(
+                    padding: const EdgeInsets.only(right: AppSpacing.md),
+                    child: SizedBox(
+                      width: 130,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          borderRadius: AppRadius.lgAll,
+                          color: cs.surfaceContainerLow,
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            AspectRatio(
+                              aspectRatio: 1,
+                              child: CachedNetworkImage(
+                                imageUrl: themes[i].coverUrl ?? '',
+                                memCacheWidth: 390,
+                                memCacheHeight: 390,
+                                fit: BoxFit.cover,
+                                placeholder: (_, _) => _coverPlaceholder(cs),
+                                errorWidget: (_, _, _) => _coverPlaceholder(cs),
                               ),
-                              child: Align(
-                                alignment: Alignment.centerLeft,
-                                child: Text(
-                                  themes[i].name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .titleSmall
-                                      ?.copyWith(
-                                        fontWeight: FontWeight.w500,
-                                        color: cs.onSurface,
-                                      ),
+                            ),
+                            Expanded(
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    themes[i].name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleSmall
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.w500,
+                                          color: cs.onSurface,
+                                        ),
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -160,25 +168,28 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
             const _SectionHeader(title: '场景音乐'),
             SizedBox(
               height: 44,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
-                itemCount: list.length,
-                itemBuilder: (context, i) {
-                  final item = list[i] as Map<String, dynamic>;
-                  return Padding(
-                    padding: const EdgeInsets.only(right: AppSpacing.sm),
-                    child: Chip(
-                      label: Text(item['name']?.toString() ?? ''),
-                      labelStyle: Theme.of(context)
-                          .textTheme
-                          .labelLarge
-                          ?.copyWith(color: cs.onSurfaceVariant),
-                      backgroundColor: cs.surfaceContainerLow,
-                      side: BorderSide(color: cs.outlineVariant),
-                    ),
-                  );
-                },
+              child: TvScrollRegion(
+                memoryKey: 'tv/explore-scene-row',
+                child: ListView.builder(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                  itemCount: list.length,
+                  itemBuilder: (context, i) {
+                    final item = list[i] as Map<String, dynamic>;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: AppSpacing.sm),
+                      child: Chip(
+                        label: Text(item['name']?.toString() ?? ''),
+                        labelStyle: Theme.of(context)
+                            .textTheme
+                            .labelLarge
+                            ?.copyWith(color: cs.onSurfaceVariant),
+                        backgroundColor: cs.surfaceContainerLow,
+                        side: BorderSide(color: cs.outlineVariant),
+                      ),
+                    );
+                  },
+                ),
               ),
             ),
           ],
@@ -194,13 +205,20 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
       selector: (_, kugou) => kugou.playlistList,
       builder: (context, plist, _) {
         if (plist.isEmpty) return const SizedBox.shrink();
+        // tag 口径与 PlaylistBrowsePage 的卡片一致（同一份 playlistList）：区块小
+        // 封面 → 完整列表大封面、区块小封面 → 歌单详情页头，两段转场共用一套 tag。
+        // 重复 gid 只给首次出现挂 tag（同一路由子树重复 tag 会在转场收集阶段抛
+        // FlutterError，见 firstIndexById 的说明）。
+        final firstGid = firstIndexById(
+          [for (final p in plist) p.globalCollectionId ?? p.id],
+        );
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _SectionHeader(
               title: '热门歌单',
-              onMore: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const PlaylistBrowsePage()),
+              onMore: () => AdaptiveNav.openDetail(context,
+                (_) => const PlaylistBrowsePage(),
               ),
             ),
             _CompactAlbumGrid(
@@ -214,11 +232,18 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
                     songCount: p.songCount,
                   ),
               ],
-              onTap: (i) => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => PlaylistPage(playlist: plist[i].toPlaylist()),
-                ),
+              heroTags: [
+                for (var i = 0; i < plist.length; i++)
+                  firstGid[plist[i].globalCollectionId ?? plist[i].id] == i
+                      ? playlistCoverHeroTag(
+                          plist[i].globalCollectionId ?? plist[i].id,
+                        )
+                      : null,
+              ],
+              onTap: (i) => AdaptiveNav.openDetail(context,
+                (_) => PlaylistPage(playlist: plist[i].toPlaylist()),
               ),
+              regionKey: 'tv/explore-hot-playlists',
             ),
           ],
         );
@@ -238,19 +263,17 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
           children: [
             _SectionHeader(
               title: '排行榜',
-              onMore: () => Navigator.of(context)
-                  .push(MaterialPageRoute(builder: (_) => const ChartsPage())),
+              onMore: () => AdaptiveNav.openDetail(context, (_) => const ChartsPage()),
             ),
             _CompactAlbumGrid(
               albums: [for (final r in ranks) r.toAlbum()],
-              onTap: (i) => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => RankDetailPage(
+              onTap: (i) => AdaptiveNav.openDetail(context,
+                (_) => RankDetailPage(
                     rankId: ranks[i].id,
                     rankName: ranks[i].name,
-                  ),
                 ),
               ),
+              regionKey: 'tv/explore-ranks',
             ),
           ],
         );
@@ -262,24 +285,34 @@ class _MusicExploreSectionsState extends State<MusicExploreSections> {
   Widget _buildNewAlbumSection() {
     return Selector<KugouProvider, List<KugouAlbumBrief>>(
       selector: (_, kugou) => kugou.topAlbums,
-      builder: (context, albums, _) {
-        if (albums.isEmpty) return const SizedBox.shrink();
+      builder: (context, briefs, _) {
+        if (briefs.isEmpty) return const SizedBox.shrink();
+        // 一次构造喂给卡片、tag、详情页三处：id 口径必须与 AlbumDetailPage 收到的
+        // widget.album.id 逐字一致，对不上就是静默不飞（与 NewAlbumBrowsePage
+        // 同一约定）。专辑走 albumCoverHeroTag 命名空间，与歌单 tag 互斥。
+        final albums = [for (final a in briefs) a.toAlbum()];
+        final firstId = firstIndexById([for (final a in albums) a.id]);
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _SectionHeader(
               title: '新碟上架',
-              onMore: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const NewAlbumBrowsePage()),
+              onMore: () => AdaptiveNav.openDetail(context,
+                (_) => const NewAlbumBrowsePage(),
               ),
             ),
             _CompactAlbumGrid(
-              albums: [for (final a in albums) a.toAlbum()],
-              onTap: (i) => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => AlbumDetailPage(album: albums[i].toAlbum()),
-                ),
+              albums: albums,
+              heroTags: [
+                for (var i = 0; i < albums.length; i++)
+                  firstId[albums[i].id] == i
+                      ? albumCoverHeroTag(albums[i].id)
+                      : null,
+              ],
+              onTap: (i) => AdaptiveNav.openDetail(context,
+                (_) => AlbumDetailPage(album: albums[i]),
               ),
+              regionKey: 'tv/explore-new-albums',
             ),
           ],
         );
@@ -301,6 +334,12 @@ class _NewAlbumBrowsePageState extends State<NewAlbumBrowsePage> {
   @override
   void initState() {
     super.initState();
+    // 完整列表与搜索页区块共用同一份 Provider 数据：从区块「›」进来时通常已
+    // 加载完毕。转场首帧必须就有网格上的 Hero 端点，区块小封面 → 完整列表大
+    // 封面的衔接才配得上对（框架 Hero 在 push 后一帧内配对两端，首帧若是
+    // loading 圈，转场收集扑空、封面就只剩页面自身的推入动画）——先按现有
+    // 数据渲染网格，后台只做一次补拉刷新。
+    _isLoading = context.read<KugouProvider>().topAlbums.isEmpty;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await context.read<KugouProvider>().getTopAlbum();
       if (mounted) setState(() => _isLoading = false);
@@ -317,22 +356,39 @@ class _NewAlbumBrowsePageState extends State<NewAlbumBrowsePage> {
               selector: (_, kugou) => kugou.topAlbums,
               builder: (context, list, _) {
                 if (list.isEmpty) return const Center(child: Text('暂无数据'));
-                return PinchableGridView(
-                  padding: EdgeInsets.fromLTRB(
-                    AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
-                    AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
-                  ),
-                  childAspectRatio: 0.8,
-                  spacing: 12,
-                  itemCount: list.length,
-                  itemBuilder: (context, i) => AlbumCard(
-                    album: list[i].toAlbum(),
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            AlbumDetailPage(album: list[i].toAlbum()),
-                      ),
+                // 一次构造喂给卡片、tag、详情页三处：id 口径必须与 AlbumDetailPage
+                // 收到的 widget.album.id 逐字一致，对不上就是静默不飞。
+                final albums = [for (final a in list) a.toAlbum()];
+                // Hero tag 唯一性防护：完整列表来自服务端，可能出现重复专辑 id；
+                // 同一路由子树重复 tag 会在转场收集阶段抛 FlutterError。只给每个
+                // id 首次出现的卡片挂 Hero（与 PlaylistPage 相似歌单同口径）。
+                final firstId = firstIndexById(
+                  [for (final a in albums) a.id],
+                );
+                return TvScrollRegion(
+                  memoryKey: 'tv/browse-albums',
+                  horizontalEdge: DpadEdgeBehavior.leave,
+                  child: PinchableGridView(
+                    padding: EdgeInsets.fromLTRB(
+                      AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
+                      AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
                     ),
+                    childAspectRatio: 0.8,
+                    spacing: 12,
+                    itemCount: albums.length,
+                    itemBuilder: (context, i) {
+                      final album = albums[i];
+                      return AlbumCard(
+                        album: album,
+                        heroTag: firstId[album.id] == i && album.id.isNotEmpty
+                            ? albumCoverHeroTag(album.id)
+                            : null,
+                        onTap: () => AdaptiveNav.openDetail(
+                          context,
+                          (_) => AlbumDetailPage(album: album),
+                        ),
+                      );
+                    },
                   ),
                 );
               },
@@ -345,7 +401,8 @@ class _NewAlbumBrowsePageState extends State<NewAlbumBrowsePage> {
 class RankDetailPage extends StatefulWidget {
   final String rankId;
   final String rankName;
-  const RankDetailPage({super.key, required this.rankId, required this.rankName});
+  const RankDetailPage({super.key, required this.rankId, required this.rankName,
+  });
   @override
   State<RankDetailPage> createState() => _RankDetailPageState();
 }
@@ -393,24 +450,28 @@ class _RankDetailPageState extends State<RankDetailPage> {
                     ),
                   );
                 }
-                return ListView.builder(
-                  padding: EdgeInsets.fromLTRB(
-                    AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
-                    AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                return TvScrollRegion(
+                  memoryKey: 'tv/browse-rank',
+                  horizontalEdge: DpadEdgeBehavior.leave,
+                  child: ListView.builder(
+                    padding: EdgeInsets.fromLTRB(
+                      AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
+                      AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                    ),
+                    itemCount: songs.length,
+                    itemBuilder: (context, i) {
+                      final song = songs[i].toSong();
+                      return SongListItem(
+                        song: song,
+                        onTap: () =>
+                            context.read<PlayerProvider>().playOnlinePlaylist(
+                              songs.map((e) => e.toSong()).toList(),
+                              i,
+                            ),
+                        onMoreTap: () {},
+                      );
+                    },
                   ),
-                  itemCount: songs.length,
-                  itemBuilder: (context, i) {
-                    final song = songs[i].toSong();
-                    return SongListItem(
-                      song: song,
-                      onTap: () =>
-                          context.read<PlayerProvider>().playOnlinePlaylist(
-                            songs.map((e) => e.toSong()).toList(),
-                            i,
-                          ),
-                      onMoreTap: () {},
-                    );
-                  },
                 );
               },
             ),
@@ -459,12 +520,24 @@ class _CompactAlbumGrid extends StatelessWidget {
   const _CompactAlbumGrid({
     required this.albums,
     required this.onTap,
+    required this.regionKey,
     this.maxItems = 6,
+    this.heroTags,
   });
 
   final List<Album> albums;
   final ValueChanged<int> onTap;
   final int maxItems;
+
+  /// 与 [albums] 等长的 Hero tag 表；null 或表内 null = 该格不参与封面连贯过渡。
+  /// **tag 必须按目标页收到的 id 口径由调用方构造**：进 `PlaylistPage` 用
+  /// `playlistCoverHeroTag`、进 `AlbumDetailPage` 用 `albumCoverHeroTag`——
+  /// 与对应完整列表页卡片的 tag 同口径，区块 → 完整列表的推入也靠它衔接。
+  final List<String?>? heroTags;
+
+  /// tv: 焦点区域记忆键，同一组件在三处调用点各用一把（同一 memoryKey
+  /// 会被 dpad 视为同一个区域，离开再回来会串到别的面板位置）。
+  final String regionKey;
 
   @override
   Widget build(BuildContext context) {
@@ -472,10 +545,10 @@ class _CompactAlbumGrid extends StatelessWidget {
     // 计划 4.7：按面板局部宽度定列数——桌面宽面板多列，手机仍两列。
     return LayoutBuilder(
       builder: (context, c) {
-        final columns = isDesktopLayout(context)
-            ? gridColumnsForWidth(c.maxWidth,
-                targetExtent: 280, min: 2, max: 4)
-            : 2;
+        final columns = gridColumnsForWidth(c.maxWidth,
+                targetExtent: 280, min: c.maxWidth < 360 ? 1 : 2, max: 4,
+        )
+            ;
         final rows = <Widget>[];
         for (var i = 0; i < count; i += columns) {
           final cells = <Widget>[];
@@ -500,10 +573,14 @@ class _CompactAlbumGrid extends StatelessWidget {
             ),
           );
         }
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: rows,
-        );
+        return TvScrollRegion(
+            memoryKey: regionKey,
+            horizontalEdge: DpadEdgeBehavior.leave,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: rows,
+            ),
+          );
       },
     );
   }
@@ -511,7 +588,20 @@ class _CompactAlbumGrid extends StatelessWidget {
   Widget _cell(BuildContext context, int index) {
     final cs = Theme.of(context).colorScheme;
     final album = albums[index];
-    return InkWell(
+    final heroTag = (heroTags != null && index < heroTags!.length)
+        ? heroTags![index]
+        : null;
+    final image = CachedNetworkImage(
+      imageUrl: album.artworkUri ?? '',
+      memCacheWidth: 156,
+      memCacheHeight: 156,
+      fit: BoxFit.cover,
+      placeholder: (_, _) =>
+          _MusicExploreSectionsState._coverPlaceholder(cs),
+      errorWidget: (_, _, _) =>
+          _MusicExploreSectionsState._coverPlaceholder(cs),
+    );
+    final row = InkWell(
       onTap: () => onTap(index),
       borderRadius: AppRadius.mdAll,
       child: Padding(
@@ -523,16 +613,13 @@ class _CompactAlbumGrid extends StatelessWidget {
               child: SizedBox(
                 width: 52,
                 height: 52,
-                child: CachedNetworkImage(
-                  imageUrl: album.artworkUri ?? '',
-                  memCacheWidth: 156,
-                  memCacheHeight: 156,
-                  fit: BoxFit.cover,
-                  placeholder: (_, _) =>
-                      _MusicExploreSectionsState._coverPlaceholder(cs),
-                  errorWidget: (_, _, _) =>
-                      _MusicExploreSectionsState._coverPlaceholder(cs),
-                ),
+                child: heroTag == null
+                    ? image
+                    : PlaylistCoverHero(
+                        tag: heroTag,
+                        radius: AppRadius.smAll,
+                        child: image,
+                      ),
               ),
             ),
             const SizedBox(width: 10),
@@ -551,6 +638,13 @@ class _CompactAlbumGrid extends StatelessWidget {
         ),
       ),
     );
+
+    // tv: 区块行单停点（OK = 原 onTap）。
+    return TvCardFocus(
+      onSelect: () => onTap(index),
+      debugLabel: 'explore-mini-row',
+      child: row,
+    );
   }
 }
 
@@ -567,6 +661,11 @@ class _PlaylistBrowsePageState extends State<PlaylistBrowsePage> {
   @override
   void initState() {
     super.initState();
+    // 完整列表与搜索页区块共用同一份 Provider 数据：从区块「›」进来时通常已
+    // 加载完毕。转场首帧必须就有网格上的 Hero 端点（区块小封面 → 完整列表大
+    // 封面的衔接，见 NewAlbumBrowsePage 同处的说明）——先按现有数据渲染，
+    // 后台只做一次补拉刷新。
+    _isLoading = context.read<KugouProvider>().playlistList.isEmpty;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await context.read<KugouProvider>().getPlaylist();
       if (mounted) setState(() => _isLoading = false);
@@ -583,27 +682,41 @@ class _PlaylistBrowsePageState extends State<PlaylistBrowsePage> {
               selector: (_, kugou) => kugou.playlistList,
               builder: (context, list, _) {
                 if (list.isEmpty) return const Center(child: Text('暂无数据'));
-                return PinchableGridView(
-                  padding: EdgeInsets.fromLTRB(
-                    AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
-                    AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
-                  ),
-                  childAspectRatio: 0.8,
-                  spacing: 12,
-                  itemCount: list.length,
-                  itemBuilder: (context, i) => AlbumCard(
-                    album: Album(
-                      id: list[i].id,
-                      name: list[i].name,
-                      artist: '',
-                      artworkUri: list[i].coverUrl,
-                      songCount: list[i].songCount,
+                // Hero tag 唯一性防护：完整列表来自服务端，可能出现重复 gid；
+                // 只给每个 id 首次出现的卡片挂 Hero（tag 口径与搜索页区块一致，
+                // 推入/返回时区块小封面 ↔ 完整列表大封面成对飞行）。
+                final firstGid = firstIndexById(
+                  [for (final p in list) p.globalCollectionId ?? p.id],
+                );
+                return TvScrollRegion(
+                  memoryKey: 'tv/browse-playlists',
+                  horizontalEdge: DpadEdgeBehavior.leave,
+                  child: PinchableGridView(
+                    padding: EdgeInsets.fromLTRB(
+                      AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
+                      AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
                     ),
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            PlaylistPage(playlist: list[i].toPlaylist()),
+                    childAspectRatio: 0.8,
+                    spacing: 12,
+                    itemCount: list.length,
+                    itemBuilder: (context, i) => AlbumCard(
+                      album: Album(
+                        id: list[i].id,
+                        name: list[i].name,
+                        artist: '',
+                        artworkUri: list[i].coverUrl,
+                        songCount: list[i].songCount,
                       ),
+                      heroTag:
+                          firstGid[list[i].globalCollectionId ?? list[i].id] == i
+                              ? playlistCoverHeroTag(
+                                  list[i].globalCollectionId ?? list[i].id,
+                                )
+                              : null,
+                      onTap: () => AdaptiveNav.openDetail(context,
+                        (_) =>
+                              PlaylistPage(playlist: list[i].toPlaylist()),
+                        ),
                     ),
                   ),
                 );

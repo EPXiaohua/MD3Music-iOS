@@ -1,3 +1,6 @@
+import '../../core/layout/page_layout.dart';
+import '../../core/layout/adaptive_navigator.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
@@ -74,10 +77,8 @@ class _AudiobookSearchPageState extends State<AudiobookSearchPage> {
           return _AlbumResultTile(
             album: album,
             onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => AudiobookAlbumDetailPage(album: album),
-                ),
+              AdaptiveNav.openDetail(context,
+                (_) => AudiobookAlbumDetailPage(album: album),
               );
             },
           );
@@ -92,6 +93,7 @@ class _AudiobookSearchPageState extends State<AudiobookSearchPage> {
         title: TextField(
           controller: _controller,
           focusNode: _focusNode,
+          contextMenuBuilder: buildAppTextContextMenu,
           autofocus: true,
           textInputAction: TextInputAction.search,
           onSubmitted: _search,
@@ -123,7 +125,7 @@ class _AudiobookSearchPageState extends State<AudiobookSearchPage> {
           ),
         ],
       ),
-      body: SafeArea(child: body),
+      body: ContentWidth(child: SafeArea(child: body)),
     );
   }
 }

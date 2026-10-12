@@ -638,7 +638,7 @@ fn respond_module(
     bypass: bool,
     is_register_dev: bool,
 ) -> Result<(), String> {
-    let mr = result.unwrap_or_else(|e| e);
+    let mut mr = result.unwrap_or_else(|e| e);
     let status = mr.status;
 
     if is_register_dev && status == 200 {
@@ -659,6 +659,28 @@ fn respond_module(
     }
     for (k, v) in &mr.headers {
         headers.push((k.clone(), v.clone()));
+    }
+
+    // ---- 流式响应体（云盘上传 NDJSON 进度流）----
+    // 不缓冲、不进 apicache（进度类响应无缓存意义且体积不可预知）、
+    // 不带 max-age。data_length=None → tiny_http 走 chunked 边读边发
+    //（同 /album/dycover/media 的流式转发）。respond 会阻塞到流结束，
+    // 因此本请求的 ActiveRequestGuard/UploadGuard 仍覆盖整个上传生命周期。
+    if matches!(mr.body, BodyValue::Stream(_)) {
+        // 仅在确为流式体时才取走 reader；普通 Json/Bytes 体绝不触碰
+        //（mem::replace 必须放在 matches! 守卫之内，否则会把真实响应覆盖成 null）。
+        let reader = match std::mem::replace(&mut mr.body, BodyValue::Json(json!(null))) {
+            BodyValue::Stream(r) => r,
+            _ => unreachable!("guarded by matches! above"),
+        };
+        headers.push(("cache-control".to_string(), "no-store".to_string()));
+        let mut tiny_headers: Vec<tiny_http::Header> = Vec::with_capacity(headers.len());
+        for (k, v) in &headers {
+            tiny_headers.push(make_header(k, v)?);
+        }
+        // data_length=None → tiny_http 用 chunked 编码边读边发（同 /album/dycover/media）
+        let resp = Response::new(tiny_http::StatusCode(status), tiny_headers, reader, None, None);
+        return request.respond(resp).map_err(|e| e.to_string());
     }
 
     if status == 200 {

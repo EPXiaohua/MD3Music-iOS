@@ -105,6 +105,30 @@ GNU/MinGW 无法替代。请先安装：
 }
 Write-Host "Visual Studio: $vsInstalled" -ForegroundColor Green
 
+# ---------- 1.5 cp936 /utf-8 与 ATL / NuGet 前置 ----------
+# 中文 Windows（代码页 936）下 MSVC 默认按 GBK 解码无 BOM 的 UTF-8 源文件，
+# connectivity_plus 等插件会报 C4819；开了 /WX（含本仓 windows/CMakeLists.txt 的
+# runner /W4 /WX）时升级为 C2220 直接编译失败。cl.exe 读取 CL 环境变量并置于
+# 命令行最前，对 runner 与全部插件的编译统一生效（也覆盖 Rust MSVC 工具链里
+# cc crate 触发的 cl.exe）：
+if ($env:CL) { $env:CL = "$env:CL /utf-8" } else { $env:CL = '/utf-8' }
+Write-Note '已注入 CL=/utf-8（规避 cp936 下 C4819 -> C2220）'
+
+# flutter_secure_storage_windows 的插件源码 include <atlstr.h>（ATL）；
+# 只装「使用 C++ 的桌面开发」工作负载不含 ATL，缺了会在插件编译阶段报 atlstr.h 找不到。
+$atlOk = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.ATL -property installationPath 2>$null
+if (-not $atlOk) {
+    Write-Warn '未检测到 VS 组件 Microsoft.VisualStudio.Component.VC.ATL（ATL）。'
+    Write-Warn 'flutter_secure_storage_windows 需要 atlstr.h，缺失时插件编译阶段会失败。建议安装：'
+    Write-Warn "    vs_installer.exe modify --installPath `"$(@($vsInstalled)[0])`" --add Microsoft.VisualStudio.Component.VC.ATL --passive"
+    Write-Warn '（或在 Visual Studio Installer 中勾选「C++ ATL for latest v143 build tools」后重试。）'
+}
+
+# permission_handler_windows 的 CMake 在 configure 阶段会从 dist.nuget.org 下载 nuget.exe
+# 并安装 Microsoft.Windows.CppWinRT 包；网络受限时会卡在 configure。
+Write-Note '提示：permission_handler_windows 在 configure 阶段需联网下载 NuGet（dist.nuget.org）；'
+Write-Note '受限网络请自备 nuget.exe 并配置本地源，或开代理后再跑本脚本。'
+
 # ---------- 2. 判断是否需要构建 Rust（逻辑与 android 任务一致） ----------
 $needRust = [bool]$ForceRust
 if (-not $needRust -and -not $SkipRust) {
@@ -164,6 +188,13 @@ Write-Step 'flutter build windows --release'
 Assert-Command flutter '请先安装并加入 PATH'
 Push-Location $RepoRoot
 try { Invoke-Native { flutter build windows --release } }
+catch {
+    # 典型坑：早期 configure 失败会在 build\windows 留下 CMAKE_INSTALL_PREFIX 已被写成
+    # 默认值的 CMakeCache.txt，之后每次构建都死在 INSTALL（cannot create directory: C:/Program Files）。
+    Write-Warn 'flutter build windows 失败。若错误信息含 INSTALL "cannot create directory: C:/Program Files..."，'
+    Write-Warn '删除整个 build\windows 目录后重跑本脚本即可（残留的 CMakeCache.txt 里 CMAKE_INSTALL_PREFIX 已是默认值）。'
+    throw
+}
 finally { Pop-Location }
 
 # ---------- 4. 复制 dll 到 exe 同目录 ----------

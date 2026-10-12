@@ -1,3 +1,6 @@
+import '../../core/theme/app_dimens.dart';
+import '../../core/layout/page_layout.dart';
+import '../../main.dart' show requestPermissions;
 import 'package:flutter/gestures.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
@@ -108,6 +111,10 @@ class _UserAgreementPageState extends State<UserAgreementPage>
       await prefs.setBool(_kAcceptedKey, true);
     } catch (_) {}
     if (!mounted) return;
+    // 覆盖「协议待确认但引导早已完成」的老用户；新用户在这里仍会被
+    // requestPermissions 内部闸门拦住，直到引导页完成才弹授权窗。
+    // ignore: discarded_futures
+    requestPermissions();
     widget.onAgreed();
   }
 
@@ -120,7 +127,9 @@ class _UserAgreementPageState extends State<UserAgreementPage>
       canPop: widget.isReview || !widget.isFirstLaunch,
       child: Scaffold(
         appBar: widget.isReview ? AppBar(title: const Text('用户协议')) : null,
-        body: SafeArea(
+        body: ContentWidth(
+          maxWidth: AppLayout.readableMaxWidth,
+          child: SafeArea(
           child: Column(
             children: [
               if (!widget.isReview) ...[
@@ -158,8 +167,7 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                       Text(
                         '用户协议',
                         style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
+                          fontWeight: FontWeight.w600),
                       ),
                       const SizedBox(height: 12),
                       _Clause(
@@ -195,7 +203,8 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                           textAlign: TextAlign.center,
                           text: TextSpan(
                             style: Theme.of(context).textTheme.bodyMedium
-                                ?.copyWith(color: colorScheme.onSurfaceVariant),
+                                ?.copyWith(color: colorScheme.onSurfaceVariant,
+                                  ),
                             children: [
                               const TextSpan(text: '查看完整'),
                               TextSpan(
@@ -258,7 +267,8 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                                     child: Checkbox(
                                       value: _agreed,
                                       onChanged: (v) =>
-                                          setState(() => _agreed = v ?? false),
+                                          setState(() => _agreed = v ?? false,
+                                        ),
                                       materialTapTargetSize:
                                           MaterialTapTargetSize.shrinkWrap,
                                     ),
@@ -267,7 +277,8 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                                   Text(
                                     '我已阅读并同意 用户协议',
                                     style:
-                                        Theme.of(context).textTheme.bodyMedium,
+                                        Theme.of(context,
+                                      ).textTheme.bodyMedium,
                                   ),
                                 ],
                               ),
@@ -280,7 +291,8 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                               onPressed: _agreed ? _onAgree : null,
                               style: FilledButton.styleFrom(
                                 padding:
-                                    const EdgeInsets.symmetric(vertical: 14),
+                                    const EdgeInsets.symmetric(vertical: 14,
+                                  ),
                               ),
                               child: const Text('下一步'),
                             ),
@@ -291,6 +303,7 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                   },
                 ),
             ],
+            ),
           ),
         ),
       ),

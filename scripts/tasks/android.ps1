@@ -18,9 +18,10 @@
                        （不含 3D；standard flavor 且 ABI 含 arm64 时自动产出，-NoAppleMusic 可跳过）
 
   打包后逐个自检产物内容（jniLibs / 3D 资产是否与 flavor 匹配、包名是否符合预期），
-  再把产物重命名为中文名（便于区分；Gradle/Flutter 内部命名不动，见 common.ps1 的
-  Get-ApkDisplayName），随后清理历史产物（含改造前的英文名包）。
-  依赖检测：rustup(GNU toolchain，仅在需要编 Rust 时校验) / Android NDK / Flutter，缺失时给出明确提示。
+  再把产物命名与正式 CI 对齐（Gradle/Flutter 内部命名不动，见 common.ps1 的
+  Get-ApkDisplayName），随后清理不符合发布命名的历史产物。
+  依赖检测：rustup(GNU toolchain，仅在需要编 Rust 时校验；android target 缺失时自动补装)
+  / Android NDK / Flutter，缺失时给出明确提示。
 
 .PARAMETER ForceRust
   忽略改动检测，强制重新交叉编译 Rust 并覆盖 jniLibs。
@@ -33,6 +34,7 @@
 
 .PARAMETER Flavor
   both（默认）/ standard / depth3d。日常 3D 迭代用 -Flavor depth3d 只出 3D 包。
+  tv（TV 版独立包体：遥控导航 + 排除 3D/USB/歌词推送，仅 arm64-v8a）
 
 .PARAMETER Abi
   all（默认：arm64-v8a + armeabi-v7a + x86_64）/ 单个 ABI。
@@ -64,7 +66,7 @@ param(
     [switch]$SkipFlutter,
     [string]$NdkPath,
     [ValidateSet('release', 'debug')][string]$BuildType = 'release',
-    [ValidateSet('both', 'standard', 'depth3d')][string]$Flavor = 'both',
+    [ValidateSet('both', 'standard', 'depth3d', 'tv')][string]$Flavor = 'both',
     [ValidateSet('all', 'arm64-v8a', 'armeabi-v7a', 'x86_64')][string]$Abi = 'all',
     [switch]$NoAppleMusic,
     [switch]$NoPause
@@ -91,12 +93,11 @@ if (Test-Path $script:Md3CommonPath) {
     function Test-HasCommand([string]$Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
     function Add-CargoToPath { $b = Join-Path $env:USERPROFILE '.cargo\bin'; if ((Test-Path $b) -and ($env:Path -notlike "*$b*")) { $env:Path = "$b;$env:Path" } }
     function Test-RustDirty { $root = Get-RepoRoot; if (-not (Test-HasCommand git)) { return $false }; $st = & git -C $root status --porcelain -- kugou_api_server/rust/ 2>$null; ($LASTEXITCODE -eq 0) -and [bool]$st }
+    function Test-RustStaleLibrary { param([string]$JniDir, [string[]]$Abis = @('arm64-v8a','armeabi-v7a','x86_64')) $root = Get-RepoRoot; $rustDir = Join-Path $root 'kugou_api_server\rust'; if (-not $JniDir) { $JniDir = Join-Path $root 'android\app\src\main\jniLibs' }; $inputs = @(Get-ChildItem (Join-Path $rustDir 'src') -File -Recurse -ErrorAction SilentlyContinue); $inputs += @(Get-ChildItem (Join-Path $rustDir 'Cargo.*') -File -ErrorAction SilentlyContinue); if (-not $inputs.Count) { return $false }; $newest = ($inputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc; foreach ($abi in $Abis) { $dst = Join-Path $JniDir "$abi\libkugou_server.so"; if (-not (Test-Path $dst)) { return $true }; if ($newest -gt (Get-Item $dst).LastWriteTimeUtc) { return $true } }; return $false }
     function Remove-ItemBypass([string]$Path) { if (Test-Path -LiteralPath $Path) { $item = Get-Item -LiteralPath $Path -Force; if ($item -is [System.IO.DirectoryInfo]) { [System.IO.Directory]::Delete($item.FullName, $true) } else { [System.IO.File]::Delete($item.FullName) } } }
     function Get-PubspecVersion { $pub = Get-Content (Join-Path (Get-RepoRoot) 'pubspec.yaml') | Select-String '^version:'; if ($pub) { ($pub.ToString() -replace '^version:\s*', '' -split '\+')[0] } else { '0.0.0' } }
-    $Md3ApkFlavorCn = @{ 'standard' = '标准版'; 'depth3d' = '3D封面版'; 'apple-music' = '随身听兼容版' }
-    $Md3ApkAbiCn    = @{ 'arm64-v8a' = '64位'; 'armeabi-v7a' = '32位'; 'x86_64' = '模拟器'; 'universal' = '通用' }
-    function Get-ApkDisplayName { param([Parameter(Mandatory)][string]$Abi, [Parameter(Mandatory)][string]$Flavor, [Parameter(Mandatory)][ValidateSet('release','debug')][string]$BuildType, [string]$Version) if (-not $Version) { $Version = Get-PubspecVersion }; $f = if ($Md3ApkFlavorCn.ContainsKey($Flavor)) { $Md3ApkFlavorCn[$Flavor] } else { $Flavor }; $a = if ($Md3ApkAbiCn.ContainsKey($Abi)) { $Md3ApkAbiCn[$Abi] } else { $Abi }; $s = if ($BuildType -eq 'debug') { '-debug' } else { '' }; $p = if ($Flavor -eq 'standard' -and $Abi -eq 'arm64-v8a' -and $BuildType -eq 'release') { '（推荐）' } else { '' }; "$pMD3音乐-$Version-$f-$a$s.apk" }
-    function Get-ApkDisplayPattern { '^(（推荐）)?MD3音乐-[\d\.]+-(标准版|3D封面版|随身听兼容版)-(64位|32位|模拟器|通用)(-debug)?\.apk$' }
+    function Get-ApkDisplayName { param([Parameter(Mandatory)][string]$Abi, [Parameter(Mandatory)][string]$Flavor, [Parameter(Mandatory)][ValidateSet('release','debug')][string]$BuildType, [string]$Version) if (-not $Version) { $Version = Get-PubspecVersion }; $s = if ($BuildType -eq 'debug') { '-debug' } else { '' }; "MD3Music-$Version-$Flavor-$Abi$s.apk" }
+    function Get-ApkDisplayPattern { '^MD3Music-[0-9A-Za-z.+-]+-(standard|depth3d|apple-music|tv)-(arm64-v8a|armeabi-v7a|x86_64|universal)(-debug)?\.apk$' }
     function Sync-SettingsSearchIndex { }   # 公开树无 scripts/tools，设置为搜索索引同步为空操作
 }
 
@@ -187,19 +188,29 @@ Write-Host "NDK: $NDK"
 $needRust = [bool]$ForceRust
 if (-not $needRust) { $needRust = Test-RustDirty }
 if (-not $needRust) {
-    # 兜底：比较 target 产物与 jniLibs 的修改时间，.so 比 jniLibs 新说明 Rust 编译过但未同步
-    foreach ($a in $ABIs) {
-        $src = Join-Path $RustDir "target\$($a.target)\release\libkugou_server.so"
-        $dst = Join-Path $JniDir "$($a.abi)\libkugou_server.so"
-        if ((Test-Path $src) -and (Test-Path $dst) -and
-            (Get-Item $src).LastWriteTime -gt (Get-Item $dst).LastWriteTime) { $needRust = $true }
-    }
+    # 已提交、工作区干净时 git 看不出改动；比"源码 vs 已入库 .so"的新鲜度（见 common.ps1 注释）。
+    # 旧兜底比的是 target 产物 vs jniLibs，两者由同一次 Copy-Item 产生、时间戳恒等，永不触发。
+    $needRust = Test-RustStaleLibrary -JniDir $JniDir -Abis @($ABIs.abi)
 }
 
 # ---------- 4. 交叉编译 Rust（仅当有改动时） ----------
 if ($needRust) {
     Write-Step "检测到 Rust 代码改动，开始交叉编译（$Toolchain）"
     Assert-Command cargo '请先安装 rustup（https://rustup.rs/）'
+    # android target 是按 toolchain 分开安装的：$Toolchain 被 rustup update 重建后会丢掉它们，
+    # 缺失时 rustc 只报 `can't find crate for core`（看不出真实原因），故先补齐
+    # （与 build_android.sh 第 2 步同口径；注意不能用默认 toolchain 的 target 列表判断）
+    if (Test-HasCommand rustup) {
+        $installedTargets = @(& rustup target list --installed --toolchain $Toolchain 2>$null)
+        foreach ($a in $ABIs) {
+            if ($installedTargets -notcontains $a.target) {
+                Write-Host "  安装 rustup target：$($a.target)" -ForegroundColor Yellow
+                Invoke-Native { rustup target add --toolchain $Toolchain $a.target }
+            }
+        }
+    } else {
+        Write-Warn "未检测到 rustup：跳过 android target 检查（请确认 $Toolchain 已装 3 个 android target）"
+    }
     if (-not (Test-Path $HostGcc)) { throw "host gcc 缺失（build-script 需要）：$HostGcc" }
     $env:CC_x86_64_pc_windows_gnu = $HostGcc
     $env:AR_x86_64_pc_windows_gnu = $HostAr
@@ -232,7 +243,7 @@ if ($needRust) {
     }
 }
 else {
-    Write-Host 'Rust 代码无改动，跳过交叉编译（如需强制重编，加 -ForceRust）' -ForegroundColor DarkYellow
+    Write-Host 'Rust 代码无改动且已入库 .so 比源码新，跳过交叉编译（如需强制重编，加 -ForceRust）' -ForegroundColor DarkYellow
 }
 
 # ---------- 5. Flutter 分包打包 ----------
@@ -265,12 +276,16 @@ $abiTargets = switch ($Abi) {
 }
 $wantStandard = $Flavor -in @('both', 'standard')
 $wantDepth3d  = $Flavor -in @('both', 'depth3d')
+$wantTv       = $Flavor -eq 'tv'
 # flutter --target-platform 目标名 -> APK 产物里的 ABI 段
 $abiOf = @{ 'android-arm64' = 'arm64-v8a'; 'android-arm' = 'armeabi-v7a'; 'android-x64' = 'x86_64' }
 # Apple Music 兼容包固定 standard flavor + arm64-v8a（与 CI 发布口径一致）
 $wantAppleMusic = (-not $NoAppleMusic) -and $wantStandard -and ($abiTargets -contains 'android-arm64')
 if ($wantDepth3d -and $Abi -notin @('all', 'arm64-v8a')) {
     Write-Warn "depth3d flavor 只有 arm64-v8a（ORT AAR 仅含该 ABI）：-Abi $Abi 只影响 standard 包"
+}
+if ($wantTv) {
+    Write-Note 'tv 包恒为 arm64-v8a，与 -Abi 无关（TV 版仅此 ABI）'
 }
 if ($NoAppleMusic -and $wantStandard -and ($abiTargets -contains 'android-arm64')) {
     Write-Note '已按要求跳过 Apple Music 兼容包（-NoAppleMusic）'
@@ -300,6 +315,12 @@ try {
     if ($wantDepth3d) {
         Invoke-Native { flutter build apk $typeFlag --flavor depth3d --dart-define=ENABLE_DEPTH_3D=true --split-per-abi --target-platform android-arm64 -t $target 2>&1 | Convert-NativeStream }
     }
+    # TV 版包体：MD3_TV 旗标启用 dpad 遥控导航；不传 ENABLE_DEPTH_3D（无 3D 封面）。
+    # Dart 侧由 kTvBuild（lib/core/build_flags.dart）树摇：正常包剔除 TV 代码，
+    # TV 包剔除 USB 独占/歌词推送。
+    if ($wantTv) {
+        Invoke-Native { flutter build apk $typeFlag --flavor tv --dart-define=MD3_TV=true --split-per-abi --target-platform android-arm64 -t $target 2>&1 | Convert-NativeStream }
+    }
     # Apple Music（Vivo 原子随身听）兼容包：只覆盖 applicationId，namespace / Kotlin 包路径
     # / MethodChannel 名均不变（见 build.gradle.kts 的 md3ApplicationId 读取）。
     # flutter 会以「同名 standard 包」覆盖输出，故先备份 → 构建 → 改名为 AM 包 → 恢复备份。
@@ -328,6 +349,7 @@ if (Test-Path -LiteralPath $amBackupDir) { Remove-ItemBypass $amBackupDir }
 $expectNames = @()
 if ($wantStandard)   { foreach ($t in $abiTargets) { $expectNames += "app-$($abiOf[$t])-standard-$suffix.apk" } }
 if ($wantDepth3d)    { $expectNames += "app-arm64-v8a-depth3d-$suffix.apk" }
+if ($wantTv)         { $expectNames += "app-arm64-v8a-tv-$suffix.apk" }
 if ($wantAppleMusic) { $expectNames += "app-apple-music-arm64-v8a-$suffix.apk" }
 
 # ---------- 6. 产物自检：flavor 与包内容必须匹配 ----------
@@ -340,6 +362,22 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Get-ApkEntries([string]$Path) {
     $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
     try { @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+}
+# 在 APK 的 lib/arm64-v8a/libapp.so 里找 Dart 符号名（AOT 快照保留 ASCII 标识符；
+# 未开 --obfuscate，类/函数名可检索）。用于校验 TV 代码双向不编入。
+function Test-ApkDartSymbol {
+    param([Parameter(Mandatory)][string]$Apk, [Parameter(Mandatory)][string]$Symbol, [Parameter(Mandatory)][bool]$ExpectPresent)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Apk)
+    try {
+        $entry = $zip.GetEntry('lib/arm64-v8a/libapp.so')
+        if (-not $entry) { return (-not $ExpectPresent) }
+        $ms = New-Object System.IO.MemoryStream
+        $entry.Open().CopyTo($ms)
+        $text = [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+        $ms.Dispose()
+        return ($text.Contains($Symbol) -eq $ExpectPresent)
+    } finally { $zip.Dispose() }
 }
 function Find-Aapt2 {
     $cands = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, 'C:\Android\Sdk') | Where-Object { $_ }
@@ -369,6 +407,7 @@ foreach ($apk in $produced) {
     $abi = if ($apk.Name -match '-(arm64-v8a|armeabi-v7a|x86_64)-') { $Matches[1] } else { '' }
     $is3d = $apk.Name -like '*-depth3d-*'
     $isAm = $apk.Name -like 'app-apple-music-*'
+    $isTv = $apk.Name -like 'app-*-tv-*'
     $problems = @()
     if ($names -notcontains "lib/$abi/libkugou_server.so") { $problems += "缺 lib/$abi/libkugou_server.so" }
     $hasOrt = $names -contains "lib/$abi/libonnxruntime.so"
@@ -384,7 +423,7 @@ foreach ($apk in $produced) {
         # 让 aapt2 提前终止并以非 0 收场，进而污染 $LASTEXITCODE（调用方会误判构建失败）。
         $badging = @(& $Aapt2 dump badging $apk.FullName 2>$null) | Select-Object -First 1
         if ($badging -match "^package: name='([^']+)'") {
-            $wantPkg = if ($isAm) { 'com.apple.android.music' } else { 'com.md3music.md3music' }
+            $wantPkg = if ($isAm) { 'com.apple.android.music' } elseif ($isTv) { 'com.md3music.md3music.tv' } else { 'com.md3music.md3music' }
             if ($Matches[1] -ne $wantPkg) { $problems += "包名 $($Matches[1])（应为 $wantPkg）" }
         } else { $problems += 'aapt2 未能读出包名' }
     }
@@ -392,31 +431,45 @@ foreach ($apk in $produced) {
     else { Write-Ok "$($apk.Name)  $([math]::Round($apk.Length / 1MB, 1)) MB" }
 }
 if (-not $Aapt2) { Write-Warn '未找到 aapt2：已跳过包名校验（内容校验仍已执行）' }
+
+# TV 包：无 USB 驱动 so、无 ONNX so、Dart 含 TV 焦点符号、不含被排除功能符号
+$problems = @()
+if ($wantTv) {
+    $tvApk = Get-ChildItem "$outDir\app-*-tv-$($BuildType).apk" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($tvApk) {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($tvApk.FullName)
+        $names = $zip.Entries.FullName; $zip.Dispose()
+        if ($names -match 'libusb_audio_driver') { $problems += 'TV 包混入 libusb_audio_driver.so（USB 驱动未排除）' }
+        if ($names -match 'onnxruntime')         { $problems += 'TV 包混入 onnxruntime so（3D 未排除）' }
+        if (-not (Test-ApkDartSymbol -Apk $tvApk.FullName -Symbol 'DpadFocusable' -ExpectPresent $true))        { $problems += 'TV 包缺少 dpad 焦点符号（MD3_TV 旗标未生效）' }
+        if (-not (Test-ApkDartSymbol -Apk $tvApk.FullName -Symbol 'UsbExclusiveSection' -ExpectPresent $false)) { $problems += 'TV 包混入 USB 独占设置 UI（kTvBuild 门控缺失）' }
+        if (-not (Test-ApkDartSymbol -Apk $tvApk.FullName -Symbol '_buildLyricPushSubpage' -ExpectPresent $false)) { $problems += 'TV 包混入歌词推送设置子页（kTvBuild 门控缺失）' }
+    }
+}
+# 正常包：不得含 TV 焦点符号
+if ($wantStandard -or $wantDepth3d) {
+    foreach ($apk in Get-ChildItem "$outDir\app-*-standard-$($BuildType).apk", "$outDir\app-*-depth3d-$($BuildType).apk" -ErrorAction SilentlyContinue) {
+        if (-not (Test-ApkDartSymbol -Apk $apk.FullName -Symbol 'DpadFocusable' -ExpectPresent $false)) { $problems += "正常包混入 TV 焦点符号：$($apk.Name)" }
+    }
+}
+if ($problems.Count) { $checkFailed = $true; Write-Fail "TV/符号自检：$($problems -join '；')" }
 if ($checkFailed) { throw '产物自检未通过（见上）' }
 
-# ---------- 7. 产物改名为中文（便于区分） ----------
+# ---------- 7. 产物命名与正式 CI 对齐 ----------
 # Flutter CLI 按固定名 app-<abi>-<flavor>-<type>.apk 查找产物（flutter_tools 的
 # gradle.dart listApkPaths），**不能在 Gradle 层改名**，故在此于构建完成后重命名。
-# 命名规则见 common.ps1 的 Get-ApkDisplayName（与 CI 三个 workflow 的 bash 版互指）。
-Write-Step '重命名产物（中文名）'
+# 命名规则见 common.ps1 的 Get-ApkDisplayName，与 main.yml / ci.yml 保持一致。
+Write-Step '整理产物文件名（与正式 CI 一致）'
 $displayNames = @()
 foreach ($apk in $produced) {
     $flavorKey = if ($apk.Name -like 'app-apple-music-*') { 'apple-music' }
                  elseif ($apk.Name -like '*-depth3d-*') { 'depth3d' }
+                 elseif ($apk.Name -like 'app-*-tv-*') { 'tv' }
                  else { 'standard' }
     $abiKey = if ($apk.Name -match '-(arm64-v8a|armeabi-v7a|x86_64)-') { $Matches[1] } else { '' }
     $newName = Get-ApkDisplayName -Abi $abiKey -Flavor $flavorKey -BuildType $BuildType
     $dest = Join-Path $outDir $newName
     if (Test-Path -LiteralPath $dest) { Remove-ItemBypass $dest }
-    # 迁移清理：早年不带「（推荐）」前缀的同组合产物（改名后与 dest 同名等价）直接删掉，
-    # 否则目录里会同时留下 `（推荐）MD3音乐-…` 与 `MD3音乐-…` 两个等价包
-    if ($newName.StartsWith('（推荐）')) {
-        $legacy = Join-Path $outDir ($newName -replace '^（推荐）', '')
-        if ((Test-Path -LiteralPath $legacy) -and $legacy -ne $dest) {
-            Write-Note "  移除旧命名 $(Split-Path -Leaf $legacy)"
-            Remove-ItemBypass $legacy
-        }
-    }
     Move-Item -LiteralPath $apk.FullName -Destination $dest
     # AGP 会为每个 APK 生成同名 .sha1，改名时让它跟随，避免留下对不上号的孤儿
     $shaSrc = "$($apk.FullName).sha1"
@@ -426,7 +479,7 @@ foreach ($apk in $produced) {
 }
 
 # ---------- 8. 清理历史产物 ----------
-# 只保留中文名产物（含 Apple Music 兼容包）；英文名 / 无 flavor 的历史产物一律清理，
+# 只保留与正式 CI 一致的发布名（含 Apple Music 兼容包）；中文名 / 无 flavor 的历史产物清理，
 # 避免目录里两套命名混在一起分不清（连同同名 .sha1 一并清理）
 $validName = Get-ApkDisplayPattern
 $stale = @(Get-ChildItem $outDir -Filter '*.apk' -ErrorAction SilentlyContinue |

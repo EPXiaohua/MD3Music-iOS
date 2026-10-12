@@ -8,7 +8,10 @@ import 'package:quick_actions/quick_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app.dart';
+import 'core/build_flags.dart';
+import 'core/remote/tv_focus_debug.dart';
 import 'core/layout/responsive_layout.dart';
+import 'core/utils/app_haptics.dart';
 import 'core/services/desktop_lyric_service.dart';
 import 'core/services/diagnostic_logger.dart';
 import 'modules/recognition/floating_recognition_service.dart';
@@ -18,11 +21,14 @@ import 'core/services/lyricon_provider_service.dart';
 import 'core/services/listening_grade_service.dart';
 import 'core/services/listen_report_service.dart';
 import 'core/services/media_notification_service.dart';
+import 'core/services/music_haptics_service.dart';
+import 'core/services/play_history_sync_service.dart';
 import 'core/services/usb_audio_service.dart';
 import 'core/services/wakelock_service.dart';
 import 'data/repositories/settings_repository.dart';
 import 'providers/theme_provider.dart';
 import 'modules/update/update_check_service.dart';
+import 'modules/onboarding/onboarding_content.dart' show kOnboardingCompletedKey;
 import 'modules/onboarding/user_agreement_page.dart';
 import 'services/kugou_server.dart';
 import 'utils/landscape_immersive.dart';
@@ -128,6 +134,13 @@ Future<(bool, bool, bool)> runBootstrap() async {
     LyricPreferences.instance.load(),
     // 加载 MD3 风格播放页的独立歌词偏好（与 Apple Music 风格完全分离）
     Md3LyricPreferences.instance.load(),
+    // 恢复震动反馈总开关与类别开关：全站震动点都在 AppHaptics 内闸门，
+    // 首帧前就位才不会让刚进来的用户感到开关状态失真。
+    AppHaptics.load().catchError((_) {}),
+    // 音乐节奏震动：恢复偏好并开始订阅频谱特征流。
+    // 内部自建五重闸门（自身开关 / 全站震动总开关 / 非模拟频谱 / 特征新鲜 / 原生可用），
+    // 默认关闭，故这里无条件启动是安全的：不开开关就一个震动也不发。
+    MusicHapticsService.instance.load().catchError((_) {}),
     // 恢复屏幕常亮开关状态，供 PlayerProvider/MV 页播放时读取
     WakelockService.instance.init().catchError((_) {}),
     // 初始化均衡器服务（恢复偏好设置，监听播放状态自动绑定）
@@ -140,6 +153,10 @@ Future<(bool, bool, bool)> runBootstrap() async {
     _restoreLyricPushPref(),
     // 恢复全屏播放器横屏沉浸开关（全局变量，播放器同步读取）
     _restoreLandscapeImmersivePref(),
+    // 预热频谱「圆盘是否生效」同步镜像（全局变量）。
+    // 必须在 runApp 前：迷你条上滑展开时跟手覆盖层是当场新建的播放页，
+    // 其封面连贯资格在第一帧就要读到真值，等不及各播放页自己的异步读取。
+    _restoreSpectrumCoverPref(),
   ]);
   markStartup('local_preferences_ready');
 
@@ -149,8 +166,13 @@ Future<(bool, bool, bool)> runBootstrap() async {
   // 注册悬浮窗识曲原生回调（PCM 段回传 / MediaProjection 授权结果 / 悬浮窗按钮动作）
   FloatingRecognitionService.instance.registerNativeCallbacks();
   // 注册 Lyricon 反向回调（连接状态变更 → UI 刷新）
-  // initialize 内部仅 setMethodCallHandler，同步完成，无需 await
-  LyriconProviderService.instance.initialize();
+  // TV 版不编入：无蓝牙歌词屏场景
+  if (!kTvBuild) {
+    LyriconProviderService.instance.initialize();
+  } else {
+    // TV：安装焦点诊断日志（仅 debug 构建实际生效，release 随 kDebugMode 树摇剔除）。
+    TvFocusDebug.install();
+  }
   // 启动 USB 独占输出状态轮询（设置页/歌曲信息页共用实时状态）
   if (!kIsWeb && Platform.isAndroid) {
     UsbAudioService.instance.init();
@@ -159,8 +181,11 @@ Future<(bool, bool, bool)> runBootstrap() async {
   // 启动听歌等级：本地听歌时长累计 + 自动上报（内部按平台/登录态自行处理）
   ListeningGradeService.instance.init();
   // CSCC 真实播放事件上报（/user/listen/report）：由 PlayerProvider 在切歌/播放
-  // 边沿驱动，开关复用 settings_upload_listening_duration（默认关闭）。
+  // 边沿驱动，开关复用 settings_upload_listening_duration（「听歌数据云同步」）。
   ListenReportService.instance.init();
+  // 云端播放历史上传（/playhistory/upload）：与 CSCC 同一切歌边沿驱动，
+  // 同一开关总控；启动时补传上次失败的 pending 队列。
+  PlayHistorySyncService.instance.init();
 
   // P0: 本地 API 服务器与 DLNA 本地 HTTP 服务器改为后台启动（不阻塞 runApp）。
   // 之前 await KugouApiServer.start() 在首帧前完成，其中
@@ -212,12 +237,37 @@ Future<(bool, bool, bool)> runBootstrap() async {
   var initialUseBackgroundImage = true;
   try {
     final prefs = await prefsFuture;
-    needsOnboarding = !(prefs.getBool('onboarding_completed') ?? false);
+    needsOnboarding = !(prefs.getBool(kOnboardingCompletedKey) ?? false);
     initialUseBackgroundImage =
         prefs.getBool(ThemeProvider.backgroundImageEnabledPreferenceKey) ??
             true;
-    kSecondaryPlayerEnabled.value =
-        prefs.getBool(SettingsRepository.secondaryPlayerEnabledPreferenceKey) ??
+    // TV 构建强制关悬浮形态、首帧即常驻条（悬浮条本体无 DpadFocusable 停点，
+    // 见 app.dart _loadSecondaryPlayerEnabled 同一门控）；只门控播种值，
+    // 不回写 prefs——切回手机版不丢用户设置。
+    kSecondaryPlayerEnabled.value = kTvBuild
+        ? false
+        : prefs.getBool(
+              SettingsRepository.secondaryPlayerEnabledPreferenceKey,
+            ) ??
+            false;
+    kSecondaryPlayerProgressEnabled.value =
+        prefs.getBool(
+              SettingsRepository.secondaryPlayerProgressPreferenceKey,
+            ) ??
+            true;
+    kSecondaryPlayerOnPrimaryPages.value =
+        prefs.getBool(
+              SettingsRepository.secondaryPlayerOnPrimaryPreferenceKey,
+            ) ??
+            true;
+    kHideNavBarOnSecondaryPages.value =
+        prefs.getBool(SettingsRepository.hideNavBarOnSecondaryPreferenceKey) ??
+            true;
+    // 桌面外壳开关：不播种则首帧是手机导航壳、app.dart 异步载入后整树跳成
+    // 侧栏（M5）。默认 false，与 SettingsRepository.getDesktopModeEnabled 及
+    // kDesktopModeEnabled 初值三处一致。
+    kDesktopModeEnabled.value =
+        prefs.getBool(SettingsRepository.desktopModeEnabledPreferenceKey) ??
             false;
   } catch (_) {}
   markStartup('onboarding_state_ready');
@@ -267,48 +317,50 @@ Future<void> _restoreLyricPushPref() async {
     // ignore: discarded_futures
     DesktopLyricService.instance.setFlymeStatusBarLyricEnabled(flymeLyricEnabled);
 
-    // 实时歌词推送协议
-    final protocol = await settings.getLyricPushProtocol();
-    final translation = await settings.getLyricPushTranslation();
-    final roma = await settings.getLyricPushRoma();
-    final preferTranslation = await settings.getLyricPushPreferTranslation();
-    // 记录各协议 enabled key（兼容 Kotlin restoreLyricon 读 lyricon_enabled）
-    await settings.setLyriconEnabled(protocol == 'lyricon');
-    await settings.setSuperLyricEnabled(protocol == 'super_lyric');
-    await settings.setLyricInfoEnabled(protocol == 'lyric_info');
-    // 应用共用偏好
-    // ignore: discarded_futures
-    DesktopLyricService.instance.setLyricPushPreferences(
-      translation: translation,
-      roma: roma,
-      preferTranslation: preferTranslation,
-    );
-    // 启用选中协议
-    if (protocol == 'lyricon') {
-      try {
-        await LyriconProviderService.instance.setDisplayTranslation(
-          translation,
-        );
-        await LyriconProviderService.instance.setDisplayRoma(roma);
-        await LyriconProviderService.instance.setEnabled(true);
-      } catch (_) {}
-    } else if (protocol == 'super_lyric') {
+    // 实时歌词推送协议（TV 版不编入：无蓝牙歌词屏/系统歌词桥/车机歌词场景）
+    if (!kTvBuild) {
+      final protocol = await settings.getLyricPushProtocol();
+      final translation = await settings.getLyricPushTranslation();
+      final roma = await settings.getLyricPushRoma();
+      final preferTranslation = await settings.getLyricPushPreferTranslation();
+      // 记录各协议 enabled key（兼容 Kotlin restoreLyricon 读 lyricon_enabled）
+      await settings.setLyriconEnabled(protocol == 'lyricon');
+      await settings.setSuperLyricEnabled(protocol == 'super_lyric');
+      await settings.setLyricInfoEnabled(protocol == 'lyric_info');
+      // 应用共用偏好
       // ignore: discarded_futures
-      DesktopLyricService.instance.setSuperLyricEnabled(true);
-    } else if (protocol == 'lyric_info') {
-      // 先恢复 ColorOS Bridge 兼容模式，再启用推送（避免首推旧格式）
-      final colorOs = await settings.getLyricInfoColorOs();
+      DesktopLyricService.instance.setLyricPushPreferences(
+        translation: translation,
+        roma: roma,
+        preferTranslation: preferTranslation,
+      );
+      // 启用选中协议
+      if (protocol == 'lyricon') {
+        try {
+          await LyriconProviderService.instance.setDisplayTranslation(
+            translation,
+          );
+          await LyriconProviderService.instance.setDisplayRoma(roma);
+          await LyriconProviderService.instance.setEnabled(true);
+        } catch (_) {}
+      } else if (protocol == 'super_lyric') {
+        // ignore: discarded_futures
+        DesktopLyricService.instance.setSuperLyricEnabled(true);
+      } else if (protocol == 'lyric_info') {
+        // 先恢复 ColorOS Bridge 兼容模式，再启用推送（避免首推旧格式）
+        final colorOs = await settings.getLyricInfoColorOs();
+        // ignore: discarded_futures
+        DesktopLyricService.instance.setLyricInfoColorOs(colorOs);
+        // ignore: discarded_futures
+        await DesktopLyricService.instance.setLyricInfoEnabled(true);
+      }
+      // MD3Music fork: lyricInfo 推送无条件启用（Vivo 车载歌词依赖此链路：extras LYRICS_WHOLE
+      // + 原子随身听 lrc_change）。协议开关只控制 lyricon/super_lyric 等展示通道；
+      // 此前受开关控制 + 覆盖安装残留旧设置（lyric_push_protocol='none'）导致链路关闭，
+      // 原子随身听缺 8/16 能力位（无歌词无进度条）、车机无歌词。
       // ignore: discarded_futures
-      DesktopLyricService.instance.setLyricInfoColorOs(colorOs);
-      // ignore: discarded_futures
-      await DesktopLyricService.instance.setLyricInfoEnabled(true);
+      DesktopLyricService.instance.setLyricInfoEnabled(true);
     }
-    // MD3Music fork: lyricInfo 推送无条件启用（Vivo 车载歌词依赖此链路：extras LYRICS_WHOLE
-    // + 原子随身听 lrc_change）。协议开关只控制 lyricon/super_lyric 等展示通道；
-    // 此前受开关控制 + 覆盖安装残留旧设置（lyric_push_protocol='none'）导致链路关闭，
-    // 原子随身听缺 8/16 能力位（无歌词无进度条）、车机无歌词。
-    // ignore: discarded_futures
-    DesktopLyricService.instance.setLyricInfoEnabled(true);
   } catch (_) {}
 }
 
@@ -318,6 +370,19 @@ Future<void> _restoreLandscapeImmersivePref() async {
   try {
     kLandscapeImmersiveEnabled = await SettingsRepository()
         .getLandscapeImmersiveEnabled();
+  } catch (_) {}
+}
+
+/// 预热频谱「圆盘（style 0/1）是否生效」同步镜像。
+/// 两个 getter 各自维护镜像里的一个字段（开关 / 样式），少任何一个都不成立，
+/// 故这里**必须两个都读**，不能只读开关。
+Future<void> _restoreSpectrumCoverPref() async {
+  try {
+    final settings = SettingsRepository();
+    await Future.wait([
+      settings.getSpectrumEnabled(),
+      settings.getSpectrumStyle(),
+    ]);
   } catch (_) {}
 }
 
@@ -338,11 +403,18 @@ void handleShortcut(String shortcutType) {
 
 /// 请求启动后立即需要的运行时权限（通知）。
 /// 音频库权限在用户打开本地曲库时按需请求；下载默认使用应用专属目录。
+///
+/// 通知权限不能不请求：播放通知由原生 `AudioPlaybackService`
+/// （manifest 里 foregroundServiceType="mediaPlayback"）承载，Android 13+ 被拒
+/// 就没有锁屏 / 通知栏播控。但也不该在冷启动第一屏就问——用户还没看到任何价值。
+/// 因此这里闸门在「首启流程走完」之后：首帧后与两个完成点（用户协议已同意 /
+/// 引导页已完成）都会调用本函数，闸门未过时直接返回，整体保持幂等且不阻塞启动。
 Future<void> requestPermissions() async {
   // Web 平台不支持 permission_handler，跳过所有权限请求
   if (kIsWeb) return;
   // 桌面端无 Android 专属权限，跳过（permission_handler 桌面语义不同）
   if (!Platform.isAndroid) return;
+  if (!await _isFirstLaunchFlowFinished()) return;
 
   // Android 13+ 通知权限
   if (await Permission.notification.isDenied) {
@@ -351,6 +423,19 @@ Future<void> requestPermissions() async {
     } catch (e) {
       print('Notification permission request failed: $e');
     }
+  }
+}
+
+/// 首启流程（用户协议 + 引导页）是否已走完。
+/// 读不到偏好时按「已走完」处理：宁可退回改动前的行为照常请求，
+/// 也不能因一次 prefs 异常让用户永久丢掉通知权限（= 丢掉锁屏播控）。
+Future<bool> _isFirstLaunchFlowFinished() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final onboardingDone = prefs.getBool(kOnboardingCompletedKey) ?? false;
+    return onboardingDone && await isUserAgreementAccepted();
+  } catch (_) {
+    return true;
   }
 }
 

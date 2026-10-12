@@ -36,7 +36,7 @@ class AdaptiveContentGrid extends StatelessWidget {
     this.spacing = AppSpacing.md,
     this.minColumns = 2,
     this.maxColumns = 6,
-    this.singleColumnBelow = 600,
+    this.singleColumnBelow = compactBreakpoint,
   });
 
   final int itemCount;
@@ -120,7 +120,7 @@ class SliverAdaptiveContentGrid extends StatelessWidget {
     this.spacing = AppSpacing.md,
     this.minColumns = 2,
     this.maxColumns = 6,
-    this.singleColumnBelow = 600,
+    this.singleColumnBelow = compactBreakpoint,
   });
 
   final int itemCount;

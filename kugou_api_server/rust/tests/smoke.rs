@@ -29,6 +29,42 @@ fn simulate_rsa_key_parses() {
     assert!(!sim.sid.is_empty());
 }
 
+/// 黑名单 items 构建（blacklist.js 的移植）：与 JS JSON.stringify 逐字段对齐——
+/// song → k 为小写 hash、v 为 `{"n":名,"m":mixsongid,"t":秒}` 字符串；
+/// singer → k 为 singerid、v 为 `{"n":名,"t":秒}`；items 参数（合法数组）原样优先。
+#[test]
+fn blacklist_items_build() {
+    use kugou_server::modules::blacklist::build_items;
+    use serde_json::json;
+
+    // song 单条：hash 大写入参 → 小写 k；v 内 n/m/t 顺序与 JS 对象插入序一致
+    let q = json!({"hash": "B3A52A7A958BF0AED0EBFBA2E9A818B7", "name": "周杰伦 - 晴天", "mixsongid": "32100650"});
+    let items = build_items(&q, "song", 1786957745);
+    let arr = items.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["k"], "b3a52a7a958bf0aed0ebfba2e9a818b7");
+    let v = arr[0]["v"].as_str().unwrap();
+    assert_eq!(v, r#"{"n":"周杰伦 - 晴天","m":"32100650","t":"1786957745"}"#);
+
+    // singer 单条：无 m 字段
+    let q = json!({"label": "singer", "singerid": "3520", "name": "周杰伦"});
+    let items = build_items(&q, "singer", 1786957745);
+    let v = items.as_array().unwrap()[0]["v"].as_str().unwrap();
+    assert_eq!(v, r#"{"n":"周杰伦","t":"1786957745"}"#);
+    assert_eq!(items.as_array().unwrap()[0]["k"], "3520");
+
+    // items 参数（JSON 数组字符串）原样透传
+    let q = json!({"items": r#"[{"k":"a","v":"{\"n\":\"x\",\"t\":\"1\"}"}]"#});
+    let items = build_items(&q, "song", 1786957745);
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(items.as_array().unwrap()[0]["k"], "a");
+
+    // items 参数非法 → 回退单条构建
+    let q = json!({"items": "not-json", "hash": "ABC"});
+    let items = build_items(&q, "song", 1786957745);
+    assert_eq!(items.as_array().unwrap()[0]["k"], "abc");
+}
+
 /// 请求级超时：`timeout_secs` 必须被正确记录（默认 None，设置后 Some(secs)）。
 /// 回归：/user/grade/info 依赖此字段把上游超时从全局 20s 收紧到 8s，
 /// 先于客户端 dio 15s 放弃，避免「客户端已超时、服务器继续空转」的空耗。
@@ -167,6 +203,8 @@ fn server_responds_404_and_cors() {
         "GET /user/cloud/url?hash=abc&album_audio_id=123&audio_id=456 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         "POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         "POST /playlist/add HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        // 歌单加歌（Task 11 研究门控：上游 playlist_tracks_add.js 已复核，路由必须保持注册）
+        "POST /playlist/tracks/add HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         // 评论写接口：content 为空 → 400（不发上游请求）。非 404 即证明 dispatch 成功。
         "POST /comment/music/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         // 删除评论：cid 为空 → 400（不发上游请求）。非 404 即证明 dispatch 成功。
@@ -179,6 +217,27 @@ fn server_responds_404_and_cors() {
         "POST /user/cloud/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
         // 专辑动态封面：元数据路由必须命中（上游可达时 200，不可达时 502，均非 404）
         "GET /album/dycover?album_audio_id=468087825&album_id=65482908 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        // 歌曲弹幕列表：hash 非空 → dispatch 命中（上游可达 200 / 不可达 502，均非 404）
+        "GET /song/barrage?hash=abc&page=1&pagesize=20 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        // 歌曲弹幕发送：content 为空 → 400（不发上游请求）。非 404 即证明 dispatch 成功，
+        // 且证明 /song/barrage/send 排在 /song/barrage 之前、未被列表 handler 吞掉。
+        "POST /song/barrage/send HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        // 歌曲成绩单：路由必须命中（上游可达 200 / 不可达 502，均非 404）。
+        // filter 注册在 /song/ranking 之前（前缀匹配，更具体者在前），两条各归各的 handler。
+        "GET /song/ranking?album_audio_id=32155307 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /song/ranking/filter?album_audio_id=32155307&page=1&pagesize=30 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        // 伴奏匹配 / K 歌数量：路由必须命中（自定义 sign，上游可达 200 / 不可达 502，均非 404）。
+        // matching 注册在 /audio 之前（前缀匹配，更具体者在前），未被 /audio 相关系列吞掉。
+        "GET /audio/accompany/matching?fileName=Test&mixId=637735200&hash=6D431B0507587447B3D7345434DC5825 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /audio/ktv/total?songId=1&singerName=a&songHash=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        // 内容黑名单：/blacklist/list 必须先于 /blacklist 注册（前缀匹配），
+        // 两条各归各的 handler（上游可达 200 / 不可达 502，均非 404）。
+        "GET /blacklist?hash=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /blacklist/list?label=singer&page=1&pagesize=100 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        // 听歌偏好：/user/preference/update 必须先于 /user/preference 注册（前缀匹配），
+        // 两条各归各的 handler（上游可达 200 / 不可达 502，均非 404）。
+        "GET /user/preference HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "POST /user/preference/update HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
     ];
     for raw in paths {
         let resp = tcp_request(port, raw);
@@ -215,6 +274,82 @@ fn server_responds_404_and_cors() {
     assert!(
         resp.contains("400 Bad Request") && resp.contains("cid"),
         "POST /comment/music/del 未命中本地写接口 handler（疑似被短前缀路由抢先）:\n{}",
+        resp
+    );
+
+    // 听歌偏好更新同理：必须真正命中本地 update handler（无任何偏好字段 → 400），
+    // 而不是被更短的 /user/preference 前缀抢先当成查询接口转发到上游。
+    let resp = tcp_request(
+        port,
+        "POST /user/preference/update HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert!(
+        resp.contains("400 Bad Request") && resp.contains("至少需要提供"),
+        "POST /user/preference/update 未命中本地 update handler（疑似被 /user/preference 抢先）:\n{}",
+        resp
+    );
+
+    kugou_server::server::stop();
+}
+
+/// 用户资料修改与头像上传（user_update.js / user_update_avatar.js 的移植）：
+/// 空参数 → 400；非法图片 → 400；带合法参数 → 非 404。
+/// 400 分支必须命中本地 handler——/user/update/avatar 若被 /user/update 前缀
+/// 抢先，非法图片会转而走 update 的「至少一个字段」400（body 无 imgFile），
+/// 文案不同，可借此抓住抢前缀回归。
+#[test]
+fn user_update_and_avatar_validation() {
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port: u16 = 18080;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+
+    let post = |path: &str, body: &str| {
+        let raw = format!(
+            "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            path,
+            body.len(),
+            body
+        );
+        tcp_request(port, &raw)
+    };
+
+    // 无任何待修改字段 → 400
+    let resp = post("/user/update", "{}");
+    assert!(
+        resp.contains("400 Bad Request") && resp.contains("至少需要提供一个待修改字段"),
+        "/user/update 空参数应返回 400 文案:\n{}",
+        resp
+    );
+
+    // 带一个字段 + 伪造 cookie → dispatch 成功（上游不可达时 502 亦算命中）
+    let resp = post(
+        "/user/update",
+        r#"{"cookie":"token=x;userid=1","signature":"hi"}"#,
+    );
+    assert!(
+        !resp.contains("Cannot POST"),
+        "/user/update 带字段应命中路由:\n{}",
+        resp
+    );
+
+    // 非法 imgFile → 400（本地校验分支，不发上游请求）
+    let resp = post("/user/update/avatar", r#"{"imgFile":"not-an-image"}"#);
+    assert!(
+        resp.contains("400 Bad Request") && resp.contains("图片数据无效"),
+        "/user/update/avatar 非法图片应返回 400 文案:\n{}",
+        resp
+    );
+
+    // 合法 1x1 PNG → dispatch 成功（先走图床上传，离线时 502 亦算命中）
+    let png = r#"{"imgFile":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}"#;
+    let resp = post("/user/update/avatar", png);
+    assert!(
+        !resp.contains("Cannot POST"),
+        "/user/update/avatar 应命中路由（且未被 /user/update 抢前缀）:\n{}",
         resp
     );
 
@@ -911,6 +1046,181 @@ fn video_barrage_send_route_order() {
     );
 }
 
+/// 路由注册顺序：`/user/preference/update` 必须出现在 `/user/preference` 之前。
+/// 前缀匹配会把更新请求误送进查询 handler，顺序错误即回归。
+#[test]
+fn user_preference_update_route_order() {
+    use kugou_server::modules::{register, ModuleFn};
+    let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
+    register(&mut routes);
+    let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
+
+    let update_idx = paths.iter().position(|p| *p == "/user/preference/update");
+    let get_idx = paths.iter().position(|p| *p == "/user/preference");
+    assert!(update_idx.is_some(), "/user/preference/update 未注册");
+    assert!(get_idx.is_some(), "/user/preference 未注册");
+    assert!(
+        update_idx.unwrap() < get_idx.unwrap(),
+        "/user/preference/update 必须注册在 /user/preference 之前（前缀匹配会把 update 请求送进查询 handler）"
+    );
+}
+
+/// /song/barrage（歌曲弹幕列表）参数口径，对齐 JS `buildSongBarrageListConfig`。
+/// 仅断言参数构造，不触发网络。
+#[test]
+fn song_barrage_list_extdata_conditional() {
+    use kugou_server::modules::song_barrage::build_list_params;
+    use serde_json::json;
+
+    // special_id + hash 同时传入：childrenid = special_id，extdata 键必须不出现。
+    let q = json!({ "special_id": "SID123", "hash": "HASH456" });
+    let p = build_list_params(&q);
+    assert_eq!(p["childrenid"], json!("SID123"));
+    assert!(p.get("extdata").is_none(), "special_id 非空时 extdata 不得出现");
+}
+
+#[test]
+fn song_barrage_list_params_hash_only() {
+    use kugou_server::modules::song_barrage::build_list_params;
+    use serde_json::json;
+
+    // 仅传 hash：extdata = hash，childrenid 键必须不出现。
+    let q = json!({ "hash": "HASH456" });
+    let p = build_list_params(&q);
+    assert_eq!(p["extdata"], json!("HASH456"));
+    assert!(p.get("childrenid").is_none(), "special_id 为空时 childrenid 不得出现");
+}
+
+#[test]
+fn song_barrage_list_params_code_mixsongid_and_defaults() {
+    use kugou_server::modules::song_barrage::{build_list_params, SONG_BARRAGE_CODE};
+    use serde_json::json;
+
+    // 与 MV 的唯一差异：mixsongid 透传；code 为歌曲弹幕池 articulossong。
+    let q = json!({ "special_id": "SID123", "mixsongid": "MIX999" });
+    let p = build_list_params(&q);
+
+    assert_eq!(p["r"], json!("comments/getCommentWithLike"));
+    assert_eq!(p["code"], json!(SONG_BARRAGE_CODE));
+    assert_eq!(p["code"], json!("articulossong"));
+    // mixsongid 透传（链 mixsongid → album_audio_id）
+    assert_eq!(p["mixsongid"], json!("MIX999"));
+    // 鉴权全集：appid / clientver / ver
+    assert_eq!(p["appid"], json!(3116));
+    assert_eq!(p["clientver"], json!(11440));
+    assert_eq!(p["ver"], json!(6));
+    // p / pagesize 缺省为数字（非字符串）
+    assert_eq!(p["p"], json!(1));
+    assert_eq!(p["pagesize"], json!(20));
+}
+
+#[test]
+fn song_barrage_list_mixsongid_from_album_audio_id_alias() {
+    use kugou_server::modules::song_barrage::build_list_params;
+    use serde_json::json;
+
+    // mixsongid 缺省时取 album_audio_id（JS firstValue 链）。
+    let q = json!({ "special_id": "SID123", "album_audio_id": "ALI" });
+    let p = build_list_params(&q);
+    assert_eq!(p["mixsongid"], json!("ALI"));
+}
+
+#[test]
+fn song_barrage_list_key_matches_sign_helper() {
+    use kugou_server::helper::sign_params_key;
+    use kugou_server::modules::song_barrage::build_list_params;
+    use serde_json::json;
+
+    // 固定 clienttime，key 必须 = signParamsKey(clienttime)（用既有 helper 比对，不硬编码 md5）。
+    let q = json!({ "special_id": "SID123", "clienttime": "1700000000" });
+    let p = build_list_params(&q);
+    let expected = sign_params_key("1700000000", "", "");
+    assert_eq!(p["key"], json!(expected));
+}
+
+#[test]
+fn song_barrage_handle_requires_special_id_or_hash() {
+    use kugou_server::modules::song_barrage::handle;
+    use kugou_server::modules::Ctx;
+    use serde_json::json;
+
+    // special_id 与 hash 皆空 → 400，body 含 error_code = 400（不触网）。
+    let ctx = Ctx { ip: String::new(), body_bytes: None };
+    let result = handle(&json!({}), &ctx);
+    assert!(result.is_err(), "两者皆空应返回 Err(400)");
+    let resp = result.err().unwrap();
+    assert_eq!(resp.status, 400);
+    let body = resp.body.to_json();
+    assert_eq!(body["error_code"], json!(400));
+    assert_eq!(body["status"], json!(0));
+    assert_eq!(body["msg"], json!("special_id 和 hash 至少需要传入一个"));
+}
+
+/// /song/barrage/send 参数口径：复用评论写接口 send_options（POST + 签名），
+/// code 换成歌曲弹幕池。仅断言参数构造，不触发网络。
+#[test]
+fn song_barrage_send_options_shape() {
+    use kugou_server::modules::comment_send::send_options;
+    use serde_json::json;
+
+    let q = json!({
+        "special_id": "SID1",
+        "content": "hi",
+        "kugouid": "123",
+        "clienttoken": "T",
+        "clienttime": "1700000000",
+        "cookie": { "KUGOU_API_MID": "MID1" },
+    });
+    let opts = send_options(&q, "hi", "SID1", "name", "articulossong", "MIX9");
+    let p = &opts.params;
+
+    // 歌曲弹幕发送是 POST + 签名形态（勿照抄 MV 弹幕的 GET 无签名）
+    assert_eq!(opts.method, "POST");
+    assert_eq!(p["r"], json!("commentsv3/add"));
+    assert_eq!(p["code"], json!("articulossong"));
+    assert_eq!(p["childrenid"], json!("SID1"));
+    // key 非空（signParamsKey(clienttime+mid+data)），与写接口一致
+    let key = p["key"].as_str().unwrap_or_default();
+    assert!(!key.is_empty(), "歌曲弹幕发送必须带签名 key");
+}
+
+/// content 为空 → 400 且 body 含 error_code = 400（不触网）。
+#[test]
+fn song_barrage_send_requires_content() {
+    use kugou_server::modules::Ctx;
+    use kugou_server::modules::song_barrage::handle_send;
+    use serde_json::json;
+
+    let ctx = Ctx { ip: String::new(), body_bytes: None };
+    let result = handle_send(&json!({ "special_id": "SID1" }), &ctx);
+    assert!(result.is_err(), "content 为空应返回 Err(400)");
+    let resp = result.err().unwrap();
+    assert_eq!(resp.status, 400);
+    let body = resp.body.to_json();
+    assert_eq!(body["error_code"], json!(400));
+    assert_eq!(body["status"], json!(0));
+    assert_eq!(body["msg"], json!("content 不能为空"));
+}
+
+/// 路由注册顺序：`/song/barrage/send` 必须出现在 `/song/barrage` 之前。
+/// 本项目前缀匹配会把发送请求误送进列表 handler，顺序错误即回归。
+#[test]
+fn song_barrage_send_route_order() {
+    use kugou_server::modules::{register, ModuleFn};
+    let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
+    register(&mut routes);
+    let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
+
+    let send_idx = paths.iter().position(|p| *p == "/song/barrage/send");
+    let list_idx = paths.iter().position(|p| *p == "/song/barrage");
+    assert!(send_idx.is_some(), "/song/barrage/send 未注册");
+    assert!(list_idx.is_some(), "/song/barrage 未注册");
+    assert!(
+        send_idx.unwrap() < list_idx.unwrap(),
+        "/song/barrage/send 必须注册在 /song/barrage 之前（前缀匹配会把发送请求送进列表 handler）"
+    );
+}
+
 /// `/home/discover`（首页刷歌推荐）路由已注册，且没有更短的前缀路由会遮蔽它。
 ///
 /// `prefix_match` 是路径段前缀匹配：若将来有人加了 `/home` 之类的短前缀并注册在
@@ -1006,4 +1316,86 @@ fn home_discover_body_overrides_and_page_optin() {
     assert!(build_params(&json!({ "page": 0 })).get("page").is_none());
     // 正值写入。
     assert_eq!(build_params(&json!({ "page": 3 }))["page"], json!(3));
+}
+
+/// /personal/fm（私人 FM）的 cur_mark 透传口径，对齐 JS `personal_fm.js:37`。
+/// 仅断言参数构造，不触发网络。
+#[test]
+fn personal_fm_cur_mark_passthrough() {
+    use kugou_server::modules::fm::build_personal_fm_params;
+    use serde_json::json;
+
+    // click_red / cancel_red 等反馈动作建议带上当前推荐标记，原样作为字符串下发。
+    let p = build_personal_fm_params(&json!({ "cur_mark": "MARK123" }));
+    assert_eq!(p["cur_mark"], json!("MARK123"));
+
+    // 缺失 / 空串都不写入该键（JS `if (params?.cur_mark)`）——空串混进 body 会
+    // 让上游按「无标记」之外的值解析。
+    assert!(build_personal_fm_params(&json!({})).get("cur_mark").is_none());
+    assert!(build_personal_fm_params(&json!({ "cur_mark": "" })).get("cur_mark").is_none());
+}
+
+/// mode / action 是自由字符串，必须原样透传（上游文档另列 `mode: radio` 与扩展
+/// action 集，Rust 侧不得白名单过滤）。
+#[test]
+fn personal_fm_mode_and_action_verbatim() {
+    use kugou_server::modules::fm::build_personal_fm_params;
+    use serde_json::json;
+
+    let p = build_personal_fm_params(&json!({ "mode": "radio", "action": "click_red" }));
+    assert_eq!(p["mode"], json!("radio"));
+    assert_eq!(p["action"], json!("click_red"));
+
+    // 缺省值与 JS 一致：mode=normal、action=play。
+    let d = build_personal_fm_params(&json!({}));
+    assert_eq!(d["mode"], json!("normal"));
+    assert_eq!(d["action"], json!("play"));
+}
+
+/// 伴奏匹配真实响应探针（#[ignore]，需外网，手动核对契约时才跑）：
+/// `cargo +stable-x86_64-pc-windows-gnu test --test smoke accompany_matching_probe -- --ignored --nocapture`
+/// 用 API 文档示例参数（希林娜依高 - Shine Brighter）捕获上游
+/// optimal_matching_accompany_2_listen.do 的真实 JSON，供 Dart KugouAccompany
+/// 模型字段定稿与日后契约漂移比对。路由 404 即失败；上游业务错误也打印全文。
+#[test]
+#[ignore]
+fn accompany_matching_probe() {
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port: u16 = 18089;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_probe")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+    // fileName 按 UTF-8 百分号编码（希林娜依高 - Shine Brighter (愈加璀璨)）
+    let resp = tcp_request(
+        port,
+        "GET /audio/accompany/matching?fileName=%E5%B8%8C%E6%9E%97%E5%A8%9C%E4%BE%9D%E9%AB%98%20-%20Shine%20Brighter%20(%E6%84%88%E5%8A%A0%E7%92%80%E7%92%A8)&mixId=637735200&hash=6D431B0507587447B3D7345434DC5825 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    println!("=== /audio/accompany/matching raw response ===\n{}", resp);
+    assert!(!resp.contains("Cannot GET"), "route 404: {}", resp);
+    kugou_server::server::stop();
+}
+
+/// K 歌数量真实响应探针（#[ignore]，需外网，手动核对契约时才跑）：
+/// 入参 songId/singerName/songHash 取自上面伴奏探针捕获的真实响应（同一首歌），
+/// 捕获 get_total_opus_num_v02.do 的真实 JSON 供 Dart KugouAudioKtvTotal 定稿。
+#[test]
+#[ignore]
+fn audio_ktv_total_probe() {
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port: u16 = 18090;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_probe")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+    // singerName=希林娜依高（UTF-8 百分号编码）
+    let resp = tcp_request(
+        port,
+        "GET /audio/ktv/total?songId=43522508&singerName=%E5%B8%8C%E6%9E%97%E5%A8%9C%E4%BE%9D%E9%AB%98&songHash=8153F7E7BF0B2EFB4F8FF1B7E79A0E2C HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    println!("=== /audio/ktv/total raw response ===\n{}", resp);
+    assert!(!resp.contains("Cannot GET"), "route 404: {}", resp);
+    kugou_server::server::stop();
 }

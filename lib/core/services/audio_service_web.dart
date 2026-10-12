@@ -253,9 +253,12 @@ UriAudioSource createAudioSource({
   String? artist,
   String? album,
   Uri? artUri,
+  Map<String, String>? headers,
 }) {
   return AudioSource.uri(
     Uri.parse(url),
+    // 与 io 端签名保持一致；Web 端请求头支持有限（仅同源 Cookie），透传即可
+    headers: headers,
     tag: <String, dynamic>{
       'id': id,
       'title': title,

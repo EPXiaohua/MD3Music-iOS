@@ -2,18 +2,30 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
 
+import 'package:dpad/dpad.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:provider/single_child_widget.dart';
 import 'package:quick_actions/quick_actions.dart';
 
+import 'core/build_flags.dart';
+import 'core/layout/adaptive_navigator.dart';
 import 'core/layout/desktop_shell.dart';
+import 'core/layout/ime_collapse.dart';
+import 'core/layout/page_layout.dart';
+import 'core/layout/page_title_alignment.dart';
 import 'core/layout/responsive_layout.dart';
+import 'core/layout/responsive_shell.dart';
 import 'core/layout/ui_density.dart';
+import 'core/remote/tv_exit_confirm_dialog.dart';
+import 'core/remote/tv_focus_highlight.dart';
 import 'core/services/external_media_intent_service.dart';
 import 'core/services/fm_widget_sync.dart';
 import 'core/services/lyricon_provider_service.dart';
+import 'core/services/music_haptics_service.dart';
 import 'core/services/startup_auto_play.dart';
 import 'core/theme/app_theme.dart';
 import 'core/theme/motion_constants.dart';
@@ -33,10 +45,16 @@ import 'main.dart'
         pendingShortcutType,
         shortcutTabRequest;
 import 'modules/discover/discover_page.dart';
+import 'modules/mcp/mcp_app_features.dart';
+import 'modules/mcp/mcp_confirm_dialog.dart';
+import 'modules/mcp/mcp_local_library.dart';
 import 'modules/mcp/mcp_player_control.dart';
 import 'modules/mcp/mcp_service.dart';
 import 'modules/coverflow/coverflow_page.dart';
+import 'modules/coverflow/coverflow_source.dart';
 import 'utils/landscape_immersive.dart';
+import 'widgets/player_top_bar_actions.dart';
+import 'widgets/player_top_bar_tab_dots.dart';
 import 'modules/charts/charts_page.dart';
 import 'modules/ip/ip_page.dart';
 import 'modules/recognition/pip_recognition_controller.dart';
@@ -49,7 +67,13 @@ import 'modules/listen_together/widgets/guest_play_confirm_dialog.dart';
 import 'modules/player/full_player.dart';
 import 'modules/player/full_player_route.dart';
 import 'modules/player/mini_player.dart';
+import 'modules/player/bottom_bar_morph_overlay.dart';
 import 'modules/player/player_drag_overlay.dart';
+import 'widgets/playlist_cover_hero.dart';
+import 'widgets/player_seek_bar.dart';
+import 'modules/player/player_cover_morph_layer.dart';
+import 'widgets/play_next_flight.dart';
+import 'modules/player/player_cover_shadow.dart';
 import 'modules/player/car_mode_panel.dart';
 import 'modules/player/secondary_mini_player.dart';
 import 'modules/playlist/playlist_page.dart';
@@ -68,11 +92,16 @@ import 'modules/scene/scene_page.dart';
 import 'modules/channel/channel_page.dart';
 import 'providers/dlna_provider.dart';
 import 'providers/favorites_provider.dart';
+import 'providers/blacklist_provider.dart';
+import 'providers/cloud_upload_provider.dart';
 import 'providers/kugou_provider.dart';
+import 'providers/listen_stats_provider.dart';
 import 'providers/library_provider.dart';
 // ignore: unused_import  // 类型用于 ChangeNotifierProvider(create: ...) 的 T 推断
 import 'providers/local_favorites_provider.dart';
 import 'providers/player_provider.dart';
+import 'providers/remote_control_provider.dart';
+import 'providers/remote_storage_provider.dart';
 import 'providers/playlist_collection_notifier.dart';
 import 'providers/device_provider.dart';
 import 'providers/grid_columns_provider.dart';
@@ -80,6 +109,7 @@ import 'providers/shortcut_config_provider.dart';
 import 'providers/tab_config_provider.dart';
 import 'providers/theme_provider.dart';
 import 'providers/comment_display_provider.dart';
+import 'providers/song_match_provider.dart';
 import 'providers/car_mode_provider.dart';
 import 'providers/listen_together_provider.dart';
 import 'services/kugou_server.dart';
@@ -170,8 +200,25 @@ class MyApp extends StatelessWidget {
           ),
         ),
         ChangeNotifierProvider(create: (_) => DeviceProvider()),
+        // TV 构建：遥控器模式总开关。正常构建不编入（kTvBuild=false 时整段树摇剔除）。
+        if (kTvBuild) ...[
+          ChangeNotifierProvider(create: (_) => RemoteControlProvider()),
+        ],
         ChangeNotifierProvider(create: (_) => GridColumnsProvider()),
-        ChangeNotifierProvider(create: (_) => PlayerProvider()),
+        ChangeNotifierProvider(
+          create: (_) {
+            final player = PlayerProvider();
+            // 播放状态 → 音乐节奏震动：「App 内/始终」两档在无播放页时也要拿到
+            // 播放/暂停沿。notifyListeners 只在播放/暂停/切歌等低频时机触发
+            // （高频位置更新走 positionNotifier），服务内部按值去重，零成本。
+            player.addListener(() {
+              MusicHapticsService.instance.setPlaybackActive(player.isPlaying);
+            });
+            return player;
+          },
+        ),
+        // 本地曲库：MCP 构造时要 read 它（本地工具的真实源），故声明在 MCP 之前。
+        ChangeNotifierProvider(create: (_) => LibraryProvider()),
         // AI 代理接口（MCP）：默认关闭。非惰性创建——需要在每次冷启动时读取
         // 持久化设置决定是否恢复监听，否则用户开启后必须先进一次设置页才会起服务。
         // 默认关闭时构造只做一次 SharedPreferences 读取即返回，零网络副作用。
@@ -181,13 +228,51 @@ class MyApp extends StatelessWidget {
             playerControl: PlayerProviderBackedControl(
               context.read<PlayerProvider>(),
             ),
+            localLibrary: LibraryProviderBackedLocalSource(
+              context.read<LibraryProvider>(),
+            ),
+            appFeatures: PlayerProviderBackedAppFeatures(
+              context.read<PlayerProvider>(),
+            ),
           ),
           update: (context, player, previous) =>
               previous ??
-              McpService(playerControl: PlayerProviderBackedControl(player)),
+              McpService(
+                playerControl: PlayerProviderBackedControl(player),
+                localLibrary: LibraryProviderBackedLocalSource(
+                  context.read<LibraryProvider>(),
+                ),
+                appFeatures: PlayerProviderBackedAppFeatures(player),
+              ),
         ),
-        ChangeNotifierProvider(create: (_) => LibraryProvider()),
+        ChangeNotifierProvider(create: (_) => RemoteStorageProvider()),
+        // 云盘上传队列：应用级常驻，页面退出不中断上传
+        ChangeNotifierProvider(create: (_) => CloudUploadProvider()),
         ChangeNotifierProvider(create: (_) => KugouProvider()),
+        // 内容黑名单（歌曲「不感兴趣」/ 歌手「屏蔽」）：登录态/账号变化时清空缓存，
+        // 防止跨账号串状态；黑名单接口按 token/userid 作用域，缓存不能跨会话复用。
+        ChangeNotifierProxyProvider<KugouProvider, BlacklistProvider>(
+          create: (_) => BlacklistProvider(),
+          update: (_, kugou, blacklist) {
+            blacklist!.syncLoginState(
+              loggedIn: kugou.isLoggedIn,
+              userid: kugou.userid,
+            );
+            return blacklist;
+          },
+        ),
+        // 云端听歌统计（排行 /user/listen + 最近历史 /user/history）：同样
+        // 按 token/userid 作用域，登录态/账号变化时清空缓存防跨账号串状态。
+        ChangeNotifierProxyProvider<KugouProvider, ListenStatsProvider>(
+          create: (_) => ListenStatsProvider(),
+          update: (_, kugou, stats) {
+            stats!.syncLoginState(
+              loggedIn: kugou.isLoggedIn,
+              userid: kugou.userid,
+            );
+            return stats;
+          },
+        ),
         ChangeNotifierProvider(create: (_) => FavoritesProvider()),
         ChangeNotifierProvider(create: (_) => LocalFavoritesProvider()),
         // 跨页面广播「收藏的歌单」变更（详情页 → 我的收藏 tab 立即刷新）
@@ -200,6 +285,8 @@ class MyApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => DlnaProvider()),
         // 评论显示设置（字号等）
         ChangeNotifierProvider(create: (_) => CommentDisplayProvider()),
+        // 本地歌曲 ↔ 在线歌曲匹配（自动匹配引擎 + 手动候选弹层的状态源）
+        ChangeNotifierProvider(create: (_) => SongMatchProvider()),
         // 车机模式（常驻播放器面板的开关 / 宽度 / 停靠位置）
         ChangeNotifierProvider(create: (_) => CarModeProvider()),
         // 一起听（众乐房）：广场列表 + 房间会话（心跳/轮询/播放同步）
@@ -276,6 +363,10 @@ class _AppViewState extends State<_AppView> {
       // ignore: discarded_futures
       PipRecognitionController.instance.openPendingResultPageIfAny();
     });
+    // 预测性返回 + 封面连贯过渡：两个开关互斥，冷启动一起载入并纠正历史同开的值
+    // （裁决见 resolveCoverBackExclusivity，封面连贯过渡优先）。
+    unawaited(_loadCoverAndBackSwitches());
+    kPredictiveBackEnabled.addListener(_onPredictiveBackChanged);
   }
 
   /// 建立私人FM桌面小部件桥接：监听三个 provider 推送快照，并接上原生按钮回调。
@@ -357,11 +448,179 @@ class _AppViewState extends State<_AppView> {
     context.read<ThemeProvider>().setBackgroundSeedColor(color);
   }
 
+  /// 冷启动一起载入两个互斥开关：预测性返回（写 [kPredictiveBackEnabled]，主题据此
+  /// 切 pageTransitionsTheme）与封面连贯过渡（写 [kPlaylistCoverTransitionEnabled]，
+  /// `PlaylistCoverHero` 读它决定是否起飞）。
+  ///
+  /// 两个都开是互斥上线前的存量状态：按 `resolveCoverBackExclusivity` 裁决（封面
+  /// 连贯过渡优先），并把修正后的预测性返回**写回持久化**，这样进设置页看到的就是
+  /// 互斥后的状态，不会出现「两个都开着但其中一个实际没生效」。
+  Future<void> _loadCoverAndBackSwitches() async {
+    final repo = SettingsRepository();
+    final results = await Future.wait([
+      repo.getPredictiveBackEnabled(),
+      repo.getPlaylistCoverTransitionEnabled(),
+    ]);
+    final resolved = resolveCoverBackExclusivity(
+      coverTransition: results[1],
+      predictiveBack: results[0],
+    );
+    if (resolved.predictiveBack != results[0]) {
+      await repo.setPredictiveBackEnabled(resolved.predictiveBack);
+    }
+    if (kPredictiveBackEnabled.value != resolved.predictiveBack) {
+      kPredictiveBackEnabled.value = resolved.predictiveBack;
+    }
+    if (kPlaylistCoverTransitionEnabled.value != resolved.coverTransition) {
+      kPlaylistCoverTransitionEnabled.value = resolved.coverTransition;
+    }
+  }
+
+  /// 预测性返回开关变化 → 重建 MaterialApp（换 pageTransitionsTheme）。
+  void _onPredictiveBackChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// TV 返回键收口：能 pop 则 pop（返回 true 表示已消费）；
+  /// 根路由返回 false 交回系统默认 —— 由 [_MainLayout] 根 [PopScope]
+  /// 走既有退出流程（回首页 → 双击返回挂后台，不允许一下退出）。
+  bool _handleTvBack() {
+    final navigator = appNavigatorKey.currentState;
+    if (navigator != null && navigator.canPop()) {
+      navigator.pop();
+      return true;
+    }
+    return false;
+  }
+
+  /// tv: TV 构建下的内容子树作用域（仅 kTvBuild 分支调用，正常构建树摇剔除）。
+  ///
+  /// 由外到内两层：
+  /// 1. [MediaQuery]：正文缩放下限 [kTvMinTextScale]。上游 [DisplayScaleScope]
+  ///    已把系统字体缩放钉在 [1.0, kMaxSystemTextScale]，本层在其结果上再抬
+  ///    下限 → 有效区间 [1.15, 1.30]。注意必须在 Builder 内取继承的
+  ///    MediaQuery（拿到的是显示大小缩放后的数据），copyWith 只改 textScaler、
+  ///    其余字段原样透传，不碰「显示大小」的 FittedBox 缩放体系；
+  /// 2. [Dpad.wrap]：dpad 遍历引擎（传参不变，仍收 builder 的 context）。
+  /// 3. [TvFocusHighlight]：焦点红框，叠在引擎之上、内容之下（IgnorePointer
+  ///    不拦按键）。替代 dpad 的 `debugOverlay`——那个开关是整体的，一开就把
+  ///    调试标签（region/尺寸）一起画出来，且 release 下自动关闭导致 release
+  ///    包完全没有焦点指示。TV 没有光标，焦点框是硬需求，故自绘并在正式包保留。
+  ///
+  /// 原先这里还有一层 overscan 安全边距（[kTvOverscanInset]，曾按 10-foot
+  /// 指标给内容留 48dp），实测在无过扫描的设备（平板/手机，以及多数现代
+  /// 零间隙屏电视）上表现为四条纯黑边，且与铺满整屏的背景层不同色、观感
+  /// 突兀，已于 2026-10-04 移除。若日后在真过扫描的老电视上发现边缘被裁，
+  /// 优先用比例自适应（按屏宽取约 5%、封顶 [kTvOverscanInset]）而不是固定
+  /// 48dp 恢复。焦点特效溢出由 Dpad.wrap 的 scrollPadding(64) 兜底。
+  Widget _tvContentScope(BuildContext context, Widget? child) {
+    return Builder(
+      builder: (mqContext) {
+        final mq = MediaQuery.of(mqContext);
+        return MediaQuery(
+          data: mq.copyWith(
+            textScaler: mq.textScaler.clamp(
+              minScaleFactor: kTvMinTextScale,
+              maxScaleFactor: kMaxSystemTextScale,
+            ),
+          ),
+          child: Stack(
+            children: [
+              // dpad 遍历引擎。debugOverlay 传 false：它开启后会连同红框一起
+              // 画出调试标签（`region: … 112×112`，dpad root.dart:499+），
+              // 且该开关是整体的、无法只关标签。焦点框改由下面的
+              // [TvFocusHighlight] 自绘（同规格红框、无标签），正式包也保留
+              // —— TV 没有光标，焦点可见是硬需求。
+              Dpad.wrap(
+                theme: const DpadThemeData(
+                  // tv: 焦点视觉只保留 [TvFocusHighlight] 的描边框，不再叠加
+                  // dpad 自带的辉光阴影——两者并存会在控件外多一圈光晕，
+                  // 遮住相邻的细边框/分割线，且滚动时阴影与描边不同步。
+                  // 传空列表而非依赖默认值（默认含 scale + border 两项）。
+                  effects: <DpadEffect>[],
+                  scrollPadding: 64,
+                ),
+                onBack: _handleTvBack,
+              )(context, child),
+              // 焦点红框叠在最上层（IgnorePointer，不拦按键）。
+              const Positioned.fill(child: TvFocusHighlight()),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// tv: 遥控媒体键兜底（播放/暂停/切歌）。播放中的媒体键正常由前台 media3
+  /// 会话消费（fork AudioPlayer.java onPlayerCommandRequest → App 队列，阶段6），
+  /// 不会走到这里；本层覆盖「无活跃会话 / 媒体通知 controller 未连接」时按键
+  /// 落到 Activity 窗口、进入 Flutter 按键管线的情形。带 [TvMediaKey] 日志，
+  /// 真机上用于判定按键被哪一层消费（AGENTS §0.1：以日志为准）。
+  Widget _tvMediaKeyFallback(Widget child) {
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.mediaPlayPause):
+            _tvMediaTogglePlay,
+        const SingleActivator(LogicalKeyboardKey.mediaPlay): _tvMediaPlay,
+        const SingleActivator(LogicalKeyboardKey.mediaPause): _tvMediaPause,
+        const SingleActivator(LogicalKeyboardKey.mediaTrackNext): () =>
+            _tvMediaSkip(next: true),
+        const SingleActivator(LogicalKeyboardKey.mediaTrackPrevious): () =>
+            _tvMediaSkip(next: false),
+      },
+      child: child,
+    );
+  }
+
+  void _tvMediaTogglePlay() {
+    final p = _playerProvider;
+    if (p == null || p.currentSong == null) return;
+    // ignore: avoid_print
+    print('[TvMediaKey] playPause isPlaying=${p.isPlaying}');
+    // ignore: discarded_futures
+    p.isPlaying ? p.pause() : p.resume();
+  }
+
+  void _tvMediaPlay() {
+    final p = _playerProvider;
+    if (p == null || p.currentSong == null) return;
+    if (p.isPlaying) return;
+    // ignore: avoid_print
+    print('[TvMediaKey] play');
+    // ignore: discarded_futures
+    p.resume();
+  }
+
+  void _tvMediaPause() {
+    final p = _playerProvider;
+    if (p == null || p.currentSong == null) return;
+    if (!p.isPlaying) return;
+    // ignore: avoid_print
+    print('[TvMediaKey] pause');
+    // ignore: discarded_futures
+    p.pause();
+  }
+
+  void _tvMediaSkip({required bool next}) {
+    final p = _playerProvider;
+    if (p == null || p.currentSong == null) return;
+    // ignore: avoid_print
+    print('[TvMediaKey] skip ${next ? 'next' : 'previous'}');
+    if (next) {
+      // ignore: discarded_futures
+      p.next();
+    } else {
+      // ignore: discarded_futures
+      p.previous();
+    }
+  }
+
   @override
   void dispose() {
     _shortcutConfig?.removeListener(_applyDesktopShortcuts);
     _playerProvider?.removeListener(_onPlayerChanged);
     _backgroundThemeProvider?.removeListener(_onBackgroundChanged);
+    kPredictiveBackEnabled.removeListener(_onPredictiveBackChanged);
     super.dispose();
   }
 
@@ -371,6 +630,7 @@ class _AppViewState extends State<_AppView> {
     // 当前生效的 fontFamily：system 模式为 null（让 Flutter 走系统字体链），
     // bundled/custom 模式为对应字体名。加载失败时降级为 null。
     final fontFamily = themeProvider.effectiveFontFamily;
+    final predictiveBack = kPredictiveBackEnabled.value;
 
     return MaterialApp(
       title: 'MD3Music',
@@ -387,6 +647,7 @@ class _AppViewState extends State<_AppView> {
           fontFamily: fontFamily,
           emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
+          predictiveBack: predictiveBack,
         ),
         themeProvider,
       ),
@@ -397,6 +658,7 @@ class _AppViewState extends State<_AppView> {
           fontFamily: fontFamily,
           emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
+          predictiveBack: predictiveBack,
         ),
         themeProvider,
       ),
@@ -406,32 +668,61 @@ class _AppViewState extends State<_AppView> {
         // 全局「显示大小」：整个 App 唯一的缩放点，页面侧一律直接写 dp。
         // 包在最外层，所以背景层、Navigator（全部路由）、Overlay（对话框 /
         // 底部弹层 / 菜单）、DLNA 与拖拽覆盖层都在作用域内。
-        return DisplayScaleScope(
-          scale: context.watch<ThemeProvider>().displayScale,
-          child: SafeInsetsGuard(
-            child: _SystemUiUpdater(
-              child: Stack(
-                children: [
-                  // 全局背景层（主页/底层背景）：复用 AppBackground 组件。
-                  // 二级页面由路由过渡内嵌 AppBackground，随页面位移入场。
-                  Positioned.fill(child: AppBackground()),
-                  // 车机模式：把整棵 Navigator 与常驻播放器面板并排。
-                  // 必须包在 Navigator **之外**（就是这里）——面板要同时覆盖
-                  // push 出来的所有二级页面，放进任何路由内部都覆盖不到。
-                  // 未开启车机模式（或当前页面声明抑制）时本组件原样返回 child，
-                  // 布局与改动前完全一致。
-                  // material_ui 兼容桥：chewie / dynamic_color / cached_network_image 等第三方包
-                  // 仍导入 package:flutter/material.dart，其 Theme.of(context) 取不到本项目的
-                  // material_ui 主题。本桥把 ThemeData / MaterialLocalizations 提供给它们。
-                  // 官方定位为过渡工具，待依赖全部迁移到 material_ui 后移除。
-                  CarModePanel(
-                    // ignore: deprecated_member_use
-                    child: MaterialUiCompatibilityBridge(child: child!),
-                  ),
-                  const DlnaCastingOverlay(),
-                  // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
-                  const PlayerDragOverlay(),
-                ],
+        // MCP 写操作确认弹窗宿主：覆盖在整棵 App 之上（含全部路由与 Overlay），
+        // 外部 AI 触发需要二次确认的写工具时在此弹出裁决对话框。
+        return McpConfirmationDialogHost(
+          child: DisplayScaleScope(
+            scale: context.watch<ThemeProvider>().displayScale,
+            child: SafeInsetsGuard(
+              child: _SystemUiUpdater(
+                child: Stack(
+                  children: [
+                    // 全局背景层（主页/底层背景）：复用 AppBackground 组件。
+                    // 二级页面由路由过渡内嵌 AppBackground，随页面位移入场。
+                    Positioned.fill(child: AppBackground()),
+                    // 车机模式：把整棵 Navigator 与常驻播放器面板并排。
+                    // 必须包在 Navigator **之外**（就是这里）——面板要同时覆盖
+                    // push 出来的所有二级页面，放进任何路由内部都覆盖不到。
+                    // 未开启车机模式（或当前页面声明抑制）时本组件原样返回 child，
+                    // 布局与改动前完全一致。
+                    // material_ui 兼容桥：chewie / dynamic_color / cached_network_image 等第三方包
+                    // 仍导入 package:flutter/material.dart，其 Theme.of(context) 取不到本项目的
+                    // material_ui 主题。本桥把 ThemeData / MaterialLocalizations 提供给它们。
+                    // 官方定位为过渡工具，待依赖全部迁移到 material_ui 后移除。
+                    CarModePanel(
+                      // ignore: deprecated_member_use
+                      child: MaterialUiCompatibilityBridge(
+                        // TV 构建：dpad 遍历引擎（区域记忆 + 束流遍历 + 聚焦特效 +
+                        // 返回键收口 + debugOverlay 调试高亮）。正常构建不包。
+                        // tv: TV 构建再叠加 10-foot 内容作用域（overscan 安全边距
+                        // + 正文缩放下限，见 [_tvContentScope]），Dpad 引擎包在
+                        // 最内层。正常构建仍走 child! 原分支，树与改动前一致。
+                        child: kTvBuild
+                            ? _tvMediaKeyFallback(
+                                _tvContentScope(context, child),
+                              )
+                            : child!,
+                      ),
+                    ),
+                    const DlnaCastingOverlay(),
+                    // 底栏形态交叉过渡浮层（一级常驻条 ↔ 二级悬浮胶囊）：挂在
+                    // Navigator 之上、`PlayerDragOverlay` **之前** —— 形变层 /
+                    // 封面层必须盖在它上面。只在飞行窗口渲染，静止时零成本。
+                    const BottomBarMorphOverlay(),
+                    // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
+                    const PlayerDragOverlay(),
+                    // 封面连贯形变层：必须排在 PlayerDragOverlay **之后**，
+                    // 否则形变中的封面会被跟手预览页盖住。
+                    const PlayerCoverMorphLayer(),
+                    // 歌单封面连贯过渡的 pane 路径飞行层（详情面板嵌套
+                    // Navigator 内的 push 没有 HeroController 观察者，框架
+                    // Hero 不飞，由该层自绘；根 Navigator 路径走框架 Hero）。
+                    const PlaylistCoverFlightLayer(),
+                    // 「下一首播放」封面跳水动画层：与形变层同处设计像素空间，
+                    // 必须排在最末（球要画在最上面，越过形变层与歌单封面飞行层）。
+                    const PlayNextFlightLayer(),
+                  ],
+                ),
               ),
             ),
           ),
@@ -671,9 +962,9 @@ class _MainLayout extends StatefulWidget {
 }
 
 class _MainLayoutState extends State<_MainLayout>
-    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   int _selectedIndex = 0;
-  int _previousSelectedIndex = 0;
+  final _responsiveShellKey = GlobalKey<ResponsiveShellState>();
 
   /// 桌面外壳句柄：横屏平板布局下由根 [PopScope] 调用其 [DesktopShellState.maybePop]
   /// 先回退当前 Tab 的中央内容栈（见横屏平板重设计计划 4.4 / 六）。
@@ -682,6 +973,61 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// 上一次同步的沉浸状态，避免重复调用 SystemChrome（幂等去重）。
   bool _immersiveSynced = false;
+
+  /// 当前 tab 是否停在二级页面（及以后），由 [ResponsiveShell] 的
+  /// `_scheduleDepthReport` 定级后上报：只看「中央栈有 push 出来的页面路由 ∨
+  /// 双栏详情面板独占整宽」两条路由事实，**不看标题对齐**（标题对齐只决定播放条
+  /// 形态，见 `kSecondaryPlayerOnPrimaryPages` 的判据说明）。底栏在壳层之外，内层页面
+  /// 盖不住它，只能靠这个标志收起；回到一级页面时自动恢复。
+  bool _secondaryPageOnTop = false;
+
+  /// 常驻 MiniPlayer 的收起动画（二级路由形态的设置页开在当前 tab 栈顶、
+  /// 或封面流横屏沉浸生效时）。
+  /// 与底栏收起同时长（kBottomChromeToggleDuration）、同曲线（面板收展缓动），
+  /// 且由同一 rebuild 帧驱动（_secondaryPageOnTop 翻转处同步起止），视觉上与
+  /// 底栏一起沉底/浮出。reduce-motion 时直接落端点（与底栏口径一致）。
+  late final AnimationController _miniPlayerHideController;
+  late final CurvedAnimation _miniPlayerHide;
+
+  /// 上一次同步给 [_miniPlayerHideController] 的目标态（true=收起）。
+  /// 幂等判据只看它，不看 `status == completed`：动画正 forward 时 status 是
+  /// forward 而非 completed，用 status 判等会把「目标翻回显示」误当成已到位、
+  /// 不执行 reverse，常驻条沉底不回（成因见 [_syncMiniPlayerHide]）。
+  late bool _miniPlayerHideTarget;
+  bool _reduceMotion = false;
+
+  /// 底栏**形态交叉过渡**控制器（一级常驻条 ↔ 二级悬浮胶囊）。
+  ///
+  /// **不能复用 [_miniPlayerHideController]**：它的目标 [_residentMiniPlayerHidden]
+  /// 含 `kSecondaryPlayerEnabled.value`，悬浮形态下恒为 true —— 那是"恒定隐藏"，
+  /// 不是切换进度（见 `docs/plans/2026-10-11-player-bar-morph-plan.md` §4.5）。
+  /// 故单开一条**一次性 260ms** 控制器，时长/曲线与底栏收展同源；值经 listener 写进
+  /// [kBottomBarFormProgress]，静止时停在端点、零帧成本（不新增常驻 Ticker/repeat）。
+  late final AnimationController _barFormController;
+  late final CurvedAnimation _barFormCurve;
+
+  /// 上一次同步给 [_barFormController] 的目标形态（true = 悬浮胶囊）。
+  late bool _barFormTargetIsCapsule;
+
+  /// 形态交棒专用的「当前 tab 是否停在 push 出来的页面上」事实（导航时刻立即更新）。
+  ///
+  /// 与 [_secondaryPageOnTop]（底栏收起 / 常驻条隐藏用）**解耦**：后者等转场收敛
+  /// 才上报（底栏收起会当场改变 Tab 栈高度，撞框架 Hero 飞行盒子，见
+  /// `responsive_shell.dart` 的 `_scheduleDepthReport`），而形态交棒的飞行窗口
+  /// 必须在**导航那一刻**开跑 —— 旧实现用推迟上报驱动形态，转场全程进度贴旧端点，
+  /// 转场收敛后胶囊先让位、常驻条凭空长出再变回胶囊（2026-10-11 会诊 D1/D3 实测）。
+  ///
+  /// 只由 [ResponsiveShell.onPageRouteEvent]（真实 push/pop/remove/replace）与切 tab
+  /// 后的栈事实刷新写入：转屏导致的 `_detailExclusive` 翻转、tab 配置装载等
+  /// **没有导航事件**的翻转不进入这里（会诊 D3 的幻影翻转 ①②）。
+  bool _formSecondaryOnTop = false;
+
+  /// 上一次形态同步时的 tab 下标（切 tab 检测，见 [_syncBarFormTarget]）。
+  int _lastSyncedBarFormTabIndex = 0;
+
+  /// 冷启动播种写 notifier 的窗口（见 [_loadSecondaryPlayerEnabled]）：
+  /// 期间的目标翻转吸附端点，不播交棒（会诊 D3 的幻影翻转 ②）。
+  bool _barFormSeeding = false;
 
   /// 词幕连接失败弹窗展示中标记，防止连发 connect_failed 时重复弹窗。
   bool _lyriconFailDialogShown = false;
@@ -1214,6 +1560,55 @@ class _MainLayoutState extends State<_MainLayout>
             curve: Curves.easeInOutCubic,
           ),
         );
+    // 常驻 MiniPlayer 收起：时长/曲线与 ResponsiveScaffold._chromeHide 完全一致，
+    // 由 [_syncMiniPlayerHide] 在同一帧驱动到目标态。
+    // 初值按目标态定端点（与 _chromeHide 按 widget.hideNavigation 定端点同一口径）：
+    // 启动即处于收起形态（悬浮播放器开关在 runBootstrap 首帧前播种为 true）时，
+    // 不必等 _secondaryPageOnTop 上报后再 forward，省掉整段 260ms 帧提交——
+    // 该形态下常驻条子树本就不渲染（见 _buildBody 的 kSecondaryPlayerEnabled 早退）。
+    // initState 读 [_residentMiniPlayerHidden] 安全：三个全局 notifier 分别已播种 /
+    // 定义即 false（kCoverFlowImmersiveActive 由 _syncImmersiveMode 在首帧 build 才
+    // 置位，initState 早于它，初值恒 false → 端点初值不受沉浸项影响），
+    // _secondaryPageOnTop 取字段初值 false，不碰 context / MediaQuery。
+    final bool initialMiniPlayerHide = _residentMiniPlayerHidden;
+    _miniPlayerHideController = AnimationController(
+      vsync: this,
+      duration: kBottomChromeToggleDuration,
+      value: initialMiniPlayerHide ? 1.0 : 0.0,
+    );
+    _miniPlayerHideTarget = initialMiniPlayerHide;
+    _miniPlayerHide = CurvedAnimation(
+      parent: _miniPlayerHideController,
+      curve: M3ExpressiveMotion.panelCollapseEasing,
+      reverseCurve: M3ExpressiveMotion.panelExpandEasing,
+    );
+    kSecondaryPlayerEnabled.addListener(_syncMiniPlayerHide);
+    kSuppressResidentMiniPlayer.addListener(_syncMiniPlayerHide);
+    // 形态交叉过渡：目标由纯函数 [resolveBottomBarFormTarget] 给出（三项输入见
+    // [_resolveBarFormTargetIsCapsule]）。初值按目标定端点（启动即处于胶囊形态时
+    // 不必再播一段 260ms）。
+    _barFormTargetIsCapsule = _resolveBarFormTargetIsCapsule();
+    _lastSyncedBarFormTabIndex = _selectedIndex;
+    _barFormController = AnimationController(
+      vsync: this,
+      duration: kBottomChromeToggleDuration,
+      value: _barFormTargetIsCapsule ? 1.0 : 0.0,
+    );
+    _barFormCurve = CurvedAnimation(
+      parent: _barFormController,
+      curve: M3ExpressiveMotion.panelCollapseEasing,
+      reverseCurve: M3ExpressiveMotion.panelExpandEasing,
+    );
+    _barFormController.addListener(_publishBarFormProgress);
+    // 交棒飞行结束/被吸附时解冻常驻条端点快照（见 _startBarFormFlight）。
+    _barFormController.addStatusListener(_onBarFormStatusChanged);
+    kSecondaryPlayerEnabled.addListener(_onBarFormSettingChanged);
+    kSecondaryPlayerOnPrimaryPages.addListener(_onBarFormSettingChanged);
+    _publishBarFormProgress();
+    // 封面流横屏沉浸：常驻条并入底栏那条 260ms 通道（见 _residentMiniPlayerHidden）。
+    // 该 notifier 由本State 的 _syncImmersiveMode 写入，listener 只驱动已存在的
+    // _miniPlayerHideController，不新增任何动画对象（净帧增量 0）。
+    kCoverFlowImmersiveActive.addListener(_syncMiniPlayerHide);
     // 未登录时尝试播放联网歌曲,弹出登录提示
     context.read<PlayerProvider>().onLoginRequired = _showLoginRequiredDialog;
     // 一起听房主播放守卫：房间歌单外的曲目（本地音乐等）不允许本地起播
@@ -1307,8 +1702,27 @@ class _MainLayoutState extends State<_MainLayout>
     unawaited(_loadDesktopModeEnabled());
     // 悬浮播放器总开关：启动时载入持久化值（宿主自己订阅，无需本 State 监听）。
     unawaited(_loadSecondaryPlayerEnabled());
+    // 悬浮播放器的进度指示与一级页面形态：同上，宿主/本 shell 各自订阅。
+    unawaited(_loadSecondaryPlayerProgress());
+    unawaited(_loadSecondaryPlayerOnPrimary());
+    // 二级页面（及以后）是否收起底部导航栏：本 State 的 hideNavigation 直接读它，
+    // 故需监听切换后重建（与 kDesktopModeEnabled 同模式）。
+    kHideNavBarOnSecondaryPages.addListener(_onHideNavBarOnSecondaryChanged);
+    unawaited(_loadHideNavBarOnSecondaryPages());
+    // 封面流歌单源：启动时载入持久化值（封面流页自己订阅通知器）。
+    unawaited(_loadCoverFlowSource());
     // 悬浮播放器停靠位：启动时载入持久化值；未设置过则按设备形态取默认。
     unawaited(_loadSecondaryPlayerDock());
+    // 播放页进度条波浪起伏开关：启动时载入持久化值（MD3 播放页自己订阅）。
+    unawaited(_loadSeekBarWaveEnabled());
+    // 封面阴影强度：启动时载入持久化值（两个播放页的封面包装层自己订阅）。
+    unawaited(_loadCoverShadowStrength());
+    // 宽屏播放页「横屏控制面板独立页」开关：启动时载入持久化值（播放页自己订阅）。
+    unawaited(_loadLandscapeDetachedControls());
+    // 顶栏「胶囊按钮收缩」开关：启动时载入持久化值（顶栏尾部组件自己订阅）。
+    unawaited(_loadTopBarPillCollapse());
+    // 页签圆点位置开关（默认关 = 底部页签条）：启动时载入持久化值（播放页自己订阅）。
+    unawaited(_loadTopBarTabDots());
     // 监听词幕连接失败（原生侧多次重试后 connect_failed）→ 弹窗提示
     LyriconProviderService.instance.addListener(_onLyriconStateChanged);
     // 冷启动前若已连接失败（如后台唤醒时），进入主页后立即补弹一次
@@ -1321,12 +1735,29 @@ class _MainLayoutState extends State<_MainLayout>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 与底栏收起同一 reduce-motion 口径：动画直接落端点，不播过渡。
+    _reduceMotion = MediaQuery.disableAnimationsOf(context);
+  }
+
+  @override
   void dispose() {
     _exitResetTimer?.cancel();
     _exitController.dispose();
+    kSecondaryPlayerEnabled.removeListener(_syncMiniPlayerHide);
+    kSuppressResidentMiniPlayer.removeListener(_syncMiniPlayerHide);
+    kCoverFlowImmersiveActive.removeListener(_syncMiniPlayerHide);
+    _miniPlayerHideController.dispose();
+    kSecondaryPlayerEnabled.removeListener(_onBarFormSettingChanged);
+    kSecondaryPlayerOnPrimaryPages.removeListener(_onBarFormSettingChanged);
+    _barFormController.removeStatusListener(_onBarFormStatusChanged);
+    _barFormController.removeListener(_publishBarFormProgress);
+    _barFormController.dispose();
     LyriconProviderService.instance.removeListener(_onLyriconStateChanged);
     kCoverFlowImmersive.removeListener(_onCoverFlowImmersiveChanged);
     kDesktopModeEnabled.removeListener(_onDesktopModeChanged);
+    kHideNavBarOnSecondaryPages.removeListener(_onHideNavBarOnSecondaryChanged);
     shortcutTabRequest.removeListener(_handleShortcutTabRequest);
     externalMediaRequest.removeListener(_handleExternalMediaRequest);
     WidgetsBinding.instance.removeObserver(this);
@@ -1363,11 +1794,121 @@ class _MainLayoutState extends State<_MainLayout>
   ///
   /// 无需监听运行时变更：SecondaryMiniPlayerHost 自己用 ValueListenableBuilder
   /// 订阅，设置页切换后各页宿主即时重建，不依赖本 State。
+  ///
+  /// TV 构建（kTvBuild）下强制为 false、回落底部常驻播放条：悬浮条本体没有
+  /// DpadFocusable 焦点停点，常驻条已有 DpadFocusable + TvPlayerBarFocusBridge。
+  /// 只门控写入值，**不回写 prefs**——切回手机版不丢用户设置。
   Future<void> _loadSecondaryPlayerEnabled() async {
     final enabled = await SettingsRepository().getSecondaryPlayerEnabled();
     if (!mounted) return;
-    if (kSecondaryPlayerEnabled.value != enabled) {
-      kSecondaryPlayerEnabled.value = enabled;
+    final effective = kTvBuild ? false : enabled;
+    if (kSecondaryPlayerEnabled.value != effective) {
+      // 冷启动播种：装载写值与用户切换写的是同一个 notifier，但这不是用户动作 ——
+      // 形态吸附端点、不播交棒（会诊 D3 的幻影翻转 ②；同 frame 内同步完成）。
+      _barFormSeeding = true;
+      kSecondaryPlayerEnabled.value = effective;
+      _barFormSeeding = false;
+    }
+  }
+
+  /// 启动时从持久化载入进度指示开关，写入全局 [kSecondaryPlayerProgressEnabled]
+  /// （宿主自己订阅，无需本 State 监听）。
+  Future<void> _loadSecondaryPlayerProgress() async {
+    final enabled = await SettingsRepository().getSecondaryPlayerProgress();
+    if (!mounted) return;
+    if (kSecondaryPlayerProgressEnabled.value != enabled) {
+      kSecondaryPlayerProgressEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入进度条波浪开关，写入全局 [kSeekBarWaveEnabled]
+  /// （MD3 播放页的 ListenableBuilder 自己订阅，无需本 State 监听）。
+  Future<void> _loadSeekBarWaveEnabled() async {
+    final enabled = await SettingsRepository().getSeekBarWaveEnabled();
+    if (!mounted) return;
+    if (kSeekBarWaveEnabled.value != enabled) {
+      kSeekBarWaveEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入封面阴影强度，写入全局 [kCoverShadowIntensity]
+  /// （两个播放页的封面包装层自己订阅，无需本 State 监听）。
+  Future<void> _loadCoverShadowStrength() async {
+    final intensity = await SettingsRepository().getCoverShadowStrength();
+    if (!mounted) return;
+    if (kCoverShadowIntensity.value != intensity) {
+      kCoverShadowIntensity.value = intensity;
+    }
+  }
+
+  /// 启动时从持久化载入宽屏「横屏控制面板独立页」开关，写入全局
+  /// [kLandscapeDetachedControlsEnabled]
+  /// （两个 full_player 的 _syncTabLayout 监听它，无需本 State 监听）。
+  Future<void> _loadLandscapeDetachedControls() async {
+    final enabled = await SettingsRepository().getLandscapeDetachedControls();
+    if (!mounted) return;
+    if (kLandscapeDetachedControlsEnabled.value != enabled) {
+      kLandscapeDetachedControlsEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入顶栏「胶囊按钮收缩」开关，写入全局
+  /// [kTopBarPillCollapseEnabled]（顶栏尾部组件订阅它，无需本 State 监听）。
+  Future<void> _loadTopBarPillCollapse() async {
+    final enabled = await SettingsRepository().getTopBarPillCollapse();
+    if (!mounted) return;
+    if (kTopBarPillCollapseEnabled.value != enabled) {
+      kTopBarPillCollapseEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入「顶栏页签圆点」开关，写入全局 [kTopBarTabDotsEnabled]
+  /// （播放页的顶栏与底部控制列各自订阅它，无需本 State 监听）。
+  Future<void> _loadTopBarTabDots() async {
+    final enabled = await SettingsRepository().getTopBarTabDots();
+    if (!mounted) return;
+    if (kTopBarTabDotsEnabled.value != enabled) {
+      kTopBarTabDotsEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入「一级页面是否也用悬浮底栏」，写入全局
+  /// [kSecondaryPlayerOnPrimaryPages]。本 State 监听它来切换常驻条的承载位置。
+  Future<void> _loadSecondaryPlayerOnPrimary() async {
+    final enabled = await SettingsRepository().getSecondaryPlayerOnPrimary();
+    if (!mounted) return;
+    if (kSecondaryPlayerOnPrimaryPages.value != enabled) {
+      // 同 [_loadSecondaryPlayerEnabled]：冷启动播种吸附端点，不播交棒。
+      _barFormSeeding = true;
+      kSecondaryPlayerOnPrimaryPages.value = enabled;
+      _barFormSeeding = false;
+    }
+  }
+
+  /// 启动时从持久化载入「二级页面是否收起底部导航栏」，写入全局
+  /// [kHideNavBarOnSecondaryPages]（默认 true = 隐藏）。
+  Future<void> _loadHideNavBarOnSecondaryPages() async {
+    final hide = await SettingsRepository().getHideNavBarOnSecondaryPages();
+    if (!mounted) return;
+    if (kHideNavBarOnSecondaryPages.value != hide) {
+      kHideNavBarOnSecondaryPages.value = hide;
+    }
+  }
+
+  void _onHideNavBarOnSecondaryChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// 启动时从持久化载入封面流歌单源，写入全局 [kCoverFlowSource]。
+  ///
+  /// 无需监听运行时变更：CoverFlowPage 自己 addListener 订听通知器，
+  /// 设置页切换后封面流页即时响应，不依赖本 State。
+  Future<void> _loadCoverFlowSource() async {
+    final raw = await SettingsRepository().getCoverFlowSourceRaw();
+    final source = CoverFlowSource.tryParse(raw);
+    if (kCoverFlowSource.value != source) {
+      kCoverFlowSource.value = source;
     }
   }
 
@@ -1468,7 +2009,6 @@ class _MainLayoutState extends State<_MainLayout>
     final index = context.read<TabConfigProvider>().visibleIndexOf(tabId);
     if (index < 0) return;
     setState(() {
-      _previousSelectedIndex = _selectedIndex;
       _selectedIndex = index;
     });
   }
@@ -1489,10 +2029,16 @@ class _MainLayoutState extends State<_MainLayout>
   }
 
   /// LaunchPad 点击隐藏 tab：以二级页面路由打开对应功能页（不切换主 tab）。
+  /// 推到当前 tab 的中央栈（内层 Navigator），深度观察者上报二级态 → 底栏播放
+  /// 收起动画；壳层不在（桌面布局 / 首帧前）时回退根 Navigator 直接覆盖。
   void _openTabAsPage(String tabId) {
+    final pushed = _responsiveShellKey.currentState?.pushCurrentTabRoute<void>(
+      (_) => _pageForTabAsRoute(tabId),
+    );
+    if (pushed != null) return;
     Navigator.of(
       context,
-    ).push(MaterialPageRoute(builder: (_) => _pageForTabAsRoute(tabId)));
+    ).push(MaterialPageRoute<void>(builder: (_) => _pageForTabAsRoute(tabId)));
   }
 
   /// tabId → 可作为二级路由打开的页面（复用主 tab 页面，去掉主 tab 专属参数）。
@@ -1558,8 +2104,20 @@ class _MainLayoutState extends State<_MainLayout>
         page = const SizedBox.shrink();
     }
     // 设置页不挂播放栏，其余二级路由页统一挂悬浮播放器宿主。
-    if (tabId == 'settings') return page;
-    return SecondaryMiniPlayerHost(child: page);
+    if (tabId == 'settings') {
+      // 常驻条形态（悬浮播放器关）下，底部常驻 MiniPlayer 在壳层之外、本路由
+      // 盖不住 —— 包装置位后由主布局隐藏，保持「设置页无播放栏」的原有行为。
+      return ResidentBarSuppressor(child: page);
+    }
+    // tabId 照传：push 出来的路由 `isFirst == false`，宿主按标题对齐判据仍归为
+    // 二级页面（可收缩），传值只为让两处口径同源、便于日志对照。
+    final hosted = SecondaryMiniPlayerHost(tabId: tabId, child: page);
+    // LaunchPad「打开为页面」/快捷方式不经 tab 壳层：双栏白名单页自带双栏壳，
+    // 详情入口（openDetail）才有作用域可分派进右栏；非白名单页保持整屏页面。
+    if (kTwoPaneTabs.contains(tabId)) {
+      return TwoPanePage(child: hosted);
+    }
+    return hosted;
   }
 
   @override
@@ -1782,6 +2340,7 @@ class _MainLayoutState extends State<_MainLayout>
               Navigator.of(ctx).pop();
               Navigator.of(
                 context,
+                rootNavigator: true,
               ).push(MaterialPageRoute(builder: (_) => const LoginPage()));
             },
             child: const Text('去登录'),
@@ -1824,6 +2383,18 @@ class _MainLayoutState extends State<_MainLayout>
         kCoverFlowImmersive.value;
     _syncImmersiveMode(immersive);
 
+    // 底栏形态目标会随「当前 tab / tab 配置 / 两个形态开关」变化，在帧末统一
+    // 重算一次（幂等）。**必须排到帧末**：本 State 是浮层所在 Stack 的
+    // 后代，同步写全局进度会在同帧标记祖先 dirty（见 [_publishBarFormProgress]）。
+    //
+    // 帧末重算只兜底两类：切 tab（[tabSwitch]，播 260ms 交棒）与其余顺带重算
+    // （[ambient] 吸附端点）。导航与设置切换有各自的显式入口（[_onPageRouteEvent]
+    // / [_onBarFormSettingChanged]），不走这里，避免「目标没变却被当导航」。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _syncBarFormTarget();
+    });
+
     // 一级页面返回拦截：
     // 1) PopScope 拦截系统返回手势 / 物理返回键，canPop=false → 触发 onPopInvoked
     // 2) 封面流沉浸中：返回键先恢复 tab 栏（退出沉浸），不弹退出确认
@@ -1831,7 +2402,7 @@ class _MainLayoutState extends State<_MainLayout>
     //    走 moveTaskToBack 挂后台（不杀进程、不停播放器、不停本地 Rust 服务器）
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (didPop, result) {
+      onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
         // 上滑拖拽展开中：返回键先收起覆盖层，回到 MiniPlayer
         if (playerDragActive.value) {
@@ -1841,11 +2412,22 @@ class _MainLayoutState extends State<_MainLayout>
         }
         // 桌面布局：先回退当前 Tab 的中央内容栈（详情页返回），空栈才继续。
         if (isDesktopLayout(context) &&
-            (_desktopShellKey.currentState?.maybePop() ?? false)) {
+            (await _desktopShellKey.currentState?.maybePop() ?? false)) {
           return;
         }
+        if (!isDesktopLayout(context) &&
+            (await _responsiveShellKey.currentState?.maybePop() ?? false)) {
+          return;
+        }
+        if (!mounted) return;
         if (immersive) {
           kCoverFlowImmersive.value = false;
+        } else if (safeIndex != 0) {
+          // 主导航页面先返回首页，只有首页继续执行双击返回退出。
+          debugPrint('[MainNavigation] back tab=${currentTab.id} -> home');
+          setState(() => _selectedIndex = 0);
+          _exitResetTimer?.cancel();
+          _exitPressed = false;
         } else {
           _onBackPressedForExit();
         }
@@ -1888,7 +2470,6 @@ class _MainLayoutState extends State<_MainLayout>
                   onDestinationSelected: (index) {
                     if (isFullPlayerOnTop) return;
                     setState(() {
-                      _previousSelectedIndex = _selectedIndex;
                       _selectedIndex = index;
                     });
                   },
@@ -1905,15 +2486,19 @@ class _MainLayoutState extends State<_MainLayout>
                       return;
                     }
                     setState(() {
-                      _previousSelectedIndex = _selectedIndex;
                       _selectedIndex = index;
                     });
                   },
-                  hideNavigation: immersive,
+                  // 沉浸（封面流横屏）恒收起；停在二级页面（及以后）时按设置项决定
+                  // （「二级页面隐藏菜单底栏」，默认隐藏）。二级判定由 ResponsiveShell
+                  // 根据路由栈及详情面板上报；侧栏同样
+                  // 在二级页面收起，只是不受该设置影响（设置只管竖屏底栏）。
+                  hideNavigation:
+                      immersive ||
+                      (_secondaryPageOnTop &&
+                          kHideNavBarOnSecondaryPages.value),
+                  hideRailNavigation: immersive || _secondaryPageOnTop,
                   body: _buildBody(context, visibleTabs, immersive),
-                  compactBody: _buildBody(context, visibleTabs, immersive),
-                  mediumBody: _buildBody(context, visibleTabs, immersive),
-                  expandedBody: _buildBody(context, visibleTabs, immersive),
                 ),
         ),
       ),
@@ -1923,6 +2508,8 @@ class _MainLayoutState extends State<_MainLayout>
   /// 封面流横屏沉浸：同步「实际生效」标志并设置系统栏沉浸模式。
   /// [immersive] 已由调用方按「tab + 方向 + 用户请求」算好；
   /// 状态变化时调用，非沉浸时恢复默认系统栏。
+  /// 置位 [kCoverFlowImmersiveActive] 会顺带触发常驻条的收起 listener
+  /// （见 [_syncMiniPlayerHide]），与底栏 `hideNavigation` 用的是同一个 `immersive`。
   void _syncImmersiveMode(bool immersive) {
     if (_immersiveSynced == immersive) return;
     _immersiveSynced = immersive;
@@ -1944,26 +2531,317 @@ class _MainLayoutState extends State<_MainLayout>
     });
   }
 
+  /// 当前选中的 tab id（列表为空返回 null）。
+  String? _currentTabId(List<TabItem> visibleTabs) {
+    if (visibleTabs.isEmpty) return null;
+    return visibleTabs[_selectedIndex.clamp(0, visibleTabs.length - 1)].id;
+  }
+
+  /// 常驻播放条的承载位置：总开关关闭时由本壳层最外层承载（所有页面共用一条，
+  /// 宿主 `ownsBottomBar` 会抑制各页自补的那条）；总开关开但一级页面退回常驻条时，
+  /// 改由每个 tab 根内容底部的 [PrimaryPagePersistentBar] 槽承载 —— 挂在壳层底部
+  /// 感知不到 tab 内层 push 出来的二级页面，会与二级页的悬浮条同屏并存。
+  ///
+  /// [ResponsiveShell.onSecondaryRouteChanged] 上报当前 tab 是否停在二级页面
+  /// （及以后）：底栏是本 Scaffold 的 `bottomNavigationBar`，在每 tab 内层 Navigator
+  /// 之外，内层页面盖不住它，只能靠 [_secondaryPageOnTop] 收起；回到一级页面时自动恢复。
+  void _onSecondaryRouteChanged(bool secondary) {
+    if (!mounted || _secondaryPageOnTop == secondary) return;
+    setState(() => _secondaryPageOnTop = secondary);
+    // 与底栏收起同一帧驱动常驻条动画（设置页开在栈顶时一起沉底）。
+    _syncMiniPlayerHide();
+  }
+
+  /// 常驻 MiniPlayer 的收起目标，四项输入任一成立即收起：
+  /// - [kSecondaryPlayerEnabled]：悬浮播放器形态下它本就不存在；
+  /// - [kCoverFlowImmersiveActive]：封面流横屏沉浸生效时（由 [_syncImmersiveMode]
+  ///   在同一处 rebuild 写入，底栏的 `hideNavigation` 读的是同一个 `immersive`），
+  ///   常驻条同样进入收起目标，与底栏走同一条 260ms 通道；
+  /// - [kSuppressResidentMiniPlayer] **且** [_secondaryPageOnTop]：二级路由形态的设置页
+  ///   停在当前 tab 栈顶时收起，合取的必要性见该 notifier 的文档。
+  bool get _residentMiniPlayerHidden =>
+      kSecondaryPlayerEnabled.value ||
+      kCoverFlowImmersiveActive.value ||
+      (kSuppressResidentMiniPlayer.value && _secondaryPageOnTop);
+
+  /// 把常驻条收起动画驱动到目标态（幂等）。四项输入（悬浮开关、沉浸标志、设置页
+  /// 置位 notifier + 二级上报）任一变化都会走到这里（前三项经 listener，末项经
+  /// [_onSecondaryRouteChanged]）；与底栏的 `_chromeHide` 共用同一 rebuild 帧起止，
+  /// 时长与曲线完全一致，视觉上同步收展。
+  ///
+  /// 沉浸项的口径说明：进入沉浸的这一次收起**看不见动画** —— [_buildBody] 的
+  /// `if (!immersive)` 会把常驻条子树整块摘掉；目标态在此处仍要置位，是为了
+  /// 退出沉浸时子树重新挂上后动画从收起端点反向播放（与底栏同一条控制器、
+  /// 同一 260ms），并保证 `_miniPlayerHideTarget` 与子树在场时的视觉状态不背离。
+  void _syncMiniPlayerHide() {
+    if (!mounted) return;
+    final hide = _residentMiniPlayerHidden;
+    // 幂等判据比较"目标态"而非 `status == completed`：动画正在 forward 时
+    // status 是 AnimationStatus.forward（`== completed` 为 false），此时目标若
+    // 翻回"显示"(hide=false)，`false == false` 会提前 return、不执行 reverse，
+    // 常驻条就此沉底不回。守卫换成目标态后，mid-flight 改目标也一定会重新驱动。
+    if (_miniPlayerHideTarget == hide) return;
+    _miniPlayerHideTarget = hide;
+    if (_reduceMotion) {
+      _miniPlayerHideController.value = hide ? 1.0 : 0.0;
+    } else if (hide) {
+      _miniPlayerHideController.forward();
+    } else {
+      _miniPlayerHideController.reverse();
+    }
+  }
+
+  /// 底栏当前该落在哪种形态（true = 悬浮胶囊）。
+  ///
+  /// 三项输入见 [resolveBottomBarFormTarget] 的说明：
+  /// - 悬浮总开关 [kSecondaryPlayerEnabled]；
+  /// - 一级页面是否也用悬浮条 [kSecondaryPlayerOnPrimaryPages]；
+  /// - 当前页是否「一级导航页」：判据与 `SecondaryMiniPlayerHost._buildHost` 用的是
+  ///   同一个 `isPrimaryNavTab`（`tab.pinnedTitle` 且未被 push）。这里的 pushedRoute
+  ///   事实取**导航时刻**的 [_formSecondaryOnTop]（不是推迟上报的
+  ///   [_secondaryPageOnTop]，理由见该字段注释）。
+  bool _resolveBarFormTargetIsCapsule() {
+    // tv: TV 版强制关闭悬浮形态（[kSecondaryPlayerEnabled] 在 TV 载入时被钉成
+    // false），本机制整段惰性 —— 目标恒 0、进度恒 0、浮层恒不渲染。
+    if (kTvBuild) return false;
+    final tabs = context.read<TabConfigProvider>().visibleTabs;
+    final tab = tabs.isEmpty
+        ? null
+        : tabs[_selectedIndex.clamp(0, tabs.length - 1)];
+    return resolveBottomBarFormTarget(
+          floatingEnabled: kSecondaryPlayerEnabled.value,
+          onPrimaryPages: kSecondaryPlayerOnPrimaryPages.value,
+          pageIsPrimaryNav: isPrimaryNavTab(
+            tab,
+            pushedRoute: _formSecondaryOnTop,
+          ),
+        ) >=
+        0.5;
+  }
+
+  /// 中央栈页面路由事件的**当下**回调（导航时刻，见
+  /// [ResponsiveShell.onPageRouteEvent]）：立刻决定形态目标并驱动交棒，
+  /// 让 `0<p<1` 的飞行窗口覆盖整个路由转场（会诊 D1/D3 的修复点）。
+  ///
+  /// **只有真正改变「当前 tab 是否停在 push 出来的页面上」这一事实的事件才算
+  /// 导航**（push 进二级 / pop 回一级）。其余路由事件一律走 ambient 语义（吸附
+  /// 端点、不播交棒）：新建 tab 的 Navigator 首路由（tab 配置装载/切 tab 时
+  /// 懒建的栈）与 pushReplacement 都只是栈内幕，用户看到的形态没有因这次
+  /// 路由事件而换（会诊 D3 的幻影翻转 ②）。
+  void _onPageRouteEvent(
+    bool hasPushedPage,
+    Route<dynamic> route,
+    Duration transition,
+  ) {
+    if (!mounted) return;
+    final bool factChanged = hasPushedPage != _formSecondaryOnTop;
+    _formSecondaryOnTop = hasPushedPage;
+    if (!factChanged) {
+      _syncBarFormTarget(cause: BarFormFlipCause.ambient);
+      return;
+    }
+    _syncBarFormTarget(
+      cause: BarFormFlipCause.navigation,
+      transition: transition,
+      navRoute: route,
+    );
+  }
+
+  /// 两个形态开关的用户切换（设置页直接写 notifier）。冷启动播种期间
+  /// （[_barFormSeeding]）吸附端点，不播交棒。
+  void _onBarFormSettingChanged() {
+    _syncBarFormTarget(
+      cause: _barFormSeeding
+          ? BarFormFlipCause.ambient
+          : BarFormFlipCause.settingsToggle,
+    );
+  }
+
+  /// 重算目标形态并驱动一次性过渡（幂等）。
+  ///
+  /// [cause] 为空时按当前状态自动分级：切了 tab → [tabSwitch]；其余一切都是
+  /// [ambient]（吸附端点）。输入变化来源与分级依据见 [BarFormFlipCause]。
+  void _syncBarFormTarget({
+    BarFormFlipCause? cause,
+    Duration? transition,
+    Route<dynamic>? navRoute,
+  }) {
+    if (!mounted) return;
+    // tv: TV 版恒无形态翻转。前提由两处门控保证——形态总开关在装载处被强制 false
+    // （`main.dart` 与 [_loadSecondaryPlayerEnabled] 的 `effective = kTvBuild ?
+    // false : enabled`），设置页开关在 TV 下 `onChanged: null` 置灰不可点，故 TV
+    // 的形态目标恒为常驻条。这里再显式早退一次：本方法的调用面（帧末顺带重算 /
+    // 设置切换 / 路由事件）比目标解算 [_resolveBarFormTargetIsCapsule] 更广，显式
+    // 门控让「TV 恒不翻转」这一 AGENTS §12 口径**不依赖**该解算内部那处 kTvBuild
+    // 早退——它一旦被重构掉，这里会立刻退化成幻影翻转。kTvBuild 为 const，
+    // 正常构建此分支被树摇剔除、零开销。
+    if (kTvBuild) return;
+    final int tabIndex = _selectedIndex;
+    final bool tabChanged = tabIndex != _lastSyncedBarFormTabIndex;
+    _lastSyncedBarFormTabIndex = tabIndex;
+    final resolvedCause =
+        cause ??
+        (tabChanged ? BarFormFlipCause.tabSwitch : BarFormFlipCause.ambient);
+    if (tabChanged) {
+      // 切 tab 后形态事实换成新 tab 的中央栈（上一 tab 的 push 态不适用；
+      // 此刻壳层里的深度事实是刚更新过的当下值）。
+      _formSecondaryOnTop =
+          _responsiveShellKey.currentState?.currentTabHasPushedPage() ?? false;
+    }
+    final target = _resolveBarFormTargetIsCapsule();
+    if (target == _barFormTargetIsCapsule) return;
+    _barFormTargetIsCapsule = target;
+    if (_reduceMotion) {
+      _snapBarFormToTarget();
+      return;
+    }
+    switch (resolvedCause) {
+      case BarFormFlipCause.navigation:
+        // 交棒窗口 = 整段路由转场 + 随后的底栏收起/恢复（两端真身要等底栏
+        // 落定才到结算端点，见 resolveMorphFlightDuration）。
+        final duration = resolveMorphFlightDuration(
+          transition: transition ?? Duration.zero,
+          navWillToggle: _barFormNavWillToggle(),
+        );
+        if (target) {
+          // push 方向：目的页的胶囊要等它构建（下一帧）才挂出来 —— 先起跑，
+          // 帧末核对；核对不过（设置子页这类不挂播放条的页面）再吸附撤销。
+          // 胶囊端点随二级页的底栏状态定：默认收底栏（胶囊贴到屏底净空）。
+          _startBarFormFlight(
+            duration,
+            capsuleNavHiddenAtSettle: kHideNavBarOnSecondaryPages.value,
+          );
+          _verifyPushedPageHasCapsule(navRoute);
+        } else {
+          // pop 方向：被弹出的那一页此刻仍在树里，可直接核对它挂不挂播放条。
+          if (!BottomBarMorphRegistry.instance.hasCapsuleForRoute(navRoute)) {
+            _snapBarFormToTarget();
+            return;
+          }
+          // 胶囊在这一侧是**被弹出的二级页**（当前结算形态），其底栏状态同样
+          // 由该设置决定。
+          _startBarFormFlight(
+            duration,
+            capsuleNavHiddenAtSettle: kHideNavBarOnSecondaryPages.value,
+          );
+        }
+      case BarFormFlipCause.settingsToggle:
+      case BarFormFlipCause.tabSwitch:
+        // 这两条线的胶囊侧都在一级页（标题居中的 tab 根页 / 一级页面也用
+        // 悬浮条）：底栏恒在场，胶囊端点要让出底栏槽位。
+        _startBarFormFlight(
+          kBottomChromeToggleDuration,
+          capsuleNavHiddenAtSettle: false,
+        );
+      case BarFormFlipCause.ambient:
+        _snapBarFormToTarget();
+    }
+  }
+
+  /// 本次形态翻转之后，底栏（竖屏 NavigationBar）还会不会在转场收敛时起
+  /// 260ms 收起/恢复动画 —— 交棒窗口据此顺延（竖屏底栏收起是唯一还要在
+  /// 转场之后变几何的动作；横屏侧栏是瞬时 Offstage，不需要顺延）。
+  bool _barFormNavWillToggle() =>
+      (_formSecondaryOnTop && kHideNavBarOnSecondaryPages.value) !=
+      (_secondaryPageOnTop && kHideNavBarOnSecondaryPages.value);
+
+  /// 起一次交棒飞行：冻结常驻条端点快照（飞行期间浮层只认它）并驱动一次性
+  /// 控制器到目标端点。
+  ///
+  /// [capsuleNavHiddenAtSettle]：胶囊侧（二级页面）在结算态是否收起了底栏 ——
+  /// 决定胶囊端点的底部净空要不要多让一个底栏槽位（见 resolveCapsuleBodyRect）。
+  void _startBarFormFlight(
+    Duration duration, {
+    required bool capsuleNavHiddenAtSettle,
+  }) {
+    BottomBarMorphRegistry.instance.freezeResidentRectForFlight(
+      capsuleNavHiddenAtSettle: capsuleNavHiddenAtSettle,
+    );
+    _barFormController.duration = duration;
+    if (_barFormTargetIsCapsule) {
+      _barFormController.forward();
+    } else {
+      _barFormController.reverse();
+    }
+  }
+
+  /// 直接吸附到目标端点（不走交棒窗口）：reduced-motion、冷启动播种、
+  /// 目的页不挂播放条，以及一切没有导航事件的顺带重算。
+  void _snapBarFormToTarget() {
+    _barFormController.stop();
+    BottomBarMorphRegistry.instance.clearFrozenResidentRect();
+    void apply() {
+      if (!mounted) return;
+      _barFormController.value = _barFormTargetIsCapsule ? 1.0 : 0.0;
+    }
+
+    // build / layout 阶段写全局进度会 markNeedsBuild 祖先（"setState during
+    // build"）：路由事件本都在事件回调里，但 Navigator 装首批路由会在挂载
+    // （build）期间回调观察者 —— 那时吸附推迟到帧末，效果同帧可见。
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => apply());
+    } else {
+      apply();
+    }
+  }
+
+  /// 交棒飞行收敛（或被吸附）时解冻常驻条端点快照。
+  void _onBarFormStatusChanged(AnimationStatus status) {
+    if (status == AnimationStatus.completed ||
+        status == AnimationStatus.dismissed) {
+      BottomBarMorphRegistry.instance.clearFrozenResidentRect();
+    }
+  }
+
+  /// push 方向的目的端核对：目的形态是悬浮胶囊，而胶囊要等新页面构建
+  /// （转场首帧）才挂出来。给一帧余量后仍找不到该路由的胶囊 → 这一页不挂
+  /// 播放条（设置子页、二级路由形态的设置页），交棒没有落点，吸附撤销。
+  ///
+  /// 撤销发生在新页面刚入场的前两帧、浮层还贴在常驻条端点附近（p≈0），
+  /// 与让位前的真身逐像素同值，视觉上无痕。
+  void _verifyPushedPageHasCapsule(Route<dynamic>? route) {
+    if (route == null) return;
+    var attempts = 0;
+    void check() {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // 目的形态已被改回（又发生了导航）或核对通过：不再跟踪。
+        if (!_barFormTargetIsCapsule) return;
+        if (BottomBarMorphRegistry.instance.hasCapsuleForRoute(route)) return;
+        if (attempts++ == 0) {
+          check();
+          return;
+        }
+        _snapBarFormToTarget();
+      });
+    }
+
+    check();
+  }
+
+  /// 把过渡进度写进全局 notifier（浮层与两端真身订阅它）。
+  ///
+  /// 注意：本 State 是浮层所在 Stack 的**后代**，因此不能在本 State 的 build /
+  /// didChangeDependencies 里同步写 —— 那会在同帧标记祖先 dirty（"markNeedsBuild
+  /// during build"）。驱动入口都落在帧末 / 事件回调里。
+  void _publishBarFormProgress() {
+    kBottomBarFormProgress.value = _barFormCurve.value;
+  }
+
   Widget _buildBody(
     BuildContext context,
     List<TabItem> visibleTabs,
     bool immersive,
   ) {
-    // 切换方向：横屏（侧边导航栏）用上下淡入，竖屏（底部导航栏）用左右滑动
-    final isLandscape =
-        MediaQuery.orientationOf(context) == Orientation.landscape;
-    final useVerticalTransition = isLandscape;
-    final goingRight = _selectedIndex > _previousSelectedIndex;
-
-    // 安全守卫
-    final safeIndex = _selectedIndex.clamp(0, visibleTabs.length - 1);
-    final currentTab = visibleTabs[safeIndex];
-
     // 主页（一级页面）与二级页面统一由悬浮播放器承载：整段 body 包进宿主后，
     // 开关开启时底部常驻 MiniPlayer 隐藏（下方 builder），避免两套播放器并存。
     // 沉浸态（封面流全屏浏览）透传 immersive，宿主不渲染悬浮条，保持全屏无遮挡。
     return SecondaryMiniPlayerHost(
+      ownsBottomBar: true,
       immersive: immersive,
+      // 宿主按「标题左对齐」判据识别一级页面（不回缩），需要当前 tab id。
+      tabId: _currentTabId(visibleTabs),
       child: Column(
         children: [
           // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
@@ -1975,71 +2853,52 @@ class _MainLayoutState extends State<_MainLayout>
                 : LocalServerDownBanner(onRetry: KugouApiServer.start),
           ),
           Expanded(
-            child: AnimatedSwitcher(
-              duration: M3ExpressiveMotion.defaultDuration,
-              switchInCurve: const Interval(
-                0.5,
-                1.0,
-                curve: M3ExpressiveMotion.expressiveEasing,
-              ),
-              // 退出曲线必须与进入曲线错开：旧页（outgoing）的 controller 是
-              // reverse（1→0），Interval(0.5,1.0) 对反向值映射后旧页恰好在前半段
-              // 淡出、新页在后半段淡入，避免新旧页同时过渡造成内容重叠/闪烁。
-              switchOutCurve: const Interval(
-                0.5,
-                1.0,
-                curve: M3ExpressiveMotion.expressiveEasing,
-              ),
-              transitionBuilder: (child, animation) {
-                final isEntering = child.key == ValueKey(currentTab.id);
-
-                if (useVerticalTransition) {
-                  // 侧边导航栏：基于 tab 顺序上下滑动
-                  final slideY = isEntering
-                      ? (goingRight ? 0.1 : -0.1)
-                      : (goingRight ? -0.1 : 0.1);
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: Offset(0.0, slideY),
-                        end: Offset.zero,
-                      ).animate(animation),
-                      child: child,
-                    ),
-                  );
-                } else {
-                  // 底部导航栏：左右滑动淡入淡出
-                  final slideX = isEntering
-                      ? (goingRight ? 0.12 : -0.12)
-                      : (goingRight ? -0.12 : 0.12);
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: Offset(slideX, 0.0),
-                        end: Offset.zero,
-                      ).animate(animation),
-                      child: child,
-                    ),
-                  );
-                }
-              },
-              child: KeyedSubtree(
-                key: ValueKey(currentTab.id),
-                child: _buildPageForTab(currentTab.id),
-              ),
+            child: ResponsiveShell(
+              key: _responsiveShellKey,
+              visibleTabs: visibleTabs,
+              selectedIndex: _selectedIndex,
+              pageBuilder: _buildPageForTab,
+              persistentBarBuilder: (tabId) =>
+                  PrimaryPagePersistentBar(tabId: tabId),
+              onSecondaryRouteChanged: _onSecondaryRouteChanged,
+              // 导航时刻的形态信号（见 _onPageRouteEvent 与
+              // ResponsiveShell.onPageRouteEvent 的说明）：底栏收起/常驻条隐藏
+              // 继续走上面那条推迟上报，两者解耦。
+              onPageRouteEvent: _onPageRouteEvent,
             ),
           ),
-          // 封面流页横屏沉浸：隐藏 MiniPlayer，实现全屏浏览
+          // 封面流页横屏沉浸：隐藏 MiniPlayer，实现全屏浏览。
+          // 沉浸下子树直接不挂载（收起动画看不见播放），但目标态仍经
+          // [_residentMiniPlayerHidden] 的沉浸项置位，退出沉浸重新挂载时从收起
+          // 端点反向播放，与底栏同一条 260ms 通道。
+          // 二级路由形态的设置页开在当前 tab 栈顶时，常驻条与底栏同一节奏
+          // 收起/展开（见 [_syncMiniPlayerHide]），沉底式收缩（底边贴住底栏
+          // 槽位、顶缘被裁），与底栏「槽位收缩 + 下沉」同一视觉语言。
           if (!immersive)
-            ValueListenableBuilder<bool>(
-              valueListenable: kSecondaryPlayerEnabled,
-              builder: (context, playerEnabled, _) => playerEnabled
-                  // 悬浮播放器接管：主页同样由悬浮条承载（页面主体已被
-                  // SecondaryMiniPlayerHost 包裹），隐藏底部常驻条避免两套并存。
-                  ? const SizedBox.shrink()
-                  : const MiniPlayer(),
+            ListenableBuilder(
+              listenable: kSecondaryPlayerEnabled,
+              builder: (context, _) {
+                // 悬浮播放器形态：常驻条不存在（形态切换保持瞬时，与原行为一致）。
+                if (kSecondaryPlayerEnabled.value) {
+                  return const SizedBox.shrink();
+                }
+                return AnimatedBuilder(
+                  animation: _miniPlayerHide,
+                  builder: (context, child) {
+                    final t = _miniPlayerHide.value;
+                    if (t <= 0) return child!;
+                    if (t >= 1) return const SizedBox.shrink();
+                    return ClipRect(
+                      child: Align(
+                        alignment: Alignment.bottomCenter,
+                        heightFactor: 1 - t,
+                        child: child,
+                      ),
+                    );
+                  },
+                  child: const ImeCollapse(child: MiniPlayer()),
+                );
+              },
             ),
         ],
       ),
@@ -2049,6 +2908,10 @@ class _MainLayoutState extends State<_MainLayout>
   /// 二次返回退出：首次返回显示提示，3 秒内再次返回触发真正退出（不弹窗）。
   void _onBackPressedForExit() {
     if (_isExiting) return;
+    if (kTvBuild) {
+      unawaited(_confirmTvExit());
+      return;
+    }
     if (_exitPressed) {
       _exitResetTimer?.cancel();
       _exitPressed = false;
@@ -2067,6 +2930,16 @@ class _MainLayoutState extends State<_MainLayout>
   /// 显示「再按一次返回桌面」提示（系统原生 Toast，非 SnackBar/弹窗）。
   void _showDoubleBackToast() {
     showToast('再按一次返回桌面');
+  }
+
+  /// TV：弹出退出确认；确认后走既有 [_doExit]（moveTaskToBack 挂后台，
+  /// 后台播放与本地服务器保持运行）。
+  Future<void> _confirmTvExit() async {
+    final confirmed = await showTvExitConfirmDialog(context);
+    if (!mounted) return;
+    if (confirmed) {
+      await _doExit();
+    }
   }
 
   /// 双击返回后回到手机桌面（仅挂后台）：
@@ -2089,16 +2962,24 @@ class _MainLayoutState extends State<_MainLayout>
   }
 }
 
-/// 底部 NavigationBar 的 tab 图标 + 自定义 M3E Expressive 胶囊 indicator。
+/// 底部 NavigationBar 的 tab 图标（胶囊由别处画，见下）。
 ///
-/// **设计思路**（对齐 MD3E MotionScheme.expressive()）：
-/// - 关掉 Flutter 原生 NavigationIndicator 的硬切横向拉伸
-///   （见 navigation_bar.dart 第 845-849 行，用 easeInOutCubicEmphasized 单轴缩放）
-/// - 自己在图标背后画一个 secondaryContainer 色的圆角胶囊
-/// - 胶囊出现/消失用 **带过冲的曲线**（easeOutBack，过冲约 10%），
-///   对应 MD3E `defaultSpatialSpec` 的"轻微过冲"原则
-/// - 胶囊做 **单轴 X 拉伸**（0.4 → 1.0），对齐 Flutter 原生 NavigationIndicator 的形变方式
-/// - 图标在胶囊弹起过程中完成 outlined → filled 切换，被弹跳掩盖
+/// **当前实现**：本类只负责**图标**，胶囊与回弹都在 `responsive_layout.dart` 的
+/// `_CapsuleBounce`（两处口径互指，改任一处先看另一处）。
+/// - 图标：**静态切换** —— [selected] 直接决定取 filled 还是 outlined
+///   （见下方 `build`），不做淡入/位移，也不在弹跳过程中切换；
+/// - 胶囊：`ResponsiveScaffold` 把 `icon` 整个包进 `_CapsuleBounce`，由它画
+///   secondaryContainer 实心 StadiumBorder（64×32，与 M3 原生胶囊同规格），
+///   原生 `NavigationIndicator` 经 `indicatorColor: Colors.transparent` 关掉
+///   —— 原生那条是沿 `easeInOutCubicEmphasized` 的单轴 X 缩放 0.4 → 1.0
+///   （SDK `navigation_bar.dart` 的 `NavigationIndicator.build`，行号随版本漂移
+///   故不写死）；
+/// - 回弹：**只作用于胶囊背景层**的 `Transform.scaleX`（图标保持不动）——
+///   80ms `Curves.easeOutCubic` 拉伸 1 → 1.2，随后由 m3e_core 官方预设
+///   `M3EMotion.standardPopup`（stiffness 1000 / damping 0.6，过冲 ≈9.5%）
+///   弹簧弹回 1.2 → 1.0；一次性 Ticker，收敛即停，无常驻帧；
+/// - 触发：点击（`_handleDestinationSelected`）或 selected false→true
+///   （`_CapsuleBounce.didUpdateWidget`）；背景图模式下胶囊隐藏。
 ///
 /// **文字行为**：由 `NavigationBarThemeData.labelBehavior` 控制，跟随用户在
 /// 设置页「底部导航栏文字」的三档选择（始终显示 / 仅当前页 / 始终不显示，
@@ -2107,6 +2988,8 @@ class _MainLayoutState extends State<_MainLayout>
 ///
 /// 不使用 NavigationDestination.selectedIcon（Flutter 原生内部是硬切）。
 class _AnimatedTabIcon extends StatelessWidget {
+  /// 类名沿用历史（早期确有动画），现行实现是静态切换，未改名以免牵动全部
+  /// `destinations` 构造点。
   final bool selected;
   final IconData outlinedIcon;
   final IconData filledIcon;

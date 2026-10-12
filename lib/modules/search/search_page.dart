@@ -1,5 +1,7 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'dart:ui' as ui;
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:flutter/widgets.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
@@ -10,7 +12,12 @@ import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../providers/kugou_provider.dart';
 import '../../core/layout/adaptive_content_grid.dart';
+import '../../core/build_flags.dart';
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
+import '../../core/utils/tab_snap_physics.dart';
 import '../../core/widgets/app_background.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/player_provider.dart';
@@ -18,12 +25,14 @@ import '../../services/kugou_api/cloud_song_mapper.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../playlist/playlist_page.dart';
 import '../player/secondary_mini_player.dart';
 import 'explore_sections.dart';
+import 'hot_search_board_card.dart';
 
 class SearchPage extends StatefulWidget {
   /// 打开时预填并立即执行的查询（桌面顶部工具栏搜索框提交时传入，见计划 4.3）。
@@ -57,9 +66,16 @@ class _SearchPageState extends State<SearchPage>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 6, vsync: this);
+    // 云盘 tab 已于 2026-10-10 下线（见下方 TabBar / TabBarView / types 三处注释），
+    // 页签数由 6 减为 5 —— 三处必须同步，否则 TabController 索引与 children 错位。
+    _tabController = TabController(length: 5, vsync: this);
     _tabController.addListener(_onTabChanged);
     _loadSearchHistory();
+    // 热搜榜单：进页后台拉一次；失败不自动重试（卡内有「重试」），
+    // 状态隔离在 KugouProvider.hotSearch，不影响结果区 loading/error。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) context.read<KugouProvider>().loadHotSearch();
+    });
     // 桌面工具栏搜索框提交：预填查询并在首帧后立即执行搜索。
     final q = widget.initialQuery?.trim() ?? '';
     if (q.isNotEmpty) {
@@ -80,7 +96,8 @@ class _SearchPageState extends State<SearchPage>
 
   void _onTabChanged() {
     if (_tabController.indexIsChanging) return;
-    final types = ['song', 'album', 'artist', 'special', 'cloud', 'lyric'];
+    // 云盘 tab 下线：types 必须与 TabBar 标签、TabBarView children 顺序一致
+    final types = ['song', 'album', 'artist', 'special', /* 'cloud', */ 'lyric'];
     final newType = types[_tabController.index];
     if (newType != _currentSearchType && _query.isNotEmpty) {
       _currentSearchType = newType;
@@ -180,8 +197,11 @@ class _SearchPageState extends State<SearchPage>
                 backgroundColor: useBackgroundImage
                     ? Colors.transparent
                     : colorScheme.surface,
+                    // RepaintBoundary：全屏高斯模糊随滚动逐帧移动，独立绘制层把
+                    // 模糊重算限制在本层内，不让它扩散到整页（对齐 playlist_page
+                    // flexibleSpace 的做法，AGENTS.md §10）。
                     flexibleSpace: useBackgroundImage
-                        ? ClipRect(
+                        ? RepaintBoundary(child: ClipRect(
                             child: Builder(builder: (context) {
                               // 与页面主体共用同一背景图解码结果（同 cacheWidth →
                               // ImageCache 同 key），避免各自解码
@@ -218,8 +238,12 @@ class _SearchPageState extends State<SearchPage>
                                         opacity: tp.backgroundOpacity,
                                         child: ImageFiltered(
                                           imageFilter: ui.ImageFilter.blur(
-                                            sigmaX: tp.backgroundBlur,
-                                            sigmaY: tp.backgroundBlur,
+                                            sigmaX: tvBlurSigma(
+                                              tp.backgroundBlur,
+                                            ),
+                                            sigmaY: tvBlurSigma(
+                                              tp.backgroundBlur,
+                                            ),
                                           ),
                                           child: Image(
                                             image: backgroundImageProvider(
@@ -235,14 +259,16 @@ class _SearchPageState extends State<SearchPage>
                                   ),
                                 ),
                               );
-                            }),
-                          )
+                            },
+                        ),
+                          ))
                         : null,
                     surfaceTintColor: Colors.transparent,
                     title: SizedBox(
                       height: 40,
                       child: TextField(
                         controller: _searchController,
+                        contextMenuBuilder: buildAppTextContextMenu,
                         decoration: InputDecoration(
                           hintText: '搜索歌曲、歌手、专辑',
                           hintStyle: Theme.of(context).textTheme.bodyMedium
@@ -296,15 +322,30 @@ class _SearchPageState extends State<SearchPage>
                     SliverPersistentHeader(
                       pinned: true,
                       delegate: _TabBarDelegate(
+                        // tv: 每个 Tab 一个单停点（OK = 切到该页），非 TV 构建
+                        // TvCardFocus 原样透传。这里不包 TvScrollRegion：
+                        // _TabBarDelegate 的字段类型是 TabBar，且 minExtent 要读
+                        // 它的 preferredSize；6 个页签在 TV 宽度下不滚动，
+                        // 左右换页签由同 scope 内的几何候选即可胜任。
                         tabBar: TabBar(
                           controller: _tabController,
-                          tabs: const [
-                            Tab(text: '歌曲'),
-                            Tab(text: '专辑'),
-                            Tab(text: '歌手'),
-                            Tab(text: '歌单'),
-                            Tab(text: '云盘'),
-                            Tab(text: '歌词'),
+                          tabs: [
+                            for (final (i, label) in const [
+                              '歌曲',
+                              '专辑',
+                              '歌手',
+                              '歌单',
+                              // 「搜索页 → 云盘」页签下线（2026-10-10）：
+                              // 云盘入口保留在「我的 → 云盘」（cloud_music_page.dart），
+                              // 搜索结果里不再单独占一个页签。
+                              // '云盘',
+                              '歌词',
+                            ].indexed)
+                              TvCardFocus(
+                                onSelect: () => _tabController.animateTo(i),
+                                debugLabel: 'search-tab-$label',
+                                child: Tab(text: label),
+                              ),
                           ],
                         ),
                         useBackgroundImage: useBackgroundImage,
@@ -326,8 +367,8 @@ class _SearchPageState extends State<SearchPage>
   }
 
   Widget _buildEmptyState() {
-    // 未输入关键词：搜索历史 + 音乐探索（从发现页迁移的内容模块）。
-    // 已移除「热门搜索」及其自动网络请求。
+    // 未输入关键词：热搜榜单卡 + 搜索历史 + 音乐探索（从发现页迁移的内容模块）。
+    // 热搜数据在进页时后台拉一次，失败只在卡内呈现（见 HotSearchBoardCard）。
     return ListView(
       padding: const EdgeInsets.only(bottom: AppSpacing.sm),
       children: [
@@ -362,8 +403,14 @@ class _SearchPageState extends State<SearchPage>
             ),
           ),
         ],
-        // 搜索历史与下方「音乐探索」之间加大间距，形成明显分段（见改版计划补充三）。
-        if (_searchHistory.isNotEmpty) const Gap(AppSpacing.lg),
+        HotSearchBoardCard(
+          onKeywordTap: (keyword) {
+            _searchController.text = keyword;
+            _performSearch(keyword);
+          },
+        ),
+        // 热门搜索与下方「音乐探索」之间加大间距，形成明显分段（见改版计划补充三）。
+        const Gap(AppSpacing.lg),
         // 音乐探索：主题歌单 / 场景音乐 / 热门歌单 / 排行榜 / 新碟上架，
         // 复用 KugouProvider 已有数据与缓存（内部数据为空时自动补拉）。
         const MusicExploreSections(),
@@ -374,13 +421,39 @@ class _SearchPageState extends State<SearchPage>
   Widget _buildSearchResults() {
     return TabBarView(
       controller: _tabController,
+      physics: const TabSnapPhysics(),
       children: [
-        _buildSongResults(),
-        _buildAlbumResults(),
-        _buildArtistResults(),
-        _buildPlaylistResults(),
-        _buildCloudResults(),
-        _buildLyricResults(),
+        TvScrollRegion(
+          memoryKey: 'tv/search-song',
+          horizontalEdge: DpadEdgeBehavior.leave,
+          child: _buildSongResults(),
+        ),
+        TvScrollRegion(
+          memoryKey: 'tv/search-album',
+          horizontalEdge: DpadEdgeBehavior.leave,
+          child: _buildAlbumResults(),
+        ),
+        TvScrollRegion(
+          memoryKey: 'tv/search-artist',
+          horizontalEdge: DpadEdgeBehavior.leave,
+          child: _buildArtistResults(),
+        ),
+        TvScrollRegion(
+          memoryKey: 'tv/search-playlist',
+          horizontalEdge: DpadEdgeBehavior.leave,
+          child: _buildPlaylistResults(),
+        ),
+        // 云盘结果页（随搜索页「云盘」tab 一并下线，入口仍在我的 → 云盘）：
+        // TvScrollRegion(
+        //   memoryKey: 'tv/search-cloud',
+        //   horizontalEdge: DpadEdgeBehavior.leave,
+        //   child: _buildCloudResults(),
+        // ),
+        TvScrollRegion(
+          memoryKey: 'tv/search-lyric',
+          horizontalEdge: DpadEdgeBehavior.leave,
+          child: _buildLyricResults(),
+        ),
       ],
     );
   }
@@ -394,26 +467,30 @@ class _SearchPageState extends State<SearchPage>
       return const SizedBox.shrink();
     }
 
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
-      itemCount: suggestions.length,
-      itemBuilder: (context, index) {
-        final suggestion = suggestions[index];
-        return ListTile(
-          leading: Icon(
-            Icons.search,
-            size: 20,
-            color: colorScheme.onSurfaceVariant,
-          ),
-          title: Text(suggestion, maxLines: 1, overflow: TextOverflow.ellipsis),
-          dense: true,
-          onTap: () {
-            _searchController.text = suggestion;
-            FocusManager.instance.primaryFocus?.unfocus();
-            _performSearch(suggestion);
-          },
-        );
-      },
+    return TvScrollRegion(
+      memoryKey: 'tv/search-suggest',
+      horizontalEdge: DpadEdgeBehavior.leave,
+      child: ListView.builder(
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
+        itemCount: suggestions.length,
+        itemBuilder: (context, index) {
+          final suggestion = suggestions[index];
+          return ListTile(
+            leading: Icon(
+              Icons.search,
+              size: 20,
+              color: colorScheme.onSurfaceVariant,
+            ),
+            title: Text(suggestion, maxLines: 1, overflow: TextOverflow.ellipsis),
+            dense: true,
+            onTap: () {
+              _searchController.text = suggestion;
+              FocusManager.instance.primaryFocus?.unfocus();
+              _performSearch(suggestion);
+            },
+          );
+        },
+      ),
     );
   }
 
@@ -563,10 +640,29 @@ class _SearchPageState extends State<SearchPage>
     );
   }
 
+  /// 输入法还开着时，第一次点大封面卡片只收键盘、不进详情；第二次点击才导航。
+  ///
+  /// 为什么不让第一次点击直接进详情：这条路径走的是框架 Hero（Tab 内容栈），
+  /// 飞行中的封面盒子按**起飞那一刻**的 `navigatorSize` 换算四边
+  /// （`heroes.dart:1033`），而本 App 是 `windowSoftInputMode=adjustResize`：
+  /// 点下去后输入法随新页面上场收起、窗口高度当场复原，差的那一截键盘高会整段
+  /// 加在飞行封面上（真机实测 140 的封面被撑成 436）。先把窗口尺寸稳定下来，
+  /// 转场期间高度不再变化，动画才干净。搜索词不会被清掉（只是 unfocus）。
+  bool _dismissImeBeforeNavigate() {
+    // 两个来源都要判：MediaQuery 的 viewInsets 会被显示缩放换算（ui_density），
+    // 平台那份是原始值；真机出现过一方为 0 而键盘仍弹着的情况。
+    final double mqInsets = MediaQuery.viewInsetsOf(context).bottom;
+    final double platformInsets =
+        WidgetsBinding.instance.platformDispatcher.implicitView?.viewInsets.bottom ?? 0;
+    if (mqInsets <= 0 && platformInsets <= 0) return false;
+    FocusManager.instance.primaryFocus?.unfocus();
+    return true;
+  }
+
   void _showAlbumDetail(Album album) {
-    Navigator.of(
+    AdaptiveNav.openDetail(
       context,
-    ).push(MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)));
+    (_) => AlbumDetailPage(album: album));
   }
 
   Widget _buildAlbumResults() {
@@ -595,6 +691,17 @@ class _SearchPageState extends State<SearchPage>
     if (results.isEmpty) {
       return _buildNoResult();
     }
+
+    // Hero tag 唯一性防护：专辑 tab 同样分页加载，重叠页会出现重复专辑；同 tag
+    // 在同一路由子树出现两次会在转场收集阶段抛 FlutterError。只给每个 id 首次
+    // 出现的卡片挂 Hero，空 id 不挂（否则多张空 id 卡互撞）。
+    final firstIndexById = <String, int>{};
+    for (var i = 0; i < results.length; i++) {
+      final id = results[i].id;
+      if (id.isEmpty) continue;
+      firstIndexById.putIfAbsent(id, () => i);
+    }
+
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (notification is ScrollEndNotification &&
@@ -608,7 +715,7 @@ class _SearchPageState extends State<SearchPage>
         children: [
           Expanded(
             // 用 PinchableGridView 替代固定 2 列的 GridView，
-            // Pad 模式下可双指捏合动态调整列数，非 Pad 模式仍固定 2 列
+            // Pad 模式下可双指捏合动态调整列数，非 Pad 模式按局部可用宽度自动调整列数
             child: PinchableGridView(
               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               // 原 childAspectRatio 0.75、spacing 12 保持不变
@@ -627,7 +734,13 @@ class _SearchPageState extends State<SearchPage>
                   artist: cleanArtist,
                   artworkUri: album.artworkUri,
                   icon: Icons.album,
-                  onTap: () => _showAlbumDetail(album),
+                  heroTag: firstIndexById[album.id] == index
+                      ? albumCoverHeroTag(album.id)
+                      : null,
+                  onTap: () {
+                    if (_dismissImeBeforeNavigate()) return;
+                    _showAlbumDetail(album);
+                  },
                 );
               },
             ),
@@ -712,13 +825,11 @@ class _SearchPageState extends State<SearchPage>
                   ),
                   subtitle: const Text('歌手'),
                   onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => ArtistDetailPage(
+                    AdaptiveNav.openDetail(context,
+                      (_) => ArtistDetailPage(
                           artistId: artist.id,
                           artistName: artist.name,
                           avatarUrl: artist.avatarUrl,
-                        ),
                       ),
                     );
                   },
@@ -762,6 +873,18 @@ class _SearchPageState extends State<SearchPage>
     if (results.isEmpty) {
       return _buildNoResult();
     }
+
+    // Hero tag 唯一性防护：同一子树重复 tag 在转场收集阶段抛 FlutterError
+    // （heroes.dart _allHeroesFor 的 assert）。搜索结果可能因分页重叠出现
+    // 重复歌单，只给每个 id 的首次出现挂 Hero。
+    final firstIndexById = <String, int>{};
+    for (var i = 0; i < results.length; i++) {
+      firstIndexById.putIfAbsent(
+        results[i].globalCollectionId ?? results[i].id,
+        () => i,
+      );
+    }
+
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (notification is ScrollEndNotification &&
@@ -775,7 +898,7 @@ class _SearchPageState extends State<SearchPage>
         children: [
           Expanded(
             // 用 PinchableGridView 替代固定 2 列的 GridView，
-            // Pad 模式下可双指捏合动态调整列数，非 Pad 模式仍固定 2 列
+            // Pad 模式下可双指捏合动态调整列数，非 Pad 模式按局部可用宽度自动调整列数
             child: PinchableGridView(
               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
               // 原 childAspectRatio 0.75、spacing 12 保持不变
@@ -785,16 +908,21 @@ class _SearchPageState extends State<SearchPage>
               itemBuilder: (context, index) {
                 final pl = results[index];
                 final cleanName = pl.name.replaceAll(RegExp(r'<[^>]*>'), '');
+                final plId = pl.globalCollectionId ?? pl.id;
                 return _SearchAlbumCard(
                   name: cleanName,
                   artist: pl.songCount > 0 ? '${pl.songCount} 首歌曲' : '',
                   artworkUri: pl.coverUrl,
                   icon: Icons.queue_music,
+                  heroTag: firstIndexById[plId] == index
+                      ? playlistCoverHeroTag(plId)
+                      : null,
                   onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => PlaylistPage(playlist: pl.toPlaylist()),
-                      ),
+                    // 与专辑 tab 同一口径：输入法没收起时第一下只收键盘（见
+                    // [_dismissImeBeforeNavigate]）。
+                    if (_dismissImeBeforeNavigate()) return;
+                    AdaptiveNav.openDetail(context,
+                      (_) => PlaylistPage(playlist: pl.toPlaylist()),
                     );
                   },
                 );
@@ -893,6 +1021,10 @@ class _SearchPageState extends State<SearchPage>
     }).toList();
   }
 
+  /// 云盘结果页。**当前未被挂载**（搜索页「云盘」tab 已下线，2026-10-10），
+  /// 连同 [_loadCloudSongsForSearch] / [_filteredCloudSongs] 整套保留备用，
+  /// 避免将来要恢复时重写；云盘入口仍在「我的 → 云盘」。
+  // ignore: unused_element
   Widget _buildCloudResults() {
     if (_cloudLoading) {
       return const Center(child: M3ELoadingIndicator());
@@ -1096,19 +1228,24 @@ class _SearchAlbumCard extends StatelessWidget {
   final IconData icon;
   final VoidCallback? onTap;
 
+  /// 非空时封面参与封面连贯过渡；歌单 tab 用 playlistCoverHeroTag、
+  /// 专辑 tab 用 albumCoverHeroTag（两个命名空间互斥，见各自注释）。
+  final String? heroTag;
+
   const _SearchAlbumCard({
     required this.name,
     required this.artist,
     this.artworkUri,
     this.icon = Icons.album,
     this.onTap,
+    this.heroTag,
   });
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
 
-    return ClipRRect(
+    final card = ClipRRect(
       borderRadius: AppRadius.mdAll,
       clipBehavior: Clip.antiAlias,
       child: Material(
@@ -1119,18 +1256,7 @@ class _SearchAlbumCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
-                child: artworkUri != null
-                    ? CachedNetworkImage(
-                        imageUrl: artworkUri!,
-                        memCacheWidth: 540,
-                        memCacheHeight: 540,
-                        fit: BoxFit.cover,
-                        width: double.infinity,
-                        placeholder: (_, _) => _buildPlaceholder(colorScheme),
-                        errorWidget: (_, _, _) =>
-                            _buildPlaceholder(colorScheme),
-                      )
-                    : _buildPlaceholder(colorScheme),
+                child: _coverImage(colorScheme),
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(10, AppSpacing.sm, 10, AppSpacing.xs),
@@ -1164,6 +1290,35 @@ class _SearchAlbumCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    // tv: 专辑/歌单卡片单停点（OK = 原 onTap）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'search-album-card',
+      child: card,
+    );
+  }
+
+  Widget _coverImage(ColorScheme colorScheme) {
+    final Widget image = artworkUri != null
+        ? CachedNetworkImage(
+            imageUrl: artworkUri!,
+            memCacheWidth: 540,
+            memCacheHeight: 540,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            placeholder: (_, _) => _buildPlaceholder(colorScheme),
+            errorWidget: (_, _, _) => _buildPlaceholder(colorScheme),
+          )
+        : _buildPlaceholder(colorScheme);
+    if (heroTag == null) return image;
+    // 卡片外层 ClipRRect(mdAll) 圆整卡四角，封面区只占卡片上部——可见圆角
+    // 仅上两角。hero 圆角与之对齐，飞行起点才与静止封面逐像素重合。
+    return PlaylistCoverHero(
+      tag: heroTag!,
+      radius: const BorderRadius.vertical(top: Radius.circular(AppRadius.md)),
+      child: image,
     );
   }
 
@@ -1224,8 +1379,10 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
     // 模糊 + 透明度 + 全屏 cover 背景图 topCenter 裁剪），tab 栏与
     // 搜索框背景视觉连续。ClipRect 把 OverflowBox 溢出内容裁到本 sliver
     // 区域，避免盖住下方 TabBarView 结果区。
+    // 外面再套 RepaintBoundary：全屏高斯模糊随滚动逐帧移动，独立绘制层把模糊
+    // 重算限制在本层内（与顶部 flexibleSpace 同一处理）。
     final size = MediaQuery.sizeOf(context);
-    return ClipRect(
+    return RepaintBoundary(child: ClipRect(
       child: Stack(
         children: [
           Positioned.fill(
@@ -1246,8 +1403,8 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
                       opacity: backgroundOpacity,
                       child: ImageFiltered(
                         imageFilter: ui.ImageFilter.blur(
-                          sigmaX: backgroundBlur,
-                          sigmaY: backgroundBlur,
+                          sigmaX: tvBlurSigma(backgroundBlur),
+                          sigmaY: tvBlurSigma(backgroundBlur),
                         ),
                         child: Image(
                           image: backgroundImage!,
@@ -1264,6 +1421,6 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
           tabBar,
         ],
       ),
-    );
+    ));
   }
 }

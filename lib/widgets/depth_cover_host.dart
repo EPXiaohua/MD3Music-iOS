@@ -79,6 +79,7 @@ class _DepthCoverHostState extends State<DepthCoverHost>
   int _attempts = 0;
   int _failedCycles = 0;
 
+  /// 上一次已上报的 3D 活动态（null = 还没上报过），避免每次 build 都回调。
   /// 首次从平面封面切换到 3D 时的中心扩散圆环过渡（一次性）。
   AnimationController? _ringCtrl;
   bool _ringVisible = false;

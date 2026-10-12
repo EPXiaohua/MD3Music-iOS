@@ -13,16 +13,22 @@ class CommentDisplayProvider extends ChangeNotifier {
   static const String _keyCommentFontSize = 'comment_display_font_size';
 
   /// 楼主评论字号，单位 px，默认 17.0。
-  /// 允许范围 10.0 ~ 24.0。
+  /// 允许范围 [_minCommentFontSize] ~ 24.0（正文属主内容，下限 12）。
   double _commentFontSize = 17.0;
+
+  /// 字号下限：可读性硬下限（正文类取 12）
+  static const double _minCommentFontSize = 12.0;
+
+  /// 字号上限
+  static const double _maxCommentFontSize = 24.0;
 
   /// 楼主评论字号
   double get commentFontSize => _commentFontSize;
 
-  /// 楼中楼回复字号 = 楼主字号 - 3.0，最小 10.0（避免过小无法阅读）。
+  /// 楼中楼回复字号 = 楼主字号 - 3.0，回复仍属正文，下限 12。
   double get commentReplyFontSize {
     final reply = _commentFontSize - 3.0;
-    return reply < 10.0 ? 10.0 : reply;
+    return reply < _minCommentFontSize ? _minCommentFontSize : reply;
   }
 
   CommentDisplayProvider() {
@@ -33,15 +39,16 @@ class CommentDisplayProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     final value = prefs.getDouble(_keyCommentFontSize);
     if (value != null) {
-      _commentFontSize = value.clamp(10.0, 24.0);
+      _commentFontSize = value.clamp(_minCommentFontSize, _maxCommentFontSize);
       notifyListeners();
     }
   }
 
-  /// 设置楼主评论字号（10.0 ~ 24.0 px），楼中楼字号自动 = 楼主 - 3。
+  /// 设置楼主评论字号（[_minCommentFontSize] ~ [_maxCommentFontSize] px），
+  /// 楼中楼字号自动 = 楼主 - 3。
   /// 持久化到 SharedPreferences。
   Future<void> setCommentFontSize(double size) async {
-    final clamped = size.clamp(10.0, 24.0);
+    final clamped = size.clamp(_minCommentFontSize, _maxCommentFontSize);
     if ((_commentFontSize - clamped).abs() < 0.01) return;
     _commentFontSize = clamped;
     notifyListeners();

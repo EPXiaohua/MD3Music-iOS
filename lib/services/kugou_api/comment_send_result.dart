@@ -13,7 +13,15 @@ class CommentSendResult {
   /// 面向用户的失败原因；成功时为空串。
   final String message;
 
-  const CommentSendResult({required this.ok, this.errorCode, this.message = ''});
+  /// 风控事件，供获取安全验证类型使用；不包含评论正文。
+  final String? verificationEventId;
+
+  bool get needsVerification => !ok &&
+      (errorCode == 20028 || errorCode == 60045) &&
+      verificationEventId != null;
+
+  const CommentSendResult({required this.ok, this.errorCode, this.message = '',
+    this.verificationEventId});
 
   static const CommentSendResult success = CommentSendResult(ok: true);
 
@@ -25,11 +33,18 @@ class CommentSendResult {
     if (json == null) return CommentSendResult.failure('网络异常，请稍后重试');
 
     final status = _asInt(json['status']);
-    final errorCode = _asInt(json['error_code']);
+    final errorCode = _asInt(json['error_code']) ?? _asInt(json['err_code']);
     if (status == 1 && (errorCode == null || errorCode == 0)) {
       return CommentSendResult.success;
     }
 
+    final data = json['data'];
+    final event = _messageOf(json['ssaCode'] ??
+        (data is Map ? data['event_id'] : null));
+    if ((errorCode == 20028 || errorCode == 60045) && event.isNotEmpty) {
+      return CommentSendResult(ok: false, errorCode: errorCode,
+        message: '请完成安全验证后再次发送', verificationEventId: event);
+    }
     final msg = _messageOf(json['msg'] ?? json['error_msg'] ?? json['message']);
     if (msg.isNotEmpty) {
       return CommentSendResult.failure(msg, errorCode: errorCode);

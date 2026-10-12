@@ -10,6 +10,7 @@ Widget _wrap({
   ValueChanged<Duration>? onSeekEnd,
   VoidCallback? onSeekStart,
   bool md3Style = true,
+  bool waveEnabled = true,
   bool isPlaying = false,
   double speed = 1.0,
   double? climaxStart,
@@ -24,6 +25,7 @@ Widget _wrap({
             position: position,
             duration: duration,
             md3Style: md3Style,
+            waveEnabled: waveEnabled,
             isPlaying: isPlaying,
             speed: speed,
             climaxStart: climaxStart,
@@ -50,6 +52,15 @@ Finder _canvas() => find.descendant(
   ),
 );
 
+/// 时间数字的淡化档位。
+///
+/// 每个时间数字各包一层 AnimatedOpacity（徽章不参与，见 player_seek_bar.dart
+/// 的 _buildLabelRow），所以这里取的是「全部」而不是第一个。
+List<double> _labelOpacities(WidgetTester tester) => tester
+    .widgetList<AnimatedOpacity>(find.byType(AnimatedOpacity))
+    .map((w) => w.opacity)
+    .toList();
+
 void main() {
   group('PlayerSeekBar', () {
     testWidgets('常态高度 38，时间常显但压暗', (tester) async {
@@ -64,11 +75,8 @@ void main() {
       // 时间常显：左＝已播放，右＝剩余（负号）
       expect(find.text('0:30'), findsOneWidget);
       expect(find.text('-1:30'), findsOneWidget);
-      // 静止时压暗到 50%
-      final opacity = tester.widget<AnimatedOpacity>(
-        find.byType(AnimatedOpacity),
-      );
-      expect(opacity.opacity, 0.5);
+      // 静止时压暗到 50%（时间数字各包一层 AnimatedOpacity，两个都得是 0.5）
+      expect(_labelOpacities(tester), <double>[0.5, 0.5]);
     });
 
     testWidgets('画布拿到完整宽高（回归：CustomPaint 默认 size 为 0 导致轨道不可见）', (
@@ -113,10 +121,7 @@ void main() {
 
       expect(started, isTrue);
       // 拖动中时间提亮到全不透明
-      final opacity = tester.widget<AnimatedOpacity>(
-        find.byType(AnimatedOpacity),
-      );
-      expect(opacity.opacity, 1);
+      expect(_labelOpacities(tester), <double>[1, 1]);
       // 剩余时间用负号显示
       expect(find.text('1:00'), findsOneWidget);
       expect(find.text('-1:00'), findsOneWidget);
@@ -187,11 +192,40 @@ void main() {
       // 上色动画 220ms 跑完
       await tester.pump(const Duration(milliseconds: 300));
 
+      // 本用例测的是「已播段用强调色、未播段用灰色」的颜色归属，不是几何形状。
+      // MD3 皮肤播放中已播段改走正弦波 Path 描边（AGENTS.md §10 的
+      // PlayerFrameDriver 驱动），故这里断言 path 而非 rrect：
+      // 未播段仍是灰色 rrect，已播段是强调色（strokeWidth = 常态轨道高 3px）。
       expect(
         tester.renderObject(_canvas()),
         paints
           ..rrect(color: Colors.grey)
-          ..rrect(color: Colors.blue),
+          ..path(color: Colors.blue, strokeWidth: 3),
+      );
+    });
+
+    testWidgets('回退开关关闭时，播放中也画直线（不走波浪 Path）', (tester) async {
+      await tester.pumpWidget(
+        _wrap(
+          position: const Duration(seconds: 30),
+          duration: const Duration(minutes: 2),
+          isPlaying: true,
+          waveEnabled: false,
+        ),
+      );
+      // 上色动画 220ms 跑完（与「播放时已播放段用强调色」同一节奏）
+      await tester.pump(const Duration(milliseconds: 300));
+
+      // 回退形态 = 未播段灰 rrect + 已播段强调色 rrect，
+      // 与相邻的「播放时已播放段用强调色」（path + strokeWidth 3）形成对照
+      expect(
+        tester.renderObject(_canvas()),
+        paints..rrect(color: Colors.grey)..rrect(color: Colors.blue),
+      );
+      // 没有任何 Path 描边 → 已播段与高潮段都走了直线分支
+      expect(
+        tester.renderObject(_canvas()),
+        paintsExactlyCountTimes(#drawPath, 0),
       );
     });
 

@@ -1,8 +1,11 @@
+import '../../core/build_flags.dart';
+import '../../core/layout/page_layout.dart';
+import '../../core/remote/remote_slider.dart';
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:md3music/core/utils/app_toast.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
+import '../../core/utils/app_haptics.dart';
 
 /// 歌词动画调节子页面。
 ///
@@ -37,7 +40,8 @@ class LyricAnimationSettingsPage extends StatelessWidget {
           ),
         ],
       ),
-      body: AnimatedBuilder(
+      body: ContentWidth(
+        child: AnimatedBuilder(
         animation: prefs,
         builder: (context, _) {
           return ListView(
@@ -65,7 +69,8 @@ class LyricAnimationSettingsPage extends StatelessWidget {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
                 child: Text('当前行细节',
-                    style: TextStyle(fontWeight: FontWeight.w600)),
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
               ),
               _buildSliderTile<double>(
                 prefs: prefs,
@@ -81,7 +86,8 @@ class LyricAnimationSettingsPage extends StatelessWidget {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
                 child: Text('切行错峰（下方行滞后跟随）',
-                    style: TextStyle(fontWeight: FontWeight.w600)),
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
               ),
               _buildSliderTile<double>(
                 prefs: prefs,
@@ -119,7 +125,8 @@ class LyricAnimationSettingsPage extends StatelessWidget {
                 title: const Text('错峰从当前行上方开始'),
                 subtitle: const Text(
                     '开启：当前行的上一行领头回位，以下各行依次跟随；'
-                    '关闭：从视口顶部开始错峰'),
+                    '关闭：从视口顶部开始错峰',
+                  ),
                 value: prefs.staggerFromCurrentLine,
                 onChanged: (v) => prefs.setStaggerFromCurrentLine(v),
               ),
@@ -127,7 +134,8 @@ class LyricAnimationSettingsPage extends StatelessWidget {
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
                 child: Text('歌词效果',
-                    style: TextStyle(fontWeight: FontWeight.w600)),
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
               ),
               // 歌词模糊强度：仅高斯模糊开启时显示（开关在播放页样式页，
               // AnimatedBuilder 监听 prefs，开关变化后进本页即自动显隐）
@@ -155,6 +163,7 @@ class LyricAnimationSettingsPage extends StatelessWidget {
             ],
           );
         },
+        ),
       ),
     );
   }
@@ -192,7 +201,7 @@ class LyricAnimationSettingsPage extends StatelessWidget {
     );
     if (confirmed != true) return;
 
-    HapticFeedback.mediumImpact();
+    AppHaptics.mediumImpact(HapticCategory.control);
     await prefs.setInactiveScale(LyricPreferences.defaultInactiveScale);
     await prefs.setAlignPosition(LyricPreferences.defaultAlignPosition);
     await prefs.setLiftHeightPx(LyricPreferences.defaultLiftHeightPx);
@@ -228,17 +237,29 @@ class LyricAnimationSettingsPage extends StatelessWidget {
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          child: M3ESlider(
-            decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium),
-            // 不传 divisions → 无极连续滑块（无档位小圆点）
-            value: value,
-            min: min,
-            max: max,
-            label: label,
-            onChanged: onChanged,
-            onChangeEnd: onChanged,
-          ),
+          // tv: TV 构建换 RemoteSlider——M3ESlider 自带 Focus 吞四方向键；
+          // TV 分支丢 M3ESliderDecoration 触觉参数（P-C）
+          child: kTvBuild
+              ? RemoteSlider(
+                  // 不传 divisions → 无极连续滑块（无档位小圆点）
+                  value: value,
+                  min: min,
+                  max: max,
+                  label: label,
+                  onChanged: onChanged,
+                  onChangeEnd: onChanged,
+                )
+              : M3ESlider(
+                  decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium),
+                  // 不传 divisions → 无极连续滑块（无档位小圆点）
+                  value: value,
+                  min: min,
+                  max: max,
+                  label: label,
+                  onChanged: onChanged,
+                  onChangeEnd: onChanged,
+                ),
         ),
       ],
     );

@@ -42,6 +42,7 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
   // 断网/加载失败时从本地持久化兜底读到的封面字节
   Uint8List? _localArtworkBytes;
   bool _hasTriedLocalFallback = false;
+  int _localArtworkRequestVersion = 0;
 
   @override
   void initState() {
@@ -57,6 +58,7 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
     super.didUpdateWidget(oldWidget);
     // songId 变化时重新预查缓存（列表项复用场景）
     if (widget.songId != oldWidget.songId) {
+      _localArtworkRequestVersion++;
       _localArtworkBytes = null;
       _hasTriedLocalFallback = false;
       _prefetchLocalArtwork();
@@ -65,6 +67,8 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
 
   Future<void> _prefetchLocalArtwork() async {
     if (widget.songId == null || widget.songId!.isEmpty) return;
+    final String songId = widget.songId!;
+    final int requestVersion = _localArtworkRequestVersion;
     final uri = widget.artworkUri;
     // artworkUri 为 null（云盘歌曲封面内嵌、无 URL）或 http(s) 封面时，
     // 尝试从本地持久化读取封面（云盘歌曲播放时提取的内嵌封面）。
@@ -75,8 +79,11 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
     final reader = SmartArtworkImage.localArtworkReader;
     if (reader == null) return;
     try {
-      final bytes = await reader(widget.songId!);
-      if (bytes != null && mounted) {
+      final bytes = await reader(songId);
+      if (bytes != null &&
+          mounted &&
+          requestVersion == _localArtworkRequestVersion &&
+          widget.songId == songId) {
         setState(() {
           _localArtworkBytes = bytes;
         });
@@ -174,6 +181,19 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
           height: isFill ? double.infinity : widget.size,
           fit: BoxFit.cover,
           cacheWidth: decodeWidth,
+          // tv: 10-foot 图片占位审计补齐——占位符（loadingBuilder）与错误兜底
+          // （errorBuilder）原本就有，缺 fadeIn：首帧到达时从占位符硬切到图片，
+          // 电视上遍历长列表会成片突跳。frameBuilder 淡入 200ms；命中内存缓存
+          // （wasSynchronouslyLoaded）直接显示不淡入，滚动回访不闪。对触屏同样
+          // 是标准 Material 淡入行为，不按 kTvBuild 分叉。
+          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+            if (wasSynchronouslyLoaded) return child;
+            return AnimatedOpacity(
+              opacity: frame == null ? 0 : 1,
+              duration: const Duration(milliseconds: 200),
+              child: child,
+            );
+          },
           errorBuilder: (_, _, _) {
             // 在线加载失败：先尝试本地持久化兜底，再退到 fallbackFilePath / 占位符
             if (!_hasTriedLocalFallback) {
@@ -236,6 +256,15 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
         height: widget.size,
         fit: BoxFit.cover,
         cacheWidth: decodeWidth,
+        // tv: 与上方 http(s) 主路径同一 fadeIn（见那里的注释）。
+        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+          if (wasSynchronouslyLoaded) return child;
+          return AnimatedOpacity(
+            opacity: frame == null ? 0 : 1,
+            duration: const Duration(milliseconds: 200),
+            child: child,
+          );
+        },
         errorBuilder: (_, _, _) => _placeholder(colorScheme),
       );
     }
@@ -250,11 +279,16 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
   /// 读取成功后触发重建，用 Image.memory 显示。
   Future<void> _loadLocalArtworkFallback() async {
     if (widget.songId == null || widget.songId!.isEmpty) return;
+    final String songId = widget.songId!;
+    final int requestVersion = _localArtworkRequestVersion;
     final reader = SmartArtworkImage.localArtworkReader;
     if (reader == null) return;
     try {
-      final bytes = await reader(widget.songId!);
-      if (bytes != null && mounted) {
+      final bytes = await reader(songId);
+      if (bytes != null &&
+          mounted &&
+          requestVersion == _localArtworkRequestVersion &&
+          widget.songId == songId) {
         setState(() {
           _localArtworkBytes = bytes;
         });
@@ -274,7 +308,10 @@ class _SmartArtworkImageState extends State<SmartArtworkImage> {
       ),
       child: Icon(
         Icons.music_note,
-        size: widget.size * 0.4,
+        // size 为 infinity（列表/网格卡片按容器铺满）时不能直接乘比例：Icon 拿到
+        // 非有限字号会在 TextPainter 布局断言（`fontSize.isFinite`）。与上面
+        // loadingBuilder 的 isFill 分支取同一档 40。
+        size: widget.size.isFinite ? widget.size * 0.4 : 40,
         color: colorScheme.onSurfaceVariant,
       ),
     );

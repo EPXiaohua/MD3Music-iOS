@@ -1,6 +1,8 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../../../core/build_flags.dart';
+import '../../../core/remote/remote_slider.dart';
 import '../../../core/services/custom_font_loader.dart';
 import '../../../core/utils/app_toast.dart';
 import 'lyric_preferences.dart';
@@ -48,37 +50,69 @@ class LyricPreferencesPanel extends StatelessWidget {
               const SizedBox(height: 8),
               // 字号滑块
               Text('字号：${prefs.fontSize.round()} px'),
-              M3ESlider(
-                min: LyricPreferences.minFontSize,
-                max: LyricPreferences.maxFontSize,
-                value: prefs.fontSize,
-                onChanged: prefs.setFontSize,
-              ),
+              // tv: TV 构建换 RemoteSlider——M3ESlider 自带 Focus 会吞四方向键
+              // （上下左右全部调值），D-pad 落上去焦点无法移出；触屏原样。
+              kTvBuild
+                  ? RemoteSlider(
+                      min: LyricPreferences.minFontSize,
+                      max: LyricPreferences.maxFontSize,
+                      value: prefs.fontSize,
+                      onChanged: prefs.setFontSize,
+                    )
+                  : M3ESlider(
+                      min: LyricPreferences.minFontSize,
+                      max: LyricPreferences.maxFontSize,
+                      value: prefs.fontSize,
+                      onChanged: prefs.setFontSize,
+                    ),
               const SizedBox(height: 8),
               // 字重滑块
               Text('字重：${_fontWeightLabel(prefs.fontWeightValue)}'),
-              M3ESlider(
-                min: LyricPreferences.minFontWeight.toDouble(),
-                max: LyricPreferences.maxFontWeight.toDouble(),
-                divisions: ((LyricPreferences.maxFontWeight -
-                        LyricPreferences.minFontWeight) ~/
-                    100),
-                value: prefs.fontWeightValue.toDouble(),
-                onChanged: (v) => prefs.setFontWeight(v.round()),
-              ),
+              // tv: 同上（P-C 滑杆替换）
+              kTvBuild
+                  ? RemoteSlider(
+                      min: LyricPreferences.minFontWeight.toDouble(),
+                      max: LyricPreferences.maxFontWeight.toDouble(),
+                      divisions: ((LyricPreferences.maxFontWeight -
+                              LyricPreferences.minFontWeight) ~/
+                          100),
+                      value: prefs.fontWeightValue.toDouble(),
+                      onChanged: (v) => prefs.setFontWeight(v.round()),
+                    )
+                  : M3ESlider(
+                      min: LyricPreferences.minFontWeight.toDouble(),
+                      max: LyricPreferences.maxFontWeight.toDouble(),
+                      divisions: ((LyricPreferences.maxFontWeight -
+                              LyricPreferences.minFontWeight) ~/
+                          100),
+                      value: prefs.fontWeightValue.toDouble(),
+                      onChanged: (v) => prefs.setFontWeight(v.round()),
+                    ),
               const SizedBox(height: 8),
               // 行间距滑块
               Text('行间距：${prefs.lineSpacing.toStringAsFixed(1)} ×'),
-              M3ESlider(
-                min: LyricPreferences.minLineSpacing,
-                max: LyricPreferences.maxLineSpacing,
-                divisions: ((LyricPreferences.maxLineSpacing -
-                            LyricPreferences.minLineSpacing) *
-                        10)
-                    .round(),
-                value: prefs.lineSpacing,
-                onChanged: prefs.setLineSpacing,
-              ),
+              // tv: 同上（P-C 滑杆替换）
+              kTvBuild
+                  ? RemoteSlider(
+                      min: LyricPreferences.minLineSpacing,
+                      max: LyricPreferences.maxLineSpacing,
+                      divisions: ((LyricPreferences.maxLineSpacing -
+                                  LyricPreferences.minLineSpacing) *
+                              10)
+                          .round(),
+                      value: prefs.lineSpacing,
+                      onChanged: prefs.setLineSpacing,
+                    )
+                  : M3ESlider(
+                      min: LyricPreferences.minLineSpacing,
+                      max: LyricPreferences.maxLineSpacing,
+                      divisions: ((LyricPreferences.maxLineSpacing -
+                                  LyricPreferences.minLineSpacing) *
+                              10)
+                          .round(),
+                      value: prefs.lineSpacing,
+                      onChanged: prefs.setLineSpacing,
+                    ),
               const SizedBox(height: 8),
               // 实际行高预览
               Text(

@@ -24,6 +24,20 @@ final ValueNotifier<bool> kPlayerLandscapeImmersiveActive = ValueNotifier<bool>(
 /// 仅影响横屏自动沉浸；Zen 模式（用户长按封面主动进入）不受此开关影响。
 bool kLandscapeImmersiveEnabled = true;
 
+/// 全屏播放器宽屏（横屏/平板）「横屏控制面板独立页」开关（设置 → 播放页样式 → 顶栏与页签），默认关闭。
+///
+/// 关闭（默认）时宽屏底部常驻控制带，进度条/传输行/音量条与歌词同屏；
+/// 开启后把控制面板搬进 tab 结构里的「控制」页签，歌词/歌单/评论获得整栏高度。
+/// 由 app.dart 启动引导恢复、设置页开关即时同步；两个 full_player 的
+/// [_syncTabLayout] 监听它并在变化时重算 tab 结构（用 ValueNotifier 而非 plain bool，
+/// 是因为播放器页打开时改设置也要即时生效，与 kLandscapeImmersiveEnabled 的
+/// 「再次进入才生效」不同）。
+///
+/// 初值与 `SettingsRepository.getLandscapeDetachedControls` 的默认值保持一致，
+/// 否则启动载入前会短暂按另一套形态渲染。
+final ValueNotifier<bool> kLandscapeDetachedControlsEnabled =
+    ValueNotifier<bool>(false);
+
 /// 全屏播放器竖屏下的系统栏样式。
 ///
 /// **重要**：[AmStyleFullPlayer._buildFullLayout] 中 AnnotatedRegion 的 value

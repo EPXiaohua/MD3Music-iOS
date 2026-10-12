@@ -10,6 +10,9 @@ library;
 
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:md3music/core/build_flags.dart';
+import 'package:md3music/core/remote/remote_slider.dart';
+import 'package:md3music/core/utils/app_text_context_menu.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences_panel.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -132,13 +135,22 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
                   children: [
                     Text('${(_currentTimeMs / 1000).toStringAsFixed(1)}s'),
                     Expanded(
-                      child: Slider(
-                        value: _currentTimeMs.toDouble(),
-                        min: 0,
-                        max: _maxTimeMs.toDouble(),
-                        onChanged: (v) =>
-                            setState(() => _currentTimeMs = v.toInt()),
-                      ),
+                      // tv: TV 构建换 RemoteSlider——原生 Slider 吞四方向键（P-C）
+                      child: kTvBuild
+                          ? RemoteSlider(
+                              value: _currentTimeMs.toDouble(),
+                              min: 0,
+                              max: _maxTimeMs.toDouble(),
+                              onChanged: (v) =>
+                                  setState(() => _currentTimeMs = v.toInt()),
+                            )
+                          : Slider(
+                              value: _currentTimeMs.toDouble(),
+                              min: 0,
+                              max: _maxTimeMs.toDouble(),
+                              onChanged: (v) =>
+                                  setState(() => _currentTimeMs = v.toInt()),
+                            ),
                     ),
                     IconButton(
                       icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
@@ -154,6 +166,7 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
                       padding: const EdgeInsets.all(16),
                       child: TextField(
                         controller: _textController,
+                        contextMenuBuilder: buildAppTextContextMenu,
                         maxLines: 10,
                         decoration: const InputDecoration(
                           border: OutlineInputBorder(),

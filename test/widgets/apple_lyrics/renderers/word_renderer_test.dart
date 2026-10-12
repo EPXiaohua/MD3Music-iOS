@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:md3music/core/utils/lyric_wrap_plan.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -610,6 +611,117 @@ void main() {
         renderer.tick(0.016, 2500);
       }
       expect(renderer.wordYOffsetsRef[0], closeTo(0.0, 0.01));
+    });
+  });
+
+  // ==================== 平衡换行：逐字落点必须跟计划一致 ====================
+  group('平衡换行（wrapPlan 消费）', () {
+    // 本组会写入偏好（关闭平衡那条），故独立准备 mock prefs 与回滚，
+    // 写法同「已播字上浮高度跟随偏好」组，避免污染同文件其他用例。
+    setUp(() {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => LyricPreferences.instance.reset());
+    });
+
+    // 7 个单字 word，Ahem 下每字宽 15，maxWidth=55：
+    //   贪心 → 每行字数 [3,3,1]（末行只剩 1 字，就是用户抱怨的观感）
+    //   平衡 → [2,2,3]
+    // 两者行数都是 3，所以必须断言「每行字数」的分组，而不是只断言行数。
+    // 断言值取 DP 实测：行宽目标函数（各行 slack² 之和）下 [2,2,3] 与 [3,2,2]
+    // 代价完全相同（30/30/45 与 45/30/30 的 slack² 和都是 1350），实现按 j 升序
+    // 取首个最优，故落在前缀短的那份。这不是缺陷——两种分组都消除了 1 字末行。
+    LyricLine sevenChars() => const LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '一二三四五六七',
+      words: [
+        LyricWord(startTime: 0, duration: 100, text: '一'),
+        LyricWord(startTime: 100, duration: 100, text: '二'),
+        LyricWord(startTime: 200, duration: 100, text: '三'),
+        LyricWord(startTime: 300, duration: 100, text: '四'),
+        LyricWord(startTime: 400, duration: 100, text: '五'),
+        LyricWord(startTime: 500, duration: 100, text: '六'),
+        LyricWord(startTime: 600, duration: 100, text: '七'),
+      ],
+    );
+
+    /// 按绘制 y 把 word 归组，得到每视觉行的 word 个数。
+    List<int> wordCountsPerRow(List<ui.Offset> offsets) {
+      final Map<double, int> byY = <double, int>{};
+      for (final o in offsets) {
+        byY[o.dy] = (byY[o.dy] ?? 0) + 1;
+      }
+      final ys = byY.keys.toList()..sort();
+      return [for (final y in ys) byY[y]!];
+    }
+
+    test('绘制分组 == 计划分组（贪心残留会被这条抓住）', () {
+      const fontSize = 15.0;
+      const maxWidth = 55.0;
+      final line = sevenChars();
+      final plan = LyricWrapPlanner.forLine(
+        line,
+        LyricLayout.mainStyle(fontSize),
+        maxWidth,
+        balanced: true,
+      );
+      // 先确认计划本身是平衡版：分组 [2,2,3]
+      expect(
+        plan.rowStarts,
+        <int>[0, 2, 4],
+        reason: 'Ahem 15/字 × 7 字、可用宽 55 时 DP 应给 [2,2,3]',
+      );
+
+      final r = WordRenderer()
+        ..setLineState(isActive: true, scale: LyricLayout.activeScale);
+      final canvas = RecordingCanvas();
+      r.paintLine(
+        canvas,
+        ui.Offset.zero,
+        line,
+        fontSize,
+        maxWidth: maxWidth,
+        viewportWidth: 200,
+      );
+
+      expect(
+        wordCountsPerRow(canvas.drawParagraphOffsets),
+        <int>[2, 2, 3],
+        reason: 'WordRenderer 必须按换行计划分组，不得再自行贪心断行',
+      );
+      // 行盒阶梯同样要一致：主行完整行高、换行行 0.8x
+      final ys = canvas.drawParagraphOffsets.map((o) => o.dy).toSet().toList()
+        ..sort();
+      final mainLineHeight = fontSize * LyricLayout.lineHeight;
+      final wrapLineHeight =
+          mainLineHeight * LyricLayout.wrapLineHeightFactor;
+      expect(ys.length, plan.rowCount);
+      expect(ys[0], closeTo(0, 1e-6));
+      expect(ys[1], closeTo(mainLineHeight, 1e-6));
+      expect(ys[2], closeTo(mainLineHeight + wrapLineHeight, 1e-6));
+    });
+
+    test('关闭平衡时分组退回旧贪心 [3,3,1]', () async {
+      await LyricPreferences.instance.setLineBalance(false);
+      const fontSize = 15.0;
+      const maxWidth = 55.0;
+      final line = sevenChars();
+      final r = WordRenderer()
+        ..setLineState(isActive: true, scale: LyricLayout.activeScale);
+      final canvas = RecordingCanvas();
+      r.paintLine(
+        canvas,
+        ui.Offset.zero,
+        line,
+        fontSize,
+        maxWidth: maxWidth,
+        viewportWidth: 200,
+      );
+      expect(
+        wordCountsPerRow(canvas.drawParagraphOffsets),
+        <int>[3, 3, 1],
+        reason: '开关关闭必须与改造前的贪心行为完全一致',
+      );
     });
   });
 }

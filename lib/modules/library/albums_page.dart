@@ -109,6 +109,9 @@ class _AlbumsPageState extends State<AlbumsPage> {
               onTap: () {
                 final library = context.read<LibraryProvider>();
                 final songs = library.getSongsInAlbum(widget.albums[index].name);
+                // 清除搜索框焦点历史，避免从详情返回时自动弹出输入法。
+                FocusManager.instance.primaryFocus?.unfocus();
+                FocusManager.instance.applyFocusChangesIfNeeded();
                 AdaptiveNav.openDetail(
                   context,
                   (_) => AlbumSongsPage(

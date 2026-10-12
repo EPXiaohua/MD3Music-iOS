@@ -13,6 +13,27 @@ const List<String> defaultScanDirs = [
   '/storage/emulated/0/kugou/down_kg',
 ];
 
+/// Windows 默认扫描目录：用户在「音乐 / 下载 / 桌面」下的常见位置。
+///
+/// 上面那份 [defaultScanDirs] 是 Android 专属路径（`/storage/emulated/0/...`），
+/// 在 Windows 上一条都不存在 → 默认扫描永远返回 0 个文件，用户不加自定义目录
+/// 就永远是空的「本地音乐」。这里按用户主目录拼出候选路径。
+List<String> get defaultScanDirsForPlatform {
+  if (Platform.isWindows) {
+    final home = Platform.environment['USERPROFILE'] ?? '';
+    if (home.isEmpty) return const [];
+    final sep = Platform.pathSeparator;
+    final dirs = <String>[
+      '$home${sep}Music',
+      '$home${sep}Downloads',
+      '$home${sep}Desktop',
+    ];
+    // 去掉重复项（如用户主目录本身就是 Music 时）
+    return dirs.toSet().toList();
+  }
+  return defaultScanDirs;
+}
+
 /// 支持的音频文件扩展名（用于过滤目录扫描结果）。
 /// 仅保留纯音频格式，不含 .mp4/.mov 等视频容器。
 const Set<String> audioExtensions = {
@@ -142,7 +163,8 @@ bool _isPathExcluded(String path, List<String> excludedDirs) {
 
 /// 从文件路径提取标题（当 metadata 无 title 时回退）。
 String _extractTitleFromPath(String path) {
-  final fileName = path.split('/').last;
+  // Windows 路径用 `\` 分隔（`C:\Music\a.mp3`），只按 `/` 切会拿到整条路径当标题。
+  final fileName = path.split(RegExp(r'[/\\]')).last;
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot > 0) return fileName.substring(0, lastDot);
   return fileName;

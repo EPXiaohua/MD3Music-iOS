@@ -1,11 +1,13 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../core/utils/app_haptics.dart';
 import '../data/models/song.dart';
+import '../modules/player/playlist_swipe.dart';
 import '../providers/player_provider.dart';
 import 'm3e_sort_sheet.dart';
 import 'player_artwork_image.dart';
@@ -29,18 +31,34 @@ class PlayerPlaylistView extends StatefulWidget {
   /// false 用主题莫奈色（为 MD3 风格 tab/浅色背景设计）。
   final bool useAmColors;
 
-  /// 「在播放列表 tab 上从右往左滑」时回调，由播放器页面切到下一个 tab
-  /// （手机竖屏是封面页；宽屏/平板没有封面 tab 时是歌词页）。
+  /// 滑页手势的三段上报（原始指针判定，见 playlist_swipe.dart）。
   ///
-  /// 面板本身不知道 tab 结构，所以只上报手势、具体切到哪一页由宿主决定。
-  /// 为空时不启用该判定（独立使用本面板时无副作用）。
-  final VoidCallback? onSwipeToNextTab;
+  /// 面板每行卡片都注册了水平拖拽（滑动删除），外层 TabBarView 收不到事件，
+  /// 所以判定在面板内完成，并**逐帧**上报进度，让页面跟手，而不是过了阈值才跳。
+  /// 全部为空时不启用该判定（独立使用本面板时无副作用）。
+  /// 进入跟手阶段时回调一次（在第一次上报进度**之前**）：宿主在这里记下
+  /// 「从哪一页开始拖」，好让补间途中被重新抓住时不跳回第 0 页。
+  final VoidCallback? onSwipeStart;
+
+  /// 拖动中：已滑过的比例（0~1，1 = 整页宽度）。越过 touch slop 的那一次移动
+  /// 被丢弃（与 Scrollable 的 `_pastTouchSlop` 同口径），避免手指刚一动就跳一截。
+  final ValueChanged<double>? onSwipeProgress;
+
+  /// 松手：水平速度（逻辑像素/秒，向左为负）与面板宽度，供宿主算吸附到哪一页。
+  final void Function(double velocity, double panelWidth)? onSwipeRelease;
+
+  /// 滚动位置的归属（宿主持有）。面板会被 PageView 销毁重建，控制器与
+  /// 「偏移属于哪首歌」必须活在面板之外，否则切回来就是顶部。
+  final PlaylistScrollAnchor scrollAnchor;
 
   const PlayerPlaylistView({
     super.key,
+    required this.scrollAnchor,
     this.useDisplayName = true,
     this.useAmColors = true,
-    this.onSwipeToNextTab,
+    this.onSwipeStart,
+    this.onSwipeProgress,
+    this.onSwipeRelease,
   });
 
   @override
@@ -85,9 +103,63 @@ class _PanelColors {
   final Color handle;
 }
 
+/// 播放列表滚动位置的**归属**：由播放页 State 持有，面板只借用它。
+///
+/// 为什么不能在面板内部 new 控制器：面板挂在 `PlayerTabPager`（`PageView` +
+/// `children`，cacheExtent=0）上，切到歌词/评论页签时**整棵子树被销毁**
+/// （`player_tab_pager.dart` 里自己就写着这条）。控制器随 State 一起消失，
+/// 重建时滚动位置自然归零 —— 用户看到的就是「切走再回来回到顶部」。
+///
+/// 为什么不能用 `TrackingScrollController`（听起来正是为「同一路由里多个懒建
+/// 滚动视图」准备的）：SDK `scroll_controller.dart` 的 `detach()` 里有
+/// `if (_positionToListener.isEmpty) _lastUpdatedOffset = null;` —— **最后一个
+/// client 摘掉时记录就清零**，而本例恰恰是「唯一的那个列表被连子树销毁」。
+/// 实测：手指滚到 880，重建回来是 0。所以偏移要自己记账，并赶在**新 position
+/// 创建之前**通过 `ScrollController(initialScrollOffset:)` 交回去（这个值只能在
+/// 构造时给）—— 于是列表出生就在原偏移，不需要事后再 jumpTo，也就不会闪一帧顶部。
+///
+/// [positionedForSongId] 记的是「这份偏移是为哪首歌取得的」。面板每次重建都会
+/// 「滚到当前播放曲」，那条自动定位会把刚恢复回来的位置直接盖掉（当前曲靠前时
+/// 目标还被 clamp 成 0，看起来更是回到顶部）。有了它就能把两种语义分开：
+/// **同一首歌内切走再回来保持原位；歌变了才跟到新曲**。
+class PlaylistScrollAnchor {
+  PlaylistScrollAnchor() {
+    _controller = _make(0);
+  }
+
+  late ScrollController _controller;
+  double? _savedOffset;
+
+  /// 面板借用的控制器。身份只在「没有任何 client」的安全时刻被换掉（见
+  /// [attachForNewPanel]），所以面板存续期间 Scrollable 不会看到控制器变卦。
+  ScrollController get controller => _controller;
+
+  /// 已定位过的那首歌 id；null = 还没定位过（面板第一次出现）。
+  String? positionedForSongId;
+
+  ScrollController _make(double initialOffset) => ScrollController(
+    initialScrollOffset: initialOffset,
+    // 摘掉的那一刻 position.pixels 仍可读：就地记账，交给下一任面板出生时用。
+    onDetach: (position) => _savedOffset = position.pixels,
+  );
+
+  /// 面板 `initState` 调用：把上一任面板留下的偏移装进一个新控制器。
+  void attachForNewPanel() {
+    final saved = _savedOffset;
+    // 有 client 说明上一任还活着（本不该发生：三个布局分支同一时刻只建一个），
+    // 此时绝不换控制器。
+    if (saved == null || _controller.hasClients) return;
+    _controller.dispose();
+    _controller = _make(saved);
+  }
+
+  void dispose() => _controller.dispose();
+}
+
 class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
-  /// 播放列表滚动控制器
-  final ScrollController _scrollController = ScrollController();
+  /// 滚动控制器来自宿主持有的 [PlaylistScrollAnchor]：本 State 会被 PageView
+  /// 连子树一起销毁，所以控制器与「为哪首歌定位过」都不能存在这里。
+  ScrollController get _scrollController => widget.scrollAnchor.controller;
 
   /// 编辑模式（多选 + 拖拽重排）
   bool _editMode = false;
@@ -99,18 +171,13 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
   PlaylistSortBy _sortBy = PlaylistSortBy.queue;
   bool _sortAscending = true;
 
-  // ── 「从右往左滑 → 下一个 tab」的判定参数 ──
+  // ── 「从右往左滑 → 下一个 tab」的跟手跟踪 ──
   //
-  // 阈值与 Flutter 的 kTouchSlop（18）同量级放大：横向位移要够大才算滑页，
-  // 纵向位移的上限保证列表滚动 / 长按拖拽重排不会被误判成滑页。
-  /// 触发滑页所需的横向位移（逻辑像素，向右为负）
-  static const double _kSwipeToNextThreshold = 64.0;
-
-  /// 横向位移必须达到纵向位移的这个倍数，才算「横向滑动」
-  static const double _kSwipeToNextAxisRatio = 1.6;
-
-  /// 纵向位移上限：超过即放弃本次判定（把纵向手势让给列表）
-  static const double _kSwipeToNextMaxCrossAxis = 48.0;
+  // 阈值全部走 playlist_swipe.dart 的纯函数（可单测），这里只保留面板自己的
+  // 状态。判定顺序：先纵向上限（把手势让给列表），再做一次方向判定，
+  // 之后不再回头——与手势竞技场「一次定方向」的语义一致。
+  /// 面板宽度（LayoutBuilder 记录），用于把位移换算成页面进度。
+  double _panelWidth = 0;
 
   /// 正在跟踪的指针 id（多指按下时置空，避免与双指手势冲突）
   int? _swipePointer;
@@ -118,76 +185,139 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
   /// 本次跟踪的起点（全局坐标）
   Offset _swipeOrigin = Offset.zero;
 
-  /// 本次指针序列是否已经触发过滑页 / 已放弃（同一序列只判定一次）
+  /// 本次指针序列已放弃（多指 / 纵向超限）：不再上报
   bool _swipeConsumed = false;
+
+  /// 已越过 touch slop：越过的那一次移动要丢弃
+  bool _swipePastSlop = false;
+
+  /// 已进入跟手阶段：此后不再重新做方向判定
+  bool _swipeTracking = false;
+
+  /// 本次指针序列的速度采样器。
+  ///
+  /// PointerEvent 本身**不携带速度**（Flutter 的 gestures/events.dart 里没有
+  /// velocity 字段，速度只存在于 DragEndDetails / LongPressEndDetails），
+  /// 所以这里自己按 Scrollable / LongPressGestureRecognizer 的同款做法用
+  /// [VelocityTracker] 累积「时间戳 + 坐标」，松手时反推速度。
+  VelocityTracker? _swipeVelocityTracker;
 
   @override
   void initState() {
     super.initState();
-    // 进入播放列表面板后自动滚动到当前播放歌曲
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _scrollToCurrentSong();
-    });
+    // 把上一任面板（被 PageView 销毁的那棵子树）留下的偏移装进新控制器：
+    // 必须赶在 Scrollable 创建 position 之前，所以放在 initState 而不是 postFrame。
+    widget.scrollAnchor.attachForNewPanel();
   }
 
   @override
   void dispose() {
-    _scrollController.dispose();
+    // 控制器属于宿主的 [PlaylistScrollAnchor]，不由本 State 释放。
     super.dispose();
   }
 
+  bool get _swipeEnabled => widget.onSwipeProgress != null;
+
   void _handleSwipePointerDown(PointerDownEvent event) {
+    if (!_swipeEnabled) return;
     if (_swipePointer != null) {
       // 多指按下（缩放等）：放弃本次判定
       _swipePointer = null;
       _swipeConsumed = true;
+      _swipeVelocityTracker = null;
       return;
     }
     _swipePointer = event.pointer;
     _swipeOrigin = event.position;
     _swipeConsumed = false;
+    _swipePastSlop = false;
+    _swipeTracking = false;
+    _swipeVelocityTracker = VelocityTracker.withKind(event.kind)
+      ..addPosition(event.timeStamp, event.position);
   }
 
   void _handleSwipePointerMove(PointerMoveEvent event) {
-    if (_swipeConsumed || event.pointer != _swipePointer) return;
-    if (widget.onSwipeToNextTab == null) return;
+    if (!_swipeEnabled || _swipeConsumed) return;
+    if (event.pointer != _swipePointer) return;
 
     final offset = event.position - _swipeOrigin;
-    // 「先纵向后横向」一律放弃：一旦纵向位移超限就判定为列表滚动 / 长按拖拽重排，
-    // 后续即使再横向移动也不切页，避免与重排抢同一段手势。
-    if (offset.dy.abs() > _kSwipeToNextMaxCrossAxis) {
+
+    // 采样速度：轻扫的动能全在这段位移里，松手时用它决定是否翻页
+    _swipeVelocityTracker?.addPosition(event.timeStamp, event.position);
+
+    // 已经在跟手：1:1 跟随，不再回头做方向判定（纵向漂移交给列表自己的识别器）
+    if (_swipeTracking) {
+      widget.onSwipeProgress!(
+        playlistSwipeProgressFromDx(offset.dx, _panelWidth),
+      );
+      return;
+    }
+
+    // 「先纵向后横向」一律放弃：纵向一旦超限就把手势让给列表滚动 / 长按拖拽重排
+    if (playlistSwipeCrossAxisExceeded(offset.dy)) {
       _swipeConsumed = true;
       return;
     }
-    // 只认「从右往左」（dx 为负）；「从左往右」留给列表的滑动删除
-    // （style.direction = startToEnd），这里绝不触发切页
-    if (offset.dx > -_kSwipeToNextThreshold) return;
-    // 必须是明显的横向滑动，排除斜向拖拽
-    if (offset.dx.abs() < offset.dy.abs() * _kSwipeToNextAxisRatio) return;
+    // 只认「从右往左」：右滑留给列表的滑动删除
+    if (!playlistSwipeIsForwardHorizontal(offset.dx, offset.dy)) return;
+    // 越过 touch slop 的那一次移动丢弃（Scrollable 同口径），避免起手就跳一截
+    if (!_swipePastSlop) {
+      _swipePastSlop = true;
+      return;
+    }
 
-    _swipeConsumed = true;
-    widget.onSwipeToNextTab!();
+    _swipeTracking = true;
+    widget.onSwipeStart?.call();
+    widget.onSwipeProgress!(
+      playlistSwipeProgressFromDx(offset.dx, _panelWidth),
+    );
   }
 
   void _handleSwipePointerEnd(PointerEvent event) {
     if (event.pointer != _swipePointer) return;
     _swipePointer = null;
     _swipeConsumed = false;
+    _swipePastSlop = false;
+    final wasTracking = _swipeTracking;
+    _swipeTracking = false;
+    // 取消（系统手势打断）没有可信速度，按 0 处理：纯按位置吸附。
+    // PointerEvent 不带 velocity，只能取本次指针序列攒下的采样反推。
+    final velocity = event is PointerUpEvent
+        ? (_swipeVelocityTracker?.getVelocityEstimate()?.pixelsPerSecond.dx ??
+              0.0)
+        : 0.0;
+    _swipeVelocityTracker = null;
+    if (!wasTracking) return;
+    widget.onSwipeRelease?.call(velocity, _panelWidth);
   }
 
-  /// 滚动到当前播放的歌曲并居中显示
+  /// 滚动到当前播放的歌曲并居中显示。
+  ///
+  /// 行高**实测**，不再猜 72：高度统一的列表里
+  /// `maxScrollExtent + viewportDimension == 内容总高 == itemCount × itemExtent`，
+  /// 除一下就是真实行高，「显示大小」缩放、编辑模式的行内差异都自动跟上。
+  /// 旧实现写死 72（ListTile 默认高），误差随下标**线性累积** —— 真机行高只要
+  /// 差 6dp，到第 50 首就已经偏出去 300dp，落点根本不是当前那一行。
   void _scrollToCurrentSong() {
     final playerProvider = context.read<PlayerProvider>();
     final currentIndex = playerProvider.currentIndex;
-    if (currentIndex < 0 || !_scrollController.hasClients) return;
+    final count = playerProvider.playlist.length;
+    if (currentIndex < 0 ||
+        currentIndex >= count ||
+        !_scrollController.hasClients) {
+      return;
+    }
 
-    // 每个列表项高度约 72px（ListTile 默认高度）
-    const itemHeight = 72.0;
-    final viewportHeight = _scrollController.position.viewportDimension;
+    final position = _scrollController.position;
+    final viewportHeight = position.viewportDimension;
+    // 实测行高：内容总高 ÷ 项数。列表无 padding、无分隔、所有项等高，
+    // 此时 maxScrollExtent + viewportDimension == count × itemHeight，
+    // 除一下即真实行高（内容不足一屏时 maxScrollExtent 为 0，目标偏移
+    // 会被下面 clamp 回 0，算出的 itemHeight 偏差不影响结果）。
+    final itemHeight = (position.maxScrollExtent + viewportHeight) / count;
     final targetOffset =
-        (currentIndex * itemHeight) - (viewportHeight / 2) + (itemHeight / 2);
-    final maxScroll = _scrollController.position.maxScrollExtent;
-    final offset = targetOffset.clamp(0.0, maxScroll);
+        currentIndex * itemHeight - (viewportHeight / 2) + (itemHeight / 2);
+    final offset = targetOffset.clamp(0.0, position.maxScrollExtent);
 
     _scrollController.animateTo(
       offset,
@@ -198,7 +328,7 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
 
   /// 长按某一项：进入编辑模式并选中它（与歌单页一致）
   void _enterEditMode(String songId) {
-    AppHaptics.heavy();
+    AppHaptics.heavy(HapticCategory.listItem);
     setState(() {
       _editMode = true;
       _selectedIds
@@ -304,6 +434,24 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
       ),
       builder: (context, data, _) {
         final playlist = playerProvider.playlist;
+        // 「歌变了才跟到新曲；同一首歌内切走再回来保持原位」。
+        // 判据用歌曲 id 而不是 currentIndex：重排/删行会让下标漂移，但正在放的
+        // 还是那首歌，就不该把用户从他的位置上拉走。
+        // 旧版是在 initState 里无条件定位的，而本 State 每次切页签回来都是新建的
+        // —— 那条定位正好把刚恢复回来的偏移盖掉（当前曲靠前时目标还被 clamp 成 0，
+        // 看起来就是「回到顶部」）。
+        // 动作排到下一帧：此刻正在 build，直接动 ScrollPosition 属于构建期副作用。
+        final currentId =
+            data.currentIndex >= 0 && data.currentIndex < playlist.length
+            ? playlist[data.currentIndex].id
+            : null;
+        if (currentId != null &&
+            currentId != widget.scrollAnchor.positionedForSongId) {
+          widget.scrollAnchor.positionedForSongId = currentId;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _scrollToCurrentSong();
+          });
+        }
         final colors = _PanelColors(
           Theme.of(context).colorScheme,
           widget.useAmColors,
@@ -327,15 +475,22 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
           onPointerMove: _handleSwipePointerMove,
           onPointerUp: _handleSwipePointerEnd,
           onPointerCancel: _handleSwipePointerEnd,
-          child: Column(
-            children: [
-              _editMode
-                  ? _buildEditHeader(playerProvider, playlist, colors)
-                  : _buildNormalHeader(playerProvider, playlist, colors),
-              Expanded(
-                child: _buildList(playerProvider, playlist, data, colors),
-              ),
-            ],
+          // LayoutBuilder 只量一次宽度写进字段（不 setState，故不会引起重建）：
+          // 滑页进度 = 左滑位移 / 一页宽度。
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              _panelWidth = constraints.maxWidth;
+              return Column(
+                children: [
+                  _editMode
+                      ? _buildEditHeader(playerProvider, playlist, colors)
+                      : _buildNormalHeader(playerProvider, playlist, colors),
+                  Expanded(
+                    child: _buildList(playerProvider, playlist, data, colors),
+                  ),
+                ],
+              );
+            },
           ),
         );
       },
@@ -363,10 +518,16 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
             ),
           ),
           _buildSortMenu(playerProvider, enabled, colors),
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            color: enabled ? colors.action : colors.disabled,
-            onPressed: enabled ? () => setState(() => _editMode = true) : null,
+          // 本页约定不弹气泡说明，读屏标签走 Semantics 而非 tooltip
+          Semantics(
+            label: '编辑',
+            child: IconButton(
+              icon: const Icon(Icons.edit_outlined),
+              color: enabled ? colors.action : colors.disabled,
+              onPressed: enabled
+                  ? () => setState(() => _editMode = true)
+                  : null,
+            ),
           ),
         ],
       ),
@@ -386,10 +547,13 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
       padding: const EdgeInsets.fromLTRB(4, 4, 8, 0),
       child: Row(
         children: [
-          IconButton(
-            icon: const Icon(Icons.close),
-            color: colors.title,
-            onPressed: _exitEditMode,
+          Semantics(
+            label: '关闭',
+            child: IconButton(
+              icon: const Icon(Icons.close),
+              color: colors.title,
+              onPressed: _exitEditMode,
+            ),
           ),
           Expanded(
             child: Text(
@@ -637,10 +801,14 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
     }
     if (isCurrent) {
       // 歌单同款三柱起伏波形（暂停时 ticker 停止保留最后一帧）
-      return PlayingSpectrumIndicator(
-        color: colors.spectrum,
-        size: 14,
-        isPlaying: isPlaying,
+      // 波形是「正在播放」的唯一视觉信号，读屏下补文字标签
+      return Semantics(
+        label: '正在播放',
+        child: PlayingSpectrumIndicator(
+          color: colors.spectrum,
+          size: 14,
+          isPlaying: isPlaying,
+        ),
       );
     }
     return const SizedBox.shrink();
@@ -680,6 +848,10 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
 /// `_DelayedPointerState._delayPassed`），使得同一竞技场里的
 /// `ListTile.onLongPress` 永远不会触发。这里用不参与竞技场的 [Listener]
 /// 自行计时长按，保持原有的「长按进入编辑模式」行为。
+///
+/// tv: 长按进入编辑模式（含拖拽重排）不适用——纯指针按住/拖拽手势，
+/// TV 上无按键等价；播放队列行本身是 ListTile（原生可聚焦，OK=切歌），
+/// 阅读与切歌主路径不受影响。
 class _HoldToEditDetector extends StatefulWidget {
   const _HoldToEditDetector({
     required this.enabled,

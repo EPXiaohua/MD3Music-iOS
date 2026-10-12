@@ -140,7 +140,7 @@ class _RoomPageState extends State<RoomPage> {
     final song = player.currentSong;
     // 未读状态在 RoomSession 上（与播放器胶囊共享游标，任一入口读过即清除）
     final hasUnreadChat = session.hasUnreadChatMessages;
-    // 待处理点歌请求（仅房主）：歌单入口右上角红点（胶囊红点见 ListenTogetherPill）
+    // 待处理点歌请求（仅房主）：歌单入口右上角红点（顶栏尾部胶囊的红点见 TopBarTrailingCapsule）
     final hasPendingOrders = session.hasPendingSongOrders;
     final isLandscape =
         MediaQuery.orientationOf(context) == Orientation.landscape;

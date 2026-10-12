@@ -7,8 +7,11 @@ import '../../modules/player/now_playing_bar.dart';
 import '../../modules/search/search_page.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/tab_config_provider.dart';
+import '../../providers/theme_provider.dart';
 import '../../widgets/resizable_splitter.dart';
+import '../utils/app_text_context_menu.dart';
 import 'adaptive_navigator.dart';
+import 'page_layout.dart';
 
 /// 桌面音乐软件式外壳（横屏平板，见横屏平板重设计计划 4.1）。
 ///
@@ -64,7 +67,11 @@ class DesktopShellState extends State<DesktopShell> {
 
   /// 走双栏 Master-Detail 的 Tab（计划 4.4 B 类）：选一项在右侧详情面板打开。
   /// 其余 Tab 走中央内容区导航（A 类），详情整屏 push 进中央栈。
-  static const Set<String> _kTwoPaneTabs = {'library', 'favorites'};
+  // 桌面版保留既有装配范围，共享形态表只作为能力来源。
+  static final Set<String> _kTwoPaneTabs = kTwoPaneTabs.intersection({
+    'library',
+    'favorites',
+  });
 
   final SettingsRepository _settings = SettingsRepository();
 
@@ -153,19 +160,13 @@ class DesktopShellState extends State<DesktopShell> {
 
   /// 供根 [PopScope] 调用与工具栏返回键：优先回退当前 Tab 的详情面板栈
   /// （双栏），其次回退中央内容栈。可回退则回退并返回 true。
-  bool maybePop() {
+  Future<bool> maybePop() async {
     final tabId = _currentTabId();
     final detail = tabId == null ? null : _detailKeys[tabId]?.currentState;
-    if (detail != null && detail.canPop()) {
-      detail.pop();
-      return true;
-    }
+    if (detail != null && await detail.maybePop()) return true;
     final nav = _activeNav();
-    if (nav != null && nav.canPop()) {
-      nav.pop();
-      return true;
-    }
-    return false;
+    // 初始路由中的设置子页也有 PopScope，不能只看路由栈数量。
+    return await nav?.maybePop() ?? false;
   }
 
   /// 当前 Tab 是否存在可回退历史（详情面板栈或中央内容栈）。
@@ -224,8 +225,15 @@ class DesktopShellState extends State<DesktopShell> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    // 壁纸模式下这层必须透明，否则会整窗盖住 app.dart 里 `Positioned.fill`
+    // 的 AppBackground 壁纸层 —— 表现为"开了自定义壁纸却完全看不到"。
+    //
+    // 背景模式判定用 `useBackgroundImage`（用户开关本身）：
+    // `backgroundImageProvider` 在无用户图时会回落到内置默认壁纸，
+    // 所以"开关开 + 未选图"仍属壁纸模式，照样该透出默认壁纸。
+    final wallpaperOn = context.watch<ThemeProvider>().useBackgroundImage;
     return Material(
-      color: cs.surface,
+      color: wallpaperOn ? Colors.transparent : cs.surface,
       // 键鼠增强（计划 4.8，作为增强）：接外接键盘时的快捷键。文本框聚焦时
       // 字符键由 EditableText 消费、不冒泡到此，故搜索框输入不受影响。
       child: CallbackShortcuts(
@@ -298,29 +306,32 @@ class DesktopShellState extends State<DesktopShell> {
 
   Widget _buildContentRegion(BuildContext context) {
     final tabCount = widget.visibleTabs.length;
-    return Column(
-      children: [
-        _DesktopToolbar(
-          canPop: _activeCanPop(),
-          canGoForward: _activeCanGoForward(),
-          onBack: maybePop,
-          onForward: _goForward,
-          onSubmitSearch: _submitSearch,
-        ),
-        Expanded(
-          child: tabCount == 0
-              ? const SizedBox.shrink()
-              : IndexedStack(
-                  index: widget.selectedIndex.clamp(0, tabCount - 1),
-                  children: [
-                    for (final tab in widget.visibleTabs)
-                      _visited.contains(tab.id)
-                          ? _buildTabNavigator(tab.id)
-                          : const SizedBox.shrink(),
-                  ],
-                ),
-        ),
-      ],
+    // 顶部工具栏整块移除：它是一条独立的 56px 色带（surface + 下边框），
+    // 与内容区背景割裂；而它承载的两项能力都已有更好的入口——
+    //   · 前进/后退：双栏详情面板自带返回，页面级路由另有系统返回语义；
+    //   · 全局搜索：各 Tab 自己的 AppBar 都有搜索入口（发现页右上角 🔍），
+    //     且最终都跳同一个 `SearchPage`（见 _submitSearch 的实现）。
+    // 原实现保留注释，需要时按 _DesktopToolbar 的参数恢复即可。
+    //
+    // _DesktopToolbar(
+    //   canPop: _activeCanPop(),
+    //   canGoForward: _activeCanGoForward(),
+    //   onBack: maybePop,
+    //   onForward: _goForward,
+    //   onSubmitSearch: _submitSearch,
+    // ),
+    return Expanded(
+      child: tabCount == 0
+          ? const SizedBox.shrink()
+          : IndexedStack(
+              index: widget.selectedIndex.clamp(0, tabCount - 1),
+              children: [
+                for (final tab in widget.visibleTabs)
+                  _visited.contains(tab.id)
+                      ? _buildTabNavigator(tab.id)
+                      : const SizedBox.shrink(),
+              ],
+            ),
     );
   }
 
@@ -384,8 +395,12 @@ class _DesktopSidebar extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
+    // 壁纸模式下半透明，让底层 AppBackground 壁纸透出（与外壳同一处理）。
+    final wallpaperOn = context.watch<ThemeProvider>().useBackgroundImage;
     return Material(
-      color: cs.surfaceContainerLow,
+      color: wallpaperOn
+          ? cs.surfaceContainerLow.withValues(alpha: 0.2)
+          : cs.surfaceContainerLow,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -512,22 +527,24 @@ class _DesktopToolbar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          IconButton(
-            icon: const Icon(Icons.arrow_back),
-            tooltip: '后退',
-            onPressed: canPop ? onBack : null,
-          ),
-          // 前进：重放最近一次「后退」弹出的详情页（仅双栏 Tab 详情面板）。
-          IconButton(
-            icon: const Icon(Icons.arrow_forward),
-            tooltip: '前进',
-            onPressed: canGoForward ? onForward : null,
-          ),
-          const SizedBox(width: 8),
+          // 后退 / 前进箭头已移除（用户反馈在桌面布局下多余且占位）：
+          // 双栏详情面板本身有返回入口，页面级路由另有系统返回语义，
+          // 工具栏再挂一对浏览器式箭头既冗余又把搜索框挤到右侧。
+          // 原实现保留注释，需要时按canPop / canGoForward 恢复。
+          //
+          // IconButton(
+          //   icon: const Icon(Icons.arrow_back),
+          //   tooltip: '后退',
+          //   onPressed: canPop ? onBack : null,
+          // ),
+          // IconButton(
+          //   icon: const Icon(Icons.arrow_forward),
+          //   tooltip: '前进',
+          //   onPressed: canGoForward ? onForward : null,
+          // ),
           // 不再在工具栏显示标题：各 Tab 页自带 AppBar 已提供标题，
           // 工具栏再显示一份会与页面标题重复（问题⑤）。留白撑开搜索框到右侧。
           const Spacer(),
-          const SizedBox(width: 12),
           SizedBox(width: 260, child: _SearchField(onSubmit: onSubmitSearch)),
         ],
       ),
@@ -575,6 +592,7 @@ class _SearchFieldState extends State<_SearchField> {
             Expanded(
               child: TextField(
                 controller: _controller,
+                contextMenuBuilder: buildAppTextContextMenu,
                 textInputAction: TextInputAction.search,
                 onSubmitted: (_) => _submit(),
                 style: Theme.of(context).textTheme.bodyMedium,

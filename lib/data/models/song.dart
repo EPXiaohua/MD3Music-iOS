@@ -1,3 +1,5 @@
+import '../../core/services/remote/remote_storage_config.dart';
+
 /// 元数据缺失时使用的占位值。
 ///
 /// **为什么需要统一常量**：项目里有两条产生占位值的路径，字面量曾经不一致——
@@ -22,6 +24,23 @@ bool isUnknownArtist(String? artist) {
   return v.isEmpty ||
       v == kUnknownArtistPlaceholder ||
       v == kUnknownArtistPlaceholderLocal;
+}
+
+/// 拆分「多位歌手连写」的 artist 字段。
+///
+/// 酷狗 API 的歌手字段多位歌手用「、」「;」「/」「&」「，」等分隔符连接（与
+/// `Singers`/`singerinfo` 数组 join('、') 的写法同源）。判定「这首歌是不是独唱」
+/// 全靠本函数，故必须与播放页跳歌手菜单用的是同一套分隔符——历史上
+/// `full_player.dart` / `full_player_am.dart` 各有一份私有实现，这里收为唯一真值。
+///
+/// 返回空列表表示「无歌手信息」；单元素表示独唱。
+List<String> splitSongArtistNames(String? artist) {
+  if (artist == null || artist.isEmpty) return const [];
+  return artist
+      .split(RegExp(r'[、;；/,，&]'))
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .toList();
 }
 
 class Song {
@@ -64,6 +83,11 @@ class Song {
   final double? loudnessLufs;
   /// 音量均衡（响度归一）用：歌曲真峰值（dBTP/dBFS），可空。
   final double? loudnessPeakDb;
+  /// 远程存储来源类型：none=非远程，webdav/ftp 见 [SongRemoteType]。
+  /// 与 [isOnline] 语义独立：远程歌曲不触发在线歌曲的富化/歌词检索/CDN 逻辑。
+  final SongRemoteType remoteType;
+  /// 所属远程存储配置 id（RemoteStorageConfig.id），用于播放时取鉴权头/按需下载。
+  final String? remoteSourceId;
 
   const Song({
     required this.id,
@@ -88,6 +112,8 @@ class Song {
     this.isLongAudio = false,
     this.loudnessLufs,
     this.loudnessPeakDb,
+    this.remoteType = SongRemoteType.none,
+    this.remoteSourceId,
   });
 
   String get displayDuration {
@@ -131,6 +157,8 @@ class Song {
       isLongAudio: (json['isLongAudio'] as bool?) ?? false,
       loudnessLufs: (json['loudnessLufs'] as num?)?.toDouble(),
       loudnessPeakDb: (json['loudnessPeakDb'] as num?)?.toDouble(),
+      remoteType: SongRemoteType.fromJson(json['remoteType'] as String?),
+      remoteSourceId: json['remoteSourceId'] as String?,
     );
   }
 
@@ -158,6 +186,8 @@ class Song {
       'isLongAudio': isLongAudio,
       'loudnessLufs': loudnessLufs,
       'loudnessPeakDb': loudnessPeakDb,
+      'remoteType': remoteType.toJson(),
+      'remoteSourceId': remoteSourceId,
     };
   }
 
@@ -184,6 +214,8 @@ class Song {
     bool? isLongAudio,
     double? loudnessLufs,
     double? loudnessPeakDb,
+    SongRemoteType? remoteType,
+    String? remoteSourceId,
     bool clearUrl = false,
   }) {
     return Song(
@@ -209,6 +241,8 @@ class Song {
       isLongAudio: isLongAudio ?? this.isLongAudio,
       loudnessLufs: loudnessLufs ?? this.loudnessLufs,
       loudnessPeakDb: loudnessPeakDb ?? this.loudnessPeakDb,
+      remoteType: remoteType ?? this.remoteType,
+      remoteSourceId: remoteSourceId ?? this.remoteSourceId,
     );
   }
 

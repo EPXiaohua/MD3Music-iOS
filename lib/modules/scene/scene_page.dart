@@ -1,11 +1,17 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
 
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
+
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import 'scene_detail_page.dart';
 
@@ -72,6 +78,7 @@ class _ScenePageState extends State<ScenePage> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final heroFirstIndex = firstIndexById(_scenes.map((s) => s.id));
     return Scaffold(
       appBar: ScrollAwareAppBar(
         title: '场景音乐',
@@ -84,22 +91,29 @@ class _ScenePageState extends State<ScenePage> {
               ? _buildEmpty(cs)
               : Md3PullToRefresh(
                   onRefresh: () => _load(showLoading: false),
-                  child: PinchableGridView(
+                  // tv: 专区网格补区域语义（memoryKey + 横向 leave）。
+                  child: TvScrollRegion(
+                    memoryKey: 'tv/scene-grid',
+                    horizontalEdge: DpadEdgeBehavior.leave,
+                    child: PinchableGridView(
                     controller: _scrollController,
                     itemCount: _scenes.length,
                     childAspectRatio: 0.72,
                     padding: const EdgeInsets.all(16),
                     itemBuilder: (context, i) => _SceneCard(
                       scene: _scenes[i],
+                      // 该 id 首次出现的卡才参与飞行（避免同子树重复 tag）。
+                      heroTag: heroFirstIndex[_scenes[i].id] == i
+                          ? sceneCoverHeroTag(_scenes[i].id)
+                          : null,
                       onTap: () {
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
+                        AdaptiveNav.openDetail(context,
+                      (_) =>
                                 SceneDetailPage(scene: _scenes[i]),
-                          ),
                         );
                       },
                     ),
+                  ),
                   ),
                 ),
     );
@@ -133,13 +147,41 @@ class _SceneCard extends StatelessWidget {
   final KugouSceneInfo scene;
   final VoidCallback? onTap;
 
-  const _SceneCard({required this.scene, this.onTap});
+  /// 非空时封面参与封面连贯过渡（sceneCoverHeroTag 命名空间）。
+  final String? heroTag;
+
+  const _SceneCard({required this.scene, this.onTap, this.heroTag});
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
-    return ClipRRect(
+    final cover = scene.coverUrl != null
+        ? CachedNetworkImage(
+            imageUrl: scene.coverUrl!,
+            memCacheWidth: 540,
+            memCacheHeight: 540,
+            fit: BoxFit.cover,
+            errorWidget: (_, _, _) => ColoredBox(
+              color: Colors.transparent,
+              child: Center(
+                child: Icon(
+                  Icons.landscape_outlined,
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+            ),
+          )
+        : ColoredBox(
+            color: Colors.transparent,
+            child: Center(
+              child: Icon(
+                Icons.landscape_outlined,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          );
+    final card = ClipRRect(
       borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: Material(
@@ -150,30 +192,15 @@ class _SceneCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Expanded(
-                child: scene.coverUrl != null
-                    ? CachedNetworkImage(
-                        imageUrl: scene.coverUrl!,
-                        memCacheWidth: 540,
-                        memCacheHeight: 540,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, _, _) => ColoredBox(
-                          color: Colors.transparent,
-                          child: Center(
-                            child: Icon(
-                              Icons.landscape_outlined,
-                              color: cs.onSurfaceVariant,
-                            ),
-                          ),
+                // 卡外层 ClipRRect 全圆 16，封面只占上部 → 可见圆角仅上两角。
+                child: heroTag == null
+                    ? cover
+                    : PlaylistCoverHero(
+                        tag: heroTag!,
+                        radius: const BorderRadius.vertical(
+                          top: Radius.circular(16),
                         ),
-                      )
-                    : ColoredBox(
-                        color: Colors.transparent,
-                        child: Center(
-                          child: Icon(
-                            Icons.landscape_outlined,
-                            color: cs.onSurfaceVariant,
-                          ),
-                        ),
+                        child: cover,
                       ),
               ),
               Padding(
@@ -193,6 +220,13 @@ class _SceneCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    // tv: 专区卡片单停点（OK = 进入该场景详情页）。裸 InkWell 卡遥控选不中。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'scene-card',
+      child: card,
     );
   }
 }

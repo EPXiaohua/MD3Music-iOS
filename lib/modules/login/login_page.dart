@@ -1,3 +1,5 @@
+import '../../core/layout/page_layout.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -19,6 +21,7 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage>
     with CarModePanelSuppressor<LoginPage> {
   Timer? _checkTimer;
+  bool _pollInFlight = false;
   String _statusText = '正在生成二维码...';
   bool _isChecking = false;
   int _tabIndex = 0; // 0=二维码 1=手机 2=微信
@@ -26,6 +29,7 @@ class _LoginPageState extends State<LoginPage>
   // 手机登录表单
   final _phoneCtrl = TextEditingController();
   final _codeCtrl = TextEditingController();
+  final _codeFocus = FocusNode();
   bool _sendingCode = false;
   bool _loggingIn = false;
   int _countdown = 0;
@@ -38,6 +42,8 @@ class _LoginPageState extends State<LoginPage>
   @override
   void initState() {
     super.initState();
+    // 验证码输满 6 位后自动尝试登录
+    _codeCtrl.addListener(_onCodeChanged);
     // 本页不显示车机模式常驻播放器面板
     suppressCarModePanel();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -51,6 +57,7 @@ class _LoginPageState extends State<LoginPage>
     _countdownTimer?.cancel();
     _phoneCtrl.dispose();
     _codeCtrl.dispose();
+    _codeFocus.dispose();
     releaseCarModePanel();
     super.dispose();
   }
@@ -74,6 +81,7 @@ class _LoginPageState extends State<LoginPage>
     if (_tabIndex == 0) {
       final kugouProvider = context.read<KugouProvider>();
       await kugouProvider.generateQrCode();
+      if (!mounted || _tabIndex != 0) return;
       setState(() {
         _statusText = '请使用酷狗音乐 App 扫码登录';
       });
@@ -118,51 +126,61 @@ class _LoginPageState extends State<LoginPage>
         timer.cancel();
         return;
       }
-      final kugouProvider = context.read<KugouProvider>();
+      if (_pollInFlight) return;
+      _pollInFlight = true;
       try {
-        final res = await kugouProvider.apiClient.checkLoginWx(_wxUuid!);
-        // 微信 check 响应根级: {wx_errcode, wx_code}
-        final code = res?['wx_code']?.toString();
-        final status = res?['wx_errcode'] as int?;
-        if (code != null && code.isNotEmpty) {
-          timer.cancel();
-          _isChecking = false;
-          final loginRes = await kugouProvider.apiClient.loginByOpenplat(code);
-          final data = loginRes?['data'] as Map?;
-          final token = data?['token']?.toString();
-          final userid = data?['userid']?.toString();
-          final vipToken = data?['vip_token']?.toString();
-          if (token != null && userid != null) {
-            await kugouProvider.apiClient.setLoginCookies(
-              token,
-              userid,
-              vipToken: vipToken,
+        final kugouProvider = context.read<KugouProvider>();
+        try {
+          final res = await kugouProvider.apiClient.checkLoginWx(_wxUuid!);
+          if (!mounted || !timer.isActive) return;
+          // 微信 check 响应根级: {wx_errcode, wx_code}
+          final code = res?['wx_code']?.toString();
+          final status = res?['wx_errcode'] as int?;
+          if (code != null && code.isNotEmpty) {
+            timer.cancel();
+            _isChecking = false;
+            final loginRes = await kugouProvider.apiClient.loginByOpenplat(
+              code,
             );
-            // 触发 provider 拉用户信息
-            await kugouProvider.refreshUserInfo();
-            if (mounted) {
-              // 登录后重新从云端同步「我喜欢的」，让红心立即生效
-              unawaited(context.read<FavoritesProvider>().loadFavorites());
-              setState(() => _statusText = '登录成功！');
-              await Future.delayed(const Duration(milliseconds: 800));
-              if (mounted) Navigator.of(context).pop();
-            }
-          } else {
-            setState(() => _statusText = '微信登录失败: ${loginRes?['error_msg']}');
-          }
-        } else if (status == 408) {
-          setState(() => _statusText = '等待扫描...');
-        } else if (status == 404) {
-          setState(() => _statusText = '已扫描，请在手机上确认');
-        } else if (status == 402) {
-          timer.cancel();
-          setState(() => _statusText = '二维码已过期');
-        } else if (status == 403) {
-          timer.cancel();
-          setState(() => _statusText = '已拒绝登录');
-        }
-      } catch (e) {
+            final data = loginRes?['data'] as Map?;
+            final token = data?['token']?.toString();
+            final userid = data?['userid']?.toString();
+            final vipToken = data?['vip_token']?.toString();
+            if (token != null && userid != null) {
+              await kugouProvider.apiClient.setLoginCookies(
+                token,
+                userid,
+                vipToken: vipToken,
+              );
+              // 触发 provider 拉用户信息
+              unawaited(kugouProvider.refreshUserInfo());
+              if (mounted) {
+                // 登录后重新从云端同步「我喜欢的」，让红心立即生效
+                unawaited(context.read<FavoritesProvider>().loadFavorites());
+                setState(() => _statusText = '登录成功！');
+                await Future.delayed(const Duration(milliseconds: 800));
+                if (mounted) Navigator.of(context).pop();
               }
+            } else {
+              setState(() => _statusText = '微信登录失败: ${loginRes?['error_msg']}');
+            }
+          } else if (status == 408) {
+            setState(() => _statusText = '等待扫描...');
+          } else if (status == 404) {
+            setState(() => _statusText = '已扫描，请在手机上确认');
+          } else if (status == 402) {
+            timer.cancel();
+            setState(() => _statusText = '二维码已过期');
+          } else if (status == 403) {
+            timer.cancel();
+            setState(() => _statusText = '已拒绝登录');
+          }
+        } catch (e) {
+          if (mounted) setState(() => _statusText = '微信登录失败，请重试');
+        }
+      } finally {
+        _pollInFlight = false;
+      }
     });
   }
 
@@ -174,42 +192,52 @@ class _LoginPageState extends State<LoginPage>
         timer.cancel();
         return;
       }
-      final kugouProvider = context.read<KugouProvider>();
-      final status = await kugouProvider.checkQrCode();
-      if (status == null) {
-        return;
-      }
-      if (status == 4) {
-        timer.cancel();
-        _isChecking = false;
-        if (mounted) {
-          // 登录后重新从云端同步「我喜欢的」，让红心立即生效
-          unawaited(context.read<FavoritesProvider>().loadFavorites());
+      if (_pollInFlight) return;
+      _pollInFlight = true;
+      try {
+        final kugouProvider = context.read<KugouProvider>();
+        final status = await kugouProvider.checkQrCode();
+        if (!mounted || !timer.isActive) return;
+        if (status == null) {
+          if (kugouProvider.error != null) {
+            setState(() => _statusText = kugouProvider.error!);
+          }
+          return;
+        }
+        if (status == 4) {
+          timer.cancel();
+          _isChecking = false;
+          if (mounted) {
+            // 登录后重新从云端同步「我喜欢的」，让红心立即生效
+            unawaited(context.read<FavoritesProvider>().loadFavorites());
+            setState(() {
+              _statusText = '登录成功！';
+            });
+            Future.delayed(const Duration(milliseconds: 800), () {
+              if (mounted) {
+                Navigator.of(context).pop();
+              }
+            });
+          }
+        } else if (status == 800 || status == 0) {
+          timer.cancel();
+          _isChecking = false;
+          if (mounted) {
+            setState(() {
+              _statusText = '二维码已过期，请刷新重试';
+            });
+          }
+        } else if (status == 2 || status == 803) {
           setState(() {
-            _statusText = '登录成功！';
+            _statusText = '已扫码，请在手机上确认登录';
           });
-          Future.delayed(const Duration(milliseconds: 800), () {
-            if (mounted) {
-              Navigator.of(context).pop();
-            }
+        } else if (status == 1) {
+          setState(() {
+            _statusText = '等待扫码...';
           });
         }
-      } else if (status == 800 || status == 0) {
-        timer.cancel();
-        _isChecking = false;
-        if (mounted) {
-          setState(() {
-            _statusText = '二维码已过期，请刷新重试';
-          });
-        }
-      } else if (status == 2 || status == 803) {
-        setState(() {
-          _statusText = '已扫码，请在手机上确认登录';
-        });
-      } else if (status == 1) {
-        setState(() {
-          _statusText = '等待扫码...';
-        });
+      } finally {
+        _pollInFlight = false;
       }
     });
   }
@@ -220,6 +248,7 @@ class _LoginPageState extends State<LoginPage>
       _statusText = '正在刷新二维码...';
     });
     await kugouProvider.generateQrCode();
+    if (!mounted || _tabIndex != 0) return;
     setState(() {
       _statusText = '请使用酷狗音乐 App 扫码登录';
     });
@@ -240,7 +269,7 @@ class _LoginPageState extends State<LoginPage>
       }
       return base64Decode(data);
     } catch (e) {
-            return null;
+      return null;
     }
   }
 
@@ -251,45 +280,47 @@ class _LoginPageState extends State<LoginPage>
 
     return Scaffold(
       appBar: AppBar(title: const Text('登录酷狗音乐')),
-      body: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Tab 切换
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 24,
-                  vertical: 8,
+      body: ContentWidth(
+        child: Center(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Tab 切换
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 8,
+                  ),
+                  child: M3EToggleButtonGroup(
+                    actions: const [
+                      M3EToggleButtonGroupAction(
+                        icon: Icon(Icons.qr_code),
+                        label: Text('扫码'),
+                      ),
+                      M3EToggleButtonGroupAction(
+                        icon: Icon(Icons.phone_android),
+                        label: Text('手机'),
+                      ),
+                    ],
+                    selectedIndex: _tabIndex,
+                    onSelectedIndexChanged: (index) {
+                      if (index != null) _switchTab(index);
+                    },
+                  ),
                 ),
-                child: M3EToggleButtonGroup(
-                  actions: const [
-                    M3EToggleButtonGroupAction(
-                      icon: Icon(Icons.qr_code),
-                      label: Text('扫码'),
-                    ),
-                    M3EToggleButtonGroupAction(
-                      icon: Icon(Icons.phone_android),
-                      label: Text('手机'),
-                    ),
-                  ],
-                  selectedIndex: _tabIndex,
-                  onSelectedIndexChanged: (index) {
-                    if (index != null) _switchTab(index);
-                  },
+                const SizedBox(height: 16),
+                if (_tabIndex == 0) _buildQrTab(colorScheme, textTheme),
+                if (_tabIndex == 1) _buildPhoneTab(colorScheme, textTheme),
+                const SizedBox(height: 16),
+                Text(
+                  _statusText,
+                  style: textTheme.bodyMedium?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 16),
-              if (_tabIndex == 0) _buildQrTab(colorScheme, textTheme),
-              if (_tabIndex == 1) _buildPhoneTab(colorScheme, textTheme),
-              const SizedBox(height: 16),
-              Text(
-                _statusText,
-                style: textTheme.bodyMedium?.copyWith(
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -328,6 +359,14 @@ class _LoginPageState extends State<LoginPage>
                         child: Image.network(
                           qrKeyImg,
                           fit: BoxFit.cover,
+                          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+                            if (wasSynchronouslyLoaded) return child;
+                            return AnimatedOpacity(
+                              opacity: frame == null ? 0 : 1,
+                              duration: const Duration(milliseconds: 200),
+                              child: child,
+                            );
+                          },
                           errorBuilder: (context, error, stackTrace) {
                             return const Center(
                               child: Icon(Icons.qr_code, size: 80),
@@ -358,8 +397,11 @@ class _LoginPageState extends State<LoginPage>
         children: [
           TextField(
             controller: _phoneCtrl,
+            contextMenuBuilder: buildAppTextContextMenu,
             keyboardType: TextInputType.phone,
             maxLength: 11,
+            textInputAction: TextInputAction.next,
+            onSubmitted: (_) => _codeFocus.requestFocus(),
             decoration: const InputDecoration(
               labelText: '手机号',
               prefixIcon: Icon(Icons.phone),
@@ -372,8 +414,12 @@ class _LoginPageState extends State<LoginPage>
               Expanded(
                 child: TextField(
                   controller: _codeCtrl,
+                  contextMenuBuilder: buildAppTextContextMenu,
                   keyboardType: TextInputType.number,
                   maxLength: 6,
+                  focusNode: _codeFocus,
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _onLoginPhone(),
                   decoration: const InputDecoration(
                     labelText: '验证码',
                     prefixIcon: Icon(Icons.message),
@@ -395,10 +441,7 @@ class _LoginPageState extends State<LoginPage>
             onPressed: _loggingIn ? null : _onLoginPhone,
             icon: _loggingIn
                 ? const M3ELoadingIndicator(
-                    constraints: BoxConstraints.tightFor(
-                      width: 16,
-                      height: 16,
-                    ),
+                    constraints: BoxConstraints.tightFor(width: 16, height: 16),
                   )
                 : const Icon(Icons.login),
             label: const Text('登录'),
@@ -458,6 +501,14 @@ class _LoginPageState extends State<LoginPage>
     );
   }
 
+  /// 验证码输满 6 位即自动尝试登录（maxLength=6 保证到 6 位就是"输满"；
+  /// 登录中由 _onLoginPhone 的防重入守卫拦下，输错重填后再次输满会重新触发）
+  void _onCodeChanged() {
+    if (_codeCtrl.text.length == 6 && !_loggingIn) {
+      _onLoginPhone();
+    }
+  }
+
   Future<void> _onSendCode() async {
     final phone = _phoneCtrl.text.trim();
     final kugou = context.read<KugouProvider>();
@@ -468,6 +519,8 @@ class _LoginPageState extends State<LoginPage>
     if (ok) {
       setState(() => _statusText = '验证码已发送');
       _startCountdown();
+      // 发送成功后焦点自动落到验证码框，方便用户直接输入
+      _codeFocus.requestFocus();
     } else {
       setState(() => _statusText = kugou.error ?? '发送失败');
     }
@@ -487,6 +540,7 @@ class _LoginPageState extends State<LoginPage>
   }
 
   Future<void> _onLoginPhone() async {
+    if (_loggingIn) return; // 自动登录触发与按钮点击共用，防止并发重复登录
     final phone = _phoneCtrl.text.trim();
     final code = _codeCtrl.text.trim();
     if (phone.length != 11) {
@@ -608,5 +662,4 @@ class _LoginPageState extends State<LoginPage>
       setState(() => _statusText = kugou.error ?? '登录失败');
     }
   }
-
 }

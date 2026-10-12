@@ -16,6 +16,14 @@ void main() {
     translation: '翻译',
   );
   const line2 = LyricLine(startTime: 20000, duration: 1500, text: '第二行');
+  // 同时带翻译与罗马音的第三行（用于独立 lane 用例）
+  const line3 = LyricLine(
+    startTime: 24000,
+    duration: 1200,
+    text: '日文原文',
+    translation: '中文翻译',
+    roma: 'romaji',
+  );
   const inlineMain1 = LyricLine(
     startTime: 1000,
     duration: 800,
@@ -142,6 +150,63 @@ void main() {
     });
   });
 
+  group('buildPlainRomaLrc', () {
+    test('只输出罗马音行（与主行同时间戳）', () {
+      expect(buildPlainRomaLrc(const [line3]), '[00:24.000]romaji');
+    });
+
+    test('无罗马音时返回空串', () {
+      expect(buildPlainRomaLrc(const [line1, line2]), '');
+    });
+
+    test('罗马音与翻译互不合并，各自独立成行', () {
+      expect(buildPlainRomaLrc(const [line3]), isNot(contains('中文翻译')));
+      expect(buildPlainTranslationLrc(const [line3]), isNot(contains('romaji')));
+    });
+  });
+
+  group('buildRawLyricLane', () {
+    test('逐字行输出词级标签，不补末尾结束标签', () {
+      expect(
+        buildRawLyricLane(const [line1]),
+        '[00:16.440]<00:16.440>歌<00:16.800>词',
+      );
+    });
+
+    test('仅行级时间的行保持普通 LRC，不伪造逐字标签', () {
+      expect(buildRawLyricLane(const [line2]), '[00:20.000]第二行');
+    });
+
+    test('逐字行与行级行混排时保持行对齐', () {
+      expect(
+        buildRawLyricLane(const [line1, line2]),
+        '[00:16.440]<00:16.440>歌<00:16.800>词\n[00:20.000]第二行',
+      );
+    });
+
+    test('includeTrailingEndTag=true 时逐字行末补末尾结束标签', () {
+      expect(
+        buildRawLyricLane(const [line1], includeTrailingEndTag: true),
+        '[00:16.440]<00:16.440>歌<00:16.800>词<00:17.200>',
+      );
+    });
+
+    test('includeTrailingEndTag=true 对行级行无效（不伪造词级标签）', () {
+      expect(
+        buildRawLyricLane(const [line2], includeTrailingEndTag: true),
+        '[00:20.000]第二行',
+      );
+    });
+
+    test('buildColorOsRawLyric 委托并保留末尾标签（colorOs 行为不变）', () {
+      expect(
+        buildColorOsRawLyric(const [line1]),
+        '[00:16.440]<00:16.440>歌<00:16.800>词<00:17.200>',
+      );
+      expect(buildColorOsRawLyric(const [line2]), '[00:20.000]第二行');
+    });
+  });
+
   group('hasPushableTranslation', () {
     test('翻译开关开启且模型含翻译时返回 true', () {
       expect(
@@ -203,10 +268,19 @@ void main() {
         isFalse,
       );
     });
+
+    test('罗马音与翻译可同时存在于归一化结果（两条 lane 独立）', () {
+      expect(
+        hasPushableTranslation(const [line3], includeTranslation: true),
+        isTrue,
+      );
+      expect(buildPlainRomaLrc(const [line3]), '[00:24.000]romaji');
+      expect(buildPlainTranslationLrc(const [line3]), '[00:24.000]中文翻译');
+    });
   });
 
   group('buildLyricInfoJson', () {
-    test('colorOsMode=false 保持现状：ELRC + format + translation', () {
+    test('colorOsMode=false：规范 lane 结构（lyric 纯原文 + rawLyric 逐字 + translation 独立）', () {
       final json = buildLyricInfoJson(
         songName: '测试',
         artist: '歌手',
@@ -215,16 +289,28 @@ void main() {
         includeTranslation: true,
         colorOsMode: false,
       );
+      expect(json['songName'], '测试');
+      expect(json['artist'], '歌手');
+      expect(json['songId'], '123');
+      // lyric 只含原文主行，翻译不合并进来
+      expect(json['lyric'], '[00:16.440]歌词\n[00:20.000]第二行');
+      expect(json['lyric'], isNot(contains('翻译')));
+      // rawLyric：逐字行保留增强标签，行级行保持普通 LRC，不补末尾标签
       expect(
-        json['lyric'],
-        buildElrcLyric(const [line1, line2], includeTranslation: true),
+        json['rawLyric'],
+        '[00:16.440]<00:16.440>歌<00:16.800>词\n[00:20.000]第二行',
       );
-      expect(json['format'], 'elrc');
-      expect(json['translation'], 'lrc');
-      expect(json.containsKey('rawLyric'), isFalse);
+      // 翻译为独立 lane（内容本体，不是格式标记）
+      expect(json['translation'], '[00:16.440]翻译');
+      // 旧格式标记已移除
+      expect(json.containsKey('format'), isFalse);
+      // ColorOS 专有字段不出现在规范模式
+      expect(json.containsKey('lyricType'), isFalse);
+      expect(json.containsKey('translationLyric'), isFalse);
+      expect(json.containsKey('provider'), isFalse);
     });
 
-    test('colorOsMode=false 无翻译时不带 translation 字段', () {
+    test('colorOsMode=false 无逐字时省略 rawLyric（不伪造逐字扫光）', () {
       final json = buildLyricInfoJson(
         songName: '测试',
         artist: '歌手',
@@ -233,8 +319,132 @@ void main() {
         includeTranslation: true,
         colorOsMode: false,
       );
+      expect(json['lyric'], '[00:20.000]第二行');
+      expect(json.containsKey('rawLyric'), isFalse);
       expect(json.containsKey('translation'), isFalse);
-      expect(json['format'], 'elrc');
+      expect(json.containsKey('format'), isFalse);
+    });
+
+    test('colorOsMode=false 关闭翻译开关时不输出 translation', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '123',
+        lines: const [line1],
+        includeTranslation: false,
+        colorOsMode: false,
+      );
+      expect(json.containsKey('translation'), isFalse);
+      expect(json['lyric'], '[00:16.440]歌词');
+      expect(
+        json['rawLyric'],
+        '[00:16.440]<00:16.440>歌<00:16.800>词',
+      );
+    });
+
+    test('colorOsMode=false 输出 roma 独立 lane（includeRoma=true）', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '123',
+        lines: const [line3],
+        includeTranslation: true,
+        includeRoma: true,
+        colorOsMode: false,
+      );
+      expect(json['lyric'], '[00:24.000]日文原文');
+      expect(json['translation'], '[00:24.000]中文翻译');
+      expect(json['roma'], '[00:24.000]romaji');
+      // 三条 lane 互不合并
+      expect(json['lyric'], isNot(contains('romaji')));
+      expect(json['translation'], isNot(contains('romaji')));
+      expect(json['roma'], isNot(contains('中文翻译')));
+    });
+
+    test('colorOsMode=false 默认不输出 roma（includeRoma 缺省 false）', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '123',
+        lines: const [line3],
+        includeTranslation: true,
+        colorOsMode: false,
+      );
+      expect(json.containsKey('roma'), isFalse);
+    });
+
+    test('colorOsMode=false 输出 album，songId 为空时省略 songId', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '   ',
+        album: '专辑',
+        lines: const [line2],
+        includeTranslation: true,
+        colorOsMode: false,
+      );
+      expect(json['album'], '专辑');
+      expect(json.containsKey('songId'), isFalse);
+      expect(json.containsKey('album'), isTrue);
+    });
+
+    test('colorOsMode=false 无 album 时不写 album 字段', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '123',
+        lines: const [line2],
+        includeTranslation: true,
+        colorOsMode: false,
+      );
+      expect(json.containsKey('album'), isFalse);
+    });
+
+    test('colorOsMode=false 曲名或歌手为空时不产出 payload', () {
+      expect(
+        buildLyricInfoJson(
+          songName: '',
+          artist: '歌手',
+          songId: '123',
+          lines: const [line2],
+          includeTranslation: true,
+          colorOsMode: false,
+        ),
+        isEmpty,
+      );
+      expect(
+        buildLyricInfoJson(
+          songName: '测试',
+          artist: '   ',
+          songId: '123',
+          lines: const [line2],
+          includeTranslation: true,
+          colorOsMode: false,
+        ),
+        isEmpty,
+      );
+    });
+
+    test('colorOsMode=false 内嵌行级双语拆成主 lyric 与独立 translation', () {
+      final json = buildLyricInfoJson(
+        songName: '测试',
+        artist: '歌手',
+        songId: '123',
+        lines: const [
+          lineTimedMain1,
+          lineTimedTranslation1,
+          lineTimedMain2,
+          lineTimedTranslation2,
+        ],
+        includeTranslation: true,
+        colorOsMode: false,
+      );
+      expect(json['lyric'], '[00:05.000]Line timed one\n[00:07.000]Line timed two');
+      expect(
+        json['translation'],
+        '[00:05.000]行级翻译一\n[00:07.000]行级翻译二',
+      );
+      expect(json.containsKey('rawLyric'), isFalse);
     });
 
     test(

@@ -10,6 +10,8 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_haptics.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 import '../mcp/mcp_service.dart';
 import 'settings_group_heading.dart';
@@ -56,7 +58,7 @@ class _McpAgentSectionState extends State<McpAgentSection> {
           subtitle: const Text('允许外部 AI 客户端通过 MCP 协议调用本应用的播放与检索能力'),
           value: settings.enabled,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             unawaited(service.update(settings.copyWith(enabled: v)));
           },
         ),
@@ -84,7 +86,7 @@ class _McpAgentSectionState extends State<McpAgentSection> {
             subtitle: const Text('仅暴露读取类工具，禁止播放/暂停/切歌/调音量等控制'),
             value: settings.readOnly,
             onChanged: (v) {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               unawaited(service.update(settings.copyWith(readOnly: v)));
             },
           ),
@@ -94,8 +96,59 @@ class _McpAgentSectionState extends State<McpAgentSection> {
             subtitle: const Text('绑定 0.0.0.0 并强制校验访问令牌；关闭时仅本机回环可达'),
             value: settings.bindLan,
             onChanged: (v) {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               unawaited(service.update(settings.copyWith(bindLan: v)));
+            },
+          ),
+          // search: MCP 二次确认 写操作确认 安全 开关
+          SwitchListTile(
+            title: const Text('写操作二次确认'),
+            subtitle: const Text('高风险写工具执行前在手机上弹窗确认，超时视为拒绝'),
+            value: settings.requireConfirm,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              unawaited(service.update(settings.copyWith(requireConfirm: v)));
+            },
+          ),
+          SettingsGroupHeading('工具分组'),
+          // search: MCP 工具分组 播放控制 开关
+          SwitchListTile(
+            title: const Text('播放与队列'),
+            subtitle: const Text('播放控制、进度音量、队列管理类工具'),
+            value: settings.groupPlayer,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              unawaited(service.update(settings.copyWith(groupPlayer: v)));
+            },
+          ),
+          // search: MCP 工具分组 搜索 发现 歌单 榜单 开关
+          SwitchListTile(
+            title: const Text('检索与发现'),
+            subtitle: const Text('搜索歌曲/歌单/专辑/歌手、歌词、榜单、每日推荐'),
+            value: settings.groupDiscovery,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              unawaited(service.update(settings.copyWith(groupDiscovery: v)));
+            },
+          ),
+          // search: MCP 工具分组 收藏 歌单修改 开关
+          SwitchListTile(
+            title: const Text('曲库修改'),
+            subtitle: const Text('收藏歌曲、加入歌单等写操作（配合二次确认）'),
+            value: settings.groupLibraryWrite,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              unawaited(service.update(settings.copyWith(groupLibraryWrite: v)));
+            },
+          ),
+          // search: MCP 工具分组 均衡器 睡眠定时 桌面歌词 开关
+          SwitchListTile(
+            title: const Text('应用功能'),
+            subtitle: const Text('睡眠定时、均衡器、桌面歌词、输出模式查询'),
+            value: settings.groupAppFeatures,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              unawaited(service.update(settings.copyWith(groupAppFeatures: v)));
             },
           ),
           SettingsGroupHeading('连接'),
@@ -177,7 +230,7 @@ class _McpAgentSectionState extends State<McpAgentSection> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(
-                    '最近调用',
+                    '最近调用（50 条）',
                     style: textTheme.labelLarge?.copyWith(
                       color: colorScheme.primary,
                     ),
@@ -187,6 +240,19 @@ class _McpAgentSectionState extends State<McpAgentSection> {
                       '${_hhmmss(entry.at)}  ${entry.ok ? '✓' : '✗'}  ${entry.tool}',
                       style: textTheme.bodySmall,
                     ),
+                  // 导出全部日志（含参数摘要），便于贴给 AI 复盘调用问题。
+                  TextButton.icon(
+                    onPressed: () async {
+                      await Clipboard.setData(
+                        ClipboardData(text: service.exportLog()),
+                      );
+                      if (context.mounted) {
+                        showToast('调用日志已复制');
+                      }
+                    },
+                    icon: const Icon(Icons.copy, size: 18),
+                    label: const Text('复制日志'),
+                  ),
                 ],
               ),
             ),
@@ -231,6 +297,7 @@ class _McpAgentSectionState extends State<McpAgentSection> {
         title: const Text('监听端口'),
         content: TextField(
           controller: controller,
+          contextMenuBuilder: buildAppTextContextMenu,
           autofocus: true,
           keyboardType: TextInputType.number,
           decoration: const InputDecoration(hintText: '1024 - 65535'),

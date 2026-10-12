@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/foundation.dart';
 
 import '../core/services/folder_picker_service.dart';
@@ -8,6 +10,7 @@ import '../data/models/artist.dart';
 import '../data/models/music_folder.dart';
 import '../data/models/song.dart';
 import '../data/repositories/local_music_repository.dart';
+import 'song_match_provider.dart';
 
 /// 调试日志辅助函数（编译时根据 debugPrint 过滤 release 模式输出）
 void _log(String msg) {
@@ -18,6 +21,8 @@ class LibraryProvider extends ChangeNotifier {
   final LocalMusicRepository _repository = LocalMusicRepository();
 
   List<Song> _songs = [];
+  List<Song> _indexedSongs = [];
+  bool _filterShortAudio = false;
   List<Album> _albums = [];
   List<Artist> _artists = [];
   List<MusicFolder> _folders = [];
@@ -42,6 +47,44 @@ class LibraryProvider extends ChangeNotifier {
   String? get error => _error;
   String get searchQuery => _searchQuery;
   bool get hasMusic => _songs.isNotEmpty;
+  bool get filterShortAudio => _filterShortAudio;
+
+  void _rebuildCategories() {
+    _songs = _repository.filterSongs(
+      _indexedSongs,
+      excludedFolders: _excludedFolders,
+      filterShortAudio: _filterShortAudio,
+    );
+    _albums = _repository.buildAlbums(_songs);
+    _artists = _repository.buildArtists(_songs);
+    _folders = _repository.buildFolders(_songs);
+  }
+
+  Future<void> setFilterShortAudio(bool enabled) async {
+    await _repository.setFilterShortAudio(enabled);
+    _filterShortAudio = enabled;
+    _rebuildCategories();
+    notifyListeners();
+  }
+
+  /// 仅移除索引；排除目录持久化，避免重新扫描时自动加入。
+  Future<void> removeFoldersFromIndex(Iterable<String> paths) async {
+    final removed = paths.toSet();
+    if (removed.isEmpty) return;
+    final saved = await _repository.getSavedFolders();
+    final excluded = await _repository.getExcludedFolders();
+    _excludedFolders = {...excluded, ...removed}.toList();
+    _scanFolders = saved.where((path) => !removed.contains(path)).toList();
+    await _repository.saveExcludedFolders(_excludedFolders);
+    await _repository.saveFolders(_scanFolders);
+    _indexedSongs = _repository.filterSongs(
+      _indexedSongs,
+      excludedFolders: _excludedFolders,
+    );
+    await _repository.saveSongs(_indexedSongs);
+    _rebuildCategories();
+    notifyListeners();
+  }
 
   void setSearchQuery(String query) {
     _searchQuery = query;
@@ -88,6 +131,8 @@ class LibraryProvider extends ChangeNotifier {
   Future<void> loadScanFolders() async {
     _scanFolders = await _repository.getSavedFolders();
     _excludedFolders = await _repository.getExcludedFolders();
+    _filterShortAudio = await _repository.getFilterShortAudio();
+    _rebuildCategories();
     notifyListeners();
   }
 
@@ -97,13 +142,11 @@ class LibraryProvider extends ChangeNotifier {
   /// 同时加载已保存的扫描目录，保持状态一致。
   Future<void> loadSavedSongs() async {
     final cached = await _repository.getSavedSongs();
-    if (cached.isEmpty) return;
-    _songs = cached;
-    _albums = _repository.buildAlbums(cached);
-    _artists = _repository.buildArtists(cached);
-    _folders = _repository.buildFolders(cached);
+    _indexedSongs = cached;
     _scanFolders = await _repository.getSavedFolders();
     _excludedFolders = await _repository.getExcludedFolders();
+    _filterShortAudio = await _repository.getFilterShortAudio();
+    _rebuildCategories();
     notifyListeners();
     _log('[LibraryProvider] 已恢复 ${cached.length} 首缓存歌曲');
   }
@@ -135,6 +178,7 @@ class LibraryProvider extends ChangeNotifier {
       // 加载用户保存的扫描文件夹和排除文件夹
       _scanFolders = await _repository.getSavedFolders();
       _excludedFolders = await _repository.getExcludedFolders();
+      _filterShortAudio = await _repository.getFilterShortAudio();
 
       // 扫描（传入排除文件夹）
       final songs = await _repository.scanSongs(
@@ -146,13 +190,19 @@ class LibraryProvider extends ChangeNotifier {
       LocalArtworkCache().clear();
 
       // 构建分类
-      _songs = songs;
-      _albums = _repository.buildAlbums(songs);
-      _artists = _repository.buildArtists(songs);
-      _folders = _repository.buildFolders(songs);
+      // 扫描期间可能移除文件夹，完成时使用最新排除配置再过滤。
+      _excludedFolders = await _repository.getExcludedFolders();
+      _indexedSongs = _repository.filterSongs(
+        songs,
+        excludedFolders: _excludedFolders,
+      );
+      _rebuildCategories();
 
       // 持久化本次扫描结果，下次启动直接恢复
-      await _repository.saveSongs(songs);
+      await _repository.saveSongs(_indexedSongs);
+
+      // 触发本地歌曲的在线信息自动匹配（引擎内部有开关与去重，重复调用安全）
+      unawaited(SongMatchProvider.instance?.onLibraryUpdated(_indexedSongs));
 
       _isScanning = false;
       notifyListeners();
@@ -170,6 +220,7 @@ class LibraryProvider extends ChangeNotifier {
 
     await _repository.addFolder(path);
     _scanFolders = await _repository.getSavedFolders();
+    _excludedFolders = await _repository.getExcludedFolders();
     notifyListeners();
     return true;
   }

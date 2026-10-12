@@ -1,22 +1,31 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
-import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 
-import '../../core/services/media_store_service.dart';
+import '../../core/build_flags.dart';
+import '../../core/layout/page_layout.dart';
+import '../../core/services/folder_picker_service.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/audio_scanner.dart';
+import '../../core/utils/permissions.dart';
 import '../../data/models/song.dart';
+import '../../providers/cloud_upload_provider.dart';
 import '../../providers/library_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/cloud_song_mapper.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
+import '../../widgets/md3_pull_to_refresh.dart';
 import '../../widgets/song_list_item.dart';
 import '../player/secondary_mini_player.dart';
+import 'cloud_capacity_card.dart';
+import 'cloud_upload_queue_sheet.dart';
 
 class CloudMusicPage extends StatefulWidget {
   const CloudMusicPage({super.key});
@@ -35,16 +44,42 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
   bool _isSelectMode = false;
   final Set<int> _selectedIndices = {};
 
+  /// 云盘已用容量（按列表条目 filesize 求和）与云端歌曲总数。
+  int _usedBytes = 0;
+  int _cloudTotal = 0;
+  /// 云盘总配额（get_list 响应内嵌配额字段时才有值；未见字段则只显示已用）。
+  int? _quotaBytes;
+
+  /// 上传队列空闲且有新增成功 → 去抖刷新云盘列表。
+  Timer? _refreshDebounce;
+  int _lastUploadGeneration = -1;
+  late final CloudUploadProvider _uploadProvider;
+
   @override
   void initState() {
     super.initState();
     _loadCloudSongs();
+    _uploadProvider = context.read<CloudUploadProvider>();
+    _lastUploadGeneration = _uploadProvider.completedGeneration;
+    _uploadProvider.addListener(_onUploadQueueChanged);
   }
 
   @override
   void dispose() {
+    _uploadProvider.removeListener(_onUploadQueueChanged);
+    _refreshDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
+  }
+
+  /// 上传队列代次变化：空闲且新增成功后 2s 去抖刷新列表（覆盖批量连传）。
+  void _onUploadQueueChanged() {
+    if (_uploadProvider.completedGeneration == _lastUploadGeneration) return;
+    _lastUploadGeneration = _uploadProvider.completedGeneration;
+    _refreshDebounce?.cancel();
+    _refreshDebounce = Timer(const Duration(seconds: 2), () {
+      if (mounted) _loadCloudSongs(showLoading: false);
+    });
   }
 
   /// 内存过滤：根据当前搜索词匹配 title / artist（不区分大小写、子串）。
@@ -88,6 +123,10 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
       const int maxPages = (_maxCloudSongs + pageSize - 1) ~/ pageSize;
 
       final songs = <Song>[];
+      var summedBytes = 0;
+      int? serverUsed;
+      int? serverMax;
+      int? serverCount;
       for (int page = 1; page <= maxPages; page++) {
         final result =
             await api.getUserCloud(page: page, pagesize: pageSize, noCache: true);
@@ -109,15 +148,23 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
         final list = _safeExtractList(data);
         if (list == null || list.isEmpty) break;
 
-        if (page == 1 && list.isNotEmpty && kDebugMode) {
-          debugPrint('[CloudMusic] first item keys: ${list.first is Map<String, dynamic> ? (list.first as Map<String, dynamic>).keys.toList() : list.first.runtimeType}');
-          debugPrint('[CloudMusic] first item: ${list.first}');
+        // 容量/总数取响应权威字段（2026-10-11 真机实证 data 内含
+        // used_size / max_size / availble_size / list_count；缺字段时
+        // 回退本地求和与列表长度）
+        if (page == 1) {
+          final dm = _asMap(data);
+          serverUsed = _intOf(dm?['used_size']);
+          serverMax = _intOf(dm?['max_size']);
+          serverCount =
+              _intOf(dm?['list_count']) ?? _intOf(dm?['total']);
         }
 
         for (final e in list) {
           if (e is Map<String, dynamic>) {
             final song = mapCloudApiItemToSong(e);
             if (song.id.isNotEmpty) songs.add(song);
+            // 求和兜底：响应缺 used_size 时按条目文件大小相加
+            summedBytes += _itemSizeBytes(e);
           }
         }
 
@@ -130,6 +177,9 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
 
       setState(() {
         _songs = songs;
+        _usedBytes = serverUsed ?? summedBytes;
+        _quotaBytes = serverMax;
+        _cloudTotal = serverCount ?? _songs.length;
         _isLoading = false;
       });
     } catch (e) {
@@ -144,7 +194,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
 
   /// 从本地音乐库弹出选歌面板（复用 LibraryProvider，无文件选择器）。
   ///
-  /// 单击歌曲 = 立即上传；长按 = 进入多选模式，可勾选多首批量上传。
+  /// 单击歌曲 = 加入上传队列；长按 = 进入多选模式，可勾选多首批量入队。
   Future<void> _showLocalSongPicker() async {
     final library = context.read<LibraryProvider>();
     // 尚未加载过本地音乐时先恢复上次扫描的缓存歌曲：
@@ -278,7 +328,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                         }
                                       : () {
                                            Navigator.of(sheetContext).pop();
-                                           _uploadSingle(song);
+                                           _enqueueSongs([song]);
                                          },
                                   onLongPress: inSelectMode
                                       ? null
@@ -287,6 +337,19 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                             selected.add(index);
                                           });
                                         },
+                                  // tv: 遥控 OK 长按 = 长按语义（选中该行进多选），
+                                  // 与 onLongPress 同一动作；SongListItem 的整行
+                                  // DpadFocusable 接线由 widgets/song_list_item.dart
+                                  // 承担（仅 kTvBuild 编入）。
+                                  onContextMenuOverride: kTvBuild
+                                      ? (inSelectMode
+                                            ? null
+                                            : () {
+                                                setSheetState(() {
+                                                  selected.add(index);
+                                                });
+                                              })
+                                      : null,
                                   isSelectMode: inSelectMode,
                                   isSelected: selected.contains(index),
                                   onSelectToggle: () {
@@ -314,7 +377,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                   (i) => localSongs[i],
                                 ).toList();
                                 Navigator.of(sheetContext).pop();
-                                _uploadBatch(batch);
+                                _enqueueSongs(batch);
                               },
                               icon: const Icon(Icons.cloud_upload_outlined),
                               label: Text('上传已选 ${selected.length} 首'),
@@ -332,155 +395,184 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
     );
   }
 
-  /// 读取本地歌曲文件二进制。
-  /// 兼容 file:// URI、content:// URI（经 MediaStore 解析）与裸绝对路径。
-  /// 加 30 秒超时：content:// 的原生解析/拷贝若挂起，不会拖死批量上传。
-  Future<Uint8List?> _readSongBytes(Song song) async {
-    final raw = song.localPath;
-    if (raw == null || raw.isEmpty) return null;
-    try {
-      Future<Uint8List> read;
-      if (raw.startsWith('content://')) {
-        read = () async {
-          final resolved = await MediaStoreService.resolveLocalPath(raw);
-          if (resolved == null || resolved.isEmpty) {
-            throw Exception('content URI 解析失败');
-          }
-          return File(resolved).readAsBytes();
-        }();
-      } else if (raw.startsWith('file://')) {
-        read = File(Uri.parse(raw).toFilePath()).readAsBytes();
-      } else {
-        read = File(raw).readAsBytes();
-      }
-      return await read.timeout(const Duration(seconds: 30));
-    } catch (e) {
-      debugPrint('[CloudMusic] 读取文件失败: $raw -> $e');
-      return null;
-    }
+  /// 上传入口菜单：从音乐库选择 / 上传文件夹，并内联「匹配官方曲库」开关
+  /// （实时生效并持久化，对未开始的上传任务生效）。
+  void _showUploadMenu() {
+    _uploadProvider.ensureMatchLoaded();
+    showM3EModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Consumer<CloudUploadProvider>(
+            builder: (context, up, _) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.library_music_outlined),
+                    title: const Text('从音乐库选择'),
+                    subtitle: const Text('上传已扫描的本地歌曲，支持多选'),
+                    onTap: () {
+                      Navigator.of(sheetContext).pop();
+                      _showLocalSongPicker();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.folder_open),
+                    title: const Text('上传文件夹'),
+                    subtitle: const Text('选择文件夹，音频文件全部加入上传队列'),
+                    onTap: () {
+                      Navigator.of(sheetContext).pop();
+                      _uploadFromFolder();
+                    },
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    value: up.matchEnabled,
+                    onChanged: (v) => up.setMatchEnabled(v),
+                    title: const Text('匹配官方曲库'),
+                    subtitle: const Text(
+                      '上传前按文件哈希匹配，命中后显示官方歌名、歌手与歌词',
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
   }
 
-  /// 上传单首本地歌曲到云盘。
-  ///
-  /// 返回 (ok, reason)：ok 为是否真正上传成功（服务端 add_files 返回
-  /// status == 1 才算数，避免把错误响应误判为成功）；reason 为失败原因
-  /// （批量上传时用于汇总展示）。不在此处刷新列表，由调用方统一刷新。
-  /// [showResult] 为 false 时（批量上传）不弹单首成功/失败提示，只显示进度。
-  Future<({bool ok, String? reason})> _uploadSong(
-    Song song, {
-    bool showResult = true,
-  }) async {
-    final api = KugouApiClient();
-
-    try {
-      if (!api.isLoggedIn) {
-        if (showResult) showToast('请先登录', long: true);
-        return (ok: false, reason: '未登录');
-      }
-
-      final bytes = await _readSongBytes(song);
-      if (bytes == null || bytes.isEmpty) {
-        if (showResult) {
-          showToast('读取文件失败：${song.displayName}', long: true);
-        }
-        return (ok: false, reason: '读取文件失败');
-      }
-
-      // 从文件路径推导扩展名（默认 mp3）
-      final raw = song.localPath ?? '';
-      final dotIdx = raw.lastIndexOf('.');
-      final ext = (dotIdx > 0 && dotIdx < raw.length - 1)
-          ? raw.substring(dotIdx + 1).toLowerCase()
-          : 'mp3';
-
-      // 上传中提示（toast 展示进行中的歌曲）
+  /// 把所选歌曲加入上传队列（队列由 CloudUploadProvider 常驻处理，
+  /// 页面退出不中断），并打开队列面板展示进度。
+  void _enqueueSongs(List<Song> batch) {
+    if (batch.isEmpty) return;
+    final added = _uploadProvider.enqueueSongs(batch);
+    if (added > 0) {
+      final skipped = batch.length - added;
       showToast(
-        '正在上传「${song.displayName}」(${_formatSize(bytes.length)})…',
-        long: true,
+        skipped > 0 ? '已加入 $added 首，$skipped 首已在队列中' : '已加入上传队列 $added 首',
       );
-
-      final result = await api.uploadCloudSong(
-        bytes,
-        extendname: ext,
-        name: song.displayName,
-        authorName: song.artist,
-        timelen: song.duration.inMilliseconds > 0
-            ? song.duration.inMilliseconds
-            : null,
-      );
-
-      // 关键：只有服务端明确返回 status == 1 才算成功。
-      // 服务端在授权/分片/完成/添加到云盘任一环节失败时返回 {status: 0, msg: ...}，
-      // 此前误把 status == 0 也当作成功，导致「提示成功但云盘里没有」。
-      final status = result?['status'];
-      if (status == 1) {
-        if (showResult) {
-          showToast('「${song.displayName}」已上传到云盘', long: true);
-        }
-        return (ok: true, reason: null);
-      }
-      final msg = (result?['msg'] ?? result?['error_msg'] ?? '未知错误')
-          .toString();
-      if (showResult) {
-        showToast('上传失败：$msg', long: true);
-      }
-      return (ok: false, reason: msg);
-    } catch (e) {
-      if (showResult) {
-        showToast('上传失败：$e', long: true);
-      }
-      return (ok: false, reason: '$e');
+      showCloudUploadQueueSheet(context);
+    } else {
+      showToast('所选歌曲已在队列中');
     }
   }
 
-  /// 单首上传：成功后刷新云盘列表。
-  Future<void> _uploadSingle(Song song) async {
-    final r = await _uploadSong(song);
-    if (r.ok && mounted) {
-      await _loadCloudSongs();
+  /// 文件夹上传：SAF 目录选择 → 递归扫描音频（扩展名白名单 +
+  /// isolate 读取标签元数据）→ 确认对话框 → 加入上传队列。
+  Future<void> _uploadFromFolder() async {
+    final granted = await requestStoragePermission();
+    if (!mounted) return;
+    if (!granted) {
+      showToast('需要存储权限才能读取本地文件', long: true);
+      return;
     }
-  }
-
-  /// 批量上传多首本地歌曲，逐首调用 [_uploadSong]。
-  ///
-  /// 每首上传前显示「正在上传 (i/n)」进度条（常驻，直到该首返回）；
-  /// 单首结果不单独弹窗（避免误导），结束后统一汇总成功/失败数量与失败原因，
-  /// 成功数 > 0 时刷新云盘列表。
-  Future<void> _uploadBatch(List<Song> songs) async {
-    if (songs.isEmpty) return;
-
-    var ok = 0;
-    final failed = <String>[];
-    for (var i = 0; i < songs.length; i++) {
-      final song = songs[i];
-      // toast 展示当前上传进度（toast 自动消失，无需手动清理队列）
-      showToast(
-        '正在上传 (${i + 1}/${songs.length})「${song.displayName}」…',
-        long: true,
-      );
-      final r = await _uploadSong(song, showResult: false);
-      if (r.ok) {
-        ok++;
-      } else if (r.reason != null && r.reason!.isNotEmpty) {
-        failed.add('${song.displayName}：${r.reason}');
-      }
+    final dir = await FolderPickerService.pickFolder();
+    if (!mounted) return;
+    if (dir == null) return; // 用户取消
+    // 目录选择服务只换算主存储（primary:）路径；SD 卡/OTG 等非主存储
+    // 换算结果不会是真实存在的目录，在此拦截并说明。
+    if (!Directory(dir).existsSync()) {
+      showToast('该存储位置暂不支持，请选择内部存储中的文件夹', long: true);
+      return;
     }
-
-    final summary = ok == songs.length
-        ? '全部上传成功（$ok 首）'
-        : '上传完成：成功 $ok 首，失败 ${songs.length - ok} 首'
-            '${failed.isEmpty ? '' : '\n${failed.take(3).join('\n')}'}';
-    showToast(summary, long: true);
-    if (ok > 0) {
-      await _loadCloudSongs();
+    showToast('正在扫描文件夹…');
+    final files = collectAudioFiles([dir]);
+    if (!mounted) return;
+    if (files.isEmpty) {
+      showToast('该文件夹内没有音频文件');
+      return;
+    }
+    final metas = await compute(scanAudioFilesInIsolate, files);
+    if (!mounted) return;
+    if (metas.isEmpty) {
+      showToast('没有可读取的音频文件');
+      return;
+    }
+    var totalBytes = 0;
+    for (final m in metas) {
+      try {
+        totalBytes += File((m['filePath'] as String?) ?? '').lengthSync();
+      } catch (_) {}
+    }
+    final dirName = dir.split('/').where((s) => s.isNotEmpty).last;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('上传「$dirName」？'),
+        content: Text(
+          '共找到 ${metas.length} 个音频文件（约 ${_formatSize(totalBytes)}），'
+          '将加入上传队列逐个上传。\n'
+          '匹配官方曲库：${_uploadProvider.matchEnabled ? '开' : '关'}'
+          '（可在上传菜单或队列面板中切换）。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('加入队列'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final added = _uploadProvider.enqueueScannedFiles(metas);
+    if (added > 0) {
+      showToast('已加入上传队列 $added 首');
+      showCloudUploadQueueSheet(context);
+    } else {
+      showToast('音频文件已在队列中');
     }
   }
 
   String _formatSize(int bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)}GB';
+    }
     if (bytes >= 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
     }
     return '${(bytes / 1024).toStringAsFixed(0)}KB';
+  }
+
+  /// 云盘列表条目的文件大小（filesize/fileSize/size 任一，缺失返回 0）。
+  static int _itemSizeBytes(Map<String, dynamic> item) {
+    for (final key in const ['filesize', 'fileSize', 'size']) {
+      final v = item[key];
+      if (v is num && v > 0) return v.toInt();
+      if (v is String) {
+        final n = int.tryParse(v);
+        if (n != null && n > 0) return n;
+      }
+    }
+    return 0;
+  }
+
+  /// 安全读取响应中的整数字段（num 或数字字符串；缺失/非法返回 null）。
+  static int? _intOf(dynamic v) {
+    if (v is num && v >= 0) return v.toInt();
+    if (v is String) {
+      final n = int.tryParse(v);
+      if (n != null && n >= 0) return n;
+    }
+    return null;
+  }
+
+  static Map<String, dynamic>? _asMap(dynamic v) {
+    if (v is Map<String, dynamic>) return v;
+    if (v is String) {
+      try {
+        final decoded = jsonDecode(v);
+        if (decoded is Map<String, dynamic>) return decoded;
+      } catch (_) {}
+    }
+    return null;
   }
 
   /// 安全地从响应字段提取歌曲列表。
@@ -556,13 +648,14 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                   onPressed: _enterSelectMode,
                 ),
                 IconButton(
-                  tooltip: '上传本地音乐',
+                  tooltip: '上传音乐',
                   icon: const Icon(Icons.cloud_upload_outlined),
-                  onPressed: _showLocalSongPicker,
+                  onPressed: _showUploadMenu,
                 ),
               ],
       ),
-      body: SecondaryMiniPlayerHost(
+      body: ContentWidth(
+        child: SecondaryMiniPlayerHost(
         child: _isLoading
           ? const Center(child: M3ELoadingIndicator())
           : _error != null
@@ -571,13 +664,20 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                   ? Md3PullToRefresh(
                       onRefresh: () => _loadCloudSongs(showLoading: false),
                       child: ListView(
-                        children: [_buildEmpty()],
-                      ),
+                        children: [_buildEmpty()]),
                     )
                   : Md3PullToRefresh(
                       onRefresh: () => _loadCloudSongs(showLoading: false),
                       child: Column(
                         children: [
+                          if (!_isSelectMode) const CloudUploadBanner(),
+                          if (!_isSelectMode)
+                            CloudCapacityCard(
+                              usedBytes: _usedBytes,
+                              quotaBytes: _quotaBytes,
+                              songCount:
+                                  _cloudTotal > 0 ? _cloudTotal : _songs.length,
+                            ),
                           if (!_isSelectMode) _buildHeader(),
                           if (!_isSelectMode) _buildSearchBar(),
                           Expanded(
@@ -602,7 +702,8 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                                             : () => _showSongMoreMenu(song),
                                         isSelectMode: _isSelectMode,
                                         isSelected:
-                                            _selectedIndices.contains(index),
+                                            _selectedIndices.contains(index,
+                                    ),
                                         onSelectToggle: () =>
                                             _toggleSelect(index),
                                         onLongPress: _isSelectMode
@@ -614,6 +715,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
                           ),
                           if (_isSelectMode) _buildSelectActionBar(),
                         ],
+                  ),
                       ),
                     ),
       ),
@@ -792,11 +894,16 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
       padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
       child: Row(
         children: [
-          Text(
-            '共 ${_songs.length} 首',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+          Flexible(
+            child: Text(
+              '共 ${_songs.length} 首'
+              '${_cloudTotal > _songs.length ? '（云端共 $_cloudTotal 首）' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+            ),
           ),
           const Spacer(),
           TextButton.icon(
@@ -821,6 +928,7 @@ class _CloudMusicPageState extends State<CloudMusicPage> {
       padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
       child: TextField(
         controller: _searchController,
+        contextMenuBuilder: buildAppTextContextMenu,
         decoration: InputDecoration(
           hintText: '搜索云盘歌曲',
           hintStyle: Theme.of(context)

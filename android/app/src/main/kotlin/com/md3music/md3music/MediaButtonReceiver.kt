@@ -58,6 +58,9 @@ class MediaButtonReceiver : BroadcastReceiver() {
             KeyEvent.KEYCODE_MEDIA_NEXT -> dispatch(context.applicationContext, "next")
             KeyEvent.KEYCODE_MEDIA_PREVIOUS -> dispatch(context.applicationContext, "previous")
             KeyEvent.KEYCODE_MEDIA_STOP -> dispatch(context.applicationContext, "pause")
+            // TV 遥控器快进/快退：走既有命令队列链路（→ handleMediaButtonCommand → Dart）
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> dispatch(context.applicationContext, "seekForward")
+            KeyEvent.KEYCODE_MEDIA_REWIND -> dispatch(context.applicationContext, "seekBack")
         }
     }
 

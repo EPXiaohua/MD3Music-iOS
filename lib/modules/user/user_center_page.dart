@@ -1,3 +1,10 @@
+import 'dart:async';
+
+import 'package:dpad/dpad.dart';
+
+import '../../core/build_flags.dart';
+import '../../core/layout/page_layout.dart';
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
@@ -15,7 +22,11 @@ import '../login/login_page.dart';
 import '../settings/settings_page.dart';
 import 'cloud_music_page.dart';
 import 'listen_ranking_page.dart';
+import 'blacklist_page.dart';
+import 'login_devices_page.dart';
+import 'music_preference_page.dart';
 import 'play_history_page.dart';
+import 'profile_edit_page.dart';
 import 'purchased_page.dart';
 import 'sign_in_calendar_page.dart';
 import 'vip_status.dart';
@@ -39,6 +50,53 @@ class _UserCenterPageState extends State<UserCenterPage> {
   /// 「同步云端时长」按钮的进行中状态（防重复点击）。
   bool _syncingGrade = false;
 
+  /// 上次感知到的登录态：用于侦测「未登录 → 已登录」跃迁。
+  ///
+  /// 首次下载场景：页面挂载时未登录（initState 的 postFrame 不会加载数据），
+  /// 登录页登录成功后 pop 回来，initState 不会重跑 —— 不在这里补一次跃迁监听，
+  /// 「我的」页就只有骨架，要手动下拉刷新才有数据（用户反馈的缺陷）。
+  bool _wasLoggedIn = false;
+
+  /// initState 里捕获的 KugouProvider 引用：listener 增删必须用同一个引用，
+  /// dispose 阶段 context 已 detach，不能用 context.read 再取。
+  KugouProvider? _kugou;
+
+  /// 登录态跃迁时触发一次完整数据加载（与下拉刷新一致）。
+  ///
+  /// 只在「未登录 → 已登录」这个方向加载：登出方向由 KugouProvider 自身的
+  /// notifyListeners 驱动 UI 切回未登录态，无需这里重复拉取。
+  void _onKugouChanged() {
+    if (!mounted) return;
+    final kugou = _kugou;
+    if (kugou == null) return;
+    final now = kugou.isLoggedIn;
+    final rising = now && !_wasLoggedIn;
+    // 先落盘本次登录态再触发加载：refreshUserInfo 等内部会 notifyListeners 递归
+    // 进入本方法，若 _wasLoggedIn 仍是旧值会把同一跃迁重复消费。
+    _wasLoggedIn = now;
+    if (rising) {
+      unawaited(_loadUserCenterData(kugou));
+    }
+  }
+
+  /// 拉取「我的」页全部数据（用户资料 + 会员 + 等级 + 月记录）。
+  ///
+  /// 刚登录的那几秒凭证可能还没在服务端生效：`getUserDetail` 会返回空
+  /// （KugouProvider 里「getUserDetail 失败时 _userInfo 残留旧账号」同一个坑），
+  /// 一次性拉取会全部落空 —— 表现为「我的」页只有骨架、头像要杀进程重开才出。
+  /// 这里重试到拿到用户资料为止，最多 3 次，避免用户还得手动下拉刷新。
+  Future<void> _loadUserCenterData(KugouProvider kugou) async {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (!mounted) return;
+      await kugou.refreshUserInfo();
+      await kugou.getVipDetail();
+      await kugou.getVipMonthRecord();
+      await kugou.getGradeInfo();
+      if (kugou.userInfo != null) return;
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
+  }
+
   /// 从云端同步听歌时长：拉取服务器权威 d_sec 并抬升本地基准。
   ///
   /// 与 App 打开时的自动同步（`KugouProvider._autoConnect`）走同一条链路；
@@ -60,18 +118,22 @@ class _UserCenterPageState extends State<UserCenterPage> {
   @override
   void initState() {
     super.initState();
+    _kugou = context.read<KugouProvider>();
+    final kugou = _kugou!;
+    // 记录挂载时的初始登录态，并注册跃迁监听：首次下载登录后 pop 回本页
+    // 能自动加载数据（见 _onKugouChanged）。
+    _wasLoggedIn = kugou.isLoggedIn;
+    kugou.addListener(_onKugouChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final kugou = context.read<KugouProvider>();
       if (kugou.isLoggedIn) {
-        kugou.getVipDetail();
-        kugou.getVipMonthRecord();
-        kugou.getGradeInfo();
+        unawaited(_loadUserCenterData(kugou));
       }
     });
   }
 
   @override
   void dispose() {
+    _kugou?.removeListener(_onKugouChanged);
     _scrollController.dispose();
     super.dispose();
   }
@@ -93,6 +155,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(
               context,
+            rootNavigator: true,
             ).push(MaterialPageRoute(builder: (_) => const SettingsPage())),
           ),
           Consumer<KugouProvider>(
@@ -100,14 +163,15 @@ class _UserCenterPageState extends State<UserCenterPage> {
               icon: Icon(kugou.isLoggedIn ? Icons.logout : Icons.login),
               onPressed: kugou.isLoggedIn
                   ? () => _confirmLogout(context, kugou)
-                  : () => Navigator.of(context).push(
+                  : () => Navigator.of(context, rootNavigator: true).push(
                       MaterialPageRoute(builder: (_) => const LoginPage()),
                     ),
             ),
           ),
         ],
       ),
-      body: Consumer<KugouProvider>(
+      body: ContentWidth(
+        child: Consumer<KugouProvider>(
         builder: (context, kugou, _) {
           if (!kugou.isLoggedIn) return _buildNotLoggedIn(cs, tt);
           return Md3PullToRefresh(
@@ -136,6 +200,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
             ),
           );
         },
+        ),
       ),
     );
   }
@@ -170,6 +235,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
               label: const Text('登录'),
               onPressed: () => Navigator.of(
                 context,
+                rootNavigator: true,
               ).push(MaterialPageRoute(builder: (_) => const LoginPage())),
             ),
           ],
@@ -195,12 +261,14 @@ class _UserCenterPageState extends State<UserCenterPage> {
       );
     }
 
-    // 修复：使用更安全的缓存键，避免 userId 为 null 导致的问题
+    // 修复：使用更安全的缓存键，避免 userId 为 null 导致的问题。
+    // 键带 URL 派生：同一账号换头像后 URL 变化即换键，
+    // 避免固定键命中旧缓存导致「头像已更新但我的页不变」。
     final safeUserId = userId.toString().replaceAll(
       RegExp(r'[^a-zA-Z0-9]'),
       '_',
     );
-    final cacheKey = 'avatar_$safeUserId';
+    final cacheKey = 'avatar_${safeUserId}_${avatarUrl.hashCode}';
 
     return CircleAvatar(
       radius: radius,
@@ -369,25 +437,49 @@ class _UserCenterPageState extends State<UserCenterPage> {
             Positioned(
               left: -overhangX,
               top: -overhangY,
-              child: Container(
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: cs.surface, width: ring),
-                  boxShadow: [
-                    BoxShadow(
-                      color: cs.shadow.withValues(alpha: 0.16),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
-                    ),
-                  ],
-                ),
-                child: _buildUserAvatar(kugou, cs),
-              ),
+              child: _buildAvatarEntry(kugou, cs, ring),
             ),
           ],
         ),
       ),
     );
+  }
+
+  /// 头像入口：点击跳转「编辑资料」子页（卡片其余区域仍走账号管理）。
+  /// TV：GestureDetector 在焦点系统里不是节点，包 DpadFocusable 单停点。
+  Widget _buildAvatarEntry(KugouProvider kugou, ColorScheme cs, double ring) {
+    final avatar = Container(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: cs.surface, width: ring),
+        boxShadow: [
+          BoxShadow(
+            color: cs.shadow.withValues(alpha: 0.16),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: _buildUserAvatar(kugou, cs),
+    );
+    void openProfileEdit() {
+      Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(builder: (_) => const ProfileEditPage()),
+      );
+    }
+
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'user-center/avatar',
+        onSelect: openProfileEdit,
+        child: InkWell(
+          onTap: openProfileEdit,
+          customBorder: const CircleBorder(),
+          child: avatar,
+        ),
+      );
+    }
+    return GestureDetector(onTap: openProfileEdit, child: avatar);
   }
 
   /// 与头像同心的装饰圆环，超出卡片的部分由卡片裁掉
@@ -627,10 +719,20 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             ),
                           ),
                         ),
+                      // 登录态作用域的管理入口：仅当前登录账号（接口按当前
+                      // token/userid 作用域，与已保存的其他账号无关），未登录时不出现。
+                      if (provider.isLoggedIn) ...[
+                        const Divider(),
+                        _buildDeviceManagerEntry(context),
+                        _buildBlacklistEntry(context),
+                        _buildPreferenceEntry(context),
+                        const Gap(AppSpacing.xs),
+                      ],
                       const Gap(AppSpacing.md),
                       FilledButton.icon(
-                        onPressed: () => Navigator.of(context).push(
-                          MaterialPageRoute(builder: (_) => const LoginPage()),
+                        onPressed: () => Navigator.of(context, rootNavigator: true).push(
+                          MaterialPageRoute(builder: (_) => const LoginPage(),
+                              ),
                         ),
                         icon: const Icon(Icons.add),
                         label: const Text('登录新账号'),
@@ -644,6 +746,119 @@ class _UserCenterPageState extends State<UserCenterPage> {
         );
       },
     );
+  }
+
+  /// 账号管理面板里的「登录设备管理」入口：仅管理当前登录账号的设备
+  /// （/login/device 系列接口按当前 token/userid 作用域，与其他已保存账号无关）。
+  Widget _buildDeviceManagerEntry(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    void open() {
+      Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(builder: (_) => const LoginDevicesPage()),
+      );
+    }
+
+    final tile = ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+      leading: Icon(Icons.devices_other, color: cs.primary),
+      title: Text(
+        '登录设备管理',
+        style: tt.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text(
+        '查看并下线当前账号的登录设备',
+        style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+      ),
+      trailing: Icon(Icons.chevron_right, color: cs.onSurfaceVariant),
+      onTap: open,
+    );
+
+    // TV：ListTile 在遥控焦点系统里可达性不稳，按项目约定包 DpadFocusable
+    // 单停点；OK 经 onSelect 走同一 open。正常构建走裸 ListTile，触屏零变化。
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'user-center/account-device-manage',
+        onSelect: open,
+        child: tile,
+      );
+    }
+
+    return tile;
+  }
+
+  /// 账号管理面板里的「黑名单管理」入口：管理当前登录账号的内容黑名单
+  /// （歌曲「不感兴趣」/ 歌手「屏蔽」，推荐场景由服务端排除）。
+  Widget _buildBlacklistEntry(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    void open() {
+      Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(builder: (_) => const BlacklistPage()),
+      );
+    }
+
+    final tile = ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+      leading: Icon(Icons.block_outlined, color: cs.primary),
+      title: Text(
+        '黑名单管理',
+        style: tt.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text(
+        '管理推荐中不想看到的歌曲和歌手',
+        style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+      ),
+      trailing: Icon(Icons.chevron_right, color: cs.onSurfaceVariant),
+      onTap: open,
+    );
+
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'user-center/account-blacklist',
+        onSelect: open,
+        child: tile,
+      );
+    }
+
+    return tile;
+  }
+
+  /// 账号管理面板里的「听歌偏好」入口：设置当前登录账号的听歌偏好
+  /// （推荐模式/性别/年龄段/语言/风格/歌曲推荐强度，接口按当前 token/userid 作用域）。
+  Widget _buildPreferenceEntry(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    void open() {
+      Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(builder: (_) => const MusicPreferencePage()),
+      );
+    }
+
+    final tile = ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+      leading: Icon(Icons.tune, color: cs.primary),
+      title: Text(
+        '听歌偏好',
+        style: tt.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text(
+        '设置性别、年龄、语言与风格，优化每日推荐',
+        style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+      ),
+      trailing: Icon(Icons.chevron_right, color: cs.onSurfaceVariant),
+      onTap: open,
+    );
+
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'user-center/account-preference',
+        onSelect: open,
+        child: tile,
+      );
+    }
+
+    return tile;
   }
 
   /// 单个已保存账号的行
@@ -687,7 +902,6 @@ class _UserCenterPageState extends State<UserCenterPage> {
                 '登录已过期',
                 style: tt.labelSmall?.copyWith(
                   color: cs.onErrorContainer,
-                  fontSize: 10,
                 ),
               ),
             ),
@@ -759,7 +973,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
     KugouAccount account,
     KugouProvider kugou,
   ) async {
-    final navigator = Navigator.of(context);
+    final navigator = Navigator.of(context, rootNavigator: true);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -802,7 +1016,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
     KugouProvider kugou,
   ) async {
     if (!context.mounted) return;
-    final navigator = Navigator.of(context);
+    final navigator = Navigator.of(context, rootNavigator: true);
     final action = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -899,7 +1113,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
           color: Colors.transparent,
           // 整卡可点击进入签到日历页
           child: InkWell(
-            onTap: () => Navigator.of(context).push(
+            onTap: () => Navigator.of(context, rootNavigator: true).push(
               MaterialPageRoute(builder: (_) => const SignInCalendarPage()),
             ),
             child: Padding(
@@ -1041,24 +1255,16 @@ class _UserCenterPageState extends State<UserCenterPage> {
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [
             _actionItem(cs, Icons.history, '历史', () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const PlayHistoryPage()),
-              );
+              AdaptiveNav.openDetail(context, (_) => const PlayHistoryPage());
             }),
             _actionItem(cs, Icons.bar_chart, '排行', () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const ListenRankingPage()),
-              );
+              AdaptiveNav.openDetail(context, (_) => const ListenRankingPage());
             }),
             _actionItem(cs, Icons.cloud, '云盘', () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const CloudMusicPage()),
-              );
+              AdaptiveNav.openDetail(context, (_) => const CloudMusicPage());
             }),
             _actionItem(cs, Icons.shopping_bag_outlined, '已购', () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const PurchasedPage()),
-              );
+              AdaptiveNav.openDetail(context, (_) => const PurchasedPage());
             }),
             // 可选扩展：私有构建注入的额外操作项（默认无）
             ...?UserCenterPage.extraActionItemsBuilder?.call(context, cs),
@@ -1074,28 +1280,52 @@ class _UserCenterPageState extends State<UserCenterPage> {
     String label,
     VoidCallback onTap,
   ) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(
-        children: [
-          Container(
-            width: 48,
-            height: 48,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: cs.surfaceContainerHighest,
-            ),
-            child: Icon(icon, color: cs.onSurfaceVariant),
+    // 图标 + 文字：触摸与 TV 共用同一份视觉。
+    final visual = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: cs.surfaceContainerHighest,
           ),
-          const SizedBox(height: 6),
-          Text(
-            label,
-            style: Theme.of(
-              context,
-            ).textTheme.labelMedium?.copyWith(color: cs.onSurfaceVariant),
-          ),
-        ],
-      ),
+          child: Icon(icon, color: cs.onSurfaceVariant),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          label,
+          style: Theme.of(
+            context,
+          ).textTheme.labelMedium?.copyWith(color: cs.onSurfaceVariant),
+        ),
+      ],
     );
+
+    // TV：纯 GestureDetector 在焦点系统里不是节点，遥控永远落不上去
+    // （2026-10-04 实测：历史/排行/云盘/已购 四个入口方向键都不可达）。
+    // 改用 Material + InkWell（自带可聚焦的 InkResponse）+ DpadFocusable
+    // 单停点；OK 经 onSelect 走同一 onTap。正常构建走原 GestureDetector，
+    // 触屏路径零变化。
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'user-center/action-$label',
+        onSelect: onTap,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: AppRadius.lgAll,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.sm,
+              vertical: AppSpacing.xs,
+            ),
+            child: visual,
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(onTap: onTap, child: visual);
   }
 }

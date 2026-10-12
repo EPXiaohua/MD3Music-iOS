@@ -1,6 +1,9 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../../../core/utils/app_haptics.dart';
+import '../../../core/utils/app_text_context_menu.dart';
+
 /// MV 弹幕发送输入条。
 ///
 /// 提交后由调用方负责清空输入并收起键盘；本 widget 不持有业务状态。
@@ -74,6 +77,7 @@ class _MvDanmakuInputBarState extends State<MvDanmakuInputBar> {
           Expanded(
             child: TextField(
               controller: _controller,
+              contextMenuBuilder: buildAppTextContextMenu,
               enabled: !widget.sending,
               maxLength: 50,
               textInputAction: TextInputAction.send,
@@ -90,14 +94,21 @@ class _MvDanmakuInputBarState extends State<MvDanmakuInputBar> {
           ),
           const SizedBox(width: 8),
           M3EFilledButton(
-            onPressed: widget.sending ? null : _submit,
+            // 按钮触觉由 Dart 侧按「开关与按钮」类别发出：m3e 的 haptic 只经
+            // m3e_haptics 原生通道，会被「滑块调节」闸门整体拦下。
+            onPressed: widget.sending
+                ? null
+                : () {
+                    AppHaptics.tick(HapticCategory.control);
+                    _submit();
+                  },
             tooltip: '发送弹幕',
             // 纯图标按钮：去掉内部水平内边距 + 固定正方形尺寸，
             // 配合 M3EButtonShape.round（默认，圆角 = 高度/2）得到正圆。
             decoration: const M3EButtonDecoration(
               padding: EdgeInsets.zero,
               fixedSize: Size.square(40),
-              haptic: M3EHapticFeedback.light,
+              haptic: M3EHapticFeedback.none,
             ),
             child: const Icon(Icons.send, size: 20),
           ),

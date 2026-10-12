@@ -1,14 +1,17 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/tab_snap_physics.dart';
 import '../../data/models/song.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/pinchable_grid_view.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/song_list_item.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
@@ -246,6 +249,7 @@ class _IpDetailPageState extends State<IpDetailPage>
       body: SecondaryMiniPlayerHost(
         child: TabBarView(
           controller: _tabController,
+          physics: const TabSnapPhysics(),
           children: [
             _buildSongsTab(),
             _buildAlbumsTab(),
@@ -379,10 +383,8 @@ class _IpDetailPageState extends State<IpDetailPage>
             child: Material(
               color: cs.surfaceContainerLow,
               child: InkWell(
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => AlbumDetailPage(album: album.toAlbum()),
-                  ),
+                onTap: () => AdaptiveNav.openDetail(context,
+                  (_) => AlbumDetailPage(album: album.toAlbum()),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -507,9 +509,10 @@ class _IpDetailPageState extends State<IpDetailPage>
       albumAudioId: albumAudioId,
       artworkUri: cover,
     );
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
-    );
+    Navigator.of(context,
+      rootNavigator: true,
+    ).push(
+      MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)));
   }
 
   /// 歌手 tab：歌手列表
@@ -565,13 +568,11 @@ class _IpDetailPageState extends State<IpDetailPage>
                 alpha: 0.5,
               ),
             ),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => ArtistDetailPage(
+            onTap: () => AdaptiveNav.openDetail(context,
+              (_) => ArtistDetailPage(
                   artistId: artist.id,
                   artistName: artist.name,
                   avatarUrl: artist.avatarUrl,
-                ),
               ),
             ),
           );
@@ -597,20 +598,21 @@ class _IpDetailPageState extends State<IpDetailPage>
             borderRadius: BorderRadius.circular(14),
             clipBehavior: Clip.antiAlias,
             child: InkWell(
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => PlaylistPage(playlist: p.toPlaylist()),
-                ),
+              onTap: () => AdaptiveNav.openDetail(context,
+                (_) => PlaylistPage(playlist: p.toPlaylist()),
               ),
               child: Padding(
                 padding: const EdgeInsets.all(8),
                 child: Row(
                   children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(10),
-                      child: SizedBox(
-                        width: 56,
-                        height: 56,
+                    SizedBox(
+                      width: 56,
+                      height: 56,
+                      child: PlaylistCoverHero(
+                        tag: playlistCoverHeroTag(
+                          p.globalCollectionId ?? p.id,
+                        ),
+                        radius: const BorderRadius.all(Radius.circular(10)),
                         child: p.coverUrl != null
                             ? CachedNetworkImage(
                                 imageUrl: p.coverUrl!,

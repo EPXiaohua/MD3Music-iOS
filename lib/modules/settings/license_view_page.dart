@@ -1,3 +1,6 @@
+import '../../core/theme/app_dimens.dart';
+import '../../core/layout/page_layout.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
@@ -38,7 +41,9 @@ class _LicenseViewPageState extends State<LicenseViewPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('本应用许可证')),
-      body: _error != null
+      body: ContentWidth(
+        maxWidth: AppLayout.readableMaxWidth,
+        child: _error != null
           ? Center(child: Text(_error!))
           : _text.isEmpty
               ? const Center(child: CircularProgressIndicator())
@@ -46,8 +51,9 @@ class _LicenseViewPageState extends State<LicenseViewPage> {
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
                   child: SelectableText(
                     _text,
+                    contextMenuBuilder: buildAppTextContextMenu,
                     style: theme.textTheme.bodySmall?.copyWith(
-                      height: 1.5,
+                      height: 1.5),
                     ),
                   ),
                 ),

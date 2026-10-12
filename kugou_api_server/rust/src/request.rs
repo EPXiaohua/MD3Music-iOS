@@ -37,10 +37,24 @@ impl BodyData {
 
 /// Module response body. Bytes preserve raw arraybuffer responses so modules can
 /// call `.to_base64()` (JS `res.body.toString('base64')`) before decrypting.
-#[derive(Debug, Clone)]
+///
+/// Stream 供云盘上传等长耗时端点边执行边回传进度（NDJSON 行流）：
+/// 仅 `server.rs::respond_module` 消费（不缓冲、不进 apicache），
+/// `to_json`/`to_bytes` 等缓冲方法对它一律返回空值。
 pub enum BodyValue {
     Json(Value),
     Bytes(Vec<u8>),
+    Stream(Box<dyn Read + Send>),
+}
+
+impl std::fmt::Debug for BodyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyValue::Json(v) => write!(f, "Json({v})"),
+            BodyValue::Bytes(b) => write!(f, "Bytes({} bytes)", b.len()),
+            BodyValue::Stream(_) => write!(f, "Stream(<reader>)"),
+        }
+    }
 }
 
 impl BodyValue {
@@ -59,6 +73,8 @@ impl BodyValue {
                 let text = String::from_utf8_lossy(b).into_owned();
                 serde_json::from_str(&text).unwrap_or(Value::String(text))
             }
+            // 流式体不缓冲；只有 respond_module 消费它，不会走到这些方法。
+            BodyValue::Stream(_) => Value::Null,
         }
     }
 
@@ -66,6 +82,7 @@ impl BodyValue {
         match self {
             BodyValue::Json(v) => crate::util::json_stringify(v).into_bytes(),
             BodyValue::Bytes(b) => b.clone(),
+            BodyValue::Stream(_) => Vec::new(),
         }
     }
 
@@ -73,6 +90,7 @@ impl BodyValue {
         match self {
             BodyValue::Json(v) => crate::util::json_stringify(v),
             BodyValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            BodyValue::Stream(_) => String::new(),
         }
     }
 
@@ -80,6 +98,7 @@ impl BodyValue {
         match self {
             BodyValue::Json(_) => base64_encode(&self.to_bytes()),
             BodyValue::Bytes(b) => base64_encode(b),
+            BodyValue::Stream(_) => String::new(),
         }
     }
 
@@ -90,12 +109,12 @@ impl BodyValue {
     pub fn as_mut_json(&mut self) -> Option<&mut Value> {
         match self {
             BodyValue::Json(v) => Some(v),
-            BodyValue::Bytes(_) => None,
+            BodyValue::Bytes(_) | BodyValue::Stream(_) => None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ModuleResponse {
     pub status: u16,
     pub body: BodyValue,
@@ -122,6 +141,10 @@ pub struct RequestOptions {
     pub response_type: Option<String>,
     /// 使用标准版(非概念版)签名盐。刷刷(brush) feed 接口 appid=1005 需要标准盐。
     pub standard_signature: bool,
+    /// 小-MSS 传输开关：Some(字节数) 时本次请求走 mss_http 自管 TCP+TLS
+    /// （钳制出站段大小 + 头/体分 record + fresh 连接 + 确定性超时），
+    /// 用于黑名单等大上行端点在 PMTU 黑洞网络下的挂死规避。见 mss_http 模块注释。
+    pub mss_clamp: Option<u32>,
     /// 请求级上游超时（秒）。None 时使用全局 20s 默认；
     /// 对偶发无响应的上游（如 /user/grade/info）单独收紧，避免客户端已放弃而服务器继续空转。
     pub timeout_secs: Option<u64>,
@@ -147,6 +170,7 @@ impl RequestOptions {
             response_type: None,
             standard_signature: false,
             timeout_secs: None,
+            mss_clamp: None,
         }
     }
 
@@ -219,6 +243,12 @@ impl RequestOptions {
 
     pub fn standard_signature(mut self, v: bool) -> Self {
         self.standard_signature = v;
+        self
+    }
+
+    /// 启用小-MSS 传输并钳制出站 TCP 段大小（字节）。见 mss_http 模块注释。
+    pub fn mss_clamp(mut self, v: u32) -> Self {
+        self.mss_clamp = Some(v);
         self
     }
 
@@ -375,6 +405,23 @@ fn do_send(opts: &RequestOptions, params: &Value, final_headers: &HashMap<String
         }
     }
 
+    // 小-MSS 传输分支（黑名单等大上行端点 opt-in）：签名/头/SSA 重试逻辑
+    // 全部复用本管线，仅替换 socket/TLS 层。见 mss_http 模块注释。
+    if let Some(mss) = opts.mss_clamp {
+        let content_type: Option<String> = final_headers
+            .iter()
+            .chain(extra.iter())
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone());
+        let hdrs: Vec<(String, String)> = final_headers
+            .iter()
+            .chain(extra.iter())
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("content-type"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        return mss_transport_send(opts, &url, hdrs, content_type, mss);
+    }
+
     // 统一使用全局 Agent（连接池共享，keep-alive/TLS 会话跨请求复用）；
     // 请求级超时仅在本次请求生效（ureq 2.x Request::timeout）。
     let mut req = agent().request(&opts.method, &url);
@@ -440,6 +487,52 @@ fn do_send(opts: &RequestOptions, params: &Value, final_headers: &HashMap<String
         cookies,
         ssa_code,
         body,
+    })
+}
+
+/// 小-MSS 传输（黑名单等 mss_clamp 端点专用，见 mss_http 模块注释）：
+/// 请求体序列化与 ureq 路径同源（Json → json_stringify），响应映射回
+/// RawResponse 后走与 ureq 完全相同的 SSA 重试/响应塑形管线。
+fn mss_transport_send(
+    opts: &RequestOptions,
+    url: &str,
+    mut hdrs: Vec<(String, String)>,
+    content_type: Option<String>,
+    mss: u32,
+) -> Result<RawResponse, String> {
+    let body: Option<String> = match &opts.data {
+        BodyData::None => None,
+        BodyData::Json(v) => Some(crate::util::json_stringify(v)),
+        BodyData::String(s) => Some(s.clone()),
+        BodyData::Bytes(_) => {
+            return Err("mss transport: binary body not supported".to_string());
+        }
+    };
+    if let Some(ct) = content_type {
+        hdrs.push(("Content-Type".to_string(), ct));
+    }
+    let resp = crate::mss_http::https_send(
+        &opts.method,
+        url,
+        &hdrs,
+        body.as_deref(),
+        mss,
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("status {}", resp.status));
+    }
+    Ok(RawResponse {
+        cookies: resp
+            .set_cookies
+            .iter()
+            .map(|c| parse_cookie_string(c))
+            .collect(),
+        ssa_code: resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("ssa-code"))
+            .map(|(_, v)| v.clone()),
+        body: resp.body,
     })
 }
 

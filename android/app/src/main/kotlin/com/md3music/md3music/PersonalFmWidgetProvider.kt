@@ -46,6 +46,11 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
         // 播放类动作常量定义在 AudioPlaybackService（PendingIntent 直接引用），
         // 保证 Provider 与 Service 两端字符串一致。
 
+        // 档位（电台）总数：与 Dart 侧 kFmStations 的条目数一一对应，
+        // 下标即档位（0 红心 / 1 探索 / 2 小众 / 3 电台），增删档位时同步改
+        // stationIconIds 与布局里的叠放槽位。
+        private const val STATION_COUNT = 4
+
         private const val EXTRA_FM_STATION_INDEX = "fm_stationIndex"
         private const val EXTRA_FM_STATION_DESC = "fm_stationDescription"
         private const val EXTRA_FM_IS_LOGGED_IN = "fm_isLoggedIn"
@@ -248,7 +253,7 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
     private fun readSnapshot(intent: Intent) {
         lastLoggedIn = intent.getBooleanExtra(EXTRA_FM_IS_LOGGED_IN, lastLoggedIn)
         lastStationIndex = intent.getIntExtra(EXTRA_FM_STATION_INDEX, lastStationIndex)
-            .coerceIn(0, 2)
+            .coerceIn(0, STATION_COUNT - 1)
         lastStationDesc = intent.getStringExtra(EXTRA_FM_STATION_DESC)
             ?.takeIf { it.isNotEmpty() } ?: lastStationDesc
         lastIsLoading = intent.getBooleanExtra(EXTRA_FM_IS_LOADING, lastIsLoading)
@@ -371,7 +376,7 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
 
                 // 档位按钮：显示当前档位图标（surfaceHigh 底 + onSurfaceVariant 图标，
                 // 与发现页抽屉收起态一致），点击循环切换下一档位。
-                // 三档图标叠放 + 可见性切换，不用 setImageViewResource 换资源：
+                // 四档图标叠放 + 可见性切换，不用 setImageViewResource 换资源：
                 // MIUI 桌面对「同视图换资源 + setColorFilter 交替」会丢失着色，图标退回
                 // 固有白色（浅色面板上白压白不可见）。叠放方案见 2×2 封面小部件同款修法。
                 views.setInt(R.id.fm_station_bg, "setColorFilter", c("surfaceHigh"))
@@ -420,7 +425,7 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
 
         // 档位按钮：点击循环切换下一档位（extra 携带渲染时算好的下一档下标，
         // 每次状态推送都会重绑，切档完成后图标随新快照更新）
-        val nextStation = (lastStationIndex + 1) % 3
+        val nextStation = (lastStationIndex + 1) % STATION_COUNT
         val stationIntent = Intent(context, PersonalFmWidgetProvider::class.java).apply {
             action = AudioPlaybackService.ACTION_WIDGET_FM_SELECT_STATION
             putExtra(EXTRA_FM_STATION_INDEX, nextStation)
@@ -470,13 +475,15 @@ class PersonalFmWidgetProvider : AppWidgetProvider() {
     private val nextBgIds =
         intArrayOf(R.id.fm_next_bg1, R.id.fm_next_bg2, R.id.fm_next_bg3)
 
-    // 档位图标叠放槽位：下标即档位（0 红心 / 1 探索 / 2 小众）。
-    // 三档共用同一 tint（onSurfaceVariant），故可安全同数组批量着色。
+    // 档位图标叠放槽位：下标即档位（0 红心 / 1 探索 / 2 小众 / 3 电台）。
+    // 四档共用同一 tint（onSurfaceVariant），故可安全同数组批量着色。
+    // 长度必须等于 companion 的 STATION_COUNT（切档取模与快照下标钳制都读它）。
     private val stationIconIds =
         intArrayOf(
             R.id.fm_station_icon_favorite,
             R.id.fm_station_icon_explore,
             R.id.fm_station_icon_diamond,
+            R.id.fm_station_icon_radio,
         )
 
     /**

@@ -12,6 +12,7 @@ pub mod config;
 pub mod crypto;
 pub mod device;
 pub mod helper;
+pub mod mss_http;
 pub mod modules;
 pub mod request;
 pub mod server;

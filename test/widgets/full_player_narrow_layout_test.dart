@@ -13,6 +13,9 @@ import 'package:md3music/data/repositories/history_repository.dart';
 import 'package:md3music/modules/player/am_transport_controls.dart';
 import 'package:md3music/modules/player/full_player.dart';
 import 'package:md3music/modules/player/full_player_am.dart';
+import 'package:md3music/modules/player/lyrics_view.dart';
+import 'package:md3music/modules/player/full_player_route.dart';
+import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/providers/comment_display_provider.dart';
 import 'package:md3music/providers/device_provider.dart';
 import 'package:md3music/providers/favorites_provider.dart';
@@ -124,9 +127,25 @@ class _ThrowingLyricProvider extends KugouProvider {
     String fmt = 'lrc',
     String? localIdentity,
     bool forceRefresh = false,
+    void Function(KugouLyric lyric)? onProgress,
   }) async {
     requestCount++;
     throw StateError('simulated lyric transport failure');
+  }
+}
+
+class _DelayedLyricProvider extends KugouProvider {
+  _DelayedLyricProvider() : super(registerDeviceOnStart: false);
+  final requests = <Completer<KugouLyric?>>[];
+  final progressCallbacks = <void Function(KugouLyric)?>[];
+  @override
+  Future<KugouLyric?> getLyric(String hash, {String? songName,
+    String fmt = 'lrc', String? localIdentity, bool forceRefresh = false,
+    void Function(KugouLyric lyric)? onProgress}) {
+    final request = Completer<KugouLyric?>();
+    requests.add(request);
+    progressCallbacks.add(onProgress);
+    return request.future;
   }
 }
 
@@ -209,6 +228,8 @@ void main() {
       ('横屏1点3倍字', const Size(800, 360), 1.3),
     ]) {
       testWidgets('$name $layout 失败提示与传输控件可见且无溢出', (tester) async {
+        final originalTabIndex = playerTabIndex.value;
+        addTearDown(() => playerTabIndex.value = originalTabIndex);
         final originalPhysicalSize = tester.view.physicalSize;
         final originalDevicePixelRatio = tester.view.devicePixelRatio;
         tester.view.physicalSize = viewport;
@@ -256,6 +277,10 @@ void main() {
           );
           await tester.pumpAndSettle(const Duration(milliseconds: 100));
 
+          expect(tester.takeException(), isNull);
+          // 宽屏（横屏）默认档：控制带常驻右栏底部，尺/传输/音量与歌词同屏，
+          // **不用切页**就能看到失败提示与传输控件（切回「横屏控制面板独立页」
+          // 开关才走独立页签，见 full_player_landscape_controls_test 的 detached 组）。
           expect(tester.takeException(), isNull);
           expect(find.text('播放失败，请重试'), findsOneWidget);
           final controls = name == 'MD3'
@@ -465,7 +490,9 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
           final coverTab = find.descendant(
             of: find.byType(PlayerTabStrip),
-            matching: find.byIcon(Icons.album),
+            matching: find.byWidgetPredicate(
+              (w) => w is Semantics && w.properties.label == '封面',
+            ),
           );
           expect(coverTab, findsOneWidget);
           await tester.tap(coverTab);
@@ -528,6 +555,84 @@ void main() {
         }
       });
     }
+  }
+
+  for (final (name, page) in <(String, Widget Function())>[
+    ('MD3', () => const FullPlayer(dockMode: true)),
+    ('AM', () => const AmStyleFullPlayer(dockMode: true)),
+  ]) {
+    testWidgets('$name 同曲元数据变化重取歌词且旧请求不能覆盖新结果', (tester) async {
+      final originalTabIndex = playerTabIndex.value;
+      addTearDown(() => playerTabIndex.value = originalTabIndex);
+      tester.view.physicalSize = const Size(360, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      SharedPreferences.setMockInitialValues({});
+      _mockPlatformChannels();
+      final audio = ControlledAudioService();
+      AudioServiceLoader.setTestOverride(() async => audio);
+      final kugou = _DelayedLyricProvider();
+      late PlayerProvider player;
+      try {
+        await tester.runAsync(() async {
+          player = PlayerProvider();
+          await player.audioReady;
+          final load = player.playPlaylist([_song()], 0);
+          await audio.waitForPlaylistLoads(1);
+          await audio.completeSourceLoad(0);
+          await load;
+        });
+        await tester.pumpWidget(_host(player, kugou, page()));
+        await tester.pump(const Duration(milliseconds: 100));
+        final strip = tester.widget<PlayerTabStrip>(find.byType(PlayerTabStrip).first);
+        strip.controller.index = strip.items.indexWhere((item) => item.label == '歌词');
+        await tester.pump();
+        expect(kugou.requests, hasLength(1));
+        await tester.runAsync(() async {
+          final load = player.playPlaylist([_song(albumAudioId: 'enriched')], 0);
+          await audio.waitForPlaylistLoads(2);
+          await audio.completeSourceLoad(1);
+          await load;
+        });
+        await tester.pump(const Duration(milliseconds: 100));
+        expect(kugou.requests, hasLength(2));
+        kugou.progressCallbacks.last?.call(const KugouLyric(
+          content: '[00:01.00]new lyric', decodedContent: '[00:01.00]new lyric'));
+        kugou.progressCallbacks.first?.call(const KugouLyric(
+          content: '[00:01.00]old lyric', decodedContent: '[00:01.00]old lyric'));
+        await tester.pump(const Duration(seconds: 9));
+        if (name == 'MD3') {
+          expect(tester.widget<LyricsView>(find.byType(LyricsView, skipOffstage: false).first).lyrics,
+            contains('new lyric'));
+        } else {
+          expect(tester.widget<AppleLyricsView>(find.byType(AppleLyricsView, skipOffstage: false).first)
+            .lines.map((line) => line.text), contains('new lyric'));
+        }
+        kugou.requests.last.complete(const KugouLyric(
+          content: '[00:01.00]new lyric', decodedContent: '[00:01.00]new lyric'));
+        await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+        await tester.pump();
+        kugou.requests.first.complete(const KugouLyric(
+          content: '[00:01.00]old lyric', decodedContent: '[00:01.00]old lyric'));
+        await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+        await tester.pump();
+        if (name == 'MD3') {
+          expect(tester.widget<LyricsView>(find.byType(LyricsView, skipOffstage: false).first).lyrics,
+            contains('new lyric'));
+        } else {
+          expect(tester.widget<AppleLyricsView>(find.byType(AppleLyricsView, skipOffstage: false).first)
+            .lines.map((line) => line.text), contains('new lyric'));
+        }
+      } finally {
+        await tester.pumpWidget(const SizedBox.shrink());
+        player.dispose();
+        kugou.dispose();
+        await tester.runAsync(() => HistoryRepository().flush());
+        await audio.dispose();
+        AudioServiceLoader.setTestOverride(null);
+      }
+    });
   }
 
   testWidgets('全屏页切歌与后台恢复时动态封面失败资源均释放', (tester) async {

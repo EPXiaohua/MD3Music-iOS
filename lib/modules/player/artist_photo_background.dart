@@ -1,13 +1,11 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
-import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
 import '../../providers/theme_provider.dart';
-import '../../services/kugou_api/kugou_endpoints.dart';
+import 'artist_photo_service.dart';
 
 /// MD3 风格播放页背景：歌手写真轮播。
 ///
@@ -21,10 +19,14 @@ class ArtistPhotoBackground extends StatefulWidget {
   /// 上层据此决定是否隐藏左侧专辑封面，避免写真无图时封面一起消失。
   final ValueChanged<bool>? onHasImages;
 
+  /// 写真数据源；null 时取 [ArtistPhotoService.instance]（测试可注入）。
+  final ArtistPhotoService? service;
+
   const ArtistPhotoBackground({
     super.key,
     required this.hash,
     this.onHasImages,
+    this.service,
   });
 
   @override
@@ -66,44 +68,10 @@ class _ArtistPhotoBackgroundState extends State<ArtistPhotoBackground> {
       return;
     }
 
-    // 用 http.get 直接请求 /images/audio（歌手图片接口），绕过 dio
-    // /images/audio 文档：hash 必选，count 可选（默认5），返回 data 是二维数组 [[{imgs}]]
-    final httpResp = await http.get(
-      Uri.parse('${KugouEndpoints.baseUrl}/images/audio?hash=${widget.hash}&count=20'),
-    );
-    final json = jsonDecode(httpResp.body) as Map<String, dynamic>;
-    if (!mounted) return;
-
-    final List<String> urls = [];
-    if (json['status'] == 1) {
-      final data = json['data'];
-      // /images/audio 的 data 是二维数组 [[{author, imgs:{...}}], ...]
-      if (data is List) {
-        for (final group in data) {
-          // group 是 [{author, imgs}] 或直接 {author, imgs}
-          final items = group is List ? group : [group];
-          for (final item in items) {
-            if (item is Map) {
-              final imgs = item['imgs'];
-              if (imgs is Map) {
-                for (final imgList in imgs.values) {
-                  if (imgList is List) {
-                    for (final img in imgList) {
-                      if (img is Map) {
-                        final url = img['sizable_portrait'];
-                        if (url is String && url.isNotEmpty && !urls.contains(url)) {
-                          urls.add(url);
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    // 走 ArtistPhotoService（与 AM 播放页共用）：本地服务器未就绪 / 请求失败 /
+    // 响应非法时返回空列表，不抛异常。
+    final urls = await (widget.service ?? ArtistPhotoService.instance)
+        .load(hash: widget.hash);
 
     if (!mounted) return;
     setState(() {

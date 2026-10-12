@@ -1,5 +1,8 @@
+import 'package:dpad/dpad.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
+
+import '../core/build_flags.dart';
 
 /// 一个排序选项：值 + 显示文本。
 typedef M3ESortOption<T> = ({T value, String label});
@@ -107,8 +110,80 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
     return isDefaultAmbient ? theme.colorScheme.onSurfaceVariant : ambient;
   }
 
+  /// tv: 遥控下的排序选择弹层，替代触屏用的 [M3EDropdownMenu]。
+  ///
+  /// 为什么 TV 不能沿用下拉（2026-10-04：歌单页焦点被右上角排序下拉"捕获"，
+  /// 其它功能全部选不中）：
+  /// 1. 字段是 `Focus(onKeyEvent: …)`，把 ↑/↓/Enter/Space **全部** 判为
+  ///    handled（m3e_core `m3e_dropdown_menu.dart:390`）—— 焦点一旦落到排序
+  ///    按钮上，方向键就被吞掉，只能靠左右键逃出去；
+  /// 2. 面板条目是 `GestureDetector` + `onTap`，不带焦点节点，就算把面板
+  ///    拉开了遥控也选不中任何一项。
+  ///
+  /// 故 TV 构建换成底部弹层，每行一个 [DpadFocusable]：OK 选排序项，
+  /// 再 OK 点当前项 = 翻转升/降序（与触屏的 `repeated` 语义一致）。
+  Future<void> _openTvSortPicker() async {
+    final picked = await showM3EModalBottomSheet<M3ESortOption<T>>(
+      context: context,
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        // 弹层底是 material_ui 的 Material，下面的行是 flutter/material 的
+        // ListTile：同名不同型的 Material 匹配不上，必须自带一层（AGENTS §4.13），
+        // 否则 TV 上打开排序弹层会顶出「此处内容加载出错」。
+        return Material(
+          type: MaterialType.transparency,
+          child: SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    widget.tooltip,
+                    style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                for (var i = 0; i < widget.options.length; i++)
+                  DpadFocusable(
+                    // 弹层首项自动聚焦：一打开就看得见焦点在哪
+                    autofocus: i == 0,
+                    debugLabel: 'sort_option_$i',
+                    onSelect: () => Navigator.pop(ctx, widget.options[i]),
+                    child: ListTile(
+                      title: Text(widget.options[i].label),
+                      trailing: widget.options[i].value == widget.current
+                          ? Icon(Icons.check, color: cs.primary)
+                          : null,
+                    ),
+                  ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (picked == null) return;
+    widget.onPicked(picked.value, picked.value == widget.current);
+  }
+
   @override
   Widget build(BuildContext context) {
+    // tv: 触屏的下拉在遥控下会吞掉方向键（见 [_openTvSortPicker] 的说明），
+    // 这里换成同外观的图标按钮 + 可聚焦弹层。
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'sort_button',
+        onSelect: _openTvSortPicker,
+        child: SizedBox(
+          width: _slot,
+          height: _slot,
+          child: Icon(widget.icon, size: 24, color: _iconColor(context)),
+        ),
+      );
+    }
     return Tooltip(
       message: widget.tooltip,
       child: SizedBox(

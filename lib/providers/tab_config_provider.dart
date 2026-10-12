@@ -1,27 +1,43 @@
 import 'package:flutter/foundation.dart';
 
+import '../core/platform_capabilities.dart';
 import '../data/repositories/settings_repository.dart';
 
 /// 主页 Tab 配置项。
 ///
 /// [id] 唯一标识，[label] 显示名称，[isRemovable] 是否允许隐藏。
 /// "我的"页面（user）不允许隐藏，保证用户始终有入口进入设置/登录。
+///
+/// [pinnedTitle] 该 tab 的页面标题是否**左对齐**（= M3 顶栏惯例、无返回键）。
+/// 这是"一级页面"的唯一判据来源：页面 AppBar 用
+/// `centerPageTitle(context, tabId: …)` 决定对齐，悬浮播放器等外壳逻辑用
+/// [isPrimaryNavPage] 读同一个字段决定"不回缩/是否用悬浮底栏"。
+/// **两处必须一致**：给页面 AppBar 新增或去掉 `tabId:` 时，同步改这里，
+/// 否则标题对齐与播放器形态会互相矛盾。
 class TabItem {
   final String id;
   final String label;
   final bool isRemovable;
+  final bool pinnedTitle;
 
   const TabItem({
     required this.id,
     required this.label,
     this.isRemovable = true,
+    this.pinnedTitle = false,
   });
 
-  TabItem copyWith({String? id, String? label, bool? isRemovable}) {
+  TabItem copyWith({
+    String? id,
+    String? label,
+    bool? isRemovable,
+    bool? pinnedTitle,
+  }) {
     return TabItem(
       id: id ?? this.id,
       label: label ?? this.label,
       isRemovable: isRemovable ?? this.isRemovable,
+      pinnedTitle: pinnedTitle ?? this.pinnedTitle,
     );
   }
 
@@ -34,17 +50,22 @@ class TabItem {
 }
 
 /// 默认 Tab 定义（与 app.dart _MainLayout._pages 顺序对应）。
+///
+/// `pinnedTitle: true` 的那几个，其页面 AppBar 必须真的传了对应 `tabId`
+/// （见各页 `centerPageTitle` / `ScrollAwareAppBar(tabId:)`）：
+/// 目前左对齐的是 discover / launchpad / favorites / user，加可选的 fm 与 settings；
+/// 本地音乐同样是固定导航入口；排行榜、搜索等标题居中的页面不标。
 const List<TabItem> kDefaultTabs = [
-  TabItem(id: 'discover', label: '发现'),
-  TabItem(id: 'favorites', label: '收藏'),
-  TabItem(id: 'launchpad', label: 'LaunchPad'),
-  TabItem(id: 'library', label: '本地音乐'),
-  TabItem(id: 'user', label: '我的', isRemovable: false),
+  TabItem(id: 'discover', label: '发现', pinnedTitle: true),
+  TabItem(id: 'favorites', label: '收藏', pinnedTitle: true),
+  TabItem(id: 'launchpad', label: 'LaunchPad', pinnedTitle: true),
+  TabItem(id: 'library', label: '本地音乐', pinnedTitle: true),
+  TabItem(id: 'user', label: '我的', isRemovable: false, pinnedTitle: true),
 ];
 
 /// 可选 Tab（默认隐藏，需在设置页手动开启）。
 const List<TabItem> kOptionalTabs = [
-  TabItem(id: 'fm', label: '私人FM'), // 原默认（私人FM），现改为可选
+  TabItem(id: 'fm', label: '私人FM', pinnedTitle: true), // 原默认（私人FM），现改为可选
   TabItem(id: 'coverflow', label: '封面流'),
   TabItem(id: 'search', label: '搜索'),
   TabItem(id: 'charts', label: '排行榜'),
@@ -55,11 +76,22 @@ const List<TabItem> kOptionalTabs = [
   TabItem(id: 'channel', label: '频道'),
   TabItem(id: 'brush', label: '刷刷'),
   TabItem(id: 'listen_together', label: '一起听'),
-  TabItem(id: 'settings', label: '设置'),
+  TabItem(id: 'settings', label: '设置', pinnedTitle: true),
 ];
 
 /// 所有可用 Tab（默认显示 + 可选）。
-final List<TabItem> kAllAvailableTabs = [...kDefaultTabs, ...kOptionalTabs];
+///
+/// **平台过滤**：听歌识曲依赖 Android 麦克风采集 + RMS 分析链路，
+/// 桌面端（Windows/macOS/Linux）点进去只会得到一个不工作的页面。
+/// 故在**源头**就剔除 —— 设置页「主页管理」、底部导航、LaunchPad 托盘
+/// 共用本列表，一处过滤三处生效；持久化的旧顺序里若含 recognition
+/// 也会被 [_recomputeVisible] 顺带忽略。
+final List<TabItem> kAllAvailableTabs = [
+  ...kDefaultTabs,
+  ...kOptionalTabs.where(
+    (t) => t.id != 'recognition' || supportsSongRecognition,
+  ),
+];
 
 /// 管理主页底部导航 Tab 的显示/隐藏和排序。
 ///

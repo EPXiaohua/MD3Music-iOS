@@ -370,13 +370,19 @@ Plain again
       expect(parsed.last.translation, isNull);
     });
 
-    test('18. 大型同时间戳翻译歌词线性匹配且保持首尾行', () {
+    test('18. 大型翻译歌词线性匹配且保持首尾行', () {
       const count = 20000;
       final main = StringBuffer();
       final translation = StringBuffer();
       for (var i = 0; i < count; i++) {
-        main.writeln('[00:01.00]original-$i');
-        translation.writeln('[00:01.00]translated-$i');
+        // 时间戳必须唯一：相邻同时间戳行会按新规则合并为翻译/罗马音副行。
+        // 用例意图是验证大歌词的最近邻匹配为线性且首尾不丢，唯一时间戳同样成立。
+        final t = i * 10; // 厘秒
+        final mm = (t ~/ 6000).toString().padLeft(2, '0');
+        final ss = ((t % 6000) ~/ 100).toString().padLeft(2, '0');
+        final cs = (t % 100).toString().padLeft(2, '0');
+        main.writeln('[$mm:$ss.$cs]original-$i');
+        translation.writeln('[$mm:$ss.$cs]translated-$i');
       }
 
       final parsed = LyricParserChain.parse(
@@ -385,13 +391,37 @@ Plain again
       );
 
       expect(parsed, hasLength(count));
-      final selectedTranslation = parsed.first.translation;
-      expect(selectedTranslation, startsWith('translated-'));
-      // 同时间戳行的排序次序不稳定；但每一主行应沿用同一个首选翻译。
-      expect(
-        parsed.every((line) => line.translation == selectedTranslation),
-        isTrue,
+      expect(parsed.first.translation, 'translated-0');
+      expect(parsed.last.translation, 'translated-${count - 1}');
+    });
+
+    test('19. 本地 LRC 无外部翻译文本时，同时间戳第二行进 translation', () {
+      final parsed = LyricParserChain.parse(
+        '[00:19.25]今天我寒夜里看雪飘过\n'
+        '[00:19.25]gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3\n'
+        '[00:24.31]怀着冷却了的心窝漂远方',
       );
+
+      expect(parsed, hasLength(2));
+      expect(parsed.first.startTime, 19250);
+      expect(parsed.first.text, '今天我寒夜里看雪飘过');
+      expect(
+        parsed.first.translation,
+        'gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3',
+      );
+      expect(parsed.last.text, '怀着冷却了的心窝漂远方');
+      expect(parsed.last.translation, isNull);
+    });
+
+    test('20. 外部翻译文本中的相邻同时间戳行被合并后仍能对齐', () {
+      final parsed = LyricParserChain.parse(
+        '[00:01.00]A\n[00:02.00]B',
+        translationText: '[00:01.00]a1\n[00:01.00]a2\n[00:02.00]b',
+      );
+
+      expect(parsed, hasLength(2));
+      expect(parsed.first.translation, 'a1');
+      expect(parsed.last.translation, 'b');
     });
   });
 }

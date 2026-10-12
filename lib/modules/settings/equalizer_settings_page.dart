@@ -1,9 +1,10 @@
+import '../../core/build_flags.dart';
+import '../../core/layout/page_layout.dart';
 import 'dart:io' show Platform;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../../core/services/equalizer_service.dart';
@@ -57,7 +58,7 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
                 tooltip: '重置',
                 onPressed: hasNonZero
                     ? () {
-                        HapticFeedback.lightImpact();
+                        AppHaptics.lightImpact(HapticCategory.control);
                         _eq.reset();
                         showToast('已重置所有频段');
                       }
@@ -68,7 +69,8 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
         ],
       ),
       // iOS 走软件 EQ（MTAudioProcessingTap），Android 走系统 audiofx
-      body: (kIsWeb || (!Platform.isAndroid && !Platform.isIOS))
+      body: ContentWidth(
+        child: (kIsWeb || (!Platform.isAndroid && !Platform.isIOS))
           ? _buildUnsupportedPlatform(colorScheme)
           : ListenableBuilder(
               listenable: _eq,
@@ -81,6 +83,7 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
                 }
                 return _buildEqualizerContent(colorScheme);
               },
+              ),
             ),
     );
   }
@@ -273,7 +276,7 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
           Switch(
             value: _eq.enabled,
             onChanged: (value) {
-              AppHaptics.tick();
+              AppHaptics.tick(HapticCategory.transport);
               _eq.setEnabled(value);
             },
           ),
@@ -318,7 +321,7 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
           return GestureDetector(
             onTap: _eq.enabled
                 ? () {
-                    AppHaptics.tick();
+                    AppHaptics.tick(HapticCategory.control);
                     _eq.applyPreset(preset);
                   }
                 : null,
@@ -437,8 +440,7 @@ class _BandSlider extends StatelessWidget {
 
   const _BandSlider({
     required this.bandIndex,
-    required this.disabled,
-  });
+    required this.disabled});
 
   @override
   Widget build(BuildContext context) {
@@ -477,20 +479,41 @@ class _BandSlider extends StatelessWidget {
             const SizedBox(height: 4),
             // 垂直滑块：M3ESlider 原生支持垂直方向，min 在底部 max 在顶部
             Expanded(
-              child: M3ESlider(
-                orientation: Axis.vertical,
-                enabled: !disabled,
-                value: level.toDouble().clamp(
-                      eq.minLevel.toDouble(),
-                      eq.maxLevel.toDouble(),
+              // tv: 不适用（垂直频段滑杆——RemoteSlider 仅水平方向且无
+              // enabled 参数，直接换会破坏逐频段的纵向布局；TV 分支用
+              // ExcludeFocus 把 M3ESlider 移出焦点遍历，防其自带 Focus
+              // 吞四方向键困死 D-pad，调值改走预设）
+              child: kTvBuild
+                  ? ExcludeFocus(
+                      child: M3ESlider(
+                        orientation: Axis.vertical,
+                        enabled: !disabled,
+                        value: level.toDouble().clamp(
+                              eq.minLevel.toDouble(),
+                              eq.maxLevel.toDouble(),
+                            ),
+                        min: eq.minLevel.toDouble(),
+                        max: eq.maxLevel.toDouble(),
+                        // 不设 divisions：无密集刻度节点，观感更清爽
+                        onChanged: (value) {
+                          eq.setBandLevel(bandIndex, value.round());
+                        },
+                      ),
+                    )
+                  : M3ESlider(
+                      orientation: Axis.vertical,
+                      enabled: !disabled,
+                      value: level.toDouble().clamp(
+                            eq.minLevel.toDouble(),
+                            eq.maxLevel.toDouble(),
+                          ),
+                      min: eq.minLevel.toDouble(),
+                      max: eq.maxLevel.toDouble(),
+                      // 不设 divisions：无密集刻度节点，观感更清爽
+                      onChanged: (value) {
+                        eq.setBandLevel(bandIndex, value.round());
+                      },
                     ),
-                min: eq.minLevel.toDouble(),
-                max: eq.maxLevel.toDouble(),
-                // 不设 divisions：无密集刻度节点，观感更清爽
-                onChanged: (value) {
-                  eq.setBandLevel(bandIndex, value.round());
-                },
-              ),
             ),
             const SizedBox(height: 4),
             // 频率标签
@@ -505,7 +528,7 @@ class _BandSlider extends StatelessWidget {
               child: Text(
                 freqLabel,
                 style: TextStyle(
-                  fontSize: 10,
+                  fontSize: 11,
                   color: disabled
                       ? colorScheme.onSurfaceVariant.withValues(alpha: 0.4)
                       : colorScheme.onSurfaceVariant,

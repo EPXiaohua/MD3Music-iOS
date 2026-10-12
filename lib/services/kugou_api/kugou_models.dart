@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/models/album.dart';
@@ -229,16 +230,28 @@ class KugouAlbumBrief {
   String get artist => artistName ?? '';
 
   factory KugouAlbumBrief.fromJson(Map<String, dynamic> json) {
-    final rawCover = _resolveArtworkUri(
-      json['imgurl'] ??
-          json['cover_url'] ??
-          json['img'] ??
-          json['pic'] ??
-          json['ImgUrl'] ??
-          json['cover'] ??
-          json['sizable_cover'] ??
-          json['album_cover'],
-    );
+    // 只认绝对 URL：歌手专辑接口（/artist/albums）里 cover 与 pic 是**裸文件名**
+    // （如 `20260909032931659085.jpg`），真实地址在 sizable_cover。旧写法按顺序取到
+    // cover 就当封面用，图片必然加载失败 —— 真机表现为「列表无封面、点进详情页反而有」。
+    final coverCandidates = <dynamic>[
+      json['imgurl'],
+      json['cover_url'],
+      json['img'],
+      json['pic'],
+      json['ImgUrl'],
+      json['cover'],
+      json['sizable_cover'],
+      json['album_cover'],
+    ];
+    dynamic rawCoverValue;
+    for (final candidate in coverCandidates) {
+      final text = candidate?.toString() ?? '';
+      if (text.startsWith('http') || text.startsWith('//')) {
+        rawCoverValue = candidate;
+        break;
+      }
+    }
+    final rawCover = _resolveArtworkUri(rawCoverValue);
 
     // 年份：优先 publish_time（秒级时间戳），否则从日期字符串取前 4 位。
     // publishtime 是 mobile_newalbum_sp 的真实字段（"YYYY-MM-DD HH:MM:SS"）。
@@ -414,6 +427,9 @@ class KugouSongDetail {
   final String? albumAudioId2;
   final String? songId;
   final int? fileId;
+  /// 私人 FM 反馈令牌（上游 rec_song_info.cur_mark）：红心/垃圾桶/播放完成等
+  /// action 回报时必须原样带回，缺了服务端就无法定位这条推荐。
+  final String? curMark;
 
   const KugouSongDetail({
     required this.hash,
@@ -435,10 +451,15 @@ class KugouSongDetail {
     this.albumAudioId2,
     this.songId,
     this.fileId,
+    this.curMark,
   });
 
   /// 创建副本并覆盖指定字段（用于补全 albumName 等缺失字段）
-  KugouSongDetail copyWith({String? albumName, String? artworkUri}) {
+  KugouSongDetail copyWith({
+    String? albumName,
+    String? artworkUri,
+    String? curMark,
+  }) {
     return KugouSongDetail(
       hash: hash,
       albumId: albumId,
@@ -459,6 +480,27 @@ class KugouSongDetail {
       albumAudioId2: albumAudioId2,
       songId: songId,
       fileId: fileId,
+      curMark: curMark ?? this.curMark,
+    );
+  }
+
+  /// 判断一个 map 是否像歌曲条目（云端听歌排行/历史等未文档化响应的条目识别）：
+  /// 有 hash 家族字段或任一名称字段即认为可解析。
+  static bool itemLooksLikeSong(Map<String, dynamic> json) {
+    const hashKeys = [
+      'hash', 'FileHash', 'Hash128', 'SQFileHash', 'HQFileHash', 'sd_hash',
+      'hash_128', 'hash_320', 'hash_flac', 'sq_hash', 'hq_hash',
+    ];
+    const nameKeys = [
+      'songname', 'SongName', 'name', 'ori_audio_name', 'FileName',
+      'filename', 'audio_name',
+    ];
+    final hasHash = hashKeys.any(
+      (k) => json[k] != null && json[k].toString().isNotEmpty,
+    );
+    if (hasHash) return true;
+    return nameKeys.any(
+      (k) => json[k] != null && json[k].toString().isNotEmpty,
     );
   }
 
@@ -478,6 +520,9 @@ class KugouSongDetail {
       'audio_info',
       'song_info',
       'base',
+      // 私人 FM 把反馈令牌 cur_mark（与 rec_desc 等）藏在 rec_song_info 里，
+      // 浅展开后顶层候选键即可命中（顶层优先，非破坏性）。
+      'rec_song_info',
     ]) {
       final nested = json[k];
       if (nested is Map) {
@@ -578,6 +623,12 @@ class KugouSongDetail {
         }
       }
     }
+
+    // 私人 FM 反馈令牌：正常从 rec_song_info（已浅展开）/顶层取 cur_mark，
+    // 兼容驼峰 curMark 与整型取值；空串按「无令牌」处理，避免把空值回报上游。
+    final curMarkRaw = _strNull(json2['cur_mark'] ?? json2['curMark']);
+    final curMark =
+        (curMarkRaw == null || curMarkRaw.isEmpty) ? null : curMarkRaw;
 
     return KugouSongDetail(
       hash: _str(
@@ -693,6 +744,8 @@ class KugouSongDetail {
             json2['img'] ??
             json2['pic'] ??
             json2['cover'] ??
+            // listenservice /user/listen 条目的封面键（实机确认：image / image_320）
+            json2['image'] ??
             json2['cover_pic'] ??
             json2['union_cover'] ??
             json2['trans_param']?['union_cover'] ??
@@ -709,6 +762,7 @@ class KugouSongDetail {
         json2['songid'] ?? json2['song_id'] ?? json2['SongId'] ?? json2['SongID'],
       ),
       fileId: _parseInt(json2['fileid'] ?? json2['file_id']),
+      curMark: curMark,
     );
   }
 
@@ -846,6 +900,48 @@ class KugouRankList {
           .map((e) => KugouRank.fromJson(e as Map<String, dynamic>))
           .toList(),
     );
+  }
+}
+
+/// 热搜榜单（上游 `/api/v3/search/hot_tab` 的 `data.list` 元素）。
+///
+/// 上游每条只有 `keyword`（`reason` 与之完全重复、`icon/type/jumpurl/json_url`
+/// 实测恒为空或固定值，**没有热度数值**），故模型只保留榜名与有序词表，
+/// 不去伪造热度字段。
+class HotSearchBoard {
+  final String name;
+  final List<String> keywords;
+
+  const HotSearchBoard({required this.name, required this.keywords});
+
+  /// 从 `/search/hot` 的响应 JSON 抽榜单。
+  ///
+  /// 关键：`data.list` 是**榜单数组**，词在 `list[i].keywords[j].keyword`。
+  /// 直接把 `data.list` 当词数组取 `keyword ?? name` 会拿到一串榜名
+  /// （这是旧实现 `kugou_api_client.dart` 的回归点）。
+  static List<HotSearchBoard> parseList(Map<String, dynamic> json) {
+    final data = json['data'];
+    if (data is! Map) return const [];
+    final list = data['list'];
+    if (list is! List) return const [];
+
+    final boards = <HotSearchBoard>[];
+    for (final entry in list) {
+      if (entry is! Map) continue;
+      final name = _str(entry['name']);
+      final rawKeywords = entry['keywords'];
+      if (name.isEmpty || rawKeywords is! List) continue;
+
+      final words = <String>[];
+      for (final item in rawKeywords) {
+        final word = item is Map ? _str(item['keyword']) : _str(item);
+        if (word.isNotEmpty) words.add(word);
+      }
+      if (words.isNotEmpty) {
+        boards.add(HotSearchBoard(name: name, keywords: words));
+      }
+    }
+    return boards;
   }
 }
 
@@ -1334,14 +1430,160 @@ class KugouArtistAlbums {
   const KugouArtistAlbums({this.albums = const [], this.total = 0});
 
   factory KugouArtistAlbums.fromJson(Map<String, dynamic> json) {
-    final data = json['data'] as Map<String, dynamic>? ?? json;
-    final list = data['list'] ?? data['albums'] ?? data['info'] ?? [];
+    // data 既可能是对象（列表在 list/albums/info）也可能是**数组**；
+    // 早先写死的 `as Map<String, dynamic>?` 在数组形态下抛 TypeError，
+    // 被客户端 catch 静默吞成 null，表现为「歌手明明有专辑却显示暂无专辑」。
+    final rawData = json['data'] ?? json;
+    final list = rawData is List
+        ? rawData
+        : (rawData is Map
+            ? (rawData['list'] ??
+                rawData['albums'] ??
+                rawData['info'] ??
+                rawData['data'] ??
+                [])
+            : []);
+    final totalSource = rawData is Map ? rawData : json;
     return KugouArtistAlbums(
       albums: (list as List<dynamic>)
-          .map((e) => KugouAlbumBrief.fromJson(e as Map<String, dynamic>))
+          .whereType<Map<String, dynamic>>()
+          .map((e) => KugouAlbumBrief.fromJson(e))
           .toList(),
-      total: _parseInt(data['total'] ?? data['total_count'] ?? 0),
+      total: _parseInt(
+        totalSource['total'] ?? totalSource['total_count'] ?? json['total'] ?? 0,
+      ),
     );
+  }
+}
+
+class KugouMvBrief {
+  final String videoId;
+  final String name;
+  final String? coverUrl;
+  final String? authorName;
+  final int timelengthMs;
+  final String? publishDate;
+  final String? albumAudioId;
+  final String? hash;
+
+  const KugouMvBrief({
+    required this.videoId,
+    required this.name,
+    this.coverUrl,
+    this.authorName,
+    this.timelengthMs = 0,
+    this.publishDate,
+    this.albumAudioId,
+    this.hash,
+  });
+
+  factory KugouMvBrief.fromJson(Map<String, dynamic> json) {
+    // 上游缺失字段常返回空串而不是 null，而 [_strNull] 只做 toString、空串会原样留下，
+    // 因此这里局部收口一次「空串当 null」（同 KugouSongDetail.fromJson 里的 firstIdOf 闭包写法）。
+    String? textOf(dynamic v) {
+      final s = v?.toString();
+      return (s == null || s.isEmpty) ? null : s;
+    }
+
+    return KugouMvBrief(
+      videoId: _str(
+        json['video_id'] ??
+            json['id'] ??
+            json['videoid'] ??
+            '',
+      ),
+      name: _str(
+        json['video_name'] ??
+            json['name'] ??
+            json['title'] ??
+            json['mv_name'] ??
+            '',
+      ),
+      coverUrl: _resolveFirstArtwork([
+        json['hdpic'],
+        json['cover'],
+        json['pic'],
+        json['imgurl'],
+        json['sizable_cover'],
+      ]),
+      authorName: textOf(
+        json['author_name'] ??
+            json['singer_name'] ??
+            json['singername'] ??
+            json['author'],
+      ),
+      timelengthMs: _parseInt(json['timelength'] ?? json['duration'] ?? 0),
+      publishDate: textOf(
+        json['publish_date'] ??
+            json['publishtime'] ??
+            json['publish_time'],
+      ),
+      albumAudioId: textOf(
+        json['album_audio_id'] ?? json['albumaudio_id'],
+      ),
+      // 清晰度由高到低回落；无 mkv_ 前缀的键名在同族上游里也出现过
+      // （见 KugouSceneVideo.fromJson 的 sd_hash / qhd_hash）
+      hash: textOf(
+        json['mkv_qhd_hash'] ??
+            json['mkv_hd_hash'] ??
+            json['mkv_sd_hash'] ??
+            json['qhd_hash'] ??
+            json['sd_hash'] ??
+            json['video_hash'] ??
+            json['hash'],
+      ),
+    );
+  }
+}
+
+class KugouArtistVideos {
+  final List<KugouMvBrief> mvs;
+  final int total;
+
+  const KugouArtistVideos({this.mvs = const [], this.total = 0});
+
+  factory KugouArtistVideos.fromJson(Map<String, dynamic> json) {
+    try {
+      dynamic rawData = json['data'] ?? json;
+      List<dynamic> list;
+      if (rawData is List) {
+        list = rawData;
+      } else if (rawData is Map) {
+        list =
+            rawData['list'] ??
+                rawData['info'] ??
+                rawData['videos'] ??
+                rawData['items'] ??
+                [];
+      } else {
+        list = [];
+      }
+
+      // total 同样双口径：先看根节点，再看 data Map 里的是否带总数
+      int parsedTotal = 0;
+      if (json['total'] != null || json['cur_total'] != null) {
+        parsedTotal = _parseInt(json['total'] ?? json['cur_total']);
+      } else if (rawData is Map &&
+          (rawData['total'] != null || rawData['total_count'] != null)) {
+        parsedTotal = _parseInt(rawData['total'] ?? rawData['total_count']);
+      }
+
+      final mvs = <KugouMvBrief>[];
+      for (final e in list) {
+        if (e is! Map) continue;
+        final mv = KugouMvBrief.fromJson(Map<String, dynamic>.from(e));
+        if (mv.videoId.isNotEmpty) {
+          mvs.add(mv);
+        }
+      }
+
+      return KugouArtistVideos(mvs: mvs, total: parsedTotal);
+    } catch (e) {
+      // 真机定位上游字段名用，不能静默吞掉
+      // ignore: avoid_print
+      print('[ArtistMvDebug] parse error: $e, raw: $json');
+      rethrow;
+    }
   }
 }
 
@@ -1733,12 +1975,40 @@ class KugouUserDetail {
   final String? username;
   final Map<String, dynamic>? rawData;
 
+  /// 个性签名（候选键 signature/usersign/sign；真实字段名以真机
+  /// [USER_DETAIL] 日志为准，见 kugou_api_client.getUserDetail）
+  final String? signature;
+
+  /// 性别：0 女 / 1 男 / 2 保密（修改接口 /user/update 的取值约定）
+  final int? sex;
+
+  /// 生日（yyyy-MM-dd；上游返回时间戳时换算为该格式）
+  final String? birthday;
+
+  /// 省份/城市。上游 /v3/get_my_info 可能返回名称或数字代码，
+  /// 而修改接口要传名称——UI 侧按原样展示并手输兜底。
+  final String? province;
+  final String? city;
+
+  /// 备注
+  final String? memo;
+
+  /// 标签（上游返回数组时以逗号连接；修改接口接受逗号分隔字符串）
+  final String? tags;
+
   const KugouUserDetail({
     this.nickname,
     this.avatar,
     this.userid,
     this.username,
     this.rawData,
+    this.signature,
+    this.sex,
+    this.birthday,
+    this.province,
+    this.city,
+    this.memo,
+    this.tags,
   });
 
   factory KugouUserDetail.fromJson(Map<String, dynamic> json) {
@@ -1749,7 +2019,154 @@ class KugouUserDetail {
       userid: _strNull(data['userid'] ?? data['userId'] ?? data['id']),
       username: _strNull(data['username'] ?? data['name']),
       rawData: data,
+      signature: _firstStr(data, const ['signature', 'usersign', 'sign']),
+      sex: _firstSex(data),
+      birthday: _firstBirthday(data),
+      province: _firstStr(data, const ['province', 'provinceName', 'province_name']),
+      city: _firstStr(data, const ['city', 'cityName', 'city_name']),
+      memo: _firstStr(data, const ['memo']),
+      tags: _firstTags(data),
     );
+  }
+
+  static String? _firstTags(Map<String, dynamic> data) {
+    final v = data['tags'];
+    if (v == null) return null;
+    if (v is List) {
+      final s = v.map((e) => e.toString()).where((e) => e.isNotEmpty).join(',');
+      return s.isEmpty ? null : s;
+    }
+    final s = v.toString();
+    return s.isEmpty ? null : s;
+  }
+
+  static String? _firstStr(Map<String, dynamic> data, List<String> keys) {
+    for (final k in keys) {
+      final v = data[k];
+      if (v == null) continue;
+      final s = v.toString();
+      if (s.isNotEmpty) return s;
+    }
+    return null;
+  }
+
+  static int? _firstSex(Map<String, dynamic> data) {
+    for (final k in const ['sex', 'gender']) {
+      final v = data[k];
+      if (v is num) return v.toInt();
+      if (v is String) {
+        final parsed = int.tryParse(v.trim());
+        if (parsed != null) return parsed;
+      }
+    }
+    return null;
+  }
+
+  static String? _firstBirthday(Map<String, dynamic> data) {
+    final v = data['birthday'];
+    if (v == null) return null;
+    // 时间戳（秒或毫秒）→ yyyy-MM-dd
+    final n = v is num ? v.toInt() : (v is String ? int.tryParse(v.trim()) : null);
+    if (n != null) {
+      if (n <= 0) return null;
+      final ms = n > 100000000000 ? n : n * 1000;
+      final d = DateTime.fromMillisecondsSinceEpoch(ms);
+      return '${d.year.toString().padLeft(4, '0')}-'
+          '${d.month.toString().padLeft(2, '0')}-'
+          '${d.day.toString().padLeft(2, '0')}';
+    }
+    final s = v.toString().trim();
+    return s.isEmpty ? null : s;
+  }
+}
+
+/// 听歌偏好（/user/preference 返回的 data）。
+///
+/// lang/style 为基础偏好的 JSON 字符串（{"标签id":权重}，>50 视为启用）；
+/// song_lang 为歌曲推荐强度 JSON 字符串（0 屏蔽 / 50 默认 / 100 加大），标签为
+/// L*/S*/T*/N* 前缀 ID（L1 国语、L2 英语、L5 粤语、L4 韩语、L3 日语、L6 纯音乐、
+/// S9 DJ、T1 翻唱、N2 现场、S28 AI 歌曲）。**两组标签 ID 相互独立，不应互相转换**。
+/// gender/age/mode 为单个 id 字符串（'' = 未设置）。
+class KugouUserPreference {
+  /// 推荐模式：'' 未设置 / 0 默认 / 1 熟悉 / 2 尝鲜
+  final String mode;
+
+  /// 性别 id：'' 未设置 / 1 女 / 2 男
+  final String gender;
+
+  /// 年龄段 id：'' 未设置 / 0 其它 / 1 00后 / 2 90后 / 3 80后 / 4 70后 /
+  /// 6 10后 / 7 05后 / 8 95后 / 9 85后 / 10 75后 / 11 65后 / 12 60后
+  final String age;
+
+  /// 语言偏好（{"标签id": 权重}，>50 视为启用）
+  final Map<String, int> lang;
+
+  /// 风格偏好（{"标签id": 权重}，>50 视为启用）
+  final Map<String, int> style;
+
+  /// 歌曲推荐强度（{"标签id": 0-100}，0 屏蔽 / 50 默认 / 100 加大）
+  final Map<String, int> songLang;
+
+  /// 三组 JSON 串的原始文本（UI 回显未识别标签、diff 兜底用）
+  final String langRaw;
+  final String styleRaw;
+  final String songLangRaw;
+
+  /// 其余上游原样字段（stylerec_taglist / wish_taglist / inactive_taglist /
+  /// inactive_singerlist / song_style 等，UI 暂不消费，更新时原样保留语义）
+  final Map<String, dynamic> rawData;
+
+  const KugouUserPreference({
+    this.mode = '',
+    this.gender = '',
+    this.age = '',
+    this.lang = const {},
+    this.style = const {},
+    this.songLang = const {},
+    this.langRaw = '',
+    this.styleRaw = '',
+    this.songLangRaw = '',
+    this.rawData = const {},
+  });
+
+  factory KugouUserPreference.fromJson(Map<String, dynamic> json) {
+    final data = json['data'] as Map<String, dynamic>? ?? json;
+    String rawOf(dynamic v) => v == null ? '' : v.toString();
+    return KugouUserPreference(
+      mode: rawOf(data['mode']),
+      gender: rawOf(data['gender']),
+      age: rawOf(data['age']),
+      langRaw: rawOf(data['lang']),
+      styleRaw: rawOf(data['style']),
+      songLangRaw: rawOf(data['song_lang']),
+      lang: _parseWeightMap(data['lang']),
+      style: _parseWeightMap(data['style']),
+      songLang: _parseWeightMap(data['song_lang']),
+      rawData: data,
+    );
+  }
+
+  /// 解析 {"1":100,"3":50} 形态的权重 JSON 串；非 Map / 解析失败回退空 map
+  /// （原始串保留在 *Raw 字段）。
+  static Map<String, int> _parseWeightMap(dynamic raw) {
+    if (raw == null || raw.toString().isEmpty) return const {};
+    if (raw is Map) {
+      return _coerceWeightMap(raw);
+    }
+    try {
+      final decoded = jsonDecode(raw.toString());
+      if (decoded is Map) return _coerceWeightMap(decoded);
+    } catch (_) {}
+    return const {};
+  }
+
+  static Map<String, int> _coerceWeightMap(Map<dynamic, dynamic> source) {
+    final out = <String, int>{};
+    source.forEach((k, v) {
+      final n = v is num ? v.toInt() : int.tryParse(v.toString().trim());
+      if (n != null) out[k.toString()] = n;
+    });
+    return out;
   }
 }
 
@@ -1916,19 +2333,215 @@ class KugouSongClimax {
   }
 }
 
+/// 歌曲成绩单（/song/ranking）：歌曲在各平台榜单的成就汇总。
 class KugouSongRanking {
-  final int? rank;
-  final int? score;
-  final String? rankType;
+  final String? title;
 
-  const KugouSongRanking({this.rank, this.score, this.rankType});
+  /// 平台汇总文案（如"该歌曲累计上榜 N 次"）。
+  final String? title2;
+
+  /// 各平台成就卡列表（data.info）。
+  final List<KugouSongRankingInfo> info;
+
+  const KugouSongRanking({
+    this.title,
+    this.title2,
+    this.info = const [],
+  });
 
   factory KugouSongRanking.fromJson(Map<String, dynamic> json) {
     final data = json['data'] as Map<String, dynamic>? ?? json;
+    final rawInfo = data['info'];
+    final info = rawInfo is List
+        ? rawInfo
+            .whereType<Map<String, dynamic>>()
+            .map(KugouSongRankingInfo.fromJson)
+            .toList()
+        : const <KugouSongRankingInfo>[];
     return KugouSongRanking(
-      rank: _parseInt(data['rank'] ?? data['rankNum']),
-      score: _parseInt(data['score']),
-      rankType: _strNull(data['rank_type'] ?? data['rankType']),
+      // 实测响应只有 title1（"已上榜 4/17"）与 title2（平台总述），无 title 字段
+      title: _strNull(data['title'] ?? data['title1']),
+      title2: _strNull(data['title2']),
+      info: info,
+    );
+  }
+}
+
+/// 成绩单平台成就卡：一个平台一条（当前名次/累计上榜/最近上榜）。
+class KugouSongRankingInfo {
+  final int? platform;
+  final String? platformName;
+
+  /// 当前名次（ranking_num）。
+  final int? rankingNum;
+
+  /// 累计上榜次数。
+  final int? rankingTimes;
+
+  /// 最近上榜时间（上游原始字符串）。
+  final String? lastTime;
+  final String? logoPic;
+  final String? sharePic;
+
+  const KugouSongRankingInfo({
+    this.platform,
+    this.platformName,
+    this.rankingNum,
+    this.rankingTimes,
+    this.lastTime,
+    this.logoPic,
+    this.sharePic,
+  });
+
+  factory KugouSongRankingInfo.fromJson(Map<String, dynamic> json) {
+    return KugouSongRankingInfo(
+      platform: _parseIntOrNull(json['platform']),
+      platformName: _strNull(json['platform_name'] ?? json['platformName']),
+      rankingNum: _parseIntOrNull(json['ranking_num'] ?? json['rankingNum']),
+      rankingTimes:
+          _parseIntOrNull(json['ranking_times'] ?? json['rankingTimes']),
+      lastTime: _strNull(json['last_time'] ?? json['lastTime']),
+      // 实测响应字段为 platform_logo；其余为旧口径/ camelCase 兜底
+      logoPic: _strNull(
+        json['platform_logo'] ??
+            json['platformLogo'] ??
+            json['logo_pic'] ??
+            json['logoPic'] ??
+            json['logo'],
+      ),
+      sharePic: _strNull(json['share_pic'] ?? json['sharePic']),
+    );
+  }
+}
+
+/// 成绩单详情（/song/ranking/filter）：单个子榜单的历史成绩条目。
+class KugouSongRankingFilterItem {
+  final int? area;
+  final String? name;
+
+  /// 累计上榜次数。
+  final int? count;
+
+  /// 历史最高名次（top_ranking，<=0 视为暂无排名）。
+  final int? topRanking;
+  final int? platform;
+  final String? platformName;
+  final String? logoPic;
+  final String? sharePic;
+
+  const KugouSongRankingFilterItem({
+    this.area,
+    this.name,
+    this.count,
+    this.topRanking,
+    this.platform,
+    this.platformName,
+    this.logoPic,
+    this.sharePic,
+  });
+
+  factory KugouSongRankingFilterItem.fromJson(Map<String, dynamic> json) {
+    return KugouSongRankingFilterItem(
+      area: _parseIntOrNull(json['area']),
+      name: _strNull(json['name']),
+      count: _parseIntOrNull(json['count']),
+      topRanking: _parseIntOrNull(json['top_ranking'] ?? json['topRanking']),
+      platform: _parseIntOrNull(json['platform']),
+      platformName: _strNull(json['platform_name'] ?? json['platformName']),
+      logoPic: _strNull(
+        json['platform_logo'] ??
+            json['platformLogo'] ??
+            json['logo_pic'] ??
+            json['logoPic'] ??
+            json['logo'],
+      ),
+      sharePic: _strNull(json['share_pic'] ?? json['sharePic']),
+    );
+  }
+}
+
+/// 伴奏匹配（/audio/accompany/matching）：上游为这首歌返回的最佳伴奏曲目。
+/// 实测响应（探针 tests/smoke.rs::accompany_matching_probe）：
+/// `{"data":{"singername":"希林娜依高","accompanySongId":"43522508","remark":"伴奏",
+///   "bitrate":"128","filesize":"3457210","songname":"Shine Brighter (愈加璀璨)",
+///   "duration":"216000","extname":"mp3","hash":"8153F7E7…","songid":"43522508",…},
+///   "error_code":0,"status":1}`
+class KugouAccompany {
+  /// 上游业务状态：1 = 匹配成功。
+  final int? status;
+  final int? errorCode;
+
+  /// 伴奏曲目 hash（试听播放入口，也是 K 歌数量接口 songHash 入参的来源）。
+  final String? hash;
+
+  /// 伴奏曲目名（如 "Shine Brighter (愈加璀璨)"）。
+  final String? songName;
+  final String? singerName;
+
+  /// 伴奏时长（毫秒，上游为字符串数字）。
+  final int? durationMs;
+
+  /// 音质信息：码率 kbps / 扩展名 / 文件大小（字节）。
+  final int? bitrate;
+  final String? extName;
+  final int? fileSize;
+
+  /// 上游备注（实测恒为 "伴奏"）。
+  final String? remark;
+
+  /// 伴奏曲目 id（K 歌数量接口 songId 入参的来源）。
+  final String? songId;
+
+  const KugouAccompany({
+    this.status,
+    this.errorCode,
+    this.hash,
+    this.songName,
+    this.singerName,
+    this.durationMs,
+    this.bitrate,
+    this.extName,
+    this.fileSize,
+    this.remark,
+    this.songId,
+  });
+
+  /// 匹配成功且伴奏 hash 可用（可试听 / 可作 K 歌数量入参）。
+  bool get hasMatch => status == 1 && (hash?.isNotEmpty ?? false);
+
+  factory KugouAccompany.fromJson(Map<String, dynamic> json) {
+    final data = json['data'] as Map<String, dynamic>? ?? json;
+    return KugouAccompany(
+      status: _parseIntOrNull(json['status']),
+      errorCode: _parseIntOrNull(json['error_code']),
+      hash: _strNull(data['hash']),
+      songName: _strNull(data['songname'] ?? data['songName']),
+      singerName: _strNull(data['singername'] ?? data['singerName']),
+      durationMs: _parseIntOrNull(data['duration']),
+      bitrate: _parseIntOrNull(data['bitrate']),
+      extName: _strNull(data['extname'] ?? data['extName']),
+      fileSize: _parseIntOrNull(data['filesize'] ?? data['fileSize']),
+      remark: _strNull(data['remark']),
+      songId: _strNull(data['songid'] ?? data['accompanySongId'] ?? data['songId']),
+    );
+  }
+}
+
+/// K 歌数量（/audio/ktv/total）：这首歌在酷狗 K 歌曲库的伴奏作品总数。
+/// 入参（songId/singerName/songHash）取自 [KugouAccompany] 的返回。
+/// 实测响应（探针 tests/smoke.rs::audio_ktv_total_probe）：
+/// `{"code":0,"msg":"","times":…,"data":{"totalOpusNum":"248"}}`
+class KugouAudioKtvTotal {
+  /// K 歌作品总数（totalOpusNum，上游为字符串数字）。
+  final int? totalOpusNum;
+
+  const KugouAudioKtvTotal({this.totalOpusNum});
+
+  factory KugouAudioKtvTotal.fromJson(Map<String, dynamic> json) {
+    final data = json['data'] as Map<String, dynamic>? ?? json;
+    return KugouAudioKtvTotal(
+      totalOpusNum:
+          _parseIntOrNull(data['totalOpusNum'] ?? data['total_opus_num']),
     );
   }
 }
@@ -2447,5 +3060,592 @@ List<KugouSongDetail> parseHomeDiscoverSongs(Map<String, dynamic> json) {
     return const [];
   } catch (_) {
     return const [];
+  }
+}
+
+/// `/login/device`（酷狗 `userinfoservice.kugou.com/v2/get_dev`）返回的单台登录
+/// 设备（`data.li[]` 条目）。字段全部字符串化：上游这些键在 JSON 里 string/number
+/// 混用，而踢下线接口要求把它们原样回传（web 签名对 string/number 的拼接结果一致）。
+///
+/// 本机判定依赖 `/login/device` 响应顶层由 Rust 服务器注入的 `local_device`
+/// （本机 mid/dfid，来自 device_info.json）——设备列表项的 `mid` 与之相同即为本机；
+/// mid 缺失时回退 dfid（`mt` 键）比对。上游响应本身不带本机标识，不能用客户端
+/// 自存的 dfid 判定（可能过期，误判会把本机标成可踢设备）。
+class KugouLoginDevice {
+  /// 设备 mid（kick 的 t_mid）。
+  final String mid;
+
+  /// 记录的 `mt` 键 = 本机 dfid。
+  final String dfid;
+
+  /// `dev` 键：机型描述。
+  final String model;
+
+  /// `app` 键：客户端平台。
+  final String platform;
+
+  /// `loc` 键：登录/活跃位置（如「广东省深圳市 联通」）。
+  final String loc;
+
+  /// `t` 键：活跃时间原始值（unix 秒或毫秒，亦是 kick 的 t）。
+  final String t;
+
+  /// `ver` 键：客户端版本（kick 的 t_clientver）。
+  final String ver;
+
+  /// `appid` 键：客户端 appid（kick 的 t_appid）。
+  final String appid;
+
+  /// `new` 键原始值：等于 [t] 且非 '0' 时视为新设备。
+  final String newFlag;
+
+  /// `login_type` 键：0 密码 1 手机 2 微信 3 QQ 4 苹果 5 微博 6 扫码。
+  final String loginType;
+
+  /// 是否本机（当前登录设备）。
+  final bool isCurrent;
+
+  /// 列表序号（1 起），仅作展示兜底「登录设备 N」。
+  final int index;
+
+  const KugouLoginDevice({
+    required this.mid,
+    required this.dfid,
+    required this.model,
+    required this.platform,
+    required this.loc,
+    required this.t,
+    required this.ver,
+    required this.appid,
+    required this.newFlag,
+    required this.loginType,
+    required this.isCurrent,
+    required this.index,
+  });
+
+  factory KugouLoginDevice.fromJson(
+    Map<String, dynamic> json, {
+    String localMid = '',
+    String localDfid = '',
+    int index = 0,
+  }) {
+    final mid = _str(json['mid']);
+    final dfid = _str(json['mt']);
+    return KugouLoginDevice(
+      mid: mid,
+      dfid: dfid,
+      model: _strNull(json['dev']) ?? '',
+      platform: _str(json['app']),
+      loc: _strNull(json['loc']) ?? '',
+      t: _str(json['t']),
+      ver: _str(json['ver']),
+      appid: _str(json['appid']),
+      newFlag: _strNull(json['new']) ?? '',
+      loginType: _str(json['login_type']),
+      isCurrent: _isCurrentDevice(mid, dfid, localMid, localDfid),
+      index: index,
+    );
+  }
+
+  /// 本机判定：mid 双方齐全时按 mid 比对；否则回退 dfid。
+  static bool _isCurrentDevice(
+    String mid,
+    String dfid,
+    String localMid,
+    String localDfid,
+  ) {
+    if (localMid.isEmpty && localDfid.isEmpty) return false;
+    if (mid.isNotEmpty && localMid.isNotEmpty) return mid == localMid;
+    if (dfid.isNotEmpty && localDfid.isNotEmpty) return dfid == localDfid;
+    return false;
+  }
+
+  /// 能否被踢下线：非本机且 kick 四元组（mid/t/appid/ver）齐全。
+  bool get canKick =>
+      !isCurrent &&
+      mid.isNotEmpty &&
+      t.isNotEmpty &&
+      appid.isNotEmpty &&
+      ver.isNotEmpty;
+
+  /// 新设备标记：`new === t` 且非 '0'（酷狗以登录时间回填 new）。
+  bool get isNew => newFlag.isNotEmpty && newFlag == t && t != '0';
+
+  /// 展示标题兜底链：机型 → 平台含安卓 → 平台 → 「登录设备 N」。
+  String get title {
+    final m = model.trim();
+    if (m.isNotEmpty) return m;
+    final p = platform.trim();
+    if (p.isNotEmpty) {
+      final lower = p.toLowerCase();
+      if (p.contains('安卓') || lower.contains('android')) {
+        return '酷狗Android客户端';
+      }
+      return p;
+    }
+    return index > 0 ? '登录设备 $index' : '登录设备';
+  }
+
+  /// 登录方式文案；未知值展示原值。
+  String get loginTypeLabel {
+    switch (loginType) {
+      case '0':
+        return '账号密码';
+      case '1':
+        return '手机';
+      case '2':
+        return '微信';
+      case '3':
+        return 'QQ';
+      case '4':
+        return '苹果';
+      case '5':
+        return '微博';
+      case '6':
+        return '扫码';
+      default:
+        return loginType.isEmpty ? '未知' : '未知($loginType)';
+    }
+  }
+
+  /// 位置展示：loc 按空白/逗号/斜杠分割取最后一段（如「广东省深圳市 联通」→「联通」）。
+  String get locationLabel {
+    final l = loc.trim();
+    if (l.isEmpty) return '';
+    final parts =
+        l.split(RegExp(r'[\s,，/]+')).where((s) => s.isNotEmpty).toList();
+    return parts.isEmpty ? l : parts.last;
+  }
+
+  /// 活跃时间的毫秒值（解析失败为 0，仅用于排序）。
+  int get activeTimeMs => int.tryParse(t) ?? 0;
+
+  /// 活跃时间展示：unix 秒（≤10 位 ×1000）/毫秒/日期串 → `yyyy-MM-dd HH:mm`。
+  String get activeTimeText {
+    final raw = t.trim();
+    if (raw.isEmpty) return '';
+    DateTime? time;
+    final ms = int.tryParse(raw);
+    if (ms != null) {
+      final normalized = raw.length <= 10 ? ms * 1000 : ms;
+      time =
+          DateTime.fromMillisecondsSinceEpoch(normalized);
+    } else {
+      time = DateTime.tryParse(raw);
+    }
+    if (time == null) return raw;
+    return DateFormat('yyyy-MM-dd HH:mm').format(time);
+  }
+}
+
+/// `/login/device` 完整响应的解析结果：设备列表（已按本机优先、活跃时间降序排列）
+/// 与 Rust 服务器注入的本机设备标识。`ok` 为 false 表示上游返回了业务错误
+/// （如 token 失效），此时 devices 为空但不应展示「暂无设备」。
+class KugouLoginDeviceSnapshot {
+  final List<KugouLoginDevice> devices;
+  final String localMid;
+  final String localDfid;
+  final bool ok;
+
+  const KugouLoginDeviceSnapshot({
+    required this.devices,
+    this.localMid = '',
+    this.localDfid = '',
+    this.ok = true,
+  });
+
+  factory KugouLoginDeviceSnapshot.fromJson(Map<String, dynamic> json) {
+    // 业务成功判定与 KugouApiClient.isBizOk 同口径：error_code 0/缺失 且 status 1/缺失。
+    final errorCode = json['error_code'];
+    final status = json['status'];
+    final ok = (errorCode == null || errorCode == 0 || errorCode == '0') &&
+        (status == null || status == 1 || status == '1');
+    final local = json['local_device'];
+    final localMap = local is Map
+        ? Map<String, dynamic>.from(local)
+        : const <String, dynamic>{};
+    final localMid = _str(localMap['mid']);
+    final localDfid = _str(localMap['dfid']);
+    final data = json['data'];
+    final li = data is Map ? data['li'] : null;
+    final rawList = li is List ? li : const [];
+    final devices = <KugouLoginDevice>[];
+    var index = 0;
+    for (final item in rawList) {
+      if (item is! Map) continue;
+      index++;
+      devices.add(
+        KugouLoginDevice.fromJson(
+          Map<String, dynamic>.from(item),
+          localMid: localMid,
+          localDfid: localDfid,
+          index: index,
+        ),
+      );
+    }
+    devices.sort((a, b) {
+      if (a.isCurrent != b.isCurrent) return a.isCurrent ? -1 : 1;
+      return b.activeTimeMs.compareTo(a.activeTimeMs);
+    });
+    return KugouLoginDeviceSnapshot(
+      devices: devices,
+      localMid: localMid,
+      localDfid: localDfid,
+      ok: ok,
+    );
+  }
+}
+
+/// 内容黑名单条目（/blacklist/list 的 data.items 项）。
+/// 歌曲条目含 `song_k/song_v`（k 为小写 FileHash），歌手条目含 `singer_k/singer_v`
+/// （k 为歌手 ID）；*_v 为 JSON 字符串 `{"n":显示名,"m":mixsongid(仅歌曲),"t":秒}`，
+/// 解析容忍字符串/对象两种形态，失败按空值处理（显示名空时由调用方回退）。
+class KugouBlacklistEntry {
+  /// 黑名单类型：song / singer
+  final String label;
+
+  /// 条目键：歌曲为 FileHash（小写），歌手为歌手 ID
+  final String key;
+
+  /// 显示名（歌曲为「歌手 - 歌名」，歌手为歌手名；空串回退「未命名歌曲/歌手」）
+  final String name;
+
+  /// 歌曲 MixSongID（仅歌曲条目，用于展示与跳转）
+  final String? mixSongId;
+
+  /// 标记时间（unix 秒；上游缺失时 0，UI 不显示时间行）
+  final int createdAtSec;
+
+  const KugouBlacklistEntry({
+    required this.label,
+    required this.key,
+    this.name = '',
+    this.mixSongId,
+    this.createdAtSec = 0,
+  });
+
+  static (String name, String? mixSongId, int t) _parseValue(dynamic value) {
+    dynamic obj;
+    if (value is String && value.isNotEmpty) {
+      try {
+        obj = jsonDecode(value);
+      } catch (_) {
+        obj = null;
+      }
+    } else if (value is Map) {
+      obj = value;
+    }
+    if (obj is! Map) return ('', null, 0);
+    final t = obj['t'];
+    return (
+      obj['n']?.toString() ?? '',
+      obj['m']?.toString(),
+      t is num ? t.toInt() : int.tryParse('${t ?? ''}') ?? 0,
+    );
+  }
+
+  factory KugouBlacklistEntry.fromJson(Map<String, dynamic> json) {
+    final hasSong = json['song_k'] != null;
+    final hasSinger = json['singer_k'] != null;
+    final isSong = hasSong || !hasSinger;
+    final parsed = _parseValue(isSong ? json['song_v'] : json['singer_v']);
+    // 时间以 value 内的 t 为准，缺失回退条目级 t（用户文档返回示例的两级字段）
+    final outerT = json['t'];
+    final createdAt = parsed.$3 != 0
+        ? parsed.$3
+        : (outerT is num
+            ? outerT.toInt()
+            : int.tryParse('${outerT ?? ''}') ?? 0);
+    return KugouBlacklistEntry(
+      label: isSong ? 'song' : 'singer',
+      key: (isSong ? json['song_k'] : json['singer_k'])?.toString() ?? '',
+      name: parsed.$1,
+      mixSongId: parsed.$2,
+      createdAtSec: createdAt,
+    );
+  }
+
+  /// 显示名；空名回退 [fallback]（歌曲「未命名歌曲」/ 歌手「未命名歌手」，EchoMusic 同款）。
+  String displayName(String fallback) => name.isEmpty ? fallback : name;
+
+  /// 标记时间展示：`yyyy-MM-dd`；无时间（0）返回空串。
+  String get createdAtText {
+    if (createdAtSec <= 0) return '';
+    return DateFormat('yyyy-MM-dd')
+        .format(DateTime.fromMillisecondsSinceEpoch(createdAtSec * 1000));
+  }
+}
+
+/// `/blacklist/list` 完整响应的解析结果。`ok` 为 false 表示上游返回业务错误
+/// （如 token 失效），此时 entries 为空但不应展示「黑名单为空」。
+class KugouBlacklistSnapshot {
+  final String label;
+  final int page;
+  final int pagesize;
+  final int total;
+  final List<KugouBlacklistEntry> entries;
+  final bool ok;
+
+  const KugouBlacklistSnapshot({
+    this.label = 'song',
+    this.page = 1,
+    this.pagesize = 30,
+    this.total = 0,
+    this.entries = const [],
+    this.ok = true,
+  });
+
+  factory KugouBlacklistSnapshot.fromJson(Map<String, dynamic> json) {
+    // 业务成功判定与 KugouApiClient.isBizOk 同口径：error_code 0/缺失 且 status 1/缺失。
+    final errorCode = json['error_code'];
+    final status = json['status'];
+    final ok = (errorCode == null || errorCode == 0 || errorCode == '0') &&
+        (status == null || status == 1 || status == '1');
+    final data = json['data'];
+    final dataMap = data is Map ? Map<String, dynamic>.from(data) : const {};
+    final rawList = dataMap['items'];
+    final entries = <KugouBlacklistEntry>[];
+    if (rawList is List) {
+      for (final item in rawList) {
+        if (item is! Map) continue;
+        try {
+          entries.add(
+            KugouBlacklistEntry.fromJson(Map<String, dynamic>.from(item)),
+          );
+        } catch (_) {
+          // 单条解析失败跳过，不影响整页
+        }
+      }
+    }
+    int toInt(dynamic v, int fallback) =>
+        v is num ? v.toInt() : int.tryParse('${v ?? ''}') ?? fallback;
+    return KugouBlacklistSnapshot(
+      label: dataMap['label']?.toString() ?? 'song',
+      page: toInt(dataMap['page'], 1),
+      pagesize: toInt(dataMap['pagesize'], 30),
+      total: toInt(dataMap['total'], entries.length),
+      entries: entries,
+      ok: ok,
+    );
+  }
+}
+
+// ==================== 云端听歌记录（/user/listen · /user/history） ====================
+//
+// 上游响应结构未文档化（listenservice /v2/get_list 与 playhistory /v1/get_songs），
+// 解析一律防御式：数组位置多候选 + 字段别名多候选 + 单条失败跳过。
+// 首次实调后若确认了真实字段，可在此收窄候选集（保留兜底不影响正确性）。
+
+/// 在 `data`（或响应根）下按候选键找歌曲条目数组。
+/// 返回 `null` 表示没找到数组；空数组是合法结果（云端确实没有记录）。
+///
+/// **`lists` 为 2026-10-11 实机确认的真值键**（`/user/listen` 空响应样本：
+/// `data:{data_date, servertime, lists:[], total_history, total_week,
+/// hide_mixsongids}`）；其余候选为防御式兜底（响应结构未文档化）。
+/// 条目级字段（hash/名称/次数/时间）尚无真实非空样本，全部走
+/// [KugouSongDetail] 的别名解析；首次拿到非空响应后应核对并收窄。
+List<dynamic>? _findListenItemArray(Map<String, dynamic> json) {
+  final data = json['data'];
+  final scopes = <Map<String, dynamic>>[
+    if (data is Map) Map<String, dynamic>.from(data),
+    json,
+  ];
+  for (final scope in scopes) {
+    for (final key in const ['lists', 'info', 'list', 'songs', 'data', 'items']) {
+      final v = scope[key];
+      if (v is List) return v;
+    }
+  }
+  return null;
+}
+
+/// 从条目里取出可交给 [KugouSongDetail.fromJson] 的歌曲信息层：
+/// 条目本身，或其内嵌的 `info`/`song`/`data` 子对象（部分响应把歌曲字段包一层）。
+Map<String, dynamic>? _listenItemSongMap(dynamic item) {
+  if (item is! Map) return null;
+  final direct = Map<String, dynamic>.from(item);
+  if (KugouSongDetail.itemLooksLikeSong(direct)) return direct;
+  for (final key in const ['info', 'song', 'data', 'base']) {
+    final inner = item[key];
+    if (inner is Map) {
+      final m = Map<String, dynamic>.from(inner);
+      if (KugouSongDetail.itemLooksLikeSong(m)) return m;
+    }
+  }
+  return direct;
+}
+
+/// 播放次数候选字段（酷狗各接口口径不一，全部尝试）。
+/// `/user/listen` 实机确认的字段是 `listen_count`（2026-10-11）。
+int? _listenItemPlayCount(Map<String, dynamic> item) {
+  for (final key in const [
+    'listen_count',
+    'count',
+    'play_count',
+    'playcount',
+    'score',
+    'pc',
+  ]) {
+    final v = item[key];
+    if (v is num && v > 0) return v.toInt();
+    final parsed = int.tryParse('${v ?? ''}');
+    if (parsed != null && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+/// 播放时间候选字段 → 归一化为秒级时间戳（≤10 位视为秒，>10 位视为毫秒）。
+int _listenItemTimestampSec(Map<String, dynamic> item) {
+  for (final key in const ['timestamp', 'time', 'ot', 'play_time', 'last_time']) {
+    final v = item[key];
+    final n = v is num
+        ? v.toInt()
+        : int.tryParse('${v ?? ''}');
+    if (n == null || n <= 0) continue;
+    return n <= 9999999999 ? n : n ~/ 1000;
+  }
+  return 0;
+}
+
+/// 云端听歌排行/历史里的单首歌曲（复用 [KugouSongDetail] 的字段别名解析转 [Song]）。
+class KugouRankedSong {
+  final Song song;
+
+  /// 云端播放次数（响应未提供时为 null，UI 只显示排名不显示次数）。
+  final int? playCount;
+
+  const KugouRankedSong({required this.song, this.playCount});
+}
+
+/// `/user/listen`（listenservice /v2/get_list）的解析结果。
+/// [ok] 为 false 表示上游返回业务错误（如未登录 token 失效），songs 为空。
+class KugouListenRanking {
+  /// 0 = 最近一周前 120 首，1 = 全部累计前 120 首
+  final int type;
+  final List<KugouRankedSong> songs;
+  final bool ok;
+
+  const KugouListenRanking({
+    this.type = 0,
+    this.songs = const [],
+    this.ok = true,
+  });
+
+  factory KugouListenRanking.fromJson(
+    Map<String, dynamic> json, {
+    int type = 0,
+  }) {
+    final errorCode = json['error_code'];
+    final status = json['status'];
+    final ok = (errorCode == null || errorCode == 0 || errorCode == '0') &&
+        (status == null || status == 1 || status == '1');
+    final rawList = _findListenItemArray(json) ?? const [];
+    final songs = <KugouRankedSong>[];
+    for (final item in rawList) {
+      final songMap = _listenItemSongMap(item);
+      if (songMap == null) continue;
+      try {
+        final song = KugouSongDetail.fromJson(songMap).toSong();
+        if (song.id.isEmpty) continue;
+        songs.add(
+          KugouRankedSong(
+            song: song,
+            playCount: _listenItemPlayCount(songMap),
+          ),
+        );
+      } catch (_) {
+        // 单条解析失败跳过，不影响整页
+      }
+    }
+    return KugouListenRanking(type: type, songs: songs, ok: ok);
+  }
+}
+
+/// `/user/history`（playhistory /v1/get_songs）里的单条最近播放记录。
+///
+/// 2026-10-11 实机确认的条目结构：`{mxid, ot, pc, op, sr, info:{name,
+/// singername, hash, timelen, cover, mixsongid, album_id, singerinfo, ...}}`
+/// —— 歌曲信息嵌套在 `info` 层，`pc` 为该曲累计播放次数（服务端保持 max），
+/// `ot` 为最后一次播放时间（秒）。
+class KugouHistoryEntry {
+  final Song song;
+
+  /// 播放时间（unix 秒；上游缺失为 0，UI 不显示时间）。
+  final int timestampSec;
+
+  /// 累计播放次数（上游 `pc`；缺失为 0）。
+  final int playCount;
+
+  const KugouHistoryEntry({
+    required this.song,
+    this.timestampSec = 0,
+    this.playCount = 0,
+  });
+}
+
+/// `/user/history` 的解析结果。[nextBp] 为下一页游标（响应里原样取出的
+/// `bp`/`next_bp`/`cursor`，为空表示没有更多页或响应未提供游标）。
+class KugouHistorySnapshot {
+  final List<KugouHistoryEntry> entries;
+  final String? nextBp;
+  final bool ok;
+
+  const KugouHistorySnapshot({
+    this.entries = const [],
+    this.nextBp,
+    this.ok = true,
+  });
+
+  bool get hasMore {
+    final bp = nextBp;
+    return bp != null && bp.isNotEmpty;
+  }
+
+  factory KugouHistorySnapshot.fromJson(Map<String, dynamic> json) {
+    final errorCode = json['error_code'];
+    final status = json['status'];
+    final ok = (errorCode == null || errorCode == 0 || errorCode == '0') &&
+        (status == null || status == 1 || status == '1');
+    final data = json['data'];
+    final dataMap = data is Map
+        ? Map<String, dynamic>.from(data)
+        : const <String, dynamic>{};
+    final rawList = _findListenItemArray(json) ?? const [];
+    final entries = <KugouHistoryEntry>[];
+    for (final item in rawList) {
+      final songMap = _listenItemSongMap(item);
+      if (songMap == null) continue;
+      try {
+        final song = KugouSongDetail.fromJson(songMap).toSong();
+        if (song.id.isEmpty) continue;
+        final itemMap =
+            item is Map ? Map<String, dynamic>.from(item) : const <String, dynamic>{};
+        final ts = _listenItemTimestampSec(itemMap);
+        // pc = 该曲累计播放次数（实机确认字段；服务端保持 max）
+        final pc = itemMap['pc'] is num
+            ? (itemMap['pc'] as num).toInt()
+            : int.tryParse('${itemMap['pc'] ?? ''}') ?? 0;
+        entries.add(
+          KugouHistoryEntry(song: song, timestampSec: ts, playCount: pc),
+        );
+      } catch (_) {
+        // 单条解析失败跳过，不影响整页
+      }
+    }
+    // 翻页游标：响应未文档化，多候选防御式提取（实调确认后可收窄）
+    String? nextBp;
+    for (final scope in <Map<String, dynamic>>[dataMap, json]) {
+      for (final key in const ['bp', 'next_bp', 'nextBp', 'cursor']) {
+        final v = scope[key];
+        if (v == null) continue;
+        final s = v.toString();
+        if (s.isNotEmpty && s != '0') {
+          nextBp = s;
+          break;
+        }
+      }
+      if (nextBp != null) break;
+    }
+    return KugouHistorySnapshot(entries: entries, nextBp: nextBp, ok: ok);
   }
 }

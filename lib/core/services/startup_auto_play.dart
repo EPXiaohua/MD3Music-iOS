@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../../data/repositories/settings_repository.dart';
+import '../../modules/discover/home_discover_refill.dart';
 import '../../modules/personal_fm/personal_fm_core.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
@@ -38,7 +39,13 @@ enum StartupAutoPlaySource {
   fmExplore('fmExplore', '私人FM · 探索'),
 
   /// 私人 FM · 小众（`mode=small` + `song_pool_id=1`）。
-  fmNiche('fmNiche', '私人FM · 小众');
+  fmNiche('fmNiche', '私人FM · 小众'),
+
+  /// 私人 FM · 电台（`mode=radio` + `song_pool_id=0`）。
+  fmRadio('fmRadio', '私人FM · 电台'),
+
+  /// 刷歌推荐（首页发现流的刷歌池，`today_play_num` 客户端游标）。
+  homeDiscover('homeDiscover', '刷歌推荐');
 
   const StartupAutoPlaySource(this.value, this.label);
 
@@ -77,8 +84,11 @@ enum StartupAutoPlaySource {
         return 1;
       case StartupAutoPlaySource.fmNiche:
         return 2;
+      case StartupAutoPlaySource.fmRadio:
+        return 3;
       case StartupAutoPlaySource.resume:
       case StartupAutoPlaySource.daily:
+      case StartupAutoPlaySource.homeDiscover:
         return null;
     }
   }
@@ -192,14 +202,17 @@ class StartupAutoPlay {
       case StartupAutoPlaySource.fmHeart:
       case StartupAutoPlaySource.fmExplore:
       case StartupAutoPlaySource.fmNiche:
+      case StartupAutoPlaySource.fmRadio:
         await _playPersonalFm(source.fmStationIndex!, kugou, player);
+      case StartupAutoPlaySource.homeDiscover:
+        await _playHomeDiscover(kugou, player);
     }
     // play* 系列对解析失败的处理是「停在原地 + 报 resolveError」而非抛异常，
     // 所以成功与否只能回到播放器身上看：起播后一定有 currentSong。
     return player.currentSong != null;
   }
 
-  /// 私人 FM 三个档位。
+  /// 私人 FM 四个档位。
   ///
   /// 走 [PersonalFmWidgetActions] 而不是自己拼：它是发现页 FM 区块与桌面小
   /// 部件共同使用的同一份起播逻辑，内含两件缺了就一定会出事的事——
@@ -214,6 +227,31 @@ class StartupAutoPlay {
     final songs = kugou.personalFmSongs;
     if (songs.isEmpty) return;
     await PersonalFmWidgetActions.playSong(kugou, player, stationIndex, songs.first);
+  }
+
+  /// 刷歌推荐。
+  ///
+  /// 顺序与发现页 `_play(index)`（discover_page.dart）完全一致，两条都是踩出来的：
+  /// 1. **先起播再 arm**。补货器靠识别「当前队列是不是刷歌来的」决定留场，
+  ///    队列在 [PlayerProvider.playOnlinePlaylist] 里落地，顺序反了它会把
+  ///    currentSong 还停在上一首的队列当成别人的直接退场。
+  /// 2. **必须立刻补一批**。PlayerProvider 一次只把当前这一首灌进
+  ///    audio_service，不补的话播到队尾就停，「刷歌」退化成「听四首就完事」。
+  /// 3. **播放源取 provider 的权威列表快照**（homeDiscoverSongsAsSongs），
+  ///    不存本地副本，补货器追加的新歌才能进队列。
+  /// 之后队列的提前补货 / 播完补货 / 停摆自愈全部由 [HomeDiscoverRefill]
+  /// 接管（它不依赖 UI，生命周期跟 App 走，冷启动场景正好合适）。
+  static Future<void> _playHomeDiscover(
+    KugouProvider kugou,
+    PlayerProvider player,
+  ) async {
+    await kugou.getHomeDiscover();
+    final songs = kugou.homeDiscoverSongsAsSongs;
+    if (songs.isEmpty) return;
+    await player.playOnlinePlaylist(songs, 0);
+    final refill = HomeDiscoverRefill.arm(kugou, player);
+    if (refill == null) return;
+    await refill.append();
   }
 
   /// 仅供测试：重置一次性保护。

@@ -35,10 +35,11 @@
     <!-- USB 独占输出：声明 USB Host 能力（非必需，无 USB 口的设备也可安装） -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <application
-        android:label="MD3Music"
+        android:label="@string/app_name"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:networkSecurityConfig="@xml/network_security_config">
         <!-- MD3Music fork: 原子随身听（vivomusicmix）合作应用认证 meta-data（照抄酷我 12.0.8.0）。
              原子可能据此识别合作控制器（c0 路径）。token 为酷我的，若与包名绑定则无效。 -->
@@ -84,7 +85,7 @@
             android:enabled="true"
             android:exported="true"
             android:icon="@mipmap/ic_launcher"
-            android:label="MD3Music">
+            android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -96,7 +97,7 @@
             android:enabled="false"
             android:exported="true"
             android:icon="@drawable/ic_launcher_legacy_cropped"
-            android:label="MD3Music">
+            android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -223,8 +224,7 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
-        <!-- 渲染引擎固定为 skia（构建期静态值）：EnableImpeller=false，兼容优先；
-             不打包 impeller 变体，杜绝 split-per-abi 出双份安装包 -->
+        <!-- 渲染引擎使用 Impeller，由 Gradle 构建期静态值启用。 -->
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="${enableImpeller}" />

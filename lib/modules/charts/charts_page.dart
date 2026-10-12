@@ -1,4 +1,8 @@
+import '../../core/layout/adaptive_navigator.dart';
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
@@ -105,7 +109,10 @@ class _ChartsPageState extends State<ChartsPage> {
         return Md3PullToRefresh(
           onRefresh: () =>
               context.read<KugouProvider>().getRankList(forceRefresh: true),
-          child: ListView.builder(
+          child: TvScrollRegion(
+            memoryKey: 'tv/charts-board',
+            horizontalEdge: DpadEdgeBehavior.leave,
+            child: ListView.builder(
             controller: _scrollController,
             padding: const EdgeInsets.fromLTRB(
               AppSpacing.lg,
@@ -116,7 +123,15 @@ class _ChartsPageState extends State<ChartsPage> {
             itemCount: ranks.ranks.length,
             itemBuilder: (context, i) {
               final rank = ranks.ranks[i];
-              return Container(
+              // tv: 榜单行的动作抽成一份，InkWell 与遥控停点共用同一个入口，
+              // 避免两处各写一遍后语义漂移。
+              void openRank() => AdaptiveNav.openDetail(
+                context,
+                (_) => _RankSongPage(
+                    rankId: rank.id,
+                    rankName: rank.name),
+              );
+              final row = Container(
                 margin: const EdgeInsets.only(bottom: 10),
                 decoration: BoxDecoration(
                   borderRadius: AppRadius.lgAll,
@@ -126,14 +141,7 @@ class _ChartsPageState extends State<ChartsPage> {
                   color: Colors.transparent,
                   child: InkWell(
                     borderRadius: AppRadius.lgAll,
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => _RankSongPage(
-                          rankId: rank.id,
-                          rankName: rank.name,
-                        ),
-                      ),
-                    ),
+                    onTap: openRank,
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
                         horizontal: AppSpacing.md,
@@ -209,7 +217,14 @@ class _ChartsPageState extends State<ChartsPage> {
                   ),
                 ),
               );
+              // tv: 行单停点（OK = 进入榜单页）。裸 InkWell 行遥控无反馈（2026-10-08）。
+              return TvCardFocus(
+                onSelect: openRank,
+                debugLabel: 'charts-board-row',
+                child: row,
+              );
             },
+          ),
           ),
         );
       },
@@ -253,8 +268,11 @@ class _ChartsPageState extends State<ChartsPage> {
           onRefresh: () =>
               context.read<KugouProvider>().getRankList(forceRefresh: true),
           // 使用 PinchableGridView 替代固定2列 GridView：
-          // Pad 模式下双指捏合可动态调整列数，非 Pad 模式仍固定 2 列
-          child: PinchableGridView(
+          // Pad 模式下双指捏合可动态调整列数，非 Pad 模式按局部可用宽度自动调整列数
+          child: TvScrollRegion(
+            memoryKey: 'tv/charts-grid-1',
+            horizontalEdge: DpadEdgeBehavior.leave,
+            child: PinchableGridView(
             controller: _scrollController,
             padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
             spacing: 12.0,
@@ -266,14 +284,13 @@ class _ChartsPageState extends State<ChartsPage> {
                 name: rank.name,
                 coverUrl: rank.coverUrl,
                 songCount: rank.songCount,
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) =>
+                onTap: () => AdaptiveNav.openDetail(context,
+                  (_) =>
                         _RankSongPage(rankId: rank.id, rankName: rank.name),
-                  ),
                 ),
               );
             },
+          ),
           ),
         );
       },
@@ -299,7 +316,7 @@ class _RankGridCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
 
-    return ClipRRect(
+    final card = ClipRRect(
       borderRadius: AppRadius.mdAll,
       clipBehavior: Clip.antiAlias,
       child: Material(
@@ -355,6 +372,13 @@ class _RankGridCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    // tv: 网格卡片单停点（OK = 原 onTap）。
+    return TvCardFocus(
+      onSelect: onTap,
+      debugLabel: 'charts-rank-card',
+      child: card,
     );
   }
 
@@ -442,26 +466,30 @@ class _RankSongPageState extends State<_RankSongPage> {
                     ),
                   );
                 }
-                return ListView.builder(
-                  padding: EdgeInsets.fromLTRB(
-                    AppSpacing.lg,
-                    AppSpacing.lg,
-                    AppSpacing.lg,
-                    AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
-                  ),
-                  itemCount: songs.length,
-                  itemBuilder: (context, i) {
-                    final song = songs[i].toSong();
-                    return SongListItem(
-                      song: song,
-                      onTap: () =>
-                          context.read<PlayerProvider>().playOnlinePlaylist(
-                            songs.map((e) => e.toSong()).toList(),
-                            i,
-                          ),
-                      onMoreTap: () {},
-                    );
-                  },
+                return TvScrollRegion(
+                  memoryKey: 'tv/charts-rank-songs',
+                  horizontalEdge: DpadEdgeBehavior.leave,
+                  child: ListView.builder(
+                    padding: EdgeInsets.fromLTRB(
+                      AppSpacing.lg,
+                      AppSpacing.lg,
+                      AppSpacing.lg,
+                      AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                    ),
+                    itemCount: songs.length,
+                    itemBuilder: (context, i) {
+                      final song = songs[i].toSong();
+                      return SongListItem(
+                        song: song,
+                        onTap: () =>
+                            context.read<PlayerProvider>().playOnlinePlaylist(
+                              songs.map((e) => e.toSong()).toList(),
+                              i,
+                            ),
+                        onMoreTap: () {},
+                      );
+                    },
+                ),
                 );
               },
             ),

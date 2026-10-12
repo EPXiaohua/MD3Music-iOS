@@ -2,6 +2,8 @@ import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/remote/remote_slider.dart';
 import '../../core/services/dlna_service.dart';
 import '../../providers/dlna_provider.dart';
 import '../../providers/player_provider.dart';
@@ -87,10 +89,8 @@ class _DlnaCastSheetState extends State<DlnaCastSheet> {
                   ),
                 ),
                 if (dlna.state == DlnaCastState.searching)
-                  const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: M3ECircularProgressIndicator(size: 20, strokeWidth: 2),
+                  const M3ELoadingIndicator(
+                    constraints: BoxConstraints.tightFor(width: 20, height: 20),
                   ),
               ],
             ),
@@ -254,19 +254,33 @@ class _DlnaCastSheetState extends State<DlnaCastSheet> {
             if (dlna.state == DlnaCastState.connecting)
               const Padding(
                 padding: EdgeInsets.all(16),
-                child: Center(child: M3ECircularProgressIndicator()),
+                child: Center(child: M3ELoadingIndicator()),
               )
             else ...[
               // 进度条（设备不支持 Seek 时降级为只读进度）
               if (totalSeconds > 0) ...[
                 if (dlna.canSeek)
-                  Slider(
-                    value: positionSeconds.toDouble().clamp(0, totalSeconds.toDouble()),
-                    max: totalSeconds.toDouble(),
-                    onChanged: (v) {
-                      dlna.seek(Duration(seconds: v.round()));
-                    },
-                  )
+                  // tv: TV 构建换 RemoteSlider——原生 Slider 在传统导航模式
+                  // 下吞四方向键，D-pad 落上去焦点无法移出；参数原样透传。
+                  kTvBuild
+                      ? RemoteSlider(
+                          value: positionSeconds
+                              .toDouble()
+                              .clamp(0, totalSeconds.toDouble()),
+                          max: totalSeconds.toDouble(),
+                          onChanged: (v) {
+                            dlna.seek(Duration(seconds: v.round()));
+                          },
+                        )
+                      : Slider(
+                          value: positionSeconds
+                              .toDouble()
+                              .clamp(0, totalSeconds.toDouble()),
+                          max: totalSeconds.toDouble(),
+                          onChanged: (v) {
+                            dlna.seek(Duration(seconds: v.round()));
+                          },
+                        )
                 else
                   M3ELinearProgressIndicator(
                     value: positionSeconds / totalSeconds,

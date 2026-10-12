@@ -197,6 +197,9 @@ object FlymeLyricBridge {
     }
 
     private fun decorate(n: Notification) {
+        // 按机型选择：非 Flyme 机型直接不处理。否则关闭态分支会把 tickerText 清空并清掉
+        // flag 位，等于原地改写别的厂商（如 vivo/iQOO 原子随身听）正在读取的媒体通知。
+        if (!isSupported()) return
         val f = effectiveFlags()
         val show = enabled && currentLyric.isNotEmpty()
         if (show) {

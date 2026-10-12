@@ -2,8 +2,40 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+
+import 'diagnostic_logger.dart';
+
+/// 「频谱总开关」的**同步可读**进程级镜像（默认关）。
+///
+/// **为什么需要镜像**：播放页的封面/文字连贯资格在 build 期求值，而偏好是异步
+/// 读的——播放页在 `initState` 的 post-frame 才去读 SharedPreferences，首帧必然
+/// 拿到「还没读」的 false。迷你条上滑展开时跟手覆盖层是**当场新建**的播放页，
+/// 它的第一帧就已经在 0<p<1，资格锁存（见 `PlayerCoverMorphBus.resolveCoverEligible`）
+/// 会把这份陈旧的 false 锁成「可形变」，于是频谱开着也照飞方封面。
+/// 镜像由 `SettingsRepository` 的频谱读写方法维护、`runBootstrap` 在 runApp 前
+/// 预热，资格判据从此与异步读取彻底解耦。
+///
+/// 单独存两个字段而不是一个 `active`：开关与样式是**分别**读写的（各自一个
+/// getter/setter），合成一个值会被后写的那次覆盖掉。
+bool kSpectrumEnabled = false;
+
+/// 「频谱样式」的同步镜像：0=柱状图（环绕圆盘）、1=曲线（环绕圆盘）、2=背景层。
+int kSpectrumStyle = 0;
+
+/// 频谱**圆盘**（style 0/1：圆形旋转封面 + 环形频谱柱）当前是否生效。
+///
+/// 圆盘下封面形变必须关闭（形变层画不出圆形裁切 + 旋转），但**文字形变照旧**。
+bool get kSpectrumDiscCoverActive => kSpectrumEnabled && kSpectrumStyle < 2;
+
+/// 频谱**视觉对齐延迟**（毫秒，默认 580）。
+///
+/// 与「节奏偏移」（[MusicHapticsService] 的 `_offsetMs`）同一事实源、由其在
+/// `load`/`setOffset`/`previewOffset` 三处回填：PCM 在混音前截取，频谱帧天然比
+/// 「听到的」早一整个输出缓冲深度——震动靠延后点火补，显示靠把帧延后发布补，
+/// 让柱体起落与听到的拍点同相。设置页拖动滑杆下一帧（≈50ms）实时生效；0 关闭。
+int kSpectrumVisualOffsetMs = 580;
 
 /// 频谱可视化服务：单例，桥接 Kotlin [SpectrumPlugin] 的 FFT 数据流。
 ///
@@ -11,13 +43,21 @@ import 'package:flutter/services.dart';
 /// - **真实模式**：通过 MethodChannel 接收原生 Visualizer 的 FFT 回调
 /// - **模拟模式**：Visualizer 不可用时，用 sin 波动 + 随机化生成装饰性频谱数据
 ///
-/// 调用 [start] 后自动尝试真实模式；若 1.5 秒内未收到 FFT 回调，自动降级到模拟模式。
+/// 播放期间超过 1.5 秒未收到 FFT 回调时降级，并低频重试原生采集。
 /// 收到真实 FFT 回调后自动切换回真实模式。
 ///
 /// 模拟模式视觉上跟随播放节奏（播放时跳动、暂停时静止），但不反映真实音频频谱。
-class SpectrumService {
-  SpectrumService._();
+class SpectrumService with WidgetsBindingObserver {
+  SpectrumService._() : _isAndroid = Platform.isAndroid;
+  @visibleForTesting
+  SpectrumService.forTesting({required bool isAndroid})
+    : _isAndroid = isAndroid;
+  final bool _isAndroid;
   static final SpectrumService instance = SpectrumService._();
+  // iOS 原生频谱走同一条 MethodChannel（MTAudioProcessingTap），必须与 Android
+  // 一样进真实采集路径；仅在「断流自动降级模拟」上比 Android 更保守（见
+  // _watchData：iOS 不降级，频谱保持静止）。
+  bool get _isIos => Platform.isIOS;
 
   static const String _channelName = 'com.md3music.md3music/spectrum';
 
@@ -35,6 +75,34 @@ class SpectrumService {
 
   Stream<List<double>> get spectrumStream => _controller.stream;
 
+  /// 节拍特征向量广播流。布局由原生 `SpectrumFeatures` 定义：
+  /// `[0..15]` 16 个对数频带能量（30Hz→16kHz，**未归一化**）、
+  /// `[16]` 全带 RMS、`[17]` 低频带(30–300Hz)、`[18]` 高频带(3–8kHz)、
+  /// `[19]` 中频带(300Hz–3kHz)。
+  ///
+  /// **只有 PCM 截取路径会产出特征**（原生 `onFeatures` 只在 `handlePcm` 里发）：
+  /// Visualizer 兜底路径拿不到原始时域样本，模拟模式更是凭空生成。
+  /// 因此音乐震动必须以本流是否有新鲜帧为闸门，绝不能拿 [spectrumStream] 顶替。
+  final StreamController<List<double>> _featuresController =
+      StreamController<List<double>>.broadcast(sync: true);
+
+  Stream<List<double>> get featuresStream => _featuresController.stream;
+
+  /// 最近一次收到真实特征帧的时刻；null 表示本次会话还没有过。
+  DateTime? _lastFeatureAt;
+
+  /// 特征通路是否真的有真实数据在流（模拟模式/Visualizer 兜底路径恒为 false）。
+  bool get hasRealFeatures => _lastFeatureAt != null;
+
+  /// 距最近一帧真实特征过去了多久；从未收到过时返回 null。
+  Duration? get featureAge {
+    final last = _lastFeatureAt;
+    return last == null ? null : DateTime.now().difference(last);
+  }
+
+  /// 复用缓冲：特征帧约 20fps，与 `_nativeBuf` 同理由。
+  List<double> _featureBuf = List.filled(0, 0.0);
+
   bool _running = false;
   bool get isRunning => _running;
 
@@ -50,6 +118,17 @@ class SpectrumService {
   // ── 模拟模式相关 ──
   Timer? _simulateTimer;
   Timer? _fallbackTimer;
+  final Set<Object> _owners = {};
+  final Object _defaultOwner = Object();
+  int _generation = 0;
+  DateTime? _lastFftAt;
+  DateTime? _lastRecoveryAt;
+  int _sessionId = 0;
+
+  /// 原生端是否允许挂 Visualizer 兜底（透传给 Kotlin，重绑时沿用）。
+  bool _visualizerFallback = true;
+  bool _recovering = false;
+  bool _foreground = true;
   double _simulateTime = 0;
   final math.Random _rng = math.Random();
   // 每根柱的相位偏移，让模拟频谱更自然（按最大 bandCount 生成，运行时取模索引）
@@ -67,62 +146,165 @@ class SpectrumService {
   List<double> _outBuf = List.filled(0, 0.0);
   List<double> _nativeBuf = List.filled(0, 0.0);
 
+  // 在途延迟帧的定时器：暂停/停止/dispose 必须全部取消，否则旧歌尾帧迟到穿透。
+  final Set<Timer> _pendingFrames = <Timer>{};
+
   /// 当前播放状态（模拟模式用：播放时生成数据，暂停时静止）
   bool _isPlaying = false;
 
   /// 启动频谱采集。返回 true 表示服务已运行（真实或模拟模式）。
-  Future<bool> start([int? audioSessionId]) async {
-    if (!Platform.isAndroid && !Platform.isIOS) {
-      // 其他平台直接用模拟模式
+  /// 每个播放器传入独立 owner，仅在最后一个使用者退出时释放原生采集。
+  ///
+  /// [visualizerFallback] 为 true 时原生端才允许挂 Visualizer 兜底（需要录音权限）；
+  /// 为 false 时只走 PCM 截取路径，不需要任何权限。
+  ///
+  /// 注意：Dart 不允许「可选位置参数 + 可选命名参数」并存，故此处第三个参数
+  /// 仍是可选位置参数（`start()` / `start(sessionId, owner)` 的既有调用不受影响）。
+  Future<bool> start([
+    int? audioSessionId,
+    Object? owner,
+    bool visualizerFallback = true,
+  ]) async {
+    _owners.add(owner ?? _defaultOwner);
+    if (_running) {
+      // 页面交接/切歌会带来新的 sessionId 与兜底开关。真实帧在流时 PCM 路径与
+      // sessionId 无关，不打断；已降级到模拟模式说明旧绑定没在工作，
+      // 必须带新参数立即重绑，否则 _recoverNative 会永远拿旧 session 重试。
+      final sessionId = audioSessionId ?? 0;
+      if (_sessionId != sessionId ||
+          _visualizerFallback != visualizerFallback) {
+        _sessionId = sessionId;
+        _visualizerFallback = visualizerFallback;
+        if (_isAndroid && _simulated) unawaited(_recoverNative());
+      }
+      return true;
+    }
+    _running = true;
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    _sessionId = audioSessionId ?? 0;
+    _visualizerFallback = visualizerFallback;
+    _lastRecoveryAt = DateTime.now();
+    final generation = ++_generation;
+    _lastFftAt = DateTime.now();
+    _lastFeatureAt = null;
+    _watchData();
+    DiagnosticLogger.instance.info(
+      '[Spectrum] start generation=$generation session=${audioSessionId ?? 0}',
+    );
+    if (!_isAndroid && !_isIos) {
+      // 其他平台（桌面）直接用模拟模式
       _startSimulated();
       return true;
     }
-    if (_running) return true;
-
-    // 懒注册 MethodChannel handler
     if (!_handlerRegistered) {
       _channel.setMethodCallHandler(_handleMethodCall);
       _handlerRegistered = true;
     }
-
-    // 尝试启动原生 Visualizer
     bool nativeOk = false;
+    _recovering = true;
     try {
-      final ok = await _channel.invokeMethod<bool>('start', {
-        'audioSessionId': audioSessionId ?? 0,
-      });
-      nativeOk = ok ?? false;
-    } on PlatformException catch (_) {
-      nativeOk = false;
+      nativeOk =
+          await _channel
+              .invokeMethod<bool>('start', {
+                'audioSessionId': audioSessionId ?? 0,
+                'visualizerFallback': visualizerFallback,
+              })
+              .timeout(const Duration(seconds: 4)) ??
+          false;
+    } catch (error) {
+      DiagnosticLogger.instance.warning(
+        '[Spectrum] native start failed: ${error.runtimeType}',
+      );
+    } finally {
+      if (generation == _generation) _recovering = false;
     }
-
-    _running = true;
-
-    if (nativeOk) {
-      if (Platform.isAndroid) {
-        // Android：等 1.5 秒看是否有 FFT 回调；无回调则降级到模拟模式
-        //（Visualizer 在部分 ROM 不可用，如 HyperOS error -3）。
-        _fallbackTimer?.cancel();
-        _fallbackTimer = Timer(const Duration(milliseconds: 1500), () {
-          if (_running && !_receivedFft) {
-            // 1.5 秒内无 FFT 回调，降级到模拟模式
-            _startSimulated();
-          }
-        });
-      }
-      // iOS 不设降级计时器：MTAudioProcessingTap 自 iOS 6 起全版本支持，
-      // 不存在"设备不支持"的场景。播放失败/缓冲/暂停期间没有 PCM 流经 tap，
-      // FFT 自然不到达——此时频谱保持静止即可；旧逻辑在 1.5s 无数据时
-      // 误降级模拟并弹"设备不支持"，网络差导致播放失败时必然触发。
-    } else {
-      // 原生启动失败（如 HyperOS error -3），直接用模拟模式
-      _startSimulated();
+    // 退出/重新进入期间，旧启动结果不能恢复已释放的服务；
+    // 本页 owner 已登记在案，作废时必须回收，否则 stop() 永远凑不齐空集合。
+    if (!_running || generation != _generation) {
+      _owners.remove(owner ?? _defaultOwner);
+      return false;
     }
-
+    if (!nativeOk) _startSimulated();
     return true;
   }
 
-  bool _receivedFft = false;
+  /// 持续检查断流，不再仅检查启动后的第一帧；暂停期间不触发降级。
+  void _watchData() {
+    _fallbackTimer?.cancel();
+    _fallbackTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (!_running || !_isPlaying || !_foreground) return;
+      if (_simulated) {
+        if (_isAndroid &&
+            !_recovering &&
+            DateTime.now().difference(_lastRecoveryAt!) >=
+                const Duration(seconds: 5)) {
+          unawaited(_recoverNative());
+        }
+        return;
+      }
+      final last = _lastFftAt;
+      if (last == null ||
+          DateTime.now().difference(last) >=
+              const Duration(milliseconds: 1500)) {
+        // iOS 不降级：MTAudioProcessingTap 自 iOS 6 起全版本支持，不存在
+        // "设备不支持"的场景。播放失败/缓冲/暂停期间没有 PCM 流经 tap，
+        // FFT 自然不到达——此时频谱保持静止即可；旧逻辑在 1.5s 无数据时
+        // 误降级模拟并弹"设备不支持"，网络差导致播放失败时必然触发。
+        if (_isAndroid) {
+          DiagnosticLogger.instance.warning(
+            '[Spectrum] FFT stream stalled, use simulated fallback',
+          );
+          _startSimulated();
+          unawaited(_logNativeStats());
+          unawaited(_recoverNative());
+        }
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (!_foreground || !_running) return;
+    // 熄屏期间系统可能回收采集资源，亮屏后主动重绑，不能依赖页面的 started 标记。
+    _lastFftAt = DateTime.now();
+    DiagnosticLogger.instance.info('[Spectrum] app resumed, restore capture');
+    if (_isAndroid && _isPlaying) unawaited(_recoverNative());
+  }
+
+  /// 断流后重新注册原生采集；恢复期间保留模拟显示，真实帧到达后自动切回。
+  Future<void> _recoverNative() async {
+    if (_recovering || !_running) return;
+    _recovering = true;
+    final generation = _generation;
+    _lastRecoveryAt = DateTime.now();
+    DiagnosticLogger.instance.info('[Spectrum] rebind native capture');
+    try {
+      await _channel
+          .invokeMethod<bool>('start', {
+            'audioSessionId': _sessionId,
+            'visualizerFallback': _visualizerFallback,
+          })
+          .timeout(const Duration(seconds: 4));
+    } catch (_) {
+      // 下一次低频检查再重试，禁止逐帧重连。
+    } finally {
+      if (generation == _generation) _recovering = false;
+    }
+  }
+
+  /// 降级当场采集原生投递链三段计数，写入诊断日志。
+  /// 旧版 APK 无 stats 方法时静默（MissingPluginException 被吞）。
+  Future<void> _logNativeStats() async {
+    try {
+      final stats = await _channel
+          .invokeMethod<Object?>('stats')
+          .timeout(const Duration(seconds: 2));
+      DiagnosticLogger.instance.info('[Spectrum] native stats: $stats');
+    } catch (_) {}
+  }
 
   /// 暂停门控：暂停时强制频谱复位为 0。
   /// 原因：ExoPlayer 暂停时会 flush 剩余 PCM（尾音），handleBuffer 仍被调用，
@@ -131,9 +313,12 @@ class SpectrumService {
 
   /// 设置播放状态（模拟模式用）
   void setPlaying(bool playing) {
+    if (playing && !_isPlaying) _lastFftAt = DateTime.now();
     _isPlaying = playing;
     _gateZero = !playing;
     if (!playing) {
+      // 先清在途延迟帧，再立即归零：否则 0.5s 前的旧帧会在柱体落下后又弹起来
+      _cancelPendingFrames();
       // 暂停：立即发一次全 0，让 UI 复位
       final n = bandCount;
       if (_outBuf.length != n) _outBuf = List<double>.filled(n, 0.0);
@@ -146,6 +331,7 @@ class SpectrumService {
   void _startSimulated() {
     if (_simulated) return;
     _simulated = true;
+    DiagnosticLogger.instance.info('[Spectrum] simulated fallback active');
     simulatedNotifier.value = true;
     _simulateTimer?.cancel();
     // 约 20fps（50ms 一次），与原生 captureRate 对齐
@@ -184,13 +370,20 @@ class SpectrumService {
   }
 
   /// 停止采集并释放资源。
-  Future<void> stop() async {
+  Future<void> stop([Object? owner]) async {
+    _owners.remove(owner ?? _defaultOwner);
+    if (_owners.isNotEmpty || !_running) return;
     _running = false;
-    _receivedFft = false;
+    WidgetsBinding.instance.removeObserver(this);
+    _recovering = false;
+    ++_generation;
+    DiagnosticLogger.instance.info('[Spectrum] stopped, no consumers');
     _fallbackTimer?.cancel();
     _fallbackTimer = null;
     _stopSimulated();
-    if (Platform.isAndroid || Platform.isIOS) {
+    _cancelPendingFrames();
+    _lastFeatureAt = null;
+    if (_isAndroid || _isIos) {
       try {
         await _channel.invokeMethod<bool>('stop');
       } catch (_) {}
@@ -198,12 +391,16 @@ class SpectrumService {
   }
 
   Future<dynamic> _handleMethodCall(MethodCall call) async {
+    if (!_running) return null;
     if (call.method == 'onFft') {
       final raw = call.arguments;
-      if (raw is List) {
-        _receivedFft = true;
+      if (raw is List && raw.isNotEmpty) {
+        _lastFftAt = DateTime.now();
         // 收到真实 FFT 数据，停止模拟模式
-        if (_simulated) _stopSimulated();
+        if (_simulated) {
+          DiagnosticLogger.instance.info('[Spectrum] real FFT resumed');
+          _stopSimulated();
+        }
         // 暂停门控：暂停时丢弃真实数据（UI 已收到全 0 复位，不再更新）
         if (_gateZero) return null;
         // 复用原生缓冲解析，避免每帧分配
@@ -217,10 +414,65 @@ class SpectrumService {
         }
         // 重采样到用户配置的 bandCount（长度相等时直接复用 native）
         final bands = _resample(native, bandCount);
-        if (!_controller.isClosed) _controller.add(bands);
+        _emitFrame(bands);
       }
+      return null;
+    }
+    if (call.method == 'onFeatures') {
+      final raw = call.arguments;
+      if (raw is List && raw.isNotEmpty) {
+        // 与 onFft 同一套门控：暂停时 ExoPlayer 会 flush 尾音，特征帧照旧到达，
+        // 放着不管就会"暂停了还在震"。
+        if (_gateZero) return null;
+        _lastFeatureAt = DateTime.now();
+        if (_featureBuf.length != raw.length) {
+          _featureBuf = List<double>.filled(raw.length, 0.0);
+        }
+        final buf = _featureBuf;
+        for (int i = 0; i < buf.length; i++) {
+          final v = raw[i];
+          // 特征不做 clamp：它是能量量纲，会超过 1.0，钳到 1 会抹掉鼓点的动态
+          buf[i] = v is num ? v.toDouble() : 0.0;
+        }
+        if (!_featuresController.isClosed) _featuresController.add(buf);
+      }
+      return null;
     }
     return null;
+  }
+
+  /// 面向显示的消费发布：偏移 ≤0 时同步发布（sync 广播 + 复用缓冲的契约仅在
+  /// 同帧消费下成立）；>0 时拷贝后经 Timer 延后发布——延后帧**必须**独立拷贝，
+  /// `_outBuf`/`_nativeBuf` 会被下一帧覆盖。模拟模式帧不走本方法（装饰数据不
+  /// 参与拍点对齐，也不值得每 50ms 起一个定时器）。
+  void _emitFrame(List<double> bands) {
+    // 无视觉消费者时跳过整条发布链：音乐震动只听 featuresStream（原生仍会送
+    // onFft，但那是对端单帧小消息），这里省掉的是每帧一次列表拷贝 + 一个延迟
+    // Timer（视觉偏移默认 580ms ≈ 常驻约 25 个定时器）。震动自持采集
+    // （频谱显示关闭 / App 内 / 始终档）时视觉流通常无人监听，这是主要省电点。
+    if (!_controller.hasListener) return;
+    final offsetMs = kSpectrumVisualOffsetMs;
+    if (offsetMs <= 0) {
+      if (!_controller.isClosed) _controller.add(bands);
+      return;
+    }
+    final copy = List<double>.of(bands);
+    late final Timer timer;
+    timer = Timer(Duration(milliseconds: offsetMs), () {
+      _pendingFrames.remove(timer);
+      // 迟到期间可能已暂停/停服/停流：三重守卫缺一不可
+      if (_running && !_gateZero && !_controller.isClosed) {
+        _controller.add(copy);
+      }
+    });
+    _pendingFrames.add(timer);
+  }
+
+  void _cancelPendingFrames() {
+    for (final timer in _pendingFrames) {
+      timer.cancel();
+    }
+    _pendingFrames.clear();
   }
 
   /// 线性插值重采样：将 [input] 重采样到 [targetCount] 段。
@@ -244,8 +496,13 @@ class SpectrumService {
   }
 
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _running = false;
+    ++_generation;
+    _owners.clear();
     _simulateTimer?.cancel();
     _fallbackTimer?.cancel();
+    _cancelPendingFrames();
     simulatedNotifier.dispose();
     _controller.close();
   }

@@ -166,12 +166,20 @@ class KugouEndpoints {
   static const String loginDeviceKick = '/login/device/kick';
   static const String captchaSent = '/captcha/sent';
 
+  // 内容黑名单（编辑 / 查询，Rust `blacklist.rs`；黑名单内容不出现在推荐场景）
+  static const String blacklist = '/blacklist';
+  static const String blacklistList = '/blacklist/list';
+
   // Verify (20028 二次安全验证)
   static const String getVerifyInfo = '/get/verify/info';
   static const String verifyUserInfo = '/verify/user/info';
 
   // User
   static const String userDetail = '/user/detail';
+  static const String userUpdate = '/user/update';
+
+  /// 修改头像（两步：图床上传 + 写资料），见 Rust `user.rs::handle_update_avatar`。
+  static const String userUpdateAvatar = '/user/update/avatar';
   static const String userVipDetail = '/user/vip/detail';
   static const String userGradeInfo = '/user/grade/info';
 
@@ -193,6 +201,11 @@ class KugouEndpoints {
   static const String playhistoryUpload = '/playhistory/upload';
   static const String lastestSongsListen = '/lastest/songs/listen';
 
+  /// 听歌偏好（获取 / 更新），见 Rust `user_preference.rs`。
+  /// update 走 POST body 传字段（空字符串=清除该字段），不拼 query（大括号编码坑）。
+  static const String userPreference = '/user/preference';
+  static const String userPreferenceUpdate = '/user/preference/update';
+
   // Video
   static const String videoUrl = '/video/url';
   static const String videoDetail = '/video/detail';
@@ -202,6 +215,15 @@ class KugouEndpoints {
   static const String videoBarrageSend = '/video/barrage/send';
   static const String videoPrivilege = '/video/privilege';
   static const String pcDiantai = '/pc/diantai';
+
+  // Song Barrage（歌曲弹幕，紧挨 MV 弹幕：两者同为「评论池当弹幕池」的机制）
+  /// 歌曲弹幕（池 code = `articulossong`，**与 [commentMusic] 不是同一个评论池**，
+  /// 普通歌曲评论池是 `fc4be23b…`）。取数不需登录；条目无任何播放位置字段，
+  /// 时间轴需前端合成。上游 `pagesize` 硬上限 50（实测请求 100 只回 50 条）。
+  static const String songBarrage = '/song/barrage';
+  /// 发送歌曲弹幕（**需登录**；底层为歌曲弹幕池）。
+  /// **调用方不得自动重试**——发布成功即产生真实公开内容。
+  static const String songBarrageSend = '/song/barrage/send';
 
   // Youth (Channel)
   static const String youthChannelAll = '/youth/channel/all';

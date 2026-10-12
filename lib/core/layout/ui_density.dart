@@ -1,5 +1,6 @@
 import 'dart:ui' as ui;
 
+import 'package:flutter/rendering.dart';
 import 'package:material_ui/material_ui.dart';
 
 /// 「显示大小」全局缩放：语义等同安卓系统设置里的「显示大小」。
@@ -127,9 +128,91 @@ class DisplayScaleScope extends StatelessWidget {
         child: SizedBox(
           width: mq.size.width / scale,
           height: mq.size.height / scale,
-          child: child,
+          child: DisplayScaleAnchor(child: child),
         ),
       ),
     );
   }
+}
+
+/// 设计像素空间的参照锚点（纯坐标参照，无任何绘制/布局行为）。
+///
+/// [DisplayScaleScope] 的 FittedBox 把整棵子树缩放输出到窗口；挂在
+/// SizedBox 之下的本锚点所在坐标系 = **设计像素**。需要跨组件对齐矩形的
+/// 测量方（封面形变探针、MiniPlayer 顶端）一律变换到锚点而非 RenderView
+/// 根——否则 s≠1 时量得窗口像素、画进设计空间，偏 s 倍。
+/// scale == 1.0 时锚点空间 ≡ 根空间，行为不变。
+class _RenderDisplayScaleAnchor extends RenderProxyBox {}
+
+class _DisplayScaleAnchorBox extends SingleChildRenderObjectWidget {
+  const _DisplayScaleAnchorBox({super.key, required super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderDisplayScaleAnchor();
+}
+
+/// 向 [DisplayScaleScope] 后代暴露设计像素锚点的组件。
+///
+/// 首帧 build 时子树 RenderObject 尚未 mount，post-frame 拿到锚点后 setState
+/// 触发第二帧：[DisplayScaleReference] 带上锚点重建子树，探针的
+/// updateRenderObject 随之收到。转场消费远晚于两帧，无视觉影响。
+///
+/// 与 [DisplayScaleScope] 的 FittedBox / SizedBox 同理**不按档位短路**：
+/// scale == 1.0 时同样挂锚点（identity 变换），跨过 1.00 档不改变元素树结构。
+class DisplayScaleAnchor extends StatefulWidget {
+  const DisplayScaleAnchor({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<DisplayScaleAnchor> createState() => _DisplayScaleAnchorState();
+}
+
+class _DisplayScaleAnchorState extends State<DisplayScaleAnchor> {
+  final GlobalKey _anchorKey = GlobalKey();
+  RenderObject? _anchor;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ro = _anchorKey.currentContext?.findRenderObject();
+      if (!identical(ro, _anchor)) setState(() => _anchor = ro);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _DisplayScaleAnchorBox(
+      key: _anchorKey,
+      child: _anchor == null
+          ? widget.child
+          : DisplayScaleReference(anchor: _anchor!, child: widget.child),
+    );
+  }
+}
+
+/// 向后代暴露 [DisplayScaleAnchor] 的 RenderObject（设计像素锚点）。
+///
+/// 只读；锚点实例变化（理论不发生，GlobalKey 跨帧稳定）才触发重建。
+class DisplayScaleReference extends InheritedWidget {
+  const DisplayScaleReference({
+    super.key,
+    required this.anchor,
+    required super.child,
+  });
+
+  final RenderObject anchor;
+
+  /// 最近的设计像素锚点；不在 [DisplayScaleScope] 内时为 null
+  /// （调用方回退 RenderView 根空间，与修复前行为逐位一致）。
+  static RenderObject? anchorOf(BuildContext context) => context
+      .dependOnInheritedWidgetOfExactType<DisplayScaleReference>()
+      ?.anchor;
+
+  @override
+  bool updateShouldNotify(covariant DisplayScaleReference oldWidget) =>
+      anchor != oldWidget.anchor;
 }

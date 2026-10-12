@@ -431,15 +431,13 @@ public final class DirectPcmCapabilities {
                 return "PCM 16bit";
             case 4:  // C.ENCODING_PCM_FLOAT
                 return "PCM float32（24bit 有效）";
-            case 0x15: // C.ENCODING_PCM_24BIT
-                return "PCM 24bit";
             case 0x16: // C.ENCODING_PCM_32BIT
                 return "PCM 32bit";
             case 3:  // C.ENCODING_PCM_8BIT
                 return "PCM 8bit";
             case 0x11: // C.ENCODING_PCM_16BIT_BIG_ENDIAN
                 return "PCM 16bit 大端";
-            case 0x12: // C.ENCODING_PCM_24BIT_PACKED（API 31）
+            case 0x15: // C.ENCODING_PCM_24BIT_PACKED = 21（API 31）
                 return "PCM 24bit packed";
             default:
                 return "编码 " + encoding;

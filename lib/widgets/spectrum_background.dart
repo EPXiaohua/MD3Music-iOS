@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:material_ui/material_ui.dart';
 
+import '../core/services/player_frame_driver.dart';
+import '../core/services/spectrum_band_envelope.dart';
 import '../core/services/spectrum_service.dart';
 
 /// 背景条形频谱图：从屏幕底部向上延伸的频谱柱，铺满整个屏幕宽度。
@@ -42,8 +44,8 @@ class _SpectrumBackgroundState extends State<SpectrumBackground> {
   /// 频谱幅值数组（0..1），驱动 CustomPainter 重绘
   late final ValueNotifier<List<double>> _bandsNotifier;
 
-  /// 当前显示的幅值（带插值：上升快、回落慢）
-  late List<double> _displayedBands;
+  /// 频谱包络：瞬时上升 + 时基指数回落，由 60fps 共享节拍推进。
+  late SpectrumBandEnvelope _envelope;
 
   /// 频谱流订阅
   StreamSubscription<List<double>>? _subscription;
@@ -51,31 +53,78 @@ class _SpectrumBackgroundState extends State<SpectrumBackground> {
   /// 柱数量（根据屏幕宽度计算，约每 5px 一根）
   int _barCount = 64;
 
+  /// 包络是否已挂在共享 60fps 帧驱动上
+  bool _bandDriverBound = false;
+
+  /// 测量真实帧间隔，供包络按**时间**推进
+  final Stopwatch _bandClock = Stopwatch();
+  int _lastBandTickUs = 0;
+
   @override
   void initState() {
     super.initState();
-    _displayedBands = List<double>.filled(_barCount, 0.0);
-    _bandsNotifier = ValueNotifier<List<double>>(List.from(_displayedBands));
+    _envelope = SpectrumBandEnvelope(bandCount: _barCount);
+    _bandsNotifier = ValueNotifier<List<double>>(
+      List<double>.filled(_barCount, 0.0),
+    );
     _subscribeSpectrum();
+    _updateBandBinding();
   }
 
+  @override
+  void didUpdateWidget(covariant SpectrumBackground oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // visible 控制背景层是否显示；隐藏后仍需推进到收敛，柱子才会平滑塌回
+    if (oldWidget.visible != widget.visible) {
+      _updateBandBinding();
+    }
+  }
+
+  /// 订阅频谱数据流：重采样后**只登记目标值**，插值交给 60fps 节拍。
+  ///
+  /// 在此处插值会让回落量化成每秒约 20 个台阶（数据到达频率）。
+  /// 重采样仍留在本 widget（包络只管包络，不管分段）。
   void _subscribeSpectrum() {
     _subscription?.cancel();
     _subscription = SpectrumService.instance.spectrumStream.listen((bands) {
       if (!mounted) return;
       // 将原生 40 段数据重采样到 _barCount 段
-      final resampled = _resample(bands, _barCount);
-      for (int i = 0; i < _barCount; i++) {
-        final target = resampled[i];
-        final current = _displayedBands[i];
-        // 上升快、回落慢
-        final next = target > current
-            ? target
-            : current * 0.7 + target * 0.3;
-        _displayedBands[i] = next;
-      }
-      _bandsNotifier.value = List.from(_displayedBands);
+      _envelope.setTarget(_resample(bands, _barCount));
+      _updateBandBinding();
     });
+  }
+
+  /// 包络 tick 的绑定条件：可见，或尚未收敛。
+  void _updateBandBinding() {
+    final need = widget.visible || !_envelope.isSettled;
+    if (need == _bandDriverBound) return;
+    if (need) {
+      // 重新起算时间基线：Stopwatch 跨停/启会累积，直接 elapsed 会得到巨大 dt
+      _bandClock
+        ..reset()
+        ..start();
+      _lastBandTickUs = 0;
+      PlayerFrameDriver.instance.addListener(_onBandTick);
+    } else {
+      _bandClock.stop();
+      PlayerFrameDriver.instance.removeListener(_onBandTick);
+    }
+    _bandDriverBound = need;
+  }
+
+  /// 以真实帧间隔推进包络并驱动重绘。
+  void _onBandTick() {
+    if (!mounted) return;
+    final nowUs = _bandClock.elapsedMicroseconds;
+    final dtUs = nowUs - _lastBandTickUs;
+    _lastBandTickUs = nowUs;
+    if (dtUs <= 0) return;
+
+    _envelope.advance(Duration(microseconds: dtUs));
+    // 必须新建 List 实例：ValueNotifier<List> 用同一性比较
+    _bandsNotifier.value = List.from(_envelope.values);
+
+    _updateBandBinding();
   }
 
   /// 线性插值重采样
@@ -95,6 +144,11 @@ class _SpectrumBackgroundState extends State<SpectrumBackground> {
 
   @override
   void dispose() {
+    if (_bandDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onBandTick);
+      _bandDriverBound = false;
+    }
+    _bandClock.stop();
     _subscription?.cancel();
     _bandsNotifier.dispose();
     super.dispose();
@@ -112,19 +166,24 @@ class _SpectrumBackgroundState extends State<SpectrumBackground> {
           final newBarCount = (constraints.maxWidth / 5).round().clamp(32, 128);
           if (newBarCount != _barCount) {
             _barCount = newBarCount;
-            _displayedBands = List<double>.filled(_barCount, 0.0);
+            // 柱数变化：同步重建包络与其缓冲，避免长度错位
+            _envelope = SpectrumBandEnvelope(bandCount: _barCount);
+            _bandsNotifier.value = List<double>.filled(_barCount, 0.0);
           }
 
           return Opacity(
             opacity: widget.opacity,
-            child: CustomPaint(
-              painter: _SpectrumBarsPainter(
-                bandsNotifier: _bandsNotifier,
-                color: widget.color,
-                barCount: _barCount,
-                heightRatio: widget.heightRatio,
+            // 频谱每帧重绘：独立 layer，避免脏区扩散到整个背景层
+            child: RepaintBoundary(
+              child: CustomPaint(
+                painter: _SpectrumBarsPainter(
+                  bandsNotifier: _bandsNotifier,
+                  color: widget.color,
+                  barCount: _barCount,
+                  heightRatio: widget.heightRatio,
+                ),
+                child: const SizedBox.expand(),
               ),
-              child: const SizedBox.expand(),
             ),
           );
         },
@@ -146,10 +205,10 @@ class _SpectrumBarsPainter extends CustomPainter {
     required this.color,
     required this.barCount,
     required this.heightRatio,
-  })  : _paint = Paint()
-          ..color = color
-          ..style = PaintingStyle.fill,
-        super(repaint: bandsNotifier);
+  }) : _paint = Paint()
+         ..color = color
+         ..style = PaintingStyle.fill,
+       super(repaint: bandsNotifier);
 
   /// 填充画笔（构造时一次创建）
   final Paint _paint;

@@ -2,6 +2,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 
 /// 从粘贴文本中提取房间号：支持纯数字与分享文案（取文本中最长的 4-20 位
@@ -82,6 +83,7 @@ class _JoinRoomSheetState extends State<JoinRoomSheet> {
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: TextField(
                 controller: _idCtrl,
+                contextMenuBuilder: buildAppTextContextMenu,
                 autofocus: true,
                 keyboardType: TextInputType.number,
                 onSubmitted: (_) => _submit(),

@@ -11,6 +11,7 @@ pub mod artist;
 pub mod audio;
 pub mod audio_match;
 pub mod audio_more;
+pub mod blacklist;
 pub mod comment_more;
 pub mod comment_music;
 pub mod comment_send;
@@ -42,11 +43,13 @@ pub mod search_more;
 pub mod search_suggest;
 pub mod server_now;
 pub mod sheet;
+pub mod song_barrage;
 pub mod song_url;
 pub mod song_url_new;
 pub mod theme;
 pub mod top;
 pub mod user;
+pub mod user_preference;
 pub mod verify;
 pub mod video;
 pub mod video_barrage;
@@ -107,6 +110,10 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/playlist/detail", playlist::handle_detail));
     routes.push(("/playlist/del", playlist::handle_del));
     routes.push(("/playlist/add", playlist::handle_add));
+    // 前缀匹配语义下 /blacklist/list 必须先于 /blacklist 注册，
+    // 否则列表请求会被 /blacklist 抢先命中。
+    routes.push(("/blacklist/list", blacklist::handle_list));
+    routes.push(("/blacklist", blacklist::handle_edit));
     routes.push(("/user/video/collect", user::handle_video_collect));
     routes.push(("/user/video/love", user::handle_video_love));
     routes.push(("/user/vip/detail", user::handle_vip_detail));
@@ -120,10 +127,18 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/user/follow", user::handle_follow));
     routes.push(("/user/grade/info", user::handle_grade_info));
     routes.push(("/user/detail", user::handle_detail));
+    // 前缀匹配语义下 /user/update/avatar 必须先于 /user/update 注册，
+    // 否则 avatar 请求会被 /user/update 抢先命中（同 /video/barrage/send 的处理）。
+    routes.push(("/user/update/avatar", user::handle_update_avatar));
+    routes.push(("/user/update", user::handle_update));
     routes.push(("/user/cloud/upload", user::handle_cloud_upload));
     routes.push(("/user/cloud/del", user::handle_cloud_del));
     routes.push(("/user/cloud/url", user::handle_cloud_url));
     routes.push(("/user/cloud", user::handle_cloud));
+    // 前缀匹配语义下 /user/preference/update 必须先于 /user/preference 注册，
+    // 否则 update 请求会被 /user/preference 抢先命中（同 /user/update/avatar 的处理）。
+    routes.push(("/user/preference/update", user_preference::handle_update));
+    routes.push(("/user/preference", user_preference::handle_get));
     // 一起听：5 条路由均以 operation 区分领域内操作。
     routes.push(("/listen/together/room", listen_together::handle_room));
     routes.push(("/listen/together/music", listen_together::handle_music));
@@ -182,6 +197,11 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     // 顺序反了会把发送请求送进列表 handler。
     routes.push(("/video/barrage/send", video_barrage::handle_send));
     routes.push(("/video/barrage", video_barrage::handle));
+    // 歌曲弹幕发送：必须注册在 /song/barrage 之前（同 /video/barrage 的处理）。
+    // 本项目路由是路径段前缀匹配，/song/barrage 会命中 /song/barrage/send，
+    // 顺序反了会把发送请求送进列表 handler。
+    routes.push(("/song/barrage/send", song_barrage::handle_send));
+    routes.push(("/song/barrage", song_barrage::handle));
     routes.push(("/yueku/banner", yueku::handle_banner));
     routes.push(("/yueku/fm", fm::handle_yueku_fm));
     routes.push(("/yueku", yueku::handle_yueku));

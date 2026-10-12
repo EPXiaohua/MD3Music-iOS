@@ -1,5 +1,7 @@
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../core/build_flags.dart';
 import '../core/theme/app_theme.dart';
 import '../core/theme/motion_constants.dart';
 import '../core/utils/app_haptics.dart';
@@ -64,7 +66,7 @@ class _SlidingSegmentedControlState extends State<SlidingSegmentedControl> {
 
   void _select(int index) {
     if (index == widget.selectedIndex) return;
-    AppHaptics.tick();
+    AppHaptics.tick(HapticCategory.navigation);
     widget.onSelected(index);
   }
 
@@ -95,7 +97,7 @@ class _SlidingSegmentedControlState extends State<SlidingSegmentedControl> {
     final cs = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    return Semantics(
+    Widget control = Semantics(
       container: true,
       label: widget.semanticLabel,
       child: SizedBox(
@@ -131,6 +133,35 @@ class _SlidingSegmentedControlState extends State<SlidingSegmentedControl> {
         ),
       ),
     );
+
+    if (kTvBuild) {
+      // TV：分段控件原本纯手势无焦点节点，遥控不可达。包成单停点：
+      // 左右方向键在控件内换段（边界返回 false 放行焦点移出），OK 循环切下一段。
+      control = DpadFocusable(
+        debugLabel: 'tv/sliding-segmented',
+        onDirection: (direction) {
+          switch (direction) {
+            case TraversalDirection.left:
+              if (widget.selectedIndex > 0) {
+                _select(widget.selectedIndex - 1);
+                return true;
+              }
+              return false;
+            case TraversalDirection.right:
+              if (widget.selectedIndex < _count - 1) {
+                _select(widget.selectedIndex + 1);
+                return true;
+              }
+              return false;
+            default:
+              return false;
+          }
+        },
+        onSelect: () => _select((widget.selectedIndex + 1) % _count),
+        child: control,
+      );
+    }
+    return control;
   }
 
   /// 指示器。等分下第 i 段的中心落在 Alignment.x = -1 + 2i/(n-1)，

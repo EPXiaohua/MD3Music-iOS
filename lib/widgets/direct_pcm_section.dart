@@ -1,10 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../core/services/device_capabilities.dart';
 import '../core/services/direct_pcm_service.dart';
+import '../core/utils/app_haptics.dart';
 
 /// 「改用系统 Direct PCM」方案的子开关 + 实测状态面板。
 ///
@@ -66,7 +66,7 @@ class _DirectPcmSectionState extends State<DirectPcmSection> {
       DirectPcmFeature f, DeviceCapabilities caps) {
     if (!caps.supports(f)) return null;
     return (bool v) async {
-      HapticFeedback.lightImpact();
+      AppHaptics.lightImpact(HapticCategory.control);
       setState(() {});
       await DirectPcmService.instance.setFeature(f, v);
       if (mounted) setState(() {});

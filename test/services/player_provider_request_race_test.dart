@@ -21,6 +21,42 @@ import '../test_helpers/fake_secure_storage.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('在线音质解析前显示默认档位，降级后更新为实际音质', () async {
+    SharedPreferences.setMockInitialValues({});
+    installFakeSecureStorage();
+    final api = KugouApiClient();
+    await api.clearCookies();
+    await api.setLoginCookies('fixture-token', 'fixture-user');
+    final originalAdapter = api.dio.httpClientAdapter;
+    final adapter = _SuccessfulPlaybackRecoveryAdapter(holdPlaybackUrl: true);
+    api.dio.httpClientAdapter = adapter;
+    KugouApiClient.markServerReady();
+    final audio = ControlledAudioService();
+    AudioServiceLoader.setTestOverride(() async => audio);
+    final player = PlayerProvider();
+    try {
+      await player.audioReady;
+      player.setAudioQuality(AudioQuality.hires);
+      final play = player.playSong(Song(
+        id: 'quality-label-target', title: 'Quality Target', artist: 'Artist',
+        album: 'Album', duration: const Duration(minutes: 3), isOnline: true,
+      ));
+      await adapter.firstPlaybackUrlRequested.future.timeout(const Duration(seconds: 2));
+      expect(player.currentQualityLabel, 'Hi-Res');
+      adapter.releasePlaybackUrl();
+      await audio.waitForPlaylistLoads(1);
+      await audio.completeSourceLoad(0);
+      await play;
+      expect(player.currentQualityLabel, '标准音质');
+    } finally {
+      player.dispose();
+      await audio.dispose();
+      AudioServiceLoader.setTestOverride(null);
+      api.dio.httpClientAdapter = originalAdapter;
+      uninstallFakeSecureStorage();
+    }
+  });
+
   test('记忆播放关闭清理尚未完成时重新开启，最终保留最后一次设置', () async {
     SharedPreferences.setMockInitialValues({});
     final clearEntered = Completer<void>();

@@ -23,18 +23,49 @@ void main() {
   );
 
   Widget host(PlayerProvider player) {
+    // 滚动归属由宿主持有（真实宿主是 FullPlayer 的 State）。测试里一用例一份，
+    // 随 TearDown 释放，免得 TrackingScrollController 泄漏。
+    final anchor = PlaylistScrollAnchor();
+    addTearDown(anchor.dispose);
     return ChangeNotifierProvider<PlayerProvider>.value(
       value: player,
       child: MaterialApp(
         home: Scaffold(
           body: SizedBox(
             height: 640,
-            child: PlayerPlaylistView(useAmColors: false),
+            child: PlayerPlaylistView(
+              scrollAnchor: anchor,
+              useAmColors: false,
+            ),
           ),
         ),
       ),
     );
   }
+
+  /// 与 [host] 同构，但滚动归属由调用方给定：要看「面板销毁重建后位置还在不在」，
+  /// 就必须让 anchor 活得比面板 State 久——那正是真实宿主 FullPlayer 的做法。
+  Widget hostWith(PlayerProvider player, PlaylistScrollAnchor anchor) =>
+      ChangeNotifierProvider<PlayerProvider>.value(
+        value: player,
+        child: MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              height: 640,
+              child: PlayerPlaylistView(
+                scrollAnchor: anchor,
+                useAmColors: false,
+              ),
+            ),
+          ),
+        ),
+      );
+
+  Widget bareTree(PlayerProvider player) =>
+      ChangeNotifierProvider<PlayerProvider>.value(
+        value: player,
+        child: const MaterialApp(home: Scaffold(body: SizedBox.shrink())),
+      );
 
   void mockConnectivityStream() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -231,6 +262,87 @@ void main() {
       // 删除后退出编辑模式
       expect(find.textContaining('已选'), findsNothing);
       expect(find.text('播放列表'), findsOneWidget);
+    } finally {
+      await disposePlayer(tester, player, audio);
+    }
+  });
+
+  // ── 播放列表记住滚动位置 ────────────────────────────────────────────────
+  //
+  // 面板挂在 PageView(cacheExtent=0) 上，切到歌词/评论页签时**整棵子树被销毁**；
+  // 旧实现有两个问题叠在一起：
+  //   ① ScrollController 是面板 State 内部的 → 重建后新 position 从 0 起步
+  //      （`ScrollController.initialScrollOffset` 是构造期定死的字段）；
+  //   ② initState 无条件「滚到当前播放曲」→ 即便位置带回来了也会被盖掉，
+  //      当前曲靠前时目标还被 clamp 成 0，用户看到的就是「回到顶部」。
+  // 现在：控制器由宿主持有（用 TrackingScrollController，重建时在创建当下就带回
+  // 偏移，不必事后 jumpTo）+ 只有歌变了才定位。
+  testWidgets('面板销毁重建后保持滚动位置；只有切歌才重新定位', (tester) async {
+    final (player, audio) = await createPlayer(tester);
+    final anchor = PlaylistScrollAnchor();
+    addTearDown(anchor.dispose);
+    try {
+      await player.playPlaylist([
+        for (var i = 0; i < 30; i++) song('s$i', 'S$i'),
+      ], 0);
+      await tester.pumpWidget(hostWith(player, anchor));
+      await tester.pumpAndSettle();
+
+      // 用户自己滚到中段（当前曲仍在第 0 首，位置与「当前曲居中」毫无关系）。
+      // 用真实拖拽而不是 jumpTo：要验的就是「手指滚动过的偏移能不能带回来」。
+      await tester.drag(find.byType(Scrollable), const Offset(0, -900));
+      await tester.pumpAndSettle();
+      final scrolled = anchor.controller.offset;
+      expect(
+        scrolled,
+        greaterThan(300),
+        reason: '确实滚离了顶部（当前曲是第 0 首，自动定位的目标恒为 0，'
+            '所以只要还停在这儿就证明偏移带回来了）',
+      );
+
+      // 模拟 PageView 销毁离屏页再重建：面板 State 全新，只有 anchor 活下来。
+      await tester.pumpWidget(bareTree(player));
+      await tester.pump();
+      await tester.pumpWidget(hostWith(player, anchor));
+      await tester.pumpAndSettle();
+      expect(
+        anchor.controller.offset,
+        closeTo(scrolled, 1),
+        reason: '同一首歌内切走再回来，必须停在用户留下的位置（旧实现会被拉回当前曲）',
+      );
+
+      // 换了歌才跟到新曲：第 20 首
+      await player.playPlaylist([
+        for (var i = 0; i < 30; i++) song('s$i', 'S$i'),
+      ], 20);
+      await tester.pumpAndSettle();
+      expect(
+        anchor.controller.offset,
+        greaterThan(1000),
+        reason: '当前曲变了，列表要跟到新曲（Q2=A 的语义）',
+      );
+
+      // 而且要跟**准**：目标行必须在视口里且大致居中。旧实现按写死的 72dp 算行高，
+      // 误差随下标线性累积；真机行高一旦不等于 72（显示大小缩放、编辑模式行内
+      // 差异），第 20 首的落点就不是那一行。现在用实测行高
+      // （(maxScrollExtent + viewport) / itemCount）定位。
+      final rowRect = tester.getRect(find.text('S20'));
+      final paneRect = tester.getRect(find.byType(Scrollable));
+      expect(
+        rowRect.top,
+        greaterThanOrEqualTo(paneRect.top - 1),
+        reason: '目标行必须在视口内（上沿 ${rowRect.top} vs 视口 ${paneRect.top}）',
+      );
+      expect(
+        rowRect.bottom,
+        lessThanOrEqualTo(paneRect.bottom + 1),
+        reason: '目标行必须在视口内（下沿 ${rowRect.bottom} vs 视口 ${paneRect.bottom}）',
+      );
+      expect(
+        (rowRect.center.dy - paneRect.center.dy).abs(),
+        lessThan(paneRect.height * 0.25),
+        reason: '目标行应大致居中（需求写的是「滚动到当前播放的歌曲并居中显示」）',
+      );
     } finally {
       await disposePlayer(tester, player, audio);
     }

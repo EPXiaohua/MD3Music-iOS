@@ -7,12 +7,17 @@ import 'package:chewie/chewie.dart';
 // 刻意引用内部路径：公开 API 拿不到该状态，重复实现计时器会与进度条漂移。
 // ignore: implementation_imports
 import 'package:chewie/src/notifiers/player_notifier.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/remote/tv_menu_key_shortcuts.dart';
+import '../../core/remote/tv_media_key_shortcuts.dart';
+import '../../core/remote/tv_seek_math.dart';
 import '../../core/services/wakelock_service.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/services/pip_service.dart';
@@ -42,6 +47,15 @@ import 'widgets/mv_danmaku_input_bar.dart';
 /// 进入时暂停背景音频播放，退出时恢复（仅当进入前正在播放）。
 /// 加载链：/kmr/audio/mv(album_audio_id) → /video/detail(mvId) → /video/url(hash)。
 enum _MvLoadState { loading, ready, noMv, error }
+
+/// tv: 左右键调进度的目标位置（夹取到 `[0, duration]`）。
+/// 钳制逻辑已上收到 `core/remote/tv_seek_math.dart`（刷刷竖屏流共用同一套），
+/// 这里保留同名转发壳，使既有单测继续钉住本路径。
+Duration mvTvSeekTarget(
+  Duration current,
+  Duration duration,
+  int deltaSeconds,
+) => tvSeekTarget(current, duration, deltaSeconds);
 
 class MvPlayerPage extends StatefulWidget {
   final Song song;
@@ -121,6 +135,20 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   /// 页面按钮组据此与进度条同步显隐。
   final ValueNotifier<bool> _controlsHidden = ValueNotifier<bool>(false);
 
+  /// tv: 全屏模式下右上角按钮组是否已由遥控菜单键唤出（默认收起）。
+  /// 非全屏恒显，此状态只在全屏生效（见 [_buildVideoStack]）。
+  bool _tvButtonsVisible = false;
+
+  /// tv: 全屏视频面的焦点节点（OK=播放/暂停、左右=±10s）。
+  final FocusNode _tvVideoFocus = FocusNode(debugLabel: 'tv/mv-video-surface');
+
+  /// tv: 右上角按钮组的焦点节点 —— 菜单键唤出后焦点自动落到组内第一个
+  /// 可见按钮（弹幕开关），收起时交还视频面。
+  final FocusNode _tvDanmakuBtnFocus = FocusNode(debugLabel: 'tv/mv-btn-danmaku');
+  final FocusNode _tvFullscreenBtnFocus =
+      FocusNode(debugLabel: 'tv/mv-btn-fullscreen');
+  final FocusNode _tvPipBtnFocus = FocusNode(debugLabel: 'tv/mv-btn-pip');
+
   /// 弹幕远端发送在途中：用于禁用发送按钮防连点。
   bool _danmakuSending = false;
 
@@ -196,6 +224,11 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     _isFullscreen.dispose();
     _pipSupported.dispose();
     _controlsHidden.dispose();
+    // tv: 页面持有的焦点节点（子 Focus 已随子树卸载，见 dispose 时序）
+    _tvVideoFocus.dispose();
+    _tvDanmakuBtnFocus.dispose();
+    _tvFullscreenBtnFocus.dispose();
+    _tvPipBtnFocus.dispose();
     _chewieController?.dispose();
     _controller?.dispose();
     // 恢复背景音频（仅当进入前正在播放）
@@ -559,6 +592,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         autoPlay: autoPlay,
         looping: false,
         showControls: true,
+        // TV：画面中央的三个按钮（replay_10 / 播放暂停 / forward_10）一律
+        // 不显示 —— 仅靠这一项只是 opacity 0，按钮仍留在树里且 IconButton
+        // 自带 FocusNode，'不落焦点' 还须排除焦点（见 _buildVideoSurface）。
+        showPlayButton: !kTvBuild,
         showOptions: false,
         // 关闭 Chewie 内置全屏：它会把播放器 push 进**独立路由**，
         // 而弹幕层是页面 Stack 的兄弟节点、不会跟进去 → 全屏看不到弹幕。
@@ -628,6 +665,8 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         autoPlay: wasPlaying,
         looping: false,
         showControls: true,
+        // 同 _initVideoController：TV 隐藏中央三按钮（焦点排除见 _buildVideoSurface）
+        showPlayButton: !kTvBuild,
         showOptions: false,
         // 同 _initVideoController：全屏改由页面自建（弹幕层需在同一棵子树内）
         allowFullScreen: false,
@@ -719,30 +758,41 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     // 页面级全屏：只渲染视频 + 弹幕层（弹幕在同一棵子树内，全屏可见）
     if (_isFullscreen.value) {
       // 全屏时系统返回键**先退出全屏**，而不是直接 pop 掉整个 MV 播放页
-      return PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop) _exitFullscreen(fromBack: true);
-        },
-        child: _buildFullscreenBody(),
+      return _withTvMediaKeys(
+        PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) _exitFullscreen(fromBack: true);
+          },
+          // TV：菜单键唤出/收起右上角按钮组并把焦点自动移过去。
+          // 仅全屏需要 —— 非全屏按钮组恒显（见 _buildVideoStack）。
+          child: kTvBuild
+              ? TvMenuKeyShortcuts(
+                  onMenu: _tvOnMenuKey,
+                  child: _buildFullscreenBody(),
+                )
+              : _buildFullscreenBody(),
+        ),
       );
     }
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          widget.song.displayName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+    return _withTvMediaKeys(
+      Scaffold(
+        appBar: AppBar(
+          title: Text(
+            widget.song.displayName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
         ),
+        body: switch (_loadState) {
+          _MvLoadState.loading => _buildLoading(colorScheme),
+          _MvLoadState.noMv => _buildNoMv(colorScheme, textTheme),
+          _MvLoadState.error => _buildError(colorScheme, textTheme),
+          _MvLoadState.ready => _buildReady(colorScheme, textTheme),
+        },
       ),
-      body: switch (_loadState) {
-        _MvLoadState.loading => _buildLoading(colorScheme),
-        _MvLoadState.noMv => _buildNoMv(colorScheme, textTheme),
-        _MvLoadState.error => _buildError(colorScheme, textTheme),
-        _MvLoadState.ready => _buildReady(colorScheme, textTheme),
-      },
     );
   }
 
@@ -882,9 +932,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          _chewieController != null
-              ? Chewie(controller: _chewieController!)
-              : const Center(child: M3ECircularProgressIndicator(color: Colors.white)),
+          _buildVideoSurface(),
           // 弹幕层：位于 Chewie 之上、手势透传（IgnorePointer 在层内）。
           // key 绑定 controller 实例 —— 切换清晰度会重建控制器，必须随之重建，
           // 否则 Ticker 会继续读已 dispose 的控制器。
@@ -911,6 +959,30 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
                   _overlayMountedLogged = true;
                   // 一次性取证日志：确认按钮组已挂载（与控件显隐桥接联动）
                   debugPrint('[MvDanmaku] 浮层按钮组已挂载（与进度条同步显隐）');
+                }
+                // TV：非全屏恒显；全屏由菜单键唤出（[_tvButtonsVisible]），
+                // 未唤出时整组**不挂载** —— 只做 opacity 的话不可见停点会留在
+                // 焦点遍历里（遥控会落到看不见的按钮上）。
+                if (kTvBuild) {
+                  if (_isFullscreen.value && !_tvButtonsVisible) {
+                    return const SizedBox.shrink();
+                  }
+                  return Positioned(
+                    top: 12,
+                    right: 12,
+                    child: Row(
+                      children: [
+                        _buildDanmakuToggleButton(),
+                        const SizedBox(width: 8),
+                        _buildFullscreenButton(fullscreen: _isFullscreen.value),
+                        // 画中画与全屏互斥，全屏时收起点
+                        if (!_isFullscreen.value && _pipSupported.value) ...[
+                          const SizedBox(width: 8),
+                          _buildPipButton(),
+                        ],
+                      ],
+                    ),
+                  );
                 }
                 final hidden = _controlsHidden.value;
                 return Positioned(
@@ -944,6 +1016,31 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     );
   }
 
+  /// Chewie 视频面（含 TV 焦点包装）。
+  ///
+  /// TV 上中央三按钮已由 `showPlayButton: false` 隐藏，但它们仍以 opacity 0
+  /// 留在树里、且 `IconButton` 自带 FocusNode —— 「不显示**也不落焦点**」必须
+  /// 再把焦点排掉：
+  /// - 非全屏：`ExcludeFocus` 纯排除 —— 视频面本身不是焦点停点（需求：非全屏
+  ///   只靠右上角按钮导航，OK/左右键仅全屏生效）；
+  /// - 全屏：包 `DpadFocusable`（`excludeChildFocus` 默认 true，一并排除
+  ///   Chewie 内部焦点），作为全屏唯一停点接 OK=播放/暂停、左右=±10s。
+  Widget _buildVideoSurface() {
+    final Widget surface = _chewieController != null
+        ? Chewie(controller: _chewieController!)
+        : const Center(child: M3ECircularProgressIndicator(color: Colors.white));
+    if (!kTvBuild) return surface;
+    if (!_isFullscreen.value) return ExcludeFocus(child: surface);
+    return DpadFocusable(
+      debugLabel: 'tv/mv-video-surface',
+      focusNode: _tvVideoFocus,
+      autofocus: true,
+      onSelect: _tvTogglePlayPause,
+      onDirection: _tvVideoDirection,
+      child: surface,
+    );
+  }
+
   /// 把 Chewie 内部的控件显隐状态桥接到 [_controlsHidden]。
   ///
   /// 为什么需要桥接：显隐由 Chewie 内部的 `PlayerNotifier.hideStuff` 驱动，该
@@ -970,20 +1067,49 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     );
   }
 
+  /// tv: 右上角浮层按钮的焦点包装。动作接在 `onSelect`（DpadFocusable 是
+  /// 唯一停点），Material+IconButton 保持纯视觉；`excludeChildFocus` 保持
+  /// 默认 true，子 IconButton 不会多出一个停点。
+  Widget _tvOverlayButton({
+    required String debugLabel,
+    required FocusNode focusNode,
+    required VoidCallback onSelect,
+    required Widget child,
+    bool autofocus = false,
+  }) {
+    if (!kTvBuild) return child;
+    return DpadFocusable(
+      debugLabel: debugLabel,
+      focusNode: focusNode,
+      autofocus: autofocus,
+      onSelect: onSelect,
+      onFocusChange: _tvOnButtonFocusChange,
+      child: child,
+    );
+  }
+
   /// 全屏按钮：进入 / 退出页面级自建全屏。
   Widget _buildFullscreenButton({required bool fullscreen}) {
-    return Material(
-      color: Colors.black.withValues(alpha: 0.6),
-      shape: const CircleBorder(),
-      clipBehavior: Clip.antiAlias,
-      child: IconButton(
-        icon: Icon(
-          fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-          color: Colors.white,
-          size: 20,
+    return _tvOverlayButton(
+      debugLabel: 'tv/mv-btn-fullscreen',
+      focusNode: _tvFullscreenBtnFocus,
+      onSelect: _toggleFullscreen,
+      // 非全屏初始焦点落在「全屏」（主动作；一屏一个 autofocus）。
+      // 全屏下同组按钮由菜单键唤出时用显式 requestFocus 定位，不走 autofocus。
+      autofocus: !fullscreen,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.6),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: IconButton(
+          icon: Icon(
+            fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+            color: Colors.white,
+            size: 20,
+          ),
+          tooltip: fullscreen ? '退出全屏' : '全屏',
+          onPressed: _toggleFullscreen,
         ),
-        tooltip: fullscreen ? '退出全屏' : '全屏',
-        onPressed: _toggleFullscreen,
       ),
     );
   }
@@ -1026,6 +1152,14 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     kPlayerLandscapeImmersiveActive.value = true;
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     debugPrint('[MvDanmaku] 全屏=true');
+    // tv: 全屏后焦点必须落在视频面（唯一停点，OK/左右键才有去处）。
+    // DpadFocusable 已有 autofocus，这里补一发帧末兜底（重建与 autofocus
+    // 存在竞态时以显式请求为准）。
+    if (kTvBuild) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _isFullscreen.value) _tvVideoFocus.requestFocus();
+      });
+    }
   }
 
   /// 退出全屏：恢复旋转、沉浸标志与系统栏。
@@ -1033,7 +1167,11 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   /// [fromBack] 仅用于日志区分入口（系统返回键 / 全屏按钮）。
   void _exitFullscreen({required bool fromBack}) {
     if (!_isFullscreen.value) return;
-    setState(() => _isFullscreen.value = false);
+    setState(() {
+      _isFullscreen.value = false;
+      // tv: 退出全屏时按钮组复位（下次进全屏重新由菜单键唤出）
+      _tvButtonsVisible = false;
+    });
     // 恢复自由旋转：项目全局未锁定方向（全仓无其它 setPreferredOrientations），
     // 因此恢复为「全部方向」即回到进入前的状态
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
@@ -1041,6 +1179,145 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     // 项目统一的退出恢复：先 manual 显式 show 再交给 _SystemUiUpdater 设 edgeToEdge
     restoreSystemUi();
     debugPrint('[MvDanmaku] 全屏=false${fromBack ? '（返回键）' : ''}');
+    // tv: 退出全屏后焦点的落点 —— 非全屏按钮组在重建，落在「全屏」按钮
+    // （同 _buildFullscreenButton 的 autofocus，此处显式兜底保证时序）。
+    if (kTvBuild) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_isFullscreen.value) {
+          _tvFullscreenBtnFocus.requestFocus();
+        }
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // tv: 遥控键位（仅 kTvBuild 生效）
+  // ---------------------------------------------------------------------
+
+  /// tv: 页级媒体键拦截。MV 打开期间后台音频已被暂停，媒体键若落到 app.dart
+  /// 根部兜底会误唤醒/误切后台音频；播放/暂停改为控制当前视频，切歌键消费为
+  /// 空操作（MV 单视频无切歌语义）。带 `[MvTvKey]` 日志，真机上用于判定按键
+  /// 被哪一层消费（AGENTS §0.1）。注意：若媒体键在原生层就被音频 media3
+  /// 会话消费，事件到不了 Flutter，本条不覆盖（真机日志可判定）。
+  Widget _withTvMediaKeys(Widget child) {
+    if (!kTvBuild) return child;
+    return TvMediaKeyShortcuts(
+      onPlayPause: () {
+        debugPrint('[MvTvKey] mediaPlayPause');
+        _tvTogglePlayPause();
+      },
+      onPlay: () {
+        debugPrint('[MvTvKey] mediaPlay');
+        _tvVideoPlay();
+      },
+      onPause: () {
+        debugPrint('[MvTvKey] mediaPause');
+        _tvVideoPause();
+      },
+      // MV 是单视频，没有切歌语义：仍要**登记绑定**把它消费掉，
+      // 否则按键会穿透到 app.dart 的根部兜底去切后台音频。
+      onNext: () => debugPrint('[MvTvKey] mediaTrackNext（MV 单视频，消费不处理）'),
+      onPrevious: () =>
+          debugPrint('[MvTvKey] mediaTrackPrevious（MV 单视频，消费不处理）'),
+      child: child,
+    );
+  }
+
+  /// tv: OK 键动作（镜像 chewie `_playPause`：已播完则从头重播）。
+  void _tvTogglePlayPause() {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (controller.value.isPlaying) {
+      controller.pause();
+    } else {
+      _tvVideoPlay();
+    }
+  }
+
+  /// tv: 播放（已播完则先回起点，避免停在结尾）。
+  void _tvVideoPlay() {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    final value = controller.value;
+    if (value.isPlaying) return;
+    final finished =
+        value.position >= value.duration && value.duration.inSeconds > 0;
+    if (finished) {
+      controller.seekTo(Duration.zero);
+    }
+    controller.play();
+  }
+
+  /// tv: 暂停（已暂停时为空操作，媒体键 mediaPause 幂等）。
+  void _tvVideoPause() {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (controller.value.isPlaying) {
+      controller.pause();
+    }
+  }
+
+  /// tv: 全屏视频面方向键 —— 左右调进度（返回 true 消费，KeyDown/KeyRepeat
+  /// 都会送达，按住天然连发）；上下返回 false 放行给 dpad 遍历。
+  bool _tvVideoDirection(TraversalDirection direction) {
+    switch (direction) {
+      case TraversalDirection.left:
+        _tvSeekBy(-10);
+        return true;
+      case TraversalDirection.right:
+        _tvSeekBy(10);
+        return true;
+      case TraversalDirection.up:
+      case TraversalDirection.down:
+        return false;
+    }
+  }
+
+  /// tv: 左右键 ±N 秒（档位对齐 chewie 中央按钮的 10 秒）。
+  void _tvSeekBy(int seconds) {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    final value = controller.value;
+    final target = mvTvSeekTarget(value.position, value.duration, seconds);
+    controller.seekTo(target);
+    debugPrint(
+      '[MvTvKey] seek ${seconds > 0 ? '+' : ''}${seconds}s → ${target.inSeconds}s',
+    );
+  }
+
+  /// tv: 全屏菜单键 —— 唤出/收起右上角按钮组，并把焦点移过去/移回视频面。
+  /// 非全屏按钮组恒显，无需菜单键（不处理，按键放行）。
+  void _tvOnMenuKey() {
+    if (!_isFullscreen.value) return;
+    final next = !_tvButtonsVisible;
+    debugPrint('[MvTvKey] menu → 按钮组${next ? '唤出' : '收起'}');
+    setState(() => _tvButtonsVisible = next);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (next) {
+        _tvDanmakuBtnFocus.requestFocus();
+      } else {
+        _tvVideoFocus.requestFocus();
+      }
+    });
+  }
+
+  /// tv: 按钮组焦点逸出时收起按钮组并把焦点交还视频面 —— 全屏下按钮组的
+  /// 可见性必须闭合：要么焦点在视频面（按钮收起）、要么在按钮组（按钮可见），
+  /// 避免焦点离开后残留一组可点按钮。
+  void _tvOnButtonFocusChange(bool focused) {
+    if (focused || !_isFullscreen.value || !_tvButtonsVisible) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_isFullscreen.value || !_tvButtonsVisible) return;
+      final primary = FocusManager.instance.primaryFocus;
+      if (primary == _tvDanmakuBtnFocus ||
+          primary == _tvFullscreenBtnFocus ||
+          primary == _tvPipBtnFocus) {
+        return; // 焦点仍在组内（按钮间移动），保持唤出
+      }
+      setState(() => _tvButtonsVisible = false);
+      _tvVideoFocus.requestFocus();
+    });
   }
 
   /// 页面级全屏布局：黑底 + 居中视频（含弹幕层），系统栏已隐藏。
@@ -1082,36 +1359,46 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   /// 与画中画按钮同样式（半透明圆底、白色图标），位于视频右上角。
   Widget _buildDanmakuToggleButton() {
     final on = _danmakuEnabled.value;
-    return Material(
-      color: Colors.black.withValues(alpha: 0.6),
-      shape: const CircleBorder(),
-      clipBehavior: Clip.antiAlias,
-      child: IconButton(
-        icon: Icon(
-          on ? Icons.subtitles : Icons.subtitles_off_outlined,
-          color: Colors.white,
-          size: 20,
+    return _tvOverlayButton(
+      debugLabel: 'tv/mv-btn-danmaku',
+      focusNode: _tvDanmakuBtnFocus,
+      onSelect: _toggleDanmaku,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.6),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: IconButton(
+          icon: Icon(
+            on ? Icons.subtitles : Icons.subtitles_off_outlined,
+            color: Colors.white,
+            size: 20,
+          ),
+          tooltip: on ? '关闭弹幕' : '开启弹幕',
+          onPressed: _toggleDanmaku,
         ),
-        tooltip: on ? '关闭弹幕' : '开启弹幕',
-        onPressed: _toggleDanmaku,
       ),
     );
   }
 
   /// 画中画按钮：半透明圆形图标，点击进入画中画。
   Widget _buildPipButton() {
-    return Material(
-      color: Colors.black.withValues(alpha: 0.6),
-      shape: const CircleBorder(),
-      clipBehavior: Clip.antiAlias,
-      child: IconButton(
-        icon: const Icon(
-          Icons.picture_in_picture_alt,
-          color: Colors.white,
-          size: 20,
+    return _tvOverlayButton(
+      debugLabel: 'tv/mv-btn-pip',
+      focusNode: _tvPipBtnFocus,
+      onSelect: _enterPip,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.6),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: IconButton(
+          icon: const Icon(
+            Icons.picture_in_picture_alt,
+            color: Colors.white,
+            size: 20,
+          ),
+          tooltip: '画中画',
+          onPressed: _enterPip,
         ),
-        tooltip: '画中画',
-        onPressed: _enterPip,
       ),
     );
   }
@@ -1136,6 +1423,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
               showM3EModalBottomSheet(
                 context: context,
                 isScrollControlled: true,
+                // 实色背景：与播放页投屏弹层保持一致（全局 M3E 主题默认 0.97
+                // alpha 会让 MV 画面透出，压在视频上不易辨认）。
+                backgroundColor: Theme.of(context).colorScheme.surfaceContainerLow,
                 builder: (_) => DlnaCastSheet(
                   mvUrl: _currentVideoUrl,
                   mvTitle: widget.song.displayName,

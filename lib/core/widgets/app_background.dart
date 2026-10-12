@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../build_flags.dart';
 import '../../providers/theme_provider.dart';
 
 /// 内置保底壁纸：用户未选择自定义背景图（或清除后）时作为默认背景。
@@ -69,6 +70,16 @@ class AppBackground extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tp = context.watch<ThemeProvider>();
+    // 判定用**用户开关**本身，不加"图片文件必须存在"的条件。
+    //
+    // 原因：`backgroundImageProvider` 在路径为空/失效时会**回落到内置默认壁纸**，
+    // 即"开关开着但用户还没选图"是一个完全正常的状态，此时就该显示默认壁纸。
+    //
+    // ⚠️ 2026-10-11 曾在这里改用 `isBackgroundImageEffective`（额外要求文件存在），
+    // 想解决"壁纸未生效时页签栏色带不一致"。**方向错了**：它把兜底壁纸在数据层
+    // 整个废掉 —— 开关开 + 无图 ⇒ 桌面与Android 两侧都不再渲染任何壁纸层，
+    // 页面回到不透明纯色。色带问题应在**渲染层**解决（各页顶部区域与主体
+    // 用同一 provider / 同一 opacity），不该拿"不渲染"当解法。
     if (!tp.useBackgroundImage) return const SizedBox.shrink();
     final colorScheme = Theme.of(context).colorScheme;
     // 解码宽度按屏幕物理宽度限制：模糊背景无需超高分辨率，避免高分辨率
@@ -95,8 +106,8 @@ class AppBackground extends StatelessWidget {
             opacity: tp.backgroundOpacity,
             child: ImageFiltered(
               imageFilter: ImageFilter.blur(
-                sigmaX: tp.backgroundBlur,
-                sigmaY: tp.backgroundBlur,
+                sigmaX: tvBlurSigma(tp.backgroundBlur),
+                sigmaY: tvBlurSigma(tp.backgroundBlur),
               ),
               child: image,
             ),

@@ -231,6 +231,9 @@ pub fn handle_cellphone(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRe
 }
 
 /// login_device.js → /login/device（设备列表）。
+/// 响应顶层追加 `local_device`（本机设备标识，来自 device_info.json），
+/// 供客户端把列表项的 mid/dfid 与本机比对以标记「本机」——上游响应不含该信息，
+/// Dart 侧自己缓存的 dfid 可能过期，误判会把本机标成可踢设备。
 pub fn handle_device(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
     let clienttime_ms = now_ms();
     let token = {
@@ -262,17 +265,22 @@ pub fn handle_device(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRespo
         "pk": rsa_pk(&json!({ "clienttime_ms": clienttime_ms, "key": key })),
         "params": encrypt.0,
     });
-    forward(
+    let mut res = forward(
         q, ctx, "POST", "/v2/get_dev", Some("https://userinfoservice.kugou.com"),
         None, Some(data_map), "android", &[], false, false,
-    )
+    )?;
+    let mut body = res.body.to_json();
+    body["local_device"] = crate::device::DeviceConfig::instance().get_device_info();
+    res.body = BodyValue::Json(body);
+    Ok(res)
 }
 
-/// login_device_kick.js → /login/device/kick（登出选定设备）。
-/// 注：JS 原版引用未定义变量（calculateMid/uuid/dfid/userid/guid），这里按合理语义实现。
-pub fn handle_device_kick(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
-    let clienttime_ms = now_ms();
-    let token = {
+/// login_device_kick.js 的上游参数构建（纯函数，便于单测）。
+/// 上游契约：token = 'h5' + RSA 无填充('moc.uoguk.59::' + token) hex 大写；
+/// 被踢设备的 t_mid/t/t_appid/t_clientver 四元组由调用方从设备列表项（mid/t/appid/ver）
+/// 经 query 传入，缺失时回退本机值；签名交由管线按 encrypt_type="web" 补（web 版盐）。
+fn build_kick_params(q: &Value) -> Value {
+    let raw_token = {
         let p = q_str(q, "token", "");
         if !p.is_empty() {
             p
@@ -280,20 +288,24 @@ pub fn handle_device_kick(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Module
             c_str(q, "token")
         }
     };
-    let encrypt = aes_hex(
-        &crate::util::json_stringify(&json!({ "token": token })),
-        None,
-        None,
+    let token = format!(
+        "h5{}",
+        crypto_rsa_encrypt(&format!("moc.uoguk.59::{}", raw_token), None).to_uppercase()
     );
     let guid = c_str(q, "KUGOU_API_GUID");
     let mid = {
         let p = q_str(q, "mid", "");
         if !p.is_empty() {
             p
-        } else if !guid.is_empty() {
-            calculate_mid(&guid)
         } else {
-            "".to_string()
+            let cm = c_str(q, "KUGOU_API_MID");
+            if !cm.is_empty() {
+                cm
+            } else if !guid.is_empty() {
+                calculate_mid(&guid)
+            } else {
+                String::new()
+            }
         }
     };
     let userid = {
@@ -304,26 +316,73 @@ pub fn handle_device_kick(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Module
             c_num(q, "userid", 0)
         }
     };
-    let date_time = now_ms();
-    let data_map = json!({
-        "appid": 3116,
-        "clientver": 11440,
-        "clienttime": clienttime_ms,
-        "mid": mid,
-        "uuid": cookie_or_param_str(q, "uuid", "-"),
-        "dfid": cookie_or_param_str(q, "dfid", "-"),
-        "plat": 1,
-        "userid": userid,
-        "token": encrypt.0,
-        "t_mid": guid,
-        "t": date_time,
-        "t_appid": 3116,
-        "t_clientver": 10597,
-        "srcappid": 2919,
-        "signature": crate::helper::sign_params_key(&date_time.to_string(), "", ""),
-    });
+    let clienttime_ms = now_ms();
+    let t_mid = {
+        let v = q_str(q, "t_mid", "");
+        if v.is_empty() {
+            guid.clone()
+        } else {
+            v
+        }
+    };
+    let t = {
+        let v = q_str(q, "t", "");
+        if v.is_empty() {
+            clienttime_ms.to_string()
+        } else {
+            v
+        }
+    };
+    let t_appid = {
+        let v = q_str(q, "t_appid", "");
+        if v.is_empty() {
+            "3116".to_string()
+        } else {
+            v
+        }
+    };
+    let t_clientver = {
+        let v = q_str(q, "t_clientver", "");
+        if v.is_empty() {
+            "10597".to_string()
+        } else {
+            v
+        }
+    };
+    let mut data_map = Map::new();
+    data_map.insert("appid".to_string(), json!(3116));
+    data_map.insert("clientver".to_string(), json!(11440));
+    data_map.insert("clienttime".to_string(), json!(clienttime_ms));
+    if !mid.is_empty() {
+        data_map.insert("mid".to_string(), json!(mid));
+    }
+    data_map.insert(
+        "uuid".to_string(),
+        json!(cookie_or_param_str(q, "uuid", "-")),
+    );
+    data_map.insert(
+        "dfid".to_string(),
+        json!(cookie_or_param_str(q, "dfid", "-")),
+    );
+    data_map.insert("plat".to_string(), json!(1));
+    data_map.insert("userid".to_string(), json!(userid));
+    data_map.insert("token".to_string(), json!(token));
+    data_map.insert("srcappid".to_string(), json!(2919));
+    data_map.insert("t_mid".to_string(), json!(t_mid));
+    data_map.insert("t".to_string(), json!(t));
+    data_map.insert("t_appid".to_string(), json!(t_appid));
+    data_map.insert("t_clientver".to_string(), json!(t_clientver));
+    Value::Object(data_map)
+}
+
+/// login_device_kick.js → /login/device/kick（登出选定设备）。
+/// 对齐上游 KuGouMusicApi/module/login_device_kick.js：token 用 RSA 无填充加密
+/// （'moc.uoguk.59::' 前缀 + 128 字节右补零，hex 大写，'h5' 前缀），web 版签名。
+/// （JS 原版引用未定义变量 calculateMid/uuid/dfid/userid/guid，这里按合理语义补齐。）
+pub fn handle_device_kick(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+    let data_map = build_kick_params(q);
     forward(
-        q, ctx, "GET", "/loginservice/v1/dev_logout", None, None, Some(data_map), "android",
+        q, ctx, "GET", "/loginservice/v1/dev_logout", None, Some(data_map), None, "web",
         &[("Host", "gateway.kugou.com")], false, false,
     )
 }
@@ -783,4 +842,60 @@ fn qr_png_data_url(url: &str) -> Result<String, String> {
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     Ok(format!("data:image/png;base64,{}", base64_encode(&buf)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上游契约回归：四元组透传 + h5 RSA token 格式（'h5' + 1024 位模长 256 hex 大写）。
+    /// 回归背景：旧实现用 AES 加密 token 且把四元组硬编码成本机值，
+    /// 上游匹配不到目标设备，kick 永远踢不掉选中的那台。
+    #[test]
+    fn kick_params_pass_through_target_quadruple() {
+        let q = json!({
+            "cookie": { "token": "tok123", "userid": "42", "KUGOU_API_GUID": "guid-abc" },
+            "t_mid": "TARGET_MID",
+            "t": "1728000000000",
+            "t_appid": "3116",
+            "t_clientver": "10597",
+        });
+        let p = build_kick_params(&q);
+        assert_eq!(p["t_mid"], json!("TARGET_MID"));
+        assert_eq!(p["t"], json!("1728000000000"));
+        assert_eq!(p["t_appid"], json!("3116"));
+        assert_eq!(p["t_clientver"], json!("10597"));
+        assert_eq!(p["userid"], json!(42));
+        let token = p["token"].as_str().unwrap();
+        assert!(token.starts_with("h5"), "token 必须带 h5 前缀: {token}");
+        let hex_part = &token[2..];
+        assert_eq!(hex_part.len(), 256, "RSA 无填充 1024 位模长应为 256 hex");
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+            "hex 必须全大写"
+        );
+        // 签名由管线按 encrypt_type="web" 补，构建函数不应预置
+        assert!(p.get("signature").is_none());
+        // web 签名对完整参数集生效（与 JS signatureWebParams(dataMap) 一致），
+        // 这里仅核对管线签名输入的确定性：同一 q 两次构建除 clienttime 外不变。
+        let p2 = build_kick_params(&q);
+        assert_eq!(p["token"], p2["token"], "RSA 无填充是确定性的");
+        assert_eq!(p["t_mid"], p2["t_mid"]);
+    }
+
+    /// 四元组缺失时回退本机 guid 派生值（保持旧调用方式可用）。
+    #[test]
+    fn kick_params_fallback_to_local_identity() {
+        let q = json!({
+            "cookie": { "token": "tok123", "KUGOU_API_GUID": "guid-abc" },
+        });
+        let p = build_kick_params(&q);
+        // t_mid 兜底为本机 guid 原值（与旧实现一致）；mid 才是 guid 的 calculate_mid 派生
+        assert_eq!(p["t_mid"], json!("guid-abc"));
+        assert_eq!(p["mid"], json!(calculate_mid("guid-abc")));
+        assert_eq!(p["t_appid"], json!("3116"));
+        assert_eq!(p["t_clientver"], json!("10597"));
+        assert_eq!(p["dfid"], json!("-"));
+        assert_eq!(p["uuid"], json!("-"));
+    }
 }

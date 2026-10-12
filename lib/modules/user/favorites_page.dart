@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart' hide M3EPullToRefreshIndicator;
 import '../../widgets/m3e_pull_to_refresh_fixed.dart';
@@ -8,11 +9,14 @@ import '../../widgets/md3_pull_to_refresh.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/layout/adaptive_content_grid.dart';
 import '../../core/layout/adaptive_navigator.dart';
 import '../../core/layout/page_title_alignment.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/tab_snap_physics.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
 import '../../data/repositories/settings_repository.dart';
 import '../../providers/favorites_provider.dart';
@@ -20,6 +24,7 @@ import '../../providers/player_provider.dart';
 import '../../providers/playlist_collection_notifier.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../artist/artist_detail_page.dart';
 import '../playlist/playlist_page.dart';
 import '../playlist/playlist_songs_loader.dart';
@@ -749,6 +754,7 @@ class _FavoritesPageState extends State<FavoritesPage>
         title: const Text('新建歌单'),
         content: TextField(
           controller: controller,
+          contextMenuBuilder: buildAppTextContextMenu,
           autofocus: true,
           decoration: const InputDecoration(
             hintText: '输入歌单名称',
@@ -999,6 +1005,7 @@ class _FavoritesPageState extends State<FavoritesPage>
             Expanded(
               child: TabBarView(
                 controller: _tabController,
+                physics: const TabSnapPhysics(),
                 children: [
                   _buildPlaylistsTab(),
                   _buildAlbumsTab(),
@@ -1198,6 +1205,12 @@ class _FavoritesPageState extends State<FavoritesPage>
       memCacheWidth: 156,
       memCacheHeight: 156,
       fit: BoxFit.cover,
+      // 这份封面会被歌单连贯过渡的飞行层拿去画（`PlaylistCoverHero` 的来源端内容）：
+      // OctoImage 默认「图片淡入 500ms + 占位淡出 1s」，飞行层每次都是新建元素，
+      // 只要不是同帧同步命中缓存就会带着透明度爬坡 → 飞行途中「暗一下」。
+      // 共享元素过渡本身就是动画，这里不再叠加渐变。
+      fadeInDuration: Duration.zero,
+      fadeOutDuration: Duration.zero,
       placeholder: (_, _) => placeholder,
       errorWidget: (_, _, _) => placeholder,
     );
@@ -1241,7 +1254,13 @@ class _FavoritesPageState extends State<FavoritesPage>
         child: Stack(
           fit: StackFit.expand,
           children: [
-            cover,
+            PlaylistCoverHero(
+              tag: playlistCoverHeroTag(
+                playlist.globalCollectionId ?? playlist.id,
+              ),
+              radius: AppRadius.smAll,
+              child: cover,
+            ),
             // 右下角一键播放小三角：提示「点击封面即可从头播放」。
             // 无底色，仅保留白色三角；叠一层轻微阴影保证在浅色封面上可辨识。
             // 加载中（进度环覆盖）或管理/排序模式（封面点击被劫持）时隐藏。
@@ -1297,38 +1316,41 @@ class _FavoritesPageState extends State<FavoritesPage>
         ? _reorderingGroup == 1
         : _reorderingGroup == 2;
 
-    return InkWell(
-        onTap: reordering
-            ? null
-            : _isManaging
-            ? () {
-                setState(() {
-                  if (isSelected) {
-                    _selectedIndices.remove(index);
-                  } else {
-                    _selectedIndices.add(index);
-                  }
-                });
+    final VoidCallback? tapAction = reordering
+        ? null
+        : _isManaging
+        ? () {
+            setState(() {
+              if (isSelected) {
+                _selectedIndices.remove(index);
+              } else {
+                _selectedIndices.add(index);
               }
-            : () async {
-                await _recordPlaylistAccess(playlist);
-                if (!mounted) return;
-                AdaptiveNav.openDetail(
-                  context,
-                  (_) => PlaylistPage(
-                    playlist: playlist.toPlaylist(),
-                    isInMyFavorites: true,
-                    isUserCreated: _isCreated(playlist),
-                    isDefaultFavorite: playlist.name == '我喜欢',
-                  ),
-                );
-              },
-        onLongPress: reordering || _isManaging
-            ? null
-            : () {
-                _enterManageMode(0);
-                setState(() => _selectedIndices.add(index));
-              },
+            });
+          }
+        : () async {
+            await _recordPlaylistAccess(playlist);
+            if (!mounted) return;
+            AdaptiveNav.openDetail(
+              context,
+              (_) => PlaylistPage(
+                playlist: playlist.toPlaylist(),
+                isInMyFavorites: true,
+                isUserCreated: _isCreated(playlist),
+                isDefaultFavorite: playlist.name == '我喜欢',
+              ),
+            );
+          };
+    final VoidCallback? longPressAction = reordering || _isManaging
+        ? null
+        : () {
+            _enterManageMode(0);
+            setState(() => _selectedIndices.add(index));
+          };
+
+    Widget content = InkWell(
+        onTap: tapAction,
+        onLongPress: longPressAction,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
           color: isSelected
@@ -1382,6 +1404,19 @@ class _FavoritesPageState extends State<FavoritesPage>
           ),
         ),
       );
+
+    // tv: TV 构建下歌单卡单停点（DpadFocusable 默认 excludeChildFocus，
+    // 内层 InkWell 不再产生第二个停点）；OK=打开/切换选中，OK 长按=进管理模式并选中。
+    // 排序模式（tapAction 为 null）时对遍历不可用，与触屏禁用语义一致。
+    if (kTvBuild) {
+      content = DpadFocusable(
+        onSelect: tapAction,
+        onLongSelect: longPressAction,
+        enabled: tapAction != null,
+        child: content,
+      );
+    }
+    return content;
   }
 
   // ==================== 专辑Tab ====================
@@ -1496,11 +1531,12 @@ class _FavoritesPageState extends State<FavoritesPage>
                   size: 22,
                 ),
               ),
-            ClipRRect(
-              borderRadius: AppRadius.smAll,
-              child: SizedBox(
-                width: 52,
-                height: 52,
+            SizedBox(
+              width: 52,
+              height: 52,
+              child: PlaylistCoverHero(
+                tag: playlistCoverHeroTag(album.globalCollectionId ?? album.id),
+                radius: AppRadius.smAll,
                 child: album.coverUrl != null
                     ? CachedNetworkImage(
                         imageUrl: album.coverUrl!,

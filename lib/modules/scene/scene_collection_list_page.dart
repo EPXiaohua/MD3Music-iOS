@@ -1,3 +1,4 @@
+import '../../core/layout/adaptive_navigator.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
@@ -5,8 +6,10 @@ import '../../widgets/md3_pull_to_refresh.dart';
 
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../widgets/pinchable_grid_view.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
+import '../../widgets/playlist_cover_hero.dart';
 import '../player/secondary_mini_player.dart';
 import '../playlist/playlist_page.dart';
 
@@ -151,7 +154,8 @@ class _SceneCollectionListPageState extends State<SceneCollectionListPage> {
                               child: SizedBox(
                                 width: 24,
                                 height: 24,
-                                child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2),
+                                child: M3ECircularProgressIndicator(size: 24, strokeWidth: 2,
+                              ),
                               ),
                             ),
                           )
@@ -160,12 +164,13 @@ class _SceneCollectionListPageState extends State<SceneCollectionListPage> {
                       final brief = _lists[i];
                       return _CollectionCard(
                         brief: brief,
+                        heroTag: playlistCoverHeroTag(
+                          brief.globalCollectionId ?? brief.id,
+                        ),
                         onTap: () {
                           final playlist = brief.toPlaylist();
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => PlaylistPage(playlist: playlist),
-                            ),
+                          AdaptiveNav.openDetail(context,
+                          (_) => PlaylistPage(playlist: playlist),
                           );
                         },
                       );
@@ -204,7 +209,10 @@ class _CollectionCard extends StatelessWidget {
   final KugouPlaylistBrief brief;
   final VoidCallback? onTap;
 
-  const _CollectionCard({required this.brief, this.onTap});
+  /// 非空时封面参与歌单封面连贯过渡；tag 口径见 playlistCoverHeroTag。
+  final String? heroTag;
+
+  const _CollectionCard({required this.brief, this.onTap, this.heroTag});
 
   /// 无封面/加载失败占位：透明背景 + 类型图标，避免大块纯色矩形
   Widget _placeholder(ColorScheme cs) {
@@ -213,6 +221,25 @@ class _CollectionCard extends StatelessWidget {
       child: Center(
         child: Icon(Icons.queue_music_outlined, color: cs.onSurfaceVariant),
       ),
+    );
+  }
+
+  Widget _coverImage(ColorScheme cs) {
+    final Widget image = brief.coverUrl != null
+        ? CachedNetworkImage(
+            imageUrl: brief.coverUrl!,
+            memCacheWidth: 540,
+            memCacheHeight: 540,
+            fit: BoxFit.cover,
+            errorWidget: (_, _, _) => _placeholder(cs),
+          )
+        : _placeholder(cs);
+    if (heroTag == null) return image;
+    // 卡片外层 ClipRRect(16) 圆整卡四角，封面区只占上部——可见圆角仅上两角。
+    return PlaylistCoverHero(
+      tag: heroTag!,
+      radius: const BorderRadius.vertical(top: Radius.circular(AppRadius.lg)),
+      child: image,
     );
   }
 
@@ -231,15 +258,7 @@ class _CollectionCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Expanded(
-                child: brief.coverUrl != null
-                    ? CachedNetworkImage(
-                        imageUrl: brief.coverUrl!,
-                        memCacheWidth: 540,
-                        memCacheHeight: 540,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, _, _) => _placeholder(cs),
-                      )
-                    : _placeholder(cs),
+                child: _coverImage(cs),
               ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),

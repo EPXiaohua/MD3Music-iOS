@@ -23,7 +23,9 @@ import 'package:flutter/scheduler.dart';
 import '../../core/utils/app_haptics.dart';
 import 'package:flutter/widgets.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/services/player_frame_driver.dart';
+import '../../core/utils/lyric_wrap_plan.dart';
 import 'controllers/lyric_scroll_controller.dart';
 import 'animation/spring.dart';
 import 'layout/duet_layout.dart';
@@ -34,6 +36,14 @@ import 'renderers/emphasize_effect.dart';
 import 'renderers/interlude_dots.dart';
 import 'renderers/line_renderer.dart';
 import 'renderers/word_renderer.dart';
+
+/// 行形变 scale 的可读下限，保证 `fontSize × scale` 不跌破字重对应的字号下限。
+double _minLegibleLineScale(double fontSize) {
+  // 传 0 即取该字重的下限本身（fontSize 已被钳过，再钳会原样返回）
+  final floor = LyricLayout.clampReadableFontSize(0);
+  if (fontSize <= 0 || floor >= fontSize) return 1.0;
+  return floor / fontSize;
+}
 
 /// Apple Music 风格歌词主组件。
 ///
@@ -351,6 +361,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   @visibleForTesting
   double auxSubHeightForTest(int i) => _auxSubHeightOf(i);
 
+  /// 第 i 行当前的形变 scale(与 painter `perLineScales` 同口径)。仅测试用:
+  /// 验证 tick 窗口外的行被钉在稳态 inactive(滚动到远处不出现未缩小行)。
+  /// 列表尚未建立(首帧 tick 前)返回 NaN。
+  @visibleForTesting
+  double lineScaleForTest(int i) =>
+      i >= 0 && i < _reusedPerLineScales.length
+          ? _reusedPerLineScales[i]
+          : double.nan;
+
   /// P1-C：上次间奏检测时的权威播放时间（毫秒）。
   ///
   /// 间奏检测只依赖 currentTimeMs（positionStream 约 200ms 更新一次），
@@ -399,6 +418,27 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// fontFamily / fontWeight，任一变化即判定过期并重渲染（修掉字号与非当前行
   /// 缩放变化后旧模糊图长期不刷新的问题）。
   final Map<int, (ui.Image image, String signature)> _lineBlurImages = {};
+
+  // 每次异步请求独占令牌，防止切歌/几何变化后旧纹理覆盖新缓存。
+  final Map<int, (Object token, String signature)> _lineBlurPending = {};
+
+  @visibleForTesting
+  Future<ui.Image?> Function(int, int, DuetAlignment)? lineBlurRendererForTest;
+
+  @visibleForTesting
+  void updateLineBlurCacheForTest(Map<int, int> levels) =>
+      _updateLineBlurCache(levels);
+
+  @visibleForTesting
+  ui.Image? lineBlurImageForTest(int index) => _lineBlurImages[index]?.$1;
+
+  void _clearLineBlurCache() {
+    _lineBlurPending.clear();
+    for (final entry in _lineBlurImages.values) {
+      entry.$1.dispose();
+    }
+    _lineBlurImages.clear();
+  }
 
   /// 上次构建模糊层时的几何签名，用于字号/缩放/视口变化时强制重算 levels。
   String _lastBlurGeometrySig = '';
@@ -487,10 +527,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _transCollapsing.clear();
     _translationExpandProgress = 0;
     // 失效模糊图片缓存：对齐/文本变化后旧模糊图位置与内容均不再匹配
-    for (final entry in _lineBlurImages.values) {
-      entry.$1.dispose();
-    }
-    _lineBlurImages.clear();
+    _clearLineBlurCache();
     _cachedBlurLineIndex = -1;
   }
 
@@ -535,6 +572,24 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 不再每帧重算（之前每帧 build 都跑 N 次 TextPainter.layout 是 CPU 杀手）。
   /// [_recomputeLineHeightsIfNeeded] 负责缓存命中判断。
   List<double> _lineHeights = const <double>[];
+
+  /// 每行的换行计划（主歌词），索引与 `_cleanedLines` 对齐。
+  ///
+  /// 生产一次、四处消费：行高测量 / WordRenderer / LineRenderer / 模糊层。
+  /// 断点只在这里算，任何消费方不得再自行数行（本仓重叠教训）。
+  List<LyricWrapPlan> _wrapPlans = const <LyricWrapPlan>[];
+
+  /// 每行副行（翻译/罗马音）的换行计划，索引同上；无副行文本时为空计划。
+  List<LyricWrapPlan> _auxWrapPlans = const <LyricWrapPlan>[];
+
+  /// 无副行文本时的占位计划（单行空文本），避免 `_auxWrapPlans` 出现 null 空洞。
+  static final LyricWrapPlan _emptyPlan = LyricWrapPlan(
+    rowStarts: const <int>[0],
+    rowTexts: const <String>[''],
+    rowWidths: const <double>[0],
+    unitSpace: LyricUnitSpace.painterWrap,
+  );
+
   List<double> _lineTops = const <double>[];
 
   /// 哪些行索引后面有间奏（gap >= thresholdMs）。
@@ -626,6 +681,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   int _cachedFontWeight = -1;
   // 副行布局缓存：displayMode 切换也需重算（虽副行高度不变，但需触发重绘）
   LyricDisplayMode _cachedDisplayMode = LyricDisplayMode.translation;
+  bool _cachedLineBalance = true;
 
   /// 返回指定行索引上方所有激活间奏占位的累计高度。
   ///
@@ -723,6 +779,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     final currentFontWeight = LyricLayout.fontWeight.value;
     final currentLineHeight = LyricLayout.lineHeight;
     final currentDisplayMode = LyricPreferences.instance.displayMode;
+    final currentLineBalance = LyricPreferences.instance.lineBalance;
     if (currentDisplayMode != _cachedDisplayMode) {
       debugPrint(
         '[RomaToggle] AppleLyricsView displayMode 变化: $_cachedDisplayMode -> $currentDisplayMode',
@@ -736,7 +793,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         _lineHeights.length == _cleanedLines.length &&
         currentFontFamily == _cachedFontFamily &&
         currentFontWeight == _cachedFontWeight &&
-        currentDisplayMode == _cachedDisplayMode) {
+        currentDisplayMode == _cachedDisplayMode &&
+        currentLineBalance == _cachedLineBalance) {
       return; // 缓存命中
     }
     _cachedFontSize = fontSize;
@@ -747,6 +805,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _cachedFontFamily = currentFontFamily;
     _cachedFontWeight = currentFontWeight;
     _cachedDisplayMode = currentDisplayMode;
+    _cachedLineBalance = currentLineBalance;
 
     // v3 优化：列表内容变化时递增 generation counter。
     // lines 用 identical 比较，只有引用变化才递增；
@@ -768,20 +827,24 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     final List<double> heights = <double>[];
     final List<double> tops = <double>[];
     final List<int> interludeIndices = <int>[];
+    final List<LyricWrapPlan> plans = <LyricWrapPlan>[];
+    final TextStyle mainStyle = LyricLayout.mainStyle(fontSize);
     double acc = 0;
     for (int i = 0; i < _cleanedLines.length; i++) {
       final line = _cleanedLines[i];
       // 行高恒按"纯主行"测量：翻译副行预留不再进静态缓存，改由
       // _transExtraHeightFor（展开/收起进度）每帧动态叠加。副行占位随动画
       // 平滑增长/回落，消除行切换时高度瞬间换位导致的位置闪现。
-      heights.add(
-        LyricLayout.measureLineHeight(
-          line,
-          fontSize,
-          mainLineHeight,
-          maxLineWidth,
-        ),
+      // 行数取自换行计划；同一份计划还会被逐字 / 整行 / 模糊三条绘制路径消费，
+      // 于是「测量的行数 == 画出的行数」由结构保证（本仓重叠教训）。
+      final LyricWrapPlan plan = LyricWrapPlanner.forLine(
+        line,
+        mainStyle,
+        maxLineWidth,
+        balanced: currentLineBalance,
       );
+      plans.add(plan);
+      heights.add(LyricLayout.lineHeightForRows(mainLineHeight, plan.rowCount));
       tops.add(acc);
       acc += heights.last;
       // 检测当前行与下一行之间是否有间奏（最后一行后面无间奏）
@@ -797,6 +860,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         }
       }
     }
+    _wrapPlans = plans;
     _lineHeights = heights;
     _lineTops = tops;
     _interludeAfterIndices = interludeIndices;
@@ -808,18 +872,28 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _cleanedLines.length,
       0,
     );
+    final List<LyricWrapPlan> auxPlans = List<LyricWrapPlan>.filled(
+      _cleanedLines.length,
+      _emptyPlan,
+    );
+    final TextStyle auxStyle = LyricLayout.auxStyle(fontSize);
     for (int i = 0; i < _cleanedLines.length; i++) {
       final line = _cleanedLines[i];
       final String? auxText = currentDisplayMode == LyricDisplayMode.roma
           ? line.roma
           : line.translation;
       if (auxText == null || auxText.isEmpty) continue;
-      auxHeights[i] = LyricLayout.auxSubHeight(
-        fontSize,
-        LyricLayout.measureAuxRows(auxText, fontSize, maxLineWidth),
+      final LyricWrapPlan auxPlan = LyricWrapPlanner.forText(
+        auxText,
+        auxStyle,
+        maxLineWidth,
+        balanced: currentLineBalance,
       );
+      auxPlans[i] = auxPlan;
+      auxHeights[i] = LyricLayout.auxSubHeight(fontSize, auxPlan.rowCount);
     }
     _auxSubHeights = auxHeights;
+    _auxWrapPlans = auxPlans;
     // 重置激活间奏（lines 变化时）
     _activeInterludeIdx = -1;
     _lastActiveAnchorIdx = -1;
@@ -1026,20 +1100,28 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// - 进场行（非当前 0.850 → 当前）：target 变 activeScale，从 0.850 平滑放大到 1.0；
   /// - 离场行（当前 1.0 → 非当前）：target 变 inactiveScale，从 1.0 平滑缩到 0.850，
   ///   补上原来"当前行缩小时硬切"的连贯动画。
-  /// 只推进视口附近行（与 renderer/偏移同范围）。
+  /// 只推进当前行 ± overscan 窗口内的行（与 renderer/偏移同范围）；
+  /// 窗口外的行钉在稳态 inactive——绘制按视口裁剪，与当前行无关，用户手动
+  /// 滚动到远处时窗口外行不能停留在建表初始值 1.0（否则出现"没缩小"的行）。
   bool _tickPerLineScales(double dt) {
     final int len = widget.lines.length;
+    final double active = LyricLayout.activeScale;
+    final double inactive = widget.enableScale
+        ? LyricLayout.inactiveScale
+        : active;
+    // 清晰层 canvas.scale 与 AM 模糊层 Transform.scale 共用本数组，钳在写入处即两层同尺
+    final double minLegible = _minLegibleLineScale(
+      LyricLayout.fontSize(context),
+    );
+    // 窗口外行的稳态值：非当前行恒为 inactive（钳可读下限）。
+    final double steady = math.max(inactive, minLegible);
     if (_reusedPerLineScales.length != len) {
-      _reusedPerLineScales = List<double>.filled(len, LyricLayout.activeScale);
+      _reusedPerLineScales = List<double>.filled(len, steady);
     }
     final int overscan = _overscan;
     final int startI = math.max(0, _currentLineIndex - overscan);
     final int endI = math.min(len, _currentLineIndex + overscan);
     bool anyChanged = false;
-    final double active = LyricLayout.activeScale;
-    final double inactive = widget.enableScale
-        ? LyricLayout.inactiveScale
-        : active;
     for (int i = startI; i < endI; i++) {
       final double target = i == _currentLineIndex ? active : inactive;
       final Spring spring = _perLineScaleSprings[i] ??= Spring(
@@ -1057,9 +1139,39 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         spring.tick(dt);
         anyChanged = true;
       }
-      _reusedPerLineScales[i] = spring.position;
+      _reusedPerLineScales[i] = math.max(spring.position, minLegible);
+    }
+    // 窗口外的行钉在稳态 inactive。窗口只覆盖当前行 ± overscan，绘制却按
+    // 视口裁剪——用户手动滚动到远离当前行的区域（或大屏/小字号使视口超出
+    // 窗口）时，窗口外行不会被上面的窗口循环写入，会保持建表初始值
+    // activeScale(1.0)，显示成"没缩小"的行。
+    // 同时把窗口外已存在的弹簧瞬移到稳态（setPosition），否则该行重新进入
+    // 窗口时会从旧位置（如曾作为当前行的 1.0）先弹回再缩，硬切穿帮。
+    // 钉住是幂等的：值已等于稳态时 anyChanged 不置位、弹簧保持 settled，
+    // 不会阻止 Ticker 收敛停帧。
+    for (int i = 0; i < startI; i++) {
+      if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
+    }
+    for (int i = endI; i < len; i++) {
+      if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
     }
     return anyChanged;
+  }
+
+  /// 把窗口外第 i 行钉到稳态 scale：显示值写入复用列表，弹簧（若存在）
+  /// 瞬移到稳态（position = target = steady、速度 0、settled）。
+  /// 返回显示值是否发生变化（供重绘门控；幂等钉住返回 false）。
+  bool _pinLineScaleToSteady(int i, double steady) {
+    bool changed = false;
+    final Spring? spring = _perLineScaleSprings[i];
+    if (spring != null && (spring.target != steady || !spring.isSettled)) {
+      spring.setPosition(steady, 0);
+    }
+    if (_reusedPerLineScales[i] != steady) {
+      _reusedPerLineScales[i] = steady;
+      changed = true;
+    }
+    return changed;
   }
 
   /// v3 优化：检测视口附近 renderer 是否已收敛。
@@ -1120,10 +1232,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _cachedFontFamily = null;
       _cachedFontWeight = -1;
       // 失效模糊图片缓存（dispose 图片资源 + 清空 Map）
-      for (final entry in _lineBlurImages.values) {
-        entry.$1.dispose();
-      }
-      _lineBlurImages.clear();
+      _clearLineBlurCache();
       _cachedBlurLineIndex = -1;
       _cachedBlurLevels = const {};
       // 失效 WordRenderer/LineRenderer 内部绑定（清空后下次 paint 会重新创建 +
@@ -1210,10 +1319,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _ticker.dispose();
     _scrollController.dispose();
     _repaintNotifier.dispose();
-    for (final entry in _lineBlurImages.values) {
-      entry.$1.dispose();
-    }
-    _lineBlurImages.clear();
+    _clearLineBlurCache();
     _releaseRendererCaches();
     LyricPreferences.instance.removeListener(_onPreferencesChanged);
     super.dispose();
@@ -2166,7 +2272,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       index = (_lineTops.length - 1).clamp(0, widget.lines.length - 1);
     }
     if (index >= 0 && index < widget.lines.length) {
-      AppHaptics.tick();
+      AppHaptics.tick(HapticCategory.gesture);
       widget.onSeek?.call(widget.lines[index].startTime);
     }
   }
@@ -2310,6 +2416,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
             interludeExpandProgress: _interludeExpandProgress,
             transExpandProgress: _translationExpandProgress,
             auxSubHeights: _auxSubHeights,
+            wrapPlans: _wrapPlans,
+            auxPlans: _auxWrapPlans,
             transCollapsing: _transCollapsing,
             perLineOffsets: _buildPerLineOffsets(),
             blurFade: _blurFade,
@@ -2351,6 +2459,10 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           // 逐行副行高度随行集/字号/宽度/displayMode 变化（重算中被替换为新列表），
           // 必须在此同步引用，否则换歌/切翻译后 painter 会读旧列表（长度不匹配）
           _painter!.auxSubHeights = _auxSubHeights;
+          // 换行计划随行集/字号/视口宽/开关变化整体重建，必须同步引用，
+          // 否则 painter 会拿旧宽度的断点画新行（行数与行盒错位 → 重叠）
+          _painter!.wrapPlans = _wrapPlans;
+          _painter!.auxPlans = _auxWrapPlans;
           _painter!.perLineOffsets = _buildPerLineOffsets();
           _painter!.blurFade = _blurFade;
           _painter!.blurActive = useGaussian;
@@ -2500,7 +2612,10 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       // k = current/bake，从大到小同步跟随 → 动画期间两层尺寸始终一致，不穿帮。
       final double currentScale = i < _reusedPerLineScales.length
           ? _reusedPerLineScales[i]
-          : LyricLayout.inactiveScale;
+          : math.max(
+              LyricLayout.inactiveScale,
+              _minLegibleLineScale(LyricLayout.fontSize(context)),
+            );
       final double bakeScale = LyricLayout.blurRenderScale(
         enableScale: widget.enableScale,
       );
@@ -2614,6 +2729,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
 
   /// 异步更新模糊缓存：为变化的行渲染模糊图片。
   void _updateLineBlurCache(Map<int, int> levels) {
+    _lineBlurPending.removeWhere((index, _) => !levels.containsKey(index));
     for (final entry in levels.entries) {
       final int lineIndex = entry.key;
       final int blurLevel = entry.value;
@@ -2624,9 +2740,26 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         continue;
       }
 
-      _renderLineBlur(lineIndex, blurLevel, _duetAlignmentAt(lineIndex)).then((
+      if (_lineBlurPending[lineIndex]?.$2 == signature) continue;
+      final token = Object();
+      _lineBlurPending[lineIndex] = (token, signature);
+
+      (lineBlurRendererForTest ?? _renderLineBlur)(
+        lineIndex, blurLevel, _duetAlignmentAt(lineIndex),
+      ).then((
         image,
       ) {
+        // 只允许最新请求写回；销毁或失效后仍需释放迟到的 GPU 图片。
+        if (!mounted || _lineBlurPending[lineIndex]?.$1 != token) {
+          image?.dispose();
+          if (kDebugMode) debugPrint('[LyricRender] discard stale blur line=$lineIndex');
+          return;
+        }
+        _lineBlurPending.remove(lineIndex);
+        if (_blurCacheSignature(blurLevel) != signature) {
+          image?.dispose();
+          return;
+        }
         if (image != null) {
           _lineBlurImages[lineIndex]?.$1.dispose();
           _lineBlurImages[lineIndex] = (image, signature);
@@ -2763,11 +2896,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       );
       textPainter.layout(maxWidth: maxTextWidth);
 
-      final LyricLine blurLine = _cleanedLines[lineIndex];
-
       // 对画布应用模糊
       final blurPaint = Paint()
-        ..imageFilter = ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma);
+        ..imageFilter = ui.ImageFilter.blur(
+          sigmaX: tvBlurSigma(sigma),
+          sigmaY: tvBlurSigma(sigma),
+        );
       canvas.saveLayer(
         Rect.fromLTWH(0, 0, _viewportWidth, renderHeight),
         blurPaint,
@@ -2794,9 +2928,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       canvas.scale(blurScale, blurScale);
       canvas.translate(-pivotX, -pivotY);
 
-      // 判断是否为多行文本（自动换行）
-      final bool isMultiLine =
-          geom.blockHeight > fontSize * LyricLayout.lineHeight * 1.5;
+      // 是否为多行只看换行计划：与清晰层、行高预留共用同一份断点，
+      // 否则模糊图与清晰文字的行数会岔开（历史上这里独立贪心过一次重叠）。
+      final LyricWrapPlan blurPlan = lineIndex < _wrapPlans.length
+          ? _wrapPlans[lineIndex]
+          : _emptyPlan;
+      final bool isMultiLine = blurPlan.rowCount > 1;
       if (!isMultiLine) {
         // 单行：用 _alignX 计算起始 x
         final double x = _blurAlignX(
@@ -2807,16 +2944,16 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         );
         textPainter.paint(canvas, Offset(x, padding));
       } else {
-        // 多行：按视觉行拆分，每行独立 _alignX 对齐绘制
+        // 多行：按计划的视觉行拆分，每行独立 _blurAlignX 对齐绘制
         _paintBlurMultiLineAligned(
           canvas,
           textPainter,
-          blurLine,
           alignment,
           leftPadding,
           padding,
           fontSize,
           _viewportWidth,
+          blurPlan,
         );
       }
       canvas.restore();
@@ -2829,6 +2966,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         _viewportWidth.round(),
         renderHeight.round(),
       );
+      // toImage 经 native 回调栅格化，future 完成后 Picture 不再被引用，此刻释放才安全。
+      picture.dispose();
       return image;
     } catch (_) {
       return null;
@@ -2859,69 +2998,17 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   void _paintBlurMultiLineAligned(
     Canvas canvas,
     TextPainter painter,
-    LyricLine line,
     DuetAlignment alignment,
     double leftPadding,
     double padding,
     double fontSize,
     double viewportWidth,
+    LyricWrapPlan plan,
   ) {
     final String text = painter.text?.toPlainText() ?? '';
     if (text.isEmpty) return;
-    // 拆分视觉行文本：
-    // - KRC 行（有 word）：按 word 累加换行（与清晰层 LineRenderer / 测量一致），
-    //   避免模糊图行数与清晰层不同导致错位重叠。
-    // - 无 word 行：TextPainter getLineBoundary 自动换行。
-    final List<String> rowTexts;
-    if (line.hasWordTiming) {
-      final double maxWidth = viewportWidth - 2 * fontSize;
-      final List<double> widths = <double>[];
-      for (final w in line.words) {
-        final TextPainter p = TextPainter(
-          text: TextSpan(text: w.text, style: painter.text!.style!),
-          textDirection: TextDirection.ltr,
-        )..layout();
-        widths.add(p.width);
-        p.dispose();
-      }
-      final List<int> rowWordStarts = <int>[0];
-      double dx = 0;
-      for (int wi = 0; wi < line.words.length; wi++) {
-        if (dx + widths[wi] > maxWidth && dx > 0) {
-          rowWordStarts.add(wi);
-          dx = 0;
-        }
-        dx += widths[wi];
-      }
-      rowTexts = <String>[];
-      for (int r = 0; r < rowWordStarts.length; r++) {
-        final ws = rowWordStarts[r];
-        final we = r + 1 < rowWordStarts.length
-            ? rowWordStarts[r + 1]
-            : line.words.length;
-        final StringBuffer sb = StringBuffer();
-        for (int wi = ws; wi < we; wi++) {
-          sb.write(line.words[wi].text);
-        }
-        rowTexts.add(sb.toString());
-      }
-    } else {
-      final List<int> lineStarts = <int>[0];
-      int pos = 0;
-      while (pos < text.length) {
-        final boundary = painter.getLineBoundary(TextPosition(offset: pos));
-        final lineEnd = boundary.end;
-        if (lineEnd <= pos) break;
-        pos = lineEnd;
-        if (pos < text.length) lineStarts.add(pos);
-      }
-      rowTexts = <String>[];
-      for (int r = 0; r < lineStarts.length; r++) {
-        final s = lineStarts[r];
-        final e = r + 1 < lineStarts.length ? lineStarts[r + 1] : text.length;
-        rowTexts.add(text.substring(s, e));
-      }
-    }
+    // 视觉行文本来自换行计划（与清晰层 LineRenderer 同源）
+    final List<String> rowTexts = plan.rowTexts;
     // 每行独立绘制（与 LineRenderer._paintMultiLineAligned 一致）：
     // 主行完整行高从 padding 起，换行行 0.8x 行高从主行底起，行盒=行距避免重叠
     final double mainLineHeight = fontSize * LyricLayout.lineHeight;
@@ -3001,6 +3088,10 @@ class _LyricsPainter extends CustomPainter {
   /// （索引 → 收起进度，live 引用，State 侧原地更新，与 blurReadyLineIndices 同模式）。
   double transExpandProgress;
   List<double> auxSubHeights;
+
+  /// 每行主歌词 / 副行的换行计划（由 State 统一生产，索引与 lines 对齐）。
+  List<LyricWrapPlan> wrapPlans;
+  List<LyricWrapPlan> auxPlans;
   Map<int, double> transCollapsing;
   List<double> perLineOffsets;
   double blurFade;
@@ -3044,6 +3135,8 @@ class _LyricsPainter extends CustomPainter {
     required this.interludeExpandProgress,
     required this.transExpandProgress,
     required this.auxSubHeights,
+    required this.wrapPlans,
+    required this.auxPlans,
     required this.transCollapsing,
     required this.perLineOffsets,
     required this.blurFade,
@@ -3235,9 +3328,14 @@ class _LyricsPainter extends CustomPainter {
       // 与 _onTick 步骤 4 传给 renderer 的 scale 口径保持一致。
       // 形变 scale 用每行自己的弹簧位置（perLineScales），这样离场行从 1.0
       // 平滑缩到 inactiveScale、进场行从 0.850 平滑放大到 1.0，都不再硬切。
+      // 兜底（perLineScales 尚未建立/长度不足）与状态侧窗口外稳态同口径：
+      // enableScale=false 时非当前行不缩小，不能误用 inactiveScale。
+      final double steadyScale = enableScale
+          ? math.max(LyricLayout.inactiveScale, _minLegibleLineScale(fontSize))
+          : LyricLayout.activeScale;
       final double scale = i < perLineScales.length
           ? perLineScales[i]
-          : LyricLayout.inactiveScale;
+          : steadyScale;
       final double alphaScale = isActive
           ? LyricLayout.activeScale
           : (enableScale ? LyricLayout.inactiveScale : LyricLayout.activeScale);
@@ -3287,6 +3385,8 @@ class _LyricsPainter extends CustomPainter {
           maxWidth: maxLineWidth,
           alignment: alignment,
           viewportWidth: viewportWidth,
+          wrapPlan: i < wrapPlans.length ? wrapPlans[i] : null,
+          auxPlan: i < auxPlans.length ? auxPlans[i] : null,
         );
       } else {
         // 整行模式：LRC/纯文本行 + 非当前行的 KRC 行
@@ -3306,6 +3406,8 @@ class _LyricsPainter extends CustomPainter {
           maxWidth: maxLineWidth,
           alignment: alignment,
           viewportWidth: viewportWidth,
+          wrapPlan: i < wrapPlans.length ? wrapPlans[i] : null,
+          auxPlan: i < auxPlans.length ? auxPlans[i] : null,
         );
       }
 

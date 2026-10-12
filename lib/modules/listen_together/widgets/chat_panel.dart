@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../../core/utils/app_text_context_menu.dart';
 import '../../../core/utils/app_toast.dart';
 import '../../../providers/listen_together_provider.dart';
 
@@ -180,7 +181,7 @@ class _ChatPanelState extends State<ChatPanel> {
                               ),
                               child: Text(
                                 message.text,
-                                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                               ),
                             ),
                           ),
@@ -211,7 +212,7 @@ class _ChatPanelState extends State<ChatPanel> {
                             Text(
                               _formatMessageTime(message.timestampMs),
                               style: TextStyle(
-                                fontSize: 10,
+                                fontSize: 11,
                                 color: cs.onSurfaceVariant,
                               ),
                             ),
@@ -239,6 +240,7 @@ class _ChatPanelState extends State<ChatPanel> {
                     Expanded(
                       child: TextField(
                         controller: _ctrl,
+                        contextMenuBuilder: buildAppTextContextMenu,
                         enabled: canChat,
                         decoration: InputDecoration(
                           hintText: canChat ? '发消息…' : '房主已关闭聊天',
@@ -253,6 +255,7 @@ class _ChatPanelState extends State<ChatPanel> {
                       onPressed:
                           (_sending || _cooldown || !canChat) ? null : _send,
                       icon: const Icon(Icons.send),
+                      tooltip: '发送消息',
                     ),
                   ],
                 ),

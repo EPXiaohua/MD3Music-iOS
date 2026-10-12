@@ -3,23 +3,29 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'mcp_confirmation.dart';
 import 'mcp_http_server.dart';
 import 'mcp_jsonrpc.dart';
 import 'mcp_library_source.dart';
 import 'mcp_ports.dart';
+import 'mcp_prompt.dart';
+import 'mcp_resources_md3.dart';
 import 'mcp_settings.dart';
 import 'mcp_tool.dart';
 import 'mcp_tools_library.dart';
 
 enum McpStatus { stopped, starting, running, error }
 
-/// 单次工具调用日志（设置页展示最近 20 条，用于确认"到底连上没有"）。
+/// 单次工具调用日志（设置页展示最近 50 条，用于确认"到底连上没有"）。
 class McpCallLogEntry {
-  McpCallLogEntry(this.at, this.tool, this.ok);
+  McpCallLogEntry(this.at, this.tool, this.ok, [this.argsSummary]);
 
   final DateTime at;
   final String tool;
   final bool ok;
+
+  /// 参数 JSON 摘要（≤160 字符），便于复盘 AI 到底传了什么。
+  final String? argsSummary;
 }
 
 /// MCP 服务的总控：持有设置、传输层、分发器与工具注册表。
@@ -32,11 +38,22 @@ class McpService extends ChangeNotifier {
   McpService({
     required McpPlayerControl playerControl,
     McpLibrarySource? library,
+    McpLocalLibrarySource? localLibrary,
+    McpLibraryWriteSource? libraryWrite,
+    // App 功能控制是新增敏感面，不设兜底默认实现，由 app.dart 显式注入；
+    // 未注入（null）时 app_features 组工具整体缺席。
+    McpAppFeaturesPort? appFeatures,
     McpSettingsStore? store,
     McpHttpServer? server,
     // ignore: prefer_initializing_formals
   })  : _playerControl = playerControl,
         _library = library ?? KugouApiClientLibrarySource(),
+        // ignore: prefer_initializing_formals
+        _localLibrary = localLibrary,
+        // ignore: prefer_initializing_formals
+        _libraryWrite = libraryWrite ?? KugouApiClientLibraryWriteSource(),
+        // ignore: prefer_initializing_formals
+        _appFeatures = appFeatures,
         _store = store ?? McpSettingsStore(),
         _server = server ?? McpHttpServer() {
     unawaited(_autoStart());
@@ -44,8 +61,12 @@ class McpService extends ChangeNotifier {
 
   final McpPlayerControl _playerControl;
   final McpLibrarySource _library;
+  final McpLocalLibrarySource? _localLibrary;
+  final McpLibraryWriteSource _libraryWrite;
+  final McpAppFeaturesPort? _appFeatures;
   final McpSettingsStore _store;
   final McpHttpServer _server;
+  final McpConfirmationBroker _confirmations = McpConfirmationBroker();
 
   McpSettings? _settings;
   McpStatus _status = McpStatus.stopped;
@@ -60,6 +81,7 @@ class McpService extends ChangeNotifier {
   int get port => _server.port;
   bool get isRunning => _status == McpStatus.running;
   List<McpCallLogEntry> get log => List<McpCallLogEntry>.unmodifiable(_log);
+  McpConfirmationBroker get confirmations => _confirmations;
 
   /// 客户端可直接使用的 URL（LAN 模式下为实际网卡 IP）。
   ///
@@ -101,16 +123,32 @@ class McpService extends ChangeNotifier {
     notifyListeners();
     try {
       final registry = McpToolRegistry(
-        buildMcpTools(control: _playerControl, library: _library),
+        buildMcpTools(
+          control: _playerControl,
+          library: _library,
+          localLibrary: _localLibrary,
+          libraryWrite: _libraryWrite,
+          appFeatures: _appFeatures,
+        ),
         onCall: recordCall,
       );
       registry.readOnly = settings.readOnly;
+      registry.enabledGroups = settings.groupFlags.entries
+          .where((e) => e.value)
+          .map((e) => e.key)
+          .toSet();
+      // broker 恒注入；用户关闭二次确认 = 跳过确认直接执行（confirmationEnabled），
+      // 而不是拒绝执行。确认弹窗 UI 由 app.dart 的宿主组件承担。
+      registry.confirmations = _confirmations;
+      registry.confirmationEnabled = settings.requireConfirm;
       final dispatcher = McpDispatcher(
         serverName: 'MD3Music',
         serverVersion: '5.7.0',
         tools: registry,
         instructions: 'MD3Music 播放器控制接口。先调用 md3_search_songs 获取 hash，'
             '再用 md3_play_song 播放；读状态用 md3_get_player_state。',
+        resources: buildMcpResources(control: _playerControl, library: _library),
+        prompts: buildMcpPrompts(),
       );
       await _server.start(
         dispatcher: dispatcher,
@@ -141,6 +179,9 @@ class McpService extends ChangeNotifier {
     await stop();
     if (next.enabled) {
       await start();
+      // 组开关/只读等影响 tools/list 的设置变更后，通知已连接客户端刷新
+      // （当前实现是重启式更新，通常已无存活的下行流；广播为幂等空操作）。
+      _server.notifyToolsListChanged();
     }
     notifyListeners();
   }
@@ -152,11 +193,18 @@ class McpService extends ChangeNotifier {
   }
 
   /// 由传输层在每次 tools/call 完成后回调，用于设置页的"最近调用"。
-  void recordCall(String tool, bool ok) {
-    if (_log.length >= 20) _log.removeRange(19, _log.length);
-    _log.insert(0, McpCallLogEntry(DateTime.now(), tool, ok));
+  void recordCall(String tool, bool ok, [String? argsSummary]) {
+    if (_log.length >= 50) _log.removeRange(49, _log.length);
+    _log.insert(0, McpCallLogEntry(DateTime.now(), tool, ok, argsSummary));
     notifyListeners();
   }
+
+  /// 最近调用日志的可复制文本（最新在前）。
+  String exportLog() => _log
+      .map((e) =>
+          '${e.at.toIso8601String()}  ${e.ok ? 'OK ' : 'ERR'}  ${e.tool}'
+          '${e.argsSummary == null ? '' : '  ${e.argsSummary}'}')
+      .join('\n');
 
   /// 解析本机局域网 IPv4（供 [endpointUrl] 展示）。
   ///
@@ -206,6 +254,7 @@ class McpService extends ChangeNotifier {
   Future<void> dispose() async {
     _disposed = true;
     await _server.stop();
+    _confirmations.dispose();
     super.dispose();
   }
 }

@@ -330,4 +330,108 @@ void main() {
       expect(result[1].startTime, 30000);
     });
   });
+
+  group('LrcParser.parse - 同时间戳双行/三行歌词', () {
+    const dualLine =
+        '[00:19.25]今天我寒夜里看雪飘过\n'
+        '[00:19.25]gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3';
+    const romaLine = 'gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3';
+
+    test('D1. 两行同时间戳 → 第一行主歌词，第二行 translation', () {
+      final result = LrcParser.parse(dualLine);
+      expect(result, hasLength(1));
+      expect(result.first.startTime, 19250);
+      expect(result.first.text, '今天我寒夜里看雪飘过');
+      expect(result.first.translation, romaLine);
+      expect(result.first.roma, isNull);
+    });
+
+    test('D2. 三行同时间戳 → 第二行 translation，第三行 roma', () {
+      final result =
+          LrcParser.parse('$dualLine\n[00:19.25]Today I watch the snow drift by');
+      expect(result, hasLength(1));
+      expect(result.first.text, '今天我寒夜里看雪飘过');
+      expect(result.first.translation, romaLine);
+      expect(result.first.roma, 'Today I watch the snow drift by');
+    });
+
+    test('D3. 四行同时间戳 → 第三行进 roma，第四行丢弃', () {
+      final result = LrcParser.parse(
+        '$dualLine\n[00:19.25]第三行译文\n[00:19.25]第四行应被丢弃',
+      );
+      expect(result, hasLength(1));
+      expect(result.first.translation, romaLine);
+      expect(result.first.roma, '第三行译文');
+      expect(
+        result.any(
+          (l) => l.text == '第四行应被丢弃' || l.roma == '第四行应被丢弃',
+        ),
+        isFalse,
+      );
+    });
+
+    test('D4. 非相邻的同时间戳行不合并（防周期性重复时间戳误并）', () {
+      final result = LrcParser.parse(
+        '[00:19.25]第一行\n[00:25.00]第二行\n[00:19.25]第三行',
+      );
+      expect(result, hasLength(3));
+      expect(result.map((l) => l.text).toList(), ['第一行', '第三行', '第二行']);
+      expect(result.every((l) => l.translation == null), isTrue);
+    });
+
+    test('D5. 多段混合：只有部分行带副行', () {
+      final result = LrcParser.parse(
+        '[00:01.00]A\n[00:01.00]a-trans\n[00:05.00]B\n[00:09.00]C\n'
+            '[00:09.00]c-trans\n[00:09.00]c-roma',
+      );
+      expect(result, hasLength(3));
+      expect(result[0].text, 'A');
+      expect(result[0].translation, 'a-trans');
+      expect(result[1].text, 'B');
+      expect(result[1].translation, isNull);
+      expect(result[2].text, 'C');
+      expect(result[2].translation, 'c-trans');
+      expect(result[2].roma, 'c-roma');
+    });
+
+    test('D6. 空文本占位行不占用副行槽位', () {
+      final result =
+          LrcParser.parse('[00:19.25]主歌词\n[00:19.25]\n[00:19.25]译文');
+      expect(result, hasLength(2));
+      expect(result.firstWhere((l) => l.text == '主歌词').translation, '译文');
+      expect(result.any((l) => l.text == '\u00A0'), isTrue);
+    });
+
+    test('D7. 合并结果仍按 startTime 升序，同时间戳保持源码顺序', () {
+      final result = LrcParser.parse(
+        '[00:03.00]三\n[00:01.00]一\n[00:01.00]一译\n[00:02.00]二',
+      );
+      expect(result.map((l) => l.text).toList(), ['一', '二', '三']);
+      expect(result.first.translation, '一译');
+    });
+
+    test('D8. [offset:] 与合并协同', () {
+      final result = LrcParser.parse('[offset:+250]\n$dualLine');
+      expect(result, hasLength(1));
+      expect(result.first.startTime, 19000);
+      expect(result.first.translation, romaLine);
+    });
+
+    test('D9. 字级 LRC 主行 + 同时间戳纯文本行 → 仍以字级行为主歌词', () {
+      final result = LrcParser.parse(
+        '[02:04.818]<02:04.818>Wait <02:09.158>and <02:09.517>pretend<02:11.436>\n'
+        '[02:04.818]等待 和 假装',
+      );
+      expect(result, hasLength(1));
+      expect(result.first.hasWordTiming, isTrue);
+      expect(result.first.text, 'Wait and pretend');
+      expect(result.first.translation, '等待 和 假装');
+    });
+
+    test('D10. 一行多时间戳不被误合并', () {
+      final result = LrcParser.parse('[00:10.00][00:30.00]Chorus');
+      expect(result, hasLength(2));
+      expect(result.every((l) => l.translation == null), isTrue);
+    });
+  });
 }

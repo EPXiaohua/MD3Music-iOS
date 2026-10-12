@@ -1,6 +1,8 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
 
 import '../models/album.dart';
 import '../models/artist.dart';
@@ -20,6 +22,28 @@ import '../../core/utils/audio_scanner.dart';
 class LocalMusicRepository {
   static const String _foldersKey = 'local_music_scan_folders';
   static const String _excludedFoldersKey = 'local_music_excluded_folders';
+  static const String _filterShortAudioKey = 'local_music_filter_short_audio';
+
+  Future<bool> getFilterShortAudio() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_filterShortAudioKey) ?? false;
+  }
+
+  Future<void> setFilterShortAudio(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_filterShortAudioKey, enabled);
+  }
+
+  /// 统一过滤缓存恢复与扫描结果，路径按目录边界匹配。
+  List<Song> filterSongs(
+    List<Song> songs, {
+    List<String> excludedFolders = const [],
+    bool filterShortAudio = false,
+  }) => songs.where((song) {
+    final path = song.localPath;
+    return (path == null || !_isExcluded(path, excludedFolders)) &&
+        (!filterShortAudio || song.duration > const Duration(seconds: 60));
+  }).toList();
 
   /// 持久化已扫描的歌曲列表（JSON 编码）。
   /// 用于 App 重启后立即显示上次扫描结果，避免每次启动都重扫。
@@ -40,6 +64,8 @@ class LocalMusicRepository {
 
   /// 添加扫描文件夹（去重）。
   Future<void> addFolder(String folder) async {
+    // 用户重新添加已移除的文件夹时，恢复其扫描资格。
+    await removeExcludedFolder(folder);
     final folders = await getSavedFolders();
     if (!folders.contains(folder)) {
       folders.add(folder);
@@ -132,11 +158,16 @@ class LocalMusicRepository {
   ///
   /// 支持子目录匹配：排除 `/storage/emulated/0/Recordings` 时，
   /// `/storage/emulated/0/Recordings/voice.mp3` 也会被排除。
-  bool _isExcluded(String filePath, List<String> excludedFolders) {
+  ///
+  /// 兼容 Windows 反斜杠：两侧都归一化为正斜杠后再比对。
+  /// 暴露为静态方法以便单测直接断言（Windows 端路径行为需要回归保护）。
+  static bool isExcluded(String filePath, List<String> excludedFolders) {
     if (excludedFolders.isEmpty) return false;
     final normalized = filePath.replaceAll('\\', '/');
     for (final excluded in excludedFolders) {
-      final normalizedExcluded = excluded.replaceAll('\\', '/');
+      final normalizedExcluded = excluded
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'/+$'), '');
       // 确保是目录级别匹配（excluded 是路径前缀，且后面跟着 / 或完全相等）
       if (normalized == normalizedExcluded ||
           normalized.startsWith('$normalizedExcluded/')) {
@@ -145,6 +176,9 @@ class LocalMusicRepository {
     }
     return false;
   }
+
+  bool _isExcluded(String filePath, List<String> excludedFolders) =>
+      isExcluded(filePath, excludedFolders);
 
   /// 根据码率和文件扩展名推断本地音质标签。
   ///
@@ -168,29 +202,32 @@ class LocalMusicRepository {
     return '128';
   }
 
-  /// 扫描所有音频文件并返回 Song 列表。
+  /// 从 Android MediaStore 收集音频文件（仅 Android 调用）。
   ///
-  /// 优先使用 MediaStore（沙箱兼容），再补充文件系统扫描用户自定义目录。
-  /// [excludedFolders] 中的文件夹及其子目录会被排除。
-  Future<List<Song>> scanSongs({
-    List<String>? customFolders,
-    List<String>? excludedFolders,
-  }) async {
-    if (kIsWeb) return [];
-
-    final excluded = excludedFolders ?? [];
-    final songs = <Song>[];
-    final seenPaths = <String>{};
-
-    // 1. MediaStore 主源：Android 11+ 沙箱模式兼容
+  /// MediaStore 已提供 title/artist/album，不再用 audio_metadata_reader 重新解析；
+  /// 优先使用 albumArtUri（content://）作为封面来源，UI 层通过
+  /// CachedNetworkImage 加载（它支持任意 https:// 和 file:// 协议，
+  /// 对 content:// 需要 Image.network + httpHeader）。
+  ///
+  /// 结果写入 [songs]，已见的路径写入 [seenPaths] 供文件系统源去重。
+  Future<void> _collectFromMediaStore(
+    List<Song> songs,
+    Set<String> seenPaths,
+    List<String> excluded,
+  ) async {
     try {
       final mediaStoreFiles = await MediaStoreService.queryAudioFiles();
       debugPrint(
         '[LocalMusicRepository] MediaStore 返回 ${mediaStoreFiles.length} 个文件',
       );
       for (final data in mediaStoreFiles) {
-        var filePath = data['filePath'] as String?;
-        if (filePath == null || !seenPaths.add(filePath)) continue;
+        final rawPath = data['filePath'] as String?;
+        if (rawPath == null || rawPath.isEmpty || !seenPaths.add(rawPath)) {
+          continue;
+        }
+        // content:// 解析失败时保留原值，由 PlayerProvider 兜底重试，
+        // 因此这里声明为非空 String（解析成功赋新值，失败沿用 rawPath）。
+        var filePath = rawPath;
 
         // 把 `content://` 提前解析为真实文件路径。
         // 这样 PlayerProvider 拿到的是绝对路径而不是 content URI，
@@ -208,15 +245,11 @@ class LocalMusicRepository {
         }
 
         // 排除文件夹过滤（解析为真实路径后再判断）
-        if (_isExcluded(filePath!, excluded)) {
+        if (_isExcluded(filePath, excluded)) {
           debugPrint('[LocalMusicRepository] 排除文件: $filePath');
           continue;
         }
 
-        // MediaStore 已提供 title/artist/album，不再用 audio_metadata_reader 重新解析
-        // 优先使用 albumArtUri（content://）作为封面来源，UI 层通过
-        // CachedNetworkImage 加载（它支持任意 https:// 和 file:// 协议，
-        // 对 content:// 需要 Image.network + httpHeader）
         final albumArtUri = data['albumArtUri'] as String?;
         final bitrate = data['bitrate'] as int?;
         songs.add(
@@ -227,8 +260,6 @@ class LocalMusicRepository {
             album: (data['album'] as String?) ?? '未知专辑',
             duration: Duration(milliseconds: (data['durationMs'] as int?) ?? 0),
             localPath: filePath,
-            // 优先用 MediaStore 的 albumArtUri（content://media/...），
-            // 为空时用 local://<filePath> 标识内嵌封面，UI 层据此懒加载
             artworkUri: albumArtUri ?? 'local://$filePath',
             isOnline: false,
             quality: _inferQuality(bitrate, filePath),
@@ -238,9 +269,31 @@ class LocalMusicRepository {
     } catch (e) {
       debugPrint('[LocalMusicRepository] MediaStore 扫描失败: $e');
     }
+  }
+
+  /// 扫描所有音频文件并返回 Song 列表。
+  ///
+  /// 优先使用 MediaStore（沙箱兼容），再补充文件系统扫描用户自定义目录。
+  /// [excludedFolders] 中的文件夹及其子目录会被排除。
+  Future<List<Song>> scanSongs({
+    List<String>? customFolders,
+    List<String>? excludedFolders,
+  }) async {
+    if (kIsWeb) return [];
+
+    final excluded = excludedFolders ?? [];
+    final songs = <Song>[];
+    final seenPaths = <String>{};
+
+    // MediaStore 是 Android 专属能力（依赖 android/app 的 MediaStore 桥）。
+    // Windows 上调用只会拿到 MissingPluginException 白跑一趟并打一条
+    // 误导性日志，直接跳过，扫描全部走文件系统源。
+    if (!Platform.isWindows) {
+      await _collectFromMediaStore(songs, seenPaths, excluded);
+    }
 
     // 2. 文件系统补充：扫描默认目录 + 用户自定义目录
-    final scanDirs = <String>[...defaultScanDirs];
+    final scanDirs = <String>[...defaultScanDirsForPlatform];
     if (customFolders != null) {
       for (final f in customFolders) {
         if (!scanDirs.contains(f)) scanDirs.add(f);
@@ -334,7 +387,8 @@ class LocalMusicRepository {
     for (final song in songs) {
       final path = song.localPath;
       if (path == null) continue;
-      final dir = path.substring(0, path.lastIndexOf('/'));
+      final normalized = path.replaceAll('\\', '/');
+      final dir = normalized.substring(0, normalized.lastIndexOf('/'));
       folderMap.putIfAbsent(dir, () => []).add(song);
     }
     return folderMap.entries.map((entry) {

@@ -1,8 +1,12 @@
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
+
+import '../../core/remote/tv_card_focus.dart';
+import '../../core/remote/tv_scroll_region.dart';
 
 import '../../data/models/song.dart';
 import '../../providers/player_provider.dart';
@@ -167,7 +171,7 @@ class _BrushPageState extends State<BrushPage> {
   /// 打开竖屏视频流，复用当前已加载的卡片。
   void _openVertical() {
     if (_cards.isEmpty) return;
-    Navigator.of(context).push(
+    Navigator.of(context, rootNavigator: true).push(
       MaterialPageRoute(
         builder: (_) => BrushVerticalPage(
           cards: List.of(_cards),
@@ -364,7 +368,7 @@ class _BrushPageState extends State<BrushPage> {
             isOnline: true,
             artworkUri: card.coverUrl,
           );
-      Navigator.of(context).push(
+      Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
           builder: (_) => MvPlayerPage(song: song, directVideoUrl: card.videoUrl),
         ),
@@ -400,7 +404,11 @@ class _BrushPageState extends State<BrushPage> {
                   ? _buildMessage(cs, '暂无内容', Icons.video_library_outlined)
                   : Md3PullToRefresh(
                       onRefresh: _load,
-                      child: ListView.builder(
+                      // tv: 纵向 feed 列表补区域语义（memoryKey + 横向 leave）。
+                      child: TvScrollRegion(
+                        memoryKey: 'tv/brush-list',
+                        horizontalEdge: DpadEdgeBehavior.leave,
+                        child: ListView.builder(
                         controller: _scrollController,
                         physics: const AlwaysScrollableScrollPhysics(),
                         padding: const EdgeInsets.only(bottom: 8),
@@ -423,12 +431,18 @@ class _BrushPageState extends State<BrushPage> {
                           return _buildCard(cs, _cards[i]);
                         },
                       ),
+                      ),
                     ),
     );
   }
 
   Widget _buildCard(ColorScheme cs, BrushCard card) {
-    return ListTile(
+    // tv: 行单停点（OK = 原 onTap：视频进 MV 页 / 音频直接播放）。
+    // 该行没有其它可点控件，包装不会吃掉子级停点。
+    return TvCardFocus(
+      onSelect: () => _playCard(card),
+      debugLabel: 'brush-row',
+      child: ListTile(
       leading: ClipRRect(
         borderRadius: BorderRadius.circular(8),
         child: SizedBox(
@@ -457,6 +471,7 @@ class _BrushPageState extends State<BrushPage> {
         color: cs.primary,
       ),
       onTap: () => _playCard(card),
+      ),
     );
   }
 

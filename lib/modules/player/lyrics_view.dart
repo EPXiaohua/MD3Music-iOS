@@ -5,6 +5,7 @@ import 'package:material_ui/material_ui.dart';
 
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/md3_lyric_preferences.dart';
+import '../../core/utils/lyric_wrap_plan.dart';
 
 class LyricsView extends StatefulWidget {
   final String lyrics;
@@ -61,6 +62,13 @@ class LyricsViewState extends State<LyricsView> {
   double _lastLayoutWidth = -1;
   List<double> _lineHeights = [];
   List<double> _lineTopOffsets = [];
+
+  /// 换行计划落成的展示文本（含硬断点 \n），索引与 [_parsedLyrics] 对齐。
+  ///
+  /// 渲染与测高共用同一字符串，于是「测到的行数 == 显示的行数」由构造保证。
+  /// 关闭平衡开关时这里就是原文，行为与改造前完全一致。
+  List<String> _displayTexts = const <String>[];
+  List<String?> _auxDisplayTexts = const <String?>[];
 
   // ListView 顶部 padding
   static const double _topPadding = 100.0;
@@ -317,6 +325,7 @@ class LyricsViewState extends State<LyricsView> {
       }
     }
 
+    _collapseDuplicateTimestampLines();
     _parsedLyrics.sort((a, b) => a.timestamp.compareTo(b.timestamp));
     _mergeParsedMetadata();
     _hasTranslation = _parsedLyrics.any(
@@ -325,6 +334,46 @@ class LyricsViewState extends State<LyricsView> {
     _hasRoma = _parsedLyrics.any(
       (line) => line.roma != null && line.roma!.isNotEmpty,
     );
+  }
+
+  /// 合并相邻且时间戳完全相同的行：第一行为主歌词，第二行为翻译，第三行为
+  /// 罗马音，其余丢弃。
+  ///
+  /// 与 [LrcParser] 的同名规则保持一致（详见 `lrc_parser.dart`）。LyricsView
+  /// 自带一套 LRC/KRC 正则解析，若不在这里合并，双行 LRC 的副行会被当成独立
+  /// 主歌词行渲染，与 AppleLyricsView 的表现不一致。
+  ///
+  /// 必须在排序前执行：合并依赖源码相邻顺序（`List.sort` 不稳定）。
+  void _collapseDuplicateTimestampLines() {
+    if (_parsedLyrics.length < 2) return;
+    final out = <_LyricLine>[];
+    for (final line in _parsedLyrics) {
+      final prev = out.isEmpty ? null : out.last;
+      if (prev != null &&
+          prev.timestamp == line.timestamp &&
+          line.text.isNotEmpty &&
+          line.text != '\u00A0') {
+        if (prev.translation == null || prev.translation!.isEmpty) {
+          out[out.length - 1] = _LyricLine(
+            timestamp: prev.timestamp,
+            text: prev.text,
+            translation: line.text,
+            roma: prev.roma,
+          );
+        } else if (prev.roma == null || prev.roma!.isEmpty) {
+          out[out.length - 1] = _LyricLine(
+            timestamp: prev.timestamp,
+            text: prev.text,
+            translation: prev.translation,
+            roma: line.text,
+          );
+        }
+        // 第 4 行及以后无槽位，直接丢弃
+        continue;
+      }
+      out.add(line);
+    }
+    _parsedLyrics = out;
   }
 
   /// 将统一歌词模型中的翻译/罗马音合并到原有 MD3 主行。
@@ -351,8 +400,10 @@ class LyricsViewState extends State<LyricsView> {
       if (bestIndex < 0) continue;
       used.add(bestIndex);
       final source = metadata[bestIndex];
-      line.translation = source.translation;
-      line.roma = source.roma;
+      // 保留本文件解析出的副行：metadata 对应字段为 null 时不要覆盖。
+      // （_parsedLyrics 每次重建，原本即为 null，该判断不改变既有行为）
+      if (source.translation != null) line.translation = source.translation;
+      if (source.roma != null) line.roma = source.roma;
     }
   }
 
@@ -432,20 +483,50 @@ class LyricsViewState extends State<LyricsView> {
     // 行间留白：把单行行距补足到 fontSize * lineSpacing（不足则为 0）
     final spacingExtra = fontSize * (_prefs.lineSpacing - wrapHeight);
     final safeSpacing = spacingExtra > 0 ? spacingExtra : 0.0;
-    _lineHeights = List<double>.generate(n, (i) {
-      final text = _parsedLyrics[i].text.isEmpty
+    final bool balanced = _prefs.lineBalance;
+    final TextStyle mainStyle = TextStyle(
+      fontSize: fontSize,
+      height: wrapHeight,
+      // 用当前行字重测量（当前行字重 >= 非当前行，可保证所有行不截断）
+      fontWeight: _prefs.fontWeight,
+      fontFamily: fontFamily,
+    );
+    final TextStyle auxStyle = TextStyle(
+      fontSize: _auxiliaryFontSize(fontSize),
+      height: _auxiliaryLineHeight,
+      fontWeight: _prefs.otherFontWeight,
+      fontFamily: fontFamily,
+    );
+    // 平衡开关开启时，把 DP 断点落成硬换行；关闭时保持原文交给 Text 自动换行
+    _displayTexts = List<String>.generate(n, (i) {
+      final String raw = _parsedLyrics[i].text.isEmpty
           ? '...'
           : _parsedLyrics[i].text;
+      if (!balanced) return raw;
+      return LyricWrapPlanner.forText(
+        raw,
+        mainStyle,
+        width,
+        balanced: true,
+      ).rowTexts.join('\n');
+    });
+    _auxDisplayTexts = List<String?>.generate(n, (i) {
+      final String? aux = _selectedAuxiliaryText(_parsedLyrics[i]);
+      if (aux == null) return null;
+      if (!balanced) return aux;
+      return LyricWrapPlanner.forText(
+        aux,
+        auxStyle,
+        width,
+        balanced: true,
+      ).rowTexts.join('\n');
+    });
+    _lineHeights = List<double>.generate(n, (i) {
+      final text = _displayTexts[i];
       final painter = TextPainter(
         text: TextSpan(
           text: text,
-          style: TextStyle(
-            fontSize: fontSize,
-            height: wrapHeight,
-            // 用当前行字重测量（当前行字重 >= 非当前行，可保证所有行不截断）
-            fontWeight: _prefs.fontWeight,
-            fontFamily: fontFamily,
-          ),
+          style: mainStyle,
         ),
         textDirection: TextDirection.ltr,
       )..layout(maxWidth: width);
@@ -453,18 +534,13 @@ class LyricsViewState extends State<LyricsView> {
         0,
         (sum, m) => sum + m.height,
       );
-      final auxiliaryText = _selectedAuxiliaryText(_parsedLyrics[i]);
+      final auxiliaryText = _auxDisplayTexts[i];
       var auxiliaryHeight = 0.0;
       if (auxiliaryText != null) {
         final auxiliaryPainter = TextPainter(
           text: TextSpan(
             text: auxiliaryText,
-            style: TextStyle(
-              fontSize: _auxiliaryFontSize(fontSize),
-              height: _auxiliaryLineHeight,
-              fontWeight: _prefs.otherFontWeight,
-              fontFamily: fontFamily,
-            ),
+            style: auxStyle,
           ),
           textDirection: TextDirection.ltr,
         )..layout(maxWidth: width);
@@ -535,7 +611,8 @@ class LyricsViewState extends State<LyricsView> {
     final colorScheme = Theme.of(context).colorScheme;
     final prefs = _prefs;
     final fontSize = prefs.fontSize;
-    final otherFontSize = (fontSize - 3).clamp(10.0, fontSize);
+    // 非当前行仍是歌词内容，下限取 12（与 LyricLayout 的可读下限一致）
+    final otherFontSize = (fontSize - 3).clamp(12.0, fontSize);
     final fontFamily = prefs.effectiveFontFamily;
 
     // 排除全局 UI 缩放，歌词保持原始大小
@@ -613,7 +690,9 @@ class LyricsViewState extends State<LyricsView> {
                             height: _wrapLineHeight,
                           ),
                           child: Text(
-                            line.text.isEmpty ? '...' : line.text,
+                            index < _displayTexts.length
+                                ? _displayTexts[index]
+                                : (line.text.isEmpty ? '...' : line.text),
                             textAlign: TextAlign.center,
                             // 不截断：英文原词+翻译超长时完整换行显示
                           ),
@@ -624,7 +703,10 @@ class LyricsViewState extends State<LyricsView> {
                               top: auxiliaryFontSize * 0.25,
                             ),
                             child: Text(
-                              auxiliaryText,
+                              index < _auxDisplayTexts.length &&
+                                      _auxDisplayTexts[index] != null
+                                  ? _auxDisplayTexts[index]!
+                                  : auxiliaryText,
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 fontSize: auxiliaryFontSize,

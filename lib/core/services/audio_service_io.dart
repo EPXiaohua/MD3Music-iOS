@@ -1355,9 +1355,12 @@ UriAudioSource createAudioSource({
   String? artist,
   String? album,
   Uri? artUri,
+  Map<String, String>? headers,
 }) {
   return AudioSource.uri(
     Uri.parse(url),
+    // 远程歌曲（WebDAV）的鉴权头，经 just_audio 本地代理附加到播放请求
+    headers: headers,
     tag: {
       'id': id,
       'title': title,

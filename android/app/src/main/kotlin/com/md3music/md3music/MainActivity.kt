@@ -3,6 +3,7 @@ package com.md3music.md3music
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PictureInPictureParams
+import android.app.UiModeManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.Context
@@ -30,6 +31,31 @@ import io.flutter.plugin.common.MethodChannel
 import com.md3music.md3music.AudioPlaybackService
 import com.md3music.md3music.FloatingLyricService
 import java.io.File
+
+/// MethodChannel Int 参数的 Number 安全读取。
+///
+/// Dart 的 ARGB 颜色（如 0xFFFF00FF = 4294901751）超出 Int32，经
+/// StandardMessageCodec 到 Java 侧是 **Long**（UINT32 解码为 `& 0xffffffffL`）。
+/// `call.argument<Int>` 对 Long 会 ClassCastException → 返回 null，
+/// putExtra 被静默跳过 —— 这就是「App 设置页改颜色，悬浮窗不同步」的根因
+/// （字号/不透明度等小整数不受影响）。统一按 Number 读再转 Int。
+private fun MethodCall.intArg(key: String): Int? =
+    (argument<Any?>(key) as? Number)?.toInt()
+
+/// 滑块震动的原生闸门，由 Dart 侧 AppHaptics 下发（见 setSliderEnabled）。
+///
+/// m3e_core 的滑条震动不经我们的 Dart 封装，它自己直连 m3e_haptics/haptics 通道，
+/// 所以「滑块调节」的开关与类型覆盖都只能在这一侧生效。放进程级 object 而非
+/// Activity 字段：引擎复用路径下 configureFlutterEngine 会再次执行，字段会被重置成
+/// 默认值，而 Dart 不会重新下发，闸门就会悄悄失效。
+private object HapticsGate {
+    @Volatile
+    var sliderEnabled: Boolean = true
+
+    /// 非空时覆盖 m3e 传来的 type（轻点/刻度/重击/双击/长按）；空则用 m3e 自己的类型。
+    @Volatile
+    var sliderType: String? = null
+}
 
 class MainActivity : FlutterActivity() {
     private val FLOATING_CHANNEL = "com.md3music.md3music/floating_lyric"
@@ -82,6 +108,7 @@ class MainActivity : FlutterActivity() {
         @Volatile private var equalizerPlugin: EqualizerPlugin? = null
         @Volatile private var usbAudioPlugin: UsbAudioPlugin? = null
         @Volatile private var directPcmPlugin: DirectPcmPlugin? = null
+        @Volatile private var musicHapticsPlugin: MusicHapticsPlugin? = null
 
         /** Activity 与 headless 服务共用自定义播放插件，避免缺 handler 和重复USB接收器。 */
         @Synchronized
@@ -92,6 +119,7 @@ class MainActivity : FlutterActivity() {
             runCatching { equalizerPlugin?.cleanup() }
             runCatching { usbAudioPlugin?.cleanup() }
             runCatching { directPcmPlugin?.cleanup() }
+            runCatching { musicHapticsPlugin?.cleanup() }
             customPluginsEngine = engine
 
             EqualizerPlugin().also {
@@ -101,14 +129,23 @@ class MainActivity : FlutterActivity() {
             // 蝰蛇母带通道：将母带设置与十段均衡器增益发送到 just_audio 处理链。
             ViperDspPlugin().register(engine)
             spectrumPlugin = SpectrumPlugin().also { it.register(engine) }
-            UsbAudioPlugin(context).also {
+            // 音乐节奏震动：预构建 VibrationEffect 缓存 + 专用线程点火
+            MusicHapticsPlugin(context).also {
                 it.register(engine)
-                usbAudioPlugin = it
+                musicHapticsPlugin = it
             }
-            // 系统 Direct PCM 档（走系统 AudioTrack 的 bit-perfect 路径，与 USB 独占互斥）
-            DirectPcmPlugin(context).also {
-                it.register(engine)
-                directPcmPlugin = it
+            // TV 版不编入 USB 独占/Direct PCM（BuildConfig.FEATURE_TV=false 跳过注册；
+            // release 由 R8 剥离未引用类）。类字段保留（cleanup 空跑无害）。
+            if (!BuildConfig.FEATURE_TV) {
+                UsbAudioPlugin(context).also {
+                    it.register(engine)
+                    usbAudioPlugin = it
+                }
+                // 系统 Direct PCM 档（走系统 AudioTrack 的 bit-perfect 路径，与 USB 独占互斥）
+                DirectPcmPlugin(context).also {
+                    it.register(engine)
+                    directPcmPlugin = it
+                }
             }
             ExternalEditorPlugin(context).register(engine)
             DiagnosticLogPlugin().register(engine)
@@ -122,10 +159,12 @@ class MainActivity : FlutterActivity() {
             runCatching { equalizerPlugin?.cleanup() }
             runCatching { usbAudioPlugin?.cleanup() }
             runCatching { directPcmPlugin?.cleanup() }
+            runCatching { musicHapticsPlugin?.cleanup() }
             spectrumPlugin = null
             equalizerPlugin = null
             usbAudioPlugin = null
             directPcmPlugin = null
+            musicHapticsPlugin = null
             customPluginsEngine = null
         }
 
@@ -387,6 +426,26 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        // 设备形态查询：TV 构建下 RemoteControlProvider 用 uiMode 判定是否 TV 设备。
+        // 仅 FEATURE_TV 时注册（正常构建 Dart 侧无调用方）。
+        if (BuildConfig.FEATURE_TV) {
+            MethodChannel(
+                flutterEngine.dartExecutor.binaryMessenger,
+                "com.md3music.md3music/device_form",
+            ).setMethodCallHandler { call, result ->
+                if (call.method == "isTv") {
+                    val uiModeManager =
+                        getSystemService(Context.UI_MODE_SERVICE) as UiModeManager
+                    result.success(
+                        uiModeManager.currentModeType ==
+                            Configuration.UI_MODE_TYPE_TELEVISION
+                    )
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
+
         // 3D 封面：Depth Anything V2 ORT 推理 + 3 层切割（背景/中景/前景，带 alpha）
         // 3D 深度封面插件仅存在于 depth3d flavor（standard 包无此类、无 onnxruntime so）。
         // 用反射注册保持 MainActivity 对两个 flavor 通用；找不到类时静默跳过。
@@ -526,20 +585,35 @@ class MainActivity : FlutterActivity() {
                         call.argument<Boolean>(FloatingLyricService.EXTRA_DOUBLE_LINE)?.let {
                             putExtra(FloatingLyricService.EXTRA_DOUBLE_LINE, it)
                         }
-                        call.argument<Int>(FloatingLyricService.EXTRA_OPACITY)?.let {
+                        call.intArg(FloatingLyricService.EXTRA_OPACITY)?.let {
                             putExtra(FloatingLyricService.EXTRA_OPACITY, it)
                         }
                         call.argument<Boolean>(FloatingLyricService.EXTRA_LOCKED)?.let {
                             putExtra(FloatingLyricService.EXTRA_LOCKED, it)
                         }
-                        call.argument<Int>(FloatingLyricService.EXTRA_GRADIENT_START)?.let {
+                        call.intArg(FloatingLyricService.EXTRA_GRADIENT_START)?.let {
                             putExtra(FloatingLyricService.EXTRA_GRADIENT_START, it)
                         }
-                        call.argument<Int>(FloatingLyricService.EXTRA_GRADIENT_END)?.let {
+                        call.intArg(FloatingLyricService.EXTRA_GRADIENT_END)?.let {
                             putExtra(FloatingLyricService.EXTRA_GRADIENT_END, it)
                         }
-                        call.argument<Int>(FloatingLyricService.EXTRA_UNPLAYED_COLOR)?.let {
+                        call.intArg(FloatingLyricService.EXTRA_UNPLAYED_COLOR)?.let {
                             putExtra(FloatingLyricService.EXTRA_UNPLAYED_COLOR, it)
+                        }
+                        call.intArg(FloatingLyricService.EXTRA_COLOR_MODE)?.let {
+                            putExtra(FloatingLyricService.EXTRA_COLOR_MODE, it)
+                        }
+                        call.intArg(FloatingLyricService.EXTRA_PRESET_INDEX)?.let {
+                            putExtra(FloatingLyricService.EXTRA_PRESET_INDEX, it)
+                        }
+                        call.intArg(FloatingLyricService.EXTRA_CUSTOM_GRAD_START)?.let {
+                            putExtra(FloatingLyricService.EXTRA_CUSTOM_GRAD_START, it)
+                        }
+                        call.intArg(FloatingLyricService.EXTRA_CUSTOM_GRAD_END)?.let {
+                            putExtra(FloatingLyricService.EXTRA_CUSTOM_GRAD_END, it)
+                        }
+                        call.intArg(FloatingLyricService.EXTRA_CUSTOM_UNPLAYED)?.let {
+                            putExtra(FloatingLyricService.EXTRA_CUSTOM_UNPLAYED, it)
                         }
                     }
                     startService(intent)
@@ -955,6 +1029,10 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // 图片保存到相册（长按评论图片保存）：UI 引擎专用，不需要注册到播放服务的
+        // headless 引擎（那里没有查看器界面），故只在这里注册一次。
+        ImageSaverPlugin(this).register(flutterEngine)
+
         // 注册桌面小组件 MethodChannel：Flutter 侧推送播放状态到 AppWidget
         HomeWidgetChannel.register(this, flutterEngine.dartExecutor.binaryMessenger)
 
@@ -1040,6 +1118,12 @@ class MainActivity : FlutterActivity() {
         hapticsChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "vibrate" -> handleHapticVibrate(call, result)
+                "setSliderEnabled" -> {
+                    HapticsGate.sliderEnabled =
+                        call.argument<Boolean>("enabled") ?: true
+                    HapticsGate.sliderType = call.argument<String>("type")
+                    result.success(true)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -1050,7 +1134,12 @@ class MainActivity : FlutterActivity() {
         )
         m3eHapticsChannel.setMethodCallHandler { call, result ->
             when (call.method) {
-                "vibrate" -> handleHapticVibrate(call, result)
+                // 拦住时回 success(true) 而非 error：m3e 的 applyTypedHaptic 只在
+                // error 时回落 HapticFeedback，那样马达又被另一条路径驱动了。
+                "vibrate" ->
+                    if (HapticsGate.sliderEnabled)
+                        handleHapticVibrate(call, result, HapticsGate.sliderType)
+                    else result.success(true)
                 else -> result.notImplemented()
             }
         }
@@ -1065,8 +1154,14 @@ class MainActivity : FlutterActivity() {
     ///
     /// 注意：VibrationEffect 仅在 API 29+ 存在，所有相关引用都收敛在 SDK 守卫分支内，
     /// 低版本设备不会执行到（否则触发 NoClassDefFoundError）。
-    private fun handleHapticVibrate(call: MethodCall, result: MethodChannel.Result) {
-        val type = call.argument<String>("type") ?: ""
+    private fun handleHapticVibrate(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        typeOverride: String? = null,
+    ) {
+        // 交互震动优先：通知音乐震动让位（两者共用同一个 Vibrator，是单通道）
+        MusicHapticsPlugin.noteInteraction()
+        val type = typeOverride ?: call.argument<String>("type") ?: ""
         val amplitude = call.argument<Double>("amplitude") ?: 0.5
         // 未知 type：直接返回 false（让 Dart 走 fallback），不触发马达
         val knownTypes = setOf(
@@ -1285,14 +1380,8 @@ class MainActivity : FlutterActivity() {
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         // 引擎接管时先解绑旧 Activity，再绑定新 Activity。不能等旧 onDestroy
         // 才清理共享引用，否则会把新 Activity 刚注册的通道一并清空。
-        if (isFinishing && !isChangingConfigurations &&
-            FlutterEngineCache.getInstance().get("md3music_engine") === flutterEngine
-        ) {
-            // 最近任务移除会结束当前媒体会话；不要把随后 detach 的 UI 引擎留在进程缓存，
-            // 否则用户重新打开时可能把已脱离 JNI 的引擎交给 FlutterView。
-            FlutterEngineCache.getInstance().remove("md3music_engine")
-            Log.i("MainActivity", "removed cached FlutterEngine after finishing activity")
-        }
+        // 米窗关闭可能结束 Activity，但后台音频仍持有当前引擎。
+        // 保留缓存供重开接管；失效引擎由 provideFlutterEngine 的 JNI 校验排除。
         firstFrameListener?.let { flutterEngine.renderer.removeIsDisplayingFlutterUiListener(it) }
         firstFrameListener = null
         // 释放 Visualizer，保留引擎插件引用，供后续 Activity 继续使用和清理。

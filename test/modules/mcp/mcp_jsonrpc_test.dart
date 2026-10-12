@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/modules/mcp/mcp_jsonrpc.dart';
+import 'package:md3music/modules/mcp/mcp_prompt.dart';
+import 'package:md3music/modules/mcp/mcp_resource.dart';
 import 'package:md3music/modules/mcp/mcp_tool.dart';
 
 McpDispatcher _dispatcher({bool readOnly = false}) {
@@ -131,6 +133,164 @@ void main() {
     test('optionalInt 缺失时回落默认值', () {
       expect(optionalInt(<String, Object?>{}, 'k', fallback: 10), 10);
       expect(optionalInt(<String, Object?>{'k': 3}, 'k', fallback: 10), 3);
+    });
+  });
+
+  group('resources', () {
+    test('resources/list 列出全部资源', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: [
+          McpResource(
+            uri: 'md3://player/state',
+            name: '播放器状态',
+            description: '当前播放状态 JSON',
+            mimeType: 'application/json',
+            read: () async => '{}',
+          ),
+        ],
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'resources/list',
+      });
+      final list = (res as Map)['result']['resources'] as List;
+      expect((list.first as Map)['uri'], 'md3://player/state');
+    });
+
+    test('resources/read 返回 contents 文本', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: [
+          McpResource(
+            uri: 'md3://x',
+            name: 'x',
+            description: 'd',
+            mimeType: 'text/plain',
+            read: () async => 'hello',
+          ),
+        ],
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': 2,
+        'method': 'resources/read',
+        'params': {'uri': 'md3://x'},
+      });
+      final contents = (res as Map)['result']['contents'] as List;
+      expect((contents.first as Map)['text'], 'hello');
+    });
+
+    test('resources/read 未知 uri 报 -32002', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: const [],
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': 3,
+        'method': 'resources/read',
+        'params': {'uri': 'md3://nope'},
+      });
+      expect((res as Map)['error']['code'], -32002);
+    });
+
+    test('initialize capabilities 带 resources 与 prompts', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        // 注：计划原文此处写 `resources: const []` 却断言 capabilities 带
+        // resources，与实现（非空才声明）自相矛盾；按测试名语义改为带一个资源。
+        resources: [
+          McpResource(
+            uri: 'md3://player/state',
+            name: '播放器状态',
+            description: 'd',
+            mimeType: 'application/json',
+            read: () async => '{}',
+          ),
+        ],
+        prompts: buildMcpPrompts(),
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': 4,
+        'method': 'initialize',
+        'params': {
+          'protocolVersion': '2025-06-18',
+          'capabilities': {},
+          'clientInfo': {'name': 't', 'version': '0'},
+        },
+      });
+      final caps = (res as Map)['result']['capabilities'] as Map;
+      expect(caps.containsKey('resources'), isTrue);
+      expect(caps.containsKey('prompts'), isTrue);
+    });
+
+    test('jsonEncode 一次完整信封（防回归）', () async {
+      // 保证 handle 输出可直接 jsonEncode（信封形状不回归）。
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: const [],
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0', 'id': 5, 'method': 'ping',
+      });
+      expect(jsonEncode(res), contains('"result"'));
+    });
+  });
+
+  group('prompts', () {
+    test('prompts/list 与 prompts/get', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: const [],
+        prompts: buildMcpPrompts(),
+      );
+      final list = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0', 'id': 1, 'method': 'prompts/list',
+      });
+      final names = ((list as Map)['result']['prompts'] as List)
+          .map((p) => (p as Map)['name'])
+          .toList();
+      expect(names, contains('sleep_assistant'));
+
+      final got = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0', 'id': 2, 'method': 'prompts/get',
+        'params': {
+          'name': 'sleep_assistant',
+          'arguments': {'minutes': '45'},
+        },
+      });
+      final messages = (got as Map)['result']['messages'] as List;
+      expect(((messages.first as Map)['content'] as Map)['text'], contains('45'));
+    });
+
+    test('prompts/get 未知模板报 InvalidParams', () async {
+      final dispatcher = McpDispatcher(
+        serverName: 'MD3Music',
+        serverVersion: 'test',
+        tools: McpToolRegistry(const []),
+        resources: const [],
+        prompts: buildMcpPrompts(),
+      );
+      final res = await dispatcher.handle(<String, dynamic>{
+        'jsonrpc': '2.0', 'id': 3, 'method': 'prompts/get',
+        'params': {'name': 'nope'},
+      });
+      expect((res as Map)['error']['code'], -32602);
     });
   });
 }

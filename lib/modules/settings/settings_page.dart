@@ -13,51 +13,69 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../core/services/usb_audio_service.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/platform_capabilities.dart';
 import '../../core/layout/page_title_alignment.dart';
 import '../../core/layout/ui_density.dart';
+import '../../core/remote/remote_slider.dart';
 import '../../core/services/audio_service_io.dart';
 import '../../core/services/volume_normalization_service.dart';
 import '../../core/services/background_image_loader.dart';
 import '../../core/widgets/app_background.dart' show kDefaultWallpaperAsset;
 import '../../core/services/custom_font_loader.dart';
 import '../../core/utils/app_toast.dart';
+import '../../core/utils/app_haptics.dart';
+import '../../core/utils/app_text_context_menu.dart';
 import '../../core/services/desktop_lyric_service.dart';
 import '../../core/services/equalizer_service.dart';
 import '../../core/services/viper_master_service.dart';
 import '../../core/services/listen_report_service.dart';
+import '../../core/services/play_history_sync_service.dart';
 import '../../core/services/lyricon_provider_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/services/media_store_service.dart';
 import '../../core/services/spectrum_service.dart';
+import '../../core/services/music_haptics_service.dart';
 import '../../core/services/startup_auto_play.dart';
 import '../../core/services/wakelock_service.dart';
 import '../../core/services/diagnostic_exporter.dart';
 import '../../core/layout/responsive_layout.dart';
+import '../../widgets/player_seek_bar.dart';
+import '../../widgets/tv_dropdown_menu.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../data/repositories/settings_repository.dart';
+import '../../data/repositories/song_match_repository.dart';
+import '../../providers/song_match_provider.dart';
+import '../coverflow/coverflow_source.dart';
 import '../onboarding/onboarding_page.dart';
 import '../onboarding/user_agreement_page.dart';
 import '../update/update_check_service.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
+import '../../providers/remote_control_provider.dart';
 import '../../providers/shortcut_config_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_server.dart';
 import '../../services/depth_cover_service.dart';
 import '../../core/services/depth_cover_feature.dart';
 import '../../utils/landscape_immersive.dart';
+import '../../widgets/player_top_bar_actions.dart';
+import '../../widgets/player_top_bar_tab_dots.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
+import '../../widgets/md3_lyric_preferences.dart';
 import 'lyric_animation_settings_page.dart';
 import '../../widgets/seed_color_picker.dart';
 import '../../widgets/usb_exclusive_section.dart';
 import '../player/mini_player.dart';
 import '../player/car_mode_layout.dart';
 import '../player/car_mode_panel.dart';
+import '../player/player_cover_shadow.dart';
 import '../../providers/car_mode_provider.dart';
 import '../sound/sounds_page.dart';
 import 'equalizer_settings_page.dart';
+import 'desktop_lyric_settings_panel.dart';
 import 'settings_group_heading.dart';
 import 'settings_navigation.dart';
 import 'settings_two_pane.dart';
@@ -71,6 +89,30 @@ import 'settings_search_index.g.dart';
 const String kBuildAppVersion = String.fromEnvironment(
   'APP_VERSION',
   defaultValue: '4.0.0',
+);
+
+/// 设置类滑块统一的触感配置：**档位式**（discrete）而非连续式。
+///
+/// M3ESlider 在 `divisions == null` 时默认取 `M3EHapticConfig.continuous()`
+/// （10ms 最小间隔 + 2% 阈值），拖动中会以最高约 100 次/秒走 MethodChannel
+/// 触发 vibrate —— 真机上马达饱和且通道洪泛。凡是带 divisions 的设置滑块
+/// 都要显式声明本配置。
+const M3ESliderDecoration kSettingsSliderDecoration = M3ESliderDecoration(
+  haptic: M3EHapticFeedback.medium,
+  hapticConfig: M3EHapticConfig.discrete(),
+);
+
+/// 无极（无节点）滑块的触感配置：保留拖动中的连续反馈，但限流到约 16 次/秒
+/// （`minimumDragInterval` 60ms + `deltaProgressForDragThreshold` 5%）。
+/// 直接用 `M3EHapticConfig.continuous()` 是 10ms + 2%，即最高约 100 次/秒
+/// 走 MethodChannel 触发 vibrate —— 与 discrete 档同一个马达饱和/通道洪泛坑。
+const M3ESliderDecoration kFreeSliderDecoration = M3ESliderDecoration(
+  haptic: M3EHapticFeedback.medium,
+  hapticConfig: M3EHapticConfig(
+    enableContinuousDrag: true,
+    deltaProgressForDragThreshold: 0.05,
+    minimumDragInterval: Duration(milliseconds: 60),
+  ),
 );
 
 class SettingsPage extends StatefulWidget {
@@ -103,8 +145,9 @@ class _SettingsPageState extends State<SettingsPage>
   // 蝰蛇母带音源档位（实验功能，默认关闭）
   bool _viperTapeQualityEnabled = false;
   bool _autoReceiveVip = true;
-  // 上传听歌时长（听歌等级累计上报）开关（默认关闭，用户主动开启才累计/上报）
-  bool _uploadListeningDuration = false;
+  // 「听歌数据云同步」开关（默认开启：云端播放历史上传 + CSCC 真实播放上报
+  // + 听歌等级累计，一个开关总控；显式关闭过的用户保持关闭）
+  bool _uploadListeningDuration = true;
   // 新版本提醒开关（默认开启，关闭后启动时不再查询 GitHub Release）
   bool _updateReminderEnabled = true;
   // 还原旧版桌面图标（默认沿用当前图标，仅 Android 提供）
@@ -135,11 +178,14 @@ class _SettingsPageState extends State<SettingsPage>
   bool _lyricDynamicColor = true;
   // 辉光触发阈值系数（默认 1.6，范围 1.0~2.0）：触发阈值 = 歌词字长中位数 × 该系数
   double _glowThresholdFactor = 1.6;
+  // 平衡行换行：AM / MD 各一套独立偏好（key 不同，互不影响）
+  bool _lyricLineBalanceAm = true;
+  bool _lyricLineBalanceMd3 = true;
   String _appVersion = '';
   // 实时歌词推送协议选择（三选一 + 关闭）
   String _lyricPushProtocol = 'none';
-  // LyricInfo 协议下的 ColorOS Bridge 兼容模式（默认关闭）
-  bool _lyricInfoColorOs = false;
+  // LyricInfo 协议下的 ColorOS Bridge 兼容模式（默认开启）
+  bool _lyricInfoColorOs = true;
   // 共用偏好：翻译 / 罗马音 / 优先翻译（同时存在时）
   bool _lyricPushTranslation = true;
   bool _lyricPushRoma = false;
@@ -154,6 +200,14 @@ class _SettingsPageState extends State<SettingsPage>
   bool _dynamicAlbumCoverOnMobile = false;
   // 全屏播放器横屏自动隐藏系统栏开关（默认开启）
   bool _landscapeImmersiveEnabled = true;
+  // 宽屏（横屏/平板）播放详情页「横屏控制面板独立页」开关（默认关闭 = 常驻控制带）
+  bool _landscapeDetachedControls = false;
+  // 顶栏「胶囊按钮收缩」开关（默认开启）：竖屏把睡眠定时 / 一起听与 ⋯ 合成一颗
+  // 只露图标的胶囊。与上面的宽屏开关无关，两个方向各自独立生效。
+  bool _topBarPillCollapse = true;
+  // 页签圆点位置开关（默认关闭）：关闭 = 圆点留在底部页签条（原形态），
+  // 开启 = 竖屏顶栏中央那排圆点。只影响竖屏，宽屏圆点恒在右栏底部。
+  bool _topBarTabDots = false;
   // 音质降级提示开关（默认关闭）：所选音质不可用自动降级时弹出提示
   bool _showQualityDowngradeToast = false;
   // 记忆播放状态开关（默认开启）：冷启动恢复上次播放的歌曲与进度
@@ -175,6 +229,9 @@ class _SettingsPageState extends State<SettingsPage>
   bool _bluetoothLyricEnabled = false;
   // 蓝牙歌词封面压缩开关：默认关闭（不压缩，保持原始封面质量）
   bool _bluetoothLyricCompressArt = false;
+  // 全屏播放器封面的投影强度：0 = 关闭，1 = 最浓。
+  // 缺省值与 PlayerCoverShadow.defaultIntensity 一致（两边各存一份是本仓惯例）。
+  double _coverShadowStrength = 0.7;
   // 3D 封面（深度视差）总开关：默认关闭（模型需在设置页导入）
   bool _depthCoverEnabled = false;
   // 3D 封面视差强度：背景层最大平移像素，0 = 不动
@@ -239,6 +296,9 @@ class _SettingsPageState extends State<SettingsPage>
   /// MV 弹幕开关（设置页与播放页浮层按钮共用同一个持久化 key）。
   bool _mvDanmakuEnabled = false;
 
+  /// 歌曲弹幕开关（播放页弹幕层总开关，默认关闭）。
+  bool _songDanmakuEnabled = false;
+
   /// MV 弹幕透明度（0.1–1.0）。用状态字段而非 FutureBuilder：
   /// FutureBuilder 每次 setState 都会新建 Future → 拖动时值会被旧快照覆盖（回弹）。
   double _mvDanmakuOpacity = 1.0;
@@ -254,17 +314,45 @@ class _SettingsPageState extends State<SettingsPage>
   // 「关闭本地音乐评论区」开关（默认开启）：开启后本地歌曲不显示评论 tab，
   // 也不提供「看评论」入口
   bool _closeLocalMusicComments = true;
+  // 「自动匹配在线信息」开关（默认开启）：开启后为本地歌曲自动搜索匹配
+  // 在线歌曲，补充封面兜底/歌词精确检索/评论区
+  bool _autoMatchOnlineInfo = true;
   // 歌词双击跳转开关（默认关闭，开启后需双击歌词才能跳转位置）
   bool _lyricDoubleTapToJump = false;
-  // 桌面布局（侧栏 + 顶部工具栏）总开关：默认关闭，开启后无论横竖屏都用桌面外壳
-  bool _desktopModeEnabled = false;
-  // 悬浮迷你播放器（二级页面底部悬浮播放条）总开关：默认关闭
-  bool _secondaryPlayerEnabled = false;
+  // 桌面布局（侧栏外壳）总开关不再走本页本地字段：设置 tile 直读全局判定源
+  // kDesktopModeEnabled（唯一真值），与悬浮播放器同一模式。
+  //
+  // 此前保留本地 `_desktopModeEnabled`，导致它与全局源各自独立：
+  // app.dart 冷启动写全局源、本页 _loadSettings 写本地字段，任一路径只更新
+  // 其中一个，开关就会与实际生效状态相反（用户实际开着桌面布局、
+  // 设置页却显示为关），且没有任何机制把两者拉回一致。
+  // 预测性返回手势（predictive back）总开关：默认关闭
+  bool _predictiveBackEnabled = false;
+  // 歌单封面连贯过渡（列表卡片封面飞向详情页头）总开关：默认开启
+  bool _playlistCoverTransition = true;
+  // 悬浮播放器的进度指示（沿胶囊内缘包边一圈）：默认开启
+  bool _secondaryPlayerProgress = true;
+  // 一级页面是否也用悬浮底栏（false = 一级页面退回底部常驻条）：默认开启
+  bool _secondaryPlayerOnPrimary = true;
+  // 二级页面（及以后）是否收起底部导航栏：默认开启（隐藏底栏）
+  bool _hideNavBarOnSecondary = true;
+  // 封面流歌单源下拉条目。**必须是稳定实例**：M3EDropdownMenu.didUpdateWidget
+  // 以列表同一性判断是否 setItems，每次 build 新建列表会触发 build 期间回调
+  // 互递归（真机 ANR，2026-09-29，同类注释见 comments_view）；选中态由菜单
+  // 内部维护，此列表只提供初始选中——外部改源（启动载入）发生在本页可交互前。
+  late final List<M3EDropdownItem<CoverFlowSource>> _coverFlowSourceItems = [
+    for (final source in CoverFlowSource.values)
+      M3EDropdownItem(
+        label: source.label,
+        value: source,
+        selected: source == kCoverFlowSource.value,
+      ),
+  ];
   // 自定义背景图片（全局界面背景）；默认关闭，未选择图片时回落到内置默认壁纸
   bool _useBackgroundImage = false;
   String? _backgroundImagePath;
   double _backgroundBlur = 20.0;
-  // AM 播放页背景模糊（sigma 0~30，默认 30；仅动态流光关闭时渲染/显示）
+  // AM 播放页背景模糊（sigma 0~200，默认 30；仅动态流光关闭时渲染/显示）
   double _amPlayerBlur = 30.0;
   double _backgroundOpacity = 0.2;
   // 按背景图莫奈取色（默认开启）
@@ -273,8 +361,12 @@ class _SettingsPageState extends State<SettingsPage>
   bool _useTextShadow = false;
   // 文字阴影磅数（阴影模糊半径）
   double _textShadowBlur = AppTheme.defaultTextShadowBlur;
+  // 播放页进度条波浪起伏开关（默认开启；关闭即回退到直线形态）
+  bool _seekBarWaveEnabled = true;
   // 音乐频谱环绕显示开关（默认关闭，Android / iOS 生效）
   bool _spectrumEnabled = false;
+  // Visualizer 兜底（默认关闭，仅 Android 生效）：见 SettingsRepository 注释
+  bool _spectrumVisualizerFallback = false;
   // 频谱柱数量（20~80，默认 40）
   int _spectrumBandCount = 40;
   // 频谱样式：0=柱状图(环绕)，1=曲线(环绕)，2=背景层(条形)
@@ -287,6 +379,14 @@ class _SettingsPageState extends State<SettingsPage>
   double _spectrumCurveOpacity = 1.0;
   // 频谱动态取色独立开关（默认开启）：AM 播放器频谱颜色取封面主色 50/50 混合
   bool _spectrumDynamicColor = true;
+  // 音乐节奏震动（默认关闭）
+  bool _musicHapticsEnabled = false;
+  double _musicHapticsStrength = 0.8;
+  double _musicHapticsSensitivity = 1.0;
+  String _musicHapticsWaveform = 'auto';
+  bool _musicHapticsSnare = true;
+  int _musicHapticsOffset = 580;
+  String _musicHapticsScope = 'playerPage';
   // 设置搜索：输入框控制器 + 当前查询词
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
@@ -306,11 +406,13 @@ class _SettingsPageState extends State<SettingsPage>
     );
     _loadSettings();
     _loadVersion();
-    _loadLyricPushSettings();
+    if (!kTvBuild) _loadLyricPushSettings();
     _loadAndroidSdkVersion();
     _loadFlymeStatusBarLyric();
     _initEnable32bit();
-    LyriconProviderService.instance.addListener(_onLyriconStateChanged);
+    if (!kTvBuild) {
+      LyriconProviderService.instance.addListener(_onLyriconStateChanged);
+    }
     // 桌面歌词状态变化（设置页开关 / 播放器长按 / 通知栏按钮）→ 刷新 UI
     DesktopLyricService.instance.addListener(_onDesktopLyricChanged);
   }
@@ -319,7 +421,9 @@ class _SettingsPageState extends State<SettingsPage>
   void dispose() {
     _sectionTransition.dispose();
     _searchController.dispose();
-    LyriconProviderService.instance.removeListener(_onLyriconStateChanged);
+    if (!kTvBuild) {
+      LyriconProviderService.instance.removeListener(_onLyriconStateChanged);
+    }
     DesktopLyricService.instance.removeListener(_onDesktopLyricChanged);
     releaseCarModePanel();
     super.dispose();
@@ -422,7 +526,13 @@ class _SettingsPageState extends State<SettingsPage>
         .read<ThemeProvider>()
         .artistPhotoInterval;
     final artistPhotoOpacity = context.read<ThemeProvider>().artistPhotoOpacity;
-    // 从 ThemeProvider 同步自定义背景图片配置
+    // 本页「启用自定义背景图片」开关的状态，必须读**用户开关本身**
+    // （useBackgroundImage），不能读 isBackgroundImageEffective。
+    //
+    // 两者语义不同：后者额外要求"用户图片文件真实存在"。用户开着开关但还没
+    // 选图时它为 false —— 若拿它驱动开关，开关会被显示成"关"，
+    // 且下方依赖 _useBackgroundImage 的文字阴影 / 自动校准等从属项一并失效。
+    // 2026-10-11误改此处，导致默认壁纸预览不显示。
     final useBackgroundImage = context.read<ThemeProvider>().useBackgroundImage;
     final backgroundImagePath = context
         .read<ThemeProvider>()
@@ -443,6 +553,9 @@ class _SettingsPageState extends State<SettingsPage>
     final depthCoverEnabled = await _settingsRepository.getDepthCoverEnabled();
     final depthCoverStrength = await _settingsRepository
         .getDepthCoverStrength();
+    // 读取封面投影强度（0 = 关闭）
+    final coverShadowStrength = await _settingsRepository
+        .getCoverShadowStrength();
     // 读取 3D 封面 AI 背景修补开关（MI-GAN 神经细化）
     final depthCoverNeuralInpaint = await _settingsRepository
         .getDepthCoverNeuralInpaint();
@@ -475,7 +588,11 @@ class _SettingsPageState extends State<SettingsPage>
     final ignoreAudioFocus = await _settingsRepository.getIgnoreAudioFocus();
     final audioFocusInterruptionMode = await _settingsRepository
         .getAudioFocusInterruptionMode();
+    final seekBarWaveEnabled = await _settingsRepository
+        .getSeekBarWaveEnabled();
     final spectrumEnabled = await _settingsRepository.getSpectrumEnabled();
+    final spectrumVisualizerFallback = await _settingsRepository
+        .getSpectrumVisualizerFallback();
     final spectrumBandCount = await _settingsRepository.getSpectrumBandCount();
     final spectrumStyle = await _settingsRepository.getSpectrumStyle();
     final spectrumBgOpacity = await _settingsRepository.getSpectrumBgOpacity();
@@ -486,6 +603,18 @@ class _SettingsPageState extends State<SettingsPage>
         .getSpectrumCurveOpacity();
     final spectrumDynamicColor = await _settingsRepository
         .getSpectrumDynamicColor();
+    final musicHapticsEnabled = await _settingsRepository
+        .getMusicHapticsEnabled();
+    final musicHapticsStrength = await _settingsRepository
+        .getMusicHapticsStrength();
+    final musicHapticsSensitivity = await _settingsRepository
+        .getMusicHapticsSensitivity();
+    final musicHapticsWaveform = await _settingsRepository
+        .getMusicHapticsWaveform();
+    final musicHapticsSnare = await _settingsRepository.getMusicHapticsSnare();
+    final musicHapticsOffset = await _settingsRepository
+        .getMusicHapticsOffset();
+    final musicHapticsScope = await _settingsRepository.getMusicHapticsScope();
     final miniPlayerSwipeSwitch = await _settingsRepository
         .getMiniPlayerSwipeSwitchEnabled();
     final sortCollectedByLatestClick = await _settingsRepository
@@ -498,6 +627,11 @@ class _SettingsPageState extends State<SettingsPage>
         .getDynamicAlbumCoverOnMobile();
     final landscapeImmersiveEnabled = await _settingsRepository
         .getLandscapeImmersiveEnabled();
+    final landscapeDetachedControls = await _settingsRepository
+        .getLandscapeDetachedControls();
+    final topBarPillCollapse = await _settingsRepository
+        .getTopBarPillCollapse();
+    final topBarTabDots = await _settingsRepository.getTopBarTabDots();
     final showQualityDowngradeToast = await _settingsRepository
         .getShowQualityDowngradeToast();
     final restoreMemoryEnabled = await _settingsRepository
@@ -510,8 +644,12 @@ class _SettingsPageState extends State<SettingsPage>
         .getStartupAutoPlayOpenPage();
     final closeLocalMusicComments = await _settingsRepository
         .getCloseLocalMusicComments();
+    final autoMatchOnlineInfo = await _settingsRepository
+        .getAutoMatchOnlineInfo();
     final mvDanmakuEnabled = await _settingsRepository.getMvDanmakuEnabled();
     final mvDanmakuOpacity = await _settingsRepository.getMvDanmakuOpacity();
+    final songDanmakuEnabled = await _settingsRepository
+        .getSongDanmakuEnabled();
     final updateReminderEnabled = await _settingsRepository
         .getUpdateReminderEnabled();
     final legacyAppIconEnabled = await _settingsRepository
@@ -520,8 +658,16 @@ class _SettingsPageState extends State<SettingsPage>
         .getUpdateLastNotifiedVersion();
     final desktopModeEnabled = await _settingsRepository
         .getDesktopModeEnabled();
-    final secondaryPlayerEnabled = await _settingsRepository
-        .getSecondaryPlayerEnabled();
+    final predictiveBackEnabled = await _settingsRepository
+        .getPredictiveBackEnabled();
+    final playlistCoverTransition = await _settingsRepository
+        .getPlaylistCoverTransitionEnabled();
+    final secondaryPlayerProgress = await _settingsRepository
+        .getSecondaryPlayerProgress();
+    final secondaryPlayerOnPrimary = await _settingsRepository
+        .getSecondaryPlayerOnPrimary();
+    final hideNavBarOnSecondary = await _settingsRepository
+        .getHideNavBarOnSecondaryPages();
     final viperMasterEnabled = await _settingsRepository
         .getViperMasterEnabled();
     final viperTapeQualityEnabled = await _settingsRepository
@@ -537,8 +683,22 @@ class _SettingsPageState extends State<SettingsPage>
       _updateReminderEnabled = updateReminderEnabled;
       _legacyAppIconEnabled = legacyAppIconEnabled;
       _pendingUpdateVersion = pendingUpdateVersion;
-      _desktopModeEnabled = desktopModeEnabled;
-      _secondaryPlayerEnabled = secondaryPlayerEnabled;
+      // 桌面布局改为直读全局判定源，这里同步全局值而非本地字段。
+      // 写全局源而不是仅记日志：app.dart 的启动同步可能尚未跑到
+      // （或被其它入口抢先写过），本页读到持久化值时顺手校正一次，
+      // 保证「唯一真值」名副其实。
+      if (kDesktopModeEnabled.value != desktopModeEnabled) {
+        kDesktopModeEnabled.value = desktopModeEnabled;
+      }
+      debugPrint(
+        '[SettingsPage] desktopModeEnabled=$desktopModeEnabled '
+        '(global=${kDesktopModeEnabled.value})',
+      );
+      _predictiveBackEnabled = predictiveBackEnabled;
+      _playlistCoverTransition = playlistCoverTransition;
+      _secondaryPlayerProgress = secondaryPlayerProgress;
+      _secondaryPlayerOnPrimary = secondaryPlayerOnPrimary;
+      _hideNavBarOnSecondary = hideNavBarOnSecondary;
       _useDynamicColor = useDynamicColor;
       _useCoverSeedColor = useCoverSeedColor;
       _useAmStylePlayer = useAmStylePlayer;
@@ -561,10 +721,13 @@ class _SettingsPageState extends State<SettingsPage>
       _lyricEcoMode = LyricPreferences.instance.ecoMode;
       _lyricDynamicColor = LyricPreferences.instance.useDynamicLyricColor;
       _glowThresholdFactor = LyricPreferences.instance.glowThresholdFactor;
+      _lyricLineBalanceAm = LyricPreferences.instance.lineBalance;
+      _lyricLineBalanceMd3 = Md3LyricPreferences.instance.lineBalance;
       _bluetoothLyricEnabled = bluetoothLyricEnabled;
       _bluetoothLyricCompressArt = bluetoothLyricCompressArt;
       _depthCoverEnabled = depthCoverEnabled;
       _depthCoverStrength = depthCoverStrength;
+      _coverShadowStrength = coverShadowStrength;
       _depthCoverNeuralInpaint = depthCoverNeuralInpaint;
       _depthCacheBytes = depthCacheBytes;
       // 同步全局开关信号（播放页若在场即时响应；播放页 host 首次加载也读它）
@@ -584,20 +747,27 @@ class _SettingsPageState extends State<SettingsPage>
       _dynamicAlbumCover = dynamicAlbumCover;
       _dynamicAlbumCoverOnMobile = dynamicAlbumCoverOnMobile;
       _landscapeImmersiveEnabled = landscapeImmersiveEnabled;
+      _landscapeDetachedControls = landscapeDetachedControls;
+      _topBarPillCollapse = topBarPillCollapse;
+      _topBarTabDots = topBarTabDots;
       _showQualityDowngradeToast = showQualityDowngradeToast;
       _restoreMemoryEnabled = restoreMemoryEnabled;
       _startupAutoPlayEnabled = startupAutoPlayEnabled;
       _startupAutoPlaySource = startupAutoPlaySource;
       _startupAutoPlayOpenPage = startupAutoPlayOpenPage;
       _closeLocalMusicComments = closeLocalMusicComments;
+      _autoMatchOnlineInfo = autoMatchOnlineInfo;
       _mvDanmakuEnabled = mvDanmakuEnabled;
       _mvDanmakuOpacity = mvDanmakuOpacity;
+      _songDanmakuEnabled = songDanmakuEnabled;
       // 启动时把音量均衡设置同步给播放器（当前曲目若已加载会自动重算）
       AudioService().setVolumeNormalization(
         enabled: volumeNormalizationEnabled,
         referenceLufs: volumeNormalizationLufs,
       );
+      _seekBarWaveEnabled = seekBarWaveEnabled;
       _spectrumEnabled = spectrumEnabled;
+      _spectrumVisualizerFallback = spectrumVisualizerFallback;
       _spectrumBandCount = spectrumBandCount;
       _spectrumStyle = spectrumStyle;
       _spectrumBgOpacity = spectrumBgOpacity;
@@ -605,6 +775,13 @@ class _SettingsPageState extends State<SettingsPage>
       _spectrumBarOpacity = spectrumBarOpacity;
       _spectrumCurveOpacity = spectrumCurveOpacity;
       _spectrumDynamicColor = spectrumDynamicColor;
+      _musicHapticsEnabled = musicHapticsEnabled;
+      _musicHapticsStrength = musicHapticsStrength;
+      _musicHapticsSensitivity = musicHapticsSensitivity;
+      _musicHapticsWaveform = musicHapticsWaveform;
+      _musicHapticsSnare = musicHapticsSnare;
+      _musicHapticsOffset = musicHapticsOffset;
+      _musicHapticsScope = musicHapticsScope;
       _miniPlayerSwipeSwitch = miniPlayerSwipeSwitch;
       _sortCollectedByLatestClick = sortCollectedByLatestClick;
     });
@@ -613,7 +790,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   void _onAudioFocusModeChanged(AudioFocusInterruptionMode mode) {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() {
       _audioFocusInterruptionMode = mode;
     });
@@ -634,7 +811,7 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 新版本提醒开关：写入后下次启动生效（本次运行已排期的检查不撤销）。
   Future<void> _setUpdateReminderEnabled(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() {
       _updateReminderEnabled = value;
     });
@@ -643,7 +820,7 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 通过 Android activity-alias 切换桌面图标；失败时保持开关原值。
   Future<void> _setLegacyAppIconEnabled(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     try {
       await _appIconChannel.invokeMethod<void>('setLegacyIcon', value);
       await _settingsRepository.setLegacyAppIconEnabled(value);
@@ -756,11 +933,13 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 层级切换过渡包裹：淡出旧层 → 切内容 → 淡入新层（方向 _navForward）。
   Widget _transitioned(Widget child) {
+    final direction = _navForward ? 1.0 : -1.0;
     return FadeTransition(
       opacity: _sectionTransition,
       child: SlideTransition(
         position: Tween<Offset>(
-          begin: Offset(_navForward ? 0.03 : -0.03, 0),
+          // 退出与进入来自相反侧：下钻时旧页向左退，新页从右进；返回时反过来。
+          begin: Offset((_sectionExiting ? -direction : direction) * 0.03, 0),
           end: Offset.zero,
         ).animate(_sectionTransition),
         child: child,
@@ -780,9 +959,15 @@ class _SettingsPageState extends State<SettingsPage>
         child: _transitioned(
           level == SettingsLevel.overview
               ? ListView(
+                  key: _sectionListKey(level),
                   children: [
-                    _buildSearchField(colorScheme),
-                    if (_searchQuery.trim().isNotEmpty)
+                    // 桌面布局：设置页以分类树导航为主，搜索框在此布局下
+                    // 既冗余又会把整页背景切成两块（用户反馈"背景不一致"），
+                    // 故隐藏。
+                    if (!kDesktopModeEnabled.value)
+                      _buildSearchField(colorScheme),
+                    if (!kDesktopModeEnabled.value &&
+                        _searchQuery.trim().isNotEmpty)
                       ..._buildSearchResults(colorScheme)
                     else
                       ..._buildCategoryEntries(colorScheme),
@@ -790,6 +975,7 @@ class _SettingsPageState extends State<SettingsPage>
                   ],
                 )
               : ListView(
+                  key: _sectionListKey(level),
                   children: [
                     ListTileTheme(
                       contentPadding: const EdgeInsets.symmetric(
@@ -822,8 +1008,9 @@ class _SettingsPageState extends State<SettingsPage>
     return SettingsTwoPaneBody(
       master: ListView(
         children: [
-          _buildSearchField(colorScheme),
-          if (_searchQuery.trim().isNotEmpty)
+          // 同单栏：桌面布局下不显示搜索框（见 _buildPaneBody 内的说明）
+          if (!kDesktopModeEnabled.value) _buildSearchField(colorScheme),
+          if (!kDesktopModeEnabled.value && _searchQuery.trim().isNotEmpty)
             ..._buildSearchResults(colorScheme)
           else
             ..._buildCategoryEntries(colorScheme),
@@ -838,6 +1025,7 @@ class _SettingsPageState extends State<SettingsPage>
                 color: Colors.transparent,
               )
             : ListView(
+                key: _sectionListKey(level),
                 children: [
                   ListTileTheme(
                     contentPadding: const EdgeInsets.symmetric(
@@ -867,12 +1055,30 @@ class _SettingsPageState extends State<SettingsPage>
   /// 本次层级切换的过渡方向：true = 下钻（新页自右侧推进），false = 返回
   bool _navForward = true;
 
+  /// 当前是否处于旧页面淡出阶段。
+  bool _sectionExiting = false;
+
   /// 页面切换过渡控制器（fade 0→1，见 initState）
   late AnimationController _sectionTransition;
 
   /// 当前所在层级
   SettingsLevel get _level =>
       resolveSettingsLevel(category: _activeSection, subpage: _activeSubpage);
+
+  /// 层级内容列表的滚动位置标识。
+  ///
+  /// 一/二/三级共用同一个 Scaffold 与同一个列表插槽：不加 key 时 Flutter 按
+  /// runtimeType+key 复用同一 Element 及其 ScrollPosition，滑动进度会跨页继承
+  /// （且被短页 clamp 后反过来污染长页）。PageStorageKey 让每层拿到全新
+  /// position（互不继承），同时各自在 PageStorage 里存自己的偏移（返回时回到
+  /// 上次位置）。
+  PageStorageKey<String> _sectionListKey(SettingsLevel level) =>
+      PageStorageKey<String>(switch (level) {
+        SettingsLevel.overview => 'settings|overview',
+        SettingsLevel.category => 'settings|category|$_activeSection',
+        SettingsLevel.subpage =>
+          'settings|subpage|$_activeSection|$_activeSubpage',
+      });
 
   /// 按标题取分类；未命中返回 null（状态与模型不同步时降级为空内容）
   SettingsCategory? _categoryNamed(String? title) {
@@ -892,7 +1098,10 @@ class _SettingsPageState extends State<SettingsPage>
   }) {
     if (_sectionTransition.isAnimating) return;
     if (_activeSection == category && _activeSubpage == subpage) return;
-    _navForward = forward;
+    setState(() {
+      _navForward = forward;
+      _sectionExiting = true;
+    });
     // 淡出更快（90ms），淡入稍长（160ms）带层次，整体跟手
     _sectionTransition.duration = const Duration(milliseconds: 90);
     _sectionTransition.reverse().whenComplete(() {
@@ -900,6 +1109,7 @@ class _SettingsPageState extends State<SettingsPage>
       setState(() {
         _activeSection = category;
         _activeSubpage = subpage;
+        _sectionExiting = false;
       });
       _sectionTransition.duration = const Duration(milliseconds: 160);
       _sectionTransition.forward();
@@ -982,10 +1192,20 @@ class _SettingsPageState extends State<SettingsPage>
       leading: _buildPlayerStyleLeading,
       body: _buildPlayerStyleTail,
       subpages: [
+        // 播放页 chrome 的形态与位置：宽屏控制带、顶栏尾部胶囊、页签条落在哪一栏。
+        // search-sub: 顶栏 页签 圆点 胶囊 收缩 控制带 控制面板 独立页 横屏 平板 布局
+        SettingsSubpage(
+          title: '顶栏与页签',
+          icon: Icons.tab,
+          description: '横屏控制带、顶栏胶囊收缩与页签圆点位置',
+          builder: _buildPlayerChromeSubpage,
+        ),
         SettingsSubpage(
           title: '封面与动态',
           icon: Icons.album_outlined,
-          description: '专辑动态封面、移动网络加载与 3D 深度封面',
+          description: kDepthCoverAvailable
+              ? '专辑动态封面、移动网络加载与 3D 深度封面'
+              : '专辑动态封面与移动网络加载',
           builder: _buildCoverDynamicSubpage,
         ),
         SettingsSubpage(
@@ -994,11 +1214,20 @@ class _SettingsPageState extends State<SettingsPage>
           description: '对唱优化、动态颜色、模糊、辉光与省电模式',
           builder: _buildLyricEffectSubpage,
         ),
+        // 音乐频谱：依赖 Android Visualizer 采集 PCM 波形，桌面端无此数据源
+        if (supportsMusicSpectrum)
+          SettingsSubpage(
+            title: '音乐频谱',
+            icon: Icons.graphic_eq,
+            description: '频谱样式、柱数量、取色与各层透明度',
+            builder: _buildSpectrumSubpage,
+          ),
+        // search-sub: 进度条 波浪 起伏 回退 直线
         SettingsSubpage(
-          title: '音乐频谱',
-          icon: Icons.graphic_eq,
-          description: '频谱样式、柱数量、取色与各层透明度',
-          builder: _buildSpectrumSubpage,
+          title: '进度条',
+          icon: Icons.linear_scale,
+          description: '播放页进度条的波浪起伏',
+          builder: _buildProgressBarSubpage,
         ),
         SettingsSubpage(
           title: '播放页背景',
@@ -1014,12 +1243,14 @@ class _SettingsPageState extends State<SettingsPage>
       description: '歌词推送与设备显示',
       body: _buildLyricTail,
       subpages: [
-        SettingsSubpage(
-          title: '歌词推送',
-          icon: Icons.push_pin_outlined,
-          description: '推送协议与翻译 / 罗马音偏好',
-          builder: _buildLyricPushSubpage,
-        ),
+        if (!kTvBuild) ...[
+          SettingsSubpage(
+            title: '歌词推送',
+            icon: Icons.push_pin_outlined,
+            description: '推送协议与翻译 / 罗马音偏好',
+            builder: _buildLyricPushSubpage,
+          ),
+        ],
         SettingsSubpage(
           title: '设备歌词',
           icon: Icons.devices_outlined,
@@ -1039,12 +1270,17 @@ class _SettingsPageState extends State<SettingsPage>
           description: '网络音质、VIP 领取与 32bit 输出',
           builder: _buildAudioQualitySubpage,
         ),
-        SettingsSubpage(
-          title: '音效与音量',
-          icon: Icons.equalizer_outlined,
-          description: '均衡器、蝰蛇母带与音量均衡',
-          builder: _buildAudioEffectsSubpage,
-        ),
+        // 桌面端隐藏整个「音效与音量」分类：它下面所有子项（均衡器 / 音效库 /
+        // 蝰蛇母带 / 音量均衡 / 参考响度）都依赖 Android AudioSession 绑定，
+        // 全部已按supportsSystemAudioEffects 等门控隐藏。分类留着只会让用户
+        // 点进一个**整页空白**的页面。
+        if (supportsSystemAudioEffects)
+          SettingsSubpage(
+            title: '音效与音量',
+            icon: Icons.equalizer_outlined,
+            description: '均衡器、蝰蛇母带与音量均衡',
+            builder: _buildAudioEffectsSubpage,
+          ),
         SettingsSubpage(
           title: '播放行为',
           icon: Icons.play_circle_outline,
@@ -1065,26 +1301,48 @@ class _SettingsPageState extends State<SettingsPage>
         ),
       ],
     ),
-    SettingsCategory(
-      title: 'USB 独占',
-      icon: Icons.usb,
-      description: '独占输出与设备状态',
-      body: (colorScheme) => UsbExclusiveSection(
-        onAutoPause: () => context.read<PlayerProvider>().pause(),
+    // 震动反馈：依赖 Android Vibrator，桌面端无对应硬件能力
+    if (supportsHaptics)
+      SettingsCategory(
+        title: '震动反馈',
+        icon: Icons.vibration,
+        description: '总开关与各交互类别的震动细分，以及跟随鼓点的音乐节奏震动',
+        body: _buildHapticsSection,
       ),
-    ),
+    // USB 独占输出：依赖 Android USB Host + native cpp（UAC1 DAC 直写 usbdevfs）
+    if (supportsUsbExclusive)
+      SettingsCategory(
+        title: 'USB 独占',
+        icon: Icons.usb,
+        description: '独占输出与设备状态',
+        body: (colorScheme) => UsbExclusiveSection(
+          onAutoPause: () => context.read<PlayerProvider>().pause(),
+        ),
+      ),
+    // TV 构建：遥控器模式（正常构建不编入）
+    if (kTvBuild) ...[
+      // search: 遥控 D-pad 焦点 电视
+      SettingsCategory(
+        title: '遥控器',
+        icon: Icons.settings_remote_outlined,
+        description: 'D-pad 导航与按键操作',
+        body: _buildRemoteControlSection,
+      ),
+    ],
     SettingsCategory(
       title: '主页管理',
       icon: Icons.tab_outlined,
       description: '主页标签显示与排序',
       body: _buildTabManagementSection,
     ),
-    SettingsCategory(
-      title: '桌面快捷方式',
-      icon: Icons.bolt_outlined,
-      description: '应用图标长按快捷入口',
-      body: _buildDesktopShortcutSection,
-    ),
+    // 桌面快捷方式：Android 应用图标长按快捷入口（quick_actions_android）
+    if (supportsDesktopShortcut)
+      SettingsCategory(
+        title: '桌面快捷方式',
+        icon: Icons.bolt_outlined,
+        description: '应用图标长按快捷入口',
+        body: _buildDesktopShortcutSection,
+      ),
     SettingsCategory(
       title: 'AI 代理',
       icon: Icons.smart_toy_outlined,
@@ -1224,8 +1482,7 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  /// AppBar 标题：总览固定「设置」；二级为分类名；三级为「分类名 + 子页名」双行。
-  /// 三级用 MD3 顶栏「标题 + 副标题」形态：上方小字保留分类上下文。
+  /// AppBar 标题：总览固定「设置」；二级为分类名；三级只显示当前子页名。
   Widget _buildAppBarTitle(SettingsLevel level, SettingsCategory? category) {
     if (level == SettingsLevel.overview) return const Text('设置');
     final title = category?.title ?? _activeSection ?? '';
@@ -1234,29 +1491,33 @@ class _SettingsPageState extends State<SettingsPage>
       return Text(title, maxLines: 1, overflow: TextOverflow.ellipsis);
     }
     final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.labelMedium?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
-        ),
-        Text(
-          subpage.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.titleLarge?.copyWith(
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ],
+    return Text(
+      subpage.title,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
     );
   }
+
+  /// 搜索索引里属于 Android 系统音效链的条目 label。
+  ///
+  /// 这些项在桌面端已整块隐藏（见 `_buildAudioEffectsSubpage` 的
+  /// `supportsSystemAudioEffects` 门控），但索引是编译期常量、
+  /// 看不穿运行时门控，故在 `_searchResults()` 里按 label 过滤，
+  /// 否则搜「均衡器 / 蝰蛇 / 响度」会跳到一个空白的「音效与音量」页。
+  ///
+  /// 「应用功能」与「旁路效果链」不在此列：前者是 MCP 能力说明，
+  /// 后者是音效链内部的调试开关（已在页面内一并隐藏）。
+  static const Set<String> _kAndroidOnlyAudioLabels = {
+    '均衡器',
+    '禁用App均衡器和音效',
+    '音效库',
+    '蝰蛇母带处理',
+    '蝰蛇母带音源',
+    '音量均衡',
+    '参考响度',
+    '参考响度 LUFS',
+  };
 
   /// 按查询词过滤搜索索引（label + aliases 包含匹配）。
   /// 索引由 scripts/tools/gen_settings_search_index.dart 从本文件源码生成，
@@ -1268,7 +1529,25 @@ class _SettingsPageState extends State<SettingsPage>
     // 合并私有构建注入的额外索引条目（默认无）：老三元组没有三级页，补空串
     final entries =
         <({String label, String category, String subpage, String aliases})>[
-          ...kSettingsSearchIndex,
+          // 过滤掉当前平台**不存在对应 UI** 的条目，否则搜索会跳到空分类：
+          //  · 3D 封面：标准包不带深度模型（kDepthCoverAvailable）
+          //  · USB 独占：桌面端整块隐藏（依赖 Android USB Host + native cpp）
+          //  · 音效链：桌面端隐藏（依赖 Android AudioSession 绑定音效）
+          //
+          // 索引本身是**编译期**常量：生成器只认 kTvBuild 这类 const 旗标，
+          // 看不穿运行时平台判定，故只能在这里按能力过滤。
+          for (final e in kSettingsSearchIndex)
+            if ((kDepthCoverAvailable ||
+                    !const {
+                      '3D 封面',
+                      '3D 封面强度',
+                      'AI 背景修补',
+                      '清理深度图缓存',
+                    }.contains(e.label)) &&
+                (supportsUsbExclusive || e.category != 'USB 独占') &&
+                (supportsSystemAudioEffects ||
+                    !_kAndroidOnlyAudioLabels.contains(e.label)))
+              e,
           for (final e in SettingsPage.extraSearchIndexEntries ?? const [])
             (
               label: e.label,
@@ -1293,6 +1572,7 @@ class _SettingsPageState extends State<SettingsPage>
       ),
       child: TextField(
         controller: _searchController,
+        contextMenuBuilder: buildAppTextContextMenu,
         onChanged: (v) => setState(() => _searchQuery = v),
         textInputAction: TextInputAction.search,
         decoration: InputDecoration(
@@ -1367,6 +1647,49 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
+  /// 「预测性返回手势」与「封面连贯过渡」互斥，两个开关的 onChanged 都走这里。
+  ///
+  /// 裁决集中在 `resolveCoverBackExclusivity`（封面连贯过渡优先），本方法只负责把
+  /// 结果同时落到**本地 state / 全局 notifier / 持久化**三处，避免出现「两个都开着
+  /// 但其中一个实际没生效」的口径分裂。
+  /// 两个开关的 onChanged 共用，裁决只有一份 `resolveCoverBackExclusivity`
+  /// （**永远封面连贯过渡优先**，与 `lib/app.dart` 冷启动收敛存量同开用的是同一个
+  /// 函数，不会出现「设置页与启动后行为不一致」）。
+  ///
+  /// 因此两种连带情况要分开告知，否则都会被当成开关失灵：
+  /// - 想开预测性返回但封面连贯过渡开着 → 本项被**拒绝**（弹回关闭）；
+  /// - 开封面连贯过渡 → 预测性返回被**连带关闭**。
+  /// 关掉任何一个不连带改动另一个。
+  void _applyCoverBackExclusivity({
+    required bool coverTransition,
+    required bool predictiveBack,
+  }) {
+    final bool wantedBackOn = predictiveBack && !_predictiveBackEnabled;
+    final bool wantedCoverOn = coverTransition && !_playlistCoverTransition;
+    final resolved = resolveCoverBackExclusivity(
+      coverTransition: coverTransition,
+      predictiveBack: predictiveBack,
+    );
+    AppHaptics.lightImpact(HapticCategory.control);
+    setState(() {
+      _predictiveBackEnabled = resolved.predictiveBack;
+      _playlistCoverTransition = resolved.coverTransition;
+    });
+    _settingsRepository.setPredictiveBackEnabled(resolved.predictiveBack);
+    _settingsRepository.setPlaylistCoverTransitionEnabled(
+      resolved.coverTransition,
+    );
+    // 立即生效：MaterialApp 按前者切 pageTransitionsTheme，
+    // PlaylistCoverHero 按后者决定是否登记来源与起飞。
+    kPredictiveBackEnabled.value = resolved.predictiveBack;
+    kPlaylistCoverTransitionEnabled.value = resolved.coverTransition;
+    if (wantedBackOn && !resolved.predictiveBack) {
+      showToast('「封面连贯过渡」开启时无法使用预测性返回，请先关闭封面连贯过渡', long: true);
+    } else if (wantedCoverOn && resolved.predictiveBack != predictiveBack) {
+      showToast('已同时关闭「预测性返回手势」：两者互斥', long: true);
+    }
+  }
+
   /// 分组标题统一承担定位与分隔作用；不使用多张独立卡片。
   Widget _buildGroupLabel(
     String text,
@@ -1385,6 +1708,78 @@ class _SettingsPageState extends State<SettingsPage>
       style: theme.textTheme.labelLarge?.copyWith(
         color: theme.colorScheme.onSurfaceVariant,
       ),
+    );
+  }
+
+  /// 偏移控件下方的「实测值 + 自动校准」行（两处共用）。
+  ///
+  /// 实测值来自 AudioTrack 的「已写入 vs 已播放」帧差；播放中没有 AudioTrack
+  /// （USB 独占 / Direct PCM）时显示"不可用"，此时自动校准按钮会提示而不是静默。
+  Widget _offsetAutoRow() {
+    final service = MusicHapticsService.instance;
+    final measured = service.measuredLatencyMs;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          measured == null ? '实测：不可用（当前输出路径无 AudioTrack）' : '实测：$measured ms',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        TextButton(
+          onPressed: () async {
+            final ok = await service.applyAutoOffset();
+            if (!mounted) return;
+            final msg = ok
+                ? '已按实测 ${service.measuredLatencyMs}ms 校准'
+                : '测量失败：请在播放中重试（USB 独占/Direct PCM 路径无此测量）';
+            showToast(msg, long: !ok);
+            if (ok) setState(() => _musicHapticsOffset = service.offsetMs);
+          },
+          child: const Text('自动校准'),
+        ),
+      ],
+    );
+  }
+
+  /// 「遥控器」分类体：三态模式选择（仅 TV 构建存在）。
+  Widget _buildRemoteControlSection(ColorScheme colorScheme) {
+    final provider = context.watch<RemoteControlProvider>();
+    return Column(
+      children: [
+        RadioListTile<String>(
+          title: const Text('自动（TV 设备开启）'),
+          value: 'auto',
+          groupValue: provider.mode,
+          onChanged: (v) {
+            if (v != null) {
+              // ignore: discarded_futures
+              provider.setMode(v);
+            }
+          },
+        ),
+        RadioListTile<String>(
+          title: const Text('始终开启'),
+          value: 'always_on',
+          groupValue: provider.mode,
+          onChanged: (v) {
+            if (v != null) {
+              // ignore: discarded_futures
+              provider.setMode(v);
+            }
+          },
+        ),
+        RadioListTile<String>(
+          title: const Text('始终关闭'),
+          value: 'always_off',
+          groupValue: provider.mode,
+          onChanged: (v) {
+            if (v != null) {
+              // ignore: discarded_futures
+              provider.setMode(v);
+            }
+          },
+        ),
+      ],
     );
   }
 
@@ -1496,12 +1891,10 @@ class _SettingsPageState extends State<SettingsPage>
         // search: 罗马音 拼音
         SwitchListTile(
           title: const Text('罗马音歌词'),
-          // 只在协议确实不支持时提示约束，其余情况标题已足够表意
-          subtitle: _lyricPushProtocol == 'lyric_info'
-              ? const Text('LyricInfo 仅支持翻译，不支持罗马音')
-              : null,
+          // 只在协议确实不支持时提示约束，其余情况标题已足够表意。
+          // LyricInfo 规范下 roma 是独立 lane，已支持（需歌词源提供罗马音）。
           value: _lyricPushRoma,
-          onChanged: protocolActive && _lyricPushProtocol != 'lyric_info'
+          onChanged: protocolActive
               ? (value) {
                   // ignore: discarded_futures
                   _setLyricPushRoma(value);
@@ -1512,7 +1905,7 @@ class _SettingsPageState extends State<SettingsPage>
         SwitchListTile(
           title: const Text('优先翻译（同时存在时）'),
           subtitle: _lyricPushProtocol == 'lyric_info'
-              ? const Text('LyricInfo 仅支持翻译，无罗马音可选')
+              ? const Text('LyricInfo 翻译与罗马音为独立通道，无需取舍')
               : null,
           value: _lyricPushPreferTranslation,
           onChanged: protocolActive && _lyricPushProtocol != 'lyric_info'
@@ -1534,26 +1927,23 @@ class _SettingsPageState extends State<SettingsPage>
         // 桌面歌词：悬浮窗锁定后点击穿透（无法点击自身解锁），
         // 且无法下拉通知栏时，可在此一键解锁悬浮窗。
         _buildGroupLabel('桌面歌词', colorScheme, first: true),
-        // search: 桌面歌词 桌面
-        SwitchListTile(
-          title: const Text('解锁桌面歌词'),
-          // 未锁定时该开关无实际作用，只在真的卡住时才说明怎么用
-          subtitle: DesktopLyricService.instance.locked
-              ? const Text('悬浮窗已锁定（点击穿透），点按此开关解除锁定')
-              : null,
-          value: DesktopLyricService.instance.locked,
-          onChanged: (_) async {
-            HapticFeedback.lightImpact();
-            await DesktopLyricService.instance.unlock();
-          },
-        ),
+        // 外观六项配置：字号 / 行式 / 不透明度 / 已唱渐变 / 未唱色 / 锁定。
+        // 悬浮窗内的原生面板改配置会经 desktopLyricConfigChanged 回灌到这里，
+        // 两端共用 DesktopLyricService 的同一份状态。
+        //
+        // 这是一个自定义 widget（不是 ListTile 系），不会被 `_tileTypes` 自动收录，
+        // 因此用 search-item 手写索引条目 —— 否则搜索框找不到这块配置。
+        // search-item: 桌面歌词外观 | 桌面歌词 悬浮窗 悬浮歌词 字号 字体大小 文字大小
+        // search-item: 桌面歌词外观 | 双行 单行 行数 透明度 不透明度 背景 黑底
+        // search-item: 桌面歌词外观 | 渐变 配色 颜色 已唱 未唱 预设 锁定 解锁 点击穿透
+        const DesktopLyricSettingsPanel(),
         _buildGroupLabel('蓝牙歌词', colorScheme),
         // search: 蓝牙
         SwitchListTile(
           title: const Text('蓝牙歌词'),
           value: _bluetoothLyricEnabled,
           onChanged: (value) async {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _bluetoothLyricEnabled = value);
             await _settingsRepository.setBluetoothLyricEnabled(value);
             // 同步到歌词服务（启停定时器）和原生端（元数据替换开关）
@@ -1567,7 +1957,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('压缩封面图'),
           value: _bluetoothLyricCompressArt,
           onChanged: (value) async {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _bluetoothLyricCompressArt = value);
             await _settingsRepository.setBluetoothLyricCompressArt(value);
           },
@@ -1580,7 +1970,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('需开启悬浮窗、后台弹出界面与锁屏通知权限'),
           value: _lockScreenLyricEnabled,
           onChanged: (value) async {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _lockScreenLyricEnabled = value);
             await _settingsRepository.setLockScreenLyricEnabled(value);
             // 同步到歌词服务（启停定时器）与原生端（开关状态/关闭界面）
@@ -1595,7 +1985,7 @@ class _SettingsPageState extends State<SettingsPage>
             subtitle: const Text('歌词显示在状态栏时钟旁，由 Flyme 系统渲染'),
             value: _flymeStatusBarLyricEnabled,
             onChanged: (value) async {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               setState(() => _flymeStatusBarLyricEnabled = value);
               await _settingsRepository.setFlymeStatusBarLyricEnabled(value);
               // 启停歌词定时器，并把开关与当前行同步到原生
@@ -1626,7 +2016,7 @@ class _SettingsPageState extends State<SettingsPage>
   /// 切换实时歌词推送协议（三选一 + 关闭）：先全部关闭，再启用选中协议。
   Future<void> _setLyricPushProtocol(String protocol) async {
     if (protocol == _lyricPushProtocol) return;
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _lyricPushProtocol = protocol);
     await _settingsRepository.setLyricPushProtocol(protocol);
     await _applyLyricPushProtocol(protocol);
@@ -1634,7 +2024,7 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// LyricInfo 的 ColorOS Bridge 兼容模式开关：持久化 + 同步到歌词服务（即时重推）。
   Future<void> _setLyricInfoColorOs(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _lyricInfoColorOs = value);
     await _settingsRepository.setLyricInfoColorOs(value);
     // ignore: discarded_futures
@@ -1688,7 +2078,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _setLyricPushTranslation(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _lyricPushTranslation = value);
     await _settingsRepository.setLyricPushTranslation(value);
     // 同步到 Lyricon 偏好（兼容 Kotlin 端 restore 读取）
@@ -1707,7 +2097,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _setLyricPushRoma(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _lyricPushRoma = value);
     await _settingsRepository.setLyricPushRoma(value);
     await _settingsRepository.setLyriconDisplayRoma(value);
@@ -1725,7 +2115,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _setLyricPushPreferTranslation(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _lyricPushPreferTranslation = value);
     await _settingsRepository.setLyricPushPreferTranslation(value);
     // 同步到各协议偏好 key
@@ -1770,7 +2160,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('任何界面常驻播放器面板，不再显示 MiniPlayer'),
           value: carMode.enabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             context.read<CarModeProvider>().setEnabled(value);
           },
         ),
@@ -1782,7 +2172,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('匹配竖屏或方屏车机等车载屏幕时自动启用车机模式'),
           value: carMode.autoScreenEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             context.read<CarModeProvider>().setAutoScreenEnabled(value);
           },
         ),
@@ -1816,38 +2206,60 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 4),
               // 滑条始终显示（两布局共用），拖动只改内存，松手落盘。
-              M3ESlider(
-                decoration: const M3ESliderDecoration(
-                  // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
-                  // M3EHapticConfig.continuous()（10ms 最小间隔 + 2% 阈值），
-                  // 拖动中会以最高约 100 次/秒走 MethodChannel 触发 vibrate，
-                  // 真机上马达饱和 + 通道洪泛。
-                  haptic: M3EHapticFeedback.medium,
-                  hapticConfig: M3EHapticConfig.discrete(),
-                ),
-                value:
-                    carMode.panelRatio.clamp(
-                      sliderMinRatio,
-                      kCarModePanelMaxRatio,
-                    ) *
-                    100,
-                // 底部布局（竖屏/近方屏车机）下限 10%，侧边保持 20%。
-                min: sliderMinRatio * 100,
-                max: kCarModePanelMaxRatio * 100,
-                // 不传 divisions = 无级调节（M3ESlider.divisions 为 int?），
-                // 有档位吸附会破坏「无级」手感。
-                label: '$ratioPercent%',
-                // 拖动中只改内存（persist: false），松手才落盘。
-                // 注意：divisions == null 时 M3ESlider 的 onChangeEnd 可能在
-                // 按下超过 100ms 后被 tap-cancel 提前触发一次（见
-                // _DisplayScaleTile 的注释）。这里提前落盘的只是一个 double，
-                // 不影响手感，真正的终值会在拖动结束时再落一次。
-                onChanged: (value) => context
-                    .read<CarModeProvider>()
-                    .setPanelRatio(value / 100, persist: false),
-                onChangeEnd: (value) =>
-                    context.read<CarModeProvider>().setPanelRatio(value / 100),
-              ),
+              // tv: TV 构建换 RemoteSlider——M3ESlider 自带 Focus 吞四方向键；
+              // TV 分支丢 M3ESliderDecoration 触觉参数（P-C，下同）
+              kTvBuild
+                  ? RemoteSlider(
+                      value:
+                          carMode.panelRatio.clamp(
+                            sliderMinRatio,
+                            kCarModePanelMaxRatio,
+                          ) *
+                          100,
+                      // 底部布局（竖屏/近方屏车机）下限 10%，侧边保持 20%。
+                      min: sliderMinRatio * 100,
+                      max: kCarModePanelMaxRatio * 100,
+                      label: '$ratioPercent%',
+                      onChanged: (value) => context
+                          .read<CarModeProvider>()
+                          .setPanelRatio(value / 100, persist: false),
+                      onChangeEnd: (value) => context
+                          .read<CarModeProvider>()
+                          .setPanelRatio(value / 100),
+                    )
+                  : M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
+                        // M3EHapticConfig.continuous()（10ms 最小间隔 + 2% 阈值），
+                        // 拖动中会以最高约 100 次/秒走 MethodChannel 触发 vibrate，
+                        // 真机上马达饱和 + 通道洪泛。
+                        haptic: M3EHapticFeedback.medium,
+                        hapticConfig: M3EHapticConfig.discrete(),
+                      ),
+                      value:
+                          carMode.panelRatio.clamp(
+                            sliderMinRatio,
+                            kCarModePanelMaxRatio,
+                          ) *
+                          100,
+                      // 底部布局（竖屏/近方屏车机）下限 10%，侧边保持 20%。
+                      min: sliderMinRatio * 100,
+                      max: kCarModePanelMaxRatio * 100,
+                      // 不传 divisions = 无级调节（M3ESlider.divisions 为 int?），
+                      // 有档位吸附会破坏「无级」手感。
+                      label: '$ratioPercent%',
+                      // 拖动中只改内存（persist: false），松手才落盘。
+                      // 注意：divisions == null 时 M3ESlider 的 onChangeEnd 可能在
+                      // 按下超过 100ms 后被 tap-cancel 提前触发一次（见
+                      // _DisplayScaleTile 的注释）。这里提前落盘的只是一个 double，
+                      // 不影响手感，真正的终值会在拖动结束时再落一次。
+                      onChanged: (value) => context
+                          .read<CarModeProvider>()
+                          .setPanelRatio(value / 100, persist: false),
+                      onChangeEnd: (value) => context
+                          .read<CarModeProvider>()
+                          .setPanelRatio(value / 100),
+                    ),
             ],
           ),
         ),
@@ -1871,26 +2283,41 @@ class _SettingsPageState extends State<SettingsPage>
                 const SizedBox(height: 4),
                 Row(
                   children: [
+                    // tv: TV 构建换 RemoteSlider（P-C）
                     Expanded(
-                      child: M3ESlider(
-                        decoration: const M3ESliderDecoration(
-                          haptic: M3EHapticFeedback.medium,
-                          hapticConfig: M3EHapticConfig.discrete(),
-                        ),
-                        value: carMode.dockClearanceDp,
-                        min: 0,
-                        max: kCarModeDockClearanceMax,
-                        // 1dp 一档：整数值好读好记，档位 haptic 也与
-                        // M3EHapticConfig.discrete() 匹配。
-                        divisions: kCarModeDockClearanceMax.round(),
-                        label: '${carMode.dockClearanceDp.round()}dp',
-                        onChanged: (value) => context
-                            .read<CarModeProvider>()
-                            .setDockClearance(value, persist: false),
-                        onChangeEnd: (value) => context
-                            .read<CarModeProvider>()
-                            .setDockClearance(value),
-                      ),
+                      child: kTvBuild
+                          ? RemoteSlider(
+                              value: carMode.dockClearanceDp,
+                              min: 0,
+                              max: kCarModeDockClearanceMax,
+                              divisions: kCarModeDockClearanceMax.round(),
+                              label: '${carMode.dockClearanceDp.round()}dp',
+                              onChanged: (value) => context
+                                  .read<CarModeProvider>()
+                                  .setDockClearance(value, persist: false),
+                              onChangeEnd: (value) => context
+                                  .read<CarModeProvider>()
+                                  .setDockClearance(value),
+                            )
+                          : M3ESlider(
+                              decoration: const M3ESliderDecoration(
+                                haptic: M3EHapticFeedback.medium,
+                                hapticConfig: M3EHapticConfig.discrete(),
+                              ),
+                              value: carMode.dockClearanceDp,
+                              min: 0,
+                              max: kCarModeDockClearanceMax,
+                              // 1dp 一档：整数值好读好记，档位 haptic 也与
+                              // M3EHapticConfig.discrete() 匹配。
+                              divisions: kCarModeDockClearanceMax.round(),
+                              label: '${carMode.dockClearanceDp.round()}dp',
+                              onChanged: (value) => context
+                                  .read<CarModeProvider>()
+                                  .setDockClearance(value, persist: false),
+                              onChangeEnd: (value) => context
+                                  .read<CarModeProvider>()
+                                  .setDockClearance(value),
+                            ),
                     ),
                     SizedBox(
                       width: 72,
@@ -1928,7 +2355,7 @@ class _SettingsPageState extends State<SettingsPage>
               selectedIndex: carMode.panelSide == CarModePanelSide.left ? 0 : 1,
               onSelectedIndexChanged: (index) {
                 if (index == null || !carMode.active) return;
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 context.read<CarModeProvider>().setPanelSide(
                   index == 0 ? CarModePanelSide.left : CarModePanelSide.right,
                 );
@@ -2008,7 +2435,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: themeProvider.useOledBlack,
           onChanged: canToggleOled
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   themeProvider.setUseOledBlack(v);
                 }
               : null,
@@ -2021,7 +2448,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('使用系统主题色'),
           value: _useDynamicColor,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useDynamicColor = v);
             context.read<ThemeProvider>().setUseDynamicColor(v);
           },
@@ -2031,7 +2458,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('封面动态取色'),
           value: _useCoverSeedColor,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useCoverSeedColor = v);
             context.read<ThemeProvider>().setUseCoverSeedColor(v);
           },
@@ -2043,16 +2470,16 @@ class _SettingsPageState extends State<SettingsPage>
           ignoring:
               themeProvider.useDynamicColor ||
               themeProvider.useCoverSeedColor ||
-              (themeProvider.useBackgroundImage &&
+              (themeProvider.isBackgroundImageEffective &&
                   themeProvider.useBackgroundMonet),
-          // search: 主题 颜色 换肤
+          // search: 主题 颜色 换肤 hex 十六进制 色号 取色
           child: ListTile(
             leading: const Icon(Icons.palette),
             title: const Text('主题色'),
             subtitle: Text(
               themeProvider.useCoverSeedColor
                   ? '跟随歌曲封面取色'
-                  : ((themeProvider.useBackgroundImage &&
+                  : ((themeProvider.isBackgroundImageEffective &&
                             themeProvider.useBackgroundMonet)
                         ? '跟随背景图片取色'
                         : (themeProvider.useDynamicColor
@@ -2100,7 +2527,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('M3E 排版：提升标题与正文字重，突出层级'),
           value: themeProvider.emphasizedTypographyEnabled,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             context.read<ThemeProvider>().setEmphasizedTypographyEnabled(v);
           },
         ),
@@ -2113,7 +2540,7 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  /// 「导航与布局」三级子页：底部导航栏标签行为 + 桌面布局外壳 + 悬浮播放器。
+  /// 「导航与布局」三级子页：底部导航栏标签行为 + 桌面布局外壳 + 悬浮播放器 + 预测性返回手势。
   Widget _buildShellLayoutSubpage(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2154,35 +2581,149 @@ class _SettingsPageState extends State<SettingsPage>
             },
           ),
         ),
-        // ⑤ 桌面布局：侧栏 + 顶部工具栏外壳总开关（默认关，开启后横竖屏皆用）
-        _buildGroupLabel('桌面布局', colorScheme),
-        // search: 桌面布局 侧栏 大屏 平板 横屏 双栏 工具栏 desktop
+        // search: 二级页面 详情页 隐藏底栏 收起导航栏 菜单底栏 底部导航栏 保留导航栏 secondary page hide navigation bar
         SwitchListTile(
-          title: const Text('桌面布局'),
-          subtitle: const Text('开启后无论横屏竖屏都使用侧栏 + 顶部工具栏界面'),
-          value: _desktopModeEnabled,
+          title: const Text('二级页面隐藏菜单底栏'),
+          subtitle: const Text(
+            '停在二级页面（及以后）时收起底部导航栏；关闭后始终保留。'
+            '仅影响竖屏底栏，横屏侧栏仍在二级页面收起',
+          ),
+          value: _hideNavBarOnSecondary,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _desktopModeEnabled = value);
-            _settingsRepository.setDesktopModeEnabled(value);
-            // 立即切换外壳：驱动全局判定源，触发主布局重建。
-            kDesktopModeEnabled.value = value;
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _hideNavBarOnSecondary = value);
+            _settingsRepository.setHideNavBarOnSecondaryPages(value);
+            // 立即生效：主布局订阅该判定源重算底栏显隐。
+            kHideNavBarOnSecondaryPages.value = value;
           },
         ),
-        // ⑥ 悬浮播放器：二级页面悬浮迷你播放条总开关（默认开，可关闭）
+        // ⑤ 桌面布局：侧栏外壳总开关（默认关，开启后横竖屏皆用）
+        _buildGroupLabel('桌面布局', colorScheme),
+        // search: 桌面布局 侧栏 大屏 平板 横屏 双栏 工具栏 desktop
+        // value 直读全局判定源 kDesktopModeEnabled（唯一真值），用
+        // ValueListenableBuilder 订阅 —— 与下方「悬浮播放器」同一模式。
+        //
+        // 此前用本页本地字段，导致开关与实际生效状态可以相反：
+        // app.dart 冷启动写全局源、本页 _loadSettings 写本地字段，
+        // 两条路径互不知情，用户会看到"实际开着桌面布局、开关却是关的"。
+        ValueListenableBuilder<bool>(
+          valueListenable: kDesktopModeEnabled,
+          builder: (context, desktopEnabled, _) => SwitchListTile(
+            title: const Text('桌面布局'),
+            subtitle: Text(
+              desktopEnabled ? '正在使用侧栏界面，关闭后恢复为底部导航栏' : '开启后无论横屏竖屏都使用侧栏界面',
+            ),
+            value: desktopEnabled,
+            onChanged: (value) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              // 立即切换外壳：驱动全局判定源，触发主布局重建。
+              kDesktopModeEnabled.value = value;
+              _settingsRepository.setDesktopModeEnabled(value);
+            },
+          ),
+        ),
+        // ⑥ 悬浮播放器：形态总开关 + 两项从属设置，就地成组
         _buildGroupLabel('悬浮播放器', colorScheme),
         // search: 悬浮播放器 悬浮迷你播放器 迷你播放器 二级页面 播放栏 圆盘 浮动 关闭 secondary mini player
+        // 总开关 value 直读全局判定源 kSecondaryPlayerEnabled（唯一真值，取代旧的
+        // 本页本地字段双份真值）；局部 ValueListenableBuilder 订阅，不新增 setState 源。
+        // TV 构建下 notifier 被装载处强制 false（app.dart / main.dart 两处门控），
+        // 本开关置灰不可点：既不写持久化也不写 notifier，切回手机版不丢设置。
+        ValueListenableBuilder<bool>(
+          valueListenable: kSecondaryPlayerEnabled,
+          builder: (context, secondaryEnabled, _) => Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SwitchListTile(
+                title: const Text('悬浮迷你播放器'),
+                subtitle: Text(
+                  kTvBuild
+                      ? 'TV 版固定使用常驻播放条，悬浮形态在电视上不可用'
+                      : secondaryEnabled
+                      ? '正在使用悬浮播放条，下面两项决定它的形态'
+                      : '关闭后所有页面统一使用底部常驻播放条',
+                ),
+                value: secondaryEnabled,
+                onChanged: kTvBuild
+                    ? null
+                    : (value) {
+                        AppHaptics.lightImpact(HapticCategory.control);
+                        _settingsRepository.setSecondaryPlayerEnabled(value);
+                        // 立即生效：驱动全局判定源，各页宿主随 ValueListenableBuilder 重建。
+                        kSecondaryPlayerEnabled.value = value;
+                      },
+              ),
+              // 从属项：总开关关闭时同时给 enabled=false 与 onChanged=null ——
+              // 前者置灰整行、后者真正禁用开关，避免"看着能点、点了没反应"。
+              // TV 下 secondaryEnabled 恒为 false，两项自然置灰，无需另加门控。
+              // search: 一级页面 主页 首页 标签页 底部常驻 退回常驻条 分级 悬浮底栏 primary page tab
+              SwitchListTile(
+                title: const Text('一级页面使用悬浮底栏'),
+                subtitle: const Text('关闭后主页各标签页退回底部常驻播放条（贴在导航栏上方），只有二级页面用悬浮条'),
+                value: _secondaryPlayerOnPrimary,
+                onChanged: secondaryEnabled
+                    ? (value) {
+                        AppHaptics.lightImpact(HapticCategory.control);
+                        setState(() => _secondaryPlayerOnPrimary = value);
+                        _settingsRepository.setSecondaryPlayerOnPrimary(value);
+                        // 立即生效：宿主与 shell 的常驻条都订阅了这个判定源。
+                        kSecondaryPlayerOnPrimaryPages.value = value;
+                      }
+                    : null,
+              ),
+              // search: 进度条 进度 悬浮进度 播放进度 包边 外圈进度环 胶囊进度 secondary player progress
+              SwitchListTile(
+                title: const Text('显示播放进度'),
+                subtitle: const Text('沿播放条内缘包边一圈显示进度；收起成圆盘时即为其外圈进度环'),
+                value: _secondaryPlayerProgress,
+                onChanged: secondaryEnabled
+                    ? (value) {
+                        AppHaptics.lightImpact(HapticCategory.control);
+                        setState(() => _secondaryPlayerProgress = value);
+                        _settingsRepository.setSecondaryPlayerProgress(value);
+                        kSecondaryPlayerProgressEnabled.value = value;
+                      }
+                    : null,
+              ),
+            ],
+          ),
+        ),
+        // ⑦ 预测性返回手势：系统返回手势期间预览上一页（仅 Android 14+ 手势导航生效）
+        //桌面端（Windows/macOS/Linux）没有 Android 的系统返回手势导航，
+        // 该开关永远不生效，整块隐藏而不是显示"仅 Android 支持"的死开关。
+        if (supportsPredictiveGesture) ...[
+          _buildGroupLabel('预测性返回手势', colorScheme),
+          // search: 预测性返回 预测返回 返回手势 手势导航 系统返回 返回预览 predictive back 互斥
+          SwitchListTile(
+            title: const Text('预测性返回手势'),
+            subtitle: const Text(
+              '系统返回手势期间实时预览上一页（需 Android 14 及以上、手势导航模式；'
+              '播放页等使用自定义返回动画的页面不受影响）。'
+              '与「封面连贯过渡」互斥，且封面连贯过渡优先：后者开着时本项开不了，'
+              '需先关闭封面连贯过渡',
+            ),
+            value: _predictiveBackEnabled,
+            onChanged: (value) => _applyCoverBackExclusivity(
+              coverTransition: _playlistCoverTransition,
+              predictiveBack: value,
+            ),
+          ),
+        ],
+        // ⑧ 封面连贯过渡：列表卡片封面飞进详情页头（共享元素，歌单/专辑共用）
+        _buildGroupLabel('封面连贯过渡', colorScheme),
+        // search: 封面过渡 连贯过渡 共享元素 封面动画 卡片放大 歌单详情封面 专辑封面 大封面 hero flight 互斥
         SwitchListTile(
-          title: const Text('悬浮迷你播放器'),
-          subtitle: const Text('开启后主页与二级页面均使用悬浮播放条；关闭后统一改用底部常驻播放条'),
-          value: _secondaryPlayerEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _secondaryPlayerEnabled = value);
-            _settingsRepository.setSecondaryPlayerEnabled(value);
-            // 立即生效：驱动全局判定源，各页宿主随 ValueListenableBuilder 重建。
-            kSecondaryPlayerEnabled.value = value;
-          },
+          title: const Text('封面连贯过渡'),
+          subtitle: const Text(
+            '从歌单/专辑/听书列表进入详情页时，卡片封面平滑放大飞入页头（返回时原路飞回）；'
+            '关闭后只保留页面自身的转场。与「预测性返回手势」互斥：'
+            '开启本项会自动关闭预测性返回',
+          ),
+          value: _playlistCoverTransition,
+          onChanged: (value) => _applyCoverBackExclusivity(
+            coverTransition: value,
+            predictiveBack: _predictiveBackEnabled,
+          ),
         ),
       ],
     );
@@ -2208,7 +2749,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('启用自定义背景图片'),
           value: _useBackgroundImage,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useBackgroundImage = v);
             // ignore: discarded_futures
             themeProvider.setUseBackgroundImage(v);
@@ -2240,8 +2781,8 @@ class _SettingsPageState extends State<SettingsPage>
                 opacity: _backgroundOpacity,
                 child: ImageFiltered(
                   imageFilter: ImageFilter.blur(
-                    sigmaX: _backgroundBlur,
-                    sigmaY: _backgroundBlur,
+                    sigmaX: tvBlurSigma(_backgroundBlur),
+                    sigmaY: tvBlurSigma(_backgroundBlur),
                   ),
                   child: hasImage
                       ? Image.file(
@@ -2284,15 +2825,25 @@ class _SettingsPageState extends State<SettingsPage>
               Icon(Icons.blur_on, color: colorScheme.onSurfaceVariant),
               const Gap(AppSpacing.md),
               Expanded(
-                child: M3ESlider(
-                  value: _backgroundBlur,
-                  min: 0,
-                  max: 30,
-                  // 界面背景控件不显示节点
-                  label: '${_backgroundBlur.round()}',
-                  onChanged: (v) => setState(() => _backgroundBlur = v),
-                  onChangeEnd: (v) => themeProvider.setBackgroundBlur(v),
-                ),
+                // tv: TV 构建换 RemoteSlider（P-C）
+                child: kTvBuild
+                    ? RemoteSlider(
+                        value: _backgroundBlur,
+                        min: 0,
+                        max: 30,
+                        label: '${_backgroundBlur.round()}',
+                        onChanged: (v) => setState(() => _backgroundBlur = v),
+                        onChangeEnd: (v) => themeProvider.setBackgroundBlur(v),
+                      )
+                    : M3ESlider(
+                        value: _backgroundBlur,
+                        min: 0,
+                        max: 30,
+                        // 界面背景控件不显示节点
+                        label: '${_backgroundBlur.round()}',
+                        onChanged: (v) => setState(() => _backgroundBlur = v),
+                        onChangeEnd: (v) => themeProvider.setBackgroundBlur(v),
+                      ),
               ),
               SizedBox(
                 width: 34,
@@ -2322,19 +2873,33 @@ class _SettingsPageState extends State<SettingsPage>
               Icon(Icons.opacity, color: colorScheme.onSurfaceVariant),
               const Gap(AppSpacing.md),
               Expanded(
-                child: M3ESlider(
-                  value: _backgroundOpacity,
-                  min: 0.2,
-                  max: 1.0,
-                  // 界面背景控件不显示节点
-                  label: '${(_backgroundOpacity * 100).round()}%',
-                  onChanged: (v) {
-                    setState(() => _backgroundOpacity = v);
-                    // 实时同步到全局背景（ThemeProvider notify → AppBackgroundLayer 重建）
-                    // ignore: discarded_futures
-                    themeProvider.setBackgroundOpacity(v);
-                  },
-                ),
+                // tv: TV 构建换 RemoteSlider（P-C）
+                child: kTvBuild
+                    ? RemoteSlider(
+                        value: _backgroundOpacity,
+                        min: 0.2,
+                        max: 1.0,
+                        label: '${(_backgroundOpacity * 100).round()}%',
+                        onChanged: (v) {
+                          setState(() => _backgroundOpacity = v);
+                          // 实时同步到全局背景（ThemeProvider notify → AppBackgroundLayer 重建）
+                          // ignore: discarded_futures
+                          themeProvider.setBackgroundOpacity(v);
+                        },
+                      )
+                    : M3ESlider(
+                        value: _backgroundOpacity,
+                        min: 0.2,
+                        max: 1.0,
+                        // 界面背景控件不显示节点
+                        label: '${(_backgroundOpacity * 100).round()}%',
+                        onChanged: (v) {
+                          setState(() => _backgroundOpacity = v);
+                          // 实时同步到全局背景（ThemeProvider notify → AppBackgroundLayer 重建）
+                          // ignore: discarded_futures
+                          themeProvider.setBackgroundOpacity(v);
+                        },
+                      ),
               ),
               SizedBox(
                 width: 34,
@@ -2356,7 +2921,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('按背景图莫奈取色'),
           value: _useBackgroundMonet,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useBackgroundMonet = v);
             // ignore: discarded_futures
             themeProvider.setUseBackgroundMonet(v);
@@ -2371,7 +2936,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _useTextShadow,
           onChanged: _useBackgroundImage
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useTextShadow = v);
                   // ignore: discarded_futures
                   themeProvider.setUseTextShadow(v);
@@ -2397,17 +2962,45 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(width: 50),
               Expanded(
-                child: M3ESlider(
-                  value: _textShadowBlur,
-                  min: AppTheme.minTextShadowBlur,
-                  max: AppTheme.maxTextShadowBlur,
-                  // 不传 divisions：磅数无极（连续）调节
-                  enabled: _useBackgroundImage && _useTextShadow,
-                  label: _textShadowBlur.toStringAsFixed(1),
-                  // 拖动只动滑块，松手才提交：改磅数要整棵主题树重建
-                  onChanged: (v) => setState(() => _textShadowBlur = v),
-                  onChangeEnd: (v) => themeProvider.setTextShadowBlur(v),
-                ),
+                // tv: TV 构建换 RemoteSlider——置灰态（M3ESlider.enabled=false
+                // 不参与焦点）仍走 M3ESlider，可调态才换 RemoteSlider（P-C）
+                child: (_useBackgroundImage && _useTextShadow)
+                    ? (kTvBuild
+                          ? RemoteSlider(
+                              value: _textShadowBlur,
+                              min: AppTheme.minTextShadowBlur,
+                              max: AppTheme.maxTextShadowBlur,
+                              label: _textShadowBlur.toStringAsFixed(1),
+                              // 拖动只动滑块，松手才提交：改磅数要整棵主题树重建
+                              onChanged: (v) =>
+                                  setState(() => _textShadowBlur = v),
+                              onChangeEnd: (v) =>
+                                  themeProvider.setTextShadowBlur(v),
+                            )
+                          : M3ESlider(
+                              value: _textShadowBlur,
+                              min: AppTheme.minTextShadowBlur,
+                              max: AppTheme.maxTextShadowBlur,
+                              // 不传 divisions：磅数无极（连续）调节
+                              enabled: _useBackgroundImage && _useTextShadow,
+                              label: _textShadowBlur.toStringAsFixed(1),
+                              // 拖动只动滑块，松手才提交：改磅数要整棵主题树重建
+                              onChanged: (v) =>
+                                  setState(() => _textShadowBlur = v),
+                              onChangeEnd: (v) =>
+                                  themeProvider.setTextShadowBlur(v),
+                            ))
+                    : M3ESlider(
+                        value: _textShadowBlur,
+                        min: AppTheme.minTextShadowBlur,
+                        max: AppTheme.maxTextShadowBlur,
+                        // 不传 divisions：磅数无极（连续）调节
+                        enabled: _useBackgroundImage && _useTextShadow,
+                        label: _textShadowBlur.toStringAsFixed(1),
+                        // 拖动只动滑块，松手才提交：改磅数要整棵主题树重建
+                        onChanged: (v) => setState(() => _textShadowBlur = v),
+                        onChangeEnd: (v) => themeProvider.setTextShadowBlur(v),
+                      ),
               ),
               SizedBox(
                 width: 34,
@@ -2433,6 +3026,9 @@ class _SettingsPageState extends State<SettingsPage>
   Future<void> _pickBackgroundImage() async {
     final path = await BackgroundImageLoader.pickBackgroundImage();
     if (path == null || path.isEmpty || !mounted) return;
+    // 换图时清掉上一张残留（Windows 端按时间戳命名，会越攒越多）
+    // ignore: discarded_futures
+    BackgroundImageLoader.cleanUpExcept(path);
     setState(() => _backgroundImagePath = path);
     await context.read<ThemeProvider>().setBackgroundImagePath(path);
     showToast('背景图片已设置，已自动莫奈取色', long: true);
@@ -2442,12 +3038,17 @@ class _SettingsPageState extends State<SettingsPage>
   /// 避免进入"无背景"状态导致浅色模式配色异常）。
   Future<void> _clearBackgroundImage() async {
     final path = _backgroundImagePath;
+    // Windows 端每次换图都写新的时间戳文件，只删当前这张会让旧图全部残留
+    // （换N 次留下 N-1 张高分辨率照片，磁盘很容易上 GB）。
     if (path != null) {
       try {
         final f = File(path);
         if (f.existsSync()) f.deleteSync();
       } catch (_) {}
     }
+    // 兜底清一遍目录里其余残留
+    // ignore: discarded_futures
+    BackgroundImageLoader.cleanUpExcept(null);
     if (!mounted) return;
     setState(() {
       _backgroundImagePath = null;
@@ -2508,6 +3109,65 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
+  /// 「顶栏与页签」三级子页：播放页 chrome 的三个形态开关。
+  ///
+  /// 三者共同决定「控制带在哪、顶栏尾部长什么样、页签条落在哪一栏」，所以放在同一页；
+  /// 都只改形态不改播放链路，默认值见 `test/data/player_switch_defaults_test.dart`。
+  Widget _buildPlayerChromeSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // 宽屏（横屏/平板）下把进度/传输控制移入独立「控制」页签，歌词/歌单占满整栏；
+        // 默认关闭 = 控制带常驻右栏底部
+        // search: 控制面板 独立页 控制页 横屏 平板 控制带
+        SwitchListTile(
+          title: const Text('横屏控制面板独立页'),
+          subtitle: const Text('宽屏下播放控制移入独立页签'),
+          value: _landscapeDetachedControls,
+          onChanged: (value) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _landscapeDetachedControls = value);
+            _settingsRepository.setLandscapeDetachedControls(value);
+            kLandscapeDetachedControlsEnabled.value = value;
+          },
+        ),
+        // 竖屏顶栏尾部：睡眠定时 / 一起听与 ⋯ 合成一颗只露图标的胶囊，点一下展开、
+        // 停留 3 秒自动收回；关闭后这两格文案常显、点一下直接执行，背景仍是同一颗胶囊。
+        // 音质格不归本开关管：它只看旁边还有没有别的格（邻居在就收，没邻居就常显）。
+        // search: 胶囊 收缩 顶栏 音质 一起听 睡眠 定时 更多 图标
+        SwitchListTile(
+          title: const Text('胶囊按钮收缩'),
+          subtitle: const Text('顶栏尾部的定时与一起听收进图标胶囊，点击展开（音质按邻居自行收放）'),
+          value: _topBarPillCollapse,
+          onChanged: (value) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _topBarPillCollapse = value);
+            _settingsRepository.setTopBarPillCollapse(value);
+            // 全局标志即时同步：播放器顶栏订阅它，改完回到播放页就是新形态
+            kTopBarPillCollapseEnabled.value = value;
+          },
+        ),
+        // 页签条位置与形态（竖屏、横屏同源）：默认关闭 = 竖屏留在底部、横屏留在右栏
+        // 底部，且都是原 icon + 指示线形态；开启 = 竖屏底部那条取消、改为顶栏中央的
+        // 一排圆点，横屏右栏底部同时改为圆点
+        // search: 圆点 页签 顶栏 底部 图标 标签 tab 切换页面 播放页
+        SwitchListTile(
+          title: const Text('顶栏页签圆点'),
+          subtitle: const Text('页签条默认用图标（竖屏在底部、横屏在右栏底部）；开启后改用圆点，竖屏移到顶栏中央'),
+          value: _topBarTabDots,
+          onChanged: (value) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _topBarTabDots = value);
+            _settingsRepository.setTopBarTabDots(value);
+            // 全局标志即时同步：播放器顶栏与底部控制列各自订阅它
+            kTopBarTabDotsEnabled.value = value;
+          },
+        ),
+      ],
+    );
+  }
+
   /// 「封面与动态」三级子页：歌词双击跳转 + 专辑动态封面 + 3D 深度封面。
   Widget _buildCoverDynamicSubpage(ColorScheme colorScheme) {
     return Column(
@@ -2519,7 +3179,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('歌词双击跳转'),
           value: _lyricDoubleTapToJump,
           onChanged: (v) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _lyricDoubleTapToJump = v);
             context.read<ThemeProvider>().setLyricDoubleTapToJump(v);
           },
@@ -2531,7 +3191,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('全屏播放器封面播放专辑动态封面短视频'),
           value: _dynamicAlbumCover,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _dynamicAlbumCover = value);
             _settingsRepository.setDynamicAlbumCover(value);
           },
@@ -2546,13 +3206,52 @@ class _SettingsPageState extends State<SettingsPage>
           // 参数，故用 null onChanged 实现等价禁用外观与交互）
           onChanged: _dynamicAlbumCover
               ? (value) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _dynamicAlbumCoverOnMobile = value);
                   _settingsRepository.setDynamicAlbumCoverOnMobile(value);
                 }
               : null,
         ),
         // 3D 封面（深度视差）：仅 depth3d 全量包启用；standard 包整体隐藏。
+        // 封面投影强度：0 关掉整层投影。播放页读的是全局
+        // kCoverShadowIntensity（PlayerCoverShadow.wrap 订阅它），所以这里必须同时
+        // 写盘与同步 notifier，否则调节后要么不动、要么重启回到旧值。
+        // search: 封面 阴影 投影 立体 悬浮 层次感
+        ListTile(
+          title: const Text('封面阴影强度'),
+          // tv: TV 构建换 RemoteSlider（P-C）
+          subtitle: kTvBuild
+              ? RemoteSlider(
+                  value: _coverShadowStrength,
+                  min: 0,
+                  max: 1,
+                  label: '${(_coverShadowStrength * 100).round()}%',
+                  onChanged: (value) {
+                    setState(() => _coverShadowStrength = value);
+                    kCoverShadowIntensity.value = value;
+                    unawaited(
+                      _settingsRepository.setCoverShadowStrength(value),
+                    );
+                  },
+                )
+              : M3ESlider(
+                  decoration: const M3ESliderDecoration(
+                    haptic: M3EHapticFeedback.medium,
+                    hapticConfig: M3EHapticConfig.discrete(),
+                  ),
+                  value: _coverShadowStrength,
+                  min: 0,
+                  max: 1,
+                  label: '${(_coverShadowStrength * 100).round()}%',
+                  onChanged: (value) {
+                    setState(() => _coverShadowStrength = value);
+                    kCoverShadowIntensity.value = value;
+                    unawaited(
+                      _settingsRepository.setCoverShadowStrength(value),
+                    );
+                  },
+                ),
+        ),
         // 开启后陀螺仪驱动封面深度视差（模型内置，亦可导入更新）
         if (kDepthCoverAvailable) ...[
           // search: 3D 封面;深度;视差;立体;封面
@@ -2560,7 +3259,7 @@ class _SettingsPageState extends State<SettingsPage>
             title: const Text('3D 封面'),
             value: _depthCoverEnabled,
             onChanged: (value) async {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               setState(() => _depthCoverEnabled = value);
               await _settingsRepository.setDepthCoverEnabled(value);
               DepthCoverService.enabledSignal.value = value;
@@ -2571,20 +3270,36 @@ class _SettingsPageState extends State<SettingsPage>
             // search: 3D 封面 强度;视差 灵敏度;陀螺仪 灵敏度;深度 幅度
             ListTile(
               title: const Text('3D 封面强度'),
-              subtitle: M3ESlider(
-                decoration: const M3ESliderDecoration(
-                  haptic: M3EHapticFeedback.medium,
-                  hapticConfig: M3EHapticConfig.discrete(),
-                ),
-                value: _depthCoverStrength,
-                min: 0,
-                max: 40,
-                label: '${_depthCoverStrength.round()}',
-                onChanged: (value) {
-                  setState(() => _depthCoverStrength = value);
-                  unawaited(_settingsRepository.setDepthCoverStrength(value));
-                },
-              ),
+              // tv: TV 构建换 RemoteSlider（P-C）
+              subtitle: kTvBuild
+                  ? RemoteSlider(
+                      value: _depthCoverStrength,
+                      min: 0,
+                      max: 40,
+                      label: '${_depthCoverStrength.round()}',
+                      onChanged: (value) {
+                        setState(() => _depthCoverStrength = value);
+                        unawaited(
+                          _settingsRepository.setDepthCoverStrength(value),
+                        );
+                      },
+                    )
+                  : M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        haptic: M3EHapticFeedback.medium,
+                        hapticConfig: M3EHapticConfig.discrete(),
+                      ),
+                      value: _depthCoverStrength,
+                      min: 0,
+                      max: 40,
+                      label: '${_depthCoverStrength.round()}',
+                      onChanged: (value) {
+                        setState(() => _depthCoverStrength = value);
+                        unawaited(
+                          _settingsRepository.setDepthCoverStrength(value),
+                        );
+                      },
+                    ),
             ),
             // search: 3D 封面 AI 修补;背景 修补;神经网络;模型 修补;智能 填充
             SwitchListTile(
@@ -2592,7 +3307,7 @@ class _SettingsPageState extends State<SettingsPage>
               subtitle: const Text('神经网络细化背景填充质量，关闭后用快速算法'),
               value: _depthCoverNeuralInpaint,
               onChanged: (value) async {
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 setState(() => _depthCoverNeuralInpaint = value);
                 await _settingsRepository.setDepthCoverNeuralInpaint(value);
                 // 关闭→开启切换后，清缓存让新封面用神经修补重新生成
@@ -2630,7 +3345,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _useDuetLayout,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useDuetLayout = v);
                   LyricPreferences.instance.setUseDuetLayout(v);
                 }
@@ -2643,7 +3358,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _lyricDynamicColor,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _lyricDynamicColor = v);
                   LyricPreferences.instance.setUseDynamicLyricColor(v);
                 }
@@ -2657,7 +3372,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _useGaussianBlur,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useGaussianBlur = v);
                   LyricPreferences.instance.setUseGaussianBlur(v);
                 }
@@ -2669,7 +3384,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _useGlowEffect,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useGlowEffect = v);
                   LyricPreferences.instance.setUseGlowEffect(v);
                 }
@@ -2705,6 +3420,35 @@ class _SettingsPageState extends State<SettingsPage>
                 : null,
           ),
         ),
+        // 平衡行换行：长歌词行的断点由 DP 求「各行宽度最均匀」的方案，
+        // 替代旧的「累加宽度超宽即换行」（后者会出现「第二行只剩两三个字」）。
+        // 两套播放器各一个开关：两套歌词的换行实现不同，问题不共用。
+        // search: 平衡 平衡行 换行 断行 折行
+        SwitchListTile(
+          title: const Text('平衡行换行（Apple 风格）'),
+          subtitle: const Text('长歌词换行时让每行长度更均匀'),
+          value: _lyricLineBalanceAm,
+          onChanged: _useAmStylePlayer
+              ? (v) {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  setState(() => _lyricLineBalanceAm = v);
+                  LyricPreferences.instance.setLineBalance(v);
+                }
+              : null,
+        ),
+        // search: 平衡 平衡行 换行 断行 折行
+        SwitchListTile(
+          title: const Text('平衡行换行（Material 风格）'),
+          subtitle: const Text('长歌词换行时让每行长度更均匀'),
+          value: _lyricLineBalanceMd3,
+          onChanged: _useAmStylePlayer
+              ? null
+              : (v) {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  setState(() => _lyricLineBalanceMd3 = v);
+                  Md3LyricPreferences.instance.setLineBalance(v);
+                },
+        ),
         // 歌词省电模式：AM 播放器歌词界面锁定 60fps，上下滑动歌词时临时解锁。
         // 排在特效末尾：它是上面几项高功耗特效的性能兜底。
         // search: 省电 限帧
@@ -2713,7 +3457,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _lyricEcoMode,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _lyricEcoMode = v);
                   LyricPreferences.instance.setEcoMode(v);
                 }
@@ -2723,7 +3467,7 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  /// 「播放页背景」三级子页：MD3 写真背景轮播 + AM 流光与背景模糊。
+  /// 「播放页背景」三级子页：写真背景轮播（MD3 + AM 共用）+ AM 流光与背景模糊。
   Widget _buildPlayerBackgroundSubpage(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2732,23 +3476,21 @@ class _SettingsPageState extends State<SettingsPage>
         // search: 写真 背景 轮播
         SwitchListTile(
           title: const Text('歌手写真背景轮播'),
+          onChanged: (v) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _useArtistPhotoBackground = v);
+            context.read<ThemeProvider>().setUseArtistPhotoBackground(v);
+          },
           value: _useArtistPhotoBackground,
-          onChanged: !_useAmStylePlayer
-              ? (v) {
-                  HapticFeedback.lightImpact();
-                  setState(() => _useArtistPhotoBackground = v);
-                  context.read<ThemeProvider>().setUseArtistPhotoBackground(v);
-                }
-              : null,
         ),
-        if (_useArtistPhotoBackground && !_useAmStylePlayer)
+        if (_useArtistPhotoBackground)
           // search: 写真 轮播 间隔
           // 原 trailing 的紧凑 DropdownButton 换成字段式 M3EDropdownMenu：
           // 控件下沉到 subtitle，与下方「写真背景透明度」的 subtitle 控件行
           // 保持同一节奏（行高、左右留白、取值文本尺寸均靠拢该行）。
           ListTile(
             title: const Text('轮播间隔'),
-            subtitle: M3EDropdownMenu<int>(
+            subtitle: TvDropdownMenu<int>(
               items: [
                 for (final s in const [5, 10, 15, 20, 30, 45, 60])
                   M3EDropdownItem(
@@ -2780,24 +3522,37 @@ class _SettingsPageState extends State<SettingsPage>
               },
             ),
           ),
-        if (_useArtistPhotoBackground && !_useAmStylePlayer)
+        if (_useArtistPhotoBackground)
           // search: 写真 透明度
           ListTile(
             title: const Text('写真背景透明度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _artistPhotoOpacity,
-              min: 0.0,
-              max: 0.95,
-              divisions: 19,
-              label: '${(_artistPhotoOpacity * 100).round()}%',
-              onChanged: (v) {
-                setState(() => _artistPhotoOpacity = v);
-                context.read<ThemeProvider>().setArtistPhotoOpacity(v);
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _artistPhotoOpacity,
+                    min: 0.0,
+                    max: 0.95,
+                    divisions: 19,
+                    label: '${(_artistPhotoOpacity * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _artistPhotoOpacity = v);
+                      context.read<ThemeProvider>().setArtistPhotoOpacity(v);
+                    },
+                  )
+                : M3ESlider(
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                    ),
+                    value: _artistPhotoOpacity,
+                    min: 0.0,
+                    max: 0.95,
+                    divisions: 19,
+                    label: '${(_artistPhotoOpacity * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _artistPhotoOpacity = v);
+                      context.read<ThemeProvider>().setArtistPhotoOpacity(v);
+                    },
+                  ),
             trailing: _statusText('${(_artistPhotoOpacity * 100).round()}%'),
           ),
         // search: 流光 背景
@@ -2807,7 +3562,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _useFlowingBackground,
           onChanged: _useAmStylePlayer
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useFlowingBackground = v);
                   LyricPreferences.instance.setUseFlowingBackground(v);
                 }
@@ -2819,35 +3574,76 @@ class _SettingsPageState extends State<SettingsPage>
         if (_useAmStylePlayer && !_useFlowingBackground)
           ListTile(
             title: const Text('播放页背景模糊'),
-            subtitle: M3ESlider(
-              // 控件统一用 md3e_core 的无节点 M3ESlider（不传 divisions）。
-              // 显式给 hapticConfig：divisions == null 时 M3ESlider 默认取
-              // continuous（10ms 间隔 + 2% 阈值），拖动会以最高约 100 次/秒
-              // 走 MethodChannel 触发 vibrate，真机马达饱和 + 通道洪泛
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-                hapticConfig: M3EHapticConfig.discrete(),
-              ),
-              value: _amPlayerBlur,
-              min: 0,
-              max: 30,
-              // 不传 divisions = 无级调节（无节点）
-              label: '${_amPlayerBlur.round()}',
-              onChanged: (v) {
-                setState(() => _amPlayerBlur = v);
-              },
-              onChangeEnd: (v) {
-                context.read<ThemeProvider>().setAmPlayerBlur(v);
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _amPlayerBlur,
+                    min: 0,
+                    max: 200,
+                    // 不传 divisions = 无级调节（无节点）
+                    label: '${_amPlayerBlur.round()}',
+                    onChanged: (v) {
+                      setState(() => _amPlayerBlur = v);
+                    },
+                    onChangeEnd: (v) {
+                      context.read<ThemeProvider>().setAmPlayerBlur(v);
+                    },
+                  )
+                : M3ESlider(
+                    // 控件统一用 md3e_core 的无节点 M3ESlider（不传 divisions）。
+                    // 显式给 hapticConfig：divisions == null 时 M3ESlider 默认取
+                    // continuous（10ms 间隔 + 2% 阈值），拖动会以最高约 100 次/秒
+                    // 走 MethodChannel 触发 vibrate，真机马达饱和 + 通道洪泛
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                      hapticConfig: M3EHapticConfig.discrete(),
+                    ),
+                    value: _amPlayerBlur,
+                    min: 0,
+                    max: 200,
+                    // 不传 divisions = 无级调节（无节点）
+                    label: '${_amPlayerBlur.round()}',
+                    onChanged: (v) {
+                      setState(() => _amPlayerBlur = v);
+                    },
+                    onChangeEnd: (v) {
+                      context.read<ThemeProvider>().setAmPlayerBlur(v);
+                    },
+                  ),
             trailing: Text('${_amPlayerBlur.round()}'),
           ),
       ],
     );
   }
 
+  /// 「进度条」三级子页：波浪起伏总开关（关闭即回退到直线形态）。
+  Widget _buildProgressBarSubpage(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // search: 进度条 波浪 起伏 回退 直线
+        SwitchListTile(
+          title: const Text('进度条波浪起伏'),
+          subtitle: const Text('关闭后播放页进度条回到直线样式'),
+          value: _seekBarWaveEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _seekBarWaveEnabled = value);
+            _settingsRepository.setSeekBarWaveEnabled(value);
+            // 立即生效：驱动 MD3 播放页的 Listenable.merge 重建
+            kSeekBarWaveEnabled.value = value;
+          },
+        ),
+      ],
+    );
+  }
+
   /// 「音乐频谱」三级子页：环绕开关 + 样式 + 柱数量 + 取色 + 各透明度/高度。
   Widget _buildSpectrumSubpage(ColorScheme colorScheme) {
+    // 进入时刷新一次实测输出延迟（探针只在播放中有意义）
+    // ignore: discarded_futures
+    MusicHapticsService.instance.refreshMeasuredLatency();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -2863,7 +3659,7 @@ class _SettingsPageState extends State<SettingsPage>
           value: _spectrumEnabled,
           onChanged: Platform.isAndroid || Platform.isIOS
               ? (v) {
-                  HapticFeedback.lightImpact();
+                  AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _spectrumEnabled = v);
                   _settingsRepository.setSpectrumEnabled(v);
                 }
@@ -2891,7 +3687,7 @@ class _SettingsPageState extends State<SettingsPage>
                     selectedIndex: _spectrumStyle,
                     onSelectedIndexChanged: (index) {
                       if (index == null) return;
-                      HapticFeedback.lightImpact();
+                      AppHaptics.lightImpact(HapticCategory.control);
                       setState(() => _spectrumStyle = index);
                       _settingsRepository.setSpectrumStyle(index);
                     },
@@ -2900,26 +3696,98 @@ class _SettingsPageState extends State<SettingsPage>
               ],
             ),
           ),
+        // 节奏偏移：频谱显示/节奏震动共用的**链路延迟补偿**，与「音乐节奏震动」分组里的
+        // 同名控件写同一个键（_keyMusicHapticsOffset）、调同一个服务方法，两处实时同步。
+        // 放这里是因为它本质属于"频谱采集链路"的参数：PCM 在写进输出缓冲那一刻就被
+        // 分析，比听到早一整个缓冲深度；震动靠延后点火补，频谱柱的发布也按同一
+        // 数值延后（kSpectrumVisualOffsetMs），两处同时补才同相。
+        if (_spectrumEnabled && Platform.isAndroid)
+          // search: 偏移 延迟 补偿 对齐 滞后 提前 offset 拍点
+          ListTile(
+            title: const Text('节奏偏移'),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // tv: TV 构建换 RemoteSlider（P-C）
+                kTvBuild
+                    ? RemoteSlider(
+                        value: _musicHapticsOffset.toDouble(),
+                        min: 0,
+                        max: MusicHapticsService.maxOffsetMs.toDouble(),
+                        // 无极连续调节，与「音乐节奏震动」分组里的同名控件完全一致
+                        label: '+${_musicHapticsOffset}ms',
+                        onChanged: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          MusicHapticsService.instance.previewOffset(ms);
+                        },
+                        onChangeEnd: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          _settingsRepository.setMusicHapticsOffset(ms);
+                          MusicHapticsService.instance.setOffset(ms);
+                        },
+                      )
+                    : M3ESlider(
+                        decoration: kFreeSliderDecoration,
+                        value: _musicHapticsOffset.toDouble(),
+                        min: 0,
+                        max: MusicHapticsService.maxOffsetMs.toDouble(),
+                        // 无极连续调节，与「音乐节奏震动」分组里的同名控件完全一致
+                        label: '+${_musicHapticsOffset}ms',
+                        onChanged: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          MusicHapticsService.instance.previewOffset(ms);
+                        },
+                        onChangeEnd: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          _settingsRepository.setMusicHapticsOffset(ms);
+                          MusicHapticsService.instance.setOffset(ms);
+                        },
+                      ),
+                Center(child: _statusText('+${_musicHapticsOffset}ms')),
+                _offsetAutoRow(),
+              ],
+            ),
+          ),
         // 频谱柱数量滑块：仅开关开启且 Android 时显示
         if (_spectrumEnabled && (Platform.isAndroid || Platform.isIOS))
           // search: 频谱
           ListTile(
             title: const Text('频谱柱数量'),
-            subtitle: M3ESlider(
-              value: _spectrumBandCount.toDouble(),
-              min: 20,
-              max: 80,
-              // 频谱柱数量不显示节点
-              label: '$_spectrumBandCount 根',
-              onChanged: (v) {
-                setState(() => _spectrumBandCount = v.round());
-              },
-              onChangeEnd: (v) {
-                final count = v.round();
-                _settingsRepository.setSpectrumBandCount(count);
-                SpectrumService.instance.bandCount = count;
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _spectrumBandCount.toDouble(),
+                    min: 20,
+                    max: 80,
+                    label: '$_spectrumBandCount 根',
+                    onChanged: (v) {
+                      setState(() => _spectrumBandCount = v.round());
+                    },
+                    onChangeEnd: (v) {
+                      final count = v.round();
+                      _settingsRepository.setSpectrumBandCount(count);
+                      SpectrumService.instance.bandCount = count;
+                    },
+                  )
+                : M3ESlider(
+                    value: _spectrumBandCount.toDouble(),
+                    min: 20,
+                    max: 80,
+                    // 频谱柱数量不显示节点
+                    label: '$_spectrumBandCount 根',
+                    onChanged: (v) {
+                      setState(() => _spectrumBandCount = v.round());
+                    },
+                    onChangeEnd: (v) {
+                      final count = v.round();
+                      _settingsRepository.setSpectrumBandCount(count);
+                      SpectrumService.instance.bandCount = count;
+                    },
+                  ),
             trailing: _statusText('$_spectrumBandCount 根'),
           ),
         // 频谱动态取色：AM 播放器频谱颜色取封面主色（50% 白 + 50% 取色混合）
@@ -2929,9 +3797,23 @@ class _SettingsPageState extends State<SettingsPage>
             title: const Text('频谱动态取色'),
             value: _spectrumDynamicColor,
             onChanged: (v) {
-              HapticFeedback.selectionClick();
+              AppHaptics.selectionClick(HapticCategory.control);
               setState(() => _spectrumDynamicColor = v);
               _settingsRepository.setSpectrumDynamicColor(v);
+            },
+          ),
+        // Visualizer 兜底：默认关闭。开启后允许在 PCM 通路无数据时改用系统采集，
+        // 代价是需要录音权限，且会把输出轨道从 fast track 降级（部分机型爆音）。
+        if (_spectrumEnabled && Platform.isAndroid)
+          // search: 频谱 兜底 Visualizer 兼容
+          SwitchListTile(
+            title: const Text('Visualizer 兜底'),
+            subtitle: const Text('PCM 无数据时改用系统采集；可能造成爆音，非必要勿开'),
+            value: _spectrumVisualizerFallback,
+            onChanged: (v) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _spectrumVisualizerFallback = v);
+              _settingsRepository.setSpectrumVisualizerFallback(v);
             },
           ),
         // 频谱透明度滑块：按当前样式显示对应项（三个分开记忆）
@@ -2941,44 +3823,74 @@ class _SettingsPageState extends State<SettingsPage>
             // search: 频谱 透明度
             ListTile(
               title: const Text('频谱柱状图透明度'),
-              subtitle: M3ESlider(
-                decoration: const M3ESliderDecoration(
-                  haptic: M3EHapticFeedback.medium,
-                ),
-                value: _spectrumBarOpacity,
-                min: 0.1,
-                max: 1.0,
-                divisions: 9,
-                label: '${(_spectrumBarOpacity * 100).round()}%',
-                onChanged: (v) {
-                  setState(() => _spectrumBarOpacity = v);
-                },
-                onChangeEnd: (v) {
-                  _settingsRepository.setSpectrumBarOpacity(v);
-                },
-              ),
+              // tv: TV 构建换 RemoteSlider（P-C）
+              subtitle: kTvBuild
+                  ? RemoteSlider(
+                      value: _spectrumBarOpacity,
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 9,
+                      label: '${(_spectrumBarOpacity * 100).round()}%',
+                      onChanged: (v) {
+                        setState(() => _spectrumBarOpacity = v);
+                      },
+                      onChangeEnd: (v) {
+                        _settingsRepository.setSpectrumBarOpacity(v);
+                      },
+                    )
+                  : M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        haptic: M3EHapticFeedback.medium,
+                      ),
+                      value: _spectrumBarOpacity,
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 9,
+                      label: '${(_spectrumBarOpacity * 100).round()}%',
+                      onChanged: (v) {
+                        setState(() => _spectrumBarOpacity = v);
+                      },
+                      onChangeEnd: (v) {
+                        _settingsRepository.setSpectrumBarOpacity(v);
+                      },
+                    ),
               trailing: _statusText('${(_spectrumBarOpacity * 100).round()}%'),
             )
           else if (_spectrumStyle == 1)
             // search: 频谱 透明度
             ListTile(
               title: const Text('频谱曲线透明度'),
-              subtitle: M3ESlider(
-                decoration: const M3ESliderDecoration(
-                  haptic: M3EHapticFeedback.medium,
-                ),
-                value: _spectrumCurveOpacity,
-                min: 0.1,
-                max: 1.0,
-                divisions: 9,
-                label: '${(_spectrumCurveOpacity * 100).round()}%',
-                onChanged: (v) {
-                  setState(() => _spectrumCurveOpacity = v);
-                },
-                onChangeEnd: (v) {
-                  _settingsRepository.setSpectrumCurveOpacity(v);
-                },
-              ),
+              // tv: TV 构建换 RemoteSlider（P-C）
+              subtitle: kTvBuild
+                  ? RemoteSlider(
+                      value: _spectrumCurveOpacity,
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 9,
+                      label: '${(_spectrumCurveOpacity * 100).round()}%',
+                      onChanged: (v) {
+                        setState(() => _spectrumCurveOpacity = v);
+                      },
+                      onChangeEnd: (v) {
+                        _settingsRepository.setSpectrumCurveOpacity(v);
+                      },
+                    )
+                  : M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        haptic: M3EHapticFeedback.medium,
+                      ),
+                      value: _spectrumCurveOpacity,
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 9,
+                      label: '${(_spectrumCurveOpacity * 100).round()}%',
+                      onChanged: (v) {
+                        setState(() => _spectrumCurveOpacity = v);
+                      },
+                      onChangeEnd: (v) {
+                        _settingsRepository.setSpectrumCurveOpacity(v);
+                      },
+                    ),
               trailing: _statusText(
                 '${(_spectrumCurveOpacity * 100).round()}%',
               ),
@@ -2990,43 +3902,73 @@ class _SettingsPageState extends State<SettingsPage>
           // search: 频谱 透明度
           ListTile(
             title: const Text('频谱背景透明度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _spectrumBgOpacity,
-              min: 0.1,
-              max: 0.8,
-              divisions: 14,
-              label: '${(_spectrumBgOpacity * 100).round()}%',
-              onChanged: (v) {
-                setState(() => _spectrumBgOpacity = v);
-              },
-              onChangeEnd: (v) {
-                _settingsRepository.setSpectrumBgOpacity(v);
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _spectrumBgOpacity,
+                    min: 0.1,
+                    max: 0.8,
+                    divisions: 14,
+                    label: '${(_spectrumBgOpacity * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _spectrumBgOpacity = v);
+                    },
+                    onChangeEnd: (v) {
+                      _settingsRepository.setSpectrumBgOpacity(v);
+                    },
+                  )
+                : M3ESlider(
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                    ),
+                    value: _spectrumBgOpacity,
+                    min: 0.1,
+                    max: 0.8,
+                    divisions: 14,
+                    label: '${(_spectrumBgOpacity * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _spectrumBgOpacity = v);
+                    },
+                    onChangeEnd: (v) {
+                      _settingsRepository.setSpectrumBgOpacity(v);
+                    },
+                  ),
             trailing: _statusText('${(_spectrumBgOpacity * 100).round()}%'),
           ),
           // search: 频谱 高度
           ListTile(
             title: const Text('频谱背景高度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _spectrumBgHeight,
-              min: 0.2,
-              max: 0.8,
-              divisions: 12,
-              label: '${(_spectrumBgHeight * 100).round()}%',
-              onChanged: (v) {
-                setState(() => _spectrumBgHeight = v);
-              },
-              onChangeEnd: (v) {
-                _settingsRepository.setSpectrumBgHeight(v);
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _spectrumBgHeight,
+                    min: 0.2,
+                    max: 0.8,
+                    divisions: 12,
+                    label: '${(_spectrumBgHeight * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _spectrumBgHeight = v);
+                    },
+                    onChangeEnd: (v) {
+                      _settingsRepository.setSpectrumBgHeight(v);
+                    },
+                  )
+                : M3ESlider(
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                    ),
+                    value: _spectrumBgHeight,
+                    min: 0.2,
+                    max: 0.8,
+                    divisions: 12,
+                    label: '${(_spectrumBgHeight * 100).round()}%',
+                    onChanged: (v) {
+                      setState(() => _spectrumBgHeight = v);
+                    },
+                    onChangeEnd: (v) {
+                      _settingsRepository.setSpectrumBgHeight(v);
+                    },
+                  ),
             trailing: _statusText('${(_spectrumBgHeight * 100).round()}%'),
           ),
         ],
@@ -3196,7 +4138,7 @@ class _SettingsPageState extends State<SettingsPage>
   /// 新音质下一首播放生效（不打断当前播放）。
   void _onNetworkQualityPicked(bool isWifi, String? quality) {
     if (quality == null) return;
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() {
       if (isWifi) {
         _wifiQuality = quality;
@@ -3277,7 +4219,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('自动领取VIP'),
           value: _autoReceiveVip,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _autoReceiveVip = value;
             });
@@ -3297,7 +4239,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('音质降级提示'),
           value: _showQualityDowngradeToast,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _showQualityDowngradeToast = value);
             context.read<PlayerProvider>().setShowQualityDowngradeToast(value);
           },
@@ -3312,137 +4254,177 @@ class _SettingsPageState extends State<SettingsPage>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const Gap(AppSpacing.sm),
-        ListenableBuilder(
-          listenable: EqualizerService.instance,
-          builder: (context, _) {
-            final eq = EqualizerService.instance;
-            final effectsDisabled =
-                _disableSystemAudioEffects || eq.systemEffectsDisabled;
-            // search: eq 均衡
-            return ListTile(
-              enabled: !effectsDisabled,
-              leading: Icon(
-                Icons.graphic_eq,
-                color: effectsDisabled
-                    ? Theme.of(
-                        context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.38)
-                    : (eq.enabled
-                          ? Theme.of(context).colorScheme.primary
-                          : null),
-              ),
-              title: const Text('均衡器'),
-              subtitle: Text(
-                eq.systemEffectsDisabled
-                    ? '系统音效已禁用'
-                    : (eq.enabled ? '已开启 · ${eq.currentPreset}' : '未开启'),
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: effectsDisabled
-                  ? null
-                  : () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const EqualizerSettingsPage(),
-                      ),
-                    ),
-            );
-          },
-        ),
-        // search: 禁用系统音效 手机厂商 音效叠加 爆音 均衡器
-        SwitchListTile(
-          title: const Text('禁用App均衡器和音效'),
-          subtitle: const Text('避免与手机厂商音效叠加后播放音乐炸音；会停用本应用均衡器和音效库'),
-          value: _disableSystemAudioEffects,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _disableSystemAudioEffects = value);
-            EqualizerService.instance.setSystemEffectsDisabled(value);
-          },
-        ),
-        // —— 蝰蛇/社区音效（浏览与下载 .irs 音效文件）——
-        // search: 蝰蛇 音效 社区音效 sound model irs
-        ListTile(
-          enabled: !_disableSystemAudioEffects,
-          leading: Icon(
-            Icons.spatial_audio_off,
-            color: _disableSystemAudioEffects
-                ? Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.38)
-                : null,
-          ),
-          title: const Text('音效库'),
-          trailing: const Icon(Icons.chevron_right),
-          onTap: _disableSystemAudioEffects
-              ? null
-              : () => Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const SoundsPage()),
+        // 桌面端隐藏整条系统音效链：均衡器 / 音效库 / 音量均衡 / 参考响度
+        // 都挂在 EqualizerService 的 AudioSession 绑定上（Android 专属），
+        // 桌面端 tryBind() 直接 return false —— 开关照样能开、能存盘，
+        // 但没有任何音效被挂载，是"假成功"（详见 platform_capabilities）。
+        if (supportsSystemAudioEffects) ...[
+          ListenableBuilder(
+            listenable: EqualizerService.instance,
+            builder: (context, _) {
+              final eq = EqualizerService.instance;
+              final effectsDisabled =
+                  _disableSystemAudioEffects || eq.systemEffectsDisabled;
+              // search: eq 均衡
+              return ListTile(
+                enabled: !effectsDisabled,
+                leading: Icon(
+                  Icons.graphic_eq,
+                  color: effectsDisabled
+                      ? Theme.of(
+                          context,
+                        ).colorScheme.onSurface.withValues(alpha: 0.38)
+                      : (eq.enabled
+                            ? Theme.of(context).colorScheme.primary
+                            : null),
                 ),
-        ),
-        // search: 蝰蛇 母带 母带处理 限幅 削波 均衡 viper master
-        SwitchListTile(
-          title: const Text('蝰蛇母带处理'),
-          subtitle: const Text('10 段均衡 + 限幅的母带级处理链，仅 Android；关闭时输出逐字节透传'),
-          value: _viperMasterEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _viperMasterEnabled = value);
-            _settingsRepository.setViperMasterEnabled(value);
-            ViperMasterService.instance.setEnabled(value);
-          },
-        ),
-        // search: 蝰蛇母带 音源 母带音质 viper tape VPT
-        SwitchListTile(
-          title: const Text('蝰蛇母带音源'),
-          subtitle: const Text('实验功能 · 开启后音质选择出现「蝰蛇母带」档，需要 VIP'),
-          value: _viperTapeQualityEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _viperTapeQualityEnabled = value);
-            _settingsRepository.setViperTapeQualityEnabled(value);
-          },
-        ),
-        // —— 音量均衡（响度归一）——
-        // search: 音量均衡 响度归一 响度 均衡 参考响度 LUFS 安静歌 放大 峰值
-        SwitchListTile(
-          title: const Text('音量均衡'),
-          value: _volumeNormalizationEnabled,
-          onChanged: (value) {
-            HapticFeedback.lightImpact();
-            setState(() => _volumeNormalizationEnabled = value);
-            _settingsRepository.setVolumeNormalizationEnabled(value);
-            // 开关变化即时对当前曲目重算并应用增益
-            AudioService().setVolumeNormalization(enabled: value);
-          },
-        ),
-        // 参考响度只在均衡开启时才有意义
-        // search-item: 参考响度 LUFS | 音量均衡 参考响度 响度 归一 均衡
-        if (_volumeNormalizationEnabled)
+                title: const Text('均衡器'),
+                subtitle: Text(
+                  eq.systemEffectsDisabled
+                      ? '系统音效已禁用'
+                      : (eq.enabled ? '已开启 · ${eq.currentPreset}' : '未开启'),
+                ),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: effectsDisabled
+                    ? null
+                    : () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const EqualizerSettingsPage(),
+                        ),
+                      ),
+              );
+            },
+          ),
+          // search: 禁用系统音效 手机厂商 音效叠加 爆音 均衡器
+          SwitchListTile(
+            title: const Text('禁用App均衡器和音效'),
+            subtitle: const Text('避免与手机厂商音效叠加后播放音乐炸音；会停用本应用均衡器和音效库'),
+            value: _disableSystemAudioEffects,
+            onChanged: (value) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _disableSystemAudioEffects = value);
+              EqualizerService.instance.setSystemEffectsDisabled(value);
+            },
+          ),
+          // —— 蝰蛇/社区音效（浏览与下载 .irs 音效文件）——
+          // search: 蝰蛇 音效 社区音效 sound model irs
           ListTile(
-            title: const Text('参考响度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _volumeNormalizationLufs,
-              min: -20,
-              max: -8,
-              divisions: 12,
-              label: '${_volumeNormalizationLufs.round()} LUFS',
-              onChanged: (v) {
-                setState(() => _volumeNormalizationLufs = v.roundToDouble());
-              },
-              onChangeEnd: (v) {
-                final lufs = v.roundToDouble();
-                setState(() => _volumeNormalizationLufs = lufs);
-                _settingsRepository.setVolumeNormalizationReferenceLufs(lufs);
-                AudioService().setVolumeNormalization(referenceLufs: lufs);
+            enabled: !_disableSystemAudioEffects,
+            leading: Icon(
+              Icons.spatial_audio_off,
+              color: _disableSystemAudioEffects
+                  ? Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.38)
+                  : null,
+            ),
+            title: const Text('音效库'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _disableSystemAudioEffects
+                ? null
+                : () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const SoundsPage()),
+                  ),
+          ),
+          // search: 蝰蛇 母带 母带处理 限幅 削波 均衡 viper master
+          if (supportsViperMaster)
+            SwitchListTile(
+              title: const Text('蝰蛇母带处理'),
+              subtitle: const Text('10 段均衡 + 限幅的母带级处理链，仅 Android；关闭时输出逐字节透传'),
+              value: _viperMasterEnabled,
+              onChanged: (value) {
+                AppHaptics.lightImpact(HapticCategory.control);
+                setState(() => _viperMasterEnabled = value);
+                _settingsRepository.setViperMasterEnabled(value);
+                ViperMasterService.instance.setEnabled(value);
               },
             ),
-            trailing: _statusText('${_volumeNormalizationLufs.round()} LUFS'),
-          ),
+          // search: 蝰蛇母带 音源 母带音质 viper tape VPT
+          if (supportsViperMaster)
+            SwitchListTile(
+              title: const Text('蝰蛇母带音源'),
+              subtitle: const Text('实验功能 · 开启后音质选择出现「蝰蛇母带」档，需要 VIP'),
+              value: _viperTapeQualityEnabled,
+              onChanged: (value) {
+                AppHaptics.lightImpact(HapticCategory.control);
+                setState(() => _viperTapeQualityEnabled = value);
+                _settingsRepository.setViperTapeQualityEnabled(value);
+              },
+            ),
+          // —— 音量均衡（响度归一）——
+          // search: 音量均衡 响度归一 响度 均衡 参考响度 LUFS 安静歌 放大 峰值
+          if (supportsLoudnessNormalization) ...[
+            SwitchListTile(
+              title: const Text('音量均衡'),
+              value: _volumeNormalizationEnabled,
+              onChanged: (value) {
+                AppHaptics.lightImpact(HapticCategory.control);
+                setState(() => _volumeNormalizationEnabled = value);
+                _settingsRepository.setVolumeNormalizationEnabled(value);
+                // 开关变化即时对当前曲目重算并应用增益
+                AudioService().setVolumeNormalization(enabled: value);
+              },
+            ),
+            // 参考响度只在均衡开启时才有意义
+            // search-item: 参考响度 LUFS | 音量均衡 参考响度 响度 归一 均衡
+            if (_volumeNormalizationEnabled)
+              ListTile(
+                title: const Text('参考响度'),
+                // tv: TV 构建换 RemoteSlider（P-C）
+                subtitle: kTvBuild
+                    ? RemoteSlider(
+                        value: _volumeNormalizationLufs,
+                        min: -20,
+                        max: -8,
+                        divisions: 12,
+                        label: '${_volumeNormalizationLufs.round()} LUFS',
+                        onChanged: (v) {
+                          setState(
+                            () => _volumeNormalizationLufs = v.roundToDouble(),
+                          );
+                        },
+                        onChangeEnd: (v) {
+                          final lufs = v.roundToDouble();
+                          setState(() => _volumeNormalizationLufs = lufs);
+                          _settingsRepository
+                              .setVolumeNormalizationReferenceLufs(lufs);
+                          AudioService().setVolumeNormalization(
+                            referenceLufs: lufs,
+                          );
+                        },
+                      )
+                    : M3ESlider(
+                        decoration: const M3ESliderDecoration(
+                          haptic: M3EHapticFeedback.medium,
+                        ),
+                        value: _volumeNormalizationLufs,
+                        min: -20,
+                        max: -8,
+                        divisions: 12,
+                        label: '${_volumeNormalizationLufs.round()} LUFS',
+                        onChanged: (v) {
+                          setState(
+                            () => _volumeNormalizationLufs = v.roundToDouble(),
+                          );
+                        },
+                        onChangeEnd: (v) {
+                          final lufs = v.roundToDouble();
+                          setState(() => _volumeNormalizationLufs = lufs);
+                          _settingsRepository
+                              .setVolumeNormalizationReferenceLufs(lufs);
+                          AudioService().setVolumeNormalization(
+                            referenceLufs: lufs,
+                          );
+                        },
+                      ),
+                trailing: _statusText(
+                  '${_volumeNormalizationLufs.round()} LUFS',
+                ),
+              ),
+          ],
+        ],
       ],
     );
   }
@@ -3459,7 +4441,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('冷启动恢复上次播放的歌曲与进度；关闭后不再记忆'),
           value: _restoreMemoryEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _restoreMemoryEnabled = value);
             context.read<PlayerProvider>().setRestoreMemoryEnabled(value);
           },
@@ -3470,17 +4452,17 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('打开应用后自动开始播放音乐；默认关闭'),
           value: _startupAutoPlayEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _startupAutoPlayEnabled = value);
             _settingsRepository.setStartupAutoPlayEnabled(value);
           },
         ),
         // 以下两项是上面那个开关的从属项：关着时它们没有意义，直接隐藏
         if (_startupAutoPlayEnabled) ...[
-          // search: 播放内容 音源 每日推荐 私人FM 红心 探索 小众 继续上次 续播 电台
+          // search: 播放内容 音源 每日推荐 私人FM 红心 探索 小众 刷歌推荐 继续上次 续播 电台
           ListTile(
             title: const Text('播放内容'),
-            subtitle: M3EDropdownMenu<String>(
+            subtitle: TvDropdownMenu<String>(
               items: [
                 for (final s in StartupAutoPlaySource.values)
                   M3EDropdownItem(
@@ -3507,7 +4489,7 @@ class _SettingsPageState extends State<SettingsPage>
                 }
                 final value = selected.first.value;
                 if (value == _startupAutoPlaySource) return;
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 setState(() => _startupAutoPlaySource = value);
                 _settingsRepository.setStartupAutoPlaySource(value);
               },
@@ -3523,7 +4505,7 @@ class _SettingsPageState extends State<SettingsPage>
             subtitle: const Text('开始播放后自动进入完整播放页'),
             value: _startupAutoPlayOpenPage,
             onChanged: (value) {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               setState(() => _startupAutoPlayOpenPage = value);
               _settingsRepository.setStartupAutoPlayOpenPage(value);
             },
@@ -3534,7 +4516,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('暂停淡入淡出'),
           value: _pauseFadeEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _pauseFadeEnabled = value;
             });
@@ -3546,7 +4528,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('歌曲淡入淡出'),
           value: _crossfadeEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _crossfadeEnabled = value;
             });
@@ -3561,27 +4543,47 @@ class _SettingsPageState extends State<SettingsPage>
           // search-item: 淡出时长 | 交叉淡化时长 淡化 时长 秒数 crossfade 叠加
           ListTile(
             title: const Text('淡出时长'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _crossfadeSeconds.toDouble(),
-              min: SettingsRepository.kCrossfadeMinSeconds.toDouble(),
-              max: SettingsRepository.kCrossfadeMaxSeconds.toDouble(),
-              divisions:
-                  SettingsRepository.kCrossfadeMaxSeconds -
-                  SettingsRepository.kCrossfadeMinSeconds,
-              label: '$_crossfadeSeconds 秒',
-              onChanged: (v) {
-                setState(() => _crossfadeSeconds = v.round());
-              },
-              onChangeEnd: (v) {
-                final seconds = v.round();
-                setState(() => _crossfadeSeconds = seconds);
-                _settingsRepository.setCrossfadeSeconds(seconds);
-                context.read<PlayerProvider>().refreshCrossfadeSettings();
-              },
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _crossfadeSeconds.toDouble(),
+                    min: SettingsRepository.kCrossfadeMinSeconds.toDouble(),
+                    max: SettingsRepository.kCrossfadeMaxSeconds.toDouble(),
+                    divisions:
+                        SettingsRepository.kCrossfadeMaxSeconds -
+                        SettingsRepository.kCrossfadeMinSeconds,
+                    label: '$_crossfadeSeconds 秒',
+                    onChanged: (v) {
+                      setState(() => _crossfadeSeconds = v.round());
+                    },
+                    onChangeEnd: (v) {
+                      final seconds = v.round();
+                      setState(() => _crossfadeSeconds = seconds);
+                      _settingsRepository.setCrossfadeSeconds(seconds);
+                      context.read<PlayerProvider>().refreshCrossfadeSettings();
+                    },
+                  )
+                : M3ESlider(
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                    ),
+                    value: _crossfadeSeconds.toDouble(),
+                    min: SettingsRepository.kCrossfadeMinSeconds.toDouble(),
+                    max: SettingsRepository.kCrossfadeMaxSeconds.toDouble(),
+                    divisions:
+                        SettingsRepository.kCrossfadeMaxSeconds -
+                        SettingsRepository.kCrossfadeMinSeconds,
+                    label: '$_crossfadeSeconds 秒',
+                    onChanged: (v) {
+                      setState(() => _crossfadeSeconds = v.round());
+                    },
+                    onChangeEnd: (v) {
+                      final seconds = v.round();
+                      setState(() => _crossfadeSeconds = seconds);
+                      _settingsRepository.setCrossfadeSeconds(seconds);
+                      context.read<PlayerProvider>().refreshCrossfadeSettings();
+                    },
+                  ),
             trailing: _statusText('$_crossfadeSeconds 秒'),
           ),
         // search: 自动混音 AutoMix 无缝过渡 对拍 节拍 变速 混音 DJ
@@ -3591,7 +4593,7 @@ class _SettingsPageState extends State<SettingsPage>
             subtitle: const Text('按节拍对齐过渡点、按节奏自适应时长，BPM 接近时自动对拍'),
             value: _automixEnabled,
             onChanged: (value) {
-              HapticFeedback.lightImpact();
+              AppHaptics.lightImpact(HapticCategory.control);
               setState(() {
                 _automixEnabled = value;
               });
@@ -3607,7 +4609,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('允许与其他应用同时播放音频'),
           value: _ignoreAudioFocus,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _ignoreAudioFocus = value;
             });
@@ -3678,21 +4680,23 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        // search: 上传听歌时长 听歌时长 上传 等级 累计 上报
+        // search: 听歌数据云同步 听歌 云同步 上传 历史 时长 等级 上报 播放历史 排行
         SwitchListTile(
-          title: const Text('上传听歌时长'),
+          title: const Text('听歌数据云同步'),
+          subtitle: const Text('云端播放历史、听歌排行与听歌时长/等级'),
           value: _uploadListeningDuration,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _uploadListeningDuration = value;
             });
             _settingsRepository.setUploadListeningDuration(value);
-            // 关闭时立刻丢弃当前计时段：否则 tracker 会继续累计，
+            // 关闭时立刻丢弃两个上报服务的当前计时段：否则 tracker 会继续累计，
             // 重新打开后这段「关闭期间」的时长会被补记上报 —— 违背用户意愿。
             // 已累计的部分同样不上报（用户关闭开关的意图优先）。
             if (!value) {
               ListenReportService.instance.discard();
+              PlayHistorySyncService.instance.discard();
             }
           },
         ),
@@ -3711,7 +4715,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('长按封面进入 Zen 模式'),
           value: _zenCoverLongPress,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _zenCoverLongPress = value);
             _settingsRepository.setZenCoverLongPress(value);
           },
@@ -3722,7 +4726,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('横屏隐藏状态栏'),
           value: _landscapeImmersiveEnabled,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _landscapeImmersiveEnabled = value);
             _settingsRepository.setLandscapeImmersiveEnabled(value);
             // 全局标志即时同步：再次进入播放器或旋转屏幕即按新值应用系统栏
@@ -3734,7 +4738,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('播放时保持屏幕常亮'),
           value: _keepScreenOn,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _keepScreenOn = value;
             });
@@ -3756,7 +4760,7 @@ class _SettingsPageState extends State<SettingsPage>
               title: const Text('播放 MV 时自动画中画'),
               value: enabled,
               onChanged: (v) async {
-                HapticFeedback.lightImpact();
+                AppHaptics.lightImpact(HapticCategory.control);
                 await SettingsRepository().setAutoPipEnabled(v);
                 setState(() {});
               },
@@ -3771,37 +4775,68 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: const Text('在 MV 播放页叠加弹幕'),
           value: _mvDanmakuEnabled,
           onChanged: (v) async {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _mvDanmakuEnabled = v);
             await _settingsRepository.setMvDanmakuEnabled(v);
           },
         ),
+        // 歌曲弹幕：控制是否在播放页叠加弹幕层（TV 无文本输入能力，不编入 TV 包）
+        // search: 歌曲 弹幕 播放页 封面 滚动
+        if (!kTvBuild)
+          SwitchListTile(
+            secondary: Icon(
+              Icons.subtitles_outlined,
+              color: colorScheme.primary,
+            ),
+            title: const Text('显示歌曲弹幕'),
+            subtitle: const Text('在播放页叠加歌曲弹幕'),
+            value: _songDanmakuEnabled,
+            onChanged: (v) async {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _songDanmakuEnabled = v);
+              await _settingsRepository.setSongDanmakuEnabled(v);
+            },
+          ),
         // MV 弹幕透明度：弹幕关闭时不显示（无可调对象）
         if (_mvDanmakuEnabled)
           // search: 弹幕透明度 弹幕 浓度
           ListTile(
             leading: Icon(Icons.opacity_outlined, color: colorScheme.primary),
             title: const Text('弹幕透明度'),
-            subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium,
-              ),
-              value: _mvDanmakuOpacity,
-              min: 0.1,
-              max: 1.0,
-              divisions: 9,
-              label: '${(_mvDanmakuOpacity * 100).round()}%',
-              // 拖动只改本地状态；松手才落盘，避免拖动过程中反复写 SharedPreferences
-              onChanged: (v) => setState(() => _mvDanmakuOpacity = v),
-              onChangeEnd: (v) => _settingsRepository.setMvDanmakuOpacity(v),
-            ),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _mvDanmakuOpacity,
+                    min: 0.1,
+                    max: 1.0,
+                    divisions: 9,
+                    label: '${(_mvDanmakuOpacity * 100).round()}%',
+                    onChanged: (v) => setState(() => _mvDanmakuOpacity = v),
+                    onChangeEnd: (v) =>
+                        _settingsRepository.setMvDanmakuOpacity(v),
+                  )
+                : M3ESlider(
+                    decoration: const M3ESliderDecoration(
+                      haptic: M3EHapticFeedback.medium,
+                    ),
+                    value: _mvDanmakuOpacity,
+                    min: 0.1,
+                    max: 1.0,
+                    divisions: 9,
+                    label: '${(_mvDanmakuOpacity * 100).round()}%',
+                    // 拖动只改本地状态；松手才落盘，避免拖动过程中反复写 SharedPreferences
+                    onChanged: (v) => setState(() => _mvDanmakuOpacity = v),
+                    onChangeEnd: (v) =>
+                        _settingsRepository.setMvDanmakuOpacity(v),
+                  ),
             trailing: _statusText('${(_mvDanmakuOpacity * 100).round()}%'),
           ),
       ],
     );
   }
 
-  /// 「列表与交互」三级子页：本地音乐评论区、MiniPlayer 滑动切歌、歌单排序。
+  /// 「列表与交互」三级子页：本地音乐评论区、MiniPlayer 滑动切歌、歌单排序、
+  /// 封面流歌单源与 FM 电台。
   Widget _buildListInteractionSubpage(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3814,7 +4849,7 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('关闭本地音乐评论区'),
           value: _closeLocalMusicComments,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _closeLocalMusicComments = value;
             });
@@ -3823,13 +4858,78 @@ class _SettingsPageState extends State<SettingsPage>
             context.read<PlayerProvider>().setCloseLocalMusicComments(value);
           },
         ),
+        // 本地歌曲在线信息匹配：自动匹配开关（关闭时终止进行中的轮次）
+        // search: 自动匹配 在线信息 匹配 封面 歌词 评论 本地歌曲
+        SwitchListTile(
+          title: const Text('自动匹配在线信息'),
+          subtitle: const Text('为本地歌曲搜索匹配在线歌曲，补充封面、歌词与评论区'),
+          value: _autoMatchOnlineInfo,
+          onChanged: (value) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _autoMatchOnlineInfo = value);
+            _settingsRepository.setAutoMatchOnlineInfo(value);
+            if (!value) context.read<SongMatchProvider>().cancelAutoMatch();
+          },
+        ),
+        // 立即匹配：忽略开关与冷却手动触发一轮；进度经 Provider 实时刷新
+        Consumer<SongMatchProvider>(
+          builder: (ctx, match, _) {
+            final running = match.autoMatching;
+            return ListTile(
+              leading: Icon(Icons.manage_search, color: colorScheme.primary),
+              title: const Text('立即匹配未匹配歌曲'),
+              subtitle: Text(
+                running
+                    ? '匹配中 ${match.autoMatchDone}/${match.autoMatchTotal}'
+                    : '手动触发一轮全库匹配（忽略开关与冷却）',
+              ),
+              enabled: !running,
+              onTap: () {
+                AppHaptics.lightImpact(HapticCategory.control);
+                unawaited(
+                  ctx.read<SongMatchProvider>().runAutoMatch(force: true),
+                );
+                showToast('开始匹配未匹配的本地歌曲');
+              },
+            );
+          },
+        ),
+        ListTile(
+          leading: Icon(Icons.clear_all, color: colorScheme.primary),
+          title: const Text('清除全部匹配记录'),
+          subtitle: const Text('清空后自动匹配将重新搜索所有本地歌曲'),
+          onTap: () async {
+            final confirmed = await showDialog<bool>(
+              context: context,
+              builder: (dialogCtx) => AlertDialog(
+                title: const Text('清除全部匹配记录'),
+                content: const Text('已匹配歌曲的封面兜底、歌词精确检索与评论区将回退到未匹配状态。'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogCtx, false),
+                    child: const Text('取消'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogCtx, true),
+                    child: const Text('清除'),
+                  ),
+                ],
+              ),
+            );
+            if (confirmed != true) return;
+            await SongMatchRepository().clearAll();
+            if (!context.mounted) return;
+            context.read<SongMatchProvider>().notifyChanged();
+            showToast('已清除全部匹配记录');
+          },
+        ),
         // search: miniplayer 迷你播放条 滑动切歌 切歌
         SwitchListTile(
           title: const Text('MiniPlayer 滑动切歌'),
           subtitle: const Text('浮动迷你播放器暂不支持滑动切歌'),
           value: _miniPlayerSwipeSwitch,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _miniPlayerSwipeSwitch = value;
             });
@@ -3843,12 +4943,58 @@ class _SettingsPageState extends State<SettingsPage>
           title: const Text('收藏歌单按最近点击排序'),
           value: _sortCollectedByLatestClick,
           onChanged: (value) {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() {
               _sortCollectedByLatestClick = value;
             });
             _settingsRepository.setSortCollectedByLatestClick(value);
           },
+        ),
+        const Gap(AppSpacing.sm),
+        _buildGroupLabel('封面流', colorScheme),
+        // search-item: 封面流歌单源 | 封面流 数据源 歌单源 每日推荐 私人FM 红心 探索 小众 刷歌推荐 source
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+          child: Row(
+            children: [
+              Icon(
+                Icons.auto_awesome_motion,
+                size: 18,
+                color: colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              const Expanded(child: Text('歌单源')),
+              SizedBox(
+                width: 150,
+                child: TvDropdownMenu<CoverFlowSource>(
+                  items: _coverFlowSourceItems,
+                  singleSelect: true,
+                  // 关闭 chip 动画：当前值渲染为可省略的纯文本
+                  showChipAnimation: false,
+                  fieldStyle: M3EDropdownFieldStyle(
+                    hintText: '选择歌单源',
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                  ),
+                  onSelectionChanged: (selected) {
+                    // 单选下再次点击已选中项会被取消选中：强制重建恢复原值
+                    if (selected.isEmpty) {
+                      setState(() {});
+                      return;
+                    }
+                    final next = selected.first.value;
+                    if (next == kCoverFlowSource.value) return;
+                    AppHaptics.lightImpact(HapticCategory.control);
+                    // ignore: discarded_futures
+                    SettingsRepository().setCoverFlowSourceRaw(next.rawValue);
+                    kCoverFlowSource.value = next;
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ],
     );
@@ -3861,6 +5007,427 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   /// 桌面快捷方式 section：Android 长按应用图标快捷入口的显示/隐藏、排序（直接内嵌，免二次点击）
+  /// 震动反馈：总开关 + 七个交互类别细分。
+  ///
+  /// 状态直接读 [AppHaptics] 的内存态（调用点在判定瞬间读取，改完立即全站生效），
+  /// 持久化也由它负责——若在这里另存一份 bool 字段，设置页与全站 150+ 个调用点
+  /// 就会各持一份真相，重启后谁覆盖谁都不确定。
+  /// 七个类别的 tile 逐个手写而非循环生成：设置搜索索引只能提取字面量 title。
+  Widget _buildHapticsSection(ColorScheme colorScheme) {
+    // 进入时刷新一次实测输出延迟（探针只在播放中有意义）
+    // ignore: discarded_futures
+    MusicHapticsService.instance.refreshMeasuredLatency();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Gap(AppSpacing.sm),
+        // search: 震动 振动 马达 触觉 haptic 反馈 手感 震感 不震动 关闭震动
+        SwitchListTile(
+          title: const Text('震动反馈'),
+          subtitle: const Text('总开关。关闭后全站按钮、滑块与手势都不再震动'),
+          value: AppHaptics.enabled,
+          onChanged: (value) {
+            // 先给本次操作留一点手感，再落盘：关总开关时这次仍会震动，
+            // 与全站「开关改动即反馈」的既有约定一致。
+            AppHaptics.lightImpact(HapticCategory.control);
+            AppHaptics.setEnabled(value);
+            // 总开关也参与震动服务的采集判定：关掉后立刻拆掉频谱采集，
+            // 不让 FFT 为一个永远不点火的震动空转。
+            MusicHapticsService.instance.refreshCapture();
+            setState(() {});
+          },
+        ),
+        // 以下七项是总开关的从属项：关着时类别细分没有意义，直接隐藏
+        if (AppHaptics.enabled) ...[
+          const SettingsGroupHeading('按类别控制'),
+          // search: 播放控制 播放键 暂停 上一首 下一首 切歌 播放模式 收藏 红心 进度条
+          SwitchListTile(
+            title: const Text('播放控制按钮'),
+            subtitle: const Text('播放/暂停、上一首/下一首、播放模式、收藏、进度条落点'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.transport),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.transport, value),
+          ),
+          // 下面七个开关保持常驻，只把「震动类型」按类别开条件：类型是关着时选
+          // 哪种都不震动，但开关本身一旦跟着条件消失就没有入口能再把它打开。
+          // search: 播放控制 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.transport))
+            ListTile(
+              title: const Text('播放控制的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.transport),
+            ),
+          // search: 列表 歌曲行 歌单行 条目 点击 长按 更多菜单 评论行
+          SwitchListTile(
+            title: const Text('列表条目'),
+            subtitle: const Text('歌曲行、歌单行的点击与长按，评论行的点击'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.listItem),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.listItem, value),
+          ),
+          // search: 列表条目 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.listItem))
+            ListTile(
+              title: const Text('列表条目的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.listItem),
+            ),
+          // search: 导航 底部导航栏 标签 切换 分段控件 侧边栏 tab
+          SwitchListTile(
+            title: const Text('导航切换'),
+            subtitle: const Text('底部导航栏与侧边栏、分段控件、播放页标签条'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.navigation),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.navigation, value),
+          ),
+          // search: 导航切换 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.navigation))
+            ListTile(
+              title: const Text('导航切换的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.navigation),
+            ),
+          // search: 开关 按钮 下拉菜单 复选 单选 按压 设置项
+          SwitchListTile(
+            title: const Text('开关与按钮'),
+            subtitle: const Text('设置项开关、下拉菜单与各类按钮的按压反馈'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.control),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.control, value),
+          ),
+          // search: 开关与按钮 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.control))
+            ListTile(
+              title: const Text('开关与按钮的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.control),
+            ),
+          // search: 滑块 拖动 音量条 进度条 刻度 吸附 滑条
+          SwitchListTile(
+            title: const Text('滑块调节'),
+            subtitle: const Text('音量、进度条与设置类滑块的拖动与吸附（含 m3e 滑条）'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.slider),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.slider, value),
+          ),
+          // search: 滑块调节 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.slider))
+            ListTile(
+              title: const Text('滑块调节的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.slider),
+            ),
+          // search: 手势 长按 封面 滑动切歌 歌词行 下拉刷新 拖拽
+          SwitchListTile(
+            title: const Text('手势与长按'),
+            subtitle: const Text('长按封面、滑动切歌、点击歌词行、下拉刷新'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.gesture),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.gesture, value),
+          ),
+          // search: 手势与长按 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.gesture))
+            ListTile(
+              title: const Text('手势与长按的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.gesture),
+            ),
+          // search: 悬浮 迷你播放器 播放条 悬浮条 圆盘 拖拽 拖动 长按 secondary mini player
+          SwitchListTile(
+            title: const Text('悬浮播放器拖拽'),
+            subtitle: const Text('拖动或长按拾起悬浮圆盘时的震动；浮起动效不受本开关影响'),
+            value: AppHaptics.isCategoryEnabled(HapticCategory.floatingPlayer),
+            onChanged: (value) =>
+                _setHapticCategoryEnabled(HapticCategory.floatingPlayer, value),
+          ),
+          // search: 悬浮播放器拖拽 震动类型 类型 强度 效果 预定义 轻点 刻度 重击 双击 长按
+          if (AppHaptics.isCategoryEnabled(HapticCategory.floatingPlayer))
+            ListTile(
+              title: const Text('悬浮播放器拖拽的震动类型'),
+              subtitle: _hapticTypeDropdown(HapticCategory.floatingPlayer),
+            ),
+        ],
+        const SettingsGroupHeading('音乐节奏震动'),
+        // search: 音乐 节奏 鼓点 节拍 震动 低音 马达 踩点 律动
+        SwitchListTile(
+          title: const Text('音乐节奏震动'),
+          subtitle: const Text('跟着鼓点震动。默认关闭；播放中生效，无需开启频谱显示，范围可在下方选择'),
+          value: _musicHapticsEnabled,
+          onChanged: (value) async {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _musicHapticsEnabled = value);
+            await _settingsRepository.setMusicHapticsEnabled(value);
+            await MusicHapticsService.instance.setEnabled(value);
+          },
+        ),
+        if (_musicHapticsEnabled) ...[
+          // search: 生效范围 范围 播放页 应用内 后台 始终 什么时候震 震动范围
+          ListTile(
+            title: const Text('生效范围'),
+            subtitle: _musicHapticsScopeDropdown(),
+          ),
+          // search: 强度 力度 震感 振幅
+          ListTile(
+            title: const Text('震动强度'),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _musicHapticsStrength,
+                    min: 0.2,
+                    max: 1.0,
+                    divisions: 8,
+                    label: '${(_musicHapticsStrength * 100).round()}%',
+                    onChanged: (v) async {
+                      setState(() => _musicHapticsStrength = v);
+                      await _settingsRepository.setMusicHapticsStrength(v);
+                      await MusicHapticsService.instance.setStrength(v);
+                    },
+                  )
+                : M3ESlider(
+                    decoration: kSettingsSliderDecoration,
+                    value: _musicHapticsStrength,
+                    min: 0.2,
+                    max: 1.0,
+                    divisions: 8,
+                    label: '${(_musicHapticsStrength * 100).round()}%',
+                    onChanged: (v) async {
+                      setState(() => _musicHapticsStrength = v);
+                      await _settingsRepository.setMusicHapticsStrength(v);
+                      await MusicHapticsService.instance.setStrength(v);
+                    },
+                  ),
+            trailing: _statusText('${(_musicHapticsStrength * 100).round()}%'),
+          ),
+          // search: 灵敏度 敏感 阈值 漏拍 误触发
+          ListTile(
+            title: const Text('检测灵敏度'),
+            // tv: TV 构建换 RemoteSlider（P-C）
+            subtitle: kTvBuild
+                ? RemoteSlider(
+                    value: _musicHapticsSensitivity,
+                    min: 0.3,
+                    max: 3.0,
+                    // 无极连续调节：阈值是模拟量，27 档的节点反而限制手感
+                    label: _musicHapticsSensitivity.toStringAsFixed(2),
+                    onChanged: (v) async {
+                      setState(() => _musicHapticsSensitivity = v);
+                      await _settingsRepository.setMusicHapticsSensitivity(v);
+                      await MusicHapticsService.instance.setSensitivity(v);
+                    },
+                  )
+                : M3ESlider(
+                    decoration: kFreeSliderDecoration,
+                    value: _musicHapticsSensitivity,
+                    min: 0.3,
+                    max: 3.0,
+                    // 无极连续调节：阈值是模拟量，27 档的节点反而限制手感
+                    label: _musicHapticsSensitivity.toStringAsFixed(2),
+                    onChanged: (v) async {
+                      setState(() => _musicHapticsSensitivity = v);
+                      await _settingsRepository.setMusicHapticsSensitivity(v);
+                      await MusicHapticsService.instance.setSensitivity(v);
+                    },
+                  ),
+            trailing: _statusText(_musicHapticsSensitivity.toStringAsFixed(2)),
+          ),
+          // search: 波形 触感 清脆 脉冲 平滑 手感 包络 衰减
+          ListTile(
+            title: const Text('触感波形'),
+            subtitle: M3EToggleButtonGroup(
+              actions: [
+                // 清脆 = 交互开关同款的系统预定义触感（createPredefined），无拖尾
+                const M3EToggleButtonGroupAction(label: Text('清脆')),
+                const M3EToggleButtonGroupAction(label: Text('脉冲')),
+                M3EToggleButtonGroupAction(
+                  label: const Text('平滑'),
+                  // 无振幅控制的设备上平滑波形会退化成二值振动，比脉冲更差（见计划 D2）
+                  enabled: MusicHapticsService.instance.hasAmplitudeControl,
+                ),
+              ],
+              selectedIndex: switch (_musicHapticsWaveform) {
+                'pulse' => 1,
+                'smooth' => 2,
+                _ => 0,
+              },
+              onSelectedIndexChanged: (index) async {
+                if (index == null) return;
+                const values = ['auto', 'pulse', 'smooth'];
+                final value = values[index];
+                setState(() => _musicHapticsWaveform = value);
+                await _settingsRepository.setMusicHapticsWaveform(value);
+                await MusicHapticsService.instance.setWaveform(
+                  MusicHapticsWaveform.fromNativeName(value),
+                );
+              },
+            ),
+          ),
+          // search: 偏移 延迟 补偿 对齐 滞后 提前 offset 拍点
+          ListTile(
+            title: const Text('节奏偏移'),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // tv: TV 构建换 RemoteSlider（P-C）
+                kTvBuild
+                    ? RemoteSlider(
+                        value: _musicHapticsOffset.toDouble(),
+                        min: 0,
+                        max: MusicHapticsService.maxOffsetMs.toDouble(),
+                        // 无极连续调节：偏移本质是模拟量，10ms 一档的节点反而限制手感
+                        label: '+${_musicHapticsOffset}ms',
+                        onChanged: (v) {
+                          // 拖动中只预览（内存态 + 下发原生），松手才落盘
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          MusicHapticsService.instance.previewOffset(ms);
+                        },
+                        onChangeEnd: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          _settingsRepository.setMusicHapticsOffset(ms);
+                          MusicHapticsService.instance.setOffset(ms);
+                        },
+                      )
+                    : M3ESlider(
+                        decoration: kFreeSliderDecoration,
+                        value: _musicHapticsOffset.toDouble(),
+                        min: 0,
+                        max: MusicHapticsService.maxOffsetMs.toDouble(),
+                        // 无极连续调节：偏移本质是模拟量，10ms 一档的节点反而限制手感
+                        label: '+${_musicHapticsOffset}ms',
+                        onChanged: (v) {
+                          // 拖动中只预览（内存态 + 下发原生），松手才落盘
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          MusicHapticsService.instance.previewOffset(ms);
+                        },
+                        onChangeEnd: (v) {
+                          final ms = v.round();
+                          setState(() => _musicHapticsOffset = ms);
+                          _settingsRepository.setMusicHapticsOffset(ms);
+                          MusicHapticsService.instance.setOffset(ms);
+                        },
+                      ),
+                Center(child: _statusText('+${_musicHapticsOffset}ms')),
+                _offsetAutoRow(),
+              ],
+            ),
+          ),
+          // search: 高频 军鼓 踩镲 镲片 细节
+          SwitchListTile(
+            title: const Text('高频触发'),
+            subtitle: const Text('让军鼓、踩镲这类高频瞬态也震一下。关掉只剩低音鼓'),
+            value: _musicHapticsSnare,
+            onChanged: (value) async {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _musicHapticsSnare = value);
+              await _settingsRepository.setMusicHapticsSnare(value);
+              await MusicHapticsService.instance.setSnareEnabled(value);
+            },
+          ),
+          // search: 设备 能力 马达 状态 阈值 振幅 排障
+          ListTile(
+            title: const Text('设备能力与当前阈值'),
+            subtitle: Text(
+              '${MusicHapticsService.instance.nativeAvailable ? (MusicHapticsService.instance.hasAmplitudeControl ? '马达可用，支持振幅控制（平滑波形可用）' : '马达可用，不支持振幅控制（平滑波形置灰）') : '未检测到可用马达，本功能不会生效'}'
+              '\n低频阈值 ${MusicHapticsService.instance.kickThreshold.toStringAsFixed(4)}'
+              ' / 高频阈值 ${MusicHapticsService.instance.snareThreshold.toStringAsFixed(4)}',
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  void _setHapticCategoryEnabled(HapticCategory category, bool value) {
+    AppHaptics.lightImpact(HapticCategory.control);
+    AppHaptics.setCategoryEnabled(category, value);
+    setState(() {});
+  }
+
+  /// 单个类别的震动类型下拉：七类共用一份配置，避免把同样的菜单复制七遍。
+  ///
+  /// 选项里首项「默认」对应 `null`，即回到「各触点保持自身强度」；其余项直接把
+  /// [HapticType] 的预定义效果套到整类上。持久化与闸门都在 [AppHaptics] 内。
+  Widget _hapticTypeDropdown(HapticCategory category) {
+    final current = AppHaptics.typeFor(category);
+    return TvDropdownMenu<String>(
+      items: [
+        M3EDropdownItem(label: '默认', value: '', selected: current == null),
+        for (final type in HapticType.values)
+          M3EDropdownItem(
+            label: type.label,
+            value: type.nativeName,
+            selected: current == type,
+          ),
+      ],
+      singleSelect: true,
+      // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+      showChipAnimation: false,
+      fieldStyle: const M3EDropdownFieldStyle(
+        hintText: '选择该类别的震动类型',
+        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      ),
+      onSelectionChanged: (selected) {
+        // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+        if (selected.isEmpty) {
+          setState(() {});
+          return;
+        }
+        // 空串解析为 null = 回到「默认（各触点自身强度）」
+        final resolved = HapticType.fromNativeName(selected.first.value);
+        // 同值必须直接返回，不能只靠 setCategoryType 内部的幂等：
+        // M3EDropdownController.setItems 末尾会同步回调 onSelectionChanged，
+        // 而本 tile 的 items 每次 build 都是新列表（引用不等），didUpdateWidget 必然
+        // 再走一次 setItems —— 于是 setState → 重建 → setItems → 回调 → setState 会
+        // 无限回环（真机表现为选完类型直接卡死，且每圈还多震一下）。
+        // 上面 selected.isEmpty 分支不会成环：重建后控制器回传的是当前选中项，
+        // 走到这里就被本守卫拦住。与既有「播放内容」tile 同一手法。
+        if (resolved == AppHaptics.typeFor(category)) return;
+        AppHaptics.setCategoryType(category, resolved);
+        setState(() {});
+        // 预览用 click 是刻意的：本类别一旦指定了类型，AppHaptics 会优先解析该
+        // 覆盖，所以这一次调用发出来的正是用户刚选中的那个效果（选「默认」时
+        // 无覆盖，click 回落为轻点，等价于「恢复原本的轻点」）。
+        AppHaptics.click(category);
+      },
+    );
+  }
+
+  /// 震动生效范围下拉：播放页 / App 内 / 始终 三档。
+  ///
+  /// 结构与 [_hapticTypeDropdown] 一致（含同值防回环守卫，原因见其注释）。
+  Widget _musicHapticsScopeDropdown() {
+    return TvDropdownMenu<String>(
+      items: [
+        for (final scope in MusicHapticsScope.values)
+          M3EDropdownItem(
+            label: scope.label,
+            value: scope.persistKey,
+            selected: _musicHapticsScope == scope.persistKey,
+          ),
+      ],
+      singleSelect: true,
+      // 单选下关闭 chip 动画，当前值才会渲染为可省略的纯文本
+      showChipAnimation: false,
+      fieldStyle: const M3EDropdownFieldStyle(
+        hintText: '选择震动的生效范围',
+        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      ),
+      onSelectionChanged: (selected) {
+        // 单选下再次点击已选中项会被取消选中：强制重建以恢复原值
+        if (selected.isEmpty) {
+          setState(() {});
+          return;
+        }
+        // 防回环守卫：setItems 的同步回传会带着当前值再进来一次
+        final value = selected.first.value;
+        if (value == _musicHapticsScope) return;
+        setState(() => _musicHapticsScope = value);
+        // ignore: discarded_futures
+        _settingsRepository.setMusicHapticsScope(value);
+        // ignore: discarded_futures
+        MusicHapticsService.instance.setScope(
+          MusicHapticsScope.fromPersistKey(value),
+        );
+      },
+    );
+  }
+
   Widget _buildDesktopShortcutSection(ColorScheme colorScheme) {
     // search-item: 桌面快捷方式 | 快捷方式 快捷 长按
     return const _DesktopShortcutPanel();
@@ -3883,7 +5450,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _setEnable32bitOutput(bool value) async {
-    HapticFeedback.lightImpact();
+    AppHaptics.lightImpact(HapticCategory.control);
     setState(() => _enable32bitOutput = value);
     await UsbAudioService.instance.setEnable32bit(value);
   }
@@ -4398,7 +5965,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: 'Material 3 风格',
           isSelected: !_useAmStylePlayer,
           onTap: () {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useAmStylePlayer = false);
             context.read<ThemeProvider>().setUseAmStylePlayer(false);
           },
@@ -4411,7 +5978,7 @@ class _SettingsPageState extends State<SettingsPage>
           subtitle: '模糊封面 + 逐字歌词',
           isSelected: _useAmStylePlayer,
           onTap: () {
-            HapticFeedback.lightImpact();
+            AppHaptics.lightImpact(HapticCategory.control);
             setState(() => _useAmStylePlayer = true);
             context.read<ThemeProvider>().setUseAmStylePlayer(true);
           },
@@ -4700,7 +6267,7 @@ class _DesktopShortcutPanel extends StatelessWidget {
                   Switch(
                     value: !isHidden,
                     onChanged: (_) {
-                      HapticFeedback.lightImpact();
+                      AppHaptics.lightImpact(HapticCategory.control);
                       shortcutConfig.toggleShortcutVisibility(shortcut.id);
                     },
                   ),
@@ -5049,14 +6616,24 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
               ),
             ],
           ),
-          M3ESlider(
-            value: _offset.clamp(_sliderMin, _sliderMax).toDouble(),
-            min: _sliderMin.toDouble(),
-            max: _sliderMax.toDouble(),
-            // 节点数过多(>30)不显示节点，连续调节
-            label: _fmt(_offset),
-            onChanged: (v) => _apply(v.round()),
-          ),
+          // tv: TV 构建换 RemoteSlider（P-C）
+          kTvBuild
+              ? RemoteSlider(
+                  value: _offset.clamp(_sliderMin, _sliderMax).toDouble(),
+                  min: _sliderMin.toDouble(),
+                  max: _sliderMax.toDouble(),
+                  // 节点数过多(>30)不显示节点，连续调节
+                  label: _fmt(_offset),
+                  onChanged: (v) => _apply(v.round()),
+                )
+              : M3ESlider(
+                  value: _offset.clamp(_sliderMin, _sliderMax).toDouble(),
+                  min: _sliderMin.toDouble(),
+                  max: _sliderMax.toDouble(),
+                  // 节点数过多(>30)不显示节点，连续调节
+                  label: _fmt(_offset),
+                  onChanged: (v) => _apply(v.round()),
+                ),
           Row(
             children: [
               Expanded(
@@ -5071,6 +6648,7 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
                 width: 120,
                 child: TextField(
                   controller: _controller,
+                  contextMenuBuilder: buildAppTextContextMenu,
                   keyboardType: const TextInputType.numberWithOptions(
                     signed: true,
                   ),
@@ -5184,33 +6762,49 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
               Expanded(
                 // Listener 在 GestureDetector 之上，指针事件按 hit-test 路径原样
                 // 送达、不参与手势竞技场，所以 up / cancel 是可靠的「抬手」信号。
+                // tv: TV 构建换 RemoteSlider（P-C，丢触觉装饰参数）
                 child: Listener(
                   onPointerDown: (_) => _pointerDown = true,
                   onPointerUp: (_) => _commit(),
                   onPointerCancel: (_) => _commit(),
-                  child: M3ESlider(
-                    // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
-                    // M3EHapticConfig.continuous()（minimumDragInterval 10ms +
-                    // 2% 阈值），拖动中会以最高约 100 次/秒走 MethodChannel 触发
-                    // vibrate，真机上马达饱和 + 通道洪泛。discrete() 关掉
-                    // dragTexture，只保留首尾端点反馈。
-                    decoration: const M3ESliderDecoration(
-                      haptic: M3EHapticFeedback.medium,
-                      hapticConfig: M3EHapticConfig.discrete(),
-                    ),
-                    value: value,
-                    min: kMinDisplayScale,
-                    max: kMaxDisplayScale,
-                    // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
-                    label: '${value.toStringAsFixed(2)}x',
-                    // 拖动中只更新本地值，界面不缩放
-                    onChanged: (v) => setState(() => _pending = v),
-                    // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
-                    // 这里只兜住键盘方向键那条没有指针的路径。
-                    onChangeEnd: (_) {
-                      if (!_pointerDown) _commit();
-                    },
-                  ),
+                  child: kTvBuild
+                      ? RemoteSlider(
+                          value: value,
+                          min: kMinDisplayScale,
+                          max: kMaxDisplayScale,
+                          // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
+                          label: '${value.toStringAsFixed(2)}x',
+                          // 拖动中只更新本地值，界面不缩放
+                          onChanged: (v) => setState(() => _pending = v),
+                          // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
+                          // 这里只兜住键盘方向键那条没有指针的路径。
+                          onChangeEnd: (_) {
+                            if (!_pointerDown) _commit();
+                          },
+                        )
+                      : M3ESlider(
+                          // 显式给 hapticConfig：M3ESlider 在 divisions == null 时默认取
+                          // M3EHapticConfig.continuous()（minimumDragInterval 10ms +
+                          // 2% 阈值），拖动中会以最高约 100 次/秒走 MethodChannel 触发
+                          // vibrate，真机上马达饱和 + 通道洪泛。discrete() 关掉
+                          // dragTexture，只保留首尾端点反馈。
+                          decoration: const M3ESliderDecoration(
+                            haptic: M3EHapticFeedback.medium,
+                            hapticConfig: M3EHapticConfig.discrete(),
+                          ),
+                          value: value,
+                          min: kMinDisplayScale,
+                          max: kMaxDisplayScale,
+                          // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
+                          label: '${value.toStringAsFixed(2)}x',
+                          // 拖动中只更新本地值，界面不缩放
+                          onChanged: (v) => setState(() => _pending = v),
+                          // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
+                          // 这里只兜住键盘方向键那条没有指针的路径。
+                          onChangeEnd: (_) {
+                            if (!_pointerDown) _commit();
+                          },
+                        ),
                 ),
               ),
               SizedBox(
@@ -5394,13 +6988,22 @@ class _FlymeLyricAdvanceTileState extends State<_FlymeLyricAdvanceTile> {
               ),
             ],
           ),
-          M3ESlider(
-            value: _advance.clamp(0, _sliderMax).toDouble(),
-            min: 0,
-            max: _sliderMax.toDouble(),
-            label: '${_advance}ms',
-            onChanged: (v) => _apply(v.round()),
-          ),
+          // tv: TV 构建换 RemoteSlider（P-C）
+          kTvBuild
+              ? RemoteSlider(
+                  value: _advance.clamp(0, _sliderMax).toDouble(),
+                  min: 0,
+                  max: _sliderMax.toDouble(),
+                  label: '${_advance}ms',
+                  onChanged: (v) => _apply(v.round()),
+                )
+              : M3ESlider(
+                  value: _advance.clamp(0, _sliderMax).toDouble(),
+                  min: 0,
+                  max: _sliderMax.toDouble(),
+                  label: '${_advance}ms',
+                  onChanged: (v) => _apply(v.round()),
+                ),
           Row(
             children: [
               Expanded(
@@ -5415,6 +7018,7 @@ class _FlymeLyricAdvanceTileState extends State<_FlymeLyricAdvanceTile> {
                 width: 120,
                 child: TextField(
                   controller: _controller,
+                  contextMenuBuilder: buildAppTextContextMenu,
                   keyboardType: const TextInputType.numberWithOptions(
                     signed: false,
                   ),

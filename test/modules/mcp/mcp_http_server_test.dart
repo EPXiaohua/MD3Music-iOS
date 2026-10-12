@@ -98,11 +98,11 @@ void main() {
     await _errorEnvelope(res);
   });
 
-  test('GET /mcp 返回 405', () async {
+  test('无会话 id 的 GET /mcp 返回 400', () async {
     final req = await client.getUrl(uri);
     req.headers.set('Accept', 'application/json, text/event-stream');
     final res = await req.close();
-    expect(res.statusCode, 405);
+    expect(res.statusCode, 400);
   });
 
   test('DELETE /mcp 返回 204', () async {

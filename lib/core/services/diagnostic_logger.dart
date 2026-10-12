@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// 诊断日志级别
@@ -29,9 +30,10 @@ enum DiagnosticLogLevel {
 /// - Kotlin 侧未捕获异常由原生 handler 写入同目录（见 Task 6）。
 ///
 /// 滚动策略：单文件默认 512KB，备份默认 2 份（app.log.1 / app.log.2），
-/// 总量上限约 1.5MB，永不膨胀。写入为批量刷盘（2 秒或缓冲超 8KB），
-/// 不阻塞主线程；写入失败一律静默，诊断功能不得影响主流程。
-class DiagnosticLogger {
+/// 总量上限约 1.5MB，永不膨胀。写入为批量刷盘（有新增日志后 2 秒、或缓冲超 8KB），
+/// **空闲时不排盘、后台/熄屏时不写盘**（回到前台补刷一次），不阻塞主线程；
+/// 写入失败一律静默，诊断功能不得影响主流程。
+class DiagnosticLogger with WidgetsBindingObserver {
   DiagnosticLogger._();
 
   static final DiagnosticLogger instance = DiagnosticLogger._();
@@ -48,8 +50,12 @@ class DiagnosticLogger {
   /// 缓冲区超过该大小时立即刷盘
   static const int _flushBufferThreshold = 8 * 1024;
 
-  /// 定时刷盘间隔
-  static const Duration _flushInterval = Duration(seconds: 2);
+  /// 缓冲刷盘延迟（自最近一条日志起算）。
+  ///
+  /// 事件驱动而非 `Timer.periodic`：只在有新日志时排一次**单次**定时器，
+  /// 空闲时一个定时器都不留 —— 旧实现的常驻 2s 定时器是永久周期唤醒，
+  /// 即便一条日志都没有也每 2 秒醒一次 CPU（AGENTS.md §10.4.6）。
+  static const Duration _flushDelay = Duration(seconds: 2);
 
   bool _initialized = false;
   Directory? _logDir;
@@ -58,7 +64,13 @@ class DiagnosticLogger {
   int _maxFileSize = defaultMaxFileSize;
   int _maxFileCount = defaultMaxFileCount;
   final StringBuffer _pending = StringBuffer();
+
+  /// 待执行的延迟刷盘（单次）。非空表示"已排盘，新日志合并进同一次"。
   Timer? _flushTimer;
+
+  /// App 是否处于后台/熄屏：此时不再排盘，回到前台补刷一次。
+  bool _appSuspended = false;
+
   Future<void>? _activeFlush;
   DebugPrintCallback? _originalDebugPrint;
 
@@ -92,7 +104,7 @@ class DiagnosticLogger {
       _openCurrentFile();
       _installDebugPrintCapture();
       _installErrorHooks();
-      _flushTimer = Timer.periodic(_flushInterval, (_) => flush());
+      WidgetsBinding.instance.addObserver(this);
       i('=== MD3Music 诊断日志已启用 ${DateTime.now()} ===');
     } catch (e, stack) {
       // 初始化失败只走原始 debugPrint，绝不影响启动流程
@@ -168,6 +180,33 @@ class DiagnosticLogger {
       formatLine(DateTime.now(), level, sanitizeDiagnosticText(message)),
     );
     if (_pending.length >= _flushBufferThreshold) {
+      // 攒够阈值立即落盘，并撤掉排着的延迟任务（省一次空唤醒）
+      _flushTimer?.cancel();
+      _flushTimer = null;
+      unawaited(flush());
+    } else {
+      _scheduleFlush();
+    }
+  }
+
+  /// 排一次延迟刷盘（幂等合并）：已有待刷任务时不叠加；
+  /// 空闲时不留定时器；后台/熄屏期间不再新排（回到前台补刷一次）。
+  void _scheduleFlush() {
+    if (_flushTimer != null || _appSuspended) return;
+    _flushTimer = Timer(_flushDelay, () {
+      _flushTimer = null;
+      unawaited(flush());
+    });
+  }
+
+  /// 后台/熄屏不排盘（已排的那次放它走完），回到前台补刷一次，
+  /// 保证后台期间攒下的日志不会丢。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state != AppLifecycleState.resumed;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
+    if (!suspended) {
       unawaited(flush());
     }
   }
@@ -317,6 +356,8 @@ class DiagnosticLogger {
   Future<void> resetForTesting() async {
     _flushTimer?.cancel();
     _flushTimer = null;
+    WidgetsBinding.instance.removeObserver(this);
+    _appSuspended = false;
     try {
       await flush();
     } catch (_) {}

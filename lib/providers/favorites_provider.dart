@@ -115,6 +115,15 @@ class FavoritesProvider extends ChangeNotifier {
   /// 红心变动后使云端整表缓存失效（下次加载选择器时重新拉取）。
   void invalidateCloudFavoriteSongs() => _cloudFavoriteSongs = null;
 
+  /// 「我喜欢」歌单记录 fileid 映射（歌曲 hash → 歌单记录 fileid）。
+  ///
+  /// 上游 `/playlist/tracks/del` 只按**歌单记录 fileid** 删除，且该 fileid
+  /// 必须取自歌单列表接口（`/playlist/track/all[/new]`）返回的 `fileid` 字段——
+  /// 传 hash 或别家歌单的记录 id 都不会真正删除（KuGouMusicApi issue #57 即
+  /// 「删除接口返回成功但歌还在」）。搜索/每日推荐/刷歌等来源的 Song 没有
+  /// fileid，故同步时顺带记录映射，取消收藏才能用对标识符。
+  final Map<String, int> _favoriteRecordFileIds = {};
+
   Future<void> _syncFavoritesFromKugou() async {
     try {
       final playlist = await _getMyFavoritePlaylist();
@@ -139,6 +148,7 @@ class FavoritesProvider extends ChangeNotifier {
           if (r == null) break;
           for (final s in r.songs) {
             _favoriteIds.add(s.hash);
+            _rememberRecordFileId(s);
           }
           if (_favoriteIds.length >= maxSongs) break;
           if (r.songs.length < pageSize) break;
@@ -152,6 +162,7 @@ class FavoritesProvider extends ChangeNotifier {
           if (result != null && result.songs.isNotEmpty) {
             for (final s in result.songs) {
               _favoriteIds.add(s.hash);
+              _rememberRecordFileId(s);
             }
             notifyListeners();
           }
@@ -159,6 +170,71 @@ class FavoritesProvider extends ChangeNotifier {
       }
     } catch (e) {
     }
+  }
+
+  /// 记录歌单列表条目携带的记录 fileid（见 [_favoriteRecordFileIds]）。
+  void _rememberRecordFileId(KugouSongDetail detail) {
+    final fileId = detail.fileId;
+    if (fileId != null && fileId > 0) {
+      _favoriteRecordFileIds[detail.hash] = fileId;
+    }
+  }
+
+  /// 取消收藏用：定位该歌曲在「我喜欢」歌单里的记录 fileid。
+  ///
+  /// 上游删除接口只认歌单记录 fileid（见 [_favoriteRecordFileIds] 说明），
+  /// 搜索/每日推荐/刷歌等来源的 Song 没有该字段，这里按 hash 反查。
+  Future<String> _resolveFavoriteRecordFileId(String listid, Song song) async {
+    // 1) 启动同步缓存的映射（常用路径，零额外请求）
+    final cached = _favoriteRecordFileIds[song.id];
+    if (cached != null && cached > 0) return cached.toString();
+
+    // 2) 现场反查：同会话内刚收藏的歌，同步时它还没进列表
+    final fetched = await _lookupFavoriteRecordFileId(listid, song.id);
+    if (fetched != null && fetched > 0) return fetched.toString();
+
+    // 3) 歌曲自带 fileid：从「我喜欢」歌单页进来时即为该歌单的记录 id
+    if (song.fileId != null && song.fileId! > 0) return song.fileId.toString();
+
+    // 4) 找不到记录（如服务器上从未收藏成功）：退回 hash，本地状态照常清理
+    return song.id;
+  }
+
+  /// 分页反查记录 fileid：先探首页、再探末页。
+  ///
+  /// 云端「我喜欢」列表按收藏时间正序（最新在末页），同会话新增的歌取末页
+  /// 即可命中；首页探测兜底顺序假设不成立的情况。**必须 noCache**，否则
+  /// 读到收藏前缓存的旧列表，反查必然落空。
+  Future<int?> _lookupFavoriteRecordFileId(String listid, String hash) async {
+    const int pageSize = 200;
+    final api = KugouApiClient();
+    final first = await api.getPlaylistSongsByListid(
+      listid: listid,
+      page: 1,
+      pagesize: pageSize,
+      noCache: true,
+    );
+    if (first == null) return null;
+    final hit = _matchRecordFileId(first.songs, hash);
+    if (hit != null) return hit;
+    final lastPage = (first.total + pageSize - 1) ~/ pageSize;
+    if (lastPage <= 1) return null;
+    final last = await api.getPlaylistSongsByListid(
+      listid: listid,
+      page: lastPage,
+      pagesize: pageSize,
+      noCache: true,
+    );
+    return _matchRecordFileId(last?.songs ?? const [], hash);
+  }
+
+  int? _matchRecordFileId(List<KugouSongDetail> songs, String hash) {
+    for (final s in songs) {
+      if (s.hash == hash && s.fileId != null && s.fileId! > 0) {
+        return s.fileId;
+      }
+    }
+    return null;
   }
 
   Future<void> toggleFavorite(Song song) async {
@@ -173,24 +249,31 @@ class FavoritesProvider extends ChangeNotifier {
       // 先调 API，成功后再更新本地状态
       if (isLoggedIn) {
         try {
-          // 优先用 fileId（歌单里的记录ID），没有再用 hash 兜底
-          final fileIds = song.fileId != null && song.fileId! > 0
-              ? song.fileId.toString()
-              : song.id;
-          await api.deletePlaylistTracks(listid, fileIds);
+          final fileIds = await _resolveFavoriteRecordFileId(listid, song);
+          final resp = await api.deletePlaylistTracks(listid, fileIds);
+          // 上游按 fileid 匹配，未命中时不报错也不删除；留日志便于对照
+          if (resp == null || (resp['status'] != null && resp['status'] != 1)) {
+            debugPrint(
+              '[Favorites] 取消收藏可能未生效: listid=$listid fileids=$fileIds resp=$resp',
+            );
+          }
         } catch (e) {
-                    notifyListeners();
+          notifyListeners();
           return;
         }
       }
       _favoriteIds.remove(song.id);
       _favorites.removeWhere((s) => s.id == song.id);
       await _repository.removeFavorite(song.id);
+      _favoriteRecordFileIds.remove(song.id);
       invalidateCloudFavoriteSongs();
     } else {
       _favoriteIds.add(song.id);
       _favorites.insert(0, song);
       await _repository.addFavorite(song);
+      // 重新收藏会生成新的歌单记录，旧记录 fileid 作废（否则下次
+      // 取消收藏会拿着已删除的旧 fileid 去删，静默失败）
+      _favoriteRecordFileIds.remove(song.id);
       invalidateCloudFavoriteSongs();
 
       if (isLoggedIn) {

@@ -1,6 +1,9 @@
 import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 /// 字体来源枚举。
 ///
@@ -81,10 +84,56 @@ class CustomFontLoader {
   /// 用户取消返回 null。
   static Future<String?> pickFontFile() async {
     try {
+      if (Platform.isWindows) {
+        final selected = await openFile(acceptedTypeGroups: const [
+          XTypeGroup(label: '字体', extensions: ['ttf', 'otf']),
+        ]);
+        if (selected == null) return null;
+        final support = await getApplicationSupportDirectory();
+        final directory =
+            Directory('${support.path}${Platform.pathSeparator}fonts');
+        await directory.create(recursive: true);
+        final extension = selected.name.split('.').last.toLowerCase();
+        // 每次换字体都写**唯一文件名**（时间戳），并清掉上一份：
+        // 固定名 `user_custom.ttf` 有两个问题——
+        //   1) File.copy 到已存在的路径在部分平台直接抛 FileSystemException；
+        //   2) 路径不变时 ThemeProvider 无法感知"内容已变"，新字体加载不上。
+        final path = '${directory.path}${Platform.pathSeparator}'
+            'user_custom_${DateTime.now().microsecondsSinceEpoch}.$extension';
+        await File(selected.path).copy(path);
+        await _removeOtherFontFiles(directory, keepPath: path);
+        return path;
+      }
       final channel = MethodChannel(_channel);
       return await channel.invokeMethod<String>('pickFontFile');
-    } catch (_) {
+    } catch (error) {
+      debugPrint('[CustomFontLoader] 选择字体文件失败: $error');
       return null;
     }
+  }
+
+  /// 删除字体目录下除 [keepPath] 外的旧字体文件。
+  ///
+  /// 避免目录里堆积用户选过的每个字体（几十 MB 很正常）。
+  /// 删除失败静默忽略 —— 残留旧文件不影响功能，只是占空间。
+  static Future<void> _removeOtherFontFiles(
+    Directory directory, {
+    required String keepPath,
+  }) async {
+    final keepName = keepPath.split(Platform.pathSeparator).last;
+    try {
+      await for (final entity in directory.list()) {
+        if (entity is! File) continue;
+        if (entity.path.split(Platform.pathSeparator).last == keepName) {
+          continue;
+        }
+        if (!entity.path.toLowerCase().contains('user_custom')) continue;
+        try {
+          await entity.delete();
+        } catch (_) {
+          // 文件被占用等情况：留着即可，不影响功能
+        }
+      }
+    } catch (_) {}
   }
 }

@@ -29,19 +29,28 @@ import '../core/services/listen_report_service.dart';
 import '../core/services/playback_duration_tracker.dart';
 import '../core/services/media_notification_service.dart';
 import '../core/services/now_playing_service.dart';
+import '../core/services/play_history_sync_service.dart';
 import '../core/services/wakelock_service.dart';
 import '../core/services/media_store_service.dart';
 import '../core/services/usb_audio_service.dart';
 import '../core/services/direct_pcm_service.dart';
 import '../core/services/output_mode_coordinator.dart';
+import '../core/services/remote/playback_headers.dart';
+import '../core/services/remote/remote_download_cache.dart';
+import '../core/services/remote/remote_storage_config.dart';
+import '../core/services/remote/remote_storage_repository.dart';
 import '../data/models/song.dart';
 import '../modules/player/comments_view.dart';
+import '../modules/player/song_accompany_sheet.dart';
+import '../modules/player/song_ranking_sheet.dart';
 import '../modules/player/mv_player_page.dart';
 import '../core/utils/app_toast.dart';
+import '../core/utils/audio_format_utils.dart';
 import '../core/utils/local_lyric_loader.dart';
 import '../data/repositories/history_repository.dart';
 import '../data/repositories/player_state_repository.dart';
 import '../data/repositories/settings_repository.dart';
+import '../data/repositories/song_match_repository.dart';
 import '../main.dart';
 import '../services/kugou_server.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -792,14 +801,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 为 null 但仍是「已启用」。
   bool get isSleepTimerActive => _sleepTimerMode != SleepTimerMode.off;
 
-  /// 当前歌曲的实际音质标签。
-  /// 本地歌曲优先使用 song.quality 推断的标签；
-  /// 在线歌曲优先显示实际播放音质（降级后可能与用户设置不同），
-  /// 若尚无实际音质则回退到用户设置的全局音质偏好。
+  /// 音质未知时的占位文案（顶栏胶囊、车机徽章共用；测试也按它断言）。
+  static const String unknownQualityLabel = '检测中';
+
+  /// 在线歌曲先显示默认音质，播放链接解析完成后以实际档位更新（含降级）。
+  /// 本地文件仍按文件音质展示，不使用在线偏好推断。
   String get currentQualityLabel {
     final song = _currentSong;
-    if (song != null && !song.isOnline && song.quality != null) {
-      switch (song.quality) {
+    if (song == null) return unknownQualityLabel;
+    if (!song.isOnline) {
+      final quality = song.quality;
+      switch (quality) {
         case '128':
           return '标准音质';
         case '320':
@@ -808,15 +820,29 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           return '无损音质';
         case 'high':
           return 'Hi-Res';
+        case null:
+          return _offlineQualityLabel(song);
         default:
-          return song.quality!;
+          return quality;
       }
     }
-    // 在线歌曲：优先显示实际播放音质（可能因降级而与设置不同）
-    if (_actualPlayingQuality != null) {
-      return KugouQuality.labelOf(_actualPlayingQuality!);
-    }
-    return _audioQuality.label;
+    // 解析期间不显示检测占位；切歌时实际音质会清空，回到默认档位。
+    final actual = _actualPlayingQuality;
+    return KugouQuality.labelOf(actual ?? _audioQuality.value);
+  }
+
+  /// 无损容器（判定口径同 `local_music_repository._inferQuality` 的扩展名分支）。
+  static const Set<String> _losslessCodecs = {'FLAC', 'APE', 'ALAC', 'WAV', 'DSD'};
+
+  /// 离线文件没带音质档时的如实展示。
+  ///
+  /// 不走 [unknownQualityLabel]：离线文件并没有任何东西在「被检测」，那是误导；
+  /// 走到这一支说明本地扫描没读到 bitrate（见 `LocalMusicRepository._inferQuality`
+  /// 的 null 分支），于是只报容器/编码本身 —— 无损容器判无损，有损编码不猜码率。
+  String _offlineQualityLabel(Song song) {
+    final codec = AudioFormatUtils.codecLabelFromPath(song.url, song.localPath);
+    if (codec == null) return '未知';
+    return _losslessCodecs.contains(codec) ? '无损音质' : '$codec 音质';
   }
 
   StreamSubscription<Duration>? _positionSubscription;
@@ -1107,6 +1133,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 与 [_handleLyriconSongChange] 同法用 addListener 监听自身，首行 short-circuit。
   /// 登录态与开关由 [ListenReportService] 内部自行判定（未登录/未开启则不请求），
   /// 故此处只负责「切歌边沿」这一件事，不重复判定登录态。
+  ///
+  /// 云端播放历史（[PlayHistorySyncService]）挂在同一边沿：service 内部自持
+  /// tracker 与 15s 阈值，未登录/开关关闭时静默跳过。
   void _handleListenReportSongChange() {
     final song = _currentSong;
     final songId = song?.id;
@@ -1118,10 +1147,20 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       ListenReportService.instance.onSongEnded(
         reason: PlaybackEndReason.switched,
       );
+      // ignore: discarded_futures
+      PlayHistorySyncService.instance.onSongEnded(
+        reason: PlaybackEndReason.switched,
+      );
     }
     _lastListenReportSongId = songId;
 
     if (song == null) return;
+    // 云端播放历史：在线歌曲开新段（无 albumAudioId 的本地文件由 service 内部跳过）
+    // ignore: discarded_futures
+    PlayHistorySyncService.instance.onSongStarted(
+      song: song,
+      playing: _isPlaying,
+    );
     if (!song.isOnline) return;
     final mixsongid = song.albumAudioId;
     if (mixsongid == null || mixsongid.isEmpty) return;
@@ -1713,13 +1752,18 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _updatePosition(state.position);
 
       // 冷启动时清除在线歌曲的旧 URL（酷狗播放链接有时效性，上次会话的 URL 大概率已过期）
-      // 强制 _resolveAndPlayCurrentSong 重新通过 API 获取有效链接
+      // 强制 _resolveAndPlayCurrentSong 重新通过 API 获取有效链接。
+      //
+      // 必须用 `clearUrl: true`：`Song.copyWith` 是 `url: clearUrl ? null : url ??
+      // this.url`（song.dart），传 `url: null` 等于什么都不清 —— 旧 URL 残留会让
+      // _resolveAndPlayCurrentSongImpl 判成「URL 已就绪」而整段跳过 API 解析，
+      // `_actualPlayingQuality` 永不回填（首曲音质停在偏好档位/占位上，直到切歌才恢复）。
       if (_currentSong != null && _currentSong!.isOnline) {
-        _currentSong = _currentSong!.copyWith(url: null);
+        _currentSong = _currentSong!.copyWith(clearUrl: true);
       }
       for (int i = 0; i < _playlist.length; i++) {
         if (_playlist[i].isOnline) {
-          _playlist[i] = _playlist[i].copyWith(url: null);
+          _playlist[i] = _playlist[i].copyWith(clearUrl: true);
         }
       }
 
@@ -1979,6 +2023,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         WakelockService.instance.setSongPlaying(isPlaying);
         // CSCC 时长计时：暂停时停表、恢复时续表（墙钟累计，天然扣除暂停）。
         ListenReportService.instance.onPlayingChanged(isPlaying);
+        // 云端播放历史同口径（独立 tracker，同一播放/暂停状态源）。
+        PlayHistorySyncService.instance.onPlayingChanged(isPlaying);
         // try-catch：_updateNotification 内部（updateWidget 等）异常不应
         // 中断后续，否则暂停时 Kotlin 收不到 isPlaying=false，WakeLock 不释放
         try {
@@ -2290,6 +2336,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         ListenReportService.instance.onSongEnded(
           reason: PlaybackEndReason.completed,
         );
+        // 云端播放历史同边沿结账（service 内部同样幂等）。
+        // ignore: discarded_futures
+        PlayHistorySyncService.instance.onSongEnded(
+          reason: PlaybackEndReason.completed,
+        );
       }
 
       // 一起听接管自然播完（异常结束不接管，继续走下方重试链路）：
@@ -2394,6 +2445,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             ListenReportService.instance.onSongStarted(
               songId: loopSong.id,
               mixsongid: loopMixsongid,
+              playing: _isPlaying,
+            );
+            // 云端播放历史同边沿开新段（service 内部自行判定 albumAudioId）。
+            // ignore: discarded_futures
+            PlayHistorySyncService.instance.onSongStarted(
+              song: loopSong,
               playing: _isPlaying,
             );
           }
@@ -3053,15 +3110,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 私人 FM 等会在末尾续列表，交给原有 onPlaylistEnd 流程
       if (onPlaylistEnd != null) return '最后一首，交给 onPlaylistEnd 续列表';
     }
-    // 同专辑：尾接头属于正常曲间过渡，不做叠加（覆盖 prepare 与 start 两阶段）
-    final nextIndex = _nextIndexForCrossfade();
-    if (nextIndex != null) {
-      final currentSong = _currentSong;
-      final nextSong = _playlist[nextIndex];
-      if (currentSong != null && _isSameAlbum(currentSong, nextSong)) {
-        return '同专辑（同 disk 歌曲不叠加）';
-      }
-    }
     // USB 独占输出：所有 AudioSink 共用一条 USB 流（见 UsbAudioSinkController
     // 的 static activeStream），两个播放器会交替写入同一条流而不是混音，
     // 结果是音频错乱而非叠加。独占开启期间直接跳过。
@@ -3074,20 +3122,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       return '系统 Direct PCM 已开启';
     }
     return null;
-  }
-
-  /// 判断两首歌是否属于同一专辑：优先比 albumId（非空且相等），
-  /// 否则比专辑名（trim 后忽略大小写相等）。
-  bool _isSameAlbum(Song a, Song b) {
-    final aId = a.albumId;
-    final bId = b.albumId;
-    if (aId != null && aId.isNotEmpty && bId != null && bId.isNotEmpty) {
-      return aId == bId;
-    }
-    final aName = a.album.trim();
-    final bName = b.album.trim();
-    if (aName.isEmpty || bName.isEmpty) return false;
-    return aName.toLowerCase() == bName.toLowerCase();
   }
 
   /// 每个 position tick 调用：决定是否预加载下一首或开始淡化。
@@ -3520,8 +3554,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         notifyListeners();
         return;
       }
-      // 把解析后的真实路径回写到 song，避免下次切回时重新解析
-      if (!song.isOnline) {
+      // 回写解析结果（content:// → file://、FTP 已下载的本地路径）。
+      // WebDAV 不回写：它的 localPath 无意义（播放走 url），写入 http URL 会
+      // 污染下游把 localPath 当作本地文件路径的判断。
+      if (!song.isOnline && song.remoteType != SongRemoteType.webdav) {
         _currentSong = song.copyWith(localPath: playbackUrl);
         _playlist[0] = _currentSong!;
         notifyListeners();
@@ -4647,7 +4683,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> resume({bool notifyRoom = true}) async {
-    final needsReload = _playbackNotReady || _isResolvingUrl;
+    final song = _currentSong;
+    // 在线歌手里没有 URL 就等于源还没装载（冷启动恢复时登录态/本地服务器尚未
+    // 就绪，解析会被静默跳过）—— 这种「播放」必须走完整解析，否则 play() 作用在
+    // 空源上什么都不发生。
+    final needsReload =
+        _playbackNotReady ||
+        _isResolvingUrl ||
+        (song != null && song.isOnline && (song.url?.isEmpty ?? true));
     final progressBaseline = _lastPlatformPosition;
     final playbackRequest = _issuePlaybackRequest();
     _playbackProgressGate.begin(playbackRequest, baseline: progressBaseline);
@@ -4759,6 +4802,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // CSCC 时长计时：seek 按墙钟计时，跳过的区间本就不计时；此处仅重新起表，
     // 避免把 seek 落地耗时算进播放时长。
     ListenReportService.instance.onSeek();
+    // 云端播放历史同口径重新起表。
+    PlayHistorySyncService.instance.onSeek();
     // 立即更新位置，让 UI（进度条、歌词行高亮、滚动）即时响应
     // 否则要等 just_audio positionStream 触发，会有一帧的滞后，
     // 导致拖动 slider 后歌词不跟随。
@@ -4934,6 +4979,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           );
           if (!_isPlaybackRequestCurrent(request) ||
               _currentSong?.id != requestedSongId) {
+            // 这一支在 `_isResolvingUrl = true` 之后、共享收尾（下方 `notifyListeners`）
+            // 之前，必须自己收口：否则标志永久卡 true —— `playback_status_feedback`
+            // 会常驻「正在解析播放链接」，交叉淡化的跳过理由也一直成立。
+            _isResolvingUrl = false;
+            notifyListeners();
             return false;
           }
 
@@ -4965,7 +5015,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
               elapsed: urlResolveTimer.elapsed,
               outcome: localApiFailure?.name ?? 'no_url',
             );
+            // 复位 + 通知都要自己做：跳过下方共享收尾后，顶栏那枚胶囊靠的就是
+            // 这次 notify 才会从「解析中」的状态里回到真实档位。
             _isResolvingUrl = false;
+            notifyListeners();
             return false;
           }
         } catch (e) {
@@ -4978,6 +5031,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             error: e,
           );
           _isResolvingUrl = false;
+          notifyListeners();
           return false;
         }
       } else {
@@ -5327,6 +5381,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 幂等：onSongEnded 首行 `tracker.end()` 在无活动段时直接返回，故不会重复上报。
     // ignore: discarded_futures
     ListenReportService.instance.onSongEnded(reason: PlaybackEndReason.stopped);
+    // 云端播放历史同边沿结账（service 内部同样幂等）。
+    // ignore: discarded_futures
+    PlayHistorySyncService.instance.onSongEnded(
+      reason: PlaybackEndReason.stopped,
+    );
     _resetCrossfadePrepared();
     // 可选扩展：播放源停止回调（默认关闭）
     if (_currentSong != null && _currentSong!.isOnline) {
@@ -5521,6 +5580,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 必须早于下方 `_currentSong = null`（理由同 clearPlaylist）。
       // ignore: discarded_futures
       ListenReportService.instance.onSongEnded(
+        reason: PlaybackEndReason.stopped,
+      );
+      // 云端播放历史同边沿结账。
+      // ignore: discarded_futures
+      PlayHistorySyncService.instance.onSongEnded(
         reason: PlaybackEndReason.stopped,
       );
       _currentIndex = -1;
@@ -5738,6 +5802,15 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// 直接设定循环模式（MCP 等程序化调用用；UI 仍走 toggleLoopMode/cyclePlayMode）。
+  Future<void> setLoopMode(AppLoopMode mode) => _applyLoopMode(mode);
+
+  /// 直接设定随机播放开关（已是目标态时为空操作）。
+  Future<void> setShuffle(bool enabled) {
+    if (_shuffleEnabled == enabled) return Future<void>.value();
+    return toggleShuffle();
+  }
+
   Future<void> toggleLoopMode() async {
     switch (_loopMode) {
       case AppLoopMode.off:
@@ -5833,7 +5906,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  Future<void> setVolume(double volume) async {
+  /// [persist] 为 false 时跳过 SharedPreferences 落盘（常驻音量条拖动中的高频
+  /// 路径：每帧写盘没有必要），仅下发到 audio service；松手后由调用方再以
+  /// `persist: true` 调一次。默认 true，行为与旧调用方完全一致。
+  Future<void> setVolume(double volume, {bool persist = true}) async {
     final target = volume.clamp(0.0, 1.0);
     // Direct PCM 的 unity 音量档：AudioTrack 的 track volume 必须为 1.0，
     // 否则 AudioFlinger 会对样本施加增益、bit-perfect 判定必然不通过。
@@ -5848,10 +5924,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _volume = target;
     await _audioService?.setVolume(_volume);
     // 持久化应用内音量（重启保留）
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setDouble('player_volume', _volume);
-    } catch (_) {}
+    if (persist) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setDouble('player_volume', _volume);
+      } catch (_) {}
+    }
     notifyListeners();
   }
 
@@ -6121,6 +6199,24 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
               },
               child: const Text('看评论'),
             ),
+          // 成绩单依赖 album_audio_id（本地歌曲缺席该字段时隐藏入口）
+          if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogCtx);
+                showSongRankingSheet(ctx, song);
+              },
+              child: const Text('看成绩单'),
+            ),
+          // 伴奏匹配同样依赖 album_audio_id（与看成绩单同门控）
+          if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogCtx);
+                showSongAccompanySheet(ctx, song);
+              },
+              child: const Text('获取伴奏'),
+            ),
         ],
       ),
     );
@@ -6262,7 +6358,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   just_audio.UriAudioSource _createAudioSource(Song song) {
-    final playbackUrl = song.isOnline ? song.url : song.localPath;
+    // 在线歌曲 / WebDAV 用 url 流式播放；本地 / FTP 用已下载的本地路径。
+    // 远程歌曲的 localPath 可能为 null（WebDAV），用旧写法会得到空 URL。
+    final playbackUrl = resolvePlaybackUrlForSource(song);
+    // 远程歌曲鉴权头：仅 WebDAV 且配置缓存命中时非空（经 just_audio 本地代理附加）
+    final headers = buildPlaybackHeaders(
+      remoteType: song.remoteType,
+      remoteSourceId: song.remoteSourceId,
+    );
     // 本地歌曲的 artworkUri 是 local:// 或 content:// 格式，
     // just_audio 无法加载这些 URI 作为封面；系统通知封面由
     // AudioPlaybackService 通过 fallbackFilePath 提取内嵌封面处理
@@ -6278,6 +6381,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         artist: song.artist,
         album: song.album,
         artUri: effectiveArtUri,
+        headers: headers,
       );
     }
     return createAudioSource(
@@ -6288,6 +6392,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       artist: song.artist,
       album: song.album,
       artUri: effectiveArtUri,
+      headers: headers,
     );
   }
 
@@ -6336,6 +6441,21 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<String?> _resolvePlaybackUrlImpl(Song song) async {
+    // 远程歌曲：WebDAV 直接返回 HTTP URL（播放时由 _createAudioSource 附加鉴权头）；
+    // FTP 需先按需下载到本地缓存（just_audio 不支持 ftp://）。
+    if (song.remoteType == SongRemoteType.webdav) return song.url;
+    if (song.remoteType == SongRemoteType.ftp) {
+      final cfg = RemoteStorageRepository.peekConfig(song.remoteSourceId);
+      if (cfg == null) return null;
+      final cache = await RemoteDownloadCache.create(config: cfg);
+      final cached = await cache.ensureDownloaded(
+        cfg.id,
+        _remotePathFromUrl(song.url),
+      );
+      return (cached == null || cached.isEmpty)
+          ? null
+          : Uri.file(cached).toString();
+    }
     if (song.isOnline) return song.url;
     final raw = song.localPath;
     if (raw == null || raw.isEmpty) return null;
@@ -6344,7 +6464,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // just_audio 的 setUrl / AudioSource.uri 需要完整的 URI，
       // 裸路径 /storage/emulated/0/... 会导致 "No host specified in URI" 错误。
       // 这里把绝对路径转换为 file:// URI。
-      if (raw.startsWith('/')) {
+      //
+      // Windows 端注意：绝对路径形如 `C:\Music\a.mp3`，**不以 `/` 开头**。
+      // 只判`startsWith('/')` 会把裸盘符路径原样丢给 setUrl，just_audio_windows
+      // （WinRT MediaPlayer）解析不了 → Windows 本地音乐全部打不开。
+      if (raw.startsWith('/') || looksLikeWindowsAbsolutePath(raw)) {
         return Uri.file(raw).toString();
       }
       return raw;
@@ -6356,7 +6480,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         return null;
       }
       // resolved 是真实文件路径，同样需要转换为 file:// URI
-      if (resolved.startsWith('/')) {
+      if (resolved.startsWith('/') || looksLikeWindowsAbsolutePath(resolved)) {
         final fileUri = Uri.file(resolved).toString();
         debugPrint('[PlayerProvider] 本地内容 URI 解析完成');
         return fileUri;
@@ -6382,6 +6506,19 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     for (final song in songs) {
       if (song.isOnline) {
         result.add(song);
+        continue;
+      }
+      // 远程歌曲走统一解析：WebDAV 返回 url（播放时附加鉴权头，无需改字段）；
+      // FTP 触发按需下载并把下载到的本地路径回写 localPath。
+      if (song.remoteType != SongRemoteType.none) {
+        final resolved = await _resolvePlaybackUrl(song);
+        if (resolved != null && resolved.isNotEmpty) {
+          result.add(song.remoteType == SongRemoteType.webdav
+              ? song
+              : song.copyWith(localPath: resolved));
+        } else {
+          result.add(song);
+        }
         continue;
       }
       final raw = song.localPath;
@@ -6438,8 +6575,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Lyricon 状态变化时：
   /// - enabled 从 false→true（auto_restored / connected）→ 重置 _lastLyriconSongSig 重推。
-  /// - enabled 保持 true 但连接状态从断开（disconnected/timeout）恢复为 connected
-  ///   （Lyricon 断开后自动重连成功）→ 同样重推当前歌曲，否则重连后词幕无歌词数据不显示。
+  /// - 首次连接和断开重连进入 connected 时均补推，避免连接前的首曲推送丢失。
   void _handleLyriconEnabledChanged() {
     final enabled = LyriconProviderService.instance.enabled;
     final state = LyriconProviderService.instance.state;
@@ -6452,11 +6588,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _lyriconWasEnabled = false;
       _lastLyriconState = LyriconConnectionState.disabled;
     } else if (_lastLyriconState != state) {
-      final wasDisconnected =
-          _lastLyriconState == LyriconConnectionState.disconnected ||
-          _lastLyriconState == LyriconConnectionState.timeout;
       _lastLyriconState = state;
-      if (wasDisconnected && state == LyriconConnectionState.connected) {
+      if (state == LyriconConnectionState.connected) {
+        debugPrint('[LyriconDebug] connection ready: repush current song');
         _lastLyriconSongSig = null;
         _handleLyriconSongChange();
       }
@@ -6479,8 +6613,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     try {
       List<LyricLine> lines = const [];
       if (song != null) {
-        // 本地歌曲优先读取内嵌歌词
-        if (!song.isOnline) {
+        // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
+        await SongMatchRepository().ensureLoaded();
+        final matchInfo =
+            song.isOnline ? null : SongMatchRepository().get(song.id);
+        final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
+
+        // 本地歌曲优先读取内嵌歌词；单曲偏好开启时跳过，直接走在线
+        if (!song.isOnline && !preferOnlineLyrics) {
           final localPath = song.localPath;
           if (localPath != null && localPath.isNotEmpty) {
             String filePath = localPath;
@@ -6494,15 +6634,19 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           }
         }
 
-        // 内嵌歌词为空时从酷狗 API 获取
+        // 内嵌歌词为空（或偏好在线）时从酷狗 API 获取
         if (lines.isEmpty) {
           final ctx = appNavigatorKey.currentContext;
           if (ctx != null && ctx.mounted) {
             try {
               final kugou = ctx.read<KugouProvider>();
-              // 本地歌曲传空 hash + "歌名 艺术家" 关键词搜索；搜索词与播放器页面 full_player 保持一致，
+              // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中传空 hash +
+              // "歌名 艺术家" 关键词搜索。搜索词与播放器页面 full_player 保持一致，
               // 确保 Lyricon 推送与播放器页面命中同一版本歌词。
-              final lyricHash = song.isOnline ? song.id : '';
+              final matchedHash = (matchInfo != null && matchInfo.isMatched)
+                  ? matchInfo.hash
+                  : null;
+              final lyricHash = matchedHash ?? (song.isOnline ? song.id : '');
               // 用 isUnknownArtist 而非比较单一字面量：一起听跟随端的占位值是
               // 「未知歌手」、本地侧是「未知艺术家」，只比一个会漏判，
               // 导致把「未知歌曲 未知歌手」当检索词去搜。
@@ -6557,9 +6701,16 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 但那会碎片化片段，且缺少合适的 `state` 语义（参考实现只文档化了「完整播放」）。
   void _flushListenReportOnExit() {
     final tracker = ListenReportService.instance.tracker;
-    if (!tracker.isTracking) return;
+    if (tracker.isTracking) {
+      // ignore: discarded_futures
+      ListenReportService.instance.onSongEnded(reason: PlaybackEndReason.stopped);
+    }
+    // 云端播放历史同样在退出前结账：阈值内直接上传，失败落 pending 队列
+    // （持久化，下次启动补传），进程被杀也不丢记录。
     // ignore: discarded_futures
-    ListenReportService.instance.onSongEnded(reason: PlaybackEndReason.stopped);
+    PlayHistorySyncService.instance.onSongEnded(
+      reason: PlaybackEndReason.stopped,
+    );
   }
 
   @override
@@ -6660,6 +6811,29 @@ class AudioServiceLoader {
   }
 }
 
+/// 选择「流式 source」使用的播放 URL（纯逻辑，便于单测回归）。
+///
+/// - 在线歌曲 / WebDAV：直接用 `song.url` 流式播放
+///   （WebDAV 的 `localPath` 无意义，为空会得到空 URL 导致播放失败）；
+/// - 本地 / FTP：优先已下载的本地路径 `localPath`，回退 `song.url`。
+@visibleForTesting
+String? resolvePlaybackUrlForSource(Song song) {
+  return song.isOnline || song.remoteType == SongRemoteType.webdav
+      ? song.url
+      : song.localPath ?? song.url;
+}
+
+/// 从远程歌曲 URL 提取远程绝对路径（ftp://host:port/a/b.mp3 → /a/b.mp3）。
+///
+/// FTP 的 RETR 需要服务器上的绝对路径，`Uri.parse` 的 `path` 恰好满足
+/// （如 `ftp://h:21/music/a.mp3` → `/music/a.mp3`）。
+String _remotePathFromUrl(String? url) {
+  if (url == null || url.isEmpty) return '';
+  final parsed = Uri.tryParse(url);
+  if (parsed == null) return '';
+  return parsed.path.isEmpty ? '/' : parsed.path;
+}
+
 just_audio.UriAudioSource createAudioSourceWeb({
   required String id,
   required String url,
@@ -6667,6 +6841,7 @@ just_audio.UriAudioSource createAudioSourceWeb({
   String? artist,
   String? album,
   Uri? artUri,
+  Map<String, String>? headers,
 }) {
   return createAudioSource(
     id: id,
@@ -6675,6 +6850,7 @@ just_audio.UriAudioSource createAudioSourceWeb({
     artist: artist,
     album: album,
     artUri: artUri,
+    headers: headers,
   );
 }
 
@@ -6722,3 +6898,36 @@ String? buildLyriconSongSignature(Song? song) {
   return '${song.id}\u0000${song.title}\u0000${song.artist}\u0000'
       '${song.artworkUri ?? ''}';
 }
+
+/// 判定是否为 Windows 绝对路径（盘符 `C:\` / `C:/`，或 UNC `\\server\share`）。
+///
+/// 用于本地音乐播放 URL 构造：`just_audio` 的 `setUrl` 需要带 scheme 的完整 URI，
+/// 裸路径会失败。Android 路径 `/storage/emulated/0/...` 以 `/` 开头即可识别，
+/// 但 Windows 路径 `C:\Music\a.mp3` **不以 `/` 开头** —— 只判 `startsWith('/')`
+/// 会让裸盘符路径直接进 `setUrl`，导致 Windows 端本地音乐全部"打不开"。
+///
+/// 刻意不引入 `dart:io` 的 [Platform]：本函数需在纯 Dart 单测里直接验证，
+/// 且 Android 侧读到盘符形态本身就是异常数据，交给 [Uri.file] 也不会更糟。
+///
+/// 公开可见是为了让 `test/providers/player_provider_windows_local_url_test.dart`
+/// 锁住该判定 —— 它一旦回退成只看 `/` 开头，Windows 本地音乐立刻全废。
+bool looksLikeWindowsAbsolutePath(String path) {
+  if (path.length >= 3 &&
+      path[1] == ':' &&
+      (path[2] == kBackslash || path[2] == '/') &&
+      _isAsciiLetter(path.codeUnitAt(0))) {
+    return true;
+  }
+  // UNC：\\server\share
+  return path.startsWith(kUncPrefix);
+}
+
+/// 反斜杠字符常量（避免在文档注释里出现裸反斜杠导致的转义歧义）。
+const String kBackslash = '\\';
+
+/// UNC 前缀 `\\`。
+const String kUncPrefix = '\\\\';
+
+bool _isAsciiLetter(int codeUnit) =>
+    (codeUnit >= 0x41 && codeUnit <= 0x5A) ||
+    (codeUnit >= 0x61 && codeUnit <= 0x7A);

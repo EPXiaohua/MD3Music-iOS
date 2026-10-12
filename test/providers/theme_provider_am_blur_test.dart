@@ -21,11 +21,11 @@ void main() {
     expect(tp2.amPlayerBlur, 12.0);
   });
 
-  test('AM 播放器背景模糊越界值被钳制到 0~30', () async {
+  test('AM 播放器背景模糊越界值被钳制到 0~200', () async {
     SharedPreferences.setMockInitialValues({});
     final tp = ThemeProvider();
-    await tp.setAmPlayerBlur(45);
-    expect(tp.amPlayerBlur, 30.0);
+    await tp.setAmPlayerBlur(300);
+    expect(tp.amPlayerBlur, 200.0);
     await tp.setAmPlayerBlur(-5);
     expect(tp.amPlayerBlur, 0.0);
   });

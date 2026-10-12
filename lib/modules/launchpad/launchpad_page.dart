@@ -1,9 +1,11 @@
 import 'dart:async';
 
+import 'package:dpad/dpad.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
 import '../../providers/tab_config_provider.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../settings/home_tab_manager.dart';
@@ -304,6 +306,23 @@ class _LaunchPadCard extends StatelessWidget {
       ),
     );
     if (!hidden) return content;
+    // tv: TV 构建下隐藏 tab 卡单停点（GestureDetector 不可聚焦；OK=跳二级页）。
+    // 长按启用不接入 D-pad（按住进度提示层由指针事件驱动，OK 长按无法等价
+    // 复现），TV 上经设置页「主页管理」启用隐藏 tab。
+    if (kTvBuild) {
+      return DpadFocusable(
+        onSelect: onTap,
+        child: Stack(
+          // expand：内容铺满网格格子，与可见 tab 卡片同尺寸同位置
+          // （loose 会缩成内容大小并靠左上角对齐）
+          fit: StackFit.expand,
+          children: [
+            content,
+            if (enabling) Positioned.fill(child: _buildEnableHint()),
+          ],
+        ),
+      );
+    }
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap,

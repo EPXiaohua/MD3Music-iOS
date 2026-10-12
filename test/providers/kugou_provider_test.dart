@@ -88,7 +88,8 @@ void main() {
       expect(provider.songUrl, isNull);
       expect(provider.comments, isNull);
       expect(provider.searchResults, isNull);
-      expect(provider.hotSearchKeywords, isEmpty);
+      expect(provider.hotSearchState.value.status, HotSearchStatus.idle);
+      expect(provider.hotSearchState.value.boards, isEmpty);
       expect(provider.recommendSongs, isEmpty);
       expect(provider.personalFmSongs, isEmpty);
       expect(provider.rankSongs, isEmpty);

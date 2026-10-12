@@ -42,9 +42,20 @@ class PlayingSpectrumIndicator extends StatefulWidget {
       _PlayingSpectrumIndicatorState();
 }
 
-class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator> {
+class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator>
+    with WidgetsBindingObserver {
   /// 是否已挂到共享 60fps 帧驱动上。
   bool _boundToDriver = false;
+
+  /// [TickerMode] 是否被关闭（被不透明路由覆盖 / TabBarView 切走）。
+  ///
+  /// 本组件常驻于歌曲列表行（`song_list_item` / `player_playlist_view`），
+  /// 而首页 tab 由 `ResponsiveShell` 的 `IndexedStack` 保活 —— `TickerMode`
+  /// 关的是 Ticker，**关不住共享 Timer**，切走 tab 后仍会持续产帧（§10.4.3）。
+  bool _tickerModeMuted = false;
+
+  /// App 是否退到后台（引擎不产帧，Timer 空转纯属唤醒浪费）。
+  bool _appSuspended = false;
 
   /// 时间累积通过 ValueNotifier 驱动 CustomPainter 重绘，
   /// 避免 _onTick 每帧 setState 触发 widget 重建
@@ -53,6 +64,28 @@ class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _syncDriver();
+  }
+
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.valuesOf(context).enabled;
+    if (muted == _tickerModeMuted) return;
+    _tickerModeMuted = muted;
+    _syncDriver();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
     _syncDriver();
   }
 
@@ -65,15 +98,17 @@ class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator> {
     }
   }
 
-  /// 按 isPlaying 绑定/解绑共享 60fps 节拍。
+  /// 唯一收口：仅在「播放中 + 可见 + 前台」时挂共享 60fps 节拍（幂等）。
   void _syncDriver() {
-    if (widget.isPlaying && !_boundToDriver) {
+    final bool shouldRun =
+        widget.isPlaying && !_tickerModeMuted && !_appSuspended;
+    if (shouldRun == _boundToDriver) return;
+    if (shouldRun) {
       PlayerFrameDriver.instance.addListener(_onSharedTick);
-      _boundToDriver = true;
-    } else if (!widget.isPlaying && _boundToDriver) {
+    } else {
       PlayerFrameDriver.instance.removeListener(_onSharedTick);
-      _boundToDriver = false;
     }
+    _boundToDriver = shouldRun;
   }
 
   /// 共享节拍回调：固定 16ms 步进推进时间，通过 ValueNotifier 触发重绘
@@ -84,6 +119,7 @@ class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (_boundToDriver) {
       PlayerFrameDriver.instance.removeListener(_onSharedTick);
       _boundToDriver = false;

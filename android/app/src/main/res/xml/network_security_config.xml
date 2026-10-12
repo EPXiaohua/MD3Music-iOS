@@ -17,5 +17,11 @@
              HTTP 明文、不支持 HTTPS（实测 https 无响应）。视频播放与封面图必需明文访问，
              故对酷狗子域放行明文；登录接口走 Rust 本地转发 HTTPS，不经此明文面。 -->
         <domain includeSubdomains="true">kugou.com</domain>
+        <!-- 歌手 MV 列表里的「饭拍」（用户上传）视频不走酷狗 CDN，/video/url 返回的是
+             腾讯侧节点（实测 kgv.stream.tencentmusic.com）。真机日志：
+             CleartextNotPermittedException: Cleartext HTTP traffic to
+             kgv.stream.tencentmusic.com not permitted → ExoPlayer Source error，
+             表现为官方 MV 能播、饭拍黑屏。只放开该 CDN 子域，不放开整条 tencentmusic.com。 -->
+        <domain includeSubdomains="true">stream.tencentmusic.com</domain>
     </domain-config>
 </network-security-config>

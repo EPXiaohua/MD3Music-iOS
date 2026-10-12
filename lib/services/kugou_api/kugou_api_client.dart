@@ -470,6 +470,9 @@ class KugouApiClient {
       }
       final headers = <String, String>{
         'Content-Type': 'application/octet-stream',
+        // 二进制 POST 一律绕过本地 apicache：缓存键只含 URL query（不含 body），
+        // 云盘上传等同参数不同文件的请求 120s 内会串台返回旧结果。
+        'x-apicache-bypass': '1',
       };
       // 添加认证信息（与 Dio 请求一致）
       if (_token != null && _userid != null) {
@@ -612,10 +615,6 @@ class KugouApiClient {
     // 等待 _initFromStorage 完成，避免其旧版分支覆盖本方法刚写入的内存凭证
     await _ensureInitialized();
 
-    _token = token;
-    _userid = userid;
-    _vipToken = vipToken;
-
     try {
       final prefs = await SharedPreferences.getInstance();
       // 敏感凭证（token/vip_token）写入加密存储（Keystore），
@@ -660,8 +659,13 @@ class KugouApiClient {
         _accounts.add(KugouAccount(userid: userid, loginTime: now));
       }
       await prefs.setString(_kAccountsKey, KugouAccount.encodeList(_accounts));
+      // 持久化成功才公布登录状态，避免本次成功、重启却丢失凭证。
+      _token = token;
+      _userid = userid;
+      _vipToken = vipToken;
     } catch (e) {
       print('❌ [Auth] 保存登录状态失败: $e');
+      throw StateError('登录凭证保存失败，请重试');
     }
   }
 
@@ -962,32 +966,12 @@ class KugouApiClient {
     }
   }
 
-  Future<List<String>?> getHotSearch() async {
+  /// 热搜榜单。失败/非 200 时 `_get` 归一为 null → 返回空列表，
+  /// 由 Provider 判定失败态（旧签名返回 `List<String>?` 已无调用方依赖）。
+  Future<List<HotSearchBoard>> getHotSearch() async {
     final json = await _get(KugouEndpoints.searchHot);
-    if (json == null) return null;
-    try {
-      final data = json['data'];
-      List<dynamic> list;
-      if (data is List) {
-        list = data;
-      } else if (data is Map) {
-        list = data['list'] ?? data['info'] ?? [];
-      } else {
-        list = [];
-      }
-      return list
-          .map((e) {
-            if (e is String) return e;
-            final m = e as Map<String, dynamic>;
-            return (m['searchword'] ?? m['keyword'] ?? m['name'] ?? '')
-                .toString();
-          })
-          .where((e) => e.isNotEmpty)
-          .cast<String>()
-          .toList();
-    } catch (e) {
-      return null;
-    }
+    if (json == null) return const [];
+    return HotSearchBoard.parseList(json);
   }
 
   Future<List<String>?> getSearchSuggest(String keywords) async {
@@ -1626,14 +1610,43 @@ class KugouApiClient {
     }
   }
 
-  Future<KugouSongRanking?> getSongRanking(String hash) async {
+  /// 歌曲成绩单（榜单成就汇总，匿名可用）。参数为 album_audio_id（即 MixSongID）。
+  Future<KugouSongRanking?> getSongRanking(String albumAudioId) async {
     final json = await _get(
       KugouEndpoints.songRanking,
-      queryParameters: {'hash': hash},
+      queryParameters: {'album_audio_id': albumAudioId},
     );
     if (json == null) return null;
     try {
       return KugouSongRanking.fromJson(json);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// 歌曲成绩单详情（各子榜单历史成绩，需登录，服务端默认 page=1/pagesize=30）。
+  Future<List<KugouSongRankingFilterItem>?> getSongRankingFilter(
+    String albumAudioId, {
+    int page = 1,
+    int pagesize = 30,
+  }) async {
+    final json = await _get(
+      KugouEndpoints.songRankingFilter,
+      queryParameters: {
+        'album_audio_id': albumAudioId,
+        'page': page,
+        'pagesize': pagesize,
+      },
+    );
+    if (json == null) return null;
+    try {
+      final data = json['data'] as Map<String, dynamic>? ?? json;
+      final list = data['info'] ?? data['list'] ?? data['data'];
+      if (list is! List) return const [];
+      return list
+          .whereType<Map<String, dynamic>>()
+          .map(KugouSongRankingFilterItem.fromJson)
+          .toList();
     } catch (e) {
       return null;
     }
@@ -1679,6 +1692,7 @@ class KugouApiClient {
     String? songName,
     String fmt = 'lrc',
     bool decode = true,
+    void Function(KugouLyric lyric)? onProgress,
   }) async {
     final failures = _LyricFailureTracker();
     if (hash.trim().isEmpty && (songName == null || songName.trim().isEmpty)) {
@@ -1778,6 +1792,13 @@ class KugouApiClient {
     final bool dualRequest = (fmt == 'lrc');
 
     if (dualRequest) {
+      Map<String, dynamic>? availableLrc;
+      Map<String, dynamic>? availableKrc;
+      // 正文一到就交给页面，不等待另一种格式及备用翻译下载。
+      void publishAvailable() {
+        final partial = mergeLyricResponses(availableLrc, availableKrc);
+        if (_hasLyricText(partial)) onProgress?.call(partial!);
+      }
       // 并发双请求：Future.wait 同时发起，每个请求独立 try/catch 防止单点失败
       final results = await Future.wait([
         _fetchLyricContent(
@@ -1786,14 +1807,22 @@ class KugouApiClient {
           'lrc',
           decode,
           onFailure: failures.record,
-        ),
+        ).then((json) {
+          availableLrc = json;
+          publishAvailable();
+          return json;
+        }),
         _fetchLyricContent(
           resolvedLyricId,
           resolvedAccesskey,
           'krc',
           decode,
           onFailure: failures.record,
-        ),
+        ).then((json) {
+          availableKrc = json;
+          publishAvailable();
+          return json;
+        }),
       ]);
       final lrcJson = results[0];
       final krcJson = results[1];
@@ -2710,8 +2739,30 @@ class KugouApiClient {
     return await _get(KugouEndpoints.topAlbum, queryParameters: {'page': page});
   }
 
-  Future<Map<String, dynamic>?> getTopSong({int page = 1}) async {
-    return await _get(KugouEndpoints.topSong, queryParameters: {'page': page});
+  /// 新歌速递（/top/song）。[type] 即上游 rank_id（21608 = 新歌速递），
+  /// 服务端按 page/pagesize 分页并原样回传上游 JSON。
+  ///
+  /// 上游响应形态是 `{status, error_code, data: [ <song>... ]}`——**data 本身就是数组**
+  /// （EchoMusic 实测确认，与本仓 `/home/discover` 同一套结构），所以直接交给
+  /// [parseHomeDiscoverSongs] 的防御式解析，不再在这里另写一条候选链。
+  Future<List<KugouSongDetail>?> getTopSong({
+    int page = 1,
+    int type = 21608,
+    int pagesize = 30,
+  }) async {
+    final json = await _get(
+      KugouEndpoints.topSong,
+      queryParameters: {'page': page, 'type': type, 'pagesize': pagesize},
+    );
+    if (json == null) return null;
+    final songs = parseHomeDiscoverSongs(json);
+    if (songs.isEmpty) {
+      // ignore: avoid_print
+      print(
+        '[topSong] empty keys=${json.keys.toList()} dataType=${json['data'].runtimeType}',
+      );
+    }
+    return songs;
   }
 
   // ==================== Yueku ====================
@@ -2807,12 +2858,21 @@ class KugouApiClient {
   /// URL 缓存，而 [_onRequest] 只在 noCache 时才加 bypass 头和 t= 戳（登录态在
   /// L183 设的那份 bypass 头会被 L207-209 的 else 分支删掉），否则同参数请求
   /// 会被原样回放，续播拿到的永远是同一批歌。
+  ///
+  /// [curMark] / [playtime] / [isOverplay] 是反馈参数（上游
+  /// POST /v2/personal_recommend）：红心与取消红心要带 [curMark]，播放完成回报
+  /// 要带已播秒数 [playtime] 和 [isOverplay]。三者为 null 时**完全不进 query**，
+  /// 与不传等价，老调用方不受影响。
+  /// `remain_songcnt` 刻意不上送：上游文档写该值大于 4 时服务端不再返回推荐。
   Future<List<KugouSongDetail>?> getPersonalFm({
     String? mode,
     int? songPoolId,
     String? hash,
     String? songId,
     String? action,
+    String? curMark,
+    int? playtime,
+    bool? isOverplay,
     bool noCache = false,
   }) async {
     final params = <String, dynamic>{};
@@ -2821,6 +2881,9 @@ class KugouApiClient {
     if (hash != null) params['hash'] = hash;
     if (songId != null) params['songid'] = songId;
     if (action != null) params['action'] = action;
+    if (curMark != null) params['cur_mark'] = curMark;
+    if (playtime != null) params['playtime'] = playtime.toString();
+    if (isOverplay != null) params['is_overplay'] = isOverplay ? '1' : '0';
 
     final json = await _get(
       KugouEndpoints.personalFm,
@@ -2842,6 +2905,38 @@ class KugouApiClient {
     } catch (e) {
       return null;
     }
+  }
+
+  /// 私人 FM 行为回报（红心 / 垃圾桶 / 播放完成等），参数与 [getPersonalFm] 同一套
+  /// 装配，只是语义上分开：调用方不要把一次反馈当成「换一批列表」。
+  ///
+  /// **强制 noCache**：[_onRequest] 的 noCache 分支之外会**删掉** x-apicache-bypass
+  /// 头（登录态设的那份也一样被删），只有 extra['noCache'] == true 才保留 bypass
+  /// 并追加 t= 戳；而本地服务端按 URL 缓存成功响应 120s（rust/src/server.rs 的
+  /// apicache）。不带 noCache 的话同参数的反馈会被缓存直接回放，根本到不了上游。
+  ///
+  /// 返回值原样透传：`garbage` 会带回替换批次，`click_red` 一类调用方直接忽略。
+  Future<List<KugouSongDetail>?> reportPersonalFmAction({
+    required String action,
+    String? mode,
+    int? songPoolId,
+    String? hash,
+    String? songId,
+    String? curMark,
+    int? playtime,
+    bool isOverplay = false,
+  }) {
+    return getPersonalFm(
+      mode: mode,
+      songPoolId: songPoolId,
+      hash: hash,
+      songId: songId,
+      action: action,
+      curMark: curMark,
+      playtime: playtime,
+      isOverplay: isOverplay,
+      noCache: true,
+    );
   }
 
   // ==================== Home ====================
@@ -3004,19 +3099,33 @@ class KugouApiClient {
     String artistId, {
     int page = 1,
     int pagesize = 30,
+    String sort = 'hot',
+    bool noCache = false,
   }) async {
+    // Rust /artist/albums 取的是 q["id"]，传 singerid 会被当成空 author_id
+    final query = <String, dynamic>{
+      'id': artistId,
+      'page': page,
+      'pagesize': pagesize,
+    };
+    if (sort.isNotEmpty) {
+      query['sort'] = sort;
+    }
     final json = await _get(
       KugouEndpoints.artistAlbums,
-      queryParameters: {
-        'singerid': artistId,
-        'page': page,
-        'pagesize': pagesize,
-      },
+      queryParameters: query,
+      noCache: noCache,
     );
-    if (json == null) return null;
+    if (json == null) {
+      // ignore: avoid_print
+      print('[ArtistAlbumDebug] response null, query=$query');
+      return null;
+    }
     try {
       return KugouArtistAlbums.fromJson(json);
     } catch (e) {
+      // ignore: avoid_print
+      print('[ArtistAlbumDebug] parse error: $e');
       return null;
     }
   }
@@ -3049,11 +3158,37 @@ class KugouApiClient {
     }
   }
 
-  Future<Map<String, dynamic>?> getArtistVideos(String artistId) async {
-    return await _get(
+  Future<KugouArtistVideos?> getArtistVideos(
+    String artistId, {
+    int page = 1,
+    int pagesize = 30,
+    String tag = 'all',
+    bool noCache = false,
+  }) async {
+    // Rust /artist/videos 同样只认 q["id"]；tag 缺省 all 时上游 tag_idx 为空
+    final query = <String, dynamic>{
+      'id': artistId,
+      'page': page,
+      'pagesize': pagesize,
+      'tag': tag,
+    };
+    final json = await _get(
       KugouEndpoints.artistVideos,
-      queryParameters: {'singerid': artistId},
+      queryParameters: query,
+      noCache: noCache,
     );
+    if (json == null) {
+      // ignore: avoid_print
+      print('[ArtistMvDebug] response null, query=$query');
+      return null;
+    }
+    try {
+      return KugouArtistVideos.fromJson(json);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[ArtistMvDebug] parse error: $e');
+      return null;
+    }
   }
 
   Future<Map<String, dynamic>?> followArtist(String artistId) async {
@@ -3248,6 +3383,66 @@ class KugouApiClient {
     return _post(KugouEndpoints.videoBarrageSend, queryParameters: params);
   }
 
+  /// 获取歌曲弹幕原始响应。
+  ///
+  /// 弹幕池 code 是 `articulossong`，与 [KugouEndpoints.commentMusic] 的普通歌曲
+  /// 评论池不是同一个池，参数口径也不同（本接口按 `hash` 查）。
+  /// [pagesize] 默认 50 —— 实测上游硬上限 50（请求 100 也只回 50 条），
+  /// 需要更多只能靠 [page] 翻页，见 `fetchSongBarragePages`。
+  /// 实测条目数组在**顶层 `list`**（不在 data 里），`status=1`/`err_code=0`/`msg="success"`，
+  /// `childrenid` 是 JSON 数字；空池为 `count=0` + `list=[]` + `childrenid=""`。
+  /// 取数不需登录。失败返回 null —— 弹幕不得影响播放。
+  Future<Map<String, dynamic>?> getSongBarrage({
+    required String hash,
+    String? specialId,
+    String? name,
+    String? mixsongid,
+    int page = 1,
+    int pagesize = 50,
+  }) async {
+    if (hash.isEmpty) return null;
+    return _get(
+      KugouEndpoints.songBarrage,
+      queryParameters: compactQueryParams({
+        'hash': hash,
+        'special_id': specialId,
+        'name': name,
+        'mixsongid': mixsongid,
+        'page': page,
+        'pagesize': pagesize,
+      }),
+    );
+  }
+
+  /// 发送歌曲弹幕。
+  ///
+  /// 三条硬约束同「评论发送（写接口）」段：参数走 query、`noCache: true`、
+  /// **调用方不得自动重试** —— 发布成功即产生真实公开内容，重试会重复发布。
+  /// 需登录（未登录请由调用方先拦截，见 [isLoggedIn]）。
+  ///
+  /// 成功判据 `status == 1 && error_code == 0` 在本机**未经真实发布验证**。
+  Future<CommentSendResult> sendSongDanmaku({
+    required String content,
+    required String hash,
+    String? name,
+    String? mixsongid,
+  }) async {
+    if (hash.isEmpty) {
+      return CommentSendResult.failure('缺少歌曲 hash');
+    }
+    final json = await _post(
+      KugouEndpoints.songBarrageSend,
+      queryParameters: compactQueryParams({
+        'content': content,
+        'hash': hash,
+        'name': name,
+        'mixsongid': mixsongid,
+      }),
+      noCache: true,
+    );
+    return CommentSendResult.fromJson(json);
+  }
+
   /// 获取视频权限信息。
   /// 对应服务端 `/video/privilege`，上游 media.store.kugou.com。
   /// 服务端从 query 读取 hash，故客户端用 GET + query。
@@ -3420,7 +3615,7 @@ class KugouApiClient {
     if (json == null) return null;
     // 业务失败（如 token 失效/未登录，error_code=20010）时返回 null，
     // 避免误判为「成功但无昵称」（此前会返回 nickname=null 的对象）。
-    if (!_isBizOk(json)) return null;
+    if (!isBizOk(json)) return null;
     try {
       final detail = KugouUserDetail.fromJson(json);
       // ignore: avoid_print
@@ -3440,19 +3635,197 @@ class KugouApiClient {
   Future<bool> checkTokenValid() async {
     final json = await _getAllowNonOk(KugouEndpoints.userDetail, noCache: true);
     if (json == null) return false;
-    if (!_isBizOk(json)) return false;
+    if (!isBizOk(json)) return false;
     final data = json['data'];
     return data is Map && data.isNotEmpty;
   }
 
   /// 判断用户态接口响应的业务状态是否成功。
   /// 成功判定：error_code 为 0 或缺失，且 status 为 1 或缺失。
-  static bool _isBizOk(Map<String, dynamic> json) {
+  static bool isBizOk(Map<String, dynamic> json) {
     final errorCode = json['error_code'];
     if (errorCode is num && errorCode != 0) return false;
     final status = json['status'];
     if (status is num && status != 1) return false;
     return true;
+  }
+
+  /// 获取当前账号的登录设备列表（/login/device，Rust `login.rs::handle_device`）。
+  /// noCache：设备会话随时变化，且 apicache key 不含 token，不能跨账号复用缓存。
+  /// 返回解析后的快照（设备列表已按本机优先、活跃时间降序排列）；
+  /// 请求失败返回 null，业务失败（token 失效等）返回 ok=false 的快照，
+  /// 调用方据此区分「空列表」与「失败」。
+  Future<KugouLoginDeviceSnapshot?> getLoginDevices() async {
+    final json = await _getAllowNonOk(
+      KugouEndpoints.loginDevice,
+      noCache: true,
+    );
+    if (json == null) return null;
+    try {
+      return KugouLoginDeviceSnapshot.fromJson(json);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[LOGIN_DEVICE] parse error: $e');
+      return null;
+    }
+  }
+
+  /// 把指定设备踢下线（/login/device/kick，Rust `login.rs::handle_device_kick`）。
+  /// 四元组取自设备列表项（mid/t/appid/ver 原样字符串回传）；
+  /// token/userid/dfid 由拦截器与 Rust 端 cookie 兜底自动携带。
+  /// 返回完整响应 body，调用方用 KugouApiClient.isBizOk 判定成败。
+  Future<Map<String, dynamic>?> kickLoginDevice({
+    required String tMid,
+    required String t,
+    required String tAppid,
+    required String tClientver,
+  }) {
+    return _getAllowNonOk(
+      KugouEndpoints.loginDeviceKick,
+      queryParameters: {
+        't_mid': tMid,
+        't': t,
+        't_appid': tAppid,
+        't_clientver': tClientver,
+      },
+      noCache: true,
+    );
+  }
+
+  /// 编辑内容黑名单（/blacklist，Rust `blacklist.rs::handle_edit`）。
+  /// 添加/移除黑名单中的歌曲或歌手（黑名单内容不出现在猜你喜欢、每日推荐等推荐场景）。
+  /// 歌曲传 hash（FileHash，建议附 mixsongid/name），歌手传 singerid/name；
+  /// [isDelete] 为 true 时移除；[items] 为批量条目 JSON 串（传入时忽略单条参数）；
+  /// [moduleId] 为场景标识 KG-TID，默认 473（黑名单管理）。
+  /// 返回完整响应 body（含 status/error_code），调用方用 KugouApiClient.isBizOk 判定成败。
+  Future<Map<String, dynamic>?> editBlacklist({
+    String? hash,
+    String? mixsongid,
+    String? singerid,
+    String? name,
+    String label = 'song',
+    bool isDelete = false,
+    String? items,
+    String? moduleId,
+  }) {
+    return _getAllowNonOk(
+      KugouEndpoints.blacklist,
+      queryParameters: {
+        if (hash != null) 'hash': hash.toLowerCase(),
+        if (mixsongid != null) 'mixsongid': mixsongid,
+        if (singerid != null) 'singerid': singerid,
+        if (name != null) 'name': name,
+        'label': label,
+        if (isDelete) 'isDelete': '1',
+        if (items != null) 'items': items,
+        if (moduleId != null) 'moduleId': moduleId,
+      },
+      noCache: true,
+    );
+  }
+
+  /// 获取内容黑名单列表（/blacklist/list，Rust `blacklist.rs::handle_list`）。
+  /// [label]：song（歌曲，默认）或 singer（歌手）；[pagesize] 服务端上限 500。
+  /// 返回完整响应 body（data.items / data.total），调用方用 KugouBlacklistSnapshot 解析。
+  Future<Map<String, dynamic>?> getBlacklistList({
+    String label = 'song',
+    int page = 1,
+    int pagesize = 30,
+    String? moduleId,
+  }) {
+    return _getAllowNonOk(
+      KugouEndpoints.blacklistList,
+      queryParameters: {
+        'label': label,
+        'page': page,
+        'pagesize': pagesize,
+        if (moduleId != null) 'moduleId': moduleId,
+      },
+      noCache: true,
+    );
+  }
+
+  /// 修改个人资料（/user/update，Rust `user.rs::handle_update`）。
+  /// 仅提交非 null 字段；signature/birthday/tags 传空串表示清空对应资料。
+  /// 返回完整响应 body（含 status/error_code/msg），调用方用 KugouApiClient.isBizOk 判定成败。
+  Future<Map<String, dynamic>?> updateUserProfile({
+    String? nickname,
+    int? sex,
+    String? birthday,
+    String? signature,
+    String? province,
+    String? city,
+    String? memo,
+    String? tags,
+  }) {
+    final data = <String, dynamic>{
+      'nickname': ?nickname,
+      'sex': ?sex,
+      'birthday': ?birthday,
+      'signature': ?signature,
+      'province': ?province,
+      'city': ?city,
+      'memo': ?memo,
+      'tags': ?tags,
+    };
+    return _post(KugouEndpoints.userUpdate, data: data, noCache: true);
+  }
+
+  /// 修改头像（/user/update/avatar，Rust `user.rs::handle_update_avatar`）。
+  /// 服务端内部先 multipart 传酷狗图床、再把文件名写进资料 photo 字段，
+  /// 成功响应额外带 photo（图床文件名）与 pic（完整头像 URL）。
+  /// 注意头像为异步审核制，写入成功不代表立即生效。
+  Future<Map<String, dynamic>?> updateUserAvatar(
+    Uint8List bytes, {
+    String filename = 'avatar.jpg',
+  }) {
+    return _post(
+      KugouEndpoints.userUpdateAvatar,
+      data: {'imgFile': base64Encode(bytes), 'filename': filename},
+      noCache: true,
+    );
+  }
+
+  /// 获取听歌偏好（/user/preference，Rust `user_preference.rs::handle_get`）。
+  /// 未登录 / 业务失败（error_code!=0，如 20010 未登录）返回 null。
+  /// noCache：偏好按账号隔离，避免 apicache 命中上一账号（缓存 key 不含 token）。
+  Future<KugouUserPreference?> getUserPreference() async {
+    final json = await _getAllowNonOk(
+      KugouEndpoints.userPreference,
+      noCache: true,
+    );
+    if (json == null) return null;
+    if (!isBizOk(json)) return null;
+    try {
+      return KugouUserPreference.fromJson(json);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[USER_PREF] parse error: $e json=$json');
+      return null;
+    }
+  }
+
+  /// 更新听歌偏好（/user/preference/update，Rust `user_preference.rs::handle_update`）。
+  /// 仅提交非 null 字段；mode/gender/age 直接传 id，lang/style/song_lang 传
+  /// JSON 字符串（如 '{"1":100}'）；传空串表示清除对应项。
+  /// 返回完整响应 body（含 status/error_code/msg），调用方用 KugouApiClient.isBizOk 判定成败。
+  Future<Map<String, dynamic>?> updateUserPreference({
+    String? mode,
+    String? gender,
+    String? age,
+    String? lang,
+    String? style,
+    String? songLang,
+  }) {
+    final data = <String, dynamic>{
+      'mode': ?mode,
+      'gender': ?gender,
+      'age': ?age,
+      'lang': ?lang,
+      'style': ?style,
+      'song_lang': ?songLang,
+    };
+    return _post(KugouEndpoints.userPreferenceUpdate, data: data, noCache: true);
   }
 
   Future<KugouUserVipDetail?> getUserVipDetail() async {
@@ -3583,6 +3956,14 @@ class KugouApiClient {
   /// [name] 上传后显示的歌名（缺省时服务端按 `作者 - MD5.ext` 生成）；
   /// [authorName] 歌手名；[bitrate] 码率等级（缺省 4）；
   /// [timelen] 时长（毫秒，可选）；[audioId]/[albumAudioId] 可选 ID 透传。
+  ///
+  /// [matchUpload] 为 true 时服务端在上传前按文件 MD5 调 KMR 曲库匹配，
+  /// 命中则把云盘文件关联到官方歌曲（响应含 matchInfo）。
+  ///
+  /// [onProgress]/[onStage] 非空时走流式协议：本地服务器边分片上传边以
+  /// NDJSON 推送进度（uploaded/total 为字节），任一回调非空即启用；
+  /// 两者皆为 null 时保持旧的整块响应行为（兼容旧 .so）。
+  /// 失败/中断返回 null 或含 status:0 的 Map（与旧契约一致）。
   Future<Map<String, dynamic>?> uploadCloudSong(
     Uint8List body, {
     String? filename,
@@ -3593,6 +3974,9 @@ class KugouApiClient {
     int? timelen,
     int? audioId,
     int? albumAudioId,
+    bool matchUpload = false,
+    void Function(int uploaded, int total)? onProgress,
+    void Function(String stage)? onStage,
   }) async {
     final params = <String, dynamic>{
       'extendname': extendname,
@@ -3608,11 +3992,133 @@ class KugouApiClient {
     if (timelen != null) params['timelen'] = timelen;
     if (audioId != null) params['audio_id'] = audioId;
     if (albumAudioId != null) params['album_audio_id'] = albumAudioId;
+    if (matchUpload) params['match'] = '1';
+    if (onProgress != null || onStage != null) {
+      return await _postBinaryStreamed(
+        KugouEndpoints.userCloudUpload,
+        body: body,
+        queryParameters: params,
+        onProgress: onProgress,
+        onStage: onStage,
+      );
+    }
     return await _postBinary(
       KugouEndpoints.userCloudUpload,
       body: body,
       queryParameters: params,
     );
+  }
+
+  /// 流式二进制 POST（云盘上传 NDJSON 进度协议专用）。
+  ///
+  /// 服务端在分片上传过程中逐行推送：
+  ///   {"type":"stage","name":"matching|finalizing"}
+  ///   {"type":"progress","uploaded":N,"total":M}
+  ///   {"type":"result","data":{...}}   ← 恒为最后一行
+  /// 行与行之间 stall 超过 120s 视为上传挂死（每收到一行即重置）；
+  /// 整个 body 无换行时按旧协议（单个 JSON）解析，兼容旧 .so。
+  Future<Map<String, dynamic>?> _postBinaryStreamed(
+    String path, {
+    required Uint8List body,
+    Map<String, dynamic>? queryParameters,
+    void Function(int uploaded, int total)? onProgress,
+    void Function(String stage)? onStage,
+  }) async {
+    http.Client? client;
+    try {
+      var url = '${KugouEndpoints.baseUrl}$path';
+      if (queryParameters != null && queryParameters.isNotEmpty) {
+        final qs = queryParameters.entries
+            .map(
+              (e) =>
+                  '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value.toString())}',
+            )
+            .join('&');
+        url = '$url?$qs';
+      }
+      final headers = <String, String>{
+        'Content-Type': 'application/octet-stream',
+        'x-apicache-bypass': '1',
+      };
+      if (_token != null && _userid != null) {
+        final cookieParts = <String>['token=$_token', 'userid=$_userid'];
+        if (_dfid != null) cookieParts.add('dfid=$_dfid');
+        headers['cookie'] = cookieParts.join(';');
+        headers['Authorization'] = cookieParts.join(';');
+      }
+
+      client = http.Client();
+      final request = http.Request('POST', Uri.parse(url))
+        ..headers.addAll(headers)
+        ..bodyBytes = body;
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 60), onTimeout: () {
+        throw Exception('上传请求无响应（响应头超时）');
+      });
+
+      // 非 200：错误响应是整块 JSON（授权/初始化失败等），与旧契约一致
+      if (response.statusCode != 200) {
+        final text = await response.stream.bytesToString();
+        try {
+          final json = jsonDecode(text);
+          if (json is Map<String, dynamic>) return json;
+        } catch (_) {}
+        print('[API _postBinaryStreamed] Non-JSON error: ${response.statusCode}');
+        return null;
+      }
+
+      Map<String, dynamic>? result;
+      final lines = utf8.decoder
+          .bind(response.stream)
+          .transform(const LineSplitter())
+          // 行间 stall 超时：4MB 分片在 60KB/s 上行约 70s，取 120s 兜底；
+          // 每收到任意一行（进度/阶段/结果）都会重置该计时。
+          .timeout(
+            const Duration(seconds: 120),
+            onTimeout: (sink) =>
+                sink.addError(Exception('上传响应中断（120s 无进度）')),
+          );
+      await for (final raw in lines) {
+        final line = raw.trim();
+        if (line.isEmpty) continue;
+        Map<String, dynamic>? obj;
+        try {
+          final decoded = jsonDecode(line);
+          if (decoded is Map<String, dynamic>) obj = decoded;
+        } catch (_) {}
+        if (obj == null) continue;
+        switch (obj['type']) {
+          case 'progress':
+            onProgress?.call(
+              (obj['uploaded'] as num?)?.toInt() ?? 0,
+              (obj['total'] as num?)?.toInt() ?? 0,
+            );
+            // progress 行可携带子阶段标记（如秒传 stage:"instant"）
+            final stageField = obj['stage'];
+            if (stageField is String && stageField.isNotEmpty) {
+              onStage?.call(stageField);
+            }
+          case 'stage':
+            onStage?.call(obj['name']?.toString() ?? '');
+          case 'result':
+            final data = obj['data'];
+            if (data is Map<String, dynamic>) result = data;
+          default:
+            // 兼容旧 .so：整块 JSON（无 type、含 status）
+            if (obj.containsKey('status')) result = obj;
+        }
+      }
+      if (result == null) {
+        print('[API _postBinaryStreamed] 流提前结束且无 result 行');
+      }
+      return result;
+    } catch (e) {
+      print('[API _postBinaryStreamed] Error: $e');
+      return null;
+    } finally {
+      client?.close();
+    }
   }
 
   /// 删除云盘音乐（支持单首与批量）。
@@ -3665,8 +4171,14 @@ class KugouApiClient {
     );
   }
 
-  Future<Map<String, dynamic>?> getUserHistory() async {
-    return await _get(KugouEndpoints.userHistory);
+  /// 获取用户最近听歌历史。
+  ///
+  /// [bp] 翻页游标：上一次响应里取出的游标值原样回传（第一次不传）。
+  Future<Map<String, dynamic>?> getUserHistory({String? bp}) async {
+    return await _get(
+      KugouEndpoints.userHistory,
+      queryParameters: bp == null || bp.isEmpty ? null : {'bp': bp},
+    );
   }
 
   /// 获取用户听歌历史排行。
@@ -3682,19 +4194,32 @@ class KugouApiClient {
   /// 提交听歌历史到云端（支持跨设备同步）。
   ///
   /// [mxid] 专辑音乐 id（album_audio_id 或 MixSongID）
-  /// [playCount] 当前播放次数，可选
+  /// [playCount] 当前播放次数（pc），可选 —— 上游保持 max(服务器, 传入)，不会回退
+  /// [ot] 播放时间（**秒级**时间戳），可选 —— 缺省取当前时间；重试补传时传
+  /// 原始播放时间（历史记录的是「什么时候播的」，不是重试时间）
+  ///
+  /// **本地 query 参数名是 `time` 而不是 `ot`**：与上游 KuGouMusicApi 的
+  /// `module/playhistory_upload.js`（`params.time`）及本地 Rust 中继
+  /// （`extras.rs::handle_playhistory_upload` 同样读 `time`）一致；
+  /// 文档里的 `ot` 是上游 **body 字段**名，本地层不识别，发 `ot` 会被回落成
+  /// 「上传时刻」——秒传路径无感，但补传重试会丢失真实播放时间。
+  ///
+  /// 写操作带 `noCache` 绕过本地 apicache：time 为秒级每次不同，缓存天然难命中，
+  /// 但同秒内重复触发（快速切歌）仍可能撞上，绕过更稳。
   Future<Map<String, dynamic>?> uploadPlayHistory(
     String mxid, {
     int? playCount,
+    int? ot,
   }) async {
     final params = <String, dynamic>{
       'mxid': mxid,
-      'ot': DateTime.now().millisecondsSinceEpoch ~/ 1000, // 秒级时间戳
+      'time': ot ?? DateTime.now().millisecondsSinceEpoch ~/ 1000, // 秒级时间戳
     };
     if (playCount != null) params['pc'] = playCount;
     return await _get(
       KugouEndpoints.playhistoryUpload,
       queryParameters: params,
+      noCache: true,
     );
   }
 
@@ -4201,10 +4726,16 @@ class KugouApiClient {
     return await _get(KugouEndpoints.youthDynamicRecent);
   }
 
-  Future<Map<String, dynamic>?> getPrivilegeLite(String hash) async {
+  Future<Map<String, dynamic>?> getPrivilegeLite(
+    String hash, {
+    String? albumId,
+  }) async {
     return await _get(
       KugouEndpoints.privilegeLite,
-      queryParameters: {'hash': hash},
+      queryParameters: {
+        'hash': hash,
+        if (albumId != null && albumId.isNotEmpty) 'album_id': albumId,
+      },
     );
   }
 
@@ -4262,18 +4793,50 @@ class KugouApiClient {
     );
   }
 
-  Future<Map<String, dynamic>?> getAudioAccompany(String hash) async {
-    return await _get(
+  /// 伴奏匹配（上游 optimal_matching_accompany_2_listen.do）：返回这首歌的最佳伴奏曲目。
+  /// [mixId] 即 MixSongID（album_audio_id）；[fileName] 为 "歌手 - 歌名" 匹配提示，可空。
+  Future<KugouAccompany?> getAudioAccompany({
+    required String hash,
+    required String mixId,
+    String fileName = '',
+  }) async {
+    final json = await _get(
       KugouEndpoints.audioAccompany,
-      queryParameters: {'hash': hash},
+      queryParameters: {
+        'hash': hash,
+        'mixId': mixId,
+        'fileName': fileName,
+      },
     );
+    if (json == null) return null;
+    try {
+      return KugouAccompany.fromJson(json);
+    } catch (e) {
+      return null;
+    }
   }
 
-  Future<Map<String, dynamic>?> getAudioKtvTotal(String hash) async {
-    return await _get(
+  /// K 歌数量（get_total_opus_num_v02.do）：这首歌在酷狗 K 歌曲库的作品总数，
+  /// 入参取自 [getAudioAccompany] 的返回（songid/singername/hash）。
+  Future<KugouAudioKtvTotal?> getAudioKtvTotal({
+    required String songId,
+    required String singerName,
+    required String songHash,
+  }) async {
+    final json = await _get(
       KugouEndpoints.audioKtvTotal,
-      queryParameters: {'hash': hash},
+      queryParameters: {
+        'songId': songId,
+        'singerName': singerName,
+        'songHash': songHash,
+      },
     );
+    if (json == null) return null;
+    try {
+      return KugouAudioKtvTotal.fromJson(json);
+    } catch (e) {
+      return null;
+    }
   }
 
   Future<Map<String, dynamic>?> getYouthVip() async {

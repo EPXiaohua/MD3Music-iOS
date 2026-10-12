@@ -167,8 +167,9 @@ pub fn handle_yueku_fm(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRes
     )
 }
 
-/// personal_fm.js → /personal/fm
-pub fn handle_personal_fm(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+/// personal_fm.js 的 body 参数构造（纯函数，不触发网络）：抽出来便于无外网
+/// 断言口径（见 `tests/smoke.rs`）。
+pub fn build_personal_fm_params(q: &Value) -> Map<String, Value> {
     let date_time = now_ms();
     let userid = cookie_or_param_num(q, "userid", 0);
     let token = cookie_or_param_str(q, "token", "");
@@ -221,6 +222,15 @@ pub fn handle_personal_fm(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Module
     if !q_str(q, "playtime", "").is_empty() {
         m.insert("playtime".into(), json!(q_str(q, "playtime", "")));
     }
+    if !q_str(q, "cur_mark", "").is_empty() {
+        m.insert("cur_mark".into(), json!(q_str(q, "cur_mark", "")));
+    }
+    m
+}
+
+/// personal_fm.js → /personal/fm（上游同时文档化了 `mode: radio` 与扩展 action 集，均按字符串透传）
+pub fn handle_personal_fm(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+    let m = build_personal_fm_params(q);
     forward(
         q, ctx, "POST", "/v2/personal_recommend", None, None, Some(Value::Object(m)), "android",
         &[("x-router", "persnfm.service.kugou.com")], false, false,

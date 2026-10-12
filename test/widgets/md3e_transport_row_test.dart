@@ -10,6 +10,8 @@
 // - 切歌动画完成后按钮身份正确（不再错位）：
 //   settledToNext 后 _prevLeft 触发 onPrevious、_playLeft 触发 onPlayPause、_nextLeft 触发 onNext
 //   settledToPrev 后 _prevLeft 触发 onPrevious、_playLeft 触发 onPlayPause、_nextLeft 触发 onNext
+import 'dart:math' show max;
+
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/md3e_transport_row.dart';
@@ -417,6 +419,86 @@ void main() {
           reason: '按下时 _buildNewPrevPositioned 的 Material color 应变化（按压反馈）');
 
       await gesture.up();
+      await tester.pumpAndSettle();
+    });
+  });
+
+  // 传输行按压方向回归测试
+  //
+  // 验证用户反馈修正：
+  // 1. 按下中央 play/pause：中央按钮扩大（存在 scale > 1.0 的 Transform），
+  //    相邻按钮被挤压（scale < 1.0）
+  // 2. 按下侧键（next/prev）：保持旧的"按压下沉"反馈（无任何扩大）
+  // 修复前的现状是中央按下去整体缩到 0.92，本组第一条必失败。
+  group('MD3ETransportRow 按压方向', () {
+    Widget harness() => MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: MD3ETransportRow(
+                isPlaying: true,
+                onPrevious: () {},
+                onPlayPause: () {},
+                onNext: () {},
+              ),
+            ),
+          ),
+        );
+
+    // 收集行内所有 Transform.scale 的缩放值
+    double maxScale(WidgetTester tester, Finder row) {
+      return tester
+          .widgetList<Transform>(
+            find.descendant(of: row, matching: find.byType(Transform)),
+          )
+          .map((t) => t.transform.getMaxScaleOnAxis())
+          .reduce(max);
+    }
+
+    testWidgets('按下 play/pause 时中央按钮扩大而非缩小', (tester) async {
+      final row = find.byType(MD3ETransportRow);
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(tester.getCenter(row));
+      // 必须先空 pump 一次再推进时间：onTapDown 是由 TapGestureRecognizer 的
+      // 100ms 按压截止定时器派发的，空 pump 让该定时器先落地，
+      // 随后的 150ms 才推进 _pressController（缺这一步读到的是未起按压的 1.0）
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 150)); // 按下反馈落定
+
+      expect(
+        maxScale(tester, row),
+        greaterThan(1.0),
+        reason: '中央播放键按下应扩大（向两边挤压），而不是缩小',
+      );
+
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 500)); // playBounce 收敛
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('按下侧键 next 保持按压下沉（不扩大）', (tester) async {
+      final row = find.byType(MD3ETransportRow);
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      final center = tester.getCenter(row);
+      // next slot 中心：_nextLeft(144) + sideButtonSize/2(28) = 172，
+      // 相对 Stack 中心(100) 即 +72；取 +78 仍落在 next 的 144~200 区间内
+      final gesture = await tester.startGesture(
+        Offset(center.dx + 78, center.dy),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 150));
+
+      expect(
+        maxScale(tester, row),
+        lessThanOrEqualTo(1.0),
+        reason: '侧键按下应保持旧的 0.92 下沉反馈，不应有任何扩大',
+      );
+
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 500));
       await tester.pumpAndSettle();
     });
   });

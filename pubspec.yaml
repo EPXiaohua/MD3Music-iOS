@@ -1,7 +1,7 @@
 name: md3music
 description: "MD3Music - Music player with Material Design 3"
 publish_to: 'none'
-version: 5.8.1+47
+version: 6.0.0+48
 
 environment:
   sdk: ^3.12.0
@@ -16,6 +16,8 @@ dependencies:
     path: third_party/just_audio
   audio_session: ^0.1.18
   http: ^1.2.1
+  # TV 构建焦点遍历引擎（fluttercandies/dpad），仅 --dart-define=MD3_TV=true 时生效，正常构建树摇剔除
+  dpad: ^3.0.0
   provider: ^6.1.2
   cached_network_image: ^3.3.1
   sensors_plus: ^7.1.0
@@ -43,6 +45,9 @@ dependencies:
   # MV 弹幕渲染层：CustomPainter 直绘，纯 Dart（无原生代码，不影响 Android 打包链路）
   # MIT 许可，与本项目 AGPL-3.0 兼容
   canvas_danmaku: ^0.3.3
+  # Windows 桌面实现（均只声明 windows 平台，Android 完全不编译/注册，零影响）
+  just_audio_windows: ^0.2.3   # just_audio 的 Windows 实现（WinRT MediaPlayer）
+  video_player_win: ^3.2.2     # video_player 的 Windows 实现（Media Foundation）
   dlna_dart: ^0.1.0
   webview_flutter: ^4.10.0
   flutter_secure_storage: ^10.3.1
@@ -63,6 +68,8 @@ dependencies:
   connectivity_plus: ^7.0.0
   # 图片选择（外部歌单截图导入）
   image_picker: ^1.1.2
+  # Windows 原生文件/目录选择（背景图、字体与本地音乐目录）
+  file_selector: ^1.1.0
   # 诊断日志导出：系统分享面板（Android ACTION_SEND / Windows 系统分享），自带 FileProvider
   share_plus: ^13.3.0
   # 诊断日志导出：纯 Dart zip 打包（无原生代码，跨平台）

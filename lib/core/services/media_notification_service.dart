@@ -32,6 +32,9 @@ class MediaNotificationService {
   static void Function()? onNext;
   static void Function()? onTogglePlayPause;
   static void Function(int)? onSeekTo;
+  /// 媒体键快进/快退（TV 遥控器）；由 desktop_lyric_service.registerNativeCallbacks 装配。
+  static void Function()? onSeekForward;
+  static void Function()? onSeekBack;
   // 线控耳机媒体键映射的独立播放 / 暂停命令（原生端唤醒播放下发）
   static void Function()? onPlay;
   static void Function()? onPause;
@@ -64,24 +67,31 @@ class MediaNotificationService {
     return commandId is int ? commandId : null;
   }
 
+  static bool _dispatchMediaCommand(
+    Object? arguments,
+    void Function()? callback,
+  ) {
+    final commandId = _commandIdFromArguments(arguments);
+    if (commandId != null) {
+      return _mediaCommandAckRouter.dispatch(commandId, callback);
+    }
+
+    // 通知栏/桌面小组件等旧入口不携带 commandId，仍要直接执行播放回调。
+    // 带 commandId 的媒体会话命令继续由 AckRouter 去重并确认。
+    if (callback == null) return false;
+    callback();
+    return true;
+  }
+
   static void initCallbacks() {
     _channel.setMethodCallHandler((call) async {
       switch (call.method) {
         case 'previous':
-          return _mediaCommandAckRouter.dispatch(
-            _commandIdFromArguments(call.arguments),
-            onPrevious,
-          );
+          return _dispatchMediaCommand(call.arguments, onPrevious);
         case 'next':
-          return _mediaCommandAckRouter.dispatch(
-            _commandIdFromArguments(call.arguments),
-            onNext,
-          );
+          return _dispatchMediaCommand(call.arguments, onNext);
         case 'togglePlayPause':
-          return _mediaCommandAckRouter.dispatch(
-            _commandIdFromArguments(call.arguments),
-            onTogglePlayPause,
-          );
+          return _dispatchMediaCommand(call.arguments, onTogglePlayPause);
         case 'play':
           return _mediaCommandAckRouter.dispatch(
             _commandIdFromArguments(call.arguments),
@@ -98,6 +108,10 @@ class MediaNotificationService {
             return true;
           }
           return _mediaCommandAckRouter.dispatch(commandId, onPause);
+        case 'seekForward':
+          return _dispatchMediaCommand(call.arguments, onSeekForward);
+        case 'seekBack':
+          return _dispatchMediaCommand(call.arguments, onSeekBack);
         case 'seekTo':
           final pos = call.arguments as int?;
           if (pos != null) onSeekTo?.call(pos);

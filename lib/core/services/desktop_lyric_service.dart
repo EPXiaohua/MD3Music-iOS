@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../data/repositories/settings_repository.dart';
+import '../../data/repositories/song_match_repository.dart';
 import '../../data/models/song.dart';
 import '../../main.dart';
 import '../../providers/favorites_provider.dart';
@@ -89,6 +90,17 @@ class LockScreenProgressPushGate {
 /// **逐字支持**：KRC 解析后每行携带 [LyricWord] 字级时间戳，逐字时间戳随行切换
 /// 整行一次下发（words + positionMs），原生按本地时钟自驱动逐字推进。
 /// LRC/纯文本无字时间戳时 words 为空，原生侧走整行渐变色（保持原行为）。
+///
+/// 桌面平台（Windows / macOS / Linux）没有 Android 那套"悬浮窗授权"概念，
+/// 提示文案与失败原因都不同，故用 [defaultTargetPlatform] 判定而不引 `dart:io`，
+/// 保持本文件的 Web 可编译性。
+bool get _isDesktopPlatform {
+  if (kIsWeb) return false;
+  return defaultTargetPlatform == TargetPlatform.windows ||
+      defaultTargetPlatform == TargetPlatform.macOS ||
+      defaultTargetPlatform == TargetPlatform.linux;
+}
+
 class DesktopLyricService {
   static final DesktopLyricService instance = DesktopLyricService._();
   DesktopLyricService._() {
@@ -128,7 +140,7 @@ class DesktopLyricService {
   bool _lyricInfoPushed = false;
   // ColorOS Bridge 兼容模式：开启后 lyricInfo JSON 输出 lyric=纯 LRC +
   // rawLyric=ELRC 逐字（插件据此启用逐字高亮等增强）；关闭保持 ELRC+format 格式
-  bool _lyricInfoColorOs = false;
+  bool _lyricInfoColorOs = true;
   bool get lyricInfoColorOs => _lyricInfoColorOs;
 
   // 锁屏歌词开关：独立于悬浮窗/蓝牙歌词/LyricInfo。开启时定时器运行，
@@ -219,15 +231,221 @@ class DesktopLyricService {
   // 当前配置缓存
   double _fontSize = 18.0;
   bool _doubleLine = false;
-  int _opacity = 80;
+  int _opacity = 50;
   int _gradientStart = 0xFF00E5FF;
   int _gradientEnd = 0xFFFF00FF;
-  int _unplayedColor = 0xFF666666;
+  int _unplayedColor = 0xFFFFFFFF;
   bool _locked = false;
+  /// 配色模式：0 = 预设配色，1 = 自调颜色。持久化，重启后保持。
+  int _colorMode = kColorModePreset;
+  /// 最近一次选中的预设下标。进入自调颜色后**保留**，
+  /// 切回预设配色时据此还原（见 [setColorMode]）。
+  int _activePreset = 0;
+  /// 自定义配色槽位。「自调颜色」写这里，**不写** [_gradientStart] 那份 ——
+  /// 预设色是常量不能被拖坏，第 5 个「自定义」色块读的就是这份。
+  int _customStart = 0xFF00E5FF;
+  int _customEnd = 0xFFFF00FF;
+  int _customUnplayed = 0xFFFFFFFF;
 
   /// 悬浮窗是否锁定（锁定后原生端加 FLAG_NOT_TOUCHABLE 点击穿透，
   /// 悬浮窗自身无法再点击，只能从设置页/通知栏等外部入口解锁）。
   bool get locked => _locked;
+
+  // ===== 外观配置：六项配置的唯一数据源 ======================================
+  //
+  // Flutter 设置页（lib/modules/settings/desktop_lyric_settings_panel.dart）与
+  // 原生悬浮窗内的面板（FloatingLyricService.createSettingsPanel）**必须共用
+  // 这里的状态**：两端各写各的会互相覆盖。链路是
+  //   本服务字段 ← → SharedPreferences ← → 原生 push/回灌
+  // 原生面板的改动经 desktopLyricConfigChanged 回灌到 _onNativeConfigChanged，
+  // Flutter 侧的改动经 _pushConfig 下发到原生，两侧因此始终一致。
+  //
+  // [persist] 语义：拖动过程中应以 false 调用（只更新内存 + 推送原生预览），
+  // 松手时再以 true 调一次写盘。原生 SeekBar 也是同样处理
+  // （onStopTrackingTouch 才 sendConfigUpdate），避免每移动一像素就写一次盘。
+
+  double get fontSize => _fontSize;
+  bool get doubleLine => _doubleLine;
+  int get opacity => _opacity;
+  int get gradientStart => _gradientStart;
+  int get gradientEnd => _gradientEnd;
+  int get unplayedColor => _unplayedColor;
+  int get colorMode => _colorMode;
+  int get activePreset => _activePreset;
+  int get customStart => _customStart;
+  int get customEnd => _customEnd;
+  int get customUnplayed => _customUnplayed;
+
+  /// 当前渐变**实际等于**自定义槽位吗（第 5 个「自定义」色块的选中环）。
+  bool get isCustomGradient =>
+      _gradientStart == _customStart && _gradientEnd == _customEnd;
+
+  /// 当前渐变**实际等于**哪一组预设；都不等（即自定义配色）时返回 -1。
+  ///
+  /// 面板上的预设选中环一律以这个值为准，两端（Flutter 设置页 / 悬浮窗）都用它：
+  /// 少写一个独立的"选中态"字段，就少一处和真实颜色对不上的机会 ——
+  /// 之前原生用自己那份 `activePreset` 记选中态，Dart 侧改了颜色它也照旧亮着。
+  int get matchedPresetIndex => gradientPresets.indexWhere(
+        (p) => p.$1 == _gradientStart && p.$2 == _gradientEnd,
+      );
+
+  /// 字号上下限，与原生 A−/A+ 的 clamp 保持一致（12f … 32f sp）。
+  static const double minFontSize = 12.0;
+  static const double maxFontSize = 32.0;
+
+  /// 背景不透明度上下限（%）；原生换算是 `bgAlpha = opacity * 255 / 100`。
+  static const int minOpacity = 0;
+  static const int maxOpacity = 100;
+
+  /// 与原生 FloatingLyricService.Companion.PRESETS 逐项一致的预设渐变。
+  static const List<(int, int)> gradientPresets = [
+    (0xFF00E5FF, 0xFFFF00FF), // 青 → 洋红（默认）
+    (0xFFFF4081, 0xFFFFC400), // 粉 → 琥珀
+    (0xFF00E676, 0xFF00B0FF), // 绿 → 天蓝
+    (0xFFFFFFFF, 0xFFFFFFFF), // 纯白（起止同色，退化为单色）
+  ];
+
+  /// 配色模式取值，与原生 `FloatingLyricService.colorMode` 一一对应。
+  static const int kColorModePreset = 0;
+  static const int kColorModeCustom = 1;
+
+  /// 预设自带的未唱色。卡拉OK二分色里"未唱"就该是白的，否则和已唱分不开 ——
+  /// 选任何预设都会把未唱色重置回这个值（用户要求：预设的未唱为白色）。
+  static const int kPresetUnplayedColor = 0xFFFFFFFF;
+
+  /// 设置歌词字号。
+  Future<void> setFontSize(double v, {bool persist = true}) async {
+    final value = v.clamp(minFontSize, maxFontSize);
+    _fontSize = value;
+    if (persist) await _settings.setDesktopLyricFontSize(value);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 设置是否同时显示下一行。
+  Future<void> setDoubleLine(bool v, {bool persist = true}) async {
+    _doubleLine = v;
+    if (persist) await _settings.setDesktopLyricDoubleLine(v);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 设置悬浮窗黑色圆角底的不透明度（0–100）。
+  Future<void> setOpacity(int v, {bool persist = true}) async {
+    final value = v.clamp(minOpacity, maxOpacity);
+    _opacity = value;
+    if (persist) await _settings.setDesktopLyricOpacity(value);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 设置已唱部分的渐变两端。两端同值即退化为单色。
+  ///
+  /// 这是「自调颜色」的写入口：写的是**自定义槽位**，同时把当前生效的渐变
+  /// 也改成它（否则拖动时看不到效果）；模式切到 [kColorModeCustom]。
+  /// 预设的四组渐变是常量，永远不会被这里改到。
+  Future<void> setGradient({
+    required int start,
+    required int end,
+    bool persist = true,
+  }) async {
+    _customStart = start;
+    _customEnd = end;
+    _gradientStart = start;
+    _gradientEnd = end;
+    _colorMode = kColorModeCustom;
+    if (persist) {
+      await _settings.setDesktopLyricCustomGradStart(start);
+      await _settings.setDesktopLyricCustomGradEnd(end);
+      await _settings.setDesktopLyricGradientStart(start);
+      await _settings.setDesktopLyricGradientEnd(end);
+      await _settings.setDesktopLyricColorMode(kColorModeCustom);
+    }
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 选中一组预设渐变：未唱色一并重置为白色，同时把配色模式切回「预设配色」。
+  ///
+  /// 预设是**常量**（用户要求：预设色不能改），自调的产物只进自定义槽位；
+  /// 「未唱为白」也是预设的一部分 —— 卡拉OK二分色里未唱就该是白的，否则
+  /// 已唱/未唱对比不出来。
+  Future<void> selectGradientPreset(int index) async {
+    if (index < 0 || index >= gradientPresets.length) return;
+    final p = gradientPresets[index];
+    _activePreset = index;
+    _colorMode = kColorModePreset;
+    _gradientStart = p.$1;
+    _gradientEnd = p.$2;
+    _unplayedColor = kPresetUnplayedColor;
+    await _settings.setDesktopLyricPresetIndex(index);
+    await _settings.setDesktopLyricColorMode(kColorModePreset);
+    await _settings.setDesktopLyricGradientStart(p.$1);
+    await _settings.setDesktopLyricGradientEnd(p.$2);
+    await _settings.setDesktopLyricUnplayedColor(kPresetUnplayedColor);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 应用自定义槽位（第 5 个「自定义」色块 / 切回自调颜色模式）。
+  Future<void> selectCustomGradient() async {
+    _colorMode = kColorModeCustom;
+    _gradientStart = _customStart;
+    _gradientEnd = _customEnd;
+    _unplayedColor = _customUnplayed;
+    await _settings.setDesktopLyricColorMode(kColorModeCustom);
+    await _settings.setDesktopLyricGradientStart(_customStart);
+    await _settings.setDesktopLyricGradientEnd(_customEnd);
+    await _settings.setDesktopLyricUnplayedColor(_customUnplayed);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 切换配色模式。
+  ///
+  /// 「预设配色」→ 恢复 [_activePreset] 那一组（未唱 = 白）；
+  /// 「自调颜色」→ 恢复自定义槽位。两个方向都可逆，且都不产生"模式显示 A、
+  /// 颜色却是 B"的错位。
+  Future<void> setColorMode(int mode) async {
+    final m = mode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
+    _colorMode = m;
+    if (m == kColorModePreset) {
+      final p = gradientPresets[_activePreset.clamp(0, gradientPresets.length - 1)];
+      _gradientStart = p.$1;
+      _gradientEnd = p.$2;
+      _unplayedColor = kPresetUnplayedColor;
+      await _settings.setDesktopLyricGradientStart(p.$1);
+      await _settings.setDesktopLyricGradientEnd(p.$2);
+      await _settings.setDesktopLyricUnplayedColor(kPresetUnplayedColor);
+    } else {
+      _gradientStart = _customStart;
+      _gradientEnd = _customEnd;
+      _unplayedColor = _customUnplayed;
+      await _settings.setDesktopLyricGradientStart(_customStart);
+      await _settings.setDesktopLyricGradientEnd(_customEnd);
+      await _settings.setDesktopLyricUnplayedColor(_customUnplayed);
+    }
+    await _settings.setDesktopLyricColorMode(m);
+    await _pushConfig();
+    _notify();
+  }
+
+  /// 设置未唱部分的颜色。
+  ///
+  /// 同样写进自定义槽位：未唱色是自调的一部分，预设模式下的未唱固定为白
+  /// （见 [kPresetUnplayedColor]），拖这个滑块就意味着进入自调颜色。
+  Future<void> setUnplayedColor(int v, {bool persist = true}) async {
+    _customUnplayed = v;
+    _unplayedColor = v;
+    _colorMode = kColorModeCustom;
+    if (persist) {
+      await _settings.setDesktopLyricCustomUnplayed(v);
+      await _settings.setDesktopLyricUnplayedColor(v);
+      await _settings.setDesktopLyricColorMode(kColorModeCustom);
+    }
+    await _pushConfig();
+    _notify();
+  }
 
   /// 解锁桌面歌词悬浮窗（锁定时悬浮窗点击穿透，需从外部解锁）。
   Future<void> unlock() async {
@@ -235,6 +453,19 @@ class DesktopLyricService {
     _locked = false;
     await _settings.setDesktopLyricLocked(false);
     _pushConfig(); // 推送原生端解除 FLAG_NOT_TOUCHABLE
+    _notify();
+  }
+
+  /// 锁定桌面歌词悬浮窗：原生端加 FLAG_NOT_TOUCHABLE，点击可穿透到下层界面。
+  ///
+  /// **代价**：锁定后悬浮窗自身不再接收触摸，面板会被收起，只能从
+  /// 设置页（DesktopLyricSettingsPanel 的锁定行）或通知栏解锁 —— 调用方
+  /// 必须把这个后果告知用户。
+  Future<void> lock() async {
+    if (_locked) return;
+    _locked = true;
+    await _settings.setDesktopLyricLocked(true);
+    _pushConfig();
     _notify();
   }
 
@@ -273,11 +504,28 @@ class DesktopLyricService {
     MediaNotificationService.onToggleFavorite = () {
       _handleToggleFavorite();
     };
+    MediaNotificationService.onSeekForward = () {
+      final player = _player;
+      if (player == null) return;
+      player.seek(player.position + const Duration(seconds: 10));
+    };
+    MediaNotificationService.onSeekBack = () {
+      final player = _player;
+      if (player == null) return;
+      final target = player.position - const Duration(seconds: 10);
+      player.seek(target < Duration.zero ? Duration.zero : target);
+    };
     MediaNotificationService.onConfigChanged = (config) {
       _onNativeConfigChanged(config);
     };
     MediaNotificationService.onScreenStateChanged = (on) {
       _screenOn = on;
+      if (!on && !_lockScreenLyricEnabled) {
+        // 熄屏且未开锁屏歌词：停表前先清掉预测调度，否则它们仍会到点唤醒
+        _cancelLineTimer();
+        _cancelFlymeLineTimer();
+      }
+      _updateTicker();
       if (on) {
         // 点亮屏幕立即补一拍：熄屏期间行提交与进度推送已暂停，需对齐漂移
         _onTick();
@@ -330,13 +578,23 @@ class DesktopLyricService {
 
   /// 原生浮窗内修改配置后回传，Dart 负责持久化
   Future<void> _onNativeConfigChanged(Map<dynamic, dynamic> config) async {
+    // 颜色一律 toUnsigned(32) 兜底：修复前的版本原生回灌过负数 Kotlin Int
+    // （ARGB 的最高位是 alpha=FF，作为 Int32 是负的），盘里可能还残留着负值。
     final fontSize = (config['fontSize'] as num?)?.toDouble();
     final doubleLine = config['doubleLine'] as bool?;
     final opacity = config['opacity'] as int?;
     final locked = config['locked'] as bool?;
-    final gradientStart = config['gradientStart'] as int?;
-    final gradientEnd = config['gradientEnd'] as int?;
-    final unplayedColor = config['unplayedColor'] as int?;
+    final gradientStart =
+        (config['gradientStart'] as int?)?.toUnsigned(32);
+    final gradientEnd = (config['gradientEnd'] as int?)?.toUnsigned(32);
+    final unplayedColor =
+        (config['unplayedColor'] as int?)?.toUnsigned(32);
+    final colorMode = config['colorMode'] as int?;
+    final activePreset = config['activePreset'] as int?;
+    final customStart = (config['customStart'] as int?)?.toUnsigned(32);
+    final customEnd = (config['customEnd'] as int?)?.toUnsigned(32);
+    final customUnplayed =
+        (config['customUnplayed'] as int?)?.toUnsigned(32);
 
     if (fontSize != null) {
       _fontSize = fontSize;
@@ -365,6 +623,27 @@ class DesktopLyricService {
     if (unplayedColor != null) {
       _unplayedColor = unplayedColor;
       await _settings.setDesktopLyricUnplayedColor(unplayedColor);
+    }
+    if (colorMode != null) {
+      _colorMode =
+          colorMode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
+      await _settings.setDesktopLyricColorMode(_colorMode);
+    }
+    if (activePreset != null) {
+      _activePreset = activePreset.clamp(0, gradientPresets.length - 1);
+      await _settings.setDesktopLyricPresetIndex(_activePreset);
+    }
+    if (customStart != null) {
+      _customStart = customStart;
+      await _settings.setDesktopLyricCustomGradStart(customStart);
+    }
+    if (customEnd != null) {
+      _customEnd = customEnd;
+      await _settings.setDesktopLyricCustomGradEnd(customEnd);
+    }
+    if (customUnplayed != null) {
+      _customUnplayed = customUnplayed;
+      await _settings.setDesktopLyricCustomUnplayed(customUnplayed);
     }
     _notify();
   }
@@ -488,25 +767,43 @@ class DesktopLyricService {
       try {
         await MediaNotificationService.startFloatingLyric(lyric: '', title: '');
       } catch (_) {}
+      // 无权限时原生端会跳系统授权页；Windows 端没有"授权页"这回事，
+      // 若这里不提示，用户只会看到开关"弹回去"而没有任何原因。
+      if (!_isDesktopPlatform) {
+        showToast('请先授予悬浮窗权限后再开启桌面歌词', long: true);
+      }
       return;
     }
     _bindProvidersFromContext();
     if (_player == null || _kugou == null) {
+      // 静默 return 会让开关"弹回去"且毫无解释，Windows 端尤其明显
+      // （该平台无 toast 时用户完全无从判断）。
+      showToast('播放器尚未就绪，请稍后再试', long: true);
       return;
     }
     // startFloatingLyric 返回 false（权限竞态撤销/BadTokenException/显示层拒绝）
     // 时保持开关为关（原生端会回填真实 addView 结果），避免悬浮窗未出现但按钮
     // 显示已开启的"假开启"状态，并提示用户授权悬浮窗权限后重试。
+    // 新建原生窗口时就带上当前行，避免先空白、等下一句才刷新。
+    await _loadConfig();
+    final song = _player!.currentSong;
+    final sameSong = song != null && song.id == _currentSongId;
+    final index = sameSong ? _findLineIndex(_player!.position.inMilliseconds) : -1;
+    final initialLyric = sameSong && _lines.isNotEmpty
+        ? (index >= 0 ? _lines[index].text : '')
+        : (song == null ? '' : '歌词加载中...');
     final started = await MediaNotificationService.startFloatingLyric(
-      lyric: '',
-      title: '',
+      lyric: initialLyric,
+      title: song?.title ?? '',
     );
     if (!started) {
-      showToast('桌面歌词开启失败，请检查并开启悬浮窗权限后重试');
+      showToast(
+        _isDesktopPlatform ? '桌面歌词开启失败（窗口创建失败）' : '桌面歌词开启失败，请检查并开启悬浮窗权限后重试',
+        long: true,
+      );
       return;
     }
     _enabled = true;
-    await _loadConfig();
     await _pushConfig();
     _syncCurrentFromPlayer();
     _updateTicker();
@@ -849,9 +1146,15 @@ class DesktopLyricService {
       _lockScreenLyricEnabled ||
       _pipActive;
 
-  /// 根据开关状态启停定时器（250ms tick：逐行歌词足够检测切行）
+  /// 除「有通道开启」外，还需亮屏、或开了锁屏歌词。
+  ///
+  /// 熄屏且未开锁屏歌词时悬浮窗不可见，tick 纯耗电——必须真的停表，
+  /// 而不是在 [_onTick] 里早退：早退省不掉定时器对 CPU 的周期性唤醒（§10.4.6）。
+  bool _tickNeeded() => _shouldTick() && (_screenOn || _lockScreenLyricEnabled);
+
+  /// 根据开关与屏幕状态启停定时器（250ms tick：逐行歌词足够检测切行）
   void _updateTicker() {
-    if (_shouldTick()) {
+    if (_tickNeeded()) {
       _syncTickInterval(_player?.isPlaying ?? false);
     } else {
       _ticker?.cancel();
@@ -861,6 +1164,11 @@ class DesktopLyricService {
 
   /// 按播放状态同步 tick 周期：周期未变化时不重建
   void _syncTickInterval(bool playing) {
+    if (!_tickNeeded()) {
+      _ticker?.cancel();
+      _ticker = null;
+      return;
+    }
     final target = playing ? _tickIntervalPlayingMs : _tickIntervalPausedMs;
     if (_ticker != null && _tickIntervalMs == target) return;
     _tickIntervalMs = target;
@@ -1017,6 +1325,13 @@ class DesktopLyricService {
     _gradientEnd = await _settings.getDesktopLyricGradientEnd();
     _unplayedColor = await _settings.getDesktopLyricUnplayedColor();
     _locked = await _settings.getDesktopLyricLocked();
+    _colorMode = await _settings.getDesktopLyricColorMode();
+    // 预设下标可能落在越界位置（旧版本数据 / 预设表被改短），clamp 兜底
+    _activePreset = (await _settings.getDesktopLyricPresetIndex())
+        .clamp(0, gradientPresets.length - 1);
+    _customStart = await _settings.getDesktopLyricCustomGradStart();
+    _customEnd = await _settings.getDesktopLyricCustomGradEnd();
+    _customUnplayed = await _settings.getDesktopLyricCustomUnplayed();
   }
 
   Future<void> _pushConfig() async {
@@ -1030,6 +1345,11 @@ class DesktopLyricService {
         'gradientStart': _gradientStart,
         'gradientEnd': _gradientEnd,
         'unplayedColor': _unplayedColor,
+        'colorMode': _colorMode,
+        'activePreset': _activePreset,
+        'customStart': _customStart,
+        'customEnd': _customEnd,
+        'customUnplayed': _customUnplayed,
       });
     } catch (_) {}
   }
@@ -1047,14 +1367,14 @@ class DesktopLyricService {
     if (_player == null) return;
     final song = _player!.currentSong;
     if (song != null) {
-      if (_currentSongId != song.id) {
-        _sessionGeneration++;
-        _lyricFetchToken++;
-      }
-      _currentSongId = song.id;
+      // 切歌状态由 _onTick 统一重置；不要提前写 songId 绕过重置、锁死旧请求。
+      // 同曲重开也要重发当前行（新窗口没有之前的内容），不受去重/迟滞限制。
+      _currentLineIndex = -2;
+      _lastLineSwitchAt = null;
       _pushProgress(_player!.position, _player!.duration ?? Duration.zero);
       _pushPlaying(_player!.isPlaying);
     }
+    _onTick();
   }
 
   Future<void> _pushProgress(Duration pos, Duration dur) async {
@@ -1114,6 +1434,7 @@ class DesktopLyricService {
     if (song == null) {
       if (_currentSongId != null) _lyricFetchToken++;
       _currentSongId = null;
+      _awaitingLyric = false;
       _lines = const [];
       _currentLineIndex = -1;
       _flymeLineIndex = -1;
@@ -1263,7 +1584,13 @@ class DesktopLyricService {
     final token = ++_lyricFetchToken;
     _awaitingLyric = true;
     try {
-      if (!song.isOnline) {
+      // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
+      await SongMatchRepository().ensureLoaded();
+      final matchInfo =
+          song.isOnline ? null : SongMatchRepository().get(song.id);
+      final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
+
+      if (!song.isOnline && !preferOnlineLyrics) {
         final localPath = song.localPath;
         if (localPath != null && localPath.isNotEmpty) {
           String filePath = localPath;
@@ -1280,6 +1607,9 @@ class DesktopLyricService {
             _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
             if (_lines.isEmpty) _pushLyric('暂无歌词', '', placeholder: '暂无歌词');
             _markLockLyricLoaded(_lines.isEmpty ? '暂无歌词' : '');
+            _currentLineIndex = -2;
+            _lastLineSwitchAt = null;
+            _onTick();
             return;
           }
         }
@@ -1291,12 +1621,28 @@ class DesktopLyricService {
       final searchName = !isUnknownArtist(song.artist)
           ? '${song.title} ${song.artist}'
           : song.title;
+      // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
+      final matchedHash =
+          (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
+      // 首份 LRC 先显示，不等待补充逐字歌词；串行解析防止迟到的初稿覆盖终稿。
+      Future<void> progressCommit = Future<void>.value();
       final result = await _kugou!.getLyricResult(
-        song.isOnline ? song.id : '',
+        matchedHash ?? (song.isOnline ? song.id : ''),
         songName: searchName,
         fmt: 'lrc',
         localIdentity: song.isOnline ? null : song.localPath,
+        onProgress: (lyric) {
+          if (!_isCurrentLyricRequest(token, requestedSongId) ||
+              lyric.displayLyric.isEmpty) {
+            return;
+          }
+          progressCommit = progressCommit.then((_) async {
+            if (!_isCurrentLyricRequest(token, requestedSongId)) return;
+            await _commitFetchedLyric(lyric, token, requestedSongId);
+          });
+        },
       );
+      await progressCommit;
       if (!_isCurrentLyricRequest(token, requestedSongId)) return;
       switch (result.status) {
         case LyricLookupStatus.found:
@@ -1309,19 +1655,22 @@ class DesktopLyricService {
           }
           break;
         case LyricLookupStatus.notFound:
+          if (_lines.isNotEmpty) break;
           _commitNoLyrics(requestedSongId);
           break;
         case LyricLookupStatus.transientFailure:
+          if (_lines.isNotEmpty) break;
           _recordLyricFailure(requestedSongId, '歌词加载失败', result.status);
           break;
         case LyricLookupStatus.invalidData:
+          if (_lines.isNotEmpty) break;
           _recordLyricFailure(requestedSongId, '歌词数据无效', result.status);
           break;
         case LyricLookupStatus.canceled:
           return;
       }
     } catch (_) {
-      if (_isCurrentLyricRequest(token, requestedSongId)) {
+      if (_isCurrentLyricRequest(token, requestedSongId) && _lines.isEmpty) {
         _recordLyricFailure(
           requestedSongId,
           '歌词加载失败',
@@ -1345,7 +1694,7 @@ class DesktopLyricService {
     String requestedSongId,
   ) async {
     if (lyric.displayLyric.isEmpty) {
-      _commitNoLyrics(requestedSongId);
+      if (_lines.isEmpty) _commitNoLyrics(requestedSongId);
       return false;
     }
     late final List<LyricLine> lines;
@@ -1356,7 +1705,7 @@ class DesktopLyricService {
         romaText: lyric.romaContent,
       );
     } catch (_) {
-      if (_isCurrentLyricRequest(token, requestedSongId)) {
+      if (_isCurrentLyricRequest(token, requestedSongId) && _lines.isEmpty) {
         _recordLyricFailure(
           requestedSongId,
           '歌词解析失败',
@@ -1368,6 +1717,7 @@ class DesktopLyricService {
     // isolate 解析期间可能已切歌：迟到结果直接丢弃
     if (!_isCurrentLyricRequest(token, requestedSongId)) return false;
     if (lines.isEmpty) {
+      if (_lines.isNotEmpty) return false;
       _recordLyricFailure(
         requestedSongId,
         '歌词解析失败',
@@ -1376,8 +1726,14 @@ class DesktopLyricService {
       return false;
     }
     _lines = lines;
+    _lyricInfoPushed = false;
+    _currentLineIndex = -2;
+    _lastLineSwitchAt = null;
+    _clearLyricRetryState();
     _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
     _markLockLyricLoaded('');
+    _onTick();
+    debugPrint('[DesktopLyric] lyrics ready: lines=${lines.length}');
     return true;
   }
 
@@ -1534,10 +1890,12 @@ class DesktopLyricService {
 
   /// 构造并推送 lyricInfo JSON。
   ///
-  /// colorOsMode=false（默认）：兼容 LyricInfo 模块（HyperLyric 等）标准格式，
-  /// lyric=ELRC 逐字 + format/translation 声明；
-  /// colorOsMode=true：兼容 ColorOS-Live-Lyrics-Bridge 开放协议，
+  /// colorOsMode=false：lidesheng LyricInfo 规范（HyperLyric 等），
+  /// lyric=原文逐行 LRC + rawLyric=原文增强 + translation/roma 独立 lane；
+  /// colorOsMode=true（默认）：兼容 ColorOS-Live-Lyrics-Bridge 开放协议，
   /// lyric=纯 LRC + rawLyric=ELRC 逐字，解锁插件逐字高亮等增强。
+  /// 翻译/罗马音 lane 受共用开关 [_pushTranslation] / [_pushRoma] 控制
+  /// （与 ColorOS 模式共用归一化规则，原生侧 hasTranslation 能力位口径一致）。
   /// 返回是否真正发起了推送（供 _maybePushLyricInfo 决定是否置位去重标志）。
   bool _pushLyricInfo() {
     if (!_lyricInfoEnabled || _player == null) return false;
@@ -1554,6 +1912,7 @@ class DesktopLyricService {
       sessionGeneration: _sessionGeneration,
       lines: _lines,
       includeTranslation: _pushTranslation,
+      includeRoma: _pushRoma,
       colorOsMode: _lyricInfoColorOs,
     );
     if (json.isEmpty) return false; // 无有效歌词行：不推送（保持移除状态）

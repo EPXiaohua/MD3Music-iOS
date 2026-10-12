@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 
+import '../core/services/player_frame_driver.dart';
+
 const Duration _kFlattenDuration = Duration(milliseconds: 500);
 const Duration _kColorDuration = Duration(milliseconds: 200);
 
@@ -44,7 +46,7 @@ class WavyPlaybackLine extends StatefulWidget {
 }
 
 class _WavyPlaybackLineState extends State<WavyPlaybackLine>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _phase;
   late final AnimationController _flatten;
   late final AnimationController _color;
@@ -52,9 +54,22 @@ class _WavyPlaybackLineState extends State<WavyPlaybackLine>
 
   late Color _fromColor;
 
+  /// 波形相位是否需要推进：播放中，或压平动画尚未走完（amp>0 才看得见波形）。
+  bool _phaseWanted = false;
+
+  /// 是否已把相位挂在共享 60fps 帧驱动上（见 [_syncPhaseDriver]）。
+  bool _phaseDriverBound = false;
+
+  /// [TickerMode] 是否被关闭（被不透明路由覆盖 / 切走 tab）。
+  bool _tickerModeMuted = false;
+
+  /// App 是否退到后台（引擎不产帧，Timer 空转纯属唤醒浪费）。
+  bool _appSuspended = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _phase = AnimationController(
       vsync: this,
       duration: Duration(
@@ -75,13 +90,62 @@ class _WavyPlaybackLineState extends State<WavyPlaybackLine>
     );
     _repaint = Listenable.merge([_phase, _flatten, _color]);
     _fromColor = widget.color;
-    // 振幅归零后波形不可见，停掉相位动画。
+    // 振幅归零后波形不可见，停掉相位推进。
     _flatten.addStatusListener(_onFlattenStatus);
-    if (widget.isPlaying) _phase.repeat();
+    _phaseWanted = widget.isPlaying;
+    _syncPhaseDriver();
   }
 
   void _onFlattenStatus(AnimationStatus status) {
-    if (status == AnimationStatus.dismissed) _phase.stop();
+    if (status == AnimationStatus.dismissed) {
+      _phaseWanted = false;
+      _syncPhaseDriver();
+    }
+  }
+
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.valuesOf(context).enabled;
+    if (muted == _tickerModeMuted) return;
+    _tickerModeMuted = muted;
+    _syncPhaseDriver();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
+    _syncPhaseDriver();
+  }
+
+  /// 唯一收口：仅在「需要流动 + 可见 + 前台」时挂共享 60fps 节拍（幂等）。
+  ///
+  /// 原实现用 `_phase.repeat()`：控制器 Ticker 每帧 scheduleFrame，120Hz 屏上
+  /// 即便本组件只是装饰性律动线也让整页保持 120fps（§10.1.1 / §10.4.1）。
+  void _syncPhaseDriver() {
+    final bool shouldRun =
+        _phaseWanted && !_tickerModeMuted && !_appSuspended;
+    if (shouldRun == _phaseDriverBound) return;
+    if (shouldRun) {
+      PlayerFrameDriver.instance.addListener(_onPhaseTick);
+    } else {
+      PlayerFrameDriver.instance.removeListener(_onPhaseTick);
+    }
+    _phaseDriverBound = shouldRun;
+  }
+
+  /// 共享节拍回调：按一个波长周期步进相位（0→1 循环）。
+  void _onPhaseTick() {
+    final int ms = _phase.duration?.inMilliseconds ?? 0;
+    if (ms <= 0) return;
+    _phase.value =
+        (_phase.value + PlayerFrameDriver.step.inMilliseconds / ms) % 1.0;
   }
 
   @override
@@ -89,7 +153,8 @@ class _WavyPlaybackLineState extends State<WavyPlaybackLine>
     super.didUpdateWidget(oldWidget);
     if (widget.isPlaying != oldWidget.isPlaying) {
       if (widget.isPlaying) {
-        if (!_phase.isAnimating) _phase.repeat();
+        _phaseWanted = true;
+        _syncPhaseDriver();
         _flatten.forward();
       } else {
         _flatten.reverse();
@@ -103,7 +168,12 @@ class _WavyPlaybackLineState extends State<WavyPlaybackLine>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _flatten.removeStatusListener(_onFlattenStatus);
+    if (_phaseDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onPhaseTick);
+      _phaseDriverBound = false;
+    }
     _phase.dispose();
     _flatten.dispose();
     _color.dispose();

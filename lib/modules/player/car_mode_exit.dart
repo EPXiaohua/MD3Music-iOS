@@ -4,9 +4,9 @@
 // 都要提供同一个退出入口；文案与确认流程共用一份，避免两处各写一遍后逐渐分叉。
 
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/utils/app_haptics.dart';
 import '../../providers/car_mode_provider.dart';
 
 /// 弹出「退出车机模式」二次确认框；用户确认则关闭车机模式并返回 `true`，
@@ -40,7 +40,7 @@ Future<bool> confirmExitCarMode(BuildContext context) async {
   );
   if (confirmed != true) return false;
 
-  HapticFeedback.mediumImpact();
+  AppHaptics.mediumImpact(HapticCategory.control);
   // 关闭当前生效的启用途径 → CarModePanel 立即返回 child，整块面板随之下线。
   // 车机模式可由「强制开关」（enabled）或「自动检测」（autoScreenEnabled）
   // 任一触发：退出应关掉**正在让它生效的那个**，而不是只关强制开关。

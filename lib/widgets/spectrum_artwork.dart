@@ -5,6 +5,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../core/services/player_frame_driver.dart';
 
+import '../core/services/spectrum_band_envelope.dart';
 import '../core/services/spectrum_service.dart';
 import 'player_artwork_image.dart';
 
@@ -25,9 +26,20 @@ import 'player_artwork_image.dart';
 ///
 /// 性能：环形频谱柱用 [ValueNotifier] + `super(repaint:)` 驱动重绘，
 /// 旋转用 [AnimatedBuilder] 局部重建，避免每帧 setState。
+/// 两层各自包 [RepaintBoundary]：频谱与旋转每帧都重绘，隔离后可避免脏区扩散。
+///
+/// 幅值插值由 [SpectrumBandEnvelope] 在共享 60fps 节拍上按真实 dt 推进
+///（不是数据到达时推进一次）—— 数据只有约 20fps，逐到达插值会呈现台阶感。
 ///
 /// 无数据（暂停/未播放/采集失败）时：环形柱为静止低柱，封面静止。
 class SpectrumArtwork extends StatefulWidget {
+  /// 环形频谱为外圈柱子预留的比例（单侧）：柱子最大长度 = 组件边长 × 本值，
+  /// 圆形封面直径因此是边长的 `1 - 2 * barReserveRatio`。
+  ///
+  /// 公开为常量：播放页 Zen 长按提示层要按同一比例内缩，黑底才能正好裁在
+  /// 封面那个圆上（各处各写一份 0.12 迟早会漂移）。
+  static const double barReserveRatio = 0.12;
+
   /// 封面 URI，支持 http(s)/content/local/file 协议（详见 [PlayerArtworkImage]）
   final String? artworkUri;
 
@@ -74,62 +86,89 @@ class SpectrumArtwork extends StatefulWidget {
 }
 
 class _SpectrumArtworkState extends State<SpectrumArtwork>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _rotationController;
   late final Animation<double> _rotationAnimation;
 
-  /// 60fps 旋转步进定时器（替代 `repeat()`，避免 120Hz 屏保持 120fps 帧管线）。
-  /// 是否已挂在共享 60fps 帧驱动上（见 [PlayerFrameDriver]）。
+  /// 封面旋转是否已挂在共享 60fps 帧驱动上（见 [PlayerFrameDriver]）。
   bool _rotationDriverBound = false;
+
+  /// 频谱包络是否已挂在共享 60fps 帧驱动上。
+  bool _bandDriverBound = false;
 
   /// 频谱幅值数组（0..1）。驱动 CustomPainter 重绘，不触发 setState。
   late final ValueNotifier<List<double>> _bandsNotifier;
 
-  /// 当前显示的幅值（带插值：上升快、回落慢）
-  late List<double> _displayedBands;
+  /// 频谱包络：瞬时上升 + 时基指数回落，由 60fps 共享节拍推进。
+  late SpectrumBandEnvelope _envelope;
+
+  /// 测量真实帧间隔，供包络按**时间**推进（而非按调用次数）。
+  final Stopwatch _bandClock = Stopwatch();
+  int _lastBandTickUs = 0;
 
   /// 频谱流订阅
   StreamSubscription<List<double>>? _subscription;
 
+  /// [TickerMode] 是否被关闭（播放页被不透明路由覆盖 / TabBarView 切走）。
+  bool _tickerModeMuted = false;
+
+  /// App 是否退到后台（引擎不产帧，Timer 空转纯属唤醒浪费）。
+  bool _appSuspended = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _rotationController = AnimationController(
       duration: widget.rotationDuration,
       vsync: this,
     );
     // 注意：Tween begin=0 end=2π（顺时针）；AnimatedBuilder 旋转角度从 0 递增
-    _rotationAnimation =
-        Tween<double>(begin: 0.0, end: 2 * math.pi).animate(_rotationController);
+    _rotationAnimation = Tween<double>(
+      begin: 0.0,
+      end: 2 * math.pi,
+    ).animate(_rotationController);
 
-    _displayedBands = List<double>.filled(widget.bandCount, 0.0);
-    _bandsNotifier = ValueNotifier<List<double>>(List.from(_displayedBands));
+    _envelope = SpectrumBandEnvelope(bandCount: widget.bandCount);
+    _bandsNotifier = ValueNotifier<List<double>>(
+      List<double>.filled(widget.bandCount, 0.0),
+    );
 
     _subscribeSpectrum();
-    _applyPlayingState();
+    _syncFrameDriverBindings();
   }
 
   @override
   void didUpdateWidget(covariant SpectrumArtwork oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.isPlaying != widget.isPlaying) {
-      _applyPlayingState();
+      _syncFrameDriverBindings();
     }
     if (oldWidget.bandCount != widget.bandCount) {
-      _displayedBands = List<double>.filled(widget.bandCount, 0.0);
-      _bandsNotifier.value = List.from(_displayedBands);
+      _envelope = SpectrumBandEnvelope(bandCount: widget.bandCount);
+      _bandsNotifier.value = List<double>.filled(widget.bandCount, 0.0);
+      _syncFrameDriverBindings();
     }
     if (oldWidget.rotationDuration != widget.rotationDuration) {
       _rotationController.duration = widget.rotationDuration;
     }
   }
 
-  /// 根据 isPlaying 启停旋转：播放时用 60fps Timer 步进，暂停时停止保持角度。
+  /// 帧生产是否被挂起：`TickerMode` 关闭（被不透明路由覆盖）或 App 退到后台。
+  ///
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起，
+  /// 否则「组件不可见仍持续产帧」——本仓最常见的漏电点（§10.4.3）。
+  bool get _framesSuspended => _tickerModeMuted || _appSuspended;
+
+  /// 同步两个 60fps 订阅：封面旋转（仅播放时）与频谱包络（播放中**或**未收敛）。
   ///
   /// 用 Timer 直接步进控制器值而非 `repeat()`：控制器 Ticker 不会被启动，
-  /// 帧生产由 16ms 定时器限制到 60fps（repeat 会让 120Hz 屏保持 120fps）。
-  void _applyPlayingState() {
-    if (widget.isPlaying) {
+  /// 帧生产由共享节拍限制到 60fps（repeat 会让 120Hz 屏保持 120fps）。
+  ///
+  /// 两者挂同一个 [PlayerFrameDriver]，因此**不增加任何帧生产**。
+  void _syncFrameDriverBindings() {
+    // ── 封面旋转 ──
+    if (widget.isPlaying && !_framesSuspended) {
       if (!_rotationDriverBound) {
         // 与歌词共用同一个 60fps 节拍：两个独立 16ms Timer 相位错开会让
         // 120Hz 屏整页跑到 ~120fps（实测），合并后整页回到 60fps，
@@ -141,6 +180,73 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
       PlayerFrameDriver.instance.removeListener(_onRotationTick);
       _rotationDriverBound = false;
     }
+
+    // ── 频谱包络 ──
+    // 暂停后目标已被 SpectrumService 推成全 0，仍需继续推进直到收敛，
+    // 柱子才会平滑塌回（而不是冻在高位再整体淡出）；收敛即解绑，不留空转订阅。
+    _updateBandBinding();
+  }
+
+  /// 包络 tick 的绑定条件：可见，且（播放中或尚未收敛）。
+  void _updateBandBinding() {
+    final need =
+        !_framesSuspended && (widget.isPlaying || !_envelope.isSettled);
+    if (need == _bandDriverBound) return;
+    if (need) {
+      // 重新起算时间基线：Stopwatch 跨停/启会累积，直接 elapsed 会得到巨大 dt
+      _bandClock
+        ..reset()
+        ..start();
+      _lastBandTickUs = 0;
+      PlayerFrameDriver.instance.addListener(_onBandTick);
+    } else {
+      _bandClock.stop();
+      PlayerFrameDriver.instance.removeListener(_onBandTick);
+    }
+    _bandDriverBound = need;
+  }
+
+  /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.valuesOf(context).enabled;
+    if (muted == _tickerModeMuted) return;
+    _tickerModeMuted = muted;
+    _syncFrameDriverBindings();
+  }
+
+  /// 后台/熄屏时引擎不合成帧，两个订阅一并停掉（§10.4.3）。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (suspended == _appSuspended) return;
+    _appSuspended = suspended;
+    _syncFrameDriverBindings();
+  }
+
+  /// 幂等退订两个共享节拍订阅（[deactivate] / [dispose] 共用）。
+  void _unbindAll() {
+    if (_rotationDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onRotationTick);
+      _rotationDriverBound = false;
+    }
+    if (_bandDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onBandTick);
+      _bandDriverBound = false;
+    }
+    _bandClock.stop();
+  }
+
+  /// widget 移出树时立即解绑：旋转经 `AnimatedBuilder` 的 setState 生效，
+  /// 路由 dismiss 期间继续推进会让已 deactivate 的子树保持 dirty。
+  @override
+  void deactivate() {
+    _unbindAll();
+    super.deactivate();
   }
 
   /// 以 16ms 步进推进旋转角度（控制器值 0→1 循环，映射到 0→2π）。
@@ -151,32 +257,41 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
     _rotationController.value = (_rotationController.value + step) % 1.0;
   }
 
-  /// 订阅 SpectrumService 数据流，做帧间插值（上升快、回落慢）。
+  /// 以真实帧间隔推进频谱包络，并驱动 CustomPainter 重绘。
+  void _onBandTick() {
+    if (!mounted) return;
+    final nowUs = _bandClock.elapsedMicroseconds;
+    final dtUs = nowUs - _lastBandTickUs;
+    _lastBandTickUs = nowUs;
+    if (dtUs <= 0) return;
+
+    _envelope.advance(Duration(microseconds: dtUs));
+    // 必须新建 List 实例：ValueNotifier<List> 用同一性比较，
+    // 赋同一个实例不会通知监听者，也就不会重绘。
+    _bandsNotifier.value = List.from(_envelope.values);
+
+    // 收敛后自行解绑（暂停塌回完成时走这条），避免空转
+    _updateBandBinding();
+  }
+
+  /// 订阅 SpectrumService 数据流：**只登记目标值**，不做插值。
+  ///
+  /// 插值交给 [_onBandTick] 在共享 60fps 节拍上按真实 dt 推进。若在此处插值，
+  /// 回落会被量化成每秒约 20 个台阶（数据到达频率），而同一屏的封面旋转是 60fps，
+  /// 反差会非常明显 —— 这正是本次要修的问题。
   void _subscribeSpectrum() {
     _subscription?.cancel();
     _subscription = SpectrumService.instance.spectrumStream.listen((bands) {
       if (!mounted) return;
-      // 长度兜底：与 widget.bandCount 对齐
-      final n = _displayedBands.length;
-      for (int i = 0; i < n; i++) {
-        final target = (i < bands.length) ? bands[i] : 0.0;
-        final current = _displayedBands[i];
-        // 上升快（直接取目标值），回落慢（衰减 35%）
-        final next = target > current
-            ? target
-            : current * 0.65 + target * 0.35;
-        _displayedBands[i] = next;
-      }
-      _bandsNotifier.value = List.from(_displayedBands);
+      _envelope.setTarget(bands);
+      _updateBandBinding();
     });
   }
 
   @override
   void dispose() {
-    if (_rotationDriverBound) {
-      PlayerFrameDriver.instance.removeListener(_onRotationTick);
-      _rotationDriverBound = false;
-    }
+    WidgetsBinding.instance.removeObserver(this);
+    _unbindAll(); // 幂等解绑（deactivate 已解绑过则直接 return）
     _subscription?.cancel();
     _rotationController.dispose();
     _bandsNotifier.dispose();
@@ -194,11 +309,9 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
         // 组件总尺寸 = 父约束最小边（正方形）
         final size = constraints.maxWidth.isFinite
             ? constraints.maxWidth
-            : (constraints.maxHeight.isFinite
-                  ? constraints.maxHeight
-                  : 280.0);
-        // 环形频谱预留外圈空间：柱最大长度 = size × 0.12
-        const barMaxLenRatio = 0.12;
+            : (constraints.maxHeight.isFinite ? constraints.maxHeight : 280.0);
+        // 环形频谱预留外圈空间：柱最大长度 = size × barReserveRatio
+        const barMaxLenRatio = SpectrumArtwork.barReserveRatio;
         final coverDiameter = size * (1.0 - 2 * barMaxLenRatio);
         final coverRadius = coverDiameter / 2;
         final center = Offset(size / 2, size / 2);
@@ -209,33 +322,36 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
           child: Stack(
             clipBehavior: Clip.none,
             children: [
-              // ── 1. 环形频谱层（柱状或曲线）：AnimatedOpacity 过渡，播放淡入、暂停淡出 ──
+              // ── 1. 环形频谱层（柱状或曲线）：AnimatedOpacity 过渡，播放时淡入、暂停淡出 ──
               Positioned.fill(
                 child: IgnorePointer(
                   child: AnimatedOpacity(
                     opacity: widget.isPlaying ? 1.0 : 0.0,
                     duration: const Duration(milliseconds: 350),
                     curve: Curves.easeOut,
-                    child: CustomPaint(
-                      painter: widget.style == 1
-                          ? _SpectrumCurvePainter(
-                              bandsNotifier: _bandsNotifier,
-                              center: center,
-                              coverRadius: coverRadius,
-                              barMaxLen: size * barMaxLenRatio,
-                              color: barColor,
-                              bandCount: widget.bandCount,
-                              opacity: widget.opacity,
-                            )
-                          : _SpectrumRingPainter(
-                              bandsNotifier: _bandsNotifier,
-                              center: center,
-                              coverRadius: coverRadius,
-                              barMaxLen: size * barMaxLenRatio,
-                              color: barColor,
-                              bandCount: widget.bandCount,
-                              opacity: widget.opacity,
-                            ),
+                    // 频谱每帧重绘：独立 layer，避免脏区扩散到播放页其余部分
+                    child: RepaintBoundary(
+                      child: CustomPaint(
+                        painter: widget.style == 1
+                            ? _SpectrumCurvePainter(
+                                bandsNotifier: _bandsNotifier,
+                                center: center,
+                                coverRadius: coverRadius,
+                                barMaxLen: size * barMaxLenRatio,
+                                color: barColor,
+                                bandCount: widget.bandCount,
+                                opacity: widget.opacity,
+                              )
+                            : _SpectrumRingPainter(
+                                bandsNotifier: _bandsNotifier,
+                                center: center,
+                                coverRadius: coverRadius,
+                                barMaxLen: size * barMaxLenRatio,
+                                color: barColor,
+                                bandCount: widget.bandCount,
+                                opacity: widget.opacity,
+                              ),
+                      ),
                     ),
                   ),
                 ),
@@ -246,24 +362,27 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
                 top: center.dy - coverRadius,
                 width: coverDiameter,
                 height: coverDiameter,
-                child: AnimatedBuilder(
-                  animation: _rotationAnimation,
-                  builder: (context, child) {
-                    return Transform.rotate(
-                      angle: _rotationAnimation.value,
-                      alignment: Alignment.center,
-                      child: child,
-                    );
-                  },
-                  child: ClipOval(
-                    child: PlayerArtworkImage(
-                      artworkUri: widget.artworkUri,
-                      fallbackFilePath: widget.fallbackFilePath,
-                      fit: BoxFit.cover,
-                      isFill: true,
-                      iconSize: coverDiameter * 0.3,
-                      backgroundColor: cs.surfaceContainerHighest,
-                      iconColor: cs.onSurfaceVariant,
+                // 旋转每帧重绘：与频谱层分开隔离，两者频率与内容都不同
+                child: RepaintBoundary(
+                  child: AnimatedBuilder(
+                    animation: _rotationAnimation,
+                    builder: (context, child) {
+                      return Transform.rotate(
+                        angle: _rotationAnimation.value,
+                        alignment: Alignment.center,
+                        child: child,
+                      );
+                    },
+                    child: ClipOval(
+                      child: PlayerArtworkImage(
+                        artworkUri: widget.artworkUri,
+                        fallbackFilePath: widget.fallbackFilePath,
+                        fit: BoxFit.cover,
+                        isFill: true,
+                        iconSize: coverDiameter * 0.3,
+                        backgroundColor: cs.surfaceContainerHighest,
+                        iconColor: cs.onSurfaceVariant,
+                      ),
                     ),
                   ),
                 ),
@@ -296,18 +415,18 @@ class _SpectrumRingPainter extends CustomPainter {
     required this.color,
     required this.bandCount,
     required this.opacity,
-  })  : _cosTable = List<double>.generate(
-          bandCount,
-          (i) => math.cos(-math.pi / 2 + i * 2 * math.pi / bandCount),
-        ),
-        _sinTable = List<double>.generate(
-          bandCount,
-          (i) => math.sin(-math.pi / 2 + i * 2 * math.pi / bandCount),
-        ),
-        _barWidth = bandCount > 0
-            ? (2 * math.pi * (coverRadius + barMaxLen / 2) / bandCount) * 0.78
-            : 0.0,
-        super(repaint: bandsNotifier) {
+  }) : _cosTable = List<double>.generate(
+         bandCount,
+         (i) => math.cos(-math.pi / 2 + i * 2 * math.pi / bandCount),
+       ),
+       _sinTable = List<double>.generate(
+         bandCount,
+         (i) => math.sin(-math.pi / 2 + i * 2 * math.pi / bandCount),
+       ),
+       _barWidth = bandCount > 0
+           ? (2 * math.pi * (coverRadius + barMaxLen / 2) / bandCount) * 0.78
+           : 0.0,
+       super(repaint: bandsNotifier) {
     _paint.color = color.withValues(alpha: color.a * opacity);
     _paint.strokeWidth = _barWidth;
   }
@@ -344,10 +463,7 @@ class _SpectrumRingPainter extends CustomPainter {
 
       // 柱起点：紧贴圆形封面外缘（无空隙）；终点：向外辐射
       path
-        ..moveTo(
-          center.dx + coverRadius * cosA,
-          center.dy + coverRadius * sinA,
-        )
+        ..moveTo(center.dx + coverRadius * cosA, center.dy + coverRadius * sinA)
         ..lineTo(
           center.dx + (coverRadius + len) * cosA,
           center.dy + (coverRadius + len) * sinA,
@@ -391,24 +507,24 @@ class _SpectrumCurvePainter extends CustomPainter {
     required this.color,
     required this.bandCount,
     required this.opacity,
-  })  : _cosTable = List<double>.generate(
-          bandCount,
-          (i) => math.cos(-math.pi / 2 + i * 2 * math.pi / bandCount),
-        ),
-        _sinTable = List<double>.generate(
-          bandCount,
-          (i) => math.sin(-math.pi / 2 + i * 2 * math.pi / bandCount),
-        ),
-        _fillPaint = Paint()
-          ..color = color.withValues(alpha: color.a * opacity * 0.15)
-          ..style = PaintingStyle.fill,
-        _strokePaint = Paint()
-          ..color = color.withValues(alpha: color.a * opacity)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.0
-          ..strokeJoin = StrokeJoin.round
-          ..strokeCap = StrokeCap.round,
-        super(repaint: bandsNotifier);
+  }) : _cosTable = List<double>.generate(
+         bandCount,
+         (i) => math.cos(-math.pi / 2 + i * 2 * math.pi / bandCount),
+       ),
+       _sinTable = List<double>.generate(
+         bandCount,
+         (i) => math.sin(-math.pi / 2 + i * 2 * math.pi / bandCount),
+       ),
+       _fillPaint = Paint()
+         ..color = color.withValues(alpha: color.a * opacity * 0.15)
+         ..style = PaintingStyle.fill,
+       _strokePaint = Paint()
+         ..color = color.withValues(alpha: color.a * opacity)
+         ..style = PaintingStyle.stroke
+         ..strokeWidth = 2.0
+         ..strokeJoin = StrokeJoin.round
+         ..strokeCap = StrokeCap.round,
+       super(repaint: bandsNotifier);
 
   /// 预计算的三角函数表（构造时一次算出，避免每帧重复 sin/cos）
   final List<double> _cosTable;
@@ -436,10 +552,9 @@ class _SpectrumCurvePainter extends CustomPainter {
     for (int i = 0; i < n; i++) {
       final v = (i < bands.length) ? bands[i].clamp(0.0, 1.0) : 0.0;
       final r = coverRadius + baseLen + barMaxLen * v;
-      points.add(Offset(
-        center.dx + r * _cosTable[i],
-        center.dy + r * _sinTable[i],
-      ));
+      points.add(
+        Offset(center.dx + r * _cosTable[i], center.dy + r * _sinTable[i]),
+      );
     }
 
     // 用平滑闭合曲线连接所有点（quadraticBezierTo，控制点=当前点，终点=相邻两点中点）

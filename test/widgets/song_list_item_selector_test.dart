@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:md3music/data/models/song.dart';
+import 'package:md3music/providers/blacklist_provider.dart';
 import 'package:md3music/providers/favorites_provider.dart';
 import 'package:md3music/providers/local_favorites_provider.dart';
 import 'package:md3music/providers/player_provider.dart';
@@ -53,6 +54,10 @@ void main() {
         ChangeNotifierProvider<FavoritesProvider>.value(value: favorites),
         ChangeNotifierProvider<LocalFavoritesProvider>.value(
           value: localFavorites,
+        ),
+        // 更多菜单内的「不感兴趣」tile 读黑名单状态（不拉取、不发请求）
+        ChangeNotifierProvider<BlacklistProvider>(
+          create: (_) => BlacklistProvider(),
         ),
       ],
       child: MaterialApp(

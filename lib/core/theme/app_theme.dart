@@ -40,6 +40,44 @@ class _BgSafeFadeForwardsBuilder extends PageTransitionsBuilder {
   }
 }
 
+/// 路由过渡：Android 预测性返回（共享元素）动效 + 页面自带背景。
+///
+/// 背景内嵌策略与 [_BgSafeFadeForwardsBuilder] 完全一致，仅把基础动效换成
+/// material_ui 的 [PredictiveBackPageTransitionsBuilder]：系统返回手势期间
+/// 实时预览上一页，松手完成、拖回边缘取消；非手势 pop（按钮 / 三键 /
+/// 不支持的机型）自动回退 FadeForwards。
+/// 对 [PopScope.canPop] == false、首页路由、过渡中的路由，框架
+/// （Route.popGestureEnabled）不会启动预测动画，天然落回各页现有返回逻辑
+/// （播放页收起动画、双击返回退出等），无需在此处理。
+class BgSafePredictiveBackBuilder extends PageTransitionsBuilder {
+  const BgSafePredictiveBackBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    // 背景作为页面底层，随过渡一起入场（与 FadeForwards 版同策略）
+    final withBg = Stack(
+      fit: StackFit.expand,
+      children: [
+        const AppBackground(),
+        child,
+      ],
+    );
+    return const PredictiveBackPageTransitionsBuilder().buildTransitions(
+      route,
+      context,
+      animation,
+      secondaryAnimation,
+      withBg,
+    );
+  }
+}
+
 class AppTheme {
   AppTheme._();
 
@@ -111,6 +149,7 @@ class AppTheme {
     bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
+    bool predictiveBack = false,
   }) {
     final colorScheme = ColorScheme.fromSeed(
       seedColor: seedColor,
@@ -122,6 +161,7 @@ class AppTheme {
       fontFamily: fontFamily,
       emphasized: emphasized,
       labelBehavior: labelBehavior,
+      predictiveBack: predictiveBack,
     );
   }
 
@@ -140,6 +180,7 @@ class AppTheme {
     bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
+    bool predictiveBack = false,
   }) {
     var colorScheme = ColorScheme.fromSeed(
       seedColor: seedColor,
@@ -164,6 +205,7 @@ class AppTheme {
       fontFamily: fontFamily,
       emphasized: emphasized,
       labelBehavior: labelBehavior,
+      predictiveBack: predictiveBack,
     );
   }
 
@@ -174,6 +216,7 @@ class AppTheme {
     bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
+    bool predictiveBack = false,
   }) {
     final isLight = brightness == Brightness.light;
 
@@ -184,9 +227,11 @@ class AppTheme {
       // 全局路由过渡：Android 用 FadeForwards（滑动 + 淡入）+ 过渡期间
       // 背景遮罩（避免透明页面过渡重叠，完成后再露出背景图）。
       // 其余平台（iOS/macOS）保留系统默认 Cupertino 过渡。
-      pageTransitionsTheme: const PageTransitionsTheme(
+      pageTransitionsTheme: PageTransitionsTheme(
         builders: {
-          TargetPlatform.android: _BgSafeFadeForwardsBuilder(),
+          TargetPlatform.android: predictiveBack
+              ? const BgSafePredictiveBackBuilder()
+              : const _BgSafeFadeForwardsBuilder(),
         },
       ),
       // fontFamily 为 null 时，Flutter 会走系统字体链（Android 上是 Roboto +
@@ -228,7 +273,8 @@ class AppTheme {
         ),
       ),
       navigationBarTheme: NavigationBarThemeData(
-        height: 80,
+        // 高度不在此配置：responsive_layout 的 NavigationBar 分支按 labelBehavior
+        // 显式传 height（44/64，见其 _buildCompactLayout），主题值永远被覆盖。
         backgroundColor: colorScheme.surface,
         // 关闭原生 NavigationIndicator：胶囊由 responsive_layout 的
         // _CapsuleBounce 自定义绘制（外观与原一致），以支持点击后胶囊
@@ -271,7 +317,9 @@ class AppTheme {
         elevation: 0,
         minWidth: 80,
         minExtendedWidth: 256,
-        labelType: NavigationRailLabelType.all,
+        // labelType 不在此配置：responsive_layout 的 NavigationRail 分支按
+        // 「底部导航栏文字」三档显式传 labelType（见其 _buildRailLayout），
+        // 主题值永远被覆盖。
         selectedIconTheme: IconThemeData(
           color: colorScheme.onSecondaryContainer,
         ),

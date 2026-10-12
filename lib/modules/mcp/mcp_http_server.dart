@@ -4,11 +4,16 @@ import 'dart:io';
 
 import 'mcp_jsonrpc.dart';
 
-/// MCP Streamable HTTP 传输层（仅 JSON 响应模式，不开 SSE 流、无会话状态）。
+/// MCP Streamable HTTP 传输层。
 ///
-/// 端点固定 `POST /mcp`；`GET` → 405；`DELETE` → 204；`OPTIONS` → 204 + CORS。
+/// 端点固定 `/mcp`：`POST` 处理 JSON-RPC；`GET`（带会话头）打开 SSE 下行；
+/// `DELETE`（带会话头）注销会话并断流；`OPTIONS` → 204 + CORS。
+/// 会话由 `initialize` 建立并经 `Mcp-Session-Id` 响应头下发。
 class McpHttpServer {
   HttpServer? _server;
+
+  /// 会话 id → 打开的 SSE 请求（null 表示会话存在但未开下行流）。
+  final Map<String, HttpRequest?> _sessions = <String, HttpRequest?>{};
 
   /// 实际监听端口（start 成功后有效）。
   int get port => _server?.port ?? 0;
@@ -54,8 +59,36 @@ class McpHttpServer {
   Future<void> stop() async {
     final server = _server;
     _server = null;
+    for (final id in _sessions.keys.toList(growable: false)) {
+      await _closeSession(id);
+    }
+    _sessions.clear();
     if (server != null) {
       await server.close(force: true);
+    }
+  }
+
+  /// 向所有打开了 SSE 下行的会话广播一条通知。
+  void notifyToolsListChanged() {
+    const frame = 'event: message\n'
+        'data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\n';
+    for (final entry in _sessions.entries) {
+      final req = entry.value;
+      if (req != null) {
+        req.response.write(frame);
+        unawaited(req.response.flush().catchError((Object _) {}));
+      }
+    }
+  }
+
+  /// 注销会话：从会话表移除并关闭其打开的 SSE 下行。
+  Future<void> _closeSession(String session) async {
+    final req = _sessions.remove(session);
+    final stream = req?.response;
+    if (stream != null) {
+      try {
+        await stream.close();
+      } catch (_) {}
     }
   }
 
@@ -81,17 +114,55 @@ class McpHttpServer {
       return;
     }
 
+    final reqSession = req.headers.value('mcp-session-id');
+
     if (req.method == 'DELETE') {
-      // 无状态服务端：会话终止为空操作。
+      // 注销会话并断开其 SSE 下行（无会话头时保持旧行为：204 空操作）。
+      if (reqSession != null) {
+        await _closeSession(reqSession);
+      }
       response.statusCode = HttpStatus.noContent;
       await response.close();
       return;
     }
 
     if (req.method == 'GET') {
-      // 不支持 SSE 流（服务端只回 JSON），按规范回 405。
-      await _writeJsonRpcError(response, HttpStatus.methodNotAllowed,
-          const JsonRpcError(-32000, 'SSE stream is not supported; use POST /mcp'));
+      if (reqSession == null) {
+        await _writeJsonRpcError(response, HttpStatus.badRequest,
+            const JsonRpcError(-32000, 'Missing Mcp-Session-Id header'));
+        return;
+      }
+      // GET 分支在既有分支顺序里位于统一鉴权之前，SSE 下行不能绕过 Bearer
+      // 校验，这里补一次与 POST 相同的鉴权。
+      if (requireAuth && !_authorized(req, token)) {
+        response.headers.set('WWW-Authenticate', 'Bearer realm="md3music-mcp"');
+        await _writeJsonRpcError(response, HttpStatus.unauthorized,
+            const JsonRpcError(-32000, 'Unauthorized'));
+        return;
+      }
+      if (!_sessions.containsKey(reqSession)) {
+        await _writeJsonRpcError(
+          response,
+          HttpStatus.notFound,
+          const JsonRpcError(-32000, 'Session not found'),
+        );
+        return;
+      }
+      response.statusCode = HttpStatus.ok;
+      response.headers.contentType =
+          ContentType('text', 'event-stream', charset: 'utf-8');
+      response.headers.set('Cache-Control', 'no-cache');
+      response.headers.set('Connection', 'keep-alive');
+      // dart:io 在写出首个 body chunk 之前不会真正把响应头推到网络上，
+      // 先写一条 SSE 注释行（keepalive，客户端按规范忽略）确保响应头
+      // 立刻可达，客户端不必等到第一条通知才能确认流已建立。
+      response.write(': open\n\n');
+      await response.flush();
+      _sessions[reqSession] = req;
+      // 挂住响应直到客户端断开（done future 完成即清理）。
+      unawaited(response.done.whenComplete(() {
+        if (_sessions[reqSession] == req) _sessions[reqSession] = null;
+      }));
       return;
     }
 
@@ -118,6 +189,15 @@ class McpHttpServer {
       return;
     }
 
+    if (reqSession != null && !_sessions.containsKey(reqSession)) {
+      await _writeJsonRpcError(
+        response,
+        HttpStatus.notFound,
+        const JsonRpcError(-32000, 'Session not found'),
+      );
+      return;
+    }
+
     // dart:io 的 HttpRequest 是 Stream<Uint8List>，不能直接喂给 Utf8Decoder.transform。
     final body = await utf8.decoder.bind(req).join();
     Object? message;
@@ -135,6 +215,14 @@ class McpHttpServer {
       response.statusCode = HttpStatus.accepted;
       await response.close();
       return;
+    }
+
+    // 无会话头的 initialize 会生成新会话：下发 Mcp-Session-Id 并登记，
+    // 之后 clearSession 交出所有权（带会话头的请求不覆盖既有会话）。
+    if (reqSession == null && dispatcher.session != null) {
+      response.headers.set('Mcp-Session-Id', dispatcher.session!);
+      _sessions[dispatcher.session!] = null;
+      dispatcher.clearSession();
     }
 
     response.statusCode = HttpStatus.ok;

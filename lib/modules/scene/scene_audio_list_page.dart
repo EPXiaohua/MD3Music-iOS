@@ -1,7 +1,10 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
+import 'package:dpad/dpad.dart';
 import 'package:provider/provider.dart';
+
+import '../../core/remote/tv_scroll_region.dart';
 
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
@@ -124,7 +127,13 @@ class _SceneAudioListPageState extends State<SceneAudioListPage> {
               ? _buildEmpty(cs)
               : Md3PullToRefresh(
                   onRefresh: () => _load(reset: true, showLoading: false),
-                  child: ListView.builder(
+                  // tv: 纵向歌曲列表补区域语义（memoryKey + 横向 leave）。
+                  // 行本身由 SongListItem 自带停点，缺的是「进带回到上次位置」
+                  // 与边缘行为，与 charts/search 的列表带同一口径。
+                  child: TvScrollRegion(
+                    memoryKey: 'tv/scene-audio-list',
+                    horizontalEdge: DpadEdgeBehavior.leave,
+                    child: ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.only(bottom: 24),
                     itemCount: _songs.length + (_loadingMore ? 1 : 0),
@@ -153,6 +162,7 @@ class _SceneAudioListPageState extends State<SceneAudioListPage> {
                         onMoreTap: () {},
                       );
                     },
+                  ),
                   ),
                 ),
       ),

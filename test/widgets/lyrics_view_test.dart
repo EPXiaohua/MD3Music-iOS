@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../lib/modules/player/lyrics_view.dart';
 import '../../lib/widgets/md3_lyric_preferences.dart';
+import 'package:md3music/core/utils/lyric_wrap_plan.dart';
 
 /// MD3 歌词视图行高自适应 + 完整显示测试。
 ///
@@ -39,7 +40,7 @@ void main() {
     await tester.pump();
 
     // 1) 超长行对应的 Text 不应设置 maxLines/ellipsis 截断
-    final longTextWidget = tester.widget<Text>(find.text(longText));
+    final longTextWidget = tester.widget<Text>(findLyricText(longText));
     expect(longTextWidget.maxLines, isNull, reason: '超长行不应被 maxLines 截断');
     expect(longTextWidget.overflow, isNull, reason: '超长行不应省略号截断');
 
@@ -48,7 +49,7 @@ void main() {
         .ancestor(of: find.text('短行'), matching: find.byType(Container))
         .first;
     final longContainer = find
-        .ancestor(of: find.text(longText), matching: find.byType(Container))
+        .ancestor(of: findLyricText(longText), matching: find.byType(Container))
         .first;
 
     final shortHeight = tester.getSize(shortContainer).height;
@@ -86,7 +87,7 @@ void main() {
     // 原实现 spacingExtra = fontSize*(lineSpacing-1.2) 在 0.8 时为负，
     // 容器矮于文本块导致英文 descenders 被裁切。
     final longContainer = find
-        .ancestor(of: find.text(longText), matching: find.byType(Container))
+        .ancestor(of: findLyricText(longText), matching: find.byType(Container))
         .first;
     final longHeight = tester.getSize(longContainer).height;
     final minTwoLines = prefs.fontSize * 1.4 * 2;
@@ -123,4 +124,93 @@ void main() {
     expect(find.textContaining('<00:'), findsNothing);
     expect(find.textContaining('<0,'), findsNothing);
   });
+
+  testWidgets('开启平衡：长行按计划硬断点，且比贪心更均匀', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = Md3LyricPreferences.instance;
+    await prefs.setLineBalance(true);
+    const longText = '这是一段足够长的中文歌词用于测试平衡换行'; // 20 字
+    const viewWidth = 300.0;
+    final availableWidth = viewWidth - 48; // 与 LyricsView 内部一致（水平 padding 24*2）
+    final style = TextStyle(
+      fontSize: prefs.fontSize,
+      height: _expectedWrapLineHeight(prefs),
+      fontWeight: prefs.fontWeight,
+      fontFamily: prefs.effectiveFontFamily,
+    );
+    final plan = LyricWrapPlanner.forText(
+      longText,
+      style,
+      availableWidth,
+      balanced: true,
+    );
+    // 实测打印：确认 Ahem 下 20 字 / 可用宽 252 的 DP 分组
+    // ignore: avoid_print
+    print('[MDWrap] rowTexts=${plan.rowTexts} widths=${plan.rowWidths} '
+        'count=${plan.rowCount} fontSize=${prefs.fontSize}');
+    // Ahem 22/字、可用宽 252 → 每行最多 11 字：贪心切成 11+9，平衡拉平成 10+10
+    expect(plan.rowTexts, <String>['这是一段足够长的中文', '歌词用于测试平衡换行']);
+
+    await tester.pumpWidget(
+      _harness(
+        SizedBox(
+          width: viewWidth,
+          height: 400,
+          child: LyricsView(
+            lyrics: '[00:00.000]$longText',
+            position: Duration.zero,
+            onSeek: (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final rendered = tester.widget<Text>(find.textContaining('词用于测试'));
+    expect(rendered.data, plan.rowTexts.join('\n'));
+  });
+
+  testWidgets('关闭平衡：展示文本不含硬断点（与改造前一致）', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = Md3LyricPreferences.instance;
+    await prefs.setLineBalance(false);
+    addTearDown(() => prefs.setLineBalance(true));
+    const longText = '这是一段足够长的中文歌词用于测试平衡换行';
+    await tester.pumpWidget(
+      _harness(
+        SizedBox(
+          width: 300,
+          height: 400,
+          child: LyricsView(
+            lyrics: '[00:00.000]$longText',
+            position: Duration.zero,
+            onSeek: (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final rendered = tester.widget<Text>(find.textContaining(longText));
+    expect(rendered.data, isNotNull);
+    expect(rendered.data!.contains('\n'), isFalse, reason: '关闭态不得插入硬断点');
+  });
 }
+
+/// 匹配内容（去掉平衡换行插入的硬断点 \n 后）与 [expected] 逐字相等的 Text。
+///
+/// 开启平衡后长行会把 DP 断点落成 `\n`，`find.text(原文)` 的精确匹配随之失效；
+/// 本 finder 保留「完整内容都在、没被省略号截断」的原意，只容忍插入的换行符。
+Finder findLyricText(String expected) => find.byWidgetPredicate(
+  (Widget w) => w is Text && (w.data?.replaceAll('\n', '') ?? '') == expected,
+);
+
+/// 与 LyricsView._wrapLineHeight 同式的期望值：行间距 × 0.8，下限 1.4。
+double _expectedWrapLineHeight(Md3LyricPreferences prefs) {
+  final scaled = prefs.lineSpacing * 0.8;
+  return scaled > 1.4 ? scaled : 1.4;
+}
+
+Widget _harness(Widget child) => MaterialApp(
+  home: Scaffold(body: child),
+);

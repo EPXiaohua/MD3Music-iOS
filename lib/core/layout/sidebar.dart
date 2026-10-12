@@ -1,8 +1,10 @@
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../modules/user/favorites_page.dart';
 import '../../providers/kugou_provider.dart';
+import '../build_flags.dart';
 
 class Sidebar extends StatelessWidget {
   final int selectedIndex;
@@ -21,7 +23,7 @@ class Sidebar extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    return Container(
+    Widget sidebar = Container(
       width: 230,
       decoration: BoxDecoration(
         border: Border(
@@ -37,6 +39,20 @@ class Sidebar extends StatelessWidget {
         ],
       ),
     );
+
+    // tv: 侧栏分区 DpadRegion —— 纵向 stop（焦点不许掉出屏幕），横向 leave
+    // （焦点能横移进内容区）；memoryKey 让侧栏焦点位跨重建记忆。
+    // 侧栏项之间保持 Flutter 默认遍历（dpad 束流遍历会接管）。
+    // 正常构建不包，触屏路径零变化（kTvBuild=false 整段树摇剔除）。
+    if (kTvBuild) {
+      sidebar = DpadRegion(
+        memoryKey: 'tv/main-sidebar',
+        verticalEdge: DpadEdgeBehavior.stop,
+        horizontalEdge: DpadEdgeBehavior.leave,
+        child: sidebar,
+      );
+    }
+    return sidebar;
   }
 
   Widget _buildHeader(
@@ -150,6 +166,10 @@ class Sidebar extends StatelessWidget {
       },
     ];
 
+    // tv: 侧栏第一个 Tab 项（首组「发现音乐」的首项「为你推荐」），
+    // 供 TV 首屏 autofocus 锚点判定。
+    final firstNavItem = (menuGroups.first['items'] as List).first;
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Column(
@@ -174,23 +194,25 @@ class Sidebar extends StatelessWidget {
               ...(group['items'] as List<Map<String, dynamic>>).map((item) {
                 final isActive =
                     selectedIndex == _getIndexForPath(item['path'] as String);
-                return Padding(
+                void selectItem() {
+                  if (item['path'] == '/personal_fm') {
+                    Navigator.pushNamed(context, '/personal_fm');
+                  } else if (item['path'] == '/') {
+                    onDestinationSelected(0);
+                  } else if (item['path'] == '/favorites') {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const FavoritesPage(),
+                      ),
+                    );
+                  }
+                }
+
+                Widget navItem = Padding(
                   padding: const EdgeInsets.symmetric(vertical: 1),
                   child: InkWell(
-                    onTap: () {
-                      if (item['path'] == '/personal_fm') {
-                        Navigator.pushNamed(context, '/personal_fm');
-                      } else if (item['path'] == '/') {
-                        onDestinationSelected(0);
-                      } else if (item['path'] == '/favorites') {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const FavoritesPage(),
-                          ),
-                        );
-                      }
-                    },
+                    onTap: selectItem,
                     borderRadius: BorderRadius.circular(14),
                     child: Container(
                       padding: const EdgeInsets.symmetric(
@@ -219,7 +241,9 @@ class Sidebar extends StatelessWidget {
                               fontWeight: isActive
                                   ? FontWeight.w600
                                   : FontWeight.w500,
-                              color: isActive ? cs.primary : cs.onSurface,
+                              color: isActive
+                                  ? cs.primary
+                                  : cs.onSurface,
                             ),
                           ),
                         ],
@@ -227,6 +251,19 @@ class Sidebar extends StatelessWidget {
                     ),
                   ),
                 );
+
+                // tv: 首屏 autofocus 落在侧栏第一个 Tab 项 —— TV 构建把首项
+                // 包成 DpadFocusable（excludeChildFocus 默认 true → 单停点，
+                // 内层 InkWell 不再参与遍历；OK 键 = 原 onTap）。
+                // 正常构建不包，触屏路径零变化。
+                if (kTvBuild && identical(item, firstNavItem)) {
+                  navItem = DpadFocusable(
+                    autofocus: true,
+                    onSelect: selectItem,
+                    child: navItem,
+                  );
+                }
+                return navItem;
               }),
               const SizedBox(height: 8),
             ],

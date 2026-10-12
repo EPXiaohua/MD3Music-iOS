@@ -104,7 +104,9 @@ void main() {
         '淡出时长',
         '自动混音（AutoMix）',
         '允许与其他应用同时播放音频',
-        '上传听歌时长',
+        // 2026-10 由「上传听歌时长」扩展为「听歌数据云同步」（总控云端播放历史
+        // 上传 + CSCC 真实播放上报 + 听歌等级累计，默认开启）
+        '听歌数据云同步',
         '长按封面进入 Zen 模式',
         '横屏隐藏状态栏',
         '播放时保持屏幕常亮',
@@ -123,6 +125,7 @@ void main() {
     expect(subpageOf('专辑动态封面'), '封面与动态');
     expect(subpageOf('3D 封面'), '封面与动态');
     expect(subpageOf('清理深度图缓存'), '封面与动态');
+    expect(subpageOf('封面阴影强度'), '封面与动态');
     expect(subpageOf('男女对唱歌词优化'), '歌词效果');
     expect(subpageOf('歌词辉光效果'), '歌词效果');
     expect(subpageOf('歌词省电模式'), '歌词效果');
@@ -130,6 +133,13 @@ void main() {
     expect(subpageOf('频谱背景高度'), '音乐频谱');
     expect(subpageOf('歌手写真背景轮播'), '播放页背景');
     expect(subpageOf('播放页背景模糊'), '播放页背景');
+    expect(subpageOf('进度条波浪起伏'), '进度条');
+    // 播放页 chrome 三个形态开关统一归到「顶栏与页签」（此前散在「播放 → 屏幕与视频」）
+    expect(subpageOf('横屏控制面板独立页'), '顶栏与页签');
+    expect(subpageOf('胶囊按钮收缩'), '顶栏与页签');
+    expect(subpageOf('顶栏页签圆点'), '顶栏与页签');
+    expect(subpageOf('横屏隐藏状态栏'), '屏幕与视频');
+    expect(subpageOf('播放时保持屏幕常亮'), '屏幕与视频');
     // 歌词动画是独立整屏页入口，保留在二级页避免四级导航（R5）
     expect(subpageOf('歌词动画'), isEmpty);
   });
@@ -156,6 +166,10 @@ void main() {
         '播放页背景模糊',
         '歌词省电模式',
         '歌词动画',
+        '横屏控制面板独立页',
+        '胶囊按钮收缩',
+        '顶栏页签圆点',
+        '顶栏与页签',
         '音乐频谱环绕',
         '频谱柱数量',
         '频谱动态取色',
@@ -163,6 +177,7 @@ void main() {
         '频谱曲线透明度',
         '频谱背景透明度',
         '频谱背景高度',
+        '进度条波浪起伏',
       ]),
     );
   });
@@ -171,7 +186,9 @@ void main() {
     expect(subpageOf('翻译歌词'), '歌词推送');
     expect(subpageOf('罗马音歌词'), '歌词推送');
     expect(subpageOf('ColorOS Bridge 兼容字段'), '歌词推送');
-    expect(subpageOf('解锁桌面歌词'), '设备歌词');
+    // 2026-10：原「解锁桌面歌词」单行已被「桌面歌词外观」面板取代
+    // （解锁/点击穿透等并入其别名，见 desktop_lyric_settings_panel.dart）
+    expect(subpageOf('桌面歌词外观'), '设备歌词');
     expect(subpageOf('蓝牙歌词'), '设备歌词');
     expect(subpageOf('压缩封面图'), '设备歌词');
     expect(subpageOf('锁屏歌词（实验性）'), '设备歌词');
@@ -190,6 +207,7 @@ void main() {
     for (final category in const [
       'USB 独占',
       'AI 代理',
+      '震动反馈',
       '缓存与数据',
       '关于',
       '主页管理',

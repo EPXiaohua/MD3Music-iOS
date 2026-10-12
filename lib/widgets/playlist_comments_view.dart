@@ -1,11 +1,15 @@
+import 'comment_verification.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'tv_dropdown_menu.dart';
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../core/build_flags.dart';
 import '../core/theme/app_dimens.dart';
+import '../core/utils/app_haptics.dart';
 import '../core/utils/app_toast.dart';
 import '../providers/kugou_provider.dart';
 import '../providers/comment_display_provider.dart';
@@ -119,9 +123,9 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     for (final scope in CommentScope.values)
       M3EDropdownItem(
         label: switch (scope) {
-          CommentScope.all => '全部评论',
-          CommentScope.singer => '歌手评论',
-          CommentScope.mine => '我的评论',
+          CommentScope.all => '全部',
+          CommentScope.singer => '歌手',
+          CommentScope.mine => '我的',
         },
         value: scope,
         selected: scope == CommentScope.all,
@@ -344,6 +348,13 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     }
   }
 
+  /// 展开 / 收起楼中楼。
+  ///
+  /// tv: 展开后焦点**保持**在头部停点。回复是 [_fetchFloorReplies] 异步拉回的，
+  /// 任何 requestFocus 都属于「异步内容抢焦点」（AGENTS §12.4 规则 7），且换焦点会
+  /// 触发 dpad 的 ensureVisible，与收起路径的 [_scrollToCommentAfterCollapse] 抢同一套
+  /// 滚动。按「下」即进入第一条回复，各回复尺寸正常、自然滚进视野。
+  /// 同一份逻辑在 lib/modules/player/comments_view.dart，改动需同步。
   void _toggleFloor(KugouComment comment) {
     final state = _getFloorState(comment.id);
     final wasExpanded = state.expanded;
@@ -417,7 +428,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
         }
         if (mounted) showToast('评论已提交，审核通过后展示');
       } else {
-        showToast(result.message, long: true);
+        await handleCommentFailure(context, result);
       }
       return result.ok;
     } finally {
@@ -439,9 +450,10 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
       ),
     );
     if (go != true || !mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const LoginPage()),
-    );
+    await Navigator.of(context,
+      rootNavigator: true,
+    ).push(
+      MaterialPageRoute(builder: (_) => const LoginPage()));
     if (mounted) setState(() {});
   }
 
@@ -635,7 +647,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           Flexible(
             child: SizedBox(
               width: 112,
-              child: M3EDropdownMenu<CommentScope>(
+              child: TvDropdownMenu<CommentScope>(
               items: _scopeItems,
               singleSelect: true,
               showChipAnimation: false,
@@ -645,7 +657,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                 // setItems（父级任何重建都会触发）也会回调到这里：
                 // 同值直接忽略，避免 build 期间 setState
                 if (scope == _scope) return;
-                HapticFeedback.selectionClick();
+                AppHaptics.selectionClick(HapticCategory.control);
                 setState(() => _scope = scope);
               },
               fieldStyle: const M3EDropdownFieldStyle(
@@ -863,7 +875,8 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
             onRefresh: () => _fetchComments(silent: true),
             child: ListView.builder(
             controller: _scrollController,
-            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm,
+              ),
             itemCount: displayItems.length + (_hasMore ? 1 : 0),
             itemBuilder: (context, index) {
               if (index == displayItems.length) {
@@ -871,8 +884,11 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                   child: Padding(
                     padding: const EdgeInsets.all(AppSpacing.lg),
                     child: _isLoadingMore
-                        ? const M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24))
-                        : TextButton(onPressed: _loadMore, child: const Text('加载更多')),
+                        ? const M3ELoadingIndicator(constraints: BoxConstraints.tightFor(width: 24, height: 24,
+                              ),
+                            )
+                        : TextButton(onPressed: _loadMore, child: const Text('加载更多'),
+                            ),
                   ),
                 );
               }
@@ -924,6 +940,66 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
     double replyFontSize,
   ) {
     final floorState = _floorStates[comment.id];
+    final head = _commentHeadChildren(
+      comment,
+      floorState,
+      colorScheme,
+      commentFontSize,
+    );
+    final floorBody = _commentFloorBody(
+      comment,
+      floorState,
+      colorScheme,
+      replyFontSize,
+    );
+    final isOwn = isOwnComment(comment, KugouApiClient().userid);
+    // 卡片动作：有楼中楼就展开/收起，无回复时长文展开/收起（与拆分前同一判据）
+    final VoidCallback? toggle = comment.replyCount > 0
+        ? () => _toggleFloor(comment)
+        : (_needsTruncate(comment.content)
+              ? () => _toggleContent(comment.id)
+              : null);
+
+    // tv: 楼中楼必须从卡片停点里拆出来。整卡当停点时，焦点矩形＝展开后的真实高度
+    // （可达数屏），dpad 的 DpadScroll.ensureVisible 对超视口目标走「居中」分支并被
+    // clamp 到 maxScrollExtent → 展开即跳列表最底；同时未裁切的巨高矩形让「下」方向
+    // 的候选判定永不把卡内回复当候选，而卡内一切又都在 ExcludeFocus 里
+    // （「加载更多回复」不可达）。
+    // 拆分后：头部一个停点 + 每条回复一个停点 + 加载更多回复停点，尺寸正常，自然滚动回归。
+    // 卡内图片九宫格/点赞行小控件在 TV 上仍不是独立停点（纯手势点触目标）。
+    final Widget contentColumn = kTvBuild
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              DpadFocusable(
+                debugLabel: 'tv/playlist-comment-head-${comment.id}',
+                onSelect: toggle,
+                onLongSelect: isOwn
+                    ? () {
+                        AppHaptics.mediumImpact(HapticCategory.listItem);
+                        _deleteOwnComment(comment);
+                      }
+                    : null,
+                // SizedBox(width: double.infinity) 把头部宽度钉回外层列宽；
+                // 内层 Column 必须显式 start，默认 center 会让正文整体右移。
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: head,
+                  ),
+                ),
+              ),
+              floorBody,
+            ],
+          )
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [...head, floorBody],
+          );
+
+    // key 继续挂在整项 Padding 上（不要下沉到头部）：_commentTopInViewport 量的
+    // 是整项顶部相对视口的位置，_scrollToCommentAfterCollapse 靠它收起后回位。
     final Widget item = Padding(
       key: _keyForComment(comment.id),
       padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
@@ -932,182 +1008,214 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
         children: [
           _buildAvatar(comment, colorScheme),
           const Gap(AppSpacing.md),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 用户名 + 徽章 + 时间
-                Row(
-                  children: [
-                    Flexible(
-                      child: Text(
-                        comment.username,
-                        style: Theme.of(context).textTheme.labelMedium
-                            ?.copyWith(
-                              color: colorScheme.primary,
-                              fontWeight: FontWeight.w500,
-                            ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (comment.isStar) ...[
-                      const SizedBox(width: 6),
-                      _buildBadge('歌手', colorScheme),
-                    ],
-                    if (comment.isHot) ...[
-                      const SizedBox(width: 6),
-                      _buildBadge('热门', colorScheme),
-                    ],
-                    const Gap(AppSpacing.sm),
-                    Text(
-                      _formatTime(comment.time),
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: colorScheme.onSurfaceVariant.withValues(
-                          alpha: 0.6,
-                        ),
-                      ),
-                    ),
-                  ],
+          Expanded(child: contentColumn),
+        ],
+      ),
+    );
+
+    // 手机侧本人评论的长按删除仍包在整卡上（与拆分前逐字一致）；TV 已接到头部停点
+    if (isOwn && !kTvBuild) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onLongPress: () {
+          AppHaptics.mediumImpact(HapticCategory.listItem);
+          _deleteOwnComment(comment);
+        },
+        child: item,
+      );
+    }
+    return item;
+  }
+
+  /// 评论卡「头部」子项（用户名/正文/图片/点赞回复行），**不含楼中楼**。
+  ///
+  /// 单一事实来源：手机侧把这份 List 和楼中楼直接平铺进外层 Column（与拆分前
+  /// 逐层等价），TV 侧只把这份 List 包进头部停点。两条装配路径共用同一份，
+  /// 避免评论正文写两遍日后走样。
+  /// 同一份逻辑在 lib/modules/player/comments_view.dart，改动需同步。
+  List<Widget> _commentHeadChildren(
+    KugouComment comment,
+    _FloorState? floorState,
+    ColorScheme colorScheme,
+    double commentFontSize,
+  ) {
+    return [
+      // 用户名 + 徽章 + 时间
+      Row(
+        children: [
+          Flexible(
+            child: Text(
+              comment.username,
+              style: Theme.of(context).textTheme.labelMedium
+                  ?.copyWith(
+                    color: colorScheme.primary,
+                    fontWeight: FontWeight.w500,
+                  ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (comment.isStar) ...[
+            const SizedBox(width: 6),
+            _buildBadge('歌手', colorScheme),
+          ],
+          if (comment.isHot) ...[
+            const SizedBox(width: 6),
+            _buildBadge('热门', colorScheme),
+          ],
+          const Gap(AppSpacing.sm),
+          Text(
+            _formatTime(comment.time),
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: colorScheme.onSurfaceVariant.withValues(
+                alpha: 0.6,
+              ),
+            ),
+          ),
+        ],
+      ),
+      const Gap(AppSpacing.xs),
+      // 评论内容（长评论展开/收起，带动画）
+      AnimatedSize(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeInOut,
+        alignment: Alignment.topLeft,
+        child: _buildContent(comment, colorScheme, commentFontSize),
+      ),
+      if (comment.images.isNotEmpty) ...[
+        const SizedBox(height: 6),
+        CommentImageGrid(
+          images: comment.images,
+          onTapImage: (index, originRect) => showCommentImageViewer(
+            context,
+            images: comment.images,
+            initialIndex: index,
+            originRect: originRect,
+          ),
+        ),
+      ],
+      // 点赞 + 回复
+      const SizedBox(height: 6),
+      Row(
+        children: [
+          if (comment.likes > 0) ...[
+            Icon(
+              Icons.thumb_up_outlined,
+              size: 12,
+              color: colorScheme.onSurfaceVariant.withValues(
+                alpha: 0.5,
+              ),
+            ),
+            const Gap(AppSpacing.xs),
+            Text(
+              _formatLike(comment.likes),
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: colorScheme.onSurfaceVariant.withValues(
+                  alpha: 0.5,
                 ),
-                const Gap(AppSpacing.xs),
-                // 评论内容（长评论展开/收起，带动画）
-                AnimatedSize(
-                  duration: const Duration(milliseconds: 200),
-                  curve: Curves.easeInOut,
-                  alignment: Alignment.topLeft,
-                  child: _buildContent(comment, colorScheme, commentFontSize),
-                ),
-                if (comment.images.isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  CommentImageGrid(
-                    images: comment.images,
-                    onTapImage: (index) => showCommentImageViewer(
-                      context,
-                      images: comment.images,
-                      initialIndex: index,
+              ),
+            ),
+          ],
+          // 回复按钮
+          if (comment.replyCount > 0) ...[
+            const Gap(AppSpacing.lg),
+            GestureDetector(
+              onTap: () => _toggleFloor(comment),
+              child: Row(
+                children: [
+                  AnimatedRotation(
+                    turns: floorState?.expanded == true ? 0.5 : 0,
+                    duration: const Duration(milliseconds: 200),
+                    child: Icon(
+                      Icons.expand_more,
+                      size: 14,
+                      color: colorScheme.primary,
                     ),
                   ),
+                  const Gap(AppSpacing.xs),
+                  Text(
+                    floorState?.expanded == true
+                        ? '收起回复'
+                        : '查看${comment.replyCount}条回复',
+                    style: Theme.of(context).textTheme.labelSmall
+                        ?.copyWith(color: colorScheme.primary),
+                  ),
                 ],
-                // 点赞 + 回复
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    if (comment.likes > 0) ...[
-                      Icon(
-                        Icons.thumb_up_outlined,
-                        size: 12,
-                        color: colorScheme.onSurfaceVariant.withValues(
-                          alpha: 0.5,
-                        ),
-                      ),
-                      const Gap(AppSpacing.xs),
-                      Text(
-                        _formatLike(comment.likes),
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: colorScheme.onSurfaceVariant.withValues(
-                            alpha: 0.5,
-                          ),
-                        ),
-                      ),
-                    ],
-                    // 回复按钮
-                    if (comment.replyCount > 0) ...[
-                      const Gap(AppSpacing.lg),
-                      GestureDetector(
-                        onTap: () => _toggleFloor(comment),
-                        child: Row(
-                          children: [
-                            AnimatedRotation(
-                              turns: floorState?.expanded == true ? 0.5 : 0,
-                              duration: const Duration(milliseconds: 200),
-                              child: Icon(
-                                Icons.expand_more,
-                                size: 14,
-                                color: colorScheme.primary,
-                              ),
-                            ),
-                            const Gap(AppSpacing.xs),
-                            Text(
-                              floorState?.expanded == true
-                                  ? '收起回复'
-                                  : '查看${comment.replyCount}条回复',
-                              style: Theme.of(context).textTheme.labelSmall
-                                  ?.copyWith(color: colorScheme.primary),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                    const Gap(AppSpacing.lg),
-                    GestureDetector(
-                      onTap: () {
-                        HapticFeedback.selectionClick();
-                        setState(() => _replyTarget = CommentReplyTarget(top: comment));
-                      },
-                      child: Row(
-                        children: [
-                          Icon(Icons.reply, size: 14, color: colorScheme.primary),
-                          const Gap(AppSpacing.xs),
-                          Text(
-                            '回复',
-                            style: Theme.of(context)
-                                .textTheme
-                                .labelSmall
-                                ?.copyWith(color: colorScheme.primary),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                // 楼层评论（带展开动画）
-                AnimatedSize(
-                  duration: const Duration(milliseconds: 250),
-                  curve: Curves.easeInOut,
-                  alignment: Alignment.topLeft,
-                  child: floorState?.expanded == true
-                      // 左侧竖条收纳按钮 + 楼中楼内容
-                      ? IntrinsicHeight(
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              _buildFloorCollapseHandle(
-                                onTap: () => _toggleFloor(comment),
-                                lineColor: colorScheme.onSurfaceVariant
-                                    .withValues(alpha: 0.28),
-                                iconColor: colorScheme.primary,
-                              ),
-                              const Gap(AppSpacing.sm),
-                              Expanded(
-                                child: _buildFloorReplies(
-                                  comment,
-                                  floorState!,
-                                  colorScheme,
-                                  replyFontSize,
-                                ),
-                              ),
-                            ],
-                          ),
-                        )
-                      : const SizedBox.shrink(),
+              ),
+            ),
+          ],
+          const Gap(AppSpacing.lg),
+          GestureDetector(
+            onTap: () => _beginReply(CommentReplyTarget(top: comment)),
+            child: Row(
+              children: [
+                Icon(Icons.reply, size: 14, color: colorScheme.primary),
+                const Gap(AppSpacing.xs),
+                Text(
+                  '回复',
+                  style: Theme.of(context)
+                      .textTheme
+                      .labelSmall
+                      ?.copyWith(color: colorScheme.primary),
                 ),
               ],
             ),
           ),
         ],
       ),
-    );
+    ];
+  }
 
-    // 自己的评论支持长按删除；非本人评论不响应长按
-    if (!isOwnComment(comment, KugouApiClient().userid)) return item;
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onLongPress: () {
-        HapticFeedback.mediumImpact();
-        _deleteOwnComment(comment);
-      },
-      child: item,
+  /// 楼层评论（楼中楼，带展开动画 + 左侧竖条收纳把手），**不含评论卡头部**。
+  ///
+  /// 与 [_commentHeadChildren] 配对，两条装配路径共用同一份。
+  /// 同一份逻辑在 lib/modules/player/comments_view.dart，改动需同步。
+  Widget _commentFloorBody(
+    KugouComment comment,
+    _FloorState? floorState,
+    ColorScheme colorScheme,
+    double replyFontSize,
+  ) {
+    // 楼层评论（带展开动画）
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeInOut,
+      alignment: Alignment.topLeft,
+      child: floorState?.expanded == true
+          // 左侧竖条收纳按钮 + 楼中楼内容
+          ? IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _buildFloorCollapseHandle(
+                    onTap: () => _toggleFloor(comment),
+                    lineColor: colorScheme.onSurfaceVariant
+                        .withValues(alpha: 0.28),
+                    iconColor: colorScheme.primary,
+                  ),
+                  const Gap(AppSpacing.sm),
+                  Expanded(
+                    child: _buildFloorReplies(
+                      comment,
+                      floorState!,
+                      colorScheme,
+                      replyFontSize,
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : const SizedBox.shrink(),
     );
+  }
+
+  /// 进入「回复这条评论」模式：触屏点按与 TV 停点共用这一份，
+  /// 保证 TV 不砍掉任何既有能力。
+  ///
+  /// 本组件的输入框常驻（无 showComposer/onReplyComment 分支），就地进入回复模式。
+  /// 同一份逻辑在 lib/modules/player/comments_view.dart，改动需同步。
+  void _beginReply(CommentReplyTarget target) {
+    AppHaptics.selectionClick(HapticCategory.control);
+    setState(() => _replyTarget = target);
   }
 
   Widget _buildContent(
@@ -1185,7 +1293,6 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
         text,
         style: Theme.of(context).textTheme.labelSmall?.copyWith(
           color: colorScheme.primary,
-          fontSize: 10,
           fontWeight: FontWeight.bold,
         ),
       ),
@@ -1196,51 +1303,59 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
   ///
   /// 一条与楼中楼等高的竖线 + 底部向上箭头，整条可点击收起楼中楼，
   /// 方便在楼中楼较长时无需滚回顶部即可收纳。仅在展开楼中楼时渲染。
+  ///
+  /// tv: 不适用（竖条收纳把手是纯手势命中区）；TV 收起走头部停点的
+  /// onSelect（同一 [_toggleFloor] 入口），功能未少。
+  /// 同一份逻辑在 lib/modules/player/comments_view.dart，改动需同步。
   Widget _buildFloorCollapseHandle({
     required VoidCallback onTap,
     required Color lineColor,
     required Color iconColor,
   }) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: SizedBox(
-        width: 20,
-        child: Column(
-          children: [
-            // 顶部圆点：与右侧楼中楼矩形顶部（margin top 10）对齐
-            Padding(
-              padding: const EdgeInsets.only(top: 10),
-              child: Container(
-                width: 4,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: lineColor,
-                  shape: BoxShape.circle,
+    return Semantics(
+      button: true,
+      label: '收起回复',
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: SizedBox(
+          width: 20,
+          child: Column(
+            children: [
+              // 顶部圆点：与右侧楼中楼矩形顶部（margin top 10）对齐
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Container(
+                  width: 4,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: lineColor,
+                    shape: BoxShape.circle,
+                  ),
                 ),
               ),
-            ),
-            // 竖线：从圆点下方延伸到楼中楼底部
-            Expanded(
-              child: Container(
-                width: 2,
-                margin: const EdgeInsets.only(top: 3),
-                decoration: BoxDecoration(
-                  color: lineColor,
-                  borderRadius: BorderRadius.circular(1),
+              // 竖线：从圆点下方延伸到楼中楼底部
+              Expanded(
+                child: Container(
+                  width: 2,
+                  margin: const EdgeInsets.only(top: 3),
+                  decoration: BoxDecoration(
+                    color: lineColor,
+                    borderRadius: BorderRadius.circular(1),
+                  ),
                 ),
               ),
-            ),
-            // 底部收纳图标
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Icon(
-                Icons.keyboard_arrow_up,
-                size: 16,
-                color: iconColor,
+              // 底部收纳图标
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Icon(
+                  Icons.keyboard_arrow_up,
+                  size: 16,
+                  color: iconColor,
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1292,18 +1407,38 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
           // 加载更多
           if (state.hasMore && !state.loading && state.replies.isNotEmpty)
             Center(
-              child: GestureDetector(
-                onTap: () => _fetchFloorReplies(comment),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Text(
-                    state.message.contains('失败') ? '加载失败，点击重试' : '加载更多回复',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                      color: colorScheme.primary,
+              // tv: 「加载更多回复」单停点（GestureDetector 不可聚焦；
+              // OK=加载下一页楼中楼）。楼中楼从卡片停点拆出来后才真正可达。
+              child: kTvBuild
+                  ? DpadFocusable(
+                      debugLabel: 'tv/playlist-comment-floor-more-${comment.id}',
+                      onSelect: () => _fetchFloorReplies(comment),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Text(
+                          state.message.contains('失败') ? '加载失败，点击重试' : '加载更多回复',
+                          style: Theme.of(
+                            context,
+                          ).textTheme.labelSmall?.copyWith(
+                            color: colorScheme.primary,
+                          ),
+                        ),
+                      ),
+                    )
+                  : GestureDetector(
+                      onTap: () => _fetchFloorReplies(comment),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Text(
+                          state.message.contains('失败') ? '加载失败，点击重试' : '加载更多回复',
+                          style: Theme.of(
+                            context,
+                          ).textTheme.labelSmall?.copyWith(
+                            color: colorScheme.primary,
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-              ),
             ),
           // 全部加载完
           if (!state.hasMore && !state.loading && state.replies.isNotEmpty)
@@ -1314,7 +1449,6 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                   '已加载全部回复',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
                     color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
-                    fontSize: 10,
                   ),
                 ),
               ),
@@ -1377,7 +1511,6 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                         color: colorScheme.onSurfaceVariant.withValues(
                           alpha: 0.5,
                         ),
-                        fontSize: 10,
                       ),
                     ),
                   ],
@@ -1395,10 +1528,11 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                   const SizedBox(height: 6),
                   CommentImageGrid(
                     images: reply.images,
-                    onTapImage: (index) => showCommentImageViewer(
+                    onTapImage: (index, originRect) => showCommentImageViewer(
                       context,
                       images: reply.images,
                       initialIndex: index,
+                      originRect: originRect,
                     ),
                   ),
                 ],
@@ -1406,11 +1540,7 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
                 const Gap(AppSpacing.xxs),
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: () {
-                    HapticFeedback.selectionClick();
-                    setState(() => _replyTarget =
-                        CommentReplyTarget(top: top, reply: reply));
-                  },
+                  onTap: () => _beginReply(CommentReplyTarget(top: top, reply: reply)),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -1433,12 +1563,30 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
       ),
     );
 
+    final isOwn = isOwnComment(reply, KugouApiClient().userid);
+    // tv: 每条回复各自一个停点。onSelect＝触屏那条「回复」按钮的同一动作（_beginReply），
+    // 本人回复把长按删除接 onLongSelect——dpad 里给了 onLongSelect 时 onSelect 改在松手触发，
+    // 两者永不重叠，与卡片头部停点同一口径。卡内图片九宫格在 TV 仍不是停点：
+    // tv: 不适用（图片查看依赖拖动/双指缩放，遥控无等价语义）。
+    if (kTvBuild) {
+      return DpadFocusable(
+        debugLabel: 'tv/playlist-comment-reply-${reply.id}',
+        onSelect: () => _beginReply(CommentReplyTarget(top: top, reply: reply)),
+        onLongSelect: isOwn
+            ? () {
+                AppHaptics.mediumImpact(HapticCategory.listItem);
+                _deleteOwnComment(reply, floorRoot: top);
+              }
+            : null,
+        child: item,
+      );
+    }
     // 自己的回复支持长按删除；非本人回复不响应长按
-    if (!isOwnComment(reply, KugouApiClient().userid)) return item;
+    if (!isOwn) return item;
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
       onLongPress: () {
-        HapticFeedback.mediumImpact();
+        AppHaptics.mediumImpact(HapticCategory.listItem);
         _deleteOwnComment(reply, floorRoot: top);
       },
       child: item,

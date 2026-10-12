@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/utils/local_lyric_loader.dart';
+import 'package:md3music/widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 
 /// LocalLyricLoader 单元测试
 ///
@@ -84,6 +85,31 @@ void main() {
     final result = LocalLyricLoader.loadForAudio(f.path);
 
     expect(result, '[00:01.000]第一句\n[00:02.500]第二句');
+  });
+
+  test('L8. 本地双行 .lrc → 解析后第二行进 translation、第三行进 roma', () {
+    final audio = _write('song.mp3', 'not a real mp3');
+    _write(
+      'song.lrc',
+      '[00:19.25]今天我寒夜里看雪飘过\n'
+      '[00:19.25]gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3\n'
+      '[00:19.25]Today I watch the snow drift by\n'
+      '[00:24.31]怀着冷却了的心窝漂远方',
+    );
+
+    final raw = LocalLyricLoader.loadForAudio(audio.path);
+    expect(raw, isNotNull);
+
+    final lines = LyricParserChain.parse(raw!);
+    expect(lines, hasLength(2));
+    expect(lines.first.startTime, 19250);
+    expect(lines.first.text, '今天我寒夜里看雪飘过');
+    expect(
+      lines.first.translation,
+      'gam1 tin1 ngo5 hon4 je6 leoi5 hon3 syut3 piu1 gwo3',
+    );
+    expect(lines.first.roma, 'Today I watch the snow drift by');
+    expect(lines.last.text, '怀着冷却了的心窝漂远方');
   });
 }
 
