@@ -119,7 +119,7 @@ jobs:
       # 启用 DEPTH_3D_LINKED 编译条件（标准构建已在上一步用占位空配置完成）
       - name: Prepare ONNX Runtime for 3D variant
         run: |
-          curl -fL --retry 3 -o /tmp/ort.zip https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.22.0.zip
+          curl -fL --retry 3 -o /tmp/ort.zip https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip
           mkdir -p /tmp/ort_extract ios/ort
           cd /tmp/ort_extract
           unzip -q /tmp/ort.zip

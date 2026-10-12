@@ -209,8 +209,10 @@ private enum Ort {
   static let arenaAllocator: Int32 = 1
   /// OrtMemType.OrtMemTypeDefault
   static let memTypeDefault: Int32 = 0
-  /// 请求的 API 版本（打包的 onnxruntime-c 1.22.0）
-  static let apiVersion: UInt32 = 22
+  // 必须与 CI 打包的 ORT 静态库版本一致（ios-build.yml 下载 onnxruntime-c-1.30.0）。
+  // 上游 Android 也用 1.30.0（自编 reduced-ops AAR）；OrtApi 只增不改，
+  // 前 110 字段声明对所有 >=1.22 版本有效，升版只需改此常量。
+  static let apiVersion: UInt32 = 30
 }
 
 private enum DepthError: Error, CustomStringConvertible {
