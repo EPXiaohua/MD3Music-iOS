@@ -30,12 +30,16 @@ import Flutter
 func OrtGetApiBase() -> UnsafePointer<OrtApiBase>?
 
 struct OrtApiBase {
-  let GetApi: @convention(c) (UInt32) -> UnsafePointer<OrtApi>?
+  // GetApi 返回 UnsafeRawPointer（C 函数指针类型不能携带 Swift struct 指针，
+  // 需在使用点 assumingMemoryBound 重新绑定到 OrtApi）。
+  let GetApi: @convention(c) (UInt32) -> UnsafeRawPointer?
   let GetVersionString: @convention(c) () -> UnsafePointer<CChar>?
 }
 
 /// 未使用的 OrtApi 字段占位类型（所有字段均为函数指针，8 字节，布局不变）。
-private typealias OrtFn = @convention(c) () -> OpaquePointer?
+/// 注意：不能声明为 private —— OrtApi（internal）的属性引用 private 类型
+/// 会触发 "Property must be declared fileprivate" 编译错误。
+typealias OrtFn = @convention(c) () -> OpaquePointer?
 
 /// OrtApi v1.22 前缀（字段 1..110，顺序与 onnxruntime_c_api.h 逐字段一致）。
 /// 1-3 Status / 4-7 Env / 8-11 Session+Run / 12-26 SessionOptions /
@@ -664,10 +668,10 @@ private enum PullPushFiller {
     guard let base = OrtGetApiBase() else {
       throw DepthError.failed("OrtGetApiBase unavailable")
     }
-    guard let a = base.pointee.GetApi(Ort.apiVersion) else {
+    guard let raw = base.pointee.GetApi(Ort.apiVersion) else {
       throw DepthError.failed("OrtGetApiBase().GetApi(\(Ort.apiVersion)) returned null")
     }
-    api = a
+    api = raw.assumingMemoryBound(to: OrtApi.self)
     if let ver = ortVersionString() {
       NSLog("[DepthCover] onnxruntime version %@", ver)
     }
