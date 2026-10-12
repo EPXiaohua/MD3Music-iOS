@@ -493,6 +493,10 @@ private enum PullPushFiller {
   private var allocator: OpaquePointer?
   private var session: OpaquePointer?
   private var inpaintSession: OpaquePointer?
+  // CreateSessionFromArray 零拷贝引用模型 buffer，必须与会话同生命周期保活，
+  // 否则首次 Run 读权重时访问悬垂内存（SIGBUS）
+  private var depthModelData: Data?
+  private var inpaintModelData: Data?
   private var channelsAttached = false
 
   private override init() {
@@ -737,9 +741,13 @@ private enum PullPushFiller {
     }
     NSLog("[DepthCover] loadModel begin: %@ (%d bytes)", path, data.count)
     let s = try createSession(modelData: data)
-    // 新会话创建成功后再释放旧会话（失败时保留旧会话可用）
+    // 新会话创建成功后再释放旧会话（失败时保留旧会话可用）。
+    // 关键：modelData 必须保活到会话释放 —— CreateSessionFromArray 零拷贝引用
+    // buffer（大 initializer 直接指向原内存），Run 时才真正读权重；
+    // 若 data 随局部作用域释放 → 首次 Run 访问悬垂指针 → SIGBUS。
     if let old = session { api.pointee.ReleaseSession(old) }
     session = s
+    depthModelData = data
   }
 
   private func loadInpaintModel() throws {
@@ -757,8 +765,10 @@ private enum PullPushFiller {
     }
     NSLog("[DepthCover] loadInpaintModel begin: %@ (%d bytes)", path, data.count)
     let s = try createSession(modelData: data)
+    // modelData 保活到会话释放（同 loadModel，CreateSessionFromArray 零拷贝引用）
     if let old = inpaintSession { api.pointee.ReleaseSession(old) }
     inpaintSession = s
+    inpaintModelData = data
   }
 
   // MARK: generate（三层切割）
