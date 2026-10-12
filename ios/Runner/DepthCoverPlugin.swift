@@ -681,17 +681,17 @@ private enum PullPushFiller {
     guard let api = api else { throw DepthError.failed("ORT api not initialized") }
     if env == nil {
       var e: OpaquePointer?
-      try ortCheck(api.CreateEnv(Ort.loggingWarning, "depth_cover", &e), "CreateEnv")
+      try ortCheck(api.pointee.CreateEnv(Ort.loggingWarning, "depth_cover", &e), "CreateEnv")
       env = e
     }
     if memInfo == nil {
       var m: OpaquePointer?
-      try ortCheck(api.CreateCpuMemoryInfo(Ort.arenaAllocator, Ort.memTypeDefault, &m), "CreateCpuMemoryInfo")
+      try ortCheck(api.pointee.CreateCpuMemoryInfo(Ort.arenaAllocator, Ort.memTypeDefault, &m), "CreateCpuMemoryInfo")
       memInfo = m
     }
     if allocator == nil {
       var al: OpaquePointer?
-      try ortCheck(api.GetAllocatorWithDefaultOptions(&al), "GetAllocatorWithDefaultOptions")
+      try ortCheck(api.pointee.GetAllocatorWithDefaultOptions(&al), "GetAllocatorWithDefaultOptions")
       allocator = al
     }
   }
@@ -702,14 +702,14 @@ private enum PullPushFiller {
     }
     // 会话选项：4 线程 + 禁用图优化（对齐 Android NO_OPT，裁剪模型缺融合内核）
     var opts: OpaquePointer?
-    try ortCheck(api.CreateSessionOptions(&opts), "CreateSessionOptions")
-    defer { if let o = opts { api.ReleaseSessionOptions(o) } }
-    try ortCheck(api.SetIntraOpNumThreads(opts, 4), "SetIntraOpNumThreads")
-    try ortCheck(api.SetSessionGraphOptimizationLevel(opts, Ort.disableAll), "SetSessionGraphOptimizationLevel")
+    try ortCheck(api.pointee.CreateSessionOptions(&opts), "CreateSessionOptions")
+    defer { if let o = opts { api.pointee.ReleaseSessionOptions(o) } }
+    try ortCheck(api.pointee.SetIntraOpNumThreads(opts, 4), "SetIntraOpNumThreads")
+    try ortCheck(api.pointee.SetSessionGraphOptimizationLevel(opts, Ort.disableAll), "SetSessionGraphOptimizationLevel")
     var out: OpaquePointer?
     try modelData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
       try ortCheck(
-        api.CreateSessionFromArray(env, raw.baseAddress, raw.count, opts, &out),
+        api.pointee.CreateSessionFromArray(env, raw.baseAddress, raw.count, opts, &out),
         "CreateSessionFromArray")
     }
     guard let s = out else { throw DepthError.failed("CreateSessionFromArray returned null session") }
@@ -738,7 +738,7 @@ private enum PullPushFiller {
     NSLog("[DepthCover] loadModel begin: %@ (%d bytes)", path, data.count)
     let s = try createSession(modelData: data)
     // 新会话创建成功后再释放旧会话（失败时保留旧会话可用）
-    if let old = session { api.ReleaseSession(old) }
+    if let old = session { api.pointee.ReleaseSession(old) }
     session = s
   }
 
@@ -757,7 +757,7 @@ private enum PullPushFiller {
     }
     NSLog("[DepthCover] loadInpaintModel begin: %@ (%d bytes)", path, data.count)
     let s = try createSession(modelData: data)
-    if let old = inpaintSession { api.ReleaseSession(old) }
+    if let old = inpaintSession { api.pointee.ReleaseSession(old) }
     inpaintSession = s
   }
 
@@ -782,8 +782,9 @@ private enum PullPushFiller {
 
     // 3) 深度带切割：layer0=远(背景) layer2=近(前景)，平滑羽化避免硬边
     var paths: [String] = []
+    let filledCover = Cover(rgba: filled, w: src.w, h: src.h)
     for (li, band) in Self.bands.enumerated() {
-      let layer = splitLayer(li == 0 ? filled : src, norm, lo: band.0, hi: band.1)
+      let layer = splitLayer(li == 0 ? filledCover : src, norm, lo: band.0, hi: band.1)
       let f = URL(fileURLWithPath: outDir).appendingPathComponent("layer\(li).png").path
       try writePNGRGBA(layer, w: src.w, h: src.h, to: f)
       paths.append(f)
@@ -875,11 +876,11 @@ private enum PullPushFiller {
     var creationStatus: OpaquePointer?
     // data 缓冲不拷贝、被 tensor 引用，必须在 Run 结束前保活（同一作用域内）
     data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-      creationStatus = api.CreateTensorWithDataAsOrtValue(
+      creationStatus = api.pointee.CreateTensorWithDataAsOrtValue(
         memInfo, raw.baseAddress, raw.count, shape, shape.count, Ort.typeFloat, &tensor)
     }
     try ortCheck(creationStatus, "create input tensor")
-    defer { if let t = tensor { api.ReleaseValue(t) } }
+    defer { if let t = tensor { api.pointee.ReleaseValue(t) } }
     guard tensor != nil else { throw DepthError.failed("input tensor null") }
 
     var outValue: OpaquePointer?
@@ -888,15 +889,15 @@ private enum PullPushFiller {
       var outputs: [OpaquePointer?] = [nil]
       var inNames: [UnsafePointer<CChar>?] = [names[0]]
       var outNames: [UnsafePointer<CChar>?] = [names[1]]
-      try ortCheck(api.Run(session, nil, inNames, inputs, 1, outNames, 1, &outputs), "Run")
+      try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 1, outNames, 1, &outputs), "Run")
       outValue = outputs[0]
     }
     guard let ov = outValue else { throw DepthError.failed("Run produced no output") }
-    defer { api.ReleaseValue(ov) }
+    defer { api.pointee.ReleaseValue(ov) }
 
     let (_, count) = try tensorDims(ov)
     var ptr: UnsafeMutableRawPointer?
-    try ortCheck(api.GetTensorMutableData(ov, &ptr), "GetTensorMutableData")
+    try ortCheck(api.pointee.GetTensorMutableData(ov, &ptr), "GetTensorMutableData")
     guard let p = ptr else { throw DepthError.failed("output data null") }
     let floats = p.assumingMemoryBound(to: Float.self)
     return Array(UnsafeBufferPointer(start: floats, count: count))
@@ -978,7 +979,7 @@ private enum PullPushFiller {
       // 3) 按张量维度识别 image/mask 输入名（image: dim1==3；mask: dim1==1）
       let inCount: Int
       var cnt: Int = 0
-      try ortCheck(api.SessionGetInputCount(session, &cnt), "SessionGetInputCount")
+      try ortCheck(api.pointee.SessionGetInputCount(session, &cnt), "SessionGetInputCount")
       inCount = cnt
       var imgName: String?
       var mskName: String?
@@ -1001,19 +1002,19 @@ private enum PullPushFiller {
       var sImg: OpaquePointer?
       var sMask: OpaquePointer?
       rgb.withUnsafeMutableBytes { (rr: UnsafeMutableRawBufferPointer) in
-        sImg = api.CreateTensorWithDataAsOrtValue(
+        sImg = api.pointee.CreateTensorWithDataAsOrtValue(
           memInfo, rr.baseAddress, rr.count, shapeImg, shapeImg.count, Ort.typeUint8, &tImg)
       }
       try ortCheck(sImg, "create migan image tensor")
       guard tImg != nil else { throw DepthError.failed("migan image tensor null") }
-      defer { if let t = tImg { api.ReleaseValue(t) } }
+      defer { if let t = tImg { api.pointee.ReleaseValue(t) } }
       maskU8.withUnsafeMutableBytes { (rm: UnsafeMutableRawBufferPointer) in
-        sMask = api.CreateTensorWithDataAsOrtValue(
+        sMask = api.pointee.CreateTensorWithDataAsOrtValue(
           memInfo, rm.baseAddress, rm.count, shapeMask, shapeMask.count, Ort.typeUint8, &tMask)
       }
       try ortCheck(sMask, "create migan mask tensor")
       guard tMask != nil else { throw DepthError.failed("migan mask tensor null") }
-      defer { if let t = tMask { api.ReleaseValue(t) } }
+      defer { if let t = tMask { api.pointee.ReleaseValue(t) } }
 
       let outName = try sessionOutputName(session, 0)
       var outValue: OpaquePointer?
@@ -1022,15 +1023,15 @@ private enum PullPushFiller {
         var outputs: [OpaquePointer?] = [nil]
         var inNames: [UnsafePointer<CChar>?] = [names[0], names[1]]
         var outNames: [UnsafePointer<CChar>?] = [names[2]]
-        try ortCheck(api.Run(session, nil, inNames, inputs, 2, outNames, 1, &outputs), "migan Run")
+        try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 2, outNames, 1, &outputs), "migan Run")
         outValue = outputs[0]
       }
       guard let ov = outValue else { throw DepthError.failed("migan Run no output") }
-      defer { api.ReleaseValue(ov) }
+      defer { api.pointee.ReleaseValue(ov) }
       let (_, count) = try tensorDims(ov)
       guard count >= 3 * plane else { throw DepthError.failed("migan output too small: \(count)") }
       var ptr: UnsafeMutableRawPointer?
-      try ortCheck(api.GetTensorMutableData(ov, &ptr), "migan GetTensorMutableData")
+      try ortCheck(api.pointee.GetTensorMutableData(ov, &ptr), "migan GetTensorMutableData")
       guard let p = ptr else { throw DepthError.failed("migan output data null") }
       let outBytes = p.assumingMemoryBound(to: UInt8.self)
       // 输出 [1,3,H,W] uint8（NCHW）；非洞区与原图一致，直接覆盖
@@ -1213,7 +1214,7 @@ private enum PullPushFiller {
   private func sessionInputName(_ session: OpaquePointer, _ index: Int) throws -> String {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var name: UnsafeMutablePointer<CChar>?
-    try ortCheck(api.SessionGetInputName(session, index, &name), "SessionGetInputName")
+    try ortCheck(api.pointee.SessionGetInputName(session, index, &name), "SessionGetInputName")
     guard let n = name else { throw DepthError.failed("SessionGetInputName returned null") }
     let s = String(cString: n)
     if let al = allocator {
@@ -1225,7 +1226,7 @@ private enum PullPushFiller {
   private func sessionOutputName(_ session: OpaquePointer, _ index: Int) throws -> String {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var name: UnsafeMutablePointer<CChar>?
-    try ortCheck(api.SessionGetOutputName(session, index, &name), "SessionGetOutputName")
+    try ortCheck(api.pointee.SessionGetOutputName(session, index, &name), "SessionGetOutputName")
     guard let n = name else { throw DepthError.failed("SessionGetOutputName returned null") }
     let s = String(cString: n)
     if let al = allocator {
@@ -1238,14 +1239,14 @@ private enum PullPushFiller {
   private func tensorDims(_ value: OpaquePointer) throws -> (dims: [Int64], count: Int) {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var info: OpaquePointer?
-    try ortCheck(api.GetTensorTypeAndShape(value, &info), "GetTensorTypeAndShape")
+    try ortCheck(api.pointee.GetTensorTypeAndShape(value, &info), "GetTensorTypeAndShape")
     guard let i = info else { throw DepthError.failed("GetTensorTypeAndShape returned null") }
     defer { api.pointee.ReleaseTensorTypeAndShapeInfo(i) }
     var rank: Int = 0
-    try ortCheck(api.GetDimensionsCount(i, &rank), "GetDimensionsCount")
+    try ortCheck(api.pointee.GetDimensionsCount(i, &rank), "GetDimensionsCount")
     guard rank > 0 else { throw DepthError.failed("rank=0") }
     var dims = [Int64](repeating: 0, count: rank)
-    try ortCheck(api.GetDimensions(i, &dims, rank), "GetDimensions")
+    try ortCheck(api.pointee.GetDimensions(i, &dims, rank), "GetDimensions")
     var count = 1
     for dv in dims { count *= Int(dv) }
     return (dims, count)
@@ -1255,18 +1256,18 @@ private enum PullPushFiller {
   private func sessionInputDims(_ session: OpaquePointer, _ index: Int) throws -> [Int64]? {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var ti: OpaquePointer?
-    try ortCheck(api.SessionGetInputTypeInfo(session, index, &ti), "SessionGetInputTypeInfo")
+    try ortCheck(api.pointee.SessionGetInputTypeInfo(session, index, &ti), "SessionGetInputTypeInfo")
     guard let t = ti else { return nil }
     defer { api.pointee.ReleaseTypeInfo(t) }
     var tsi: OpaquePointer?
-    try ortCheck(api.CastTypeInfoToTensorInfo(t, &tsi), "CastTypeInfoToTensorInfo")
+    try ortCheck(api.pointee.CastTypeInfoToTensorInfo(t, &tsi), "CastTypeInfoToTensorInfo")
     guard let ts = tsi else { return nil }
     defer { api.pointee.ReleaseTensorTypeAndShapeInfo(ts) }
     var rank: Int = 0
-    try ortCheck(api.GetDimensionsCount(ts, &rank), "GetDimensionsCount")
+    try ortCheck(api.pointee.GetDimensionsCount(ts, &rank), "GetDimensionsCount")
     guard rank > 0 else { return [] }
     var dims = [Int64](repeating: 0, count: rank)
-    try ortCheck(api.GetDimensions(ts, &dims, rank), "GetDimensions")
+    try ortCheck(api.pointee.GetDimensions(ts, &dims, rank), "GetDimensions")
     return dims
   }
 
