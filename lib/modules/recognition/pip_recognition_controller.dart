@@ -107,7 +107,7 @@ class PipRecognitionController {
     try {
       ok = await _channel.invokeMethod<bool>('start') ?? false;
     } catch (e) {
-      print('[PipRecognition] native start failed: $e');
+      debugPrint('[PipRecognition] native start failed: $e');
     }
     if (!ok) return false;
     _windowWanted = true;
@@ -148,7 +148,7 @@ class PipRecognitionController {
         }),
       );
     } catch (e) {
-      print('[PipRecognition] save pending result failed: $e');
+      debugPrint('[PipRecognition] save pending result failed: $e');
     }
   }
 
@@ -175,7 +175,7 @@ class PipRecognitionController {
       }
       return Map<String, dynamic>.from(wrapper['response'] as Map);
     } catch (e) {
-      print('[PipRecognition] load pending result failed: $e');
+      debugPrint('[PipRecognition] load pending result failed: $e');
       return null;
     }
   }
@@ -191,7 +191,7 @@ class PipRecognitionController {
     if (sink != null && sink(result)) return;
     final navigator = appNavigatorKey.currentState;
     if (navigator == null) {
-      print('[PipRecognition] navigator not ready, drop pending result');
+      debugPrint('[PipRecognition] navigator not ready, drop pending result');
       return;
     }
     unawaited(
@@ -350,7 +350,7 @@ class PipRecognitionController {
         }
       }
     } catch (e) {
-      print('[PipRecognition] loop error: $e');
+      debugPrint('[PipRecognition] loop error: $e');
       if (_isLooping) _pushState('stopped', text: '未识别到歌曲');
     } finally {
       _isLooping = false;
@@ -402,12 +402,12 @@ class PipRecognitionController {
       if (dir != null && dir.isNotEmpty) {
         _appGroupDir = dir;
         _appGroupId = info?['group'] as String?;
-        print(
+        debugPrint(
           '[PipRecognition] app group dir: $_appGroupDir (group=$_appGroupId)',
         );
       }
     } catch (e) {
-      print('[PipRecognition] resolve app group dir failed: $e');
+      debugPrint('[PipRecognition] resolve app group dir failed: $e');
     }
     return _appGroupDir;
   }
@@ -422,27 +422,29 @@ class PipRecognitionController {
   Future<({Uint8List pcm, int sampleRate})?> _readSystemAudioSegment() async {
     final dir = await _resolveAppGroupDir();
     if (dir == null) {
-      print('[PipRecognition] sys audio: no app group dir');
+      debugPrint('[PipRecognition] sys audio: no app group dir');
       return null;
     }
     RandomAccessFile? raf;
     try {
       final metaFile = File('$dir/sysrecog/seg_meta.json');
       if (!await metaFile.exists()) {
-        print('[PipRecognition] sys audio: no meta (broadcast never started)');
+        debugPrint(
+          '[PipRecognition] sys audio: no meta (broadcast never started)',
+        );
         return null;
       }
       final meta = jsonDecode(await metaFile.readAsString());
       if (meta is! Map) return null;
       if (meta['stopped'] == true) {
-        print('[PipRecognition] sys audio: broadcast stopped');
+        debugPrint('[PipRecognition] sys audio: broadcast stopped');
         return null;
       }
       final metaGroup = meta['group'];
       if (metaGroup is String &&
           _appGroupId != null &&
           metaGroup != _appGroupId) {
-        print(
+        debugPrint(
           '[PipRecognition] sys audio: app group mismatch '
           '(meta=$metaGroup host=$_appGroupId)',
         );
@@ -453,7 +455,7 @@ class PipRecognitionController {
           ? DateTime.now().millisecondsSinceEpoch - ts
           : _sysAudioFreshMs + 1;
       if (age > _sysAudioFreshMs) {
-        print('[PipRecognition] sys audio: data stale/stopped (${age}ms)');
+        debugPrint('[PipRecognition] sys audio: data stale/stopped (${age}ms)');
         return null;
       }
       final writing = meta['writing'];
@@ -461,7 +463,7 @@ class PipRecognitionController {
       final rate = meta['sampleRate'];
       if (writing is! int || total is! int || rate is! int) return null;
       if (total <= 0 || rate <= 0) {
-        print('[PipRecognition] sys audio: meta present but empty');
+        debugPrint('[PipRecognition] sys audio: meta present but empty');
         return null;
       }
       // 取尾部 8s（Int16 mono = 2 字节/帧）
@@ -470,21 +472,21 @@ class PipRecognitionController {
       final offset = total - take;
       final f = File('$dir/sysrecog/seg_$writing.pcm');
       if (!await f.exists()) {
-        print('[PipRecognition] sys audio: seg file missing');
+        debugPrint('[PipRecognition] sys audio: seg file missing');
         return null;
       }
       raf = await f.open();
       if (await f.length() < offset + take) {
-        print('[PipRecognition] sys audio: seg file shorter than meta');
+        debugPrint('[PipRecognition] sys audio: seg file shorter than meta');
         return null;
       }
       await raf.setPosition(offset);
       final pcm = await raf.read(take);
       if (pcm.length < take) return null;
-      print('[PipRecognition] sys audio: using ${pcm.length}B @${rate}Hz');
+      debugPrint('[PipRecognition] sys audio: using ${pcm.length}B @${rate}Hz');
       return (pcm: pcm, sampleRate: rate);
     } catch (e) {
-      print('[PipRecognition] read system audio failed: $e');
+      debugPrint('[PipRecognition] read system audio failed: $e');
       return null;
     } finally {
       try {
@@ -519,7 +521,7 @@ class PipRecognitionController {
       try {
         await _recorder.start(configFor(AndroidAudioSource.mic), path: path);
       } catch (e) {
-        print('[PipRecognition] start recorder failed: $e');
+        debugPrint('[PipRecognition] start recorder failed: $e');
         // 启动失败按整段静音处理，等满段时长避免 busy-loop
         await Future.delayed(const Duration(seconds: _segmentDuration));
         return null;
@@ -536,7 +538,7 @@ class PipRecognitionController {
     try {
       stopped = await _recorder.stop();
     } catch (e) {
-      print('[PipRecognition] stop recorder error: $e');
+      debugPrint('[PipRecognition] stop recorder error: $e');
     }
     if (stopped == null || stopped.isEmpty) return null;
     try {
@@ -604,7 +606,7 @@ class PipRecognitionController {
           '';
       return (name: name, artist: artistName, response: response);
     } catch (e) {
-      print('[PipRecognition] recognize error: $e');
+      debugPrint('[PipRecognition] recognize error: $e');
       return null;
     }
   }
