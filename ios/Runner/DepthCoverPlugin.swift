@@ -44,7 +44,7 @@ typealias OrtFn = @convention(c) () -> OpaquePointer?
 /// OrtApi v1.22 前缀（字段 1..110，顺序与 onnxruntime_c_api.h 逐字段一致）。
 /// 1-3 Status / 4-7 Env / 8-11 Session+Run / 12-26 SessionOptions /
 /// 27-39 CustomOp+SessionInfo / 40-48 RunOptions / 49-70 Tensor /
-/// 71-92 MemoryInfo+Allocator+Kernel / 93-110 Release 系列。
+/// 71-92 MemoryInfo+Allocator+Kernel / 93-102 Release / 103-110 Denotation+Map/Sequence。
 struct OrtApi {
   // 1
   let CreateStatus: @convention(c) (Int32, UnsafePointer<CChar>?) -> OpaquePointer?
@@ -176,7 +176,7 @@ struct OrtApi {
   let KernelContext_GetOutputCount: OrtFn
   let KernelContext_GetInput: OrtFn
   let KernelContext_GetOutput: OrtFn
-  // 93-110 Release 系列（void 返回）
+  // 93-102 Release 系列（void 返回）
   let ReleaseEnv: @convention(c) (OpaquePointer?) -> Void
   let ReleaseStatus: @convention(c) (OpaquePointer?) -> Void
   let ReleaseMemoryInfo: @convention(c) (OpaquePointer?) -> Void
@@ -187,14 +187,16 @@ struct OrtApi {
   let ReleaseTensorTypeAndShapeInfo: @convention(c) (OpaquePointer?) -> Void
   let ReleaseSessionOptions: @convention(c) (OpaquePointer?) -> Void
   let ReleaseCustomOpDomain: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseMapTypeInfo: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseSequenceTypeInfo: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseModelMetadata: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseThreadingOptions: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseAllocator: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseIoBinding: @convention(c) (OpaquePointer?) -> Void
-  let ReleaseArenaCfg: @convention(c) (OpaquePointer?) -> Void
-  let ReleasePrepackedWeightsContainer: @convention(c) (OpaquePointer?) -> Void
+  // 103-110 Denotation + Map/Sequence TypeInfo（1.30 头文件逐字段核对；
+  // 此前误写为 Release 系列，与真实函数表错位 8 槽）
+  let GetDenotationFromTypeInfo: OrtFn
+  let CastTypeInfoToMapTypeInfo: OrtFn
+  let CastTypeInfoToSequenceTypeInfo: OrtFn
+  let GetMapKeyType: OrtFn
+  let GetMapValueType: OrtFn
+  let GetSequenceElementType: OrtFn
+  let ReleaseMapTypeInfo: OrtFn
+  let ReleaseSequenceTypeInfo: OrtFn
 }
 
 /// ORT 常量（onnxruntime_c_api.h v1.22.0 逐一核对）
@@ -982,6 +984,7 @@ private enum PullPushFiller {
     do {
       guard let api = api, let memInfo = memInfo else { return false }
       let d = Self.depthSize
+      NSLog("[DepthCover] nr1: begin %dx%d", w, h)
       // 1) 膨胀掩码 → 反转 → uint8（双线性上采样与 push-pull 同一几何）。
       //    官方要求掩码必须二值：连续值会让 pipeline 的 crop/blending 在
       //    过渡带产生彩色镶边，故此处硬阈值化。
@@ -1022,6 +1025,7 @@ private enum PullPushFiller {
       guard let img = imgName, let msk = mskName else {
         throw DepthError.failed("unexpected inpaint model inputs")
       }
+      NSLog("[DepthCover] nr2: dims+names done img=%@ msk=%@", img, msk)
       // 4) 推理（uint8 NCHW）
       var shapeImg: [Int64] = [1, 3, Int64(h), Int64(w)]
       var shapeMask: [Int64] = [1, 1, Int64(h), Int64(w)]
@@ -1046,6 +1050,7 @@ private enum PullPushFiller {
 
       let outName = try sessionOutputName(session, 0)
       var outValue: OpaquePointer?
+      NSLog("[DepthCover] nr3: tensors done, Run begin")
       try withCStrings([img, msk, outName]) { names in
         var inputs: [OpaquePointer?] = [tImg, tMask]
         var outputs: [OpaquePointer?] = [nil]
@@ -1054,6 +1059,7 @@ private enum PullPushFiller {
         try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 2, outNames, 1, &outputs), "migan Run")
         outValue = outputs[0]
       }
+      NSLog("[DepthCover] nr4: Run done")
       guard let ov = outValue else { throw DepthError.failed("migan Run no output") }
       defer { api.pointee.ReleaseValue(ov) }
       let (_, count) = try tensorDims(ov)
@@ -1289,6 +1295,10 @@ private enum PullPushFiller {
   }
 
   /// 输入张量维度（MI-GAN image/mask 识别用）；非张量输入返回 nil。
+  /// 注意：CastTypeInfoToTensorInfo 返回借用指针（头文件明言 "Do not free this
+  /// value, it will be valid until type_info is freed"），绝不能对返回值调
+  /// ReleaseTensorTypeAndShapeInfo —— 释放 OrtTypeInfo 仍持有的内存会导致堆损坏
+  /// SIGSEGV（此前七轮闪退的最后根因）；只需释放外层 OrtTypeInfo 本身。
   private func sessionInputDims(_ session: OpaquePointer, _ index: Int) throws -> [Int64]? {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var ti: OpaquePointer?
@@ -1298,7 +1308,6 @@ private enum PullPushFiller {
     var tsi: OpaquePointer?
     try ortCheck(api.pointee.CastTypeInfoToTensorInfo(t, &tsi), "CastTypeInfoToTensorInfo")
     guard let ts = tsi else { return nil }
-    defer { api.pointee.ReleaseTensorTypeAndShapeInfo(ts) }
     var rank: Int = 0
     try ortCheck(api.pointee.GetDimensionsCount(ts, &rank), "GetDimensionsCount")
     guard rank > 0 else { return [] }
