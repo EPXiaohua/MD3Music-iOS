@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -685,7 +685,7 @@ class DesktopLyricService {
       _bindProvidersFromContext();
       // 激活补推版式（字号/行式）再推歌词：PiP 首帧即按正确版式画
       // ignore: discarded_futures
-      _syncPipLayoutConfig();
+      _syncPipConfig();
       _pushPipLyricsFull();
       _pushPipLine(_currentLineIndex);
       final player = _player;
@@ -709,17 +709,21 @@ class DesktopLyricService {
     // 开窗前先把持久化版式（字号/行式）同步给原生，首帧即正确版式，
     // 不出现"先按默认版式画出、激活后突然变高"的跳变。
     if (!LyricsPipService.instance.active) {
-      await _syncPipLayoutConfig();
+      await _syncPipConfig();
     }
     await LyricsPipService.instance.toggle();
   }
 
-  /// iOS PiP 版式同步：字号驱动 PiP 条高度、行式切单/双行渲染。
-  Future<void> _syncPipLayoutConfig() async {
+  /// iOS PiP 外观同步：字号驱动条高、行式切单/双行，配色（已唱渐变 +
+  /// 未唱色）与安卓悬浮窗同一组值。
+  Future<void> _syncPipConfig() async {
     await ensureConfigLoaded();
     await LyricsPipService.instance.configure(
       fontSize: _fontSize,
       doubleLine: _doubleLine,
+      gradientStart: _gradientStart,
+      gradientEnd: _gradientEnd,
+      unplayedColor: _unplayedColor,
     );
   }
 
@@ -1376,7 +1380,7 @@ class DesktopLyricService {
     // iOS：悬浮窗是系统 PiP（LyricsPipManager），版式里只有字号/行式对它
     // 有意义（配色为原生默认渐变），转发后即返回；Android 走原通道全量下发。
     if (Platform.isIOS) {
-      await _syncPipLayoutConfig();
+      await _syncPipConfig();
       return;
     }
     try {

@@ -566,9 +566,11 @@ final class NowPlayingManager {
 /// 字号」缩放：单行 22pt 基准、双行 44pt 基准 @18sp，@2x 位图）——
 /// 主行当前句逐字卡拉OK（粗体），双行时副行下一句整行灰未唱色（细体、
 /// 静态不滚动——副行是未唱预览，不跟随主行滚动）。
-/// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
-/// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
-/// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
+/// 卡拉OK文字蒙版式（对齐安卓 GradientTextView）：整行先画未唱色，再 clip
+/// 已唱宽度重画渐变色层，蒙版硬边随播放逐字向右扫过；已唱渐变 = 设置页
+/// 「设备歌词」配色下发的 gradientStart→gradientEnd（默认青 0xFF00E5FF→紫
+/// 0xFFFF00FF）按行内 x 位置采样，未唱色默认灰 0xFF666666。底部细进度条。
+/// 行进度原生自推进：
 /// 以 Dart 最近推送的 positionMs 为锚点 + 本机单调时钟流逝推算，Dart tick 定期校准。
 /// 行超宽不省略号：着色前沿驱动 easeOut 向左滚动（单向不往返、换行复位贴左）。
 
@@ -599,6 +601,10 @@ final class LyricsPipManager: NSObject {
   // 字号驱动 PiP 条高度，行式切单/双行渲染。
   private var configFontSize: Double = 18.0
   private var configDoubleLine = false
+  // 配色（ARGB，与安卓悬浮窗同一组值；默认 = FloatingLyricService 默认渐变）。
+  private var configSungStartARGB = LyricsPipManager.sungColorStartARGB
+  private var configSungEndARGB = LyricsPipManager.sungColorEndARGB
+  private var configUnplayedARGB = LyricsPipManager.unplayedARGB
 
   // 进度锚点：Dart 最近推送的 positionMs + 接收时刻（本机单调钟）
   private var anchorPositionMs: Double = 0
@@ -758,22 +764,45 @@ final class LyricsPipManager: NSObject {
     playing = args["playing"] as? Bool ?? false
   }
 
-  // MARK: configure（版式：字号 / 行式，设置页「设备歌词」下发）
+  // MARK: configure（外观：字号 / 行式 / 配色，设置页「设备歌词」下发）
 
   private func configure(_ args: [String: Any]) {
+    // Dart int 经 StandardMessageCodec 可能落在 Int64（ARGB 常带高bit，
+    // 如 0xFFFF00FF 超出 Int32），必须用 int64Value 取，intValue 会回绕。
     let fs = (args["fontSize"] as? NSNumber)?.doubleValue
     let dl = (args["doubleLine"] as? NSNumber)?.boolValue
-    var changed = false
+    let gs = (args["gradientStart"] as? NSNumber).map { Int($0.int64Value) }
+    let ge = (args["gradientEnd"] as? NSNumber).map { Int($0.int64Value) }
+    let uc = (args["unplayedColor"] as? NSNumber).map { Int($0.int64Value) }
+    var layoutChanged = false
     if let fs, fs != configFontSize {
       configFontSize = fs
-      changed = true
+      layoutChanged = true
     }
     if let dl, dl != configDoubleLine {
       configDoubleLine = dl
-      changed = true
+      layoutChanged = true
     }
-    guard changed else { return }
-    applyBarSize()
+    var colorChanged = false
+    if let gs, gs != configSungStartARGB {
+      configSungStartARGB = gs
+      colorChanged = true
+    }
+    if let ge, ge != configSungEndARGB {
+      configSungEndARGB = ge
+      colorChanged = true
+    }
+    if let uc, uc != configUnplayedARGB {
+      configUnplayedARGB = uc
+      colorChanged = true
+    }
+    // 版式变化要重建条尺寸并复位滚动；纯配色变化只需重出一帧
+    // （滚动偏移复位会把已滚到中途的行瞬间弹回行首，不能共用）。
+    if layoutChanged {
+      applyBarSize()
+    } else if colorChanged {
+      renderFrame()
+    }
   }
 
   /// 条高变化：同步离屏宿主/显示层尺寸、复位滚动状态并立即重出一帧。
@@ -1188,26 +1217,47 @@ final class LyricsPipManager: NSObject {
       return
     }
 
-    // —— 逐字卡拉OK：主行当前句（逐字着色粗体），超宽不省略号，着色前沿
-    // 接近右缘时 easeOut 向左滚动露出后续字；双行时副行下一句整行灰未唱色
-    // （细体——安卓 lyricText2 不设 DEFAULT_BOLD）——
+    // —— 文字蒙版式卡拉OK（对齐安卓 GradientTextView）：整行先画未唱色，
+    // 再 clip 已唱宽度重画渐变色层——蒙版右缘 = 已完成字宽累加 + 当前字按
+    // 字内播放比例推进，硬边逐字向右扫过；已唱渐变按字 x 位置跨行采样
+    //（近似安卓 LinearGradient 0..行宽）。LRC 无逐字：整行渐变不蒙版 ——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
     let maxWidth = width - horizontalPadding * 2
 
-    let glyphs = layoutBarGlyphs(
-      text: lineText, words: lineWords, positionMs: estimatedPositionMs, font: font)
+    let glyphs = layoutBarGlyphs(text: lineText, words: lineWords, font: font)
     let scroll = updatedScrollOffset(
       glyphs: glyphs, words: lineWords, maxWidth: maxWidth, padding: horizontalPadding)
-    drawScrollingLine(
-      ctx: ctx, glyphs: glyphs, font: font,
-      rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
-      scrollOffset: scroll, padding: horizontalPadding)
+    if !lineWords.isEmpty {
+      // 未唱层：整行未唱色
+      drawScrollingLine(
+        ctx: ctx, glyphs: grayGlyphs(glyphs), font: font,
+        rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+        scrollOffset: scroll, padding: horizontalPadding)
+      // 已唱层：clip 已唱宽度（蒙版右缘随播放右移、随行滚动平移）后重画渐变色
+      let sungWidth = sungKaraokeWidth(glyphs: glyphs)
+      let edgeX = horizontalPadding - scroll + sungWidth
+      if edgeX > 0 {
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: 0, y: 0, width: min(edgeX, width), height: height))
+        drawScrollingLine(
+          ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
+          rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+          scrollOffset: scroll, padding: horizontalPadding)
+        ctx.restoreGState()
+      }
+    } else {
+      // LRC/纯文本：整行渐变色（安卓 GradientTextView 的 LRC 路径同款）
+      drawScrollingLine(
+        ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
+        rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+        scrollOffset: scroll, padding: horizontalPadding)
+    }
 
     if dual, !nextLineText.isEmpty {
       let nextGlyphs = grayGlyphs(
-        layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: nextFont))
+        layoutBarGlyphs(text: nextLineText, words: [], font: nextFont))
       // 副行静态：下一句是未唱预览，超宽右缘裁切即可。不跟随主行滚动——
       // 两者节奏无关，跟着滚会被误读成副行在逐字推进（旧实现 bug）。
       drawScrollingLine(
@@ -1219,8 +1269,8 @@ final class LyricsPipManager: NSObject {
 
   // MARK: 逐字卡拉OK布局与绘制
 
-  /// 安卓 FloatingLyricService 默认配色：已唱 青→紫 渐变（按字索引在行内插值），
-  /// 未唱 灰。正在唱的字按字内比例在灰与已唱色之间过渡。
+  /// 默认配色（configure 未下发前的兜底）：安卓 FloatingLyricService 默认
+  /// 渐变 青→紫、未唱灰。
   private static let sungColorStartARGB = 0xFF00E5FF
   private static let sungColorEndARGB = 0xFFFF00FF
   private static let unplayedARGB = 0xFF666666
@@ -1245,63 +1295,80 @@ final class LyricsPipManager: NSObject {
       alpha: a1 + (a2 - a1) * t)
   }
 
-  /// 第 i 字的"已唱"色：行内索引在 青→紫 间线性插值
-  private func sungColor(at index: Int, wordCount: Int) -> UIColor {
-    guard wordCount > 1 else { return argbColor(Self.sungColorStartARGB) }
-    let t = CGFloat(index) / CGFloat(wordCount - 1)
-    return lerpColor(
-      argbColor(Self.sungColorStartARGB),
-      argbColor(Self.sungColorEndARGB),
-      t)
-  }
-
-  /// 第 i 字在 positionMs 时刻的颜色：未唱灰 / 已唱渐变色 / 当前字按字内比例过渡
-  private func wordColor(index: Int, word: (text: String, start: Int, duration: Int),
-      wordCount: Int, positionMs: Double) -> UIColor {
-    let unplayed = argbColor(Self.unplayedARGB)
-    let sung = sungColor(at: index, wordCount: wordCount)
-    guard word.duration > 0 else {
-      return positionMs >= Double(word.start) ? sung : unplayed
-    }
-    let t = CGFloat((positionMs - Double(word.start)) / Double(word.duration))
-    if t <= 0 { return unplayed }
-    if t >= 1 { return sung }
-    return lerpColor(unplayed, sung, t)
-  }
-
-  /// 全量逐字布局：逐字测量宽度并上色（不截断，超宽由 drawScrollingLine
-  /// 以跑马灯滚动呈现）。
+  /// 全量逐字布局：逐字测量宽度（不截断，超宽由 drawScrollingLine 以跑马灯
+  /// 滚动呈现）。KRC 有逐字时间轴时按"词"布局（与 lineWords 一一对应，
+  /// sungKaraokeWidth/滚动驱动都按下标取词宽）；LRC 纯文本按字布局。
+  /// 颜色由调用方分层上色：grayGlyphs（未唱层）/ gradientGlyphs（已唱渐变层）。
   private func layoutBarGlyphs(
     text: String,
     words: [(text: String, start: Int, duration: Int)],
-    positionMs: Double,
     font: UIFont
   ) -> [(text: String, width: CGFloat, color: UIColor)] {
     var glyphs: [(text: String, width: CGFloat, color: UIColor)] = []
     let attrs: [NSAttributedString.Key: Any] = [.font: font]
     if words.isEmpty {
-      // LRC/纯文本无逐字时间轴：整行白字
       for ch in text {
         let s = String(ch)
         glyphs.append((s, (s as NSString).size(withAttributes: attrs).width, .white))
       }
     } else {
-      for (i, w) in words.enumerated() {
-        glyphs.append((
-          w.text,
-          (w.text as NSString).size(withAttributes: attrs).width,
-          wordColor(index: i, word: w, wordCount: words.count, positionMs: positionMs)))
+      for w in words {
+        glyphs.append((w.text, (w.text as NSString).size(withAttributes: attrs).width, .white))
       }
     }
     return glyphs
   }
 
-  /// 副行整行灰色（未唱色 0xFF666666）：下一句尚未唱到，不给卡拉OK着色。
+  /// 未唱层：整行未唱色（设置页配色下发的 unplayedColor）。
   private func grayGlyphs(
     _ glyphs: [(text: String, width: CGFloat, color: UIColor)]
   ) -> [(text: String, width: CGFloat, color: UIColor)] {
-    let gray = argbColor(Self.unplayedARGB)
+    let gray = argbColor(configUnplayedARGB)
     return glyphs.map { ($0.text, $0.width, gray) }
+  }
+
+  /// 已唱层配色：整行渐变（gradientStart→gradientEnd）按字 x 位置采样，
+  /// 配合已唱区域 clip 形成硬边蒙版——近似安卓 LinearGradient 0..行宽的
+  /// 跨行渐变（逐字采样，行滚动时颜色跟字走不漂移）。
+  private func gradientGlyphs(
+    _ glyphs: [(text: String, width: CGFloat, color: UIColor)]
+  ) -> [(text: String, width: CGFloat, color: UIColor)] {
+    let start = argbColor(configSungStartARGB)
+    let end = argbColor(configSungEndARGB)
+    let total = glyphs.reduce(0) { $0 + $1.width }
+    guard total > 0 else {
+      return glyphs.map { ($0.text, $0.width, start) }
+    }
+    var x: CGFloat = 0
+    return glyphs.map { g in
+      let t = min(max((x + g.width / 2) / total, 0), 1)
+      x += g.width
+      return (g.text, g.width, lerpColor(start, end, t))
+    }
+  }
+
+  /// 已唱像素宽度（文本空间，蒙版右缘）：已完成字宽累加 + 当前字按字内
+  /// 播放比例线性插值（对齐安卓 sungKaraokeWidth 的蒙版推进语义）。
+  private func sungKaraokeWidth(
+    glyphs: [(text: String, width: CGFloat, color: UIColor)]
+  ) -> CGFloat {
+    guard !lineWords.isEmpty, glyphs.count == lineWords.count else { return 0 }
+    let pos = estimatedPositionMs
+    var idx = -1
+    for (i, w) in lineWords.enumerated() where pos >= Double(w.start) { idx = i }
+    guard idx >= 0 else { return 0 }
+    var w: CGFloat = 0
+    if idx > 0 {
+      for i in 0..<idx { w += glyphs[i].width }
+    }
+    let word = lineWords[idx]
+    if word.duration > 0 {
+      let t = min(max((pos - Double(word.start)) / Double(word.duration), 0), 1)
+      w += glyphs[idx].width * CGFloat(t)
+    } else {
+      w += glyphs[idx].width
+    }
+    return w
   }
 
   /// 着色前沿驱动的滚动偏移：行首贴左静止；当卡拉OK着色位置接近视口右缘

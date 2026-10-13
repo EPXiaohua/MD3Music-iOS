@@ -159,16 +159,27 @@ class LyricsPipService {
     }
   }
 
-  /// 版式配置下发（设置页「设备歌词」→ 字号/行式）。字号驱动 PiP 条高度
-  ///（单行 22pt / 双行 44pt 基准 @18sp 线性缩放），行式切单/双行渲染。
-  /// PiP 未激活时原生仅存值，激活后首帧即按新版式画。
-  Future<void> configure({double? fontSize, bool? doubleLine}) async {
+  /// 外观配置下发（设置页「设备歌词」→ 配色/版式）。字号驱动 PiP 条高度
+  ///（单行 22pt / 双行 44pt 基准 @18sp 线性缩放），行式切单/双行渲染，
+  /// 配色（已唱渐变 gradientStart→gradientEnd + 未唱色）与安卓悬浮窗同一
+  /// 组值；原生卡拉OK为文字蒙版式，蒙版扫过处按渐变着色。PiP 未激活时
+  /// 原生仅存值，激活后首帧即按新配置画。
+  Future<void> configure({
+    double? fontSize,
+    bool? doubleLine,
+    int? gradientStart,
+    int? gradientEnd,
+    int? unplayedColor,
+  }) async {
     if (!Platform.isIOS) return;
     _ensureHandler();
     try {
       await _channel.invokeMethod('configure', <String, dynamic>{
         'fontSize': ?fontSize,
         'doubleLine': ?doubleLine,
+        'gradientStart': ?gradientStart,
+        'gradientEnd': ?gradientEnd,
+        'unplayedColor': ?unplayedColor,
       });
     } catch (e) {
       debugPrint('[LyricsPip] configure failed: $e');
