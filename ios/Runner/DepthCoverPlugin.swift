@@ -591,7 +591,9 @@ private enum PullPushFiller {
         defer { self.clearInFlight(key) }
         do {
           NSLog("[DepthCover] generate begin: key=\(key) src=\(sourcePath)")
-          let paths = try self.generate(sourcePath: sourcePath, sourceBytes: nil, outDir: outDir)
+          let paths = try self.runOnBigStack {
+            try self.generate(sourcePath: sourcePath, sourceBytes: nil, outDir: outDir)
+          }
           NSLog("[DepthCover] generate OK: \(paths.joined(separator: ","))")
           DispatchQueue.main.async { result(["layers": paths]) }
         } catch {
@@ -622,7 +624,9 @@ private enum PullPushFiller {
         defer { self.clearInFlight(key) }
         do {
           NSLog("[DepthCover] generateDepth begin: key=\(key) src=\(sourcePath)")
-          let out = try self.generateDepth(sourcePath: sourcePath, sourceBytes: nil, outDir: outDir)
+          let out = try self.runOnBigStack {
+            try self.generateDepth(sourcePath: sourcePath, sourceBytes: nil, outDir: outDir)
+          }
           NSLog("[DepthCover] generateDepth OK: std=\(out.std) inpaint=\(out.inpaint)")
           DispatchQueue.main.async {
             result([
@@ -661,6 +665,49 @@ private enum PullPushFiller {
     lock.lock()
     defer { lock.unlock() }
     inFlight.remove(key)
+  }
+
+  // MARK: 大栈线程执行
+  // iOS 主线程栈 1MB、GCD 池线程仅 512KB；ORT 图执行（尤其 migan pipeline 的
+  // 512×512 图像算子链）会吃穿 512KB 栈 → SIGSEGV 且无任何 ORT 错误输出
+  // （nr3 崩点实测）。Android 同代码线程栈 >=1MB 无此问题。深度模型（ViT
+  // matmul 工作在堆上）侥幸不溢，但统一把推理全程调度到 64MB 栈 pthread。
+
+  private final class BigStackWork {
+    let work: () throws -> Any
+    var result: Result<Any, Error>?
+    let done = DispatchSemaphore(value: 0)
+    init(_ work: @escaping () throws -> Any) { self.work = work }
+  }
+
+  private func bigStackEntry(_ arg: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
+    let w = Unmanaged<BigStackWork>.fromOpaque(arg).takeRetainedValue()
+    w.result = Result<Any, Error> { try w.work() }
+    w.done.signal()
+    return nil
+  }
+
+  private func runOnBigStack<T>(_ work: @escaping () throws -> T) throws -> T {
+    let wrapped = BigStackWork { try work() }
+    var attr = pthread_attr_t()
+    pthread_attr_init(&attr)
+    pthread_attr_setstacksize(&attr, 64 << 20)
+    var tid: pthread_t?
+    let op = Unmanaged.passRetained(wrapped).toOpaque()
+    let rc = pthread_create(&tid, &attr, { arg in
+      // @convention(c) 不能捕获上下文，经 arg 转回
+      DepthCoverPlugin.shared.bigStackEntry(arg)
+    }, op)
+    pthread_attr_destroy(&attr)
+    guard rc == 0 else {
+      Unmanaged<BigStackWork>.fromOpaque(op).release()
+      throw DepthError.failed("pthread_create failed: \(rc)")
+    }
+    wrapped.done.wait()
+    switch wrapped.result! {
+    case .success(let v): return v as! T
+    case .failure(let e): throw e
+    }
   }
 
   // MARK: 模型加载
