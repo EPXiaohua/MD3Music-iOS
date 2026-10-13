@@ -815,10 +815,13 @@ private enum PullPushFiller {
 
   private func generateDepth(sourcePath: String, sourceBytes: Data?, outDir: String) throws -> DepthResult {
     guard let session = session else { throw DepthError.failed("session null") }
+    NSLog("[DepthCover] gd1: decode begin")
     let src = try decodeCover(path: sourcePath, bytes: sourceBytes)
+    NSLog("[DepthCover] gd2: decode done %dx%d", src.w, src.h)
     try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
     let norm = normalize(try infer(session, src))
+    NSLog("[DepthCover] gd11: infer+normalize done")
     let std = depthStd(norm)
 
     // --- 背景修补（push-pull + 深度保边平滑）：洞区被填充，
@@ -829,18 +832,20 @@ private enum PullPushFiller {
 
     // --- 神经细化（可选）：MI-GAN pipeline 会话就绪时对洞区二次填充，
     // 失败保底 push-pull 结果。开关由 Dart 侧控制（未开启不加载会话，直接跳过） ---
+    NSLog("[DepthCover] gd12: pushpull done")
     var usedNeural = false
     if let s2 = inpaintSession {
       usedNeural = neuralRefine(src, mask, &filled, w: src.w, h: src.h, session: s2)
       if usedNeural { NSLog("[DepthCover] neuralRefine OK (migan)") }
     }
+    NSLog("[DepthCover] gd13: neural done used=%d", usedNeural ? 1 : 0)
 
     let w = src.w, h = src.h
     let outDirURL = URL(fileURLWithPath: outDir)
 
     let bgFillPath = outDirURL.appendingPathComponent("bg_fill.png").path
     try writePNGRGBA(filled, w: w, h: h, to: bgFillPath)
-    NSLog("[DepthCover] generateDepth bg_fill OK: %@ inpaint=%@", bgFillPath, usedNeural ? "migan" : "pushpull")
+    NSLog("[DepthCover] gd14: bg_fill png OK: %@ inpaint=%@", bgFillPath, usedNeural ? "migan" : "pushpull")
 
     // 灰度 8-bit（R=G=B=gray, A=255）@378×378
     let d = Self.depthSize
@@ -854,7 +859,7 @@ private enum PullPushFiller {
     }
     let depthPath = outDirURL.appendingPathComponent("depth.png").path
     try writePNGRGBA(gray, w: d, h: d, to: depthPath)
-    NSLog("[DepthCover] generateDepth OK: %@ std=\(std)", depthPath)
+    NSLog("[DepthCover] gd15: depth png OK std=\(std)")
 
     return DepthResult(
       depthPath: depthPath, std: Double(std),
@@ -869,6 +874,7 @@ private enum PullPushFiller {
     guard let api = api, let memInfo = memInfo else { throw DepthError.failed("ORT not initialized") }
     let d = Self.depthSize
     let scaled = scaledRGBA(src, d, d)
+    NSLog("[DepthCover] gd3: scaled done %dx%d", scaled.w, scaled.h)
 
     // NCHW float + ImageNet 归一化
     var data = [Float](repeating: 0, count: 3 * d * d)
@@ -879,9 +885,11 @@ private enum PullPushFiller {
         data[plane + i] = (Float(scaled.rgba[i * 4 + c]) / 255.0 - mean) / std
       }
     }
+    NSLog("[DepthCover] gd5: normalize done")
 
     let inName = try sessionInputName(session, 0)
     let outName = try sessionOutputName(session, 0)
+    NSLog("[DepthCover] gd6: names done in=%@ out=%@", inName, outName)
 
     var shape: [Int64] = [1, 3, Int64(d), Int64(d)]
     var tensor: OpaquePointer?
@@ -894,6 +902,7 @@ private enum PullPushFiller {
     try ortCheck(creationStatus, "create input tensor")
     defer { if let t = tensor { api.pointee.ReleaseValue(t) } }
     guard tensor != nil else { throw DepthError.failed("input tensor null") }
+    NSLog("[DepthCover] gd7: tensor done")
 
     var outValue: OpaquePointer?
     try withCStrings([inName, outName]) { names in
@@ -901,7 +910,9 @@ private enum PullPushFiller {
       var outputs: [OpaquePointer?] = [nil]
       var inNames: [UnsafePointer<CChar>?] = [names[0]]
       var outNames: [UnsafePointer<CChar>?] = [names[1]]
+      NSLog("[DepthCover] gd8: Run begin")
       try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 1, outNames, 1, &outputs), "Run")
+      NSLog("[DepthCover] gd9: Run done")
       outValue = outputs[0]
     }
     guard let ov = outValue else { throw DepthError.failed("Run produced no output") }
@@ -912,7 +923,9 @@ private enum PullPushFiller {
     try ortCheck(api.pointee.GetTensorMutableData(ov, &ptr), "GetTensorMutableData")
     guard let p = ptr else { throw DepthError.failed("output data null") }
     let floats = p.assumingMemoryBound(to: Float.self)
-    return Array(UnsafeBufferPointer(start: floats, count: count))
+    let result = Array(UnsafeBufferPointer(start: floats, count: count))
+    NSLog("[DepthCover] gd10: out data done count=%d", count)
+    return result
   }
 
   // MARK: 背景修补管线（generate/generateDepth 共用）
