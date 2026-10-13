@@ -98,8 +98,10 @@ struct OrtApi {
   let SessionGetOutputTypeInfo: @convention(c) (OpaquePointer?, Int, UnsafeMutablePointer<OpaquePointer?>) -> OpaquePointer?
   let SessionGetOverridableInitializerTypeInfo: OrtFn
   // 37-39
-  let SessionGetInputName: @convention(c) (OpaquePointer?, Int, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> OpaquePointer?
-  let SessionGetOutputName: @convention(c) (OpaquePointer?, Int, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> OpaquePointer?
+  // 37/38：签名含 allocator（ORT 1.15+，第 3 参数 OrtAllocator*，第 4 参数 char** out）
+  // —— 旧 3 参数签名会导致 ORT 内部解引用垃圾 allocator → SIGBUS
+  let SessionGetInputName: @convention(c) (OpaquePointer?, Int, OpaquePointer?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> OpaquePointer?
+  let SessionGetOutputName: @convention(c) (OpaquePointer?, Int, OpaquePointer?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> OpaquePointer?
   let SessionGetOverridableInitializerName: OrtFn
   // 40-48 RunOptions
   let CreateRunOptions: OrtFn
@@ -1250,34 +1252,22 @@ private enum PullPushFiller {
   }
 
   private func sessionInputName(_ session: OpaquePointer, _ index: Int) throws -> String {
-    guard let api = api else { throw DepthError.failed("ORT api null") }
+    guard let api = api, let al = allocator else { throw DepthError.failed("ORT api/allocator null") }
     var name: UnsafeMutablePointer<CChar>?
-    NSLog("[DepthCover] gd6a: SessionGetInputName calling")
-    try ortCheck(api.pointee.SessionGetInputName(session, index, &name), "SessionGetInputName")
-    NSLog("[DepthCover] gd6b: SessionGetInputName returned")
+    try ortCheck(api.pointee.SessionGetInputName(session, index, al, &name), "SessionGetInputName")
     guard let n = name else { throw DepthError.failed("SessionGetInputName returned null") }
     let s = String(cString: n)
-    NSLog("[DepthCover] gd6c: input string=%@", s)
-    if let al = allocator {
-      api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
-      NSLog("[DepthCover] gd6d: input AllocatorFree ok")
-    }
+    api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
     return s
   }
 
   private func sessionOutputName(_ session: OpaquePointer, _ index: Int) throws -> String {
-    guard let api = api else { throw DepthError.failed("ORT api null") }
+    guard let api = api, let al = allocator else { throw DepthError.failed("ORT api/allocator null") }
     var name: UnsafeMutablePointer<CChar>?
-    NSLog("[DepthCover] gd6e: SessionGetOutputName calling")
-    try ortCheck(api.pointee.SessionGetOutputName(session, index, &name), "SessionGetOutputName")
-    NSLog("[DepthCover] gd6f: SessionGetOutputName returned")
+    try ortCheck(api.pointee.SessionGetOutputName(session, index, al, &name), "SessionGetOutputName")
     guard let n = name else { throw DepthError.failed("SessionGetOutputName returned null") }
     let s = String(cString: n)
-    NSLog("[DepthCover] gd6g: output string=%@", s)
-    if let al = allocator {
-      api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
-      NSLog("[DepthCover] gd6h: output AllocatorFree ok")
-    }
+    api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
     return s
   }
 
