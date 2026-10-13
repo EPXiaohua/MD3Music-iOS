@@ -155,7 +155,8 @@ struct OrtApi {
   let MemoryInfoGetType: OrtFn
   // 76-78
   let AllocatorAlloc: OrtFn
-  let AllocatorFree: @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?) -> OpaquePointer?
+  // C 实际签名是 void AllocatorFree(OrtAllocator*, void*)，返回类型必须为 Void
+  let AllocatorFree: @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?) -> Void
   let AllocatorGetInfo: OrtFn
   // 79
   let GetAllocatorWithDefaultOptions: @convention(c) (UnsafeMutablePointer<OpaquePointer?>) -> OpaquePointer?
@@ -1251,11 +1252,15 @@ private enum PullPushFiller {
   private func sessionInputName(_ session: OpaquePointer, _ index: Int) throws -> String {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var name: UnsafeMutablePointer<CChar>?
+    NSLog("[DepthCover] gd6a: SessionGetInputName calling")
     try ortCheck(api.pointee.SessionGetInputName(session, index, &name), "SessionGetInputName")
+    NSLog("[DepthCover] gd6b: SessionGetInputName returned")
     guard let n = name else { throw DepthError.failed("SessionGetInputName returned null") }
     let s = String(cString: n)
+    NSLog("[DepthCover] gd6c: input string=%@", s)
     if let al = allocator {
       api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
+      NSLog("[DepthCover] gd6d: input AllocatorFree ok")
     }
     return s
   }
@@ -1263,11 +1268,15 @@ private enum PullPushFiller {
   private func sessionOutputName(_ session: OpaquePointer, _ index: Int) throws -> String {
     guard let api = api else { throw DepthError.failed("ORT api null") }
     var name: UnsafeMutablePointer<CChar>?
+    NSLog("[DepthCover] gd6e: SessionGetOutputName calling")
     try ortCheck(api.pointee.SessionGetOutputName(session, index, &name), "SessionGetOutputName")
+    NSLog("[DepthCover] gd6f: SessionGetOutputName returned")
     guard let n = name else { throw DepthError.failed("SessionGetOutputName returned null") }
     let s = String(cString: n)
+    NSLog("[DepthCover] gd6g: output string=%@", s)
     if let al = allocator {
       api.pointee.AllocatorFree(al, UnsafeMutableRawPointer(n))
+      NSLog("[DepthCover] gd6h: output AllocatorFree ok")
     }
     return s
   }
