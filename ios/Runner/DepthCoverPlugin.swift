@@ -1395,33 +1395,66 @@ private enum PullPushFiller {
 }
 
 // MARK: - 崩溃现场记录（SIGSEGV/SIGBUS 诊断，验证期临时设施）
-// 信号处理器内只能用异步信号安全的函数，NSLog/String(format:)/Swift 字符串
-// 插值都会分配内存并加锁 → 在崩溃现场死锁或二次崩溃，实测无任何输出。
-// 因此改为：snprintf 组消息 + write/open/backtrace_symbols_fd 落盘到容器 tmp，
-// 崩溃后可在 App 数据目录 tmp/ 下取 depth_crash.log 查看 PC/LR/backtrace。
+// 信号处理器内必须零分配、零加锁：不能用 snprintf（Swift 无变参 C 函数）、
+// 不能用 String(format:)/字符串插值/数组字面量（都会堆分配或加锁，崩溃现场
+// 直接死锁 → 实测无任何输出）。故所有缓冲在 install 时一次性分配，handler 内
+// 只做手动字节拼接 + write/backtrace_symbols_fd，崩溃后可在 App 数据目录
+// tmp/depth_crash.log 看到 PC 附近地址与 backtrace。
 
 private var depthCrashLogPath: UnsafeMutablePointer<CChar>?
+private var depthCrashPrefix: UnsafeMutablePointer<CChar>?  // "[DepthCover] CRASH sig="
+private var depthCrashSuffix: UnsafeMutablePointer<CChar>?  // " addr=0x"
+private var depthCrashOut: UnsafeMutablePointer<CChar>?
+private var depthCrashFrames: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+
+private func depthCrashCopy(
+  _ dst: UnsafeMutablePointer<CChar>, _ off: inout Int,
+  _ src: UnsafeMutablePointer<CChar>, _ cap: Int
+) {
+  var i = 0
+  while src[i] != 0 && off < cap {
+    dst[off] = src[i]; off += 1; i += 1
+  }
+}
 
 private func depthCrashSigHandler(
   _ sig: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ uctx: UnsafeMutableRawPointer?
 ) -> Void {
-  var buf = [CChar](repeating: 0, count: 512)
-  if let i = info {
-    _ = snprintf(&buf, buf.count, "[DepthCover] CRASH sig=%d addr=0x%lx",
-                 sig, UInt(bitPattern: i.pointee.si_addr))
-  } else {
-    _ = snprintf(&buf, buf.count, "[DepthCover] CRASH sig=%d", sig)
+  guard let out = depthCrashOut, let pf = depthCrashPrefix, let sfx = depthCrashSuffix else {
+    signal(sig, SIG_DFL); raise(sig); return
   }
-  _ = write(2, buf, strlen(buf))
-  _ = write(2, "\n", 1)
-  var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 96)
-  let n = backtrace(&frames, 96)
+  let cap = 500
+  var off = 0
+  depthCrashCopy(out, &off, pf, cap)
+  // sig 十进制
+  if sig >= 10 { out[off] = CChar(48 + Int(sig / 10)); off += 1 }
+  out[off] = CChar(48 + Int(sig % 10)); off += 1
+  depthCrashCopy(out, &off, sfx, cap)
+  if let i = info {
+    let v = UInt(bitPattern: i.pointee.si_addr)
+    var started = false
+    var shift = (MemoryLayout<UInt>.size * 2 - 1) * 4
+    while shift >= 0 && off < cap {
+      let nib = Int((v >> UInt(shift)) & 0xF)
+      let c: CChar = nib < 10 ? CChar(48 + nib) : CChar(87 + nib)
+      if started || nib != 0 || shift == 0 {
+        out[off] = c; off += 1; started = true
+      }
+      shift -= 4
+    }
+  }
+  out[off] = 10  // '\n'
+  off += 1
+
+  _ = write(2, out, off)
   if let path = depthCrashLogPath {
     let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
     if fd >= 0 {
-      _ = write(fd, buf, strlen(buf))
-      _ = write(fd, "\n", 1)
-      if n > 0 { backtrace_symbols_fd(&frames, n, fd) }
+      _ = write(fd, out, off)
+      if let frames = depthCrashFrames {
+        let n = backtrace(frames, 96)
+        if n > 0 { backtrace_symbols_fd(frames, n, fd) }
+      }
       _ = write(fd, "---\n", 4)
       close(fd)
     }
@@ -1440,6 +1473,11 @@ private func depthInstallCrashLogger() {
   act.__sigaction_u.__sa_sigaction = depthCrashSigHandler
   sigaction(SIGSEGV, &act, nil)
   sigaction(SIGBUS, &act, nil)
+  // 一次性分配，信号处理器内复用（避免现场堆分配引发死锁）
+  depthCrashOut = UnsafeMutablePointer<CChar>.allocate(capacity: 512)
+  depthCrashFrames = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 96)
+  depthCrashPrefix = strdup("[DepthCover] CRASH sig=")
+  depthCrashSuffix = strdup(" addr=0x")
   let logPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("depth_crash.log")
   depthCrashLogPath = strdup(logPath)
   NSLog("[DepthCover] crash logger installed, log=%@", logPath)
