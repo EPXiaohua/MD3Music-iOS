@@ -73,9 +73,10 @@ bool get supportsPredictiveGesture => isAndroidPlatform;
 /// `AVAudioEngine` 采集，见 `spectrum_service.dart` 的 iOS 分支）。
 bool get supportsMusicSpectrum => isMobilePlatform;
 
-/// 震动反馈（Android `Vibrator` / 鼓点节奏震动）。上游 6.0.0 新增项，
-/// iOS 无对应实现（CoreHaptics 未接入），保持仅 Android。
-bool get supportsHaptics => isAndroidPlatform;
+/// 震动反馈（交互震动 / 音乐节奏震动）。上游 6.0.0 新增项，原版仅 Android；
+/// 本移植版 iOS 侧已接入等价实现（交互触感走 `UIFeedbackGenerator`、音乐节奏震动走
+/// `CoreHaptics` 跟鼓点，见 `ios/Runner/HapticsPlugin.swift`），故对 iOS 一并开放。
+bool get supportsHaptics => isMobilePlatform;
 
 /// 桌面快捷方式（Android 走 `quick_actions_android`；iOS 走
 /// `UIApplication.shortcutItems`，由 `ShortcutConfigProvider` 统一配置）。

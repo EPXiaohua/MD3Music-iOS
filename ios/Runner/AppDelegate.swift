@@ -84,6 +84,12 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     SongRecognitionPipManager.shared.attach(messenger: messenger)
 
+    // iOS 震动反馈：交互触感（UIFeedbackGenerator）+ m3e 滑条震动 + 音乐节奏震动
+    // （CoreHaptics）。与 Android 的 md3music/haptics、m3e_haptics/haptics、
+    // com.md3music.md3music/music_haptics 三个 channel 同名，原生各自实现。
+    HapticsBridge.shared.attach(messenger: messenger)
+    MusicHapticsEngine.shared.attach(messenger: messenger)
+
     // iOS 3D 封面（Depth Anything V2 推理 + push-pull/MI-GAN 修补 + 三层切割）。
     // 仅 3D 包定义 DEPTH_3D_LINKED（CI 写入链接 xcconfig）；标准包此段编译为空，
     // Dart 侧 MissingPluginException 走平面封面回退。

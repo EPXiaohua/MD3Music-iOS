@@ -23,6 +23,7 @@
 		WGT000000000000000000000A /* MD3Widget.swift in Sources */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000001 /* MD3Widget.swift */; };
 		WGT000000000000000000000B /* MD3Widget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000002 /* MD3Widget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		WGT0000000000000000000008 /* WidgetSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000007 /* WidgetSync.swift */; };
+		HAP0000000000000000000002 /* HapticsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = HAP0000000000000000000001 /* HapticsPlugin.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -71,6 +72,7 @@
 		RPG0000000000000000000001 /* SongRecognitionPipManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = SongRecognitionPipManager.swift; sourceTree = "<group>"; };
 		DCP0000000000000000000001 /* DepthCoverPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DepthCoverPlugin.swift; sourceTree = "<group>"; };
 		WGT0000000000000000000007 /* WidgetSync.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = WidgetSync.swift; sourceTree = "<group>"; };
+		HAP0000000000000000000001 /* HapticsPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = HapticsPlugin.swift; sourceTree = "<group>"; };
 		WGT0000000000000000000001 /* MD3Widget.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MD3Widget.swift; sourceTree = "<group>"; };
 		WGT0000000000000000000002 /* MD3Widget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MD3Widget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		WGT0000000000000000000003 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -174,6 +176,7 @@
 				RPG0000000000000000000001 /* SongRecognitionPipManager.swift */,
 				DCP0000000000000000000001 /* DepthCoverPlugin.swift */,
 				WGT0000000000000000000007 /* WidgetSync.swift */,
+				HAP0000000000000000000001 /* HapticsPlugin.swift */,
 				WGT0000000000000000000005 /* Runner.entitlements */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
@@ -371,6 +374,7 @@
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
 				WGT0000000000000000000008 /* WidgetSync.swift in Sources */,
+				HAP0000000000000000000002 /* HapticsPlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

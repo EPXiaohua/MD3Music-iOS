@@ -131,7 +131,7 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     guard frames > 0 else { return }
 
     let buffers = UnsafeMutableAudioBufferListPointer(bufferListInOut)
-    AudioEqualizer.spectrumFeed(buffers)
+    AudioEqualizer.spectrumFeed(buffers, sampleRateHz: state.sampleRate)
 
     // EQ 关闭（无活动频段）时跳过滤波处理，tap 仅承担频谱采样职责
     guard !state.activeBands.isEmpty else { return }
@@ -282,9 +282,30 @@ final class EqTapState {
     static var fftImag = [Float](repeating: 0, count: fftSize)
     static var fftMags = [Double](repeating: 0, count: spectrumBandCount)
 
+    // ── 节拍特征通路（音乐节奏震动的数据源，对齐 Android SpectrumAnalyzer.analyzeOf） ──
+    //
+    // 与视觉 40 段**分开**算：视觉是「逐帧自归一化 + 只取前 40 bin」，分母是帧内最大值
+    // （音量相关、非线性），且 44.1kHz/1024 下只覆盖 ≈0–1.7kHz —— 谱流量依赖帧间幅度的
+    // **绝对关系**、军鼓高频瞬态又全在 3–8kHz，故特征必须走未归一化的全 512 bin 幅度。
+    static var spectrumFeatures = SpectrumFeatures(fftSize: fftSize, binCount: fftSize / 2)
+    /// Hann 窗：`0.5 * (1 - cos(2πn/(N-1)))`，与 Android `SpectrumFft.hann` 逐字一致。
+    /// 惰性初始化（静态 let），由 setupSpectrumChannel 在主线程预热，避免首次落在音频线程。
+    static let hannWindow: [Float] = (0..<fftSize).map { i in
+        Float(0.5 * (1.0 - cos(2.0 * Double.pi * Double(i) / Double(fftSize - 1))))
+    }
+    static var featureReal = [Float](repeating: 0, count: fftSize)
+    static var featureImag = [Float](repeating: 0, count: fftSize)
+    /// 未加窗的时域快照：RMS 用它算（加窗会给能量引入常数偏置，Dart 侧做帧间差分，
+    /// 偏置会被抵消，故直接用原始样本更省一次遍历 —— 对齐 Android 注释）。
+    static var featureSamples = [Float](repeating: 0, count: fftSize)
+    static var featureMags = [Double](repeating: 0, count: fftSize / 2)
+    static var featureOut = [Double](repeating: 0, count: SpectrumFeatures.count)
+
     /// 注册频谱 MethodChannel（bootstrap 时调用，主线程）。
     /// 协议对齐 Android SpectrumPlugin：start/stop 由 Dart 驱动，原生主动推 onFft。
     static func setupSpectrumChannel(_ messenger: FlutterBinaryMessenger) {
+        // 主线程预热 Hann 窗（静态 let 惰性初始化），避免首次落在实时音频线程上做三角函数
+        _ = hannWindow
         let ch = FlutterMethodChannel(name: spectrumChannelName, binaryMessenger: messenger)
         ch.setMethodCallHandler { call, result in
             switch call.method {
@@ -311,7 +332,10 @@ final class EqTapState {
 
     /// 音频线程调用：采样左声道写入环形缓冲；攒满 1024 点且距上次发射 ≥45ms
     /// 时做 FFT，把 40 段幅值 post 到主线程推送 Dart。
-    static func spectrumFeed(_ buffers: UnsafeMutableAudioBufferListPointer) {
+    ///
+    /// [sampleRateHz] 由 tap 的 processingFormat 提供（ASBD），特征向量的频带表
+    /// 需要它才能把 Hz 映射到 bin 下标。
+    static func spectrumFeed(_ buffers: UnsafeMutableAudioBufferListPointer, sampleRateHz: Double) {
         guard spectrumCaptureEnabled, spectrumChannel != nil else { return }
         os_unfair_lock_lock(&spectrumLock)
         defer { os_unfair_lock_unlock(&spectrumLock) }
@@ -344,10 +368,15 @@ final class EqTapState {
         lastEmitMs = nowMs
 
         let bands = computeSpectrumBandsLocked()
+        // 特征向量与视觉 40 段共用同一帧快照：此刻 pcmFilled 尚未递减、环形缓冲未动，
+        // 两次读取拿到的是同一窗口（对齐 Android analyzeOf 的「一次 FFT 产出两者」）。
+        let features = computeFeaturesLocked(sampleRateHz: sampleRateHz)
         pcmFilled -= fftSize
         // 实时音频线程不做 IPC：算完 post 主线程再走 MethodChannel
         DispatchQueue.main.async {
             spectrumChannel?.invokeMethod("onFft", arguments: bands)
+            // 音乐节奏震动的数据源（只有 PCM 截取路径有原始时域样本）
+            spectrumChannel?.invokeMethod("onFeatures", arguments: features)
         }
     }
 
@@ -381,6 +410,38 @@ final class EqTapState {
             bands[i] = min(max(fftMags[i] / maxMag, 0.0), 1.0)
         }
         return bands
+    }
+
+    /// 需持有 spectrumLock 调用：最近 1024 点（**未加窗**快照）→ Hann 窗 → 全 512 bin
+    /// 未归一化幅度 → 20 维节拍特征。
+    ///
+    /// 逐行对齐 Android `SpectrumAnalyzer.analyzeOf`：`mags` 来自**加窗** FFT（未归一化，
+    /// 长度 512），RMS 用**未加窗**快照。必须在 [computeSpectrumBandsLocked] 之后、
+    /// `pcmFilled -= fftSize` 之前调用（两者读同一窗口）。
+    private static func computeFeaturesLocked(sampleRateHz: Double) -> [Double] {
+        let start = pcmWritePos
+        for i in 0..<fftSize {
+            let sample = pcmSamples[(start + i) % fftSize]
+            featureSamples[i] = sample
+            featureReal[i] = sample * hannWindow[i]
+            featureImag[i] = 0
+        }
+        fftRadix2(&featureReal, &featureImag)
+
+        let binCount = fftSize / 2
+        for i in 0..<binCount {
+            let re = Double(featureReal[i + 1]), im = Double(featureImag[i + 1])
+            featureMags[i] = (re * re + im * im).squareRoot()
+        }
+
+        var out = featureOut
+        spectrumFeatures.extract(
+            sampleRateHz: Int(sampleRateHz),
+            mags: featureMags,
+            samples: featureSamples,
+            out: &out
+        )
+        return out
     }
 
     /// 原地基 2 迭代 FFT（移植自 Android SpectrumPlugin.fftRadix2，长度须为 2 的幂）

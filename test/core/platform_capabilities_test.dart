@@ -16,7 +16,7 @@ import 'package:md3music/modules/settings/settings_search_index.g.dart';
 ///   - 听歌识曲：麦克风采集 + RMS 分析
 ///   - 预测性返回：Android 14+ 系统手势导航
 ///   - 音乐频谱：Visualizer 采集 PCM 波形
-///   - 震动反馈：Vibrator 硬件
+///   - 震动反馈：Vibrator 硬件（移动端；iOS 侧另走 UIFeedbackGenerator / CoreHaptics）
 ///   - 桌面快捷方式：quick_actions_android
 ///
 /// 本测试锁两件事：

@@ -76,15 +76,15 @@ enum MusicHapticsScope {
 /// 暂停/切歌/退后台由「原生暂停门控 + 特征断流 + 失活看门狗」自动兜住，
 /// 因此**不需要改 `full_player.dart` / `full_player_am.dart`**。
 class MusicHapticsService with WidgetsBindingObserver {
-  MusicHapticsService._({SpectrumService? spectrum, bool? isAndroid})
+  MusicHapticsService._({SpectrumService? spectrum, bool? isMobile})
     : _spectrum = spectrum ?? SpectrumService.instance,
-      _isAndroid = isAndroid ?? Platform.isAndroid;
+      _isMobile = isMobile ?? (Platform.isAndroid || Platform.isIOS);
 
   @visibleForTesting
   factory MusicHapticsService.forTesting({
     required SpectrumService spectrum,
-    bool isAndroid = true,
-  }) => MusicHapticsService._(spectrum: spectrum, isAndroid: isAndroid);
+    bool isMobile = true,
+  }) => MusicHapticsService._(spectrum: spectrum, isMobile: isMobile);
 
   static final MusicHapticsService instance = MusicHapticsService._();
 
@@ -113,6 +113,10 @@ class MusicHapticsService with WidgetsBindingObserver {
   /// PCM 在写入输出缓冲那一刻就被分析，比"听到"早约 0.55s，延后 580ms 才踩上拍。
   /// **换输出设备会变**（蓝牙耳机 / USB DAC / 系统 Direct PCM 的缓冲深度都不同），
   /// 那些情况下用设置里的滑块重调即可 —— 这也正是做成可调的原因。
+  ///
+  /// iOS 侧的 tap 挂在 AVPlayer 音频图上、链路深度与 AudioTrack 不同，且原生
+  /// `outputLatency` 恒返回 -1（自动校准不生效），故 iOS 首次使用需用滑块手动校准：
+  /// 默认 580 仅作起点，听感偏早就调小、偏晚就调大。
   static const int defaultOffsetMs = 580;
 
   /// 节奏偏移的最大可调值（毫秒）。输出链路的缓冲深度因设备/ROM/音量而异，
@@ -142,7 +146,10 @@ class MusicHapticsService with WidgetsBindingObserver {
   static const Duration _watchdogPeriod = Duration(seconds: 1);
 
   final SpectrumService _spectrum;
-  final bool _isAndroid;
+
+  /// 是否移动端（Android 或 iOS）。两端原生都实现了 `music_haptics` 通道
+  /// （Android 走 `Vibrator`、iOS 走 `CoreHaptics`），桌面端无实现、闸门常闭。
+  final bool _isMobile;
   final MethodChannel _channel = const MethodChannel(_channelName);
 
   /// 低频（kick）检测器。参数按低频带的能量量纲调过。
@@ -295,7 +302,7 @@ class MusicHapticsService with WidgetsBindingObserver {
   }
 
   Future<void> _probeCapabilities() async {
-    if (!_isAndroid) return;
+    if (!_isMobile) return;
     try {
       final caps = await _channel.invokeMapMethod<String, Object?>(
         'capabilities',
@@ -304,14 +311,14 @@ class MusicHapticsService with WidgetsBindingObserver {
       _nativeAvailable = caps['hasVibrator'] == true;
       _hasAmplitudeControl = caps['hasAmplitudeControl'] == true;
     } catch (_) {
-      // 通道未注册（非 Android / 引擎未就绪）：保持不可用，闸门自然关闭
+      // 通道未注册（桌面端 / 引擎未就绪）：保持不可用，闸门自然关闭
       _nativeAvailable = false;
     }
   }
 
   /// 把当前偏好下发原生。**每次改动都重下发**：波形缓存依赖这些参数。
   Future<void> _pushConfig() async {
-    if (!_isAndroid) return;
+    if (!_isMobile) return;
     try {
       await _channel.invokeMethod<void>('configure', {
         // 下发用户偏好而非五重闸门的合成值：configure 只在偏好变化时重发，
@@ -335,7 +342,7 @@ class MusicHapticsService with WidgetsBindingObserver {
     // 全站震动总开关：用户关了全站震动就不该再被音乐震动
     if (!AppHaptics.enabled) return false;
     if (!_nativeAvailable) return false;
-    if (!_isAndroid) return false;
+    if (!_isMobile) return false;
     // 模拟频谱是凭空生成的 sin 波，绝不能拿它驱动马达
     if (_spectrum.isSimulated) return false;
     // 特征通路必须有新鲜数据（暂停 / 视觉兜底路径 / 未开频谱都是这里拦下）
@@ -606,9 +613,11 @@ class MusicHapticsService with WidgetsBindingObserver {
 
   /// 实测输出排队深度（毫秒）。不可用返回 null。
   ///
-  /// 播放中才有意义：没在播音时 AudioTrack 未挂载，原生侧返回 -1。
+  /// Android：播放中才有意义（没在播音时 AudioTrack 未挂载），原生侧返回 -1。
+  /// iOS：tap 挂在 AVPlayer 音频图上，量不到整条输出链路的排队深度，恒定返回 -1，
+  /// 因此自动校准在 iOS 上不生效，节奏偏移只走用户手动值。
   Future<int?> refreshMeasuredLatency() async {
-    if (!_isAndroid) {
+    if (!_isMobile) {
       measuredLatencyMs = null;
       return null;
     }
