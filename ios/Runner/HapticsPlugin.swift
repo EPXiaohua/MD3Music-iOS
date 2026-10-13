@@ -391,7 +391,7 @@ final class MusicHapticsEngine: NSObject {
             let player = try engine.makePlayer(with: pattern)
             // 延迟排在引擎时钟上：不受调用线程抖动影响（见类注释）
             let startTime = delaySeconds > 0
-                ? engine.currentTime() + delaySeconds
+                ? engine.currentTime + delaySeconds
                 : CHHapticTimeImmediate
             try player.start(atTime: startTime)
             keepPlayerAlive(player, seconds: delaySeconds + 1.0)
