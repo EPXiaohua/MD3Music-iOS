@@ -6,9 +6,19 @@
 // -DDEPTH_3D_LINKED）后参与编译。
 //
 // ORT C API 采用「自声明函数表」方式绑定：不引入 C 头文件，直接按
-// onnxruntime_c_api.h（v1.22.0）的 OrtApi 结构体前 110 个字段顺序声明
-// （@since 单调性校验过，v1.0 起冻结不变）。未用字段以同尺寸占位类型填充，
-// 保证内存布局与 C 结构体一致。经 OrtGetApiBase().GetApi(22) 获取。
+// onnxruntime_c_api.h（v1.30.0，与上游 Android 自编库同版）的 OrtApi 结构体
+// 前 110 个字段顺序声明（ABI 只增不改，v1.22 前缀字段序一致，已逐字段核对）。
+// 未用字段以同尺寸占位类型填充，保证内存布局与 C 结构体一致。
+// 经 OrtGetApiBase().GetApi(30) 获取。
+//
+// 已踩过的坑（勿回退）：
+// - GetApi 返回值用 UnsafeRawPointer 接（C 函数指针不能携带 Swift struct 指针）
+// - SessionGetInputName/OutputName 是 4 参数签名（含 OrtAllocator，ORT 1.15+）
+// - CastTypeInfoToTensorInfo 返回借用指针，禁止 Release
+// - tensor 输入缓冲用显式 UnsafeMutableRawPointer 分配，生命周期覆盖到 Run
+//   结束（withUnsafeMutableBytes 指针仅闭包内有效，跨闭包使用必崩）
+// - 推理跑在 64MB 栈独立 pthread + 会话单线程（iOS 池线程栈仅 512KB，
+//   migan pipeline 图执行吃栈远超默认值）
 //
 // 通道 "com.md3music.md3music/depth_cover"，方法与 Android 一致：
 // - isModelLoaded / isInpaintModelLoaded -> Bool
@@ -871,13 +881,10 @@ private enum PullPushFiller {
 
   private func generateDepth(sourcePath: String, sourceBytes: Data?, outDir: String) throws -> DepthResult {
     guard let session = session else { throw DepthError.failed("session null") }
-    NSLog("[DepthCover] gd1: decode begin")
     let src = try decodeCover(path: sourcePath, bytes: sourceBytes)
-    NSLog("[DepthCover] gd2: decode done %dx%d", src.w, src.h)
     try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
     let norm = normalize(try infer(session, src))
-    NSLog("[DepthCover] gd11: infer+normalize done")
     let std = depthStd(norm)
 
     // --- 背景修补（push-pull + 深度保边平滑）：洞区被填充，
@@ -888,20 +895,16 @@ private enum PullPushFiller {
 
     // --- 神经细化（可选）：MI-GAN pipeline 会话就绪时对洞区二次填充，
     // 失败保底 push-pull 结果。开关由 Dart 侧控制（未开启不加载会话，直接跳过） ---
-    NSLog("[DepthCover] gd12: pushpull done")
     var usedNeural = false
     if let s2 = inpaintSession {
       usedNeural = neuralRefine(src, mask, &filled, w: src.w, h: src.h, session: s2)
-      if usedNeural { NSLog("[DepthCover] neuralRefine OK (migan)") }
     }
-    NSLog("[DepthCover] gd13: neural done used=%d", usedNeural ? 1 : 0)
 
     let w = src.w, h = src.h
     let outDirURL = URL(fileURLWithPath: outDir)
 
     let bgFillPath = outDirURL.appendingPathComponent("bg_fill.png").path
     try writePNGRGBA(filled, w: w, h: h, to: bgFillPath)
-    NSLog("[DepthCover] gd14: bg_fill png OK: %@ inpaint=%@", bgFillPath, usedNeural ? "migan" : "pushpull")
 
     // 灰度 8-bit（R=G=B=gray, A=255）@378×378
     let d = Self.depthSize
@@ -915,7 +918,6 @@ private enum PullPushFiller {
     }
     let depthPath = outDirURL.appendingPathComponent("depth.png").path
     try writePNGRGBA(gray, w: d, h: d, to: depthPath)
-    NSLog("[DepthCover] gd15: depth png OK std=\(std)")
 
     return DepthResult(
       depthPath: depthPath, std: Double(std),
@@ -930,7 +932,6 @@ private enum PullPushFiller {
     guard let api = api, let memInfo = memInfo else { throw DepthError.failed("ORT not initialized") }
     let d = Self.depthSize
     let scaled = scaledRGBA(src, d, d)
-    NSLog("[DepthCover] gd3: scaled done %dx%d", scaled.w, scaled.h)
 
     // NCHW float + ImageNet 归一化
     var data = [Float](repeating: 0, count: 3 * d * d)
@@ -941,18 +942,16 @@ private enum PullPushFiller {
         data[plane + i] = (Float(scaled.rgba[i * 4 + c]) / 255.0 - mean) / std
       }
     }
-    NSLog("[DepthCover] gd5: normalize done")
 
     let inName = try sessionInputName(session, 0)
     let outName = try sessionOutputName(session, 0)
-    NSLog("[DepthCover] gd6: names done in=%@ out=%@", inName, outName)
 
     var shape: [Int64] = [1, 3, Int64(d), Int64(d)]
     var tensor: OpaquePointer?
     // 关键：withUnsafeMutableBytes 的指针只在闭包内有效，闭包返回后 Swift 可立即
     // 释放/移动缓冲区；而 tensor 引用该内存且 Run 在闭包之外，会读到悬垂内存 →
-    // SIGSEGV（深度路径偶发 gd8 前后崩）。故改用显式自有缓冲，生命周期覆盖到 Run
-    // 结束（defer 逆序执行：先 ReleaseValue 再释放缓冲）。
+    // SIGSEGV。故改用显式自有缓冲，生命周期覆盖到 Run 结束（defer 逆序执行：
+    // 先 ReleaseValue 再释放缓冲）。
     let dataBytes = data.count * MemoryLayout<Float>.stride
     let dataPtr = UnsafeMutableRawPointer.allocate(
       byteCount: dataBytes, alignment: MemoryLayout<Float>.alignment)
@@ -964,7 +963,6 @@ private enum PullPushFiller {
     try ortCheck(creationStatus, "create input tensor")
     defer { if let t = tensor { api.pointee.ReleaseValue(t) } }
     guard tensor != nil else { throw DepthError.failed("input tensor null") }
-    NSLog("[DepthCover] gd7: tensor done")
 
     var outValue: OpaquePointer?
     try withCStrings([inName, outName]) { names in
@@ -972,9 +970,7 @@ private enum PullPushFiller {
       var outputs: [OpaquePointer?] = [nil]
       var inNames: [UnsafePointer<CChar>?] = [names[0]]
       var outNames: [UnsafePointer<CChar>?] = [names[1]]
-      NSLog("[DepthCover] gd8: Run begin")
       try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 1, outNames, 1, &outputs), "Run")
-      NSLog("[DepthCover] gd9: Run done")
       outValue = outputs[0]
     }
     guard let ov = outValue else { throw DepthError.failed("Run produced no output") }
@@ -985,9 +981,7 @@ private enum PullPushFiller {
     try ortCheck(api.pointee.GetTensorMutableData(ov, &ptr), "GetTensorMutableData")
     guard let p = ptr else { throw DepthError.failed("output data null") }
     let floats = p.assumingMemoryBound(to: Float.self)
-    let result = Array(UnsafeBufferPointer(start: floats, count: count))
-    NSLog("[DepthCover] gd10: out data done count=%d", count)
-    return result
+    return Array(UnsafeBufferPointer(start: floats, count: count))
   }
 
   // MARK: 背景修补管线（generate/generateDepth 共用）
@@ -1041,7 +1035,6 @@ private enum PullPushFiller {
     do {
       guard let api = api, let memInfo = memInfo else { return false }
       let d = Self.depthSize
-      NSLog("[DepthCover] nr1: begin %dx%d", w, h)
       // 1) 膨胀掩码 → 反转 → uint8（双线性上采样与 push-pull 同一几何）。
       //    官方要求掩码必须二值：连续值会让 pipeline 的 crop/blending 在
       //    过渡带产生彩色镶边，故此处硬阈值化。
@@ -1082,7 +1075,6 @@ private enum PullPushFiller {
       guard let img = imgName, let msk = mskName else {
         throw DepthError.failed("unexpected inpaint model inputs")
       }
-      NSLog("[DepthCover] nr2: dims+names done img=%@ msk=%@", img, msk)
       // 4) 推理（uint8 NCHW）
       var shapeImg: [Int64] = [1, 3, Int64(h), Int64(w)]
       var shapeMask: [Int64] = [1, 1, Int64(h), Int64(w)]
@@ -1110,7 +1102,6 @@ private enum PullPushFiller {
 
       let outName = try sessionOutputName(session, 0)
       var outValue: OpaquePointer?
-      NSLog("[DepthCover] nr3: tensors done, Run begin")
       try withCStrings([img, msk, outName]) { names in
         var inputs: [OpaquePointer?] = [tImg, tMask]
         var outputs: [OpaquePointer?] = [nil]
@@ -1119,7 +1110,6 @@ private enum PullPushFiller {
         try ortCheck(api.pointee.Run(session, nil, inNames, inputs, 2, outNames, 1, &outputs), "migan Run")
         outValue = outputs[0]
       }
-      NSLog("[DepthCover] nr4: Run done")
       guard let ov = outValue else { throw DepthError.failed("migan Run no output") }
       defer { api.pointee.ReleaseValue(ov) }
       let (_, count) = try tensorDims(ov)
@@ -1394,12 +1384,13 @@ private enum PullPushFiller {
   }
 }
 
-// MARK: - 崩溃现场记录（SIGSEGV/SIGBUS 诊断，验证期临时设施）
+// MARK: - 崩溃现场记录（SIGSEGV/SIGBUS 兜底日志）
+// ORT 图执行若在进程内 SIGSEGV（无 ORT 日志可循），信号处理器把 sig/addr 与
+// backtrace 落盘到 App 数据目录 tmp/depth_crash.log，供事后定位。
 // 信号处理器内必须零分配、零加锁：不能用 snprintf（Swift 无变参 C 函数）、
 // 不能用 String(format:)/字符串插值/数组字面量（都会堆分配或加锁，崩溃现场
 // 直接死锁 → 实测无任何输出）。故所有缓冲在 install 时一次性分配，handler 内
-// 只做手动字节拼接 + write/backtrace_symbols_fd，崩溃后可在 App 数据目录
-// tmp/depth_crash.log 看到 PC 附近地址与 backtrace。
+// 只做手动字节拼接 + write/backtrace_symbols_fd。
 
 private var depthCrashLogPath: UnsafeMutablePointer<CChar>?
 private var depthCrashPrefix: UnsafeMutablePointer<CChar>?  // "[DepthCover] CRASH sig="
