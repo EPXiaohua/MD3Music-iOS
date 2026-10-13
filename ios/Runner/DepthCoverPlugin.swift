@@ -949,12 +949,18 @@ private enum PullPushFiller {
 
     var shape: [Int64] = [1, 3, Int64(d), Int64(d)]
     var tensor: OpaquePointer?
+    // 关键：withUnsafeMutableBytes 的指针只在闭包内有效，闭包返回后 Swift 可立即
+    // 释放/移动缓冲区；而 tensor 引用该内存且 Run 在闭包之外，会读到悬垂内存 →
+    // SIGSEGV（深度路径偶发 gd8 前后崩）。故改用显式自有缓冲，生命周期覆盖到 Run
+    // 结束（defer 逆序执行：先 ReleaseValue 再释放缓冲）。
+    let dataBytes = data.count * MemoryLayout<Float>.stride
+    let dataPtr = UnsafeMutableRawPointer.allocate(
+      byteCount: dataBytes, alignment: MemoryLayout<Float>.alignment)
+    defer { dataPtr.deallocate() }
+    data.withUnsafeBytes { dataPtr.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
     var creationStatus: OpaquePointer?
-    // data 缓冲不拷贝、被 tensor 引用，必须在 Run 结束前保活（同一作用域内）
-    data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-      creationStatus = api.pointee.CreateTensorWithDataAsOrtValue(
-        memInfo, raw.baseAddress, raw.count, shape, shape.count, Ort.typeFloat, &tensor)
-    }
+    creationStatus = api.pointee.CreateTensorWithDataAsOrtValue(
+      memInfo, dataPtr, dataBytes, shape, shape.count, Ort.typeFloat, &tensor)
     try ortCheck(creationStatus, "create input tensor")
     defer { if let t = tensor { api.pointee.ReleaseValue(t) } }
     guard tensor != nil else { throw DepthError.failed("input tensor null") }
@@ -1082,19 +1088,22 @@ private enum PullPushFiller {
       var shapeMask: [Int64] = [1, 1, Int64(h), Int64(w)]
       var tImg: OpaquePointer?
       var tMask: OpaquePointer?
+      // 同 infer：withUnsafeMutableBytes 指针仅在闭包内有效，绝不能跨 Run 使用。
+      // 改用显式自有缓冲，Run 结束后才由 defer 释放（此前稳定崩在 nr3→nr4）。
+      let rgbPtr = UnsafeMutableRawPointer.allocate(byteCount: rgb.count, alignment: 1)
+      let maskPtr = UnsafeMutableRawPointer.allocate(byteCount: maskU8.count, alignment: 1)
+      defer { rgbPtr.deallocate(); maskPtr.deallocate() }
+      rgb.withUnsafeBytes { rgbPtr.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+      maskU8.withUnsafeBytes { maskPtr.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
       var sImg: OpaquePointer?
-      var sMask: OpaquePointer?
-      rgb.withUnsafeMutableBytes { (rr: UnsafeMutableRawBufferPointer) in
-        sImg = api.pointee.CreateTensorWithDataAsOrtValue(
-          memInfo, rr.baseAddress, rr.count, shapeImg, shapeImg.count, Ort.typeUint8, &tImg)
-      }
+      sImg = api.pointee.CreateTensorWithDataAsOrtValue(
+        memInfo, rgbPtr, rgb.count, shapeImg, shapeImg.count, Ort.typeUint8, &tImg)
       try ortCheck(sImg, "create migan image tensor")
       guard tImg != nil else { throw DepthError.failed("migan image tensor null") }
       defer { if let t = tImg { api.pointee.ReleaseValue(t) } }
-      maskU8.withUnsafeMutableBytes { (rm: UnsafeMutableRawBufferPointer) in
-        sMask = api.pointee.CreateTensorWithDataAsOrtValue(
-          memInfo, rm.baseAddress, rm.count, shapeMask, shapeMask.count, Ort.typeUint8, &tMask)
-      }
+      var sMask: OpaquePointer?
+      sMask = api.pointee.CreateTensorWithDataAsOrtValue(
+        memInfo, maskPtr, maskU8.count, shapeMask, shapeMask.count, Ort.typeUint8, &tMask)
       try ortCheck(sMask, "create migan mask tensor")
       guard tMask != nil else { throw DepthError.failed("migan mask tensor null") }
       defer { if let t = tMask { api.pointee.ReleaseValue(t) } }
@@ -1386,31 +1395,35 @@ private enum PullPushFiller {
 }
 
 // MARK: - 崩溃现场记录（SIGSEGV/SIGBUS 诊断，验证期临时设施）
-// ORT 图执行若在进程内 SIGSEGV（此前多轮闪退均无 ORT 日志可循），在信号
-// 处理器里把 si_addr / PC / LR / SP / backtrace 写到 stderr（syslog 可见），
-// 用于离线符号定位崩溃函数。写完恢复默认处置并重新 raise，不影响正常崩溃报告。
+// 信号处理器内只能用异步信号安全的函数，NSLog/String(format:)/Swift 字符串
+// 插值都会分配内存并加锁 → 在崩溃现场死锁或二次崩溃，实测无任何输出。
+// 因此改为：snprintf 组消息 + write/open/backtrace_symbols_fd 落盘到容器 tmp，
+// 崩溃后可在 App 数据目录 tmp/ 下取 depth_crash.log 查看 PC/LR/backtrace。
+
+private var depthCrashLogPath: UnsafeMutablePointer<CChar>?
 
 private func depthCrashSigHandler(
   _ sig: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ uctx: UnsafeMutableRawPointer?
 ) -> Void {
-  var msg = "[DepthCover] CRASH sig=\(sig)"
+  var buf = [CChar](repeating: 0, count: 512)
   if let i = info {
-    msg += String(format: " addr=0x%lx", UInt(bitPattern: i.pointee.si_addr))
+    _ = snprintf(&buf, buf.count, "[DepthCover] CRASH sig=%d addr=0x%lx",
+                 sig, UInt(bitPattern: i.pointee.si_addr))
+  } else {
+    _ = snprintf(&buf, buf.count, "[DepthCover] CRASH sig=%d", sig)
   }
-  if let uc = uctx?.assumingMemoryBound(to: ucontext_t.self) {
-    let ss = uc.pointee.uc_mcontext.pointee.__ss
-    msg += String(format: " pc=0x%llx lr=0x%llx sp=0x%llx fp=0x%llx",
-                  ss.__pc, ss.__lr, ss.__sp, ss.__fp)
-  }
-  // iOS GUI 进程的 fd 2 是黑洞（不进 os_log），必须走 NSLog 才能被 syslog 采集
-  NSLog("%@", msg)
+  _ = write(2, buf, strlen(buf))
+  _ = write(2, "\n", 1)
   var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 96)
   let n = backtrace(&frames, 96)
-  if n > 0, let syms = backtrace_symbols(&frames, n) {
-    for i in 0..<Int(n) {
-      if let p = syms[i] {
-        NSLog("[DepthCover] bt[%d] %@", i, String(cString: p))
-      }
+  if let path = depthCrashLogPath {
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    if fd >= 0 {
+      _ = write(fd, buf, strlen(buf))
+      _ = write(fd, "\n", 1)
+      if n > 0 { backtrace_symbols_fd(&frames, n, fd) }
+      _ = write(fd, "---\n", 4)
+      close(fd)
     }
   }
   signal(sig, SIG_DFL)
@@ -1427,7 +1440,9 @@ private func depthInstallCrashLogger() {
   act.__sigaction_u.__sa_sigaction = depthCrashSigHandler
   sigaction(SIGSEGV, &act, nil)
   sigaction(SIGBUS, &act, nil)
-  NSLog("[DepthCover] crash logger installed")
+  let logPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("depth_crash.log")
+  depthCrashLogPath = strdup(logPath)
+  NSLog("[DepthCover] crash logger installed, log=%@", logPath)
 }
 
 #endif // DEPTH_3D_LINKED
