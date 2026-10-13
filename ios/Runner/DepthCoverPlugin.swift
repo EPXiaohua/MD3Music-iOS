@@ -515,6 +515,7 @@ private enum PullPushFiller {
   func attach(messenger: FlutterBinaryMessenger) {
     guard !channelsAttached else { return }
     channelsAttached = true
+    depthInstallCrashLogger()
     FlutterMethodChannel(name: Self.channelName, binaryMessenger: messenger)
       .setMethodCallHandler { [weak self] call, result in
         self?.handle(call, result: result)
@@ -754,15 +755,18 @@ private enum PullPushFiller {
     }
   }
 
-  private func createSession(modelData: Data) throws -> OpaquePointer {
+  private func createSession(modelData: Data, intraOpThreads: Int32 = 4) throws -> OpaquePointer {
     guard let api = api, let env = env, let memInfo = memInfo else {
       throw DepthError.failed("ORT not initialized")
     }
-    // 会话选项：4 线程 + 禁用图优化（对齐 Android NO_OPT，裁剪模型缺融合内核）
+    // 会话选项：禁用图优化（对齐 Android NO_OPT，裁剪模型缺融合内核）。
+    // migan 用单线程：ORT 线程池线程在 iOS 默认 512KB 栈，pipeline 图执行
+    // 曾在池线程内 SIGSEGV（64MB 大栈调用线程也崩，nr3 实测）；单线程后
+    // 全部算子都在 64MB 大栈线程上执行。
     var opts: OpaquePointer?
     try ortCheck(api.pointee.CreateSessionOptions(&opts), "CreateSessionOptions")
     defer { if let o = opts { api.pointee.ReleaseSessionOptions(o) } }
-    try ortCheck(api.pointee.SetIntraOpNumThreads(opts, 4), "SetIntraOpNumThreads")
+    try ortCheck(api.pointee.SetIntraOpNumThreads(opts, intraOpThreads), "SetIntraOpNumThreads")
     try ortCheck(api.pointee.SetSessionGraphOptimizationLevel(opts, Ort.disableAll), "SetSessionGraphOptimizationLevel")
     var out: OpaquePointer?
     try modelData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
@@ -818,7 +822,7 @@ private enum PullPushFiller {
       throw DepthError.failed("read inpaint model failed: \(error)")
     }
     NSLog("[DepthCover] loadInpaintModel begin: %@ (%d bytes)", path, data.count)
-    let s = try createSession(modelData: data)
+    let s = try createSession(modelData: data, intraOpThreads: 1)
     // modelData 保活到会话释放（同 loadModel，CreateSessionFromArray 零拷贝引用）
     if let old = inpaintSession { api.pointee.ReleaseSession(old) }
     inpaintSession = s
@@ -1364,7 +1368,6 @@ private enum PullPushFiller {
   }
 
   // MARK: C 字符串辅助
-
   /// 把字符串数组以 withCString 嵌套方式转成 C 指针数组（生命周期覆盖 body）。
   private func withCStrings(
     _ strings: [String], index: Int = 0, acc: [UnsafePointer<CChar>?] = [],
@@ -1380,6 +1383,45 @@ private enum PullPushFiller {
       }
     }
   }
+}
+
+// MARK: - 崩溃现场记录（SIGSEGV/SIGBUS 诊断，验证期临时设施）
+// ORT 图执行若在进程内 SIGSEGV（此前多轮闪退均无 ORT 日志可循），在信号
+// 处理器里把 si_addr / PC / LR / SP / backtrace 写到 stderr（syslog 可见），
+// 用于离线符号定位崩溃函数。写完恢复默认处置并重新 raise，不影响正常崩溃报告。
+
+private func depthCrashSigHandler(
+  _ sig: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ uctx: UnsafeMutableRawPointer?
+) -> Void {
+  var buf = "[DepthCover] CRASH sig=\(sig)"
+  if let i = info {
+    buf += String(format: " addr=0x%lx", UInt(bitPattern: i.pointee.si_addr))
+  }
+  if let uc = uctx?.assumingMemoryBound(to: ucontext_t.self) {
+    let ss = uc.pointee.uc_mcontext.pointee.__ss
+    buf += String(format: " pc=0x%llx lr=0x%llx sp=0x%llx fp=0x%llx",
+                  ss.__pc, ss.__lr, ss.__sp, ss.__fp)
+  }
+  buf.withCString { p in _ = write(2, p, strlen(p)) }
+  _ = write(2, "\n", 1)
+  var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 96)
+  let n = backtrace(&frames, 96)
+  if n > 0 { backtrace_symbols_fd(&frames, n, 2) }
+  signal(sig, SIG_DFL)
+  raise(sig)
+}
+
+private func depthInstallCrashLogger() {
+  let sz = 256 * 1024
+  var stack = stack_t(ss_sp: malloc(sz), ss_size: sz, ss_flags: 0)
+  _ = sigaltstack(&stack, nil)
+  var act = sigaction()
+  sigemptyset(&act.sa_mask)
+  act.sa_flags = SA_SIGINFO | SA_ONSTACK
+  act.__sigaction_u.__sa_sigaction = depthCrashSigHandler
+  sigaction(SIGSEGV, &act, nil)
+  sigaction(SIGBUS, &act, nil)
+  NSLog("[DepthCover] crash logger installed")
 }
 
 #endif // DEPTH_3D_LINKED
