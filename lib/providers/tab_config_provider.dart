@@ -81,8 +81,9 @@ const List<TabItem> kOptionalTabs = [
 
 /// 所有可用 Tab（默认显示 + 可选）。
 ///
-/// **平台过滤**：听歌识曲依赖 Android 麦克风采集 + RMS 分析链路，
-/// 桌面端（Windows/macOS/Linux）点进去只会得到一个不工作的页面。
+/// **平台过滤**：听歌识曲在 Android（麦克风 + RMS 分析链路）与 iOS
+/// （麦克风采集 + PiP 悬浮窗识别）均有实现，仅桌面端
+/// （Windows/macOS/Linux）点进去只会得到一个不工作的页面。
 /// 故在**源头**就剔除 —— 设置页「主页管理」、底部导航、LaunchPad 托盘
 /// 共用本列表，一处过滤三处生效；持久化的旧顺序里若含 recognition
 /// 也会被 [_recomputeVisible] 顺带忽略。
