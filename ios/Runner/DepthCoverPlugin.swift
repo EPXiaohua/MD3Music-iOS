@@ -1393,20 +1393,26 @@ private enum PullPushFiller {
 private func depthCrashSigHandler(
   _ sig: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ uctx: UnsafeMutableRawPointer?
 ) -> Void {
-  var buf = "[DepthCover] CRASH sig=\(sig)"
+  var msg = "[DepthCover] CRASH sig=\(sig)"
   if let i = info {
-    buf += String(format: " addr=0x%lx", UInt(bitPattern: i.pointee.si_addr))
+    msg += String(format: " addr=0x%lx", UInt(bitPattern: i.pointee.si_addr))
   }
   if let uc = uctx?.assumingMemoryBound(to: ucontext_t.self) {
     let ss = uc.pointee.uc_mcontext.pointee.__ss
-    buf += String(format: " pc=0x%llx lr=0x%llx sp=0x%llx fp=0x%llx",
+    msg += String(format: " pc=0x%llx lr=0x%llx sp=0x%llx fp=0x%llx",
                   ss.__pc, ss.__lr, ss.__sp, ss.__fp)
   }
-  buf.withCString { p in _ = write(2, p, strlen(p)) }
-  _ = write(2, "\n", 1)
+  // iOS GUI 进程的 fd 2 是黑洞（不进 os_log），必须走 NSLog 才能被 syslog 采集
+  NSLog("%@", msg)
   var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 96)
   let n = backtrace(&frames, 96)
-  if n > 0 { backtrace_symbols_fd(&frames, n, 2) }
+  if n > 0, let syms = backtrace_symbols(&frames, n) {
+    for i in 0..<Int(n) {
+      if let p = syms[i] {
+        NSLog("[DepthCover] bt[%d] %@", i, String(cString: p))
+      }
+    }
+  }
   signal(sig, SIG_DFL)
   raise(sig)
 }
