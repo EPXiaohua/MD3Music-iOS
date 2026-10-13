@@ -126,11 +126,14 @@ final class SongRecognitionPipManager: NSObject {
         result(nil)
       case "getAppGroupDir":
         // 系统声音识曲：广播扩展把 PCM 写在 App Group 容器 sysrecog/ 下，
-        // Dart 直接读文件（组 id 免签动态解析与 widget 同款，两边解析一致）
+        // Dart 直接读文件（组 id 免签动态解析与 widget 同款）。返回解析出的
+        // 组 id，Dart 与广播扩展写进 meta 的 group 比对可发现免签两侧
+        // 没分到同一个组的场景。
+        let group = WidgetSync.resolvedAppGroupId
         if let dir = FileManager.default.containerURL(
-          forSecurityApplicationGroupIdentifier: WidgetSync.resolvedAppGroupId)
+          forSecurityApplicationGroupIdentifier: group)
         {
-          result(dir.path)
+          result(["dir": dir.path, "group": group])
         } else {
           result(nil)
         }

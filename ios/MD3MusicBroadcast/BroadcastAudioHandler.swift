@@ -41,6 +41,8 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   /// 每个缓冲的容量（字节）：按实际采样率在首帧时确定（10s × 2字节/样本）
   private var bufferCapBytes: Int { (sampleRate > 0 ? sampleRate : 48000) * 2 * 10 }
 
+  private var queue2sBeatUptime: TimeInterval = 0
+
   private var segFileUrl: URL {
     groupDir!.appendingPathComponent("seg_\(writingIndex).pcm")
   }
@@ -54,10 +56,10 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     queue.async { [weak self] in
       guard let self else { return }
       self.groupDir = Self.resolveAppGroupContainer()?.appendingPathComponent("sysrecog")
-      guard let dir = self.groupDir else {
-        NSLog("[MD3Broadcast] no usable app group container")
-        return
-      }
+      guard let dir = self.groupDir else { return }
+      NSLog(
+        "[MD3Broadcast] broadcast started, group=%@ dir=%@",
+        Self.resolvedGroupId ?? "?", dir.path)
       try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
       self.writingIndex = 0
       self.writtenBytes = 0
@@ -75,6 +77,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   override func broadcastFinished() {
     queue.async { [weak self] in
       guard let self else { return }
+      NSLog("[MD3Broadcast] broadcast finished")
       self.writeMeta(stopped: true)
       for i in 0...1 {
         try? self.fileHandles[i]?.close()
@@ -127,6 +130,11 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       guard self.groupDir != nil else { return }
       if self.sampleRate == 0 {
         self.sampleRate = rate
+        NSLog(
+          "[MD3Broadcast] first audio sample: rate=%ld ch=%ld bits=%ld float=%ld nonInterleaved=%ld",
+          rate, channels, Int(asbd.mBitsPerChannel),
+          (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0,
+          (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)
       }
       self.append(pcm)
     }
@@ -211,6 +219,13 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     writtenBytes += pcm.count
 
     let now = ProcessInfo.processInfo.systemUptime
+    if now - queue2sBeatUptime >= 2.0 {
+      // 诊断心跳：确认扩展在持续收到系统音频并落盘
+      queue2sBeatUptime = now
+      NSLog(
+        "[MD3Broadcast] seg=%ld bytes=%ld rate=%ld",
+        writingIndex, writtenBytes, sampleRate)
+    }
     if writtenBytes >= bufferCapBytes {
       // 满 10s 翻缓冲：先把当前缓冲的终态写进 meta，再切到另一个并截断
       writeMeta(stopped: false)
@@ -230,13 +245,17 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
 
   private func writeMeta(stopped: Bool) {
     guard let dir = groupDir else { return }
-    let meta: [String: Any] = [
+    var meta: [String: Any] = [
       "writing": writingIndex,
       "bytes": writtenBytes,
       "sampleRate": sampleRate,
       "ts": Int64(Date().timeIntervalSince1970 * 1000),
       "stopped": stopped,
     ]
+    // 写入扩展侧解析出的组 id：宿主比对可发现免签两侧没分到同一个组
+    if let g = Self.resolvedGroupId {
+      meta["group"] = g
+    }
     guard let json = try? JSONSerialization.data(withJSONObject: meta) else { return }
     // 原子替换，Dart 读到的是完整 JSON
     try? json.write(to: metaUrl, options: .atomic)
@@ -247,6 +266,9 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
 
   static let declaredAppGroupId = "group.com.md3music.md3music"
 
+  /// 本次实际解析出的 App Group id（写入 meta 供宿主比对）
+  static var resolvedGroupId: String?
+
   static func resolveAppGroupContainer() -> URL? {
     var candidates = signedAppGroups() ?? []
     if !candidates.contains(declaredAppGroupId) { candidates.append(declaredAppGroupId) }
@@ -254,9 +276,12 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       if let url = FileManager.default.containerURL(
         forSecurityApplicationGroupIdentifier: g)
       {
+        resolvedGroupId = g
+        NSLog("[MD3Broadcast] resolved app group: %@", g)
         return url
       }
     }
+    NSLog("[MD3Broadcast] no usable app group container")
     return nil
   }
 

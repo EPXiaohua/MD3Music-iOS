@@ -386,6 +386,10 @@ class PipRecognitionController {
   /// App Group 容器路径缓存（原生免签动态解析后返回，一次获取）
   String? _appGroupDir;
 
+  /// 原生解析出的 App Group id（与广播扩展写进 meta 的 group 比对，
+  /// 可发现免签重签时扩展与宿主没分到同一个组的场景）
+  String? _appGroupId;
+
   /// 系统声音数据新鲜窗口：ts 超过该时长视为广播已停止/失效
   static const int _sysAudioFreshMs = 15000;
 
@@ -393,9 +397,18 @@ class PipRecognitionController {
     final cached = _appGroupDir;
     if (cached != null) return cached;
     try {
-      final dir = await _channel.invokeMethod<String>('getAppGroupDir');
-      if (dir != null && dir.isNotEmpty) _appGroupDir = dir;
-    } catch (_) {}
+      final info = await _channel.invokeMethod<Map>('getAppGroupDir');
+      final dir = info?['dir'] as String?;
+      if (dir != null && dir.isNotEmpty) {
+        _appGroupDir = dir;
+        _appGroupId = info?['group'] as String?;
+        print(
+          '[PipRecognition] app group dir: $_appGroupDir (group=$_appGroupId)',
+        );
+      }
+    } catch (e) {
+      print('[PipRecognition] resolve app group dir failed: $e');
+    }
     return _appGroupDir;
   }
 
@@ -408,35 +421,67 @@ class PipRecognitionController {
   /// 读侧读到多少算多少，天然无撕裂。
   Future<({Uint8List pcm, int sampleRate})?> _readSystemAudioSegment() async {
     final dir = await _resolveAppGroupDir();
-    if (dir == null) return null;
+    if (dir == null) {
+      print('[PipRecognition] sys audio: no app group dir');
+      return null;
+    }
     RandomAccessFile? raf;
     try {
       final metaFile = File('$dir/sysrecog/seg_meta.json');
-      if (!await metaFile.exists()) return null;
+      if (!await metaFile.exists()) {
+        print('[PipRecognition] sys audio: no meta (broadcast never started)');
+        return null;
+      }
       final meta = jsonDecode(await metaFile.readAsString());
       if (meta is! Map) return null;
-      if (meta['stopped'] == true) return null;
+      if (meta['stopped'] == true) {
+        print('[PipRecognition] sys audio: broadcast stopped');
+        return null;
+      }
+      final metaGroup = meta['group'];
+      if (metaGroup is String &&
+          _appGroupId != null &&
+          metaGroup != _appGroupId) {
+        print(
+          '[PipRecognition] sys audio: app group mismatch '
+          '(meta=$metaGroup host=$_appGroupId)',
+        );
+        return null;
+      }
       final ts = meta['ts'];
-      if (ts is! int ||
-          DateTime.now().millisecondsSinceEpoch - ts > _sysAudioFreshMs) {
+      final age = ts is int
+          ? DateTime.now().millisecondsSinceEpoch - ts
+          : _sysAudioFreshMs + 1;
+      if (age > _sysAudioFreshMs) {
+        print('[PipRecognition] sys audio: data stale/stopped (${age}ms)');
         return null;
       }
       final writing = meta['writing'];
       final total = meta['bytes'];
       final rate = meta['sampleRate'];
       if (writing is! int || total is! int || rate is! int) return null;
-      if (total <= 0 || rate <= 0) return null;
+      if (total <= 0 || rate <= 0) {
+        print('[PipRecognition] sys audio: meta present but empty');
+        return null;
+      }
       // 取尾部 8s（Int16 mono = 2 字节/帧）
       final cap = rate * 2 * _segmentDuration;
       final take = total > cap ? cap : total;
       final offset = total - take;
       final f = File('$dir/sysrecog/seg_$writing.pcm');
-      if (!await f.exists()) return null;
+      if (!await f.exists()) {
+        print('[PipRecognition] sys audio: seg file missing');
+        return null;
+      }
       raf = await f.open();
-      if (await f.length() < offset + take) return null;
+      if (await f.length() < offset + take) {
+        print('[PipRecognition] sys audio: seg file shorter than meta');
+        return null;
+      }
       await raf.setPosition(offset);
       final pcm = await raf.read(take);
       if (pcm.length < take) return null;
+      print('[PipRecognition] sys audio: using ${pcm.length}B @${rate}Hz');
       return (pcm: pcm, sampleRate: rate);
     } catch (e) {
       print('[PipRecognition] read system audio failed: $e');
