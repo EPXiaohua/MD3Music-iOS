@@ -20,10 +20,14 @@ import 'song_recognition_page.dart';
 
 /// iOS 听歌识曲悬浮窗控制器（系统画中画）。
 ///
-/// iOS 没有 Android AudioPlaybackCapture（系统音频捕获）的对应能力，
-/// 悬浮窗识别走与识曲页相同的麦克风链路：本控制器驱动 8s/段、最多 56s 的
-/// 录音+识别循环，原生侧（SongRecognitionPipManager）只负责渲染 2:1 PiP
-/// 窗口，状态经 update 推送（idle/listening/recognizing/result/stopped）。
+/// 音频源两级：**系统声音优先**——用户在系统控制中心长按「屏幕录制」选择
+/// MD3Music 开广播后，广播上传扩展（MD3MusicBroadcast target）把其他 app
+/// 的混音输出持续写入 App Group 容器 sysrecog/ 双缓冲 PCM，识别循环检测到
+/// 新鲜数据（ts 15s 内）就直接读尾部 8s 段（数字拷贝，比麦克风干净）；无
+/// 广播数据时回退与识曲页相同的麦克风链路。识别循环 8s/段、最多 56s，
+/// 原生侧（SongRecognitionPipManager）只负责渲染 2:1 PiP 窗口 + 暴露
+/// App Group 容器路径，状态经 update 推送
+///（idle/listening/recognizing/result/stopped）。
 ///
 /// 交互：
 /// - 识曲页「悬浮窗模式」开窗后**立即开始识别循环**（iOS 悬浮窗内部不可点，
@@ -263,35 +267,19 @@ class PipRecognitionController {
     return null;
   }
 
-  // ===================== 识别循环（麦克风，与识曲页同链路） =====================
+  // ===================== 识别循环（系统声音优先，回退麦克风） =====================
 
-  /// 启动识别循环。返回 false 表示麦克风权限被拒等无法开始的情况。
+  /// 录音会话是否已被本循环切到录音模式（系统声音段不动会话）
+  bool _sessionConfigured = false;
+
+  /// 启动识别循环。系统声音（广播扩展 PCM）可用时优先；无广播数据回退
+  /// 麦克风，权限被拒时提示一次（循环继续，后续段仍可吃到系统声音）。
   Future<bool> startLoop() async {
     if (_isLooping) return true;
-    final mic = await Permission.microphone.request();
-    if (!mic.isGranted) {
-      showToast('需要麦克风权限才能使用听歌识曲', long: true);
-      return false;
-    }
     _isLooping = true;
     _attemptCount = 0;
     _notify();
-
-    // 切换音频会话为录音模式（与识曲页一致）
-    try {
-      final session = await AudioSession.instance;
-      await session.configure(
-        const AudioSessionConfiguration(
-          avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-          avAudioSessionMode: AVAudioSessionMode.defaultMode,
-          androidAudioAttributes: AndroidAudioAttributes(
-            contentType: AndroidAudioContentType.music,
-            usage: AndroidAudioUsage.media,
-          ),
-          androidWillPauseWhenDucked: false,
-        ),
-      );
-    } catch (_) {}
+    var micDeniedToasted = false;
 
     try {
       while (_isLooping) {
@@ -307,10 +295,49 @@ class PipRecognitionController {
           text:
               '正在聆听... ${_attemptCount * _segmentDuration}s / ${_maxTotalDuration}s',
         );
-        final wav = await _recordSegment();
-        if (!_isLooping) break;
+        // 系统声音优先：广播扩展持续写入 App Group 的双缓冲 PCM 有新鲜数据
+        // （ts 15s 内）就用数字拷贝（无环境噪声、无损，准确率远高于麦克风）；
+        // 没有则回退麦克风。系统声音段完全不碰录音会话，不打断当前播放。
+        Uint8List? audioData;
+        var sourceHz = _recordSampleRate;
+        final sys = await _readSystemAudioSegment();
+        if (sys != null) {
+          audioData = sys.pcm;
+          sourceHz = sys.sampleRate;
+          // 数据是现成的，等满段时长保持 8s/段的识别节奏（与安卓悬浮窗一致）
+          await Future.delayed(const Duration(seconds: _segmentDuration));
+          if (!_isLooping) break;
+        } else {
+          if (!_sessionConfigured) {
+            final mic = await Permission.microphone.request();
+            if (mic.isGranted) {
+              // 切换音频会话为录音模式（与识曲页一致）
+              try {
+                final session = await AudioSession.instance;
+                await session.configure(
+                  const AudioSessionConfiguration(
+                    avAudioSessionCategory:
+                        AVAudioSessionCategory.playAndRecord,
+                    avAudioSessionMode: AVAudioSessionMode.defaultMode,
+                    androidAudioAttributes: AndroidAudioAttributes(
+                      contentType: AndroidAudioContentType.music,
+                      usage: AndroidAudioUsage.media,
+                    ),
+                    androidWillPauseWhenDucked: false,
+                  ),
+                );
+                _sessionConfigured = true;
+              } catch (_) {}
+            } else if (!micDeniedToasted) {
+              micDeniedToasted = true;
+              showToast('需要麦克风权限，或在系统控制中心开启 MD3Music 屏幕录制（识别系统声音）', long: true);
+            }
+          }
+          audioData = await _recordSegment();
+          if (!_isLooping) break;
+        }
         _pushState('recognizing', text: '正在识别第 $_attemptCount 段...');
-        final matched = await _recognizeSegment(wav);
+        final matched = await _recognizeSegment(audioData, sourceHz: sourceHz);
         if (!_isLooping) break;
         if (matched != null) {
           // 保存未读结果：回前台/重新打开应用时自动打开识曲页展示
@@ -327,7 +354,7 @@ class PipRecognitionController {
       if (_isLooping) _pushState('stopped', text: '未识别到歌曲');
     } finally {
       _isLooping = false;
-      await _releaseRecorderAndSession();
+      await _releaseRecorderAndSession(restoreSession: _sessionConfigured);
       _notify();
     }
     return true;
@@ -337,18 +364,88 @@ class PipRecognitionController {
   Future<void> _abortLoop() async {
     if (!_isLooping) return;
     _isLooping = false;
-    await _releaseRecorderAndSession();
+    await _releaseRecorderAndSession(restoreSession: _sessionConfigured);
     _notify();
   }
 
-  Future<void> _releaseRecorderAndSession() async {
+  /// 释放录音器并恢复音频会话。restoreSession=false 时只停录音、不动会话
+  /// （整轮都走系统声音、会话从未被本循环切过时使用，不打断当前播放）。
+  Future<void> _releaseRecorderAndSession({bool restoreSession = true}) async {
     try {
       await _recorder.stop();
     } catch (_) {}
+    if (!restoreSession) return;
     try {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
     } catch (_) {}
+  }
+
+  // ===================== 系统声音段（广播扩展双缓冲文件） =====================
+
+  /// App Group 容器路径缓存（原生免签动态解析后返回，一次获取）
+  String? _appGroupDir;
+
+  /// 系统声音数据新鲜窗口：ts 超过该时长视为广播已停止/失效
+  static const int _sysAudioFreshMs = 15000;
+
+  Future<String?> _resolveAppGroupDir() async {
+    final cached = _appGroupDir;
+    if (cached != null) return cached;
+    try {
+      final dir = await _channel.invokeMethod<String>('getAppGroupDir');
+      if (dir != null && dir.isNotEmpty) _appGroupDir = dir;
+    } catch (_) {}
+    return _appGroupDir;
+  }
+
+  /// 读广播扩展写入的系统声音尾部 8s 段（Int16 mono PCM）。
+  /// 返回 null = 无新鲜系统声音，调用方回退麦克风。
+  ///
+  /// 文件协议（与 BroadcastAudioHandler 约定）：App Group 容器 sysrecog/ 下
+  /// seg_0.pcm / seg_1.pcm 双缓冲 + seg_meta.json {"writing","bytes",
+  /// "sampleRate","ts","stopped"}；扩展先写数据再更新 meta（bytes 单调递增），
+  /// 读侧读到多少算多少，天然无撕裂。
+  Future<({Uint8List pcm, int sampleRate})?> _readSystemAudioSegment() async {
+    final dir = await _resolveAppGroupDir();
+    if (dir == null) return null;
+    RandomAccessFile? raf;
+    try {
+      final metaFile = File('$dir/sysrecog/seg_meta.json');
+      if (!await metaFile.exists()) return null;
+      final meta = jsonDecode(await metaFile.readAsString());
+      if (meta is! Map) return null;
+      if (meta['stopped'] == true) return null;
+      final ts = meta['ts'];
+      if (ts is! int ||
+          DateTime.now().millisecondsSinceEpoch - ts > _sysAudioFreshMs) {
+        return null;
+      }
+      final writing = meta['writing'];
+      final total = meta['bytes'];
+      final rate = meta['sampleRate'];
+      if (writing is! int || total is! int || rate is! int) return null;
+      if (total <= 0 || rate <= 0) return null;
+      // 取尾部 8s（Int16 mono = 2 字节/帧）
+      final cap = rate * 2 * _segmentDuration;
+      final take = total > cap ? cap : total;
+      final offset = total - take;
+      final f = File('$dir/sysrecog/seg_$writing.pcm');
+      if (!await f.exists()) return null;
+      raf = await f.open();
+      if (await f.length() < offset + take) return null;
+      await raf.setPosition(offset);
+      final pcm = await raf.read(take);
+      if (pcm.length < take) return null;
+      return (pcm: pcm, sampleRate: rate);
+    } catch (e) {
+      print('[PipRecognition] read system audio failed: $e');
+      return null;
+    } finally {
+      try {
+        await raf?.close();
+      } catch (_) {}
+    }
   }
 
   /// 录一段 8s WAV（unprocessed 源，失败回退 mic）
@@ -411,13 +508,18 @@ class PipRecognitionController {
   /// 返回命中的歌名/歌手/完整响应（识曲页结果卡片要用完整响应）；
   /// 未命中返回 null。
   Future<({String name, String artist, Map<String, dynamic> response})?>
-  _recognizeSegment(Uint8List? wav) async {
+  _recognizeSegment(
+    Uint8List? audio, {
+    int sourceHz = _recordSampleRate,
+  }) async {
     try {
-      if (wav == null || wav.isEmpty) return null;
-      // 优先用本地 Rust 服务器做 PCM 前处理，失败降级 Dart 实现（与识曲页一致）
+      if (audio == null || audio.isEmpty) return null;
+      // 优先用本地 Rust 服务器做 PCM 前处理，失败降级 Dart 实现（与识曲页一致）。
+      // 麦克风段是 WAV（有 RIFF 头，_extractPcmFromWav 剥掉），系统声音段是
+      // 裸 PCM（无 RIFF 头原样穿过），两种源同一管线。
       final rustResult = await processPcmWithRust(
-        input: wav,
-        fromHz: _recordSampleRate,
+        input: audio,
+        fromHz: sourceHz,
         toHz: _targetSampleRate,
       );
       Uint8List pcmData;
@@ -426,8 +528,8 @@ class PipRecognitionController {
         pcmData = rustResult.pcm;
         maxAmplitude = rustResult.maxAmplitude;
       } else {
-        final rawPcm = _extractPcmFromWav(wav);
-        pcmData = downsamplePcm(rawPcm, _recordSampleRate, _targetSampleRate);
+        final rawPcm = _extractPcmFromWav(audio);
+        pcmData = downsamplePcm(rawPcm, sourceHz, _targetSampleRate);
         maxAmplitude = computeMaxAmplitude(pcmData);
         if (maxAmplitude >= kSilenceAmplitudeThreshold) {
           pcmData = normalizeGain(pcmData, maxAmplitude);

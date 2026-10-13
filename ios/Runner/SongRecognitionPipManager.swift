@@ -124,6 +124,16 @@ final class SongRecognitionPipManager: NSObject {
           self.applyThemeColors(args)
         }
         result(nil)
+      case "getAppGroupDir":
+        // 系统声音识曲：广播扩展把 PCM 写在 App Group 容器 sysrecog/ 下，
+        // Dart 直接读文件（组 id 免签动态解析与 widget 同款，两边解析一致）
+        if let dir = FileManager.default.containerURL(
+          forSecurityApplicationGroupIdentifier: WidgetSync.resolvedAppGroupId)
+        {
+          result(dir.path)
+        } else {
+          result(nil)
+        }
       default:
         result(FlutterMethodNotImplemented)
       }

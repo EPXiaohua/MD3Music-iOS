@@ -24,6 +24,8 @@
 		WGT000000000000000000000B /* MD3Widget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000002 /* MD3Widget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		WGT0000000000000000000008 /* WidgetSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000007 /* WidgetSync.swift */; };
 		HAP0000000000000000000002 /* HapticsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = HAP0000000000000000000001 /* HapticsPlugin.swift */; };
+		BCT0000000000000000000002 /* BroadcastAudioHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCT0000000000000000000001 /* BroadcastAudioHandler.swift */; };
+		BCT0000000000000000000004 /* MD3MusicBroadcast.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = BCT0000000000000000000003 /* MD3MusicBroadcast.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,6 +56,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				WGT000000000000000000000B /* MD3Widget.appex in Embed App Extensions */,
+				BCT0000000000000000000004 /* MD3MusicBroadcast.appex in Embed App Extensions */,
 			);
 			name = "Embed App Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -73,6 +76,10 @@
 		DCP0000000000000000000001 /* DepthCoverPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DepthCoverPlugin.swift; sourceTree = "<group>"; };
 		WGT0000000000000000000007 /* WidgetSync.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = WidgetSync.swift; sourceTree = "<group>"; };
 		HAP0000000000000000000001 /* HapticsPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = HapticsPlugin.swift; sourceTree = "<group>"; };
+		BCT0000000000000000000001 /* BroadcastAudioHandler.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BroadcastAudioHandler.swift; sourceTree = "<group>"; };
+		BCT0000000000000000000003 /* MD3MusicBroadcast.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MD3MusicBroadcast.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		BCT0000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BCT0000000000000000000006 /* MD3MusicBroadcast.entitlements */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.entitlements; path = MD3MusicBroadcast.entitlements; sourceTree = "<group>"; };
 		WGT0000000000000000000001 /* MD3Widget.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MD3Widget.swift; sourceTree = "<group>"; };
 		WGT0000000000000000000002 /* MD3Widget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MD3Widget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		WGT0000000000000000000003 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -101,6 +108,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		WGT0000000000000000000012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BCT0000000000000000000012 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -136,6 +150,7 @@
 				9740EEB11CF90186004384FC /* Flutter */,
 				97C146F01CF9000F007C117D /* Runner */,
 				WGT0000000000000000000006 /* MD3Widget */,
+				BCT0000000000000000000007 /* MD3MusicBroadcast */,
 				97C146EF1CF9000F007C117D /* Products */,
 				331C8082294A63A400263BE5 /* RunnerTests */,
 			);
@@ -151,11 +166,22 @@
 			path = MD3Widget;
 			sourceTree = "<group>";
 		};
+		BCT0000000000000000000007 /* MD3MusicBroadcast */ = {
+			isa = PBXGroup;
+			children = (
+				BCT0000000000000000000001 /* BroadcastAudioHandler.swift */,
+				BCT0000000000000000000005 /* Info.plist */,
+				BCT0000000000000000000006 /* MD3MusicBroadcast.entitlements */,
+			);
+			path = MD3MusicBroadcast;
+			sourceTree = "<group>";
+		};
 		97C146EF1CF9000F007C117D /* Products */ = {
 			isa = PBXGroup;
 			children = (
 				97C146EE1CF9000F007C117D /* Runner.app */,
 				WGT0000000000000000000002 /* MD3Widget.appex */,
+				BCT0000000000000000000003 /* MD3MusicBroadcast.appex */,
 				331C8081294A63A400263BE5 /* RunnerTests.xctest */,
 			);
 			name = Products;
@@ -245,6 +271,23 @@
 			productReference = WGT0000000000000000000002 /* MD3Widget.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		BCT0000000000000000000010 /* MD3MusicBroadcast */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BCT0000000000000000000030 /* Build configuration list for PBXNativeTarget "MD3MusicBroadcast" */;
+			buildPhases = (
+				BCT0000000000000000000011 /* Sources */,
+				BCT0000000000000000000012 /* Frameworks */,
+				BCT0000000000000000000013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MD3MusicBroadcast;
+			productName = MD3MusicBroadcast;
+			productReference = BCT0000000000000000000003 /* MD3MusicBroadcast.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -264,6 +307,9 @@
 						LastSwiftMigration = 1100;
 					};
 					WGT0000000000000000000010 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					BCT0000000000000000000010 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -286,6 +332,7 @@
 			targets = (
 				97C146ED1CF9000F007C117D /* Runner */,
 				WGT0000000000000000000010 /* MD3Widget */,
+				BCT0000000000000000000010 /* MD3MusicBroadcast */,
 				331C8080294A63A400263BE5 /* RunnerTests */,
 			);
 		};
@@ -300,6 +347,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		WGT0000000000000000000013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BCT0000000000000000000013 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -383,6 +437,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				WGT000000000000000000000A /* MD3Widget.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BCT0000000000000000000011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BCT0000000000000000000002 /* BroadcastAudioHandler.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -786,6 +848,78 @@
 				};
 				name = Profile;
 			};
+		BCT0000000000000000000020 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9740EEB21CF90195004384FC /* Debug.xcconfig */;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MD3MusicBroadcast/MD3MusicBroadcast.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				INFOPLIST_FILE = MD3MusicBroadcast/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music.MD3MusicBroadcast;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		BCT0000000000000000000021 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MD3MusicBroadcast/MD3MusicBroadcast.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				INFOPLIST_FILE = MD3MusicBroadcast/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music.MD3MusicBroadcast;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		BCT0000000000000000000022 /* Profile */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MD3MusicBroadcast/MD3MusicBroadcast.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				INFOPLIST_FILE = MD3MusicBroadcast/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music.MD3MusicBroadcast;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Profile;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -795,6 +929,16 @@
 				WGT0000000000000000000020 /* Debug */,
 				WGT0000000000000000000021 /* Release */,
 				WGT0000000000000000000022 /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		BCT0000000000000000000030 /* Build configuration list for PBXNativeTarget "MD3MusicBroadcast" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BCT0000000000000000000020 /* Debug */,
+				BCT0000000000000000000021 /* Release */,
+				BCT0000000000000000000022 /* Profile */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
