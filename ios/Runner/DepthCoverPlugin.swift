@@ -798,7 +798,7 @@ private enum PullPushFiller {
       throw DepthError.failed("read model failed: \(error)")
     }
     NSLog("[DepthCover] loadModel begin: %@ (%d bytes)", path, data.count)
-    let s = try createSession(modelData: data)
+    let s = try createSession(modelData: data, intraOpThreads: 1)
     // 新会话创建成功后再释放旧会话（失败时保留旧会话可用）。
     // 关键：modelData 必须保活到会话释放 —— CreateSessionFromArray 零拷贝引用
     // buffer（大 initializer 直接指向原内存），Run 时才真正读权重；
