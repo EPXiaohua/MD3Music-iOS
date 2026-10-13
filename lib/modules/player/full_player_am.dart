@@ -2120,20 +2120,29 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               ),
             // 3. 半透明蒙版 rgba(0,0,0,0.35)
             _buildDarkOverlay(),
-            // 写真·横屏/平板形态：贴屏幕上下左铺满左栏（宽 = 屏宽 × 0.4，
-            // 与下方 Row 的 flex 4:6 同源），右缘一条羽化带过渡向歌词区。
-            // 放在背景 Stack（内容层之下）：顶栏/传输控件照常叠在写真上。
-            // 竖屏不走这里——竖屏写真在专辑 tab 内（_buildArtworkView 分支）。
-            // Positioned 常驻 + 内部 ListenableBuilder：写真取到图时
-            // _buildFullLayout 本身不重建，必须由控制器通知才能出图
-            // （Positioned 不能包在 builder 返回里，故层在内在外挂开关）。
+            // 写真统一放在页面背景层：紧凑手机覆盖顶栏到控制区，避免 PageView 与相邻区域的裁剪边缘露线。
+            // 宽屏仍只铺左栏，并在左右外缘羽化；两种布局共用控制器与加载状态。
+            if (getScreenType(MediaQuery.sizeOf(context).width) ==
+                ScreenType.compact)
+              Positioned.fill(
+                child: ListenableBuilder(
+                  listenable: _photoController,
+                  builder: (context, _) => _photoCoverActive
+                      ? RepaintBoundary(
+                          child: IgnorePointer(
+                            child: AmArtistPhotoCover(
+                              currentUrl: _photoController.currentUrl,
+                              feather: AmPhotoFeather.vertical,
+                            ),
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ),
             if (getScreenType(MediaQuery.sizeOf(context).width) !=
                 ScreenType.compact)
-              Positioned(
-                left: 0,
-                top: 0,
-                bottom: 0,
-                width: MediaQuery.sizeOf(context).width * 0.4,
+              // 滤镜/遮罩整页绘制，只限制图片内容宽度；不在 40% 分栏处裁剪滤镜层。
+              Positioned.fill(
                 child: ListenableBuilder(
                   listenable: _photoController,
                   builder: (context, _) => _photoCoverActive
@@ -2142,6 +2151,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                             child: AmArtistPhotoCover(
                               currentUrl: _photoController.currentUrl,
                               feather: AmPhotoFeather.rightEdge,
+                              photoWidthFraction: 0.4,
                             ),
                           ),
                         )
@@ -3414,28 +3424,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     final textSpacing = isExpanded ? 8.0 : 24.0;
     final iconSize = isExpanded ? 48.0 : 64.0;
 
-    // 写真生效：专辑 tab 全出血——写真横向贴屏幕边缘铺满整个 tab 页
-    // （本方法所在 tab 页本身无水平 padding，外层 Padding 由本分支绕开），
-    // 上下边缘由 AmArtistPhotoCover 的「模糊 + 渐变」双层遮罩消融进页面背景；
-    // 标题块叠在写真下缘渐变区之上。方形封面（含形变槽位/圆盘/动态封面）不渲染。
+    // 全屏写真由 _buildFullLayout 的背景层统一绘制；此处只叠加标题，避免 PageView 上下边界形成接缝。
     if (_photoCoverActive) {
       return Stack(
         fit: StackFit.expand,
         children: [
-          Positioned.fill(
-            // Listener 型手势（_wrapArtworkZenPress 不消费点击/拖拽），
-            // tab 页级的 onTap→歌词、下拉收起 仍照常命中。
-            // allowShrink=false：写真按压缩小会露出底下页面背景（真机反馈），
-            // 只保留引导提示动效。
-            child: _withDanmaku(
-              _wrapArtworkZenPress(
-                allowShrink: false,
-                child: AmArtistPhotoCover(
-                  currentUrl: _photoController.currentUrl,
-                ),
-              ),
-            ),
-          ),
           Align(
             alignment: Alignment.bottomCenter,
             child: Padding(

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart' as services;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:md3music/data/models/song.dart';
 import 'package:md3music/modules/player/am_artist_photo_cover.dart';
 import 'package:md3music/modules/player/artist_photo_service.dart';
@@ -161,6 +162,12 @@ void main() {
       expect(find.byType(AmArtistPhotoCover), findsOneWidget);
       expect(find.byKey(const Key('amArtistPhotoMasterFade')), findsOneWidget);
       expect(find.byKey(const Key('amArtistPhotoSharpMask')), findsOneWidget);
+      // 写真背景覆盖整页而非仅限 PageView，消除顶栏/控制区交界的裁剪接缝。
+      final photoRect = tester.getRect(
+        find.byKey(const Key('amArtistPhotoMasterFade')),
+      );
+      expect(photoRect.top, lessThanOrEqualTo(1));
+      expect(photoRect.bottom, greaterThanOrEqualTo(799));
       // 方形封面（形变槽位）已让位
       expect(find.byType(PlayerCoverSlot), findsNothing);
       // 标题块叠在写真下缘
@@ -293,10 +300,10 @@ void main() {
     }
   });
 
-  testWidgets('横屏写真：出血层挂背景 Stack（右缘过渡），左栏只剩标题', (
+  testWidgets('横屏写真：整页遮罩无分栏裁剪，图片仍占左侧40%', (
     tester,
   ) async {
-    tester.view.physicalSize = const Size(800, 360);
+    tester.view.physicalSize = const Size(1264, 681);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     SharedPreferences.setMockInitialValues({
@@ -321,7 +328,7 @@ void main() {
       await tester.pumpAndSettle(const Duration(milliseconds: 100));
 
       expect(tester.takeException(), isNull);
-      // 出血层：右缘两枚遮罩在，且宽度 = 800×0.4 = 320、贴屏幕左缘
+      // 遮罩/滤镜覆盖整页，图片内容仍只占左侧 40%；不能在 505.6dp 处裁剪。
       expect(find.byKey(const Key('amArtistPhotoRightFade')), findsOneWidget);
       expect(
         find.byKey(const Key('amArtistPhotoSharpRight')),
@@ -330,7 +337,17 @@ void main() {
       final box = tester.getRect(
         find.byKey(const Key('amArtistPhotoRightFade')),
       );
-      expect(box.width, closeTo(320, 1));
+      expect(box.width, closeTo(1264, 1));
+      final photos = find.descendant(
+        of: find.byType(AmArtistPhotoCover),
+        matching: find.byType(CachedNetworkImage),
+      );
+      expect(tester.getSize(photos.first).width, closeTo(505.6, 0.01));
+      final blur = find.descendant(
+        of: find.byType(AmArtistPhotoCover),
+        matching: find.byType(ImageFiltered),
+      );
+      expect(tester.getSize(blur).width, closeTo(1264, 1));
       expect(box.left, 0.0);
       // 左栏不再渲染方形封面槽位（写真已移出左栏）
       expect(find.byType(PlayerCoverSlot), findsNothing);

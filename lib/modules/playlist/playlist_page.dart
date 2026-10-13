@@ -1385,6 +1385,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
                               _enterMultiSelectMode(_displaySongs[index].id),
                           itemBuilder: _buildSongRow,
                         ),
+                        // 胶囊悬浮在列表上方；显式消费宿主注入的占位，
+                        // 让末行能滚到悬浮栏上方，不被其点击层挡住。
+                        SliverToBoxAdapter(
+                          // 必须在宿主注入 MediaQuery 的子树中取 context，不能用页面外层 context。
+                          child: Builder(
+                            builder: (context) => SizedBox(
+                              key: const ValueKey('playlist-player-clearance'),
+                              height: MediaQuery.paddingOf(context).bottom,
+                            ),
+                          ),
+                        ),
                         // 搜索无结果提示
                         if (!_isLoading &&
                             !_isMultiSelectMode &&

@@ -1,5 +1,6 @@
 // test/widgets/am_artist_photo_cover_test.dart
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -158,20 +159,26 @@ void main() {
     );
   });
 
-  group('右缘过渡（横屏出血层：上下左铺满、右侧向歌词区消融）', () {
-    test('主罩：x=0 不透明，x=w 透明，单调不增', () {
+  group('左右缘过渡（横屏出血层：两侧平滑消融）', () {
+    test('主罩：左右外缘透明，向中部平滑过渡并保持平台', () {
       final g = amPhotoRightFade(400);
-      expect(_alphaAtH(g, 0.0), 1.0);
+      expect(_alphaAtH(g, 0.0), 0.0);
+      expect(_alphaAtH(g, 70.0), greaterThan(0.0));
+      expect(_alphaAtH(g, 70.0), lessThan(1.0));
+      expect(_alphaAtH(g, 140.0), 1.0);
+      expect(_alphaAtH(g, 200.0), 1.0);
+      expect(_alphaAtH(g, 260.0), 1.0);
+      expect(_alphaAtH(g, 330.0), lessThan(1.0));
       expect(_alphaAtH(g, 400.0), 0.0);
       final stops = g.stops!;
       for (var i = 1; i < stops.length; i++) {
         expect(stops[i], greaterThan(stops[i - 1]));
       }
-      var prev = 2.0;
-      for (var i = 0; i < stops.length; i++) {
-        final a = g.colors[i].a;
-        expect(a, lessThanOrEqualTo(prev + 1e-9));
-        prev = a;
+      for (var x = 1.0; x <= 140; x += 1) {
+        expect(_alphaAtH(g, x), greaterThanOrEqualTo(_alphaAtH(g, x - 1)));
+      }
+      for (var x = 261.0; x <= 400; x += 1) {
+        expect(_alphaAtH(g, x), lessThanOrEqualTo(_alphaAtH(g, x - 1)));
       }
       expect(g.begin, Alignment.centerLeft);
       expect(g.end, Alignment.centerRight);
@@ -187,7 +194,7 @@ void main() {
       expect(_alphaAtH(amPhotoRightFade(400), 372), greaterThan(0.0));
     });
 
-    test('回归钉：右缘两罩不透明标记为白色', () {
+    test('回归钉：两侧遮罩不透明标记为白色', () {
       for (final g in [amPhotoRightFade(400), amPhotoSharpMaskRight(400)]) {
         final opaque = g.colors.firstWhere((c) => c.a > 0.99);
         expect(opaque.r, 1.0);
@@ -227,6 +234,48 @@ void main() {
       findsOneWidget,
     );
   });
+
+  for (final width in [1264.0, 1023.0]) {
+    for (final dpr in [1.0, 1.25]) {
+      testWidgets('分数分栏 $width / $dpr：全页滤镜与遮罩，右栏 alpha=0', (tester) async {
+        _mockPathProvider();
+        tester.view.devicePixelRatio = dpr;
+        tester.view.physicalSize = Size(width * dpr, 681 * dpr);
+        addTearDown(tester.view.reset);
+        await tester.pumpWidget(MaterialApp(
+          home: AmArtistPhotoCover(
+            currentUrl: ValueNotifier('https://photo.invalid/a.jpg'),
+            feather: AmPhotoFeather.rightEdge,
+            photoWidthFraction: 0.4,
+          ),
+        ));
+        await tester.pump();
+        final master = find.byKey(const Key('amArtistPhotoRightFade'));
+        expect(tester.getSize(master).width, closeTo(width, 0.01));
+        expect(tester.getSize(find.byType(ImageFiltered)).width, closeTo(width, 0.01));
+        for (final photo in find.byType(CachedNetworkImage).evaluate()) {
+          expect(tester.getSize(find.byWidget(photo.widget)).width, closeTo(width * 0.4, 0.01));
+        }
+        final mask = tester.widget<ShaderMask>(master);
+        await tester.runAsync(() async {
+          final recorder = ui.PictureRecorder();
+          final canvas = Canvas(recorder);
+          final rect = Rect.fromLTWH(0, 0, width, 10);
+          canvas.drawRect(rect, Paint()..shader = mask.shaderCallback(rect));
+          final picture = recorder.endRecording();
+          final image = await picture.toImage(width.ceil(), 10);
+          final data = (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!;
+          int alpha(int x) => data.getUint8((5 * width.ceil() + x) * 4 + 3);
+          expect(alpha((width * 0.2).floor()), 255);
+          expect(alpha((width * 0.4).ceil() + 1), 0);
+          expect(alpha(width.floor() - 1), 0);
+          image.dispose();
+          picture.dispose();
+        });
+        await tester.pumpWidget(const SizedBox());
+      });
+    }
+  }
 
   testWidgets('vertical 档同样被 ClipRect 包住（修竖屏滑动穿帮）', (
     tester,

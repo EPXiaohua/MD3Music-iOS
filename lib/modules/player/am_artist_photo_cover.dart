@@ -236,16 +236,16 @@ enum AmPhotoFeather {
   /// 竖屏专辑 tab：上下缘过渡（现状）。
   vertical,
 
-  /// 横屏/平板出血层：上下左贴边铺满，右缘（靠歌词侧）过渡。
+  /// 横屏/平板出血层：左、右外缘都过渡，避免栏边裁剪形成细线。
   rightEdge,
 }
 
-/// 横向（左→右）上下文的「外缘透明」渐变构造：透明带贴在 x=w 一侧，
-/// 带宽 = min(底缘 dp, w × 底缘比例)——横屏右缘与竖屏底缘同为「标题/内容
-/// 交接侧」，参数复用，观感一致。
+/// 横向上下文的双侧「外缘透明」渐变构造：左右两侧各有一条羽化带，
+/// 带宽 = min(底缘 dp, w × 底缘比例)——侧缘与竖屏边缘使用同一比例，
+/// 与内容区交界时平滑消融，避免边界采样细线。
 ///
-/// 与 [_photoEdgeFade] 镜像：竖屏清晰罩是「边缘 0 → 中部 1」，
-/// 这里贴边一侧（x=0）保持平台值、向远端外缘（x=w）降到 0。
+/// 与 [_photoEdgeFade] 同样从外缘透明过渡到内容区不透明。
+
 LinearGradient _photoEdgeFadeH({
   required double width,
   double innerAlpha = 1.0,
@@ -257,7 +257,6 @@ LinearGradient _photoEdgeFadeH({
     kAmPhotoFeatherBottomHeight,
     w * kAmPhotoFeatherBottomRatio,
   );
-  final startDp = w - band;
   final points = <double, double>{};
   // stops 必须是 0..1 归一（LinearGradient 的硬性要求）：按 px 算位置后除以 w。
   void put(double xPx, double a) {
@@ -266,12 +265,12 @@ LinearGradient _photoEdgeFadeH({
   }
   for (var i = 0; i <= samples; i++) {
     final f = math.min(i / samples, zoneScale);
-    // 主罩：1 → 0；innerAlpha 控制平台高度
-    final a = innerAlpha * (1 - _smoothStep(f / zoneScale));
-    put(startDp + band * f, a);
+    put(band * f, innerAlpha * _smoothStep(f / zoneScale));
+    put(w - band + band * f, innerAlpha * (1 - _smoothStep(f / zoneScale)));
   }
-  put(0, innerAlpha);
-  put(startDp, innerAlpha);
+  put(0, 0);
+  put(band, innerAlpha);
+  put(w - band, innerAlpha);
   put(w, 0);
   final ts = points.keys.toList()..sort();
   return LinearGradient(
@@ -282,13 +281,13 @@ LinearGradient _photoEdgeFadeH({
   );
 }
 
-/// 右缘主淡出罩：左侧全不透明（上下左贴边铺满），右缘 smoothstep 收 0。
+/// 横向主淡出罩：左右外缘 smoothstep 收 0，中间内容区保持不透明。
 @visibleForTesting
 LinearGradient amPhotoRightFade(double width) => _photoEdgeFadeH(
   width: width,
 );
 
-/// 右缘清晰罩：带内 80% 处已降完（与主罩错开，同竖屏防条带策略）。
+/// 横向清晰罩：两侧羽化带内 80% 处已完成过渡（与主罩错开，防止条带）。
 @visibleForTesting
 LinearGradient amPhotoSharpMaskRight(double width) => _photoEdgeFadeH(
   width: width,
@@ -304,7 +303,7 @@ LinearGradient amPhotoSharpMaskRight(double width) => _photoEdgeFadeH(
 /// 3. 整体再乘 [amPhotoMasterFade]，最外缘消融进页面背景。
 ///
 /// 羽化方向由 [feather] 决定（[AmPhotoFeather.vertical] 上下缘 /
-/// [AmPhotoFeather.rightEdge] 右缘，横屏出血层用后者），罩与模糊尺寸同源。
+/// [AmPhotoFeather.rightEdge] 左右缘，横屏出血层用后者），罩与模糊尺寸同源。
 ///
 /// 纯展示组件：拉取与轮播归 [ArtistPhotoController]，本 widget 只订阅
 /// [currentUrl]——轮播 tick 仅重建图片子树（外层 RepaintBoundary 隔离重绘）。
@@ -314,13 +313,17 @@ class AmArtistPhotoCover extends StatelessWidget {
     super.key,
     required this.currentUrl,
     this.feather = AmPhotoFeather.vertical,
-  });
+    this.photoWidthFraction = 1.0,
+  }) : assert(photoWidthFraction > 0 && photoWidthFraction <= 1);
 
   /// 当前图片 URL（null = 无图，整层收缩）。
   final ValueListenable<String?> currentUrl;
 
   /// 羽化方向，见 [AmPhotoFeather]。
   final AmPhotoFeather feather;
+
+  /// 图片内容占绘制区域的宽度比例；遮罩与滤镜始终覆盖整页，避免内部硬裁剪接缝。
+  final double photoWidthFraction;
 
   static Widget _photo(String url, String role) => CachedNetworkImage(
     // 同 Stack 两枚图必须不同 key：重复 ValueKey(url) 在转场位移的
@@ -353,7 +356,20 @@ class AmArtistPhotoCover extends StatelessWidget {
               return LayoutBuilder(
                 builder: (context, constraints) {
                   final h = constraints.maxHeight;
-                  final w = constraints.maxWidth;
+                  final w = constraints.maxWidth * photoWidthFraction;
+                  Rect photoShaderRect(Rect rect) => Rect.fromLTWH(
+                    rect.left, rect.top, w, rect.height,
+                  );
+                  Widget photoLayer(String role) => photoWidthFraction == 1.0
+                      ? _photo(url, role)
+                      : Align(
+                          alignment: Alignment.centerLeft,
+                          child: SizedBox(
+                            width: w,
+                            height: h,
+                            child: _photo(url, role),
+                          ),
+                        );
                   // 按方向选出两枚罩、模糊参考边与 key：竖屏用高度（上下缘），
                   // 横屏出血层用宽度（右缘）。key 两档互不冲突，测试按 key 定位。
                   final (
@@ -374,9 +390,9 @@ class AmArtistPhotoCover extends StatelessWidget {
                     ),
                     AmPhotoFeather.rightEdge => (
                       masterShader: (Rect rect) =>
-                          amPhotoRightFade(w).createShader(rect),
+                          amPhotoRightFade(w).createShader(photoShaderRect(rect)),
                       sharpShader: (Rect rect) =>
-                          amPhotoSharpMaskRight(w).createShader(rect),
+                          amPhotoSharpMaskRight(w).createShader(photoShaderRect(rect)),
                       blurRef: w,
                       masterKey: const Key('amArtistPhotoRightFade'),
                       sharpKey: const Key('amArtistPhotoSharpRight'),
@@ -402,14 +418,14 @@ class AmArtistPhotoCover extends StatelessWidget {
                                 sigmaY: tvBlurSigma(sigma),
                                 tileMode: TileMode.clamp,
                               ),
-                              child: _photo(url, 'blur'),
+                              child: photoLayer('blur'),
                             ),
                           // 2. 清晰层：羽化带让位给模糊底
                           ShaderMask(
                             key: sharpKey,
                             blendMode: BlendMode.modulate,
                             shaderCallback: sharp,
-                            child: _photo(url, 'sharp'),
+                            child: photoLayer('sharp'),
                           ),
                         ],
                       ),
