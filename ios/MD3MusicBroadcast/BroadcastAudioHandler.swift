@@ -42,10 +42,10 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   private var bufferCapBytes: Int { (sampleRate > 0 ? sampleRate : 48000) * 2 * 10 }
 
   private var segFileUrl: URL {
-    groupDir!.appendingPathComponent("sysrecog/seg_\(writingIndex).pcm")
+    groupDir!.appendingPathComponent("seg_\(writingIndex).pcm")
   }
   private var metaUrl: URL {
-    groupDir!.appendingPathComponent("sysrecog/seg_meta.json")
+    groupDir!.appendingPathComponent("seg_meta.json")
   }
 
   // MARK: - 生命周期
@@ -66,7 +66,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       // 开播清场：两个缓冲都截断，meta 归零（writing=0, bytes=0）
       for i in 0...1 {
         FileManager.default.createFile(
-          at: dir.appendingPathComponent("seg_\(i).pcm").path, contents: nil)
+          atPath: dir.appendingPathComponent("seg_\(i).pcm").path, contents: nil)
       }
       self.writeMeta(stopped: false)
     }
@@ -101,7 +101,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     let copied = data.withUnsafeMutableBytes { raw -> Bool in
       guard let base = raw.baseAddress else { return false }
       let status = CMBlockBufferCopyDataBytes(
-        block, atOffset: 0, length: length, destination: base)
+        block, atOffset: 0, dataLength: length, destination: base)
       return status == kCMBlockBufferNoErr
     }
     guard copied else { return }
@@ -147,7 +147,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
         // 非交织：[ch0 全部帧][ch1 全部帧]...，每通道 4 字节/样本
         let frames = byteCount / (4 * ch)
         guard frames > 0 else { return nil }
-        let planes = base.bindMemory(to: Float.self)
+        let planes = base.bindMemory(to: Float.self, capacity: byteCount / 4)
         var out = [Float](repeating: 0, count: frames)
         for f in 0..<frames {
           var sum: Float = 0
@@ -162,7 +162,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
         // 交织 Float32
         let frames = byteCount / (4 * ch)
         guard frames > 0 else { return nil }
-        let values = base.bindMemory(to: Float.self)
+        let values = base.bindMemory(to: Float.self, capacity: byteCount / 4)
         var out = [Float](repeating: 0, count: frames)
         for f in 0..<frames {
           var sum: Float = 0
@@ -177,7 +177,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
         // 交织 Int16
         let frames = byteCount / (2 * ch)
         guard frames > 0 else { return nil }
-        let values = base.bindMemory(to: Int16.self)
+        let values = base.bindMemory(to: Int16.self, capacity: byteCount / 2)
         var out = [Float](repeating: 0, count: frames)
         for f in 0..<frames {
           var sum: Float = 0
@@ -200,14 +200,14 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       handle = h
     } else {
       guard FileManager.default.fileExists(atPath: segFileUrl.path)
-          || FileManager.default.createFile(at: segFileUrl.path, contents: nil)
+          || FileManager.default.createFile(atPath: segFileUrl.path, contents: nil)
       else { return }
       guard let h = try? FileHandle(forWritingTo: segFileUrl) else { return }
       try? h.seekToEnd()
       fileHandles[writingIndex] = h
       handle = h
     }
-    try? handle.write(contents: pcm)
+    try? handle.write(pcm)
     writtenBytes += pcm.count
 
     let now = ProcessInfo.processInfo.systemUptime
@@ -218,7 +218,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       writtenBytes = 0
       try? fileHandles[writingIndex]?.close()
       fileHandles[writingIndex] = nil
-      FileManager.default.createFile(at: segFileUrl.path, contents: nil)
+      FileManager.default.createFile(atPath: segFileUrl.path, contents: nil)
       writeMeta(stopped: false)
     } else if now - lastMetaWriteUptime >= 0.5 {
       // 节流：每 0.5s 刷一次 meta（bytes 单调递增，Dart 读到即完整数据）
