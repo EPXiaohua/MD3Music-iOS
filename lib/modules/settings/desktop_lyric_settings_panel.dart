@@ -74,6 +74,10 @@ class _DesktopLyricSettingsPanelState
   void initState() {
     super.initState();
     _svc.addListener(_onServiceChanged);
+    // iOS PiP 路径不经 enable()（Android 才在开启悬浮窗时载入配置），进面板
+    // 时补载持久化设置，避免字号/行式显示字段默认值而非用户上次的选择。
+    // ignore: discarded_futures
+    _svc.ensureConfigLoaded();
   }
 
   @override

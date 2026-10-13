@@ -236,11 +236,14 @@ class DesktopLyricService {
   int _gradientEnd = 0xFFFF00FF;
   int _unplayedColor = 0xFFFFFFFF;
   bool _locked = false;
+
   /// 配色模式：0 = 预设配色，1 = 自调颜色。持久化，重启后保持。
   int _colorMode = kColorModePreset;
+
   /// 最近一次选中的预设下标。进入自调颜色后**保留**，
   /// 切回预设配色时据此还原（见 [setColorMode]）。
   int _activePreset = 0;
+
   /// 自定义配色槽位。「自调颜色」写这里，**不写** [_gradientStart] 那份 ——
   /// 预设色是常量不能被拖坏，第 5 个「自定义」色块读的就是这份。
   int _customStart = 0xFF00E5FF;
@@ -286,8 +289,8 @@ class DesktopLyricService {
   /// 少写一个独立的"选中态"字段，就少一处和真实颜色对不上的机会 ——
   /// 之前原生用自己那份 `activePreset` 记选中态，Dart 侧改了颜色它也照旧亮着。
   int get matchedPresetIndex => gradientPresets.indexWhere(
-        (p) => p.$1 == _gradientStart && p.$2 == _gradientEnd,
-      );
+    (p) => p.$1 == _gradientStart && p.$2 == _gradientEnd,
+  );
 
   /// 字号上下限，与原生 A−/A+ 的 clamp 保持一致（12f … 32f sp）。
   static const double minFontSize = 12.0;
@@ -410,7 +413,8 @@ class DesktopLyricService {
     final m = mode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
     _colorMode = m;
     if (m == kColorModePreset) {
-      final p = gradientPresets[_activePreset.clamp(0, gradientPresets.length - 1)];
+      final p =
+          gradientPresets[_activePreset.clamp(0, gradientPresets.length - 1)];
       _gradientStart = p.$1;
       _gradientEnd = p.$2;
       _unplayedColor = kPresetUnplayedColor;
@@ -584,17 +588,14 @@ class DesktopLyricService {
     final doubleLine = config['doubleLine'] as bool?;
     final opacity = config['opacity'] as int?;
     final locked = config['locked'] as bool?;
-    final gradientStart =
-        (config['gradientStart'] as int?)?.toUnsigned(32);
+    final gradientStart = (config['gradientStart'] as int?)?.toUnsigned(32);
     final gradientEnd = (config['gradientEnd'] as int?)?.toUnsigned(32);
-    final unplayedColor =
-        (config['unplayedColor'] as int?)?.toUnsigned(32);
+    final unplayedColor = (config['unplayedColor'] as int?)?.toUnsigned(32);
     final colorMode = config['colorMode'] as int?;
     final activePreset = config['activePreset'] as int?;
     final customStart = (config['customStart'] as int?)?.toUnsigned(32);
     final customEnd = (config['customEnd'] as int?)?.toUnsigned(32);
-    final customUnplayed =
-        (config['customUnplayed'] as int?)?.toUnsigned(32);
+    final customUnplayed = (config['customUnplayed'] as int?)?.toUnsigned(32);
 
     if (fontSize != null) {
       _fontSize = fontSize;
@@ -625,8 +626,9 @@ class DesktopLyricService {
       await _settings.setDesktopLyricUnplayedColor(unplayedColor);
     }
     if (colorMode != null) {
-      _colorMode =
-          colorMode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
+      _colorMode = colorMode == kColorModeCustom
+          ? kColorModeCustom
+          : kColorModePreset;
       await _settings.setDesktopLyricColorMode(_colorMode);
     }
     if (activePreset != null) {
@@ -663,7 +665,8 @@ class DesktopLyricService {
     }
   }
 
-  // —— iOS PiP 悬浮歌词（单行细条，300x22pt）：复用本服务歌词拉取/tick 管线 ——
+  // —— iOS PiP 悬浮歌词（细条，宽 300pt；高随设置字号缩放，默认单行 22pt）：
+  // 复用本服务歌词拉取/tick 管线 ——
 
   // PiP 推送去重状态：行下标 / 占位文案 变化才重推 setLine；进度 500ms 节流
   int _pipPushedLineIndex = -2;
@@ -680,6 +683,9 @@ class DesktopLyricService {
   void _onPipActiveChanged() {
     if (_pipActive) {
       _bindProvidersFromContext();
+      // 激活补推版式（字号/行式）再推歌词：PiP 首帧即按正确版式画
+      // ignore: discarded_futures
+      _syncPipLayoutConfig();
       _pushPipLyricsFull();
       _pushPipLine(_currentLineIndex);
       final player = _player;
@@ -700,7 +706,21 @@ class DesktopLyricService {
   /// 回调驱动（快速连点由原生状态机收敛），激活后的歌词补推在
   /// [_onPipActiveChanged] 里做。
   Future<void> _toggleIosPipFloatingLyric() async {
+    // 开窗前先把持久化版式（字号/行式）同步给原生，首帧即正确版式，
+    // 不出现"先按默认版式画出、激活后突然变高"的跳变。
+    if (!LyricsPipService.instance.active) {
+      await _syncPipLayoutConfig();
+    }
     await LyricsPipService.instance.toggle();
+  }
+
+  /// iOS PiP 版式同步：字号驱动 PiP 条高度、行式切单/双行渲染。
+  Future<void> _syncPipLayoutConfig() async {
+    await ensureConfigLoaded();
+    await LyricsPipService.instance.configure(
+      fontSize: _fontSize,
+      doubleLine: _doubleLine,
+    );
   }
 
   /// 整包歌词推给 PiP（切歌/解析完成时）：原生用行尾时间画进度条总长。
@@ -788,7 +808,9 @@ class DesktopLyricService {
     await _loadConfig();
     final song = _player!.currentSong;
     final sameSong = song != null && song.id == _currentSongId;
-    final index = sameSong ? _findLineIndex(_player!.position.inMilliseconds) : -1;
+    final index = sameSong
+        ? _findLineIndex(_player!.position.inMilliseconds)
+        : -1;
     final initialLyric = sameSong && _lines.isNotEmpty
         ? (index >= 0 ? _lines[index].text : '')
         : (song == null ? '' : '歌词加载中...');
@@ -1327,14 +1349,36 @@ class DesktopLyricService {
     _locked = await _settings.getDesktopLyricLocked();
     _colorMode = await _settings.getDesktopLyricColorMode();
     // 预设下标可能落在越界位置（旧版本数据 / 预设表被改短），clamp 兜底
-    _activePreset = (await _settings.getDesktopLyricPresetIndex())
-        .clamp(0, gradientPresets.length - 1);
+    _activePreset = (await _settings.getDesktopLyricPresetIndex()).clamp(
+      0,
+      gradientPresets.length - 1,
+    );
     _customStart = await _settings.getDesktopLyricCustomGradStart();
     _customEnd = await _settings.getDesktopLyricCustomGradEnd();
     _customUnplayed = await _settings.getDesktopLyricCustomUnplayed();
+    _configLoaded = true;
+  }
+
+  /// 持久化设置是否已载入。iOS PiP 路径不经 [enable]（Android 才在开启
+  /// 悬浮窗时载入），设置面板与 PiP 激活补推都依赖字段就绪，否则面板会
+  /// 显示字段默认值、PiP 用错版式。
+  bool _configLoaded = false;
+
+  /// 确保设置项已从持久层载入（幂等）。设置面板 initState 与 iOS PiP
+  /// 版式同步前调用；载入完成经 [_notify] 刷新监听者。
+  Future<void> ensureConfigLoaded() async {
+    if (_configLoaded) return;
+    await _loadConfig();
+    _notify();
   }
 
   Future<void> _pushConfig() async {
+    // iOS：悬浮窗是系统 PiP（LyricsPipManager），版式里只有字号/行式对它
+    // 有意义（配色为原生默认渐变），转发后即返回；Android 走原通道全量下发。
+    if (Platform.isIOS) {
+      await _syncPipLayoutConfig();
+      return;
+    }
     try {
       await _channel.invokeMethod('setDesktopLyricConfig', {
         'fontSize': _fontSize,
@@ -1586,8 +1630,9 @@ class DesktopLyricService {
     try {
       // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
       await SongMatchRepository().ensureLoaded();
-      final matchInfo =
-          song.isOnline ? null : SongMatchRepository().get(song.id);
+      final matchInfo = song.isOnline
+          ? null
+          : SongMatchRepository().get(song.id);
       final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
       if (!song.isOnline && !preferOnlineLyrics) {
@@ -1622,8 +1667,9 @@ class DesktopLyricService {
           ? '${song.title} ${song.artist}'
           : song.title;
       // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
-      final matchedHash =
-          (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
+      final matchedHash = (matchInfo != null && matchInfo.isMatched)
+          ? matchInfo.hash
+          : null;
       // 首份 LRC 先显示，不等待补充逐字歌词；串行解析防止迟到的初稿覆盖终稿。
       Future<void> progressCommit = Future<void>.value();
       final result = await _kugou!.getLyricResult(

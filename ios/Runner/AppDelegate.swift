@@ -562,8 +562,10 @@ final class NowPlayingManager {
 ///   isPictureInPicturePossible 后再 startPictureInPicture（最多 8 次，
 ///   0.02/0.12s 间隔）。
 ///
-/// 渲染：每帧 NSString/UIFont 画双行细条（300x44pt @2x 位图）——
-/// 主行当前句逐字卡拉OK（粗体），副行下一句整行灰未唱色（细体）。
+/// 渲染：每帧 NSString/UIFont 画单/双行细条（宽 300pt；高随设置页「版式 →
+/// 字号」缩放：单行 22pt 基准、双行 44pt 基准 @18sp，@2x 位图）——
+/// 主行当前句逐字卡拉OK（粗体），双行时副行下一句整行灰未唱色（细体、
+/// 静态不滚动——副行是未唱预览，不跟随主行滚动）。
 /// 逐字卡拉OK双色——已唱字按行内索引在 青(0xFF00E5FF)→紫(0xFFFF00FF) 间插值
 /// （安卓 FloatingLyricService 默认渐变配色），未唱字灰(0xFF666666)，正在唱的
 /// 字按字内比例平滑过渡；底部细进度条。行进度原生自推进：
@@ -592,6 +594,11 @@ final class LyricsPipManager: NSObject {
   private var scrollLineStartMs = -1
   /// 占位文案（歌词加载中.../暂无歌词/歌词加载失败），空 = 正常渲染行
   private var placeholder = ""
+
+  // 版式配置（设置页「设备歌词」经 configure 下发；默认对齐 Dart：18sp / 单行）。
+  // 字号驱动 PiP 条高度，行式切单/双行渲染。
+  private var configFontSize: Double = 18.0
+  private var configDoubleLine = false
 
   // 进度锚点：Dart 最近推送的 positionMs + 接收时刻（本机单调钟）
   private var anchorPositionMs: Double = 0
@@ -625,8 +632,13 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 双行细条尺寸（pt）：主行当前句 + 副行下一句
-  private static let barSize = CGSize(width: 300, height: 44)
+  /// 条状画布尺寸（pt）：宽度固定 300；高度 = 基准高 × 字号缩放（18sp 归一，
+  /// 下限 8sp 防御持久层脏数据出 0 高帧）。单行基准 22pt、双行 44pt——
+  /// 设置页「版式 → 字号」滑杆即 PiP 高度滑杆。
+  private var barSize: CGSize {
+    let scale = CGFloat(max(configFontSize, 8) / 18.0)
+    return CGSize(width: 300, height: ((configDoubleLine ? 44.0 : 22.0) * scale).rounded())
+  }
 
   private override init() {}
 
@@ -665,6 +677,11 @@ final class LyricsPipManager: NSObject {
       case "update":
         if let args = call.arguments as? [String: Any] {
           self.update(args)
+        }
+        result(nil)
+      case "configure":
+        if let args = call.arguments as? [String: Any] {
+          self.configure(args)
         }
         result(nil)
       default:
@@ -739,6 +756,39 @@ final class LyricsPipManager: NSObject {
     anchorPositionMs = (args["position"] as? NSNumber)?.doubleValue ?? 0
     anchorUptime = ProcessInfo.processInfo.systemUptime
     playing = args["playing"] as? Bool ?? false
+  }
+
+  // MARK: configure（版式：字号 / 行式，设置页「设备歌词」下发）
+
+  private func configure(_ args: [String: Any]) {
+    let fs = (args["fontSize"] as? NSNumber)?.doubleValue
+    let dl = (args["doubleLine"] as? NSNumber)?.boolValue
+    var changed = false
+    if let fs, fs != configFontSize {
+      configFontSize = fs
+      changed = true
+    }
+    if let dl, dl != configDoubleLine {
+      configDoubleLine = dl
+      changed = true
+    }
+    guard changed else { return }
+    applyBarSize()
+  }
+
+  /// 条高变化：同步离屏宿主/显示层尺寸、复位滚动状态并立即重出一帧。
+  /// 像素池按尺寸缓存（pixelBufferPool），barSize 变化自动重建；PiP 窗口
+  /// 随新帧宽高比自适应。
+  private func applyBarSize() {
+    scrollOffset = 0
+    scrollLastUptime = 0
+    if let host = hostView {
+      host.frame = CGRect(
+        x: -barSize.width - 16, y: -8,
+        width: barSize.width, height: barSize.height)
+      sampleLayer.frame = host.bounds
+    }
+    renderFrame()
   }
 
   /// 估算当前播放位置：锚点 + 本机单调钟流逝（播放中原生自推进）。
@@ -877,8 +927,8 @@ final class LyricsPipManager: NSObject {
     }
     // 1. 离屏宿主：layer 必须在窗口层级里 PiP 才会从它取帧；本体移出屏幕不显示
     let host = UIView(frame: CGRect(
-      x: -Self.barSize.width - 16, y: -8,
-      width: Self.barSize.width, height: Self.barSize.height))
+      x: -barSize.width - 16, y: -8,
+      width: barSize.width, height: barSize.height))
     host.backgroundColor = .clear
     host.isUserInteractionEnabled = false
     rootViewController.view.addSubview(host)
@@ -1002,12 +1052,12 @@ final class LyricsPipManager: NSObject {
 
   private func makeSample() -> CMSampleBuffer? {
     let format = UIGraphicsImageRendererFormat()
-    format.scale = 2 // @2x 位图（600x88），小窗里文字足够清晰
+    format.scale = 2 // @2x 位图，小窗里文字足够清晰
     format.opaque = true
-    let renderer = UIGraphicsImageRenderer(size: Self.barSize, format: format)
+    let renderer = UIGraphicsImageRenderer(size: barSize, format: format)
     let image = renderer.image { ctx in
       // 渲染器上下文已是 UIKit 左上原点坐标系，与 drawBar 的坐标约定一致
-      self.drawBar(in: ctx.cgContext, size: Self.barSize)
+      self.drawBar(in: ctx.cgContext, size: barSize)
     }
     guard let cgImage = image.cgImage else { return nil }
 
@@ -1103,10 +1153,12 @@ final class LyricsPipManager: NSObject {
     ctx.setFillColor(UIColor.white.withAlphaComponent(0.85).cgColor)
     ctx.fill(CGRect(x: 0, y: height - barHeight, width: CGFloat(progress) * width, height: barHeight))
 
-    // 字号随条高自适应：双行均分文本区（44pt 条 ≈ 14.6pt 字）
+    // 字号 = 设置字号 × 0.8（18sp → 14.4pt，与原 44pt 条观感一致）；
+    // 条高随字号缩放（barSize），文本行始终放得下
     let textAreaHeight = height - barHeight
-    let rowHeight = textAreaHeight / 2
-    let fontSize = min(max(rowHeight * 0.72, 9), 16)
+    let dual = configDoubleLine
+    let rowHeight = dual ? textAreaHeight / 2 : textAreaHeight
+    let fontSize = CGFloat(configFontSize) * 0.8
 
     // 占位文案（歌词加载中/暂无歌词/歌词加载失败）：跨两行居中
     if !placeholder.isEmpty {
@@ -1136,9 +1188,9 @@ final class LyricsPipManager: NSObject {
       return
     }
 
-    // —— 双行逐字卡拉OK：主行当前句（逐字着色粗体），副行下一句（整行灰
-    // 未唱色，细体——安卓 lyricText2 不设 DEFAULT_BOLD）；超宽不省略号，
-    // 着色前沿接近右缘时 easeOut 向左滚动露出后续字 ——
+    // —— 逐字卡拉OK：主行当前句（逐字着色粗体），超宽不省略号，着色前沿
+    // 接近右缘时 easeOut 向左滚动露出后续字；双行时副行下一句整行灰未唱色
+    // （细体——安卓 lyricText2 不设 DEFAULT_BOLD）——
     let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
     let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
@@ -1153,15 +1205,15 @@ final class LyricsPipManager: NSObject {
       rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
       scrollOffset: scroll, padding: horizontalPadding)
 
-    if !nextLineText.isEmpty {
+    if dual, !nextLineText.isEmpty {
       let nextGlyphs = grayGlyphs(
         layoutBarGlyphs(text: nextLineText, words: [], positionMs: 0, font: nextFont))
-      // 副行跟随主行滚动，但最多滚到自身行尾可见即停
-      let nextMax = max(0, nextGlyphs.reduce(0) { $0 + $1.width } - maxWidth + horizontalPadding)
+      // 副行静态：下一句是未唱预览，超宽右缘裁切即可。不跟随主行滚动——
+      // 两者节奏无关，跟着滚会被误读成副行在逐字推进（旧实现 bug）。
       drawScrollingLine(
         ctx: ctx, glyphs: nextGlyphs, font: nextFont,
         rowCenterY: rowHeight * 1.5, rowHeight: rowHeight, width: width,
-        scrollOffset: min(scroll, nextMax), padding: horizontalPadding)
+        scrollOffset: 0, padding: horizontalPadding)
     }
   }
 

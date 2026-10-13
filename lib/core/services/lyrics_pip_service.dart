@@ -7,8 +7,9 @@ import '../../widgets/apple_lyrics/models/lyric_line.dart';
 
 /// iOS 歌词悬浮窗：系统画中画（FaceTime 式 VideoCall contentSource）桥接。
 ///
-/// 单行细条状悬浮条（300x22pt），无系统播放控件，点击小窗直接关闭；
-/// 逐字卡拉OK渲染在原生端完成（参照 github.com/CaiWanFeng/PiP 项目）。
+/// 细条状悬浮条（宽 300pt；高随设置页「版式 → 字号」缩放，默认单行 22pt），
+/// 无系统播放控件，点击小窗直接关闭；逐字卡拉OK渲染在原生端完成
+///（参照 github.com/CaiWanFeng/PiP 项目）。
 /// 仅 iOS 激活；其它平台全部 no-op（Android 悬浮歌词走 FloatingLyricService，
 /// 由 DesktopLyricService 原路径负责，互不影响）。
 /// Swift 端实现见 ios/Runner/AppDelegate.swift 的 LyricsPipManager。
@@ -155,6 +156,22 @@ class LyricsPipService {
       });
     } catch (e) {
       debugPrint('[LyricsPip] update failed: $e');
+    }
+  }
+
+  /// 版式配置下发（设置页「设备歌词」→ 字号/行式）。字号驱动 PiP 条高度
+  ///（单行 22pt / 双行 44pt 基准 @18sp 线性缩放），行式切单/双行渲染。
+  /// PiP 未激活时原生仅存值，激活后首帧即按新版式画。
+  Future<void> configure({double? fontSize, bool? doubleLine}) async {
+    if (!Platform.isIOS) return;
+    _ensureHandler();
+    try {
+      await _channel.invokeMethod('configure', <String, dynamic>{
+        'fontSize': ?fontSize,
+        'doubleLine': ?doubleLine,
+      });
+    } catch (e) {
+      debugPrint('[LyricsPip] configure failed: $e');
     }
   }
 
