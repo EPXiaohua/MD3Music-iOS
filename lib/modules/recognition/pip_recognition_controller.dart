@@ -583,10 +583,25 @@ class PipRecognitionController {
         }
       }
       // 静音段跳过
-      if (maxAmplitude < kSilenceAmplitudeThreshold) return null;
+      if (maxAmplitude < kSilenceAmplitudeThreshold) {
+        debugPrint(
+          '[PipRecognition] segment silent (maxAmp=$maxAmplitude '
+          '<$kSilenceAmplitudeThreshold, pcm=${pcmData.length}B)',
+        );
+        return null;
+      }
 
       final response = await KugouApiClient().audioMatch(pcmData);
-      if (response == null || !hasSongData(response)) return null;
+      if (response == null) {
+        debugPrint('[PipRecognition] audioMatch null (网络/接口失败)');
+        return null;
+      }
+      if (!hasSongData(response)) {
+        debugPrint(
+          '[PipRecognition] audioMatch no hit: ${_summarizeResponse(response)}',
+        );
+        return null;
+      }
       final audioInfo = _extractAudioInfo(response);
       final name =
           extractField(audioInfo, [
@@ -604,10 +619,21 @@ class PipRecognitionController {
             'SingerName',
           ]) ??
           '';
+      debugPrint('[PipRecognition] hit: $name - $artistName');
       return (name: name, artist: artistName, response: response);
     } catch (e) {
       debugPrint('[PipRecognition] recognize error: $e');
       return null;
+    }
+  }
+
+  /// audioMatch 未命中时输出精简响应（截断到 300 字符），便于诊断
+  String _summarizeResponse(Map<String, dynamic> response) {
+    try {
+      final s = jsonEncode(response);
+      return s.length > 300 ? '${s.substring(0, 300)}…' : s;
+    } catch (_) {
+      return '${response.keys.toList()}';
     }
   }
 
