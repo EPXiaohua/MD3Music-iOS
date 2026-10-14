@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../core/build_flags.dart';
+import '../core/platform_capabilities.dart';
 import '../core/remote/tv_menu_key_shortcuts.dart';
 import '../core/services/lyrico_editor.dart';
 import '../core/utils/app_haptics.dart';
@@ -19,6 +20,7 @@ import '../modules/player/player_cover_morph.dart' show PlayerCoverMorphBus;
 import '../providers/favorites_provider.dart';
 import '../providers/blacklist_provider.dart';
 import '../providers/kugou_provider.dart';
+import '../providers/library_provider.dart';
 import '../providers/local_favorites_provider.dart';
 import '../providers/player_provider.dart';
 import 'add_to_playlist_dialog.dart';
@@ -267,10 +269,47 @@ class SongListItem extends StatelessWidget {
                   showSongAccompanySheet(context, song);
                 },
               ),
+            // iOS：本地歌曲删除入口。导入的音频文件归沙箱所有，删除 =
+            // 删文件 + 移出本地音乐列表；Android 文件在公共存储目录，
+            // 无法绕过 MediaStore 直删，保持上游行为不提供。
+            if (!song.isOnline && song.localPath != null && isIOSPlatform)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('删除'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final ok = await _confirmDeleteSong(context, song);
+                  if (!ok || !context.mounted) return;
+                  await context.read<LibraryProvider>().deleteLocalSong(song);
+                  showToast('已删除');
+                },
+              ),
           ],
         ),
       ),
     );
+  }
+
+  /// 本地歌曲删除确认弹窗（iOS 专属菜单项使用）
+  Future<bool> _confirmDeleteSong(BuildContext context, Song song) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('删除歌曲'),
+        content: Text('确定删除「${song.title}」吗？导入的音频文件将一并删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    return result == true;
   }
 
   /// 标记「不感兴趣」（加入歌曲黑名单）。未拉满时先全量拉取防重复标记；
