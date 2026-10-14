@@ -1,7 +1,11 @@
 import 'dart:async' show unawaited;
+import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
+import '../core/platform_capabilities.dart';
 import '../core/services/folder_picker_service.dart';
 import '../core/services/local_artwork_cache.dart';
 import '../core/utils/permissions.dart';
@@ -166,13 +170,15 @@ class LibraryProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // 请求存储权限
-      final hasPermission = await requestStoragePermission();
-      if (!hasPermission) {
-        _error = '需要存储权限才能扫描本地音乐';
-        _isScanning = false;
-        notifyListeners();
-        return;
+      // 请求存储权限（iOS 无需权限：只读 app 沙箱内的导入目录）
+      if (!isIOSPlatform) {
+        final hasPermission = await requestStoragePermission();
+        if (!hasPermission) {
+          _error = '需要存储权限才能扫描本地音乐';
+          _isScanning = false;
+          notifyListeners();
+          return;
+        }
       }
 
       // 加载用户保存的扫描文件夹和排除文件夹
@@ -180,9 +186,14 @@ class LibraryProvider extends ChangeNotifier {
       _excludedFolders = await _repository.getExcludedFolders();
       _filterShortAudio = await _repository.getFilterShortAudio();
 
-      // 扫描（传入排除文件夹）
+      // 扫描（传入排除文件夹）。iOS 沙箱限制：外部媒体目录不可达，扫描源
+      // 只有导入目录（导入音乐 = 文件选择器拷贝进沙箱），Android 目录天然
+      // 不存在返回空，行为无害
+      final scanDirs = isIOSPlatform
+          ? [await _importsDirectory()]
+          : _scanFolders;
       final songs = await _repository.scanSongs(
-        customFolders: _scanFolders,
+        customFolders: scanDirs,
         excludedFolders: _excludedFolders,
       );
 
@@ -230,6 +241,59 @@ class LibraryProvider extends ChangeNotifier {
     await _repository.removeFolder(path);
     _scanFolders = await _repository.getSavedFolders();
     notifyListeners();
+  }
+
+  /// iOS 导入目录：Documents/Music/Imports（app 沙箱内，无权限要求）。
+  Future<String> _importsDirectory() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(
+      '${docs.path}${Platform.pathSeparator}Music'
+      '${Platform.pathSeparator}Imports',
+    );
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir.path;
+  }
+
+  /// iOS 导入音乐：文件选择器选择音频文件 → 拷贝进沙箱导入目录 → 重扫。
+  ///
+  /// iOS 沙箱无法扫描系统媒体库，本地音乐的唯一来源就是把音频文件导入进
+  /// 沙箱。返回拷入的文件数；-1 = 选择器/拷贝失败，0 = 未选择任何文件。
+  Future<int> importSongs() async {
+    if (!isIOSPlatform) return -1;
+    try {
+      const exts = [
+        'mp3', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wav', 'aiff', 'aif',
+        'ape', 'wma',
+      ];
+      final files = await openFiles(
+        acceptedTypeGroups: [const XTypeGroup(label: '音频', extensions: exts)],
+      );
+      if (files.isEmpty) return 0;
+      final dir = await _importsDirectory();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      var copied = 0;
+      for (final f in files) {
+        final name = f.name.replaceAll('/', '_').replaceAll('\\', '_');
+        final dot = name.lastIndexOf('.');
+        final base = dot <= 0 ? name : name.substring(0, dot);
+        final ext = dot <= 0 ? '' : name.substring(dot);
+        // 同名文件共存：加时间戳后缀，避免覆盖已有导入
+        var target = File('$dir${Platform.pathSeparator}$name');
+        if (await target.exists()) {
+          target = File('$dir${Platform.pathSeparator}$base.$ts$ext');
+        }
+        await f.saveTo(target.path);
+        copied++;
+      }
+      _log('[LibraryProvider] imported $copied audio files');
+      await loadLocalMusic();
+      return copied;
+    } catch (e) {
+      _log('[LibraryProvider] import songs failed: $e');
+      return -1;
+    }
   }
 
   /// 通过文件夹选择器添加排除目录。

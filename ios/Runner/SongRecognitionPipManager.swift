@@ -16,8 +16,8 @@ import UIKit
 /// - 启动重试 8 次，等"宿主进层级 + 首帧 + isPictureInPicturePossible"。
 ///
 /// 与歌词窗的差异：
-/// - 窗口为 2:1 横向（300x150pt @2x 位图 600x300）：左侧麦克风圆标 + 右侧
-///   状态文案；状态机（idle/listening/recognizing/result/stopped）由 Dart 识别
+/// - 窗口为 1:1 方形（220x220pt @2x 位图 440x440）：上方居中麦克风圆标 +
+///   下方状态文案；状态机（idle/listening/recognizing/result/stopped）由 Dart 识别
 ///   循环经 update 推送。iOS 无系统音频捕获能力，识别音频走麦克风（Dart 侧
 ///   录音，与识曲页同一链路），原生不采集任何音频；
 /// - 聆听中：麦克风圆标变红 + 红色边缘发光 + 1.0→1.15 脉冲缩放（对齐识曲页
@@ -66,8 +66,8 @@ final class SongRecognitionPipManager: NSObject {
   private var pipState: PipState = .idle
   private var pendingIntent: Bool?
   private var awaitingStartCallback = false
-  /// 2:1 横向窗口（pt）
-  private static let windowSize = CGSize(width: 300, height: 150)
+  /// 1:1 方形窗口（pt）
+  private static let windowSize = CGSize(width: 220, height: 220)
 
   // 主题配色：由 Dart 经 setThemeColors 推送（应用莫奈/动态取色的
   // ColorScheme token，浅色主题为近白面板、深色主题为深色容器，深浅
@@ -508,10 +508,10 @@ final class SongRecognitionPipManager: NSObject {
     ctx.setFillColor(panelColor.cgColor)
     ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-    // —— 左侧圆形麦克风标 ——
-    let diameter = h * 0.61
-    let cx = h * 0.44
-    let cy = h / 2
+    // —— 上方居中圆形麦克风标 ——
+    let diameter = h * 0.38
+    let cx = w / 2
+    let cy = h * 0.31
     let listening = state == "listening"
 
     // 聆听中脉冲缩放：1.0→1.15，1.2s 往返（对齐识曲页 1200ms easeInOut）
@@ -541,15 +541,21 @@ final class SongRecognitionPipManager: NSObject {
       break
     }
 
-    // 红色边缘发光：聆听中外扩三层描边模拟柔光
+    // 边缘微发光：单层低透明柔光（对齐识曲页 BoxShadow——alpha 0.3 /
+    // blur 24 / spread 8），无硬边光圈
     if listening {
-      let glow: [(extra: CGFloat, alpha: CGFloat)] = [(3, 0.5), (8, 0.28), (15, 0.13)]
-      for g in glow {
-        let r = radius + g.extra
-        ctx.setStrokeColor(errorColor.withAlphaComponent(g.alpha).cgColor)
-        ctx.setLineWidth(g.extra)
-        ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
-      }
+      let spread: CGFloat = 8
+      let glowRadius = radius + spread
+      ctx.saveGState()
+      ctx.setShadow(
+        offset: .zero, blur: 24,
+        color: errorColor.withAlphaComponent(0.3).cgColor)
+      ctx.setFillColor(errorColor.withAlphaComponent(0.3).cgColor)
+      ctx.fillEllipse(
+        in: CGRect(
+          x: cx - glowRadius, y: cy - glowRadius,
+          width: glowRadius * 2, height: glowRadius * 2))
+      ctx.restoreGState()
     }
 
     ctx.setFillColor(circleColor.cgColor)
@@ -563,13 +569,15 @@ final class SongRecognitionPipManager: NSObject {
       drawMic(cx: cx, cy: cy, size: iconSize, color: iconColor)
     }
 
-    // —— 右侧文案区 ——
-    let textX = cx + diameter / 2 + h * 0.12
-    let textMaxWidth = w - textX - h * 0.10
+    // —— 下方文案区（水平留白 12pt，占下半区）——
+    let textX: CGFloat = 12
+    let textMaxWidth = w - textX * 2
+    let textBand = CGRect(
+      x: textX, y: h * 0.53, width: textMaxWidth, height: h * 0.40)
     if state == "result" {
-      drawResultText(x: textX, maxWidth: textMaxWidth, height: h)
+      drawResultText(in: textBand, maxWidth: textMaxWidth)
     } else {
-      drawHintText(x: textX, maxWidth: textMaxWidth, height: h)
+      drawHintText(in: textBand, maxWidth: textMaxWidth)
     }
 
     // 右上角音频源徽标（系统声音广播模式），独立于内容文案区
@@ -663,8 +671,8 @@ final class SongRecognitionPipManager: NSObject {
     path.stroke()
   }
 
-  /// 单行状态文案：超宽逐步缩字号，仍超则尾部省略
-  private func drawHintText(x: CGFloat, maxWidth: CGFloat, height: CGFloat) {
+  /// 单行状态文案：在文案带内垂直居中，超宽逐步缩字号，仍超则尾部省略
+  private func drawHintText(in band: CGRect, maxWidth: CGFloat) {
     let muted = state == "idle" || state == "stopped"
     var fontSize: CGFloat = 15
     let paragraph = NSMutableParagraphStyle()
@@ -682,12 +690,14 @@ final class SongRecognitionPipManager: NSObject {
       textSize = text.size(withAttributes: attrs)
     }
     text.draw(
-      with: CGRect(x: x, y: (height - textSize.height) / 2, width: maxWidth, height: textSize.height),
+      with: CGRect(
+        x: band.minX, y: band.midY - textSize.height / 2,
+        width: maxWidth, height: textSize.height),
       options: .usesLineFragmentOrigin, attributes: attrs, context: nil)
   }
 
-  /// 结果态：歌名（粗体）+ 歌手（灰），整体垂直居中，尾部省略
-  private func drawResultText(x: CGFloat, maxWidth: CGFloat, height: CGFloat) {
+  /// 结果态：歌名（粗体）+ 歌手（灰），在文案带内垂直居中，尾部省略
+  private func drawResultText(in band: CGRect, maxWidth: CGFloat) {
     let nameFont = UIFont.systemFont(ofSize: 15.5, weight: .bold)
     let artistFont = UIFont.systemFont(ofSize: 12.5, weight: .regular)
     let name = (songName.isEmpty ? "未知歌曲" : songName) as NSString
@@ -710,15 +720,15 @@ final class SongRecognitionPipManager: NSObject {
     let artistSize = showArtist ? artistText.size(withAttributes: artistAttrs) : .zero
     let gap: CGFloat = showArtist ? 5 : 0
     let totalHeight = nameSize.height + gap + artistSize.height
-    var y = (height - totalHeight) / 2
+    var y = band.midY - totalHeight / 2
 
     name.draw(
-      with: CGRect(x: x, y: y, width: maxWidth, height: nameSize.height),
+      with: CGRect(x: band.minX, y: y, width: maxWidth, height: nameSize.height),
       options: .usesLineFragmentOrigin, attributes: nameAttrs, context: nil)
     y += nameSize.height + gap
     if showArtist {
       artistText.draw(
-        with: CGRect(x: x, y: y, width: maxWidth, height: artistSize.height),
+        with: CGRect(x: band.minX, y: y, width: maxWidth, height: artistSize.height),
         options: .usesLineFragmentOrigin, attributes: artistAttrs, context: nil)
     }
   }
