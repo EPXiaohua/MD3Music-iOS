@@ -43,10 +43,6 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
 
   private var queue2sBeatUptime: TimeInterval = 0
 
-  /// 原始字节探针：把收到的 block buffer 原样累积，≥512KB 覆盖写
-  /// raw_probe.bin（诊断用——WAV 实测为密码学级伪随机（相邻相关≈0、字节
-  /// 分布均匀），需对比「未解码原始字节」区分格式矛盾 vs 源头随机）
-  private var rawProbe = Data()
   /// 首帧确定的 ASBD 完整描述（写进 meta 供 Dart 打印）
   private var fmtDescription: String?
 
@@ -83,13 +79,11 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       self.sampleRate = 0
       self.fileHandles = [nil, nil]
       self.fmtDescription = nil
-      self.rawProbe.removeAll(keepingCapacity: false)
       self.failCount = 0
       self.lastFailReason = ""
       self.appSampleCount = 0
       self.micSampleCount = 0
       self.activeSrc = ""
-      try? FileManager.default.removeItem(at: dir.appendingPathComponent("raw_probe.bin"))
       // 开播清场：两个缓冲都截断，meta 归零（writing=0, bytes=0）
       for i in 0...1 {
         FileManager.default.createFile(
@@ -144,22 +138,6 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
         + "nonInterleaved=\((flags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)"
     }
 
-    // 原始字节探针：在样本有效期内同步拷贝（与解码路径独立，无论解码
-    // 成败都落 raw_probe.bin 供宿主导出对比）
-    let raw: Data? = {
-      guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
-      let length = CMBlockBufferGetDataLength(block)
-      guard length > 0 else { return nil }
-      var data = Data(count: length)
-      let ok = data.withUnsafeMutableBytes { raw -> Bool in
-        guard let base = raw.baseAddress else { return false }
-        return CMBlockBufferCopyDataBytes(
-          block, atOffset: 0, dataLength: length, destination: base)
-          == kCMBlockBufferNoErr
-      }
-      return ok ? data : nil
-    }()
-
     let decoded = decodeSampleToMonoFloat(sampleBuffer, asbd: asbd)
     guard let floats = decoded.floats, !floats.isEmpty else {
       recordFailure(decoded.fail ?? "unknown")
@@ -191,10 +169,6 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
           "[MD3Broadcast] first audio sample (src=%@): %@",
           self.activeSrc as NSString, (self.fmtDescription ?? "?") as NSString)
       }
-      if let raw {
-        self.rawProbe.append(raw)
-        self.flushRawProbeIfNeeded()
-      }
       self.append(pcm)
     }
   }
@@ -202,15 +176,11 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   /// 解码失败留痕：计数 + 节流刷 meta（Dart 读到 fmt/err/src 打印定位）。
   /// 失败也刷新 ts——Dart 的 15s 新鲜窗口会把「有广播但无数据」识别为
   /// "meta present but empty"（回退麦克风）而非误判广播停止。
-  private func recordFailure(_ reason: String, raw: Data? = nil) {
+  private func recordFailure(_ reason: String) {
     queue.async { [weak self] in
       guard let self, self.groupDir != nil else { return }
       self.failCount += 1
       self.lastFailReason = reason
-      if let raw {
-        self.rawProbe.append(raw)
-        self.flushRawProbeIfNeeded()
-      }
       if self.failCount <= 3 {
         NSLog(
           "[MD3Broadcast] decode fail #%ld: %@",
@@ -221,14 +191,6 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
         self.lastFailMetaUptime = now
         self.writeMeta(stopped: false)
       }
-    }
-  }
-
-  private func flushRawProbeIfNeeded() {
-    if rawProbe.count >= 512 * 1024 {
-      try? rawProbe.write(
-        to: groupDir!.appendingPathComponent("raw_probe.bin"), options: .atomic)
-      rawProbe.removeAll(keepingCapacity: true)
     }
   }
 
