@@ -167,7 +167,6 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     }
 
     let rate = Int(asbd.mSampleRate)
-    let channels = Int(asbd.mChannelsPerFrame)
 
     // Float [-1,1] → Int16 LE 字节
     var pcm = Data(count: floats.count * 2)
@@ -233,111 +232,82 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     }
   }
 
-  /// 官方姿势解码：经 CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer
-  /// 拿 AudioBufferList，逐 buffer 按系统给出的 mData/mDataByteSize/
-  /// mNumberChannels 读取，**零内存布局假设**。
+  /// ASBD 驱动的原始解码：raw-copy 整个 block buffer，严格按格式描述的
+  /// 端序/位深/交织方式解释字节。
   ///
-  /// 此前实现直接 raw-copy 整个 block buffer，对非交织按「[ch0 全部帧]
-  /// [ch1 全部帧] 连续拼接」猜测索引——真机实测解出纯噪音（用户听
-  /// recog_segment.wav 确认），即该布局假设不成立。
+  /// 真机实锤（诊断包 20261015_023613）：ReplayKit 广播扩展的音频是
+  /// 16bit **大端**有符号整数交织立体声（signedInt=1 bigEndian=1 bits=16
+  /// bytesPerFrame=4）——第一版 raw-copy 按小端 Int16 解释大端数据 → 字节
+  /// 序颠倒解出密码学级伪随机"噪音"；第二版 AudioBufferList API 在该设备
+  /// 返回 -12737 全败 → 零数据。本版按 ASBD 端序逐样本读，两症同治。
   ///
-  /// 规则：buffer 内按帧跨其声道数平均（交织）；多 buffer（非交织，每块
-  /// 单声道）再跨块按帧平均；输出 Int16 mono。
   /// 失败返回 (nil, 原因串)——原因随 meta.err 带出扩展。
   private func decodeSampleToMonoFloat(
     _ sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription
   ) -> (floats: [Float]?, fail: String?) {
     let ch = max(1, Int(asbd.mChannelsPerFrame))
     let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-    let bytesPerSample = Int(asbd.mBitsPerChannel) / 8
-    guard bytesPerSample == 4 || bytesPerSample == 2 else {
-      return (
-        nil, "unsupported bits=\(asbd.mBitsPerChannel) float=\(isFloat ? 1 : 0)"
-      )
+    let isBigEndian = (asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0
+    let isNonInterleaved =
+      (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+    let bits = Int(asbd.mBitsPerChannel)
+    guard bits == 16 || bits == 32 else {
+      return (nil, "unsupported bits=\(bits)")
     }
-
-    // AudioBufferList 是 C 变长结构：静态含 1 个 buffer 槽，按声道数补足。
-    // mBuffers[0] 偏移 = AudioBufferList.size - AudioBuffer.size（C ABI 固定
-    // 布局，arm64/x86_64 均为 8）。
-    let listSize = MemoryLayout<AudioBufferList>.size
-      + (ch - 1) * MemoryLayout<AudioBuffer>.size
-    let listPtr = UnsafeMutableRawPointer.allocate(
-      byteCount: listSize, alignment: MemoryLayout<AudioBuffer>.alignment)
-    defer { listPtr.deallocate() }
-    listPtr.initializeMemory(as: UInt8.self, repeating: 0, count: listSize)
-    let ablPtr = listPtr.assumingMemoryBound(to: AudioBufferList.self)
-
-    var neededSize = 0
-    var blockBuffer: CMBlockBuffer?
-    let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-      sampleBuffer,
-      bufferListSizeNeededOut: &neededSize,
-      bufferListOut: ablPtr,
-      bufferListSize: listSize,
-      blockBufferAllocator: kCFAllocatorDefault,
-      blockBufferMemoryAllocator: kCFAllocatorDefault,
-      flags: 0,
-      blockBufferOut: &blockBuffer)
-    guard status == noErr else {
-      return (nil, "abl status=\(status) needed=\(neededSize)")
+    guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+      return (nil, "no data buffer")
     }
-    guard blockBuffer != nil else { return (nil, "abl no block buffer") }
+    let length = CMBlockBufferGetDataLength(block)
+    guard length > 0 else { return (nil, "empty data buffer len=\(length)") }
+    var data = Data(count: length)
+    let copied = data.withUnsafeMutableBytes { raw -> Bool in
+      guard let base = raw.baseAddress else { return false }
+      return CMBlockBufferCopyDataBytes(
+        block, atOffset: 0, dataLength: length, destination: base)
+        == kCMBlockBufferNoErr
+    }
+    guard copied else { return (nil, "copy failed len=\(length)") }
 
-    let bufCount = Int(ablPtr.pointee.mNumberBuffers)
-    guard bufCount > 0 else { return (nil, "bufCount=0") }
-    let firstBufOffset =
-      MemoryLayout<AudioBufferList>.size - MemoryLayout<AudioBuffer>.size
-
-    // 逐 buffer 解成 [Float]（buffer 内按帧跨声道平均），记录最小帧数
-    var arrays: [[Float]] = []
-    var minFrames = Int.max
-    for i in 0..<bufCount {
-      let bufRaw = listPtr.advanced(
-        by: firstBufOffset + i * MemoryLayout<AudioBuffer>.size)
-      let buf = bufRaw.bindMemory(to: AudioBuffer.self, capacity: 1).pointee
-      let bufCh = max(1, Int(buf.mNumberChannels))
-      let bytes = Int(buf.mDataByteSize)
-      guard let mData = buf.mData, bytes > 0 else {
-        return (nil, "buf\(i) mData=nil size=\(bytes)")
+    let bytesPerSample = bits / 8
+    let frameCount = length / (bytesPerSample * ch)
+    guard frameCount > 0 else {
+      return (nil, "frames=0 len=\(length) ch=\(ch)")
+    }
+    var out = [Float](repeating: 0, count: frameCount)
+    data.withUnsafeBytes { raw in
+      let base = raw.baseAddress!
+      // 样本下标：交织 = 帧×声道；非交织 = 每声道一整块平面
+      func sampleIndex(_ f: Int, _ c: Int) -> Int {
+        isNonInterleaved ? c * frameCount + f : f * ch + c
       }
-      let frames = bytes / (bytesPerSample * bufCh)
-      guard frames > 0 else {
-        return (nil, "buf\(i) frames=0 size=\(bytes) ch=\(bufCh)")
-      }
-      var out = [Float](repeating: 0, count: frames)
-      if isFloat, bytesPerSample == 4 {
-        let v = mData.bindMemory(to: Float.self, capacity: bytes / 4)
-        for f in 0..<frames {
-          var s: Float = 0
-          for c in 0..<bufCh { s += v[f * bufCh + c] }
-          out[f] = s / Float(bufCh)
+      for f in 0..<frameCount {
+        var sum: Float = 0
+        for c in 0..<ch {
+          let off = sampleIndex(f, c) * bytesPerSample
+          if isFloat, bytesPerSample == 4 {
+            let v: Float
+            if isBigEndian {
+              let u = UInt32(base[off]) << 24 | UInt32(base[off + 1]) << 16
+                | UInt32(base[off + 2]) << 8 | UInt32(base[off + 3])
+              v = Float(bitPattern: u)
+            } else {
+              v = base.load(fromByteOffset: off, as: Float.self)
+            }
+            sum += v
+          } else {
+            let v: Int16
+            if isBigEndian {
+              v = Int16(bitPattern: UInt16(base[off]) << 8 | UInt16(base[off + 1]))
+            } else {
+              v = base.load(fromByteOffset: off, as: Int16.self)
+            }
+            sum += Float(v) / 32768.0
+          }
         }
-      } else if bytesPerSample == 2 {
-        let v = mData.bindMemory(to: Int16.self, capacity: bytes / 2)
-        for f in 0..<frames {
-          var s: Float = 0
-          for c in 0..<bufCh { s += Float(v[f * bufCh + c]) / 32768.0 }
-          out[f] = s / Float(bufCh)
-        }
-      } else {
-        return (
-          nil, "buf\(i) fmt mismatch float=\(isFloat ? 1 : 0) bits=\(asbd.mBitsPerChannel)"
-        )
+        out[f] = sum / Float(ch)
       }
-      arrays.append(out)
-      minFrames = min(minFrames, frames)
     }
-    guard minFrames > 0, minFrames != .max else { return (nil, "minFrames=0") }
-
-    // 跨 buffer（非交织多块）按帧平均 → 单声道
-    if arrays.count == 1 { return (arrays[0], nil) }
-    var mono = [Float](repeating: 0, count: minFrames)
-    for f in 0..<minFrames {
-      var s: Float = 0
-      for a in arrays { s += a[f] }
-      mono[f] = s / Float(arrays.count)
-    }
-    return (mono, nil)
+    return (out, nil)
   }
 
   // MARK: - 文件写入
