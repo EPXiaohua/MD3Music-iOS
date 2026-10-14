@@ -9,9 +9,13 @@ import AVKit
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate,
     UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
-  /// 待回复的 FlutterResult（两个选择器互斥，同一时间只允许一个）
+  /// 待回复的 FlutterResult（各选择器互斥，同一时间只允许一个）
   private var pendingResult: FlutterResult?
+  /// 当前 UIDocumentPicker 的用途（字体单选 / 音频多选，回调按此分派）
+  private var pendingDocPickerKind: DocPickerKind?
   private var channelsConfigured = false
+
+  private enum DocPickerKind { case font, audio }
 
   override func application(
     _ application: UIApplication,
@@ -55,6 +59,16 @@ import AVKit
           return
         }
         self?.pickBackgroundImage(result: result)
+      }
+
+    // 本地音乐导入：UIDocumentPicker 多选音频，拷贝进沙箱后返回文件数
+    FlutterMethodChannel(name: "com.md3music.md3music/audio_import", binaryMessenger: messenger)
+      .setMethodCallHandler { [weak self] call, result in
+        guard call.method == "pickAudioFiles" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        self?.pickAudioFiles(result: result)
       }
 
     // 真实机型（诊断日志用）。iOS 无 MediaStore，Dart 侧 Platform.operatingSystem
@@ -197,6 +211,7 @@ import AVKit
       return
     }
     pendingResult = result
+    pendingDocPickerKind = .font
     // UTType 没有字体静态成员，用标准 UTI 构造：ttf / otf / 通用字体
     let fontTypes = [
       UTType("public.truetype-ttf"),
@@ -210,13 +225,80 @@ import AVKit
     presenter.present(picker, animated: true)
   }
 
+  // MARK: - 音频导入（本地音乐：DocumentPicker 多选，拷入沙箱后返回文件数）
+
+  private func pickAudioFiles(result: @escaping FlutterResult) {
+    guard pendingResult == nil else {
+      result(0)  // 已有选择器在运行，视为取消
+      return
+    }
+    guard let presenter = presenter else {
+      result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "无法获取展示控制器", details: nil))
+      return
+    }
+    pendingResult = result
+    pendingDocPickerKind = .audio
+    // 常见音频 UTI + 冷门扩展名动态构造（ape/wma 无标准 UTI）
+    var audioTypes: Set<UTType> = [
+      .audio, .mp3, .mpeg4Audio, .wav, .aiff,
+    ]
+    for ext in ["ape", "wma", "opus", "ogg", "aif", "m4a", "aac", "flac"] {
+      if let t = UTType(filenameExtension: ext) { audioTypes.insert(t) }
+    }
+    let picker = UIDocumentPickerViewController(
+      forOpeningContentTypes: Array(audioTypes), asCopy: true)
+    picker.delegate = self
+    picker.allowsMultipleSelection = true
+    presenter.present(picker, animated: true)
+  }
+
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
     guard let result = pendingResult else { return }
     pendingResult = nil
-    guard let src = urls.first else {
-      result(nil)
+    let kind = pendingDocPickerKind
+    pendingDocPickerKind = nil
+    guard let src = urls.first, !urls.isEmpty else {
+      result(kind == .audio ? 0 : nil)
       return
     }
+    switch kind {
+    case .audio:
+      result(handleAudioPicked(urls))
+    default:
+      handleFontPicked(src, result: result)
+    }
+  }
+
+  /// 音频导入：拷进 Documents/Music/Imports/（保留原文件名，同名加时间戳），
+  /// 返回成功拷入的文件数
+  private func handleAudioPicked(_ urls: [URL]) -> Int {
+    do {
+      let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+      let dir = docs.appendingPathComponent("Music/Imports", isDirectory: true)
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      let ts = Int(Date().timeIntervalSince1970 * 1000)
+      var copied = 0
+      for src in urls {
+        let rawName = src.lastPathComponent
+        let dot = rawName.lastIndex(of: ".")
+        let base = dot.map { String(rawName[..< $0]) } ?? rawName
+        let ext = dot.map { String(rawName[$0...]) } ?? ""
+        var name = rawName
+        if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
+          name = "\(base)_\(ts)\(ext)"
+        }
+        try FileManager.default.copyItem(
+          at: src, to: dir.appendingPathComponent(name))
+        copied += 1
+      }
+      return copied
+    } catch {
+      NSLog("[MD3Music] audio import copy failed: \(error)")
+      return 0
+    }
+  }
+
+  private func handleFontPicked(_ src: URL, result: @escaping FlutterResult) {
     do {
       let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
       let dir = docs.appendingPathComponent("fonts", isDirectory: true)
@@ -247,7 +329,9 @@ import AVKit
   func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
     guard let result = pendingResult else { return }
     pendingResult = nil
-    result(nil)
+    let kind = pendingDocPickerKind
+    pendingDocPickerKind = nil
+    result(kind == .audio ? 0 : nil)
   }
 
   // MARK: - 背景图片选择（对齐 Android SAF：拷贝到 Documents/background/ 后返回路径）

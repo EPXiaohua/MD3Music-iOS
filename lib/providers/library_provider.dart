@@ -1,8 +1,8 @@
 import 'dart:async' show unawaited;
 import 'dart:io';
 
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../core/platform_capabilities.dart';
@@ -256,51 +256,24 @@ class LibraryProvider extends ChangeNotifier {
     return dir.path;
   }
 
-  /// iOS 导入音乐：文件选择器选择音频文件 → 拷贝进沙箱导入目录 → 重扫。
+  /// iOS 导入音乐：原生 DocumentPicker 多选音频 → 原生拷贝进沙箱导入目录
+  /// （Documents/Music/Imports）→ 重扫。
   ///
   /// iOS 沙箱无法扫描系统媒体库，本地音乐的唯一来源就是把音频文件导入进
-  /// 沙箱。返回拷入的文件数；-1 = 选择器/拷贝失败，0 = 未选择任何文件。
+  /// 沙箱。原生通道与字体/背景图导入同款（file_selector 的 iOS 实现在这台
+  /// 设备上不弹出选择器）。返回拷入的文件数；-1 = 通道/选择器失败，0 = 取消。
   Future<int> importSongs() async {
     if (!isIOSPlatform) return -1;
     try {
-      const exts = [
-        'mp3', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wav', 'aiff', 'aif',
-        'ape', 'wma',
-      ];
       debugPrint('[LibraryImport] opening picker...');
-      final files = await openFiles(
-        acceptedTypeGroups: [const XTypeGroup(label: '音频', extensions: exts)],
-      );
-      debugPrint('[LibraryImport] picked ${files.length} files');
-      if (files.isEmpty) return 0;
-      final dir = await _importsDirectory();
-      debugPrint('[LibraryImport] target dir: $dir');
-      final ts = DateTime.now().millisecondsSinceEpoch;
-      var copied = 0;
-      for (final f in files) {
-        final name = f.name.replaceAll('/', '_').replaceAll('\\', '_');
-        final dot = name.lastIndexOf('.');
-        final base = dot <= 0 ? name : name.substring(0, dot);
-        final ext = dot <= 0 ? '' : name.substring(dot);
-        // 同名文件共存：加时间戳后缀，避免覆盖已有导入
-        var target = File('$dir${Platform.pathSeparator}$name');
-        if (await target.exists()) {
-          target = File('$dir${Platform.pathSeparator}$base.$ts$ext');
-        }
-        try {
-          await f.saveTo(target.path);
-          copied++;
-        } catch (e) {
-          // 单文件失败不中断整批（如 security-scoped 读取失败）
-          debugPrint('[LibraryImport] save ${f.name} failed: $e');
-        }
-      }
-      debugPrint('[LibraryImport] copied $copied files');
-      if (copied == 0) return -1;
+      const channel = MethodChannel('com.md3music.md3music/audio_import');
+      final count = await channel.invokeMethod<int>('pickAudioFiles') ?? 0;
+      debugPrint('[LibraryImport] imported $count files');
+      if (count <= 0) return 0;
       await loadLocalMusic();
-      return copied;
+      return count;
     } catch (e) {
-      // 直出（不经 kDebugMode 过滤）：诊断包需要采集到选择器/拷贝失败原因
+      // 直出（不经 kDebugMode 过滤）：诊断包需要采集到失败原因
       debugPrint('[LibraryImport] import failed: $e');
       return -1;
     }
