@@ -182,7 +182,7 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     for i in 0..<bufCount {
       let bufRaw = listPtr.advanced(
         by: firstBufOffset + i * MemoryLayout<AudioBuffer>.size)
-      let buf = bufRaw.bindMemory(to: AudioBuffer.self).pointee
+      let buf = bufRaw.bindMemory(to: AudioBuffer.self, capacity: 1).pointee
       let bufCh = max(1, Int(buf.mNumberChannels))
       let bytes = buf.mDataByteSize
       guard let mData = buf.mData, bytes > 0 else { return nil }
