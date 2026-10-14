@@ -292,24 +292,19 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     bigEndian: Bool, nonInterleaved: Bool
   ) -> [Float] {
     var out = [Float](repeating: 0, count: frameCount)
-    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-      let base = raw.baseAddress!
+    let scale: Float = 1.0 / 32768.0
+    data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
       for f in 0..<frameCount {
-        var sum: Float = 0
+        var acc: Int32 = 0
         for c in 0..<ch {
           let idx = nonInterleaved ? c * frameCount + f : f * ch + c
           let off = idx * 2
-          let v: Int16
-          if bigEndian {
-            let hi = UInt16(base[off])
-            let lo = UInt16(base[off + 1])
-            v = Int16(bitPattern: (hi << 8) | lo)
-          } else {
-            v = base.load(fromByteOffset: off, as: Int16.self)
-          }
-          sum += Float(v) / 32768.0
+          let b0 = UInt16(buf[off])
+          let b1 = UInt16(buf[off + 1])
+          let u: UInt16 = bigEndian ? (b0 << 8) | b1 : (b1 << 8) | b0
+          acc += Int32(Int16(bitPattern: u))
         }
-        out[f] = sum / Float(ch)
+        out[f] = Float(acc) / Float(ch) * scale
       }
     }
     return out
@@ -321,21 +316,21 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     bigEndian: Bool, nonInterleaved: Bool
   ) -> [Float] {
     var out = [Float](repeating: 0, count: frameCount)
-    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-      let base = raw.baseAddress!
+    data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
       for f in 0..<frameCount {
         var sum: Float = 0
         for c in 0..<ch {
           let idx = nonInterleaved ? c * frameCount + f : f * ch + c
           let off = idx * 4
-          if bigEndian {
-            let u =
-              UInt32(base[off]) << 24 | UInt32(base[off + 1]) << 16
-              | UInt32(base[off + 2]) << 8 | UInt32(base[off + 3])
-            sum += Float(bitPattern: u)
-          } else {
-            sum += base.load(fromByteOffset: off, as: Float.self)
-          }
+          let b0 = UInt32(buf[off])
+          let b1 = UInt32(buf[off + 1])
+          let b2 = UInt32(buf[off + 2])
+          let b3 = UInt32(buf[off + 3])
+          let u: UInt32 =
+            bigEndian
+            ? (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+            : (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+          sum += Float(bitPattern: u)
         }
         out[f] = sum / Float(ch)
       }
