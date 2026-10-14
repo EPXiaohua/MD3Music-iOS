@@ -310,6 +310,7 @@ class PipRecognitionController {
           // 可离线分析指纹不命中时的真实音频内容
           unawaited(_dumpSegmentWav(sys.pcm, sys.sampleRate));
           _logSegmentStats(sys.pcm, sys.sampleRate);
+          if (_appGroupDir != null) unawaited(_syncRawProbe(_appGroupDir!));
           // 数据是现成的，等满段时长保持 8s/段的识别节奏（与安卓悬浮窗一致）
           await Future.delayed(const Duration(seconds: _segmentDuration));
           if (!_isLooping) break;
@@ -399,6 +400,12 @@ class PipRecognitionController {
   /// 系统声音数据新鲜窗口：ts 超过该时长视为广播已停止/失效
   static const int _sysAudioFreshMs = 15000;
 
+  /// 广播侧上报的 ASBD 格式描述（变化才打日志）
+  String? _lastBroadcastFmt;
+
+  /// 上次同步 raw 探针文件的时间（30s 节流）
+  DateTime? _lastRawProbeSync;
+
   Future<String?> _resolveAppGroupDir() async {
     final cached = _appGroupDir;
     if (cached != null) return cached;
@@ -442,6 +449,12 @@ class PipRecognitionController {
       }
       final meta = jsonDecode(await metaFile.readAsString());
       if (meta is! Map) return null;
+      // 广播侧 ASBD 格式描述（首帧后出现）：检验格式声明与实际数据排布
+      final fmt = meta['fmt'];
+      if (fmt is String && fmt != _lastBroadcastFmt) {
+        _lastBroadcastFmt = fmt;
+        debugPrint('[PipRecognition] broadcast fmt: $fmt');
+      }
       if (meta['stopped'] == true) {
         debugPrint('[PipRecognition] sys audio: broadcast stopped');
         return null;
@@ -557,6 +570,27 @@ class PipRecognitionController {
     }
   }
 
+  /// 把广播扩展落盘的原始字节探针（未解码，512KB 覆盖写）拷进诊断目录，
+  /// 随诊断包导出后与解码 WAV 对比，区分「格式声明矛盾」vs「源头随机」。
+  Future<void> _syncRawProbe(String dir) async {
+    final last = _lastRawProbeSync;
+    final now = DateTime.now();
+    if (last != null && now.difference(last) < const Duration(seconds: 30)) {
+      return;
+    }
+    _lastRawProbeSync = now;
+    try {
+      final src = File('$dir/sysrecog/raw_probe.bin');
+      if (!await src.exists()) return;
+      final len = await src.length();
+      if (len <= 0) return;
+      final logDir = DiagnosticLogger.instance.logDir;
+      if (logDir == null) return;
+      await src.copy('${logDir.path}/raw_probe.bin');
+      debugPrint('[PipRecognition] raw probe synced ($len B)');
+    } catch (_) {}
+  }
+
   /// 把系统声音段写成 16bit mono WAV，放入诊断日志目录（随诊断包导出）。
   /// 固定文件名覆盖式写入，只保留最新一段。
   Future<void> _dumpSegmentWav(Uint8List rawPcm, int sampleRate) async {
@@ -569,6 +603,7 @@ class PipRecognitionController {
           bd.setUint8(off + i, s.codeUnitAt(i));
         }
       }
+
       str(0, 'RIFF');
       bd.setUint32(4, 36 + rawPcm.length, Endian.little);
       str(8, 'WAVE');

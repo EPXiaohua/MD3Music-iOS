@@ -43,6 +43,13 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
 
   private var queue2sBeatUptime: TimeInterval = 0
 
+  /// 原始字节探针：把收到的 block buffer 原样累积，≥512KB 覆盖写
+  /// raw_probe.bin（诊断用——WAV 实测为密码学级伪随机（相邻相关≈0、字节
+  /// 分布均匀），需对比「未解码原始字节」区分格式矛盾 vs 源头随机）
+  private var rawProbe = Data()
+  /// 首帧确定的 ASBD 完整描述（写进 meta 供 Dart 打印）
+  private var fmtDescription: String?
+
   private var segFileUrl: URL {
     groupDir!.appendingPathComponent("seg_\(writingIndex).pcm")
   }
@@ -65,6 +72,9 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       self.writtenBytes = 0
       self.sampleRate = 0
       self.fileHandles = [nil, nil]
+      self.fmtDescription = nil
+      self.rawProbe.removeAll(keepingCapacity: false)
+      try? FileManager.default.removeItem(at: dir.appendingPathComponent("raw_probe.bin"))
       // 开播清场：两个缓冲都截断，meta 归零（writing=0, bytes=0）
       for i in 0...1 {
         FileManager.default.createFile(
@@ -98,11 +108,38 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     else { return }
     let asbd = asbdPtr.pointee
 
+    // 原始字节探针：在样本有效期内同步拷贝（与解码路径独立，绕开
+    // AudioBufferList，保留系统送来的原始字节供诊断对比）
+    let raw: Data? = {
+      guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+      let length = CMBlockBufferGetDataLength(block)
+      guard length > 0 else { return nil }
+      var data = Data(count: length)
+      let ok = data.withUnsafeMutableBytes { raw -> Bool in
+        guard let base = raw.baseAddress else { return false }
+        return CMBlockBufferCopyDataBytes(
+          block, atOffset: 0, dataLength: length, destination: base)
+          == kCMBlockBufferNoErr
+      }
+      return ok ? data : nil
+    }()
+
     let floats = decodeSampleToMonoFloat(sampleBuffer, asbd: asbd)
     guard let floats, !floats.isEmpty else { return }
 
     let rate = Int(asbd.mSampleRate)
     let channels = Int(asbd.mChannelsPerFrame)
+    if fmtDescription == nil {
+      let flags = asbd.mFormatFlags
+      fmtDescription =
+        "rate=\(Int(asbd.mSampleRate)) ch=\(asbd.mChannelsPerFrame) "
+        + "bits=\(asbd.mBitsPerChannel) bytesPerFrame=\(asbd.mBytesPerFrame) "
+        + "bytesPerPacket=\(asbd.mBytesPerPacket) framesPerPacket=\(asbd.mFramesPerPacket) "
+        + "float=\((flags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0) "
+        + "signedInt=\((flags & kAudioFormatFlagIsSignedInteger) != 0 ? 1 : 0) "
+        + "bigEndian=\((flags & kAudioFormatFlagIsBigEndian) != 0 ? 1 : 0) "
+        + "nonInterleaved=\((flags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)"
+    }
 
     // Float [-1,1] → Int16 LE 字节
     var pcm = Data(count: floats.count * 2)
@@ -124,6 +161,15 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
           rate, channels, Int(asbd.mBitsPerChannel),
           (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0,
           (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)
+      }
+      if let raw {
+        self.rawProbe.append(raw)
+        if self.rawProbe.count >= 512 * 1024 {
+          try? self.rawProbe.write(
+            to: self.groupDir!.appendingPathComponent("raw_probe.bin"),
+            options: .atomic)
+          self.rawProbe.removeAll(keepingCapacity: true)
+        }
       }
       self.append(pcm)
     }
@@ -277,6 +323,10 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     // 写入扩展侧解析出的组 id：宿主比对可发现免签两侧没分到同一个组
     if let g = Self.resolvedGroupId {
       meta["group"] = g
+    }
+    // 首帧确定的 ASBD 完整描述：Dart 打印，检验格式声明与实际数据是否矛盾
+    if let fmt = fmtDescription {
+      meta["fmt"] = fmt
     }
     guard let json = try? JSONSerialization.data(withJSONObject: meta) else { return }
     // 原子替换，Dart 读到的是完整 JSON
