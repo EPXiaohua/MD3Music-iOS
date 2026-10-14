@@ -12,6 +12,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/services/diagnostic_logger.dart';
 import '../../core/utils/app_toast.dart';
 import '../../main.dart' show appNavigatorKey;
 import '../../services/kugou_api/kugou_api_client.dart';
@@ -304,6 +305,9 @@ class PipRecognitionController {
         if (sys != null) {
           audioData = sys.pcm;
           sourceHz = sys.sampleRate;
+          // 落一份 WAV 进诊断目录（覆盖式只留最新一段），随诊断包导出后
+          // 可离线分析指纹不命中时的真实音频内容
+          unawaited(_dumpSegmentWav(sys.pcm, sys.sampleRate));
           // 数据是现成的，等满段时长保持 8s/段的识别节奏（与安卓悬浮窗一致）
           await Future.delayed(const Duration(seconds: _segmentDuration));
           if (!_isLooping) break;
@@ -548,6 +552,44 @@ class PipRecognitionController {
       return bytes;
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 把系统声音段写成 16bit mono WAV，放入诊断日志目录（随诊断包导出）。
+  /// 固定文件名覆盖式写入，只保留最新一段。
+  Future<void> _dumpSegmentWav(Uint8List rawPcm, int sampleRate) async {
+    try {
+      final logDir = DiagnosticLogger.instance.logDir;
+      if (logDir == null) return;
+      final bd = ByteData(44);
+      void str(int off, String s) {
+        for (var i = 0; i < s.length; i++) {
+          bd.setUint8(off + i, s.codeUnitAt(i));
+        }
+      }
+      str(0, 'RIFF');
+      bd.setUint32(4, 36 + rawPcm.length, Endian.little);
+      str(8, 'WAVE');
+      str(12, 'fmt ');
+      bd.setUint32(16, 16, Endian.little);
+      bd.setUint16(20, 1, Endian.little); // PCM
+      bd.setUint16(22, 1, Endian.little); // mono
+      bd.setUint32(24, sampleRate, Endian.little);
+      bd.setUint32(28, sampleRate * 2, Endian.little); // byteRate
+      bd.setUint16(32, 2, Endian.little); // blockAlign
+      bd.setUint16(34, 16, Endian.little); // bits
+      str(36, 'data');
+      bd.setUint32(40, rawPcm.length, Endian.little);
+      final out = File('${logDir.path}/recog_segment.wav');
+      await out.writeAsBytes([
+        ...bd.buffer.asUint8List(),
+        ...rawPcm,
+      ], flush: true);
+      debugPrint(
+        '[PipRecognition] dumped segment wav (${rawPcm.length}B @${sampleRate}Hz)',
+      );
+    } catch (e) {
+      debugPrint('[PipRecognition] dump wav failed: $e');
     }
   }
 
