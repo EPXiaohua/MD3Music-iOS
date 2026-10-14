@@ -274,12 +274,16 @@ class PipRecognitionController {
   /// 录音会话是否已被本循环切到录音模式（系统声音段不动会话）
   bool _sessionConfigured = false;
 
+  /// 当前段是否使用系统声音广播数据（PiP 右上角徽标随此显隐）
+  bool _usingSysAudio = false;
+
   /// 启动识别循环。系统声音（广播扩展 PCM）可用时优先；无广播数据回退
   /// 麦克风，权限被拒时提示一次（循环继续，后续段仍可吃到系统声音）。
   Future<bool> startLoop() async {
     if (_isLooping) return true;
     _isLooping = true;
     _attemptCount = 0;
+    _usingSysAudio = false;
     _notify();
     var micDeniedToasted = false;
 
@@ -292,17 +296,20 @@ class PipRecognitionController {
           break;
         }
         _attemptCount++;
+        // 系统声音优先：广播扩展持续写入 App Group 的双缓冲 PCM 有新鲜数据
+        // （ts 15s 内）就用数字拷贝（无环境噪声、无损，准确率远高于麦克风）；
+        // 没有则回退麦克风。系统声音段完全不碰录音会话，不打断当前播放。
+        // 先探测源再推状态：徽标随本段实际来源显隐
+        final sys = await _readSystemAudioSegment();
+        _usingSysAudio = sys != null;
         _pushState(
           'listening',
           text:
               '正在聆听... ${_attemptCount * _segmentDuration}s / ${_maxTotalDuration}s',
+          sysAudio: _usingSysAudio,
         );
-        // 系统声音优先：广播扩展持续写入 App Group 的双缓冲 PCM 有新鲜数据
-        // （ts 15s 内）就用数字拷贝（无环境噪声、无损，准确率远高于麦克风）；
-        // 没有则回退麦克风。系统声音段完全不碰录音会话，不打断当前播放。
         Uint8List? audioData;
         var sourceHz = _recordSampleRate;
-        final sys = await _readSystemAudioSegment();
         if (sys != null) {
           audioData = sys.pcm;
           sourceHz = sys.sampleRate;
@@ -343,7 +350,11 @@ class PipRecognitionController {
           audioData = await _recordSegment();
           if (!_isLooping) break;
         }
-        _pushState('recognizing', text: '正在识别第 $_attemptCount 段...');
+        _pushState(
+          'recognizing',
+          text: '正在识别第 $_attemptCount 段...',
+          sysAudio: _usingSysAudio,
+        );
         final matched = await _recognizeSegment(audioData, sourceHz: sourceHz);
         if (!_isLooping) break;
         if (matched != null) {
@@ -788,6 +799,7 @@ class PipRecognitionController {
     String? text,
     String songName = '',
     String artist = '',
+    bool sysAudio = false,
   }) async {
     try {
       await _channel.invokeMethod('update', {
@@ -795,6 +807,8 @@ class PipRecognitionController {
         'text': text ?? '',
         'songName': songName,
         'artist': artist,
+        // 'sys' = 系统声音广播模式（PiP 右上角徽标），其他 = 隐藏
+        'src': sysAudio ? 'sys' : '',
       });
     } catch (_) {}
   }

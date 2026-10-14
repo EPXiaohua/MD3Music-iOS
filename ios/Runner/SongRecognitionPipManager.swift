@@ -42,6 +42,8 @@ final class SongRecognitionPipManager: NSObject {
   private var hintText = "点击开始听歌识曲"
   private var songName = ""
   private var artist = ""
+  /// 右上角音频源徽标文案：系统声音广播模式时为「系统声音」，否则空（隐藏）
+  private var srcBadge = ""
 
   // —— SampleBuffer 帧管线 ——
   private let sampleLayer = AVSampleBufferDisplayLayer()
@@ -151,6 +153,9 @@ final class SongRecognitionPipManager: NSObject {
     hintText = text.isEmpty ? Self.defaultHint(for: state) : text
     songName = args["songName"] as? String ?? ""
     artist = args["artist"] as? String ?? ""
+    // 音频源徽标：'sys' = 正在识别系统声音广播段（右上角胶囊标注），
+    // 其他值（含缺省）= 麦克风/无广播，隐藏徽标
+    srcBadge = (args["src"] as? String == "sys") ? "系统声音" : ""
   }
 
   // MARK: 主题配色（Dart 推送应用 ColorScheme token）
@@ -566,6 +571,39 @@ final class SongRecognitionPipManager: NSObject {
     } else {
       drawHintText(x: textX, maxWidth: textMaxWidth, height: h)
     }
+
+    // 右上角音频源徽标（系统声音广播模式），独立于内容文案区
+    if !srcBadge.isEmpty {
+      drawSrcBadge(in: ctx, w: w, h: h)
+    }
+  }
+
+  /// 右上角小圆角胶囊徽标：主题灰度色（surfaceVariant 16% 透明底 + 同色字），
+  /// 深浅主题都成立，不挤占中间内容区
+  private func drawSrcBadge(in ctx: CGContext, w: CGFloat, h: CGFloat) {
+    let label = srcBadge as NSString
+    let fontSize: CGFloat = 9.5
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: UIFont.systemFont(ofSize: fontSize, weight: .medium),
+      .foregroundColor: onSurfaceVariantColor,
+    ]
+    let textSize = label.size(withAttributes: attrs)
+    let padX: CGFloat = 7
+    let padY: CGFloat = 3.5
+    let pillW = textSize.width + padX * 2
+    let pillH = textSize.height + padY * 2
+    let inset: CGFloat = 8
+    let rect = CGRect(x: w - inset - pillW, y: inset, width: pillW, height: pillH)
+    ctx.saveGState()
+    ctx.setFillColor(onSurfaceVariantColor.withAlphaComponent(0.16).cgColor)
+    UIBezierPath(roundedRect: rect, cornerRadius: pillH / 2).addClip()
+    ctx.fill(rect)
+    ctx.restoreGState()
+    label.draw(
+      with: CGRect(
+        x: rect.minX + padX, y: rect.minY + padY,
+        width: textSize.width, height: textSize.height),
+      options: .usesLineFragmentOrigin, attributes: attrs, context: nil)
   }
 
   /// 麦克风图标：U 型拾音架 + 拾音头胶囊 + 笔杆 + 底座（单位方坐标）。
