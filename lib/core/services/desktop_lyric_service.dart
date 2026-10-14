@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -715,7 +715,8 @@ class DesktopLyricService {
   }
 
   /// iOS PiP 外观同步：字号驱动条高、行式切单/双行，配色（已唱渐变 +
-  /// 未唱色）与安卓悬浮窗同一组值。
+  /// 未唱色）与安卓悬浮窗同一组值；不透明度 = 黑色遮罩 alpha（底下铺
+  /// 封面高斯模糊背景）。
   Future<void> _syncPipConfig() async {
     await ensureConfigLoaded();
     await LyricsPipService.instance.configure(
@@ -724,6 +725,7 @@ class DesktopLyricService {
       gradientStart: _gradientStart,
       gradientEnd: _gradientEnd,
       unplayedColor: _unplayedColor,
+      opacity: _opacity,
     );
   }
 

@@ -162,7 +162,8 @@ class LyricsPipService {
   /// 外观配置下发（设置页「设备歌词」→ 配色/版式）。字号驱动 PiP 条高度
   ///（单行 22pt / 双行 44pt 基准 @18sp 线性缩放），行式切单/双行渲染，
   /// 配色（已唱渐变 gradientStart→gradientEnd + 未唱色）与安卓悬浮窗同一
-  /// 组值；原生卡拉OK为文字蒙版式，蒙版扫过处按渐变着色。PiP 未激活时
+  /// 组值；opacity 是黑色遮罩不透明度（0–100），底下铺封面高斯模糊背景。
+  /// 原生卡拉OK为文字蒙版式，蒙版扫过处按渐变着色。PiP 未激活时
   /// 原生仅存值，激活后首帧即按新配置画。
   Future<void> configure({
     double? fontSize,
@@ -170,6 +171,7 @@ class LyricsPipService {
     int? gradientStart,
     int? gradientEnd,
     int? unplayedColor,
+    int? opacity,
   }) async {
     if (!Platform.isIOS) return;
     _ensureHandler();
@@ -180,6 +182,7 @@ class LyricsPipService {
         'gradientStart': ?gradientStart,
         'gradientEnd': ?gradientEnd,
         'unplayedColor': ?unplayedColor,
+        'opacity': ?opacity,
       });
     } catch (e) {
       debugPrint('[LyricsPip] configure failed: $e');

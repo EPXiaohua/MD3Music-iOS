@@ -696,6 +696,19 @@ final class LyricsPipManager: NSObject {
   private var configSungStartARGB = LyricsPipManager.sungColorStartARGB
   private var configSungEndARGB = LyricsPipManager.sungColorEndARGB
   private var configUnplayedARGB = LyricsPipManager.unplayedARGB
+  // 黑色遮罩不透明度（0–100，设置页「设备歌词」的不透明度滑杆）。
+  // 底下铺当前歌曲封面高斯模糊背景，遮罩 alpha = opacity/100；无封面时
+  // 直接实色黑。默认 50 对齐 Dart 侧初始值。
+  private var configOpacity: Int = 50
+  // 模糊封面背景：封面取自 NowPlayingManager（WidgetSync 小组件同源），
+  // 帧循环里指针比对发现切歌/条尺寸变化后，后台队列重出模糊图再回主
+  // 线程重绘——模糊每封面只做一次，20fps 帧循环只多一次指针比较。
+  private var coverImage: UIImage?
+  private var blurredCover: CGImage?
+  private var blurredCoverSize: CGSize = .zero
+  private var coverBlurPending = false
+  private let coverQueue = DispatchQueue(label: "com.md3music.lyricspip.cover", qos: .utility)
+  private static let ciContext = CIContext()
 
   // 进度锚点：Dart 最近推送的 positionMs + 接收时刻（本机单调钟）
   private var anchorPositionMs: Double = 0
@@ -865,6 +878,7 @@ final class LyricsPipManager: NSObject {
     let gs = (args["gradientStart"] as? NSNumber).map { Int($0.int64Value) }
     let ge = (args["gradientEnd"] as? NSNumber).map { Int($0.int64Value) }
     let uc = (args["unplayedColor"] as? NSNumber).map { Int($0.int64Value) }
+    let op = (args["opacity"] as? NSNumber)?.intValue
     var layoutChanged = false
     if let fs, fs != configFontSize {
       configFontSize = fs
@@ -885,6 +899,10 @@ final class LyricsPipManager: NSObject {
     }
     if let uc, uc != configUnplayedARGB {
       configUnplayedARGB = uc
+      colorChanged = true
+    }
+    if let op, op != configOpacity {
+      configOpacity = max(0, min(100, op))
       colorChanged = true
     }
     // 版式变化要重建条尺寸并复位滚动；纯配色变化只需重出一帧
@@ -1250,16 +1268,91 @@ final class LyricsPipManager: NSObject {
     return created
   }
 
+  // MARK: 模糊封面背景（切歌/条尺寸变化时后台重出一次）
+
+  /// 帧循环每帧调用：封面指针比对（廉价），变化或条尺寸变了才后台重模糊。
+  private func refreshCoverIfNeeded(size: CGSize) {
+    guard !coverBlurPending else { return }
+    let latest = NowPlayingManager.shared.lastArtworkImage
+    let sizeChanged =
+      blurredCover != nil && blurredCoverSize != size
+    if latest !== coverImage {
+      coverImage = latest
+      blurredCover = nil // 新封面模糊出来前先回黑底，避免显示旧封面
+      blurredCoverSize = .zero
+      startCoverBlur(latest, size: size)
+    } else if sizeChanged {
+      startCoverBlur(latest, size: size)
+    }
+  }
+
+  private func startCoverBlur(_ image: UIImage?, size: CGSize) {
+    coverBlurPending = true
+    coverQueue.async { [weak self] in
+      let blurred = image.flatMap { Self.makeBlurredCover($0, targetSize: size) }
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.coverBlurPending = false
+        // 期间可能又切了歌：只在封面仍是最新的情况下落图，否则下帧重触发
+        if let blurred, image === self.coverImage {
+          self.blurredCover = blurred
+          self.blurredCoverSize = size
+        }
+        self.renderFrame()
+      }
+    }
+  }
+
+  /// 封面 → 高斯模糊背景图：先按条宽高比 aspect-fill 中心裁到小尺寸，
+  /// 小图上做 CIGaussianBlur，绘制时整幅拉伸放大（进一步柔化，代价极低）。
+  private static func makeBlurredCover(_ image: UIImage, targetSize: CGSize) -> CGImage? {
+    let barAspect = targetSize.width / max(targetSize.height, 1)
+    let smallW: CGFloat = 120
+    let smallH = max(smallW / max(barAspect, 0.05), 1)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let small = UIGraphicsImageRenderer(size: CGSize(width: smallW, height: smallH), format: format)
+      .image { _ in
+        let imgW = max(image.size.width, 1)
+        let imgH = max(image.size.height, 1)
+        let scale = max(smallW / imgW, smallH / imgH)
+        image.draw(in: CGRect(
+          x: (smallW - imgW * scale) / 2,
+          y: (smallH - imgH * scale) / 2,
+          width: imgW * scale,
+          height: imgH * scale))
+      }
+    guard let ci = CIImage(image: small),
+      let filter = CIFilter(name: "CIGaussianBlur")
+    else { return nil }
+    filter.setValue(ci, forKey: kCIInputImageKey)
+    filter.setValue(12.0, forKey: kCIInputRadiusKey)
+    guard let out = filter.outputImage else { return nil }
+    // 高斯核会向边缘外扩散出透明边，裁回画布尺寸
+    let cropped = out.cropped(to: CGRect(x: 0, y: 0, width: smallW, height: smallH))
+    return ciContext.createCGImage(cropped, from: cropped.extent)
+  }
+
   // MARK: 卡拉OK绘制（makeSample 的位图上下文调用，UIKit 坐标系）
 
-  /// 在条状画布上绘制一帧：黑背景 + 底部细进度条 + 双行逐字卡拉OK。
+  /// 在条状画布上绘制一帧：模糊封面背景 + 黑色遮罩（不透明度）+ 底部细
+  /// 进度条 + 双行逐字卡拉OK。
   func drawBar(in ctx: CGContext, size: CGSize) {
     let width = size.width
     let height = size.height
-    // 底色：sample buffer 视为不透明视频帧，无透明合成对象；实色黑与原
-    // 0.75 透明黑叠在小窗黑底上的观感一致
-    ctx.setFillColor(UIColor.black.cgColor)
-    ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    // 底色：sample buffer 视为不透明视频帧，无透明合成对象。有封面时铺
+    // 高斯模糊背景（已按条宽高比预裁，直接整幅拉伸），黑色遮罩的 alpha
+    // 即设置里的不透明度；无封面时实色黑。
+    refreshCoverIfNeeded(size: size)
+    if let blurred = blurredCover {
+      UIImage(cgImage: blurred).draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+      ctx.setFillColor(
+        UIColor.black.withAlphaComponent(CGFloat(configOpacity) / 100.0).cgColor)
+      ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    } else {
+      ctx.setFillColor(UIColor.black.cgColor)
+      ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    }
 
     // 底部细进度条（进度 = 当前位置 / 最后一行结束时间）
     var progress: Double = 0
