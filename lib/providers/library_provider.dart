@@ -267,11 +267,14 @@ class LibraryProvider extends ChangeNotifier {
         'mp3', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wav', 'aiff', 'aif',
         'ape', 'wma',
       ];
+      debugPrint('[LibraryImport] opening picker...');
       final files = await openFiles(
         acceptedTypeGroups: [const XTypeGroup(label: '音频', extensions: exts)],
       );
+      debugPrint('[LibraryImport] picked ${files.length} files');
       if (files.isEmpty) return 0;
       final dir = await _importsDirectory();
+      debugPrint('[LibraryImport] target dir: $dir');
       final ts = DateTime.now().millisecondsSinceEpoch;
       var copied = 0;
       for (final f in files) {
@@ -284,14 +287,21 @@ class LibraryProvider extends ChangeNotifier {
         if (await target.exists()) {
           target = File('$dir${Platform.pathSeparator}$base.$ts$ext');
         }
-        await f.saveTo(target.path);
-        copied++;
+        try {
+          await f.saveTo(target.path);
+          copied++;
+        } catch (e) {
+          // 单文件失败不中断整批（如 security-scoped 读取失败）
+          debugPrint('[LibraryImport] save ${f.name} failed: $e');
+        }
       }
-      _log('[LibraryProvider] imported $copied audio files');
+      debugPrint('[LibraryImport] copied $copied files');
+      if (copied == 0) return -1;
       await loadLocalMusic();
       return copied;
     } catch (e) {
-      _log('[LibraryProvider] import songs failed: $e');
+      // 直出（不经 kDebugMode 过滤）：诊断包需要采集到选择器/拷贝失败原因
+      debugPrint('[LibraryImport] import failed: $e');
       return -1;
     }
   }

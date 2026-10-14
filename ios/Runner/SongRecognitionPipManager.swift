@@ -671,12 +671,13 @@ final class SongRecognitionPipManager: NSObject {
     path.stroke()
   }
 
-  /// 单行状态文案：在文案带内垂直居中，超宽逐步缩字号，仍超则尾部省略
+  /// 单行状态文案：在文案带内水平垂直双居中，超宽逐步缩字号，仍超则尾部省略
   private func drawHintText(in band: CGRect, maxWidth: CGFloat) {
     let muted = state == "idle" || state == "stopped"
     var fontSize: CGFloat = 15
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineBreakMode = .byTruncatingTail
+    paragraph.alignment = .center
     var attrs: [NSAttributedString.Key: Any] = [
       .font: UIFont.systemFont(ofSize: fontSize, weight: .medium),
       .foregroundColor: muted ? onSurfaceVariantColor : onSurfaceColor,
@@ -696,7 +697,7 @@ final class SongRecognitionPipManager: NSObject {
       options: .usesLineFragmentOrigin, attributes: attrs, context: nil)
   }
 
-  /// 结果态：歌名（粗体）+ 歌手（灰），在文案带内垂直居中，尾部省略
+  /// 结果态：歌名（粗体）+ 歌手（灰），在文案带内水平垂直双居中，尾部省略
   private func drawResultText(in band: CGRect, maxWidth: CGFloat) {
     let nameFont = UIFont.systemFont(ofSize: 15.5, weight: .bold)
     let artistFont = UIFont.systemFont(ofSize: 12.5, weight: .regular)
@@ -706,6 +707,7 @@ final class SongRecognitionPipManager: NSObject {
 
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineBreakMode = .byTruncatingTail
+    paragraph.alignment = .center
     let nameAttrs: [NSAttributedString.Key: Any] = [
       .font: nameFont,
       .foregroundColor: onSurfaceColor,
