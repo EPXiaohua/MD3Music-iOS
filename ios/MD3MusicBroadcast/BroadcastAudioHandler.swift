@@ -273,41 +273,74 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     guard frameCount > 0 else {
       return (nil, "frames=0 len=\(length) ch=\(ch)")
     }
+    // 拆成独立小函数：巨型单闭包表达式会让 Swift 类型检查器超时
+    if isFloat, bytesPerSample == 4 {
+      let out = decodeFloat32Mono(
+        data, frameCount: frameCount, ch: ch,
+        bigEndian: isBigEndian, nonInterleaved: isNonInterleaved)
+      return (out, nil)
+    }
+    let out = decodeInt16Mono(
+      data, frameCount: frameCount, ch: ch,
+      bigEndian: isBigEndian, nonInterleaved: isNonInterleaved)
+    return (out, nil)
+  }
+
+  /// 16bit 整数 → 单声道 Float（按 ASBD 端序/交织读取，多声道取平均）
+  private func decodeInt16Mono(
+    _ data: Data, frameCount: Int, ch: Int,
+    bigEndian: Bool, nonInterleaved: Bool
+  ) -> [Float] {
     var out = [Float](repeating: 0, count: frameCount)
-    data.withUnsafeBytes { raw in
+    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
       let base = raw.baseAddress!
-      // 样本下标：交织 = 帧×声道；非交织 = 每声道一整块平面
-      func sampleIndex(_ f: Int, _ c: Int) -> Int {
-        isNonInterleaved ? c * frameCount + f : f * ch + c
-      }
       for f in 0..<frameCount {
         var sum: Float = 0
         for c in 0..<ch {
-          let off = sampleIndex(f, c) * bytesPerSample
-          if isFloat, bytesPerSample == 4 {
-            let v: Float
-            if isBigEndian {
-              let u = UInt32(base[off]) << 24 | UInt32(base[off + 1]) << 16
-                | UInt32(base[off + 2]) << 8 | UInt32(base[off + 3])
-              v = Float(bitPattern: u)
-            } else {
-              v = base.load(fromByteOffset: off, as: Float.self)
-            }
-            sum += v
+          let idx = nonInterleaved ? c * frameCount + f : f * ch + c
+          let off = idx * 2
+          let v: Int16
+          if bigEndian {
+            let hi = UInt16(base[off])
+            let lo = UInt16(base[off + 1])
+            v = Int16(bitPattern: (hi << 8) | lo)
           } else {
-            let v: Int16
-            if isBigEndian {
-              v = Int16(bitPattern: UInt16(base[off]) << 8 | UInt16(base[off + 1]))
-            } else {
-              v = base.load(fromByteOffset: off, as: Int16.self)
-            }
-            sum += Float(v) / 32768.0
+            v = base.load(fromByteOffset: off, as: Int16.self)
+          }
+          sum += Float(v) / 32768.0
+        }
+        out[f] = sum / Float(ch)
+      }
+    }
+    return out
+  }
+
+  /// Float32 → 单声道 Float（按 ASBD 端序/交织读取，多声道取平均）
+  private func decodeFloat32Mono(
+    _ data: Data, frameCount: Int, ch: Int,
+    bigEndian: Bool, nonInterleaved: Bool
+  ) -> [Float] {
+    var out = [Float](repeating: 0, count: frameCount)
+    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+      let base = raw.baseAddress!
+      for f in 0..<frameCount {
+        var sum: Float = 0
+        for c in 0..<ch {
+          let idx = nonInterleaved ? c * frameCount + f : f * ch + c
+          let off = idx * 4
+          if bigEndian {
+            let u =
+              UInt32(base[off]) << 24 | UInt32(base[off + 1]) << 16
+              | UInt32(base[off + 2]) << 8 | UInt32(base[off + 3])
+            sum += Float(bitPattern: u)
+          } else {
+            sum += base.load(fromByteOffset: off, as: Float.self)
           }
         }
         out[f] = sum / Float(ch)
       }
     }
-    return (out, nil)
+    return out
   }
 
   // MARK: - 文件写入
