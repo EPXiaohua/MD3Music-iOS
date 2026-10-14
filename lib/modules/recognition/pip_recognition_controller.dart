@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
@@ -308,6 +309,7 @@ class PipRecognitionController {
           // 落一份 WAV 进诊断目录（覆盖式只留最新一段），随诊断包导出后
           // 可离线分析指纹不命中时的真实音频内容
           unawaited(_dumpSegmentWav(sys.pcm, sys.sampleRate));
+          _logSegmentStats(sys.pcm, sys.sampleRate);
           // 数据是现成的，等满段时长保持 8s/段的识别节奏（与安卓悬浮窗一致）
           await Future.delayed(const Duration(seconds: _segmentDuration));
           if (!_isLooping) break;
@@ -591,6 +593,33 @@ class PipRecognitionController {
     } catch (e) {
       debugPrint('[PipRecognition] dump wav failed: $e');
     }
+  }
+
+  /// 段统计日志（Int16 LE）：峰值/RMS/过零率，app.log 直接判断解码好坏——
+  /// 正常音乐 RMS 中等、过零率低；纯噪音 RMS 高、过零率极高；静音 RMS≈0。
+  void _logSegmentStats(Uint8List pcm, int sampleRate) {
+    try {
+      final n = pcm.length ~/ 2;
+      if (n < 2) return;
+      final bd = ByteData.sublistView(pcm);
+      double sumSq = 0;
+      var peak = 0;
+      var crossings = 0;
+      var prev = 0;
+      for (var i = 0; i < n; i++) {
+        final v = bd.getInt16(i * 2, Endian.little);
+        sumSq += v * v;
+        final a = v >= 0 ? v : -v;
+        if (a > peak) peak = a;
+        if (i > 0 && (v < 0) != (prev < 0)) crossings++;
+        prev = v;
+      }
+      final rms = sqrt(sumSq / n);
+      debugPrint(
+        '[PipRecognition] seg stats: peak=$peak rms=${rms.toStringAsFixed(0)} '
+        'zcr=${(crossings / n * sampleRate).toStringAsFixed(0)}/s',
+      );
+    } catch (_) {}
   }
 
   /// 识别一段：静音检测 → 增益归一化 → 酷狗 audioMatch。
