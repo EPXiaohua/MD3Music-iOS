@@ -400,8 +400,8 @@ class PipRecognitionController {
   /// 系统声音数据新鲜窗口：ts 超过该时长视为广播已停止/失效
   static const int _sysAudioFreshMs = 15000;
 
-  /// 广播侧上报的 ASBD 格式描述（变化才打日志）
-  String? _lastBroadcastFmt;
+  /// 广播侧诊断串（fmt/err/src，变化才打日志）
+  String? _lastBroadcastDiag;
 
   /// 上次同步 raw 探针文件的时间（30s 节流）
   DateTime? _lastRawProbeSync;
@@ -449,11 +449,12 @@ class PipRecognitionController {
       }
       final meta = jsonDecode(await metaFile.readAsString());
       if (meta is! Map) return null;
-      // 广播侧 ASBD 格式描述（首帧后出现）：检验格式声明与实际数据排布
-      final fmt = meta['fmt'];
-      if (fmt is String && fmt != _lastBroadcastFmt) {
-        _lastBroadcastFmt = fmt;
-        debugPrint('[PipRecognition] broadcast fmt: $fmt');
+      // 广播侧诊断串（fmt=ASBD 描述 / err=最近解码失败原因 / src=样本源），
+      // 任一变化即打印——定位「广播启动但扩展解不出数据」的问题
+      final diag = 'fmt=${meta['fmt']} err=${meta['err']} src=${meta['src']}';
+      if (diag != _lastBroadcastDiag) {
+        _lastBroadcastDiag = diag;
+        debugPrint('[PipRecognition] broadcast diag: $diag');
       }
       if (meta['stopped'] == true) {
         debugPrint('[PipRecognition] sys audio: broadcast stopped');

@@ -50,6 +50,16 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   /// 首帧确定的 ASBD 完整描述（写进 meta 供 Dart 打印）
   private var fmtDescription: String?
 
+  /// 诊断状态：解码失败计数/最近失败原因/样本类型统计（02:13 日志发现
+  /// 广播启动了但 append 从未执行——解码全失败时必须把原因带出扩展）
+  private var failCount = 0
+  private var lastFailReason = ""
+  private var lastFailMetaUptime: TimeInterval = 0
+  private var appSampleCount = 0
+  private var micSampleCount = 0
+  /// 当前生效样本源："app" / "mic"（mic 仅在从未收到 .audioApp 时降级启用）
+  private var activeSrc = ""
+
   private var segFileUrl: URL {
     groupDir!.appendingPathComponent("seg_\(writingIndex).pcm")
   }
@@ -74,6 +84,11 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       self.fileHandles = [nil, nil]
       self.fmtDescription = nil
       self.rawProbe.removeAll(keepingCapacity: false)
+      self.failCount = 0
+      self.lastFailReason = ""
+      self.appSampleCount = 0
+      self.micSampleCount = 0
+      self.activeSrc = ""
       try? FileManager.default.removeItem(at: dir.appendingPathComponent("raw_probe.bin"))
       // 开播清场：两个缓冲都截断，meta 归零（writing=0, bytes=0）
       for i in 0...1 {
@@ -101,15 +116,36 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   override func processSampleBuffer(
     _ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType
   ) {
-    guard sampleBufferType == .audioApp else { return }
+    // .audioApp = 其他 app 混音输出（首选）；.audioMic = 麦克风。部分设备/
+    // 版本可能只送 .audioMic——从未收到 .audioApp 时降级用 mic（meta.src 可见）
+    guard sampleBufferType == .audioApp || sampleBufferType == .audioMic else {
+      return
+    }
+    let isApp = sampleBufferType == .audioApp
     guard
       let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
       let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)
-    else { return }
+    else {
+      recordFailure("no format desc")
+      return
+    }
     let asbd = asbdPtr.pointee
 
-    // 原始字节探针：在样本有效期内同步拷贝（与解码路径独立，绕开
-    // AudioBufferList，保留系统送来的原始字节供诊断对比）
+    // ASBD 描述在解码前确定（解码失败也要把格式信息带出来）
+    if fmtDescription == nil {
+      let flags = asbd.mFormatFlags
+      fmtDescription =
+        "rate=\(Int(asbd.mSampleRate)) ch=\(asbd.mChannelsPerFrame) "
+        + "bits=\(asbd.mBitsPerChannel) bytesPerFrame=\(asbd.mBytesPerFrame) "
+        + "bytesPerPacket=\(asbd.mBytesPerPacket) framesPerPacket=\(asbd.mFramesPerPacket) "
+        + "float=\((flags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0) "
+        + "signedInt=\((flags & kAudioFormatFlagIsSignedInteger) != 0 ? 1 : 0) "
+        + "bigEndian=\((flags & kAudioFormatFlagIsBigEndian) != 0 ? 1 : 0) "
+        + "nonInterleaved=\((flags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)"
+    }
+
+    // 原始字节探针：在样本有效期内同步拷贝（与解码路径独立，无论解码
+    // 成败都落 raw_probe.bin 供宿主导出对比）
     let raw: Data? = {
       guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
       let length = CMBlockBufferGetDataLength(block)
@@ -124,22 +160,14 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       return ok ? data : nil
     }()
 
-    let floats = decodeSampleToMonoFloat(sampleBuffer, asbd: asbd)
-    guard let floats, !floats.isEmpty else { return }
+    let decoded = decodeSampleToMonoFloat(sampleBuffer, asbd: asbd)
+    guard let floats = decoded.floats, !floats.isEmpty else {
+      recordFailure(decoded.fail ?? "unknown")
+      return
+    }
 
     let rate = Int(asbd.mSampleRate)
     let channels = Int(asbd.mChannelsPerFrame)
-    if fmtDescription == nil {
-      let flags = asbd.mFormatFlags
-      fmtDescription =
-        "rate=\(Int(asbd.mSampleRate)) ch=\(asbd.mChannelsPerFrame) "
-        + "bits=\(asbd.mBitsPerChannel) bytesPerFrame=\(asbd.mBytesPerFrame) "
-        + "bytesPerPacket=\(asbd.mBytesPerPacket) framesPerPacket=\(asbd.mFramesPerPacket) "
-        + "float=\((flags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0) "
-        + "signedInt=\((flags & kAudioFormatFlagIsSignedInteger) != 0 ? 1 : 0) "
-        + "bigEndian=\((flags & kAudioFormatFlagIsBigEndian) != 0 ? 1 : 0) "
-        + "nonInterleaved=\((flags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)"
-    }
 
     // Float [-1,1] → Int16 LE 字节
     var pcm = Data(count: floats.count * 2)
@@ -154,24 +182,54 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     queue.async { [weak self] in
       guard let self else { return }
       guard self.groupDir != nil else { return }
+      if isApp { self.appSampleCount += 1 } else { self.micSampleCount += 1 }
+      // mic 样本只在从未收到 .audioApp 时接受（降级），src 标注当前源
+      guard isApp || self.appSampleCount == 0 else { return }
+      self.activeSrc = isApp ? "app" : "mic"
       if self.sampleRate == 0 {
         self.sampleRate = rate
         NSLog(
-          "[MD3Broadcast] first audio sample: rate=%ld ch=%ld bits=%ld float=%ld nonInterleaved=%ld",
-          rate, channels, Int(asbd.mBitsPerChannel),
-          (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 ? 1 : 0,
-          (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0 ? 1 : 0)
+          "[MD3Broadcast] first audio sample (src=%@): %@",
+          self.activeSrc as NSString, (self.fmtDescription ?? "?") as NSString)
       }
       if let raw {
         self.rawProbe.append(raw)
-        if self.rawProbe.count >= 512 * 1024 {
-          try? self.rawProbe.write(
-            to: self.groupDir!.appendingPathComponent("raw_probe.bin"),
-            options: .atomic)
-          self.rawProbe.removeAll(keepingCapacity: true)
-        }
+        self.flushRawProbeIfNeeded()
       }
       self.append(pcm)
+    }
+  }
+
+  /// 解码失败留痕：计数 + 节流刷 meta（Dart 读到 fmt/err/src 打印定位）。
+  /// 失败也刷新 ts——Dart 的 15s 新鲜窗口会把「有广播但无数据」识别为
+  /// "meta present but empty"（回退麦克风）而非误判广播停止。
+  private func recordFailure(_ reason: String, raw: Data? = nil) {
+    queue.async { [weak self] in
+      guard let self, self.groupDir != nil else { return }
+      self.failCount += 1
+      self.lastFailReason = reason
+      if let raw {
+        self.rawProbe.append(raw)
+        self.flushRawProbeIfNeeded()
+      }
+      if self.failCount <= 3 {
+        NSLog(
+          "[MD3Broadcast] decode fail #%ld: %@",
+          self.failCount, reason as NSString)
+      }
+      let now = ProcessInfo.processInfo.systemUptime
+      if now - self.lastFailMetaUptime >= 1.0 {
+        self.lastFailMetaUptime = now
+        self.writeMeta(stopped: false)
+      }
+    }
+  }
+
+  private func flushRawProbeIfNeeded() {
+    if rawProbe.count >= 512 * 1024 {
+      try? rawProbe.write(
+        to: groupDir!.appendingPathComponent("raw_probe.bin"), options: .atomic)
+      rawProbe.removeAll(keepingCapacity: true)
     }
   }
 
@@ -185,13 +243,18 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
   ///
   /// 规则：buffer 内按帧跨其声道数平均（交织）；多 buffer（非交织，每块
   /// 单声道）再跨块按帧平均；输出 Int16 mono。
+  /// 失败返回 (nil, 原因串)——原因随 meta.err 带出扩展。
   private func decodeSampleToMonoFloat(
     _ sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription
-  ) -> [Float]? {
+  ) -> (floats: [Float]?, fail: String?) {
     let ch = max(1, Int(asbd.mChannelsPerFrame))
     let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
     let bytesPerSample = Int(asbd.mBitsPerChannel) / 8
-    guard bytesPerSample == 4 || bytesPerSample == 2 else { return nil }
+    guard bytesPerSample == 4 || bytesPerSample == 2 else {
+      return (
+        nil, "unsupported bits=\(asbd.mBitsPerChannel) float=\(isFloat ? 1 : 0)"
+      )
+    }
 
     // AudioBufferList 是 C 变长结构：静态含 1 个 buffer 槽，按声道数补足。
     // mBuffers[0] 偏移 = AudioBufferList.size - AudioBuffer.size（C ABI 固定
@@ -215,10 +278,13 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       blockBufferMemoryAllocator: kCFAllocatorDefault,
       flags: 0,
       blockBufferOut: &blockBuffer)
-    guard status == noErr, blockBuffer != nil else { return nil }
+    guard status == noErr else {
+      return (nil, "abl status=\(status) needed=\(neededSize)")
+    }
+    guard blockBuffer != nil else { return (nil, "abl no block buffer") }
 
     let bufCount = Int(ablPtr.pointee.mNumberBuffers)
-    guard bufCount > 0 else { return nil }
+    guard bufCount > 0 else { return (nil, "bufCount=0") }
     let firstBufOffset =
       MemoryLayout<AudioBufferList>.size - MemoryLayout<AudioBuffer>.size
 
@@ -231,9 +297,13 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
       let buf = bufRaw.bindMemory(to: AudioBuffer.self, capacity: 1).pointee
       let bufCh = max(1, Int(buf.mNumberChannels))
       let bytes = Int(buf.mDataByteSize)
-      guard let mData = buf.mData, bytes > 0 else { return nil }
+      guard let mData = buf.mData, bytes > 0 else {
+        return (nil, "buf\(i) mData=nil size=\(bytes)")
+      }
       let frames = bytes / (bytesPerSample * bufCh)
-      guard frames > 0 else { return nil }
+      guard frames > 0 else {
+        return (nil, "buf\(i) frames=0 size=\(bytes) ch=\(bufCh)")
+      }
       var out = [Float](repeating: 0, count: frames)
       if isFloat, bytesPerSample == 4 {
         let v = mData.bindMemory(to: Float.self, capacity: bytes / 4)
@@ -250,22 +320,24 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
           out[f] = s / Float(bufCh)
         }
       } else {
-        return nil
+        return (
+          nil, "buf\(i) fmt mismatch float=\(isFloat ? 1 : 0) bits=\(asbd.mBitsPerChannel)"
+        )
       }
       arrays.append(out)
       minFrames = min(minFrames, frames)
     }
-    guard minFrames > 0, minFrames != .max else { return nil }
+    guard minFrames > 0, minFrames != .max else { return (nil, "minFrames=0") }
 
     // 跨 buffer（非交织多块）按帧平均 → 单声道
-    if arrays.count == 1 { return arrays[0] }
+    if arrays.count == 1 { return (arrays[0], nil) }
     var mono = [Float](repeating: 0, count: minFrames)
     for f in 0..<minFrames {
       var s: Float = 0
       for a in arrays { s += a[f] }
       mono[f] = s / Float(arrays.count)
     }
-    return mono
+    return (mono, nil)
   }
 
   // MARK: - 文件写入
@@ -327,6 +399,15 @@ class BroadcastAudioHandler: RPBroadcastSampleHandler {
     // 首帧确定的 ASBD 完整描述：Dart 打印，检验格式声明与实际数据是否矛盾
     if let fmt = fmtDescription {
       meta["fmt"] = fmt
+    }
+    // 解码失败诊断：失败原因 + 计数（Dart 变化时打印）
+    if failCount > 0 {
+      meta["err"] = lastFailReason
+      meta["errs"] = failCount
+    }
+    // 当前样本源（app=其他 app 混音 / mic=降级麦克风样本）
+    if !activeSrc.isEmpty {
+      meta["src"] = activeSrc
     }
     guard let json = try? JSONSerialization.data(withJSONObject: meta) else { return }
     // 原子替换，Dart 读到的是完整 JSON
