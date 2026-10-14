@@ -281,8 +281,15 @@ import AVKit
       for src in urls {
         let rawName = src.lastPathComponent
         let dot = rawName.lastIndex(of: ".")
-        let base = dot.map { String(rawName[..< $0]) } ?? rawName
-        let ext = dot.map { String(rawName[$0...]) } ?? ""
+        let base: String
+        let ext: String
+        if let dot {
+          base = String(rawName[..<dot])
+          ext = String(rawName[dot...])
+        } else {
+          base = rawName
+          ext = ""
+        }
         var name = rawName
         if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
           name = "\(base)_\(ts)\(ext)"
