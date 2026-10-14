@@ -49,7 +49,11 @@ class _LibraryPageState extends State<LibraryPage>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this);
+    _tabController = TabController(
+      // iOS 沙箱下导入的音乐全部在 Imports 目录，「文件夹」视图无意义，隐藏
+      length: isIOSPlatform ? 4 : 5,
+      vsync: this,
+    );
     _searchFocusNode = FocusNode();
     if (kTvBuild) TvFabFocusBridge.instance.register(_tvFabNode);
     // 监听 FullPlayer 展开状态：展开时取消搜索框焦点，防止返回时自动弹输入法
@@ -161,12 +165,12 @@ class _LibraryPageState extends State<LibraryPage>
                     // TabBar
                     TabBar(
                       controller: _tabController,
-                      tabs: const [
-                        Tab(text: '曲目'),
-                        Tab(text: '专辑'),
-                        Tab(text: '艺术家'),
-                        Tab(text: '文件夹'),
-                        Tab(text: '收藏'),
+                      tabs: [
+                        const Tab(text: '曲目'),
+                        const Tab(text: '专辑'),
+                        const Tab(text: '艺术家'),
+                        if (!isIOSPlatform) const Tab(text: '文件夹'),
+                        const Tab(text: '收藏'),
                       ],
                       // 5 个 Tab 内容较窄，关闭滚动并居中分布到整行，
                       // 缩窄每个 Tab 内部 padding 让全部标题都能完整显示。
@@ -194,7 +198,7 @@ class _LibraryPageState extends State<LibraryPage>
                 SongsPage(songs: libraryProvider.songs),
                 AlbumsPage(albums: libraryProvider.albums),
                 ArtistsPage(artists: libraryProvider.artists),
-                FoldersPage(folders: libraryProvider.folders),
+                if (!isIOSPlatform) FoldersPage(folders: libraryProvider.folders),
                 const _LocalFavoritesTab(),
               ],
             ),

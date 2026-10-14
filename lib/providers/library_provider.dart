@@ -243,6 +243,29 @@ class LibraryProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 删除本地歌曲（歌曲更多菜单）。
+  ///
+  /// iOS：导入目录内的文件归 app 沙箱所有，删除时连同文件一起删除；
+  /// 文件删除失败（已被系统清理等）不阻塞列表移除。其余平台仅移出索引。
+  Future<void> deleteLocalSong(Song song) async {
+    final path = song.localPath;
+    if (isIOSPlatform && path != null && path.contains('/Music/Imports/')) {
+      try {
+        final f = File(path);
+        if (await f.exists()) {
+          await f.delete();
+          _log('[LibraryProvider] deleted file: $path');
+        }
+      } catch (e) {
+        _log('[LibraryProvider] delete file failed: $e');
+      }
+    }
+    _indexedSongs = _indexedSongs.where((s) => s.id != song.id).toList();
+    await _repository.saveSongs(_indexedSongs);
+    _rebuildCategories();
+    notifyListeners();
+  }
+
   /// iOS 导入目录：Documents/Music/Imports（app 沙箱内，无权限要求）。
   Future<String> _importsDirectory() async {
     final docs = await getApplicationDocumentsDirectory();

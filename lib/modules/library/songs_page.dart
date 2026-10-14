@@ -2,8 +2,10 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/platform_capabilities.dart';
 import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
+import '../../providers/library_provider.dart';
 import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/m3e_sort_sheet.dart';
@@ -120,11 +122,13 @@ class _SongsPageState extends State<SongsPage> {
     switch (_sortBy) {
       case SongSortBy.title:
         songs.sort(
-            (a, b) => compare(a.title, b.title, (x, y) => x.compareTo(y)));
+          (a, b) => compare(a.title, b.title, (x, y) => x.compareTo(y)),
+        );
         break;
       case SongSortBy.artist:
         songs.sort(
-            (a, b) => compare(a.artist, b.artist, (x, y) => x.compareTo(y)));
+          (a, b) => compare(a.artist, b.artist, (x, y) => x.compareTo(y)),
+        );
         break;
       case SongSortBy.dateAdded:
         // 添加时间排序：原列表顺序视为添加顺序，倒序时整体反转
@@ -165,8 +169,8 @@ class _SongsPageState extends State<SongsPage> {
         child: Text(
           '暂无歌曲',
           style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
       );
     }
@@ -180,8 +184,8 @@ class _SongsPageState extends State<SongsPage> {
               Text(
                 '${songs.length} 首歌曲',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
               const Spacer(),
               IconButton(
@@ -244,12 +248,90 @@ class _SongsPageState extends State<SongsPage> {
                   if (_blockedByRoomOwnership()) return;
                   context.read<PlayerProvider>().playPlaylist(songs, index);
                 },
-                onMoreTap: () {},
+                onMoreTap: isIOSPlatform
+                    ? () => _showSongMenu(context, songs[index])
+                    : () {},
               );
             },
           ),
         ),
       ],
     );
+  }
+
+  /// iOS 本地歌曲更多菜单：导入的音乐文件归 app 沙箱所有，
+  /// 删除 = 删除沙箱文件并移出列表。
+  void _showSongMenu(BuildContext context, Song song) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  song.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(sheetCtx).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.play_arrow_rounded),
+              title: const Text('播放'),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                if (_blockedByRoomOwnership()) return;
+                final songs = _sortedSongs;
+                final idx = songs.indexWhere((s) => s.id == song.id);
+                context.read<PlayerProvider>().playPlaylist(
+                  songs,
+                  idx < 0 ? 0 : idx,
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('删除'),
+              onTap: () async {
+                Navigator.pop(sheetCtx);
+                // 用外层 context（列表项）而非 sheetCtx：sheet 已 pop
+                final ok = await _confirmDelete(context, song);
+                if (!ok || !context.mounted) return;
+                await context.read<LibraryProvider>().deleteLocalSong(song);
+                if (context.mounted) showToast('已删除');
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<bool> _confirmDelete(BuildContext context, Song song) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('删除歌曲'),
+        content: Text('确定删除「${song.title}」吗？导入的音频文件将一并删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    return result == true;
   }
 }
