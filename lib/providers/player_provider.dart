@@ -1105,6 +1105,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         _isPlaying ? await pause() : await resume();
       case 'next':
         await next();
+      case 'previous':
+        await previous();
     }
   }
 

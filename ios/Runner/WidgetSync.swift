@@ -219,7 +219,8 @@ final class WidgetSync {
   func handleWidgetURL(_ url: URL) {
     guard url.scheme == "md3music", url.host == "widget" else { return }
     let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    guard action == "play_pause" || action == "next" else { return }
+    guard action == "play_pause" || action == "next" || action == "previous"
+    else { return }
     Self.writeCommand(action)
     forwardPendingCommand()
   }

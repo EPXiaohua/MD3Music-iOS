@@ -2,9 +2,13 @@
 //  MD3Widget.swift
 //  MD3Widget
 //
-//  音乐播放器桌面小组件（WidgetKit）。样式对齐 Android MusicWidgetProvider：
-//  专辑封面圆角、播放/下一首按钮、进度条，颜色由 app 推送的 ColorScheme
-//  色板（App Group "widget_state" 的 colors 字段）驱动，缺省用系统语义色。
+//  音乐播放器桌面小组件（WidgetKit）。两个尺寸对齐 Android 组件：
+//  - 小号（systemSmall）= Android 2x2 封面播放器：封面全幅铺底 +
+//    封面主色（简化 vibrant）渐变遮罩，中部歌名/歌手，底部
+//    上一首/播放暂停/下一首三键；
+//  - 中号（systemMedium）= 歌曲展示台：左侧大封面，右侧歌名/歌手 +
+//    进度条 + 时间 + 三键，颜色由 app 推送的 ColorScheme 色板
+//    （App Group "widget_state" 的 colors 字段）驱动。
 //
 //  数据来源：主 app 的 WidgetSync 写入 App Group（group.com.md3music.md3music）
 //  的 widget_state JSON 与 widget_cover.png；app 每次播放状态变化时调用
@@ -13,8 +17,8 @@
 //  进度条：播放中用 TimelineView(.periodic) 每秒按墙钟推进（position +
 //  (now - updatedAt)），无需依赖系统刷新预算；暂停时静止。
 //
-//  交互：iOS 17+ 播放/暂停、下一首按钮走 AppIntent——把命令写入 App Group
-//  并打开 app，由主 app 回前台后转发给 Dart 执行；iOS 16 按钮用 Link 经
+//  交互：iOS 17+ 按钮走 AppIntent——把命令写入 App Group 并打开 app，由
+//  主 app 回前台后转发给 Dart 执行；iOS 16 按钮用 Link 经
 //  `md3music://widget/<action>` URL scheme 打开 app 携带命令（iOS 15 点整
 //  个 widget 走 widgetURL 兜底）；主 app 由 SceneDelegate 接收 URL 后同样
 //  经 WidgetSync 转发给 Dart。
@@ -67,6 +71,66 @@ struct WidgetState {
     guard isPlaying else { return positionMs }
     let elapsed = Int(Date().timeIntervalSince(updatedAt) * 1000)
     return min(positionMs + max(0, elapsed), max(durationMs, 1))
+  }
+
+  /// 封面主色（简化 vibrant）：缩到 24x24 统计饱和像素的色相分布，
+  /// 取最高频色相桶的平均色相/饱和度，亮度固定 0.62——对应 Android
+  /// 封面播放器用 Palette 取色做遮罩/按钮底色的行为。近灰封面返回 nil。
+  static func coverAccent(from image: UIImage?) -> UIColor? {
+    guard let cg = image?.cgImage else { return nil }
+    let w = 24, h = 24
+    var pixels = [UInt8](repeating: 0, count: w * h * 4)
+    let drawn: Bool = pixels.withUnsafeMutableBytes { raw -> Bool in
+      guard
+        let ctx = CGContext(
+          data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+          bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+      else { return false }
+      ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+      return true
+    }
+    guard drawn else { return nil }
+    var bucketCount = [Int](repeating: 0, count: 24)
+    var bucketHue = [Double](repeating: 0, count: 24)
+    var bucketSat = [Double](repeating: 0, count: 24)
+    var colored = 0
+    for i in stride(from: 0, to: pixels.count, by: 4) {
+      let a = Double(pixels[i + 3]) / 255
+      guard a > 0.5 else { continue }
+      let r = Double(pixels[i]) / 255
+      let g = Double(pixels[i + 1]) / 255
+      let b = Double(pixels[i + 2]) / 255
+      let mx = max(r, g, b)
+      let mn = min(r, g, b)
+      let v = mx
+      let sat = mx == 0 ? 0 : (mx - mn) / mx
+      // 跳过近黑/近白/低饱和像素，只统计"有颜色"的部分
+      guard v > 0.22, v < 0.98, sat > 0.28 else { continue }
+      var hue: Double
+      if mx == mn {
+        hue = 0
+      } else if mx == r {
+        hue = (g - b) / (mx - mn)
+      } else if mx == g {
+        hue = 2 + (b - r) / (mx - mn)
+      } else {
+        hue = 4 + (r - g) / (mx - mn)
+      }
+      if hue < 0 { hue += 6 }
+      let bucket = min(Int(hue / 6 * 24), 23)
+      bucketCount[bucket] += 1
+      bucketHue[bucket] += hue / 6
+      bucketSat[bucket] += sat
+      colored += 1
+    }
+    guard colored > 8 else { return nil }
+    var best = 0
+    for i in 1..<24 where bucketCount[i] > bucketCount[best] { best = i }
+    guard bucketCount[best] > 0 else { return nil }
+    let hue = bucketHue[best] / Double(bucketCount[best])
+    let sat = min(max(bucketSat[best] / Double(bucketCount[best]), 0.45), 0.85)
+    return UIColor(hue: CGFloat(hue), saturation: CGFloat(sat), brightness: 0.62, alpha: 1)
   }
 }
 
@@ -185,92 +249,106 @@ struct MD3MusicWidgetView: View {
     let s = entry.state
     Group {
       if family == .systemMedium {
-        mediumLayout(s)
+        showcaseLayout(s)
       } else {
-        smallLayout(s)
+        coverPlayerLayout(s)
       }
     }
-    .widgetBackground(s.panelBg)
+    .widgetBackground(backgroundView(s))
     // 兜底：iOS 15/16 点击非按钮区域打开 app（按钮区域 Link 优先）；
     // iOS 17+ 按钮走 AppIntent，其余区域同样能打开 app
     .widgetURL(URL(string: "md3music://widget/open"))
   }
 
-  /// 小号：封面在上、信息在中、进度条在下，整体居中。
-  private func smallLayout(_ s: WidgetState) -> some View {
-    VStack(spacing: 7) {
-      coverView(s, size: 70)
-      VStack(spacing: 2) {
-        plainText(
-          s.title.isEmpty ? "MD3Music" : s.title,
-          fontSize: 11, weight: .semibold, color: s.onSurface,
-          alignment: .center)
-        plainText(
-          s.artist.isEmpty ? "未在播放" : s.artist,
-          fontSize: 9, weight: .regular, color: s.onSurfaceVariant,
-          alignment: .center)
-      }
-      progressView(s, inset: 16)
-    }
-    .padding(.horizontal, 10)
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-  }
-
-  /// 中号（参照设计图）：上排封面+歌曲信息，中间通栏进度条，底部播放/下一首按钮。
-  private func mediumLayout(_ s: WidgetState) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
-      HStack(spacing: 12) {
-        coverView(s, size: 56)
-        VStack(alignment: .leading, spacing: 3) {
-          plainText(
-            s.title.isEmpty ? "MD3Music" : s.title,
-            fontSize: 14, weight: .semibold, color: s.onSurface,
-            alignment: .leading)
-          plainText(
-            s.artist.isEmpty ? "未在播放" : s.artist,
-            fontSize: 12, weight: .regular, color: s.onSurfaceVariant,
-            alignment: .leading)
-        }
-      }
-      progressView(s, inset: 10)
-      HStack(spacing: 10) {
-        // iOS 17+ 按钮绑定 AppIntent 真实控制播放；15/16 用 Link 携带
-        // URL scheme 命令打开 app（Link 仅 iOS 16 生效，iOS 15 整组件
-        // 点按走 widgetURL 兜底打开 app）
-        if #available(iOSApplicationExtension 17.0, *) {
-          Button(intent: PlayPauseIntent()) {
-            controlCircle(
-              systemName: s.isPlaying ? "pause.fill" : "play.fill",
-              tint: s.primary, icon: s.onPrimary)
-          }
-          .buttonStyle(.plain)
-          Button(intent: NextIntent()) {
-            controlCircle(
-              systemName: "forward.fill", tint: s.surfaceHigh,
-              icon: s.onSurface)
-          }
-          .buttonStyle(.plain)
+  /// 组件背景层：小号 = 封面铺底 + 封面主色渐变遮罩（文字/按钮画在
+  /// 内容层，遮罩负责对比度）；中号 = 展示台纯色底（推送的 panelBg）。
+  @ViewBuilder
+  private func backgroundView(_ s: WidgetState) -> some View {
+    if family == .systemMedium {
+      s.panelBg
+    } else {
+      ZStack {
+        if let image = s.coverImage {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
         } else {
-          Link(destination: URL(string: "md3music://widget/play_pause")!) {
-            controlCircle(
-              systemName: s.isPlaying ? "pause.fill" : "play.fill",
-              tint: s.primary, icon: s.onPrimary)
-          }
-          Link(destination: URL(string: "md3music://widget/next")!) {
-            controlCircle(
-              systemName: "forward.fill", tint: s.surfaceHigh,
-              icon: s.onSurface)
-          }
+          Color(UIColor(s.primary))
         }
-        Spacer()
+        scrimGradient(s)
       }
+      .clipped()
     }
-    .padding(.horizontal, 30)
-    .padding(.vertical, 10)
+  }
+
+  /// 莫奈遮罩：封面主色自上而下加深（顶 30% 透出封面 → 底 78% 保证
+  /// 按钮区可读）；无封面时用主题 primary 淡化铺底。
+  private func scrimGradient(_ s: WidgetState) -> some View {
+    let accent = UIColor.coverAccent(from: s.coverImage) ?? UIColor(s.primary)
+    return LinearGradient(
+      stops: [
+        .init(color: Color(accent).opacity(0.30), location: 0),
+        .init(color: Color(accent).opacity(0.55), location: 0.55),
+        .init(color: Color(accent).opacity(0.78), location: 1),
+      ],
+      startPoint: .top, endPoint: .bottom)
+  }
+
+  /// 小号（Android 2x2 封面播放器）：中部歌名/歌手，底部三键。
+  private func coverPlayerLayout(_ s: WidgetState) -> some View {
+    VStack(spacing: 0) {
+      Spacer(minLength: 0)
+      VStack(spacing: 3) {
+        Text(s.title.isEmpty ? "MD3Music" : s.title)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundColor(.white)
+          .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+          .lineLimit(1)
+          .truncationMode(.tail)
+        Text(s.artist.isEmpty ? "未在播放" : s.artist)
+          .font(.system(size: 10))
+          .foregroundColor(.white.opacity(0.85))
+          .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+          .lineLimit(1)
+          .truncationMode(.tail)
+      }
+      .padding(.horizontal, 12)
+      Spacer(minLength: 0)
+      transportRow(s, compact: true)
+        .padding(.bottom, 14)
+    }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  private func coverView(_ s: WidgetState, size: CGFloat) -> some View {
+  /// 中号 = 歌曲展示台：左侧大封面，右侧歌名/歌手 + 进度 + 时间 + 三键。
+  private func showcaseLayout(_ s: WidgetState) -> some View {
+    HStack(alignment: .center, spacing: 14) {
+      bigCover(s, size: 104)
+      VStack(alignment: .leading, spacing: 0) {
+        Text(s.title.isEmpty ? "MD3Music" : s.title)
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundColor(s.onSurface)
+          .lineLimit(2)
+          .truncationMode(.tail)
+        Text(s.artist.isEmpty ? "未在播放" : s.artist)
+          .font(.system(size: 12))
+          .foregroundColor(s.onSurfaceVariant)
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .padding(.top, 3)
+        Spacer(minLength: 0)
+        progressWithTime(s)
+        Spacer(minLength: 0)
+        transportRow(s, compact: false)
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 14)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  /// 展示台大封面（圆角矩形）
+  private func bigCover(_ s: WidgetState, size: CGFloat) -> some View {
     ZStack {
       if let image = s.coverImage {
         Image(uiImage: image)
@@ -280,44 +358,91 @@ struct MD3MusicWidgetView: View {
         Rectangle().fill(s.outlineVariant)
           .overlay(
             Image(systemName: "music.note")
-              .font(.system(size: size * 0.4))
+              .font(.system(size: size * 0.34))
               .foregroundColor(s.onSurfaceVariant))
       }
     }
     .frame(width: size, height: size)
-    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: size * 0.18, style: .continuous))
   }
 
-  /// 单行文本，超宽省略号截断。
-  private func plainText(
-    _ text: String, fontSize: CGFloat, weight: Font.Weight, color: Color,
-    alignment: Alignment
-  ) -> some View {
-    Text(text)
-      .font(.system(size: fontSize, weight: weight))
-      .foregroundColor(color)
-      .lineLimit(1)
-      .truncationMode(.tail)
-      .frame(maxWidth: .infinity, alignment: alignment)
-      .frame(height: fontSize * 1.25)
-  }
-
-  /// 细进度条：inset 为在布局容器内边距基础上额外左右内收的宽度，
-  /// 填充宽度做 clamp 双保险避免越界。
-  private func progressView(_ s: WidgetState, inset: CGFloat) -> some View {
-    TimelineView(.periodic(from: .now, by: 1)) { _ in
-      GeometryReader { geo in
-        let w = max(geo.size.width, 0)
-        ZStack(alignment: .leading) {
-          Capsule().fill(s.outlineVariant)
-          Capsule()
-            .fill(s.primary)
-            .frame(width: min(w * progressFraction(s), w))
+  /// 进度条 + 当前/总时长（展示台右列中部）
+  private func progressWithTime(_ s: WidgetState) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      TimelineView(.periodic(from: .now, by: 1)) { _ in
+        GeometryReader { geo in
+          let w = max(geo.size.width, 0)
+          ZStack(alignment: .leading) {
+            Capsule().fill(s.outlineVariant)
+            Capsule()
+              .fill(s.primary)
+              .frame(width: min(w * progressFraction(s), w))
+          }
         }
+        .frame(height: 4)
+        .animation(.linear(duration: 1), value: progressFraction(s))
       }
       .frame(height: 4)
-      .padding(.horizontal, inset)
-      .animation(.linear(duration: 1), value: progressFraction(s))
+      HStack {
+        Text(formatMs(s.livePositionMs))
+        Spacer()
+        Text(formatMs(s.durationMs))
+      }
+      .font(.system(size: 10).monospacedDigit())
+      .foregroundColor(s.onSurfaceVariant)
+    }
+  }
+
+  /// 三键行：上一首 / 播放暂停 / 下一首。小号用裸图标 + 白色半透明
+  /// 圆底播放键（封面播放器样式）；中号播放键用主题 primary 圆底。
+  private func transportRow(_ s: WidgetState, compact: Bool) -> some View {
+    let iconSize: CGFloat = compact ? 14 : 17
+    let playSize: CGFloat = compact ? 40 : 42
+    let spacing: CGFloat = compact ? 26 : 18
+    return HStack(spacing: spacing) {
+      transportButton(action: "previous") {
+        Image(systemName: "backward.end.fill")
+          .font(.system(size: iconSize, weight: .semibold))
+          .foregroundColor(compact ? .white : s.onSurface)
+          .frame(width: playSize * 0.8, height: playSize * 0.8)
+          .shadow(color: .black.opacity(compact ? 0.35 : 0), radius: 2)
+      }
+      transportButton(action: "play_pause") {
+        Image(systemName: s.isPlaying ? "pause.fill" : "play.fill")
+          .font(.system(size: playSize * 0.42, weight: .semibold))
+          .foregroundColor(compact ? Color(UIColor(white: 0.13, alpha: 1)) : s.onPrimary)
+          .frame(width: playSize, height: playSize)
+          .background(
+            Circle().fill(compact ? Color.white.opacity(0.82) : s.primary))
+      }
+      transportButton(action: "next") {
+        Image(systemName: "forward.end.fill")
+          .font(.system(size: iconSize, weight: .semibold))
+          .foregroundColor(compact ? .white : s.onSurface)
+          .frame(width: playSize * 0.8, height: playSize * 0.8)
+          .shadow(color: .black.opacity(compact ? 0.35 : 0), radius: 2)
+      }
+    }
+  }
+
+  /// 单个传输按钮：iOS 17+ AppIntent 直控，iOS 16 Link 带命令打开 app
+  /// （iOS 15 整组件点按走 widgetURL 兜底）。
+  @ViewBuilder
+  private func transportButton(
+    action: String, @ViewBuilder content: () -> some View
+  ) -> some View {
+    let url = URL(string: "md3music://widget/\(action)")!
+    if #available(iOSApplicationExtension 17.0, *) {
+      switch action {
+      case "previous":
+        Button(intent: PreviousIntent()) { content() }.buttonStyle(.plain)
+      case "next":
+        Button(intent: NextIntent()) { content() }.buttonStyle(.plain)
+      default:
+        Button(intent: PlayPauseIntent()) { content() }.buttonStyle(.plain)
+      }
+    } else {
+      Link(destination: url) { content() }
     }
   }
 
@@ -326,15 +451,9 @@ struct MD3MusicWidgetView: View {
     return CGFloat(min(max(s.livePositionMs, 0), s.durationMs)) / CGFloat(s.durationMs)
   }
 
-  /// 圆形控制按钮外观（不含交互）
-  private func controlCircle(systemName: String, tint: Color, icon: Color)
-    -> some View
-  {
-    Image(systemName: systemName)
-      .font(.system(size: 13, weight: .semibold))
-      .foregroundColor(icon)
-      .frame(width: 30, height: 30)
-      .background(Circle().fill(tint))
+  private func formatMs(_ ms: Int) -> String {
+    let total = max(ms, 0) / 1000
+    return String(format: "%d:%02d", total / 60, total % 60)
   }
 }
 
@@ -344,11 +463,11 @@ struct MD3MusicWidgetView: View {
 /// 视图外扩抵消 margin，让背景铺满整个组件。
 private extension View {
   @ViewBuilder
-  func widgetBackground(_ color: Color) -> some View {
+  func widgetBackground<V: View>(_ background: V) -> some View {
     if #available(iOSApplicationExtension 17.0, *) {
-      containerBackground(for: .widget) { color }
+      containerBackground(for: .widget) { background }
     } else {
-      padding(-16).background(color)
+      padding(-16).background(background)
     }
   }
 }
@@ -362,6 +481,17 @@ struct PlayPauseIntent: AppIntent {
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("play_pause")
+    return .result()
+  }
+}
+
+@available(iOSApplicationExtension 17.0, *)
+struct PreviousIntent: AppIntent {
+  static var title: LocalizedStringResource = "上一首"
+  static var openAppWhenRun = true
+
+  func perform() async throws -> some IntentResult {
+    WidgetSyncBridge.writeCommand("previous")
     return .result()
   }
 }
@@ -394,7 +524,7 @@ struct MD3MusicWidget: Widget {
       MD3MusicWidgetView(entry: entry)
     }
     .configurationDisplayName("音乐播放")
-    .description("显示当前播放的歌曲与进度")
+    .description("封面播放器（小）与歌曲展示台（中），支持上一首/播放暂停/下一首")
     .supportedFamilies([.systemSmall, .systemMedium])
   }
 }
