@@ -192,6 +192,13 @@ class LyricsPipService {
   void _setActive(bool value) {
     if (_active == value) return;
     _active = value;
+    // 原生终态与最近意图不一致（启动重试放弃/用户点小窗 X 关闭/系统回收）：
+    // 以实际态复位意图。否则 [_desiredActive] 停留在旧意图上，下一次
+    // toggle 会朝反方向发指令——表现为"快速操作后开关方向相反"。
+    if (_desiredActive != value) {
+      _desiredActive = value;
+      debugPrint('[LyricsPip] desired resynced to actual: $value');
+    }
     onActiveChanged?.call();
   }
 }
