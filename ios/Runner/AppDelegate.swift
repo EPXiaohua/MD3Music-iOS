@@ -515,11 +515,19 @@ final class NowPlayingManager {
   private func loadArtwork(_ artUri: String?) {
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      if let uri = artUri, uri == self.appliedArtUri { return }
-      self.appliedArtUri = artUri
+      // 空 URI 的推送（局部更新等）：清掉锁屏旧封面，但 appliedArtUri 保持
+      // 原值——若在这里清空，下一次带 URI 的推送会被判为新封面而重复下载，
+      // 生成新的 UIImage 实例，PiP 模糊背景按指针比对误判切歌反复重模糊
+      //（低遮罩不透明度下表现为背景黑↔封面闪烁）。
+      guard let uri = artUri, !uri.isEmpty else {
+        if self.appliedArtUri != nil { self.removeArtwork() }
+        return
+      }
+      if uri == self.appliedArtUri { return }
+      self.appliedArtUri = uri
       self.artworkRequestId += 1
       let requestId = self.artworkRequestId
-      guard let uri = artUri, !uri.isEmpty, let url = URL(string: uri) else {
+      guard let url = URL(string: uri) else {
         self.removeArtwork()
         return
       }
@@ -1278,8 +1286,8 @@ final class LyricsPipManager: NSObject {
       blurredCover != nil && blurredCoverSize != size
     if latest !== coverImage {
       coverImage = latest
-      blurredCover = nil // 新封面模糊出来前先回黑底，避免显示旧封面
-      blurredCoverSize = .zero
+      // 旧模糊图保留到新图就绪再替换：模糊后原图不可辨，直接淡替即可；
+      // 若先置 nil 回黑底，低遮罩不透明度下会黑↔封面闪烁
       startCoverBlur(latest, size: size)
     } else if sizeChanged {
       startCoverBlur(latest, size: size)
