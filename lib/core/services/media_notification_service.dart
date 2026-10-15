@@ -1,4 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
+
+import 'now_playing_service.dart';
 
 /// 为原生重试提供有界的命令去重，并且只确认实际交给回调的命令。
 class MediaCommandAckRouter {
@@ -32,6 +36,7 @@ class MediaNotificationService {
   static void Function()? onNext;
   static void Function()? onTogglePlayPause;
   static void Function(int)? onSeekTo;
+
   /// 媒体键快进/快退（TV 遥控器）；由 desktop_lyric_service.registerNativeCallbacks 装配。
   static void Function()? onSeekForward;
   static void Function()? onSeekBack;
@@ -275,16 +280,26 @@ class MediaNotificationService {
     }
   }
 
-  // 蓝牙歌词兼容通道仍保留，但原生端不再改写共享 MediaSession 的 TITLE/ARTIST，
-  // 避免 ColorOS 锁屏把歌词行误判为歌曲身份。
+  // 蓝牙歌词兼容通道仍保留，但 Android 原生端不再改写共享 MediaSession 的
+  // TITLE/ARTIST，避免 ColorOS 锁屏把歌词行误判为歌曲身份；
+  // iOS 走 NowPlayingService（锁屏 MPNowPlayingInfoCenter 标题覆盖，车载
+  // 经 AVRCP 读取）。
   static Future<void> updateBluetoothLyric(String lyric) async {
     try {
+      if (Platform.isIOS) {
+        await NowPlayingService.instance.updateBluetoothLyric(lyric);
+        return;
+      }
       await _channel.invokeMethod('updateBluetoothLyric', {'lyric': lyric});
     } catch (_) {}
   }
 
   static Future<void> setBluetoothLyricEnabled(bool enabled) async {
     try {
+      if (Platform.isIOS) {
+        await NowPlayingService.instance.setBluetoothLyricEnabled(enabled);
+        return;
+      }
       await _channel.invokeMethod('setBluetoothLyricEnabled', {
         'enabled': enabled,
       });

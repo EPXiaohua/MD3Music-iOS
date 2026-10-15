@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../../core/build_flags.dart';
+import '../../core/platform_capabilities.dart';
 import '../../core/remote/remote_slider.dart';
 import '../../core/services/desktop_lyric_service.dart';
 import '../../core/theme/app_dimens.dart';
@@ -884,7 +885,9 @@ class _DesktopLyricSettingsPanelState
           ),
         ),
         const SizedBox(height: AppSpacing.xs),
-        _buildLockRow(),
+        // 锁定/点击穿透是 Android 悬浮窗专属（FLAG_NOT_TOUCHABLE）；
+        // iOS PiP 由系统渲染与交互，无此概念，隐藏该行
+        if (!isIOSPlatform) _buildLockRow(),
       ],
     );
   }

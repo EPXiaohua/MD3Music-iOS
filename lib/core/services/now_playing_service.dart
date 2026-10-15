@@ -109,4 +109,25 @@ class NowPlayingService {
       debugPrint('[NowPlaying] clear failed: $e');
     }
   }
+
+  /// 蓝牙歌词：把当前歌词行写入锁屏元数据（标题=歌词行，艺术家=「歌手 · 歌名」），
+  /// 车载/带屏蓝牙设备经 AVRCP 读取显示。[lyric] 空串 = 间奏/占位，恢复真实身份。
+  Future<void> updateBluetoothLyric(String lyric) async {
+    if (!_initialized || !Platform.isIOS) return;
+    try {
+      await _channel.invokeMethod('updateBluetoothLyric', <String, dynamic>{
+        'lyric': lyric,
+      });
+    } catch (_) {}
+  }
+
+  /// 蓝牙歌词开关：关闭时立即恢复锁屏真实标题/艺术家。
+  Future<void> setBluetoothLyricEnabled(bool enabled) async {
+    if (!_initialized || !Platform.isIOS) return;
+    try {
+      await _channel.invokeMethod('setBluetoothLyricEnabled', <String, dynamic>{
+        'enabled': enabled,
+      });
+    } catch (_) {}
+  }
 }

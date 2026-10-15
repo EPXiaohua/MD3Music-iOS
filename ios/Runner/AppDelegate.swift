@@ -438,6 +438,14 @@ final class NowPlayingManager {
   /// 最近一次成功加载的封面（桌面小组件 WidgetSync 读取）
   var lastArtworkImage: UIImage?
 
+  // —— 蓝牙歌词（车载 AVRCP）：借标题/艺术家字段携带当前歌词行 ——
+  /// 真实歌名/歌手基线（setMetadata 写入，恢复时用）
+  private var btTitle: String?
+  private var btArtist: String?
+  /// 当前歌词行（updateBluetoothLyric 推送；空串=间奏/占位）
+  private var btLyric = ""
+  private var btLyricEnabled = false
+
   private init() {}
 
   /// 注册 MethodChannel 与远程命令（幂等）。attach 与命令回调均保证在主线程。
@@ -471,6 +479,22 @@ final class NowPlayingManager {
     case "clear":
       clear()
       result(nil)
+    case "updateBluetoothLyric":
+      let args = call.arguments as? [String: Any]
+      let lyric = args?["lyric"] as? String ?? ""
+      DispatchQueue.main.async { [weak self] in
+        self?.btLyric = lyric
+        self?.refreshTitles()
+      }
+      result(nil)
+    case "setBluetoothLyricEnabled":
+      let enabled = (call.arguments as? [String: Any])?["enabled"] as? Bool ?? false
+      DispatchQueue.main.async { [weak self] in
+        self?.btLyricEnabled = enabled
+        if !enabled { self?.btLyric = "" }
+        self?.refreshTitles()
+      }
+      result(nil)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -484,15 +508,16 @@ final class NowPlayingManager {
       // 增量更新：保留封面等已有字段，不重建整个 dict
       var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
       let newTitle = args["title"] as? String
-      let oldTitle = info[MPMediaItemPropertyTitle] as? String
-      // 仅切歌（标题变化）时进度归零；同曲刷新（暂停/收藏/封面覆盖路径等
-      // 重建通知）保留进度，避免把锁屏进度打回 0。
-      let isTrackChange = newTitle != nil && newTitle != oldTitle
+      // 切歌判定与真实基线比较（而非锁屏当前显示的标题——蓝牙歌词开启时
+      // 标题位是歌词行，与推送的真实标题恒不等，按显示值比较会把同曲
+      // 局部更新误判成切歌清零进度）
+      let isTrackChange = newTitle != nil && newTitle != self.btTitle
+      // 真实歌名/歌手存基线，标题位写什么由 applyBtTitles 决定
       if let title = newTitle, !title.isEmpty {
-        info[MPMediaItemPropertyTitle] = title
+        self.btTitle = title
       }
       if let artist = args["artist"] as? String {
-        info[MPMediaItemPropertyArtist] = artist
+        self.btArtist = artist
       }
       if let album = args["album"] as? String {
         info[MPMediaItemPropertyAlbumTitle] = album
@@ -504,9 +529,33 @@ final class NowPlayingManager {
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
         info[MPNowPlayingInfoPropertyPlaybackRate] = self.currentRate
       }
+      self.applyBtTitles(to: &info)
       MPNowPlayingInfoCenter.default().nowPlayingInfo = info
       self.loadArtwork(args["artUri"] as? String)
     }
+  }
+
+  // MARK: 蓝牙歌词标题覆盖（车载 AVRCP 显示歌词）
+
+  /// 按蓝牙歌词开关态写标题/艺术家：开启且有歌词行时标题=歌词行、
+  /// 艺术家=「歌手 · 歌名」（保留身份线索）；否则恢复真实身份。
+  /// loadArtwork/updatePlayback 不触碰 title/artist，覆盖态自然保持。
+  private func applyBtTitles(to info: inout [String: Any]) {
+    if btLyricEnabled, !btLyric.isEmpty, let title = btTitle {
+      info[MPMediaItemPropertyTitle] = btLyric
+      let artist = btArtist ?? ""
+      info[MPMediaItemPropertyArtist] = artist.isEmpty ? title : "\(artist) · \(title)"
+    } else {
+      if let title = btTitle { info[MPMediaItemPropertyTitle] = title }
+      if let artist = btArtist { info[MPMediaItemPropertyArtist] = artist }
+    }
+  }
+
+  /// 只重写标题/艺术家两个字段（蓝牙歌词开关切换/歌词行更新）。
+  private func refreshTitles() {
+    var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+    applyBtTitles(to: &info)
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
   }
 
   /// 异步取封面：http/https/file 均由 URLSession 支持（Info.plist 已放行 ATS）。
@@ -580,6 +629,9 @@ final class NowPlayingManager {
       self?.appliedArtUri = nil
       self?.currentRate = 0
       self?.artworkRequestId += 1
+      self?.btTitle = nil
+      self?.btArtist = nil
+      self?.btLyric = ""
     }
   }
 

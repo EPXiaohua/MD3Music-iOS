@@ -1962,21 +1962,27 @@ class _SettingsPageState extends State<SettingsPage>
             await _settingsRepository.setBluetoothLyricCompressArt(value);
           },
         ),
-        _buildGroupLabel('锁屏歌词', colorScheme),
-        // search: 锁屏
-        SwitchListTile(
-          title: const Text('锁屏歌词（实验性）'),
-          // 缺权限就完全不生效，属于必要前提；其余行为说明删除
-          subtitle: const Text('需开启悬浮窗、后台弹出界面与锁屏通知权限'),
-          value: _lockScreenLyricEnabled,
-          onChanged: (value) async {
-            AppHaptics.lightImpact(HapticCategory.control);
-            setState(() => _lockScreenLyricEnabled = value);
-            await _settingsRepository.setLockScreenLyricEnabled(value);
-            // 同步到歌词服务（启停定时器）与原生端（开关状态/关闭界面）
-            await DesktopLyricService.instance.setLockScreenLyricEnabled(value);
-          },
-        ),
+        // 锁屏歌词是 Android 悬浮窗挂到锁屏的方案（需悬浮窗/锁屏通知权限）；
+        // iOS 无此机制，隐藏整个区块
+        if (!isIOSPlatform) ...[
+          _buildGroupLabel('锁屏歌词', colorScheme),
+          // search: 锁屏
+          SwitchListTile(
+            title: const Text('锁屏歌词（实验性）'),
+            // 缺权限就完全不生效，属于必要前提；其余行为说明删除
+            subtitle: const Text('需开启悬浮窗、后台弹出界面与锁屏通知权限'),
+            value: _lockScreenLyricEnabled,
+            onChanged: (value) async {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _lockScreenLyricEnabled = value);
+              await _settingsRepository.setLockScreenLyricEnabled(value);
+              // 同步到歌词服务（启停定时器）与原生端（开关状态/关闭界面）
+              await DesktopLyricService.instance.setLockScreenLyricEnabled(
+                value,
+              );
+            },
+          ),
+        ],
         if (_flymeStatusBarLyricSupported) ...[
           _buildGroupLabel('魅族状态栏歌词', colorScheme),
           // search: 魅族 flyme 状态栏
