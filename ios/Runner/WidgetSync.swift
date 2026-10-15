@@ -248,9 +248,8 @@ final class WidgetSync {
       DispatchQueue.main.async {
         guard let self else { return }
         self.fmInFlight.removeValue(forKey: file)
-        let ok = (response as? HTTPURLResponse)?.statusCode.map {
-          (200..<300).contains($0)
-        } ?? false
+        let code = (response as? HTTPURLResponse)?.statusCode
+        let ok = code.map { (200..<300).contains($0) } ?? false
         if ok, let data, let image = UIImage(data: data),
           let jpeg = image.jpegData(compressionQuality: 0.9),
           let container = self.groupContainer
