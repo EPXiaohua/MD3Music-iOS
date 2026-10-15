@@ -553,7 +553,7 @@ class PlayerBarTransport extends StatelessWidget {
 ///
 /// [opacity]/[widthFactor] 供交叉过渡浮层把它**淡出并收掉宽度**（胶囊端没有这个
 /// 按钮）。常驻条侧两个参数保持 1.0，逐像素与改动前一致。
-class PlayerBarLyricButton extends StatelessWidget {
+class PlayerBarLyricButton extends StatefulWidget {
   const PlayerBarLyricButton({
     super.key,
     required this.opacity,
@@ -564,7 +564,34 @@ class PlayerBarLyricButton extends StatelessWidget {
   final double widthFactor;
 
   @override
+  State<PlayerBarLyricButton> createState() => _PlayerBarLyricButtonState();
+}
+
+/// 按钮自行监听 [DesktopLyricService] 通知：高亮严格跟随激活态（PiP 开窗
+/// 动画完成的原生回调 / 从 PiP 小窗点关闭还原）。不能依赖宿主重建——底栏
+/// 浮层挂在 app.dart 的独立 Stack，mini_player 等宿主的监听 setState 刷
+/// 不到这里，会造成"高亮滞后一拍/小窗关闭后不复位"。
+class _PlayerBarLyricButtonState extends State<PlayerBarLyricButton> {
+  @override
+  void initState() {
+    super.initState();
+    DesktopLyricService.instance.addListener(_onServiceChanged);
+  }
+
+  @override
+  void dispose() {
+    DesktopLyricService.instance.removeListener(_onServiceChanged);
+    super.dispose();
+  }
+
+  void _onServiceChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final opacity = widget.opacity;
+    final widthFactor = widget.widthFactor;
     if (widthFactor <= 0.001 || opacity <= 0.001) {
       return const SizedBox.shrink();
     }
