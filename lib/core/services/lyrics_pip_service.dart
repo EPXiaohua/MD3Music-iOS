@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -30,6 +32,13 @@ class LyricsPipService {
   /// 的 'state' 回调走，不做乐观置位。
   bool _desiredActive = false;
 
+  /// 在途标志：指令已发、原生终态未到（PiP 开/关动画数百 ms）。期间再点
+  /// 直接吞掉——用户看到按钮没反应而补点时，真实意图是"维持刚才那次"，
+  /// 若继续翻转会反向执行（关→开/开→关），这是"快速操作开关方向相反"的
+  /// 根因。终态到达/受理失败/3s 兜底超时都会清除。
+  bool _busy = false;
+  Timer? _busyGuard;
+
   /// PiP 窗口是否激活。严格由原生 didStart/didStop 的 'state' 回调驱动
   /// （含用户从 PiP 窗口关闭/系统手势划掉小窗），按钮激活态以它为准。
   bool get active => _active;
@@ -52,18 +61,35 @@ class LyricsPipService {
     return null;
   }
 
-  /// 开关 PiP 悬浮窗，返回当前激活态。激活态由原生回调驱动，快速连点时
-  /// 这里只负责翻转并下发最终意图（原生状态机收敛）；设备/系统不支持时
-  /// 意图回退并保持 false。
+  /// 开关 PiP 悬浮窗，返回当前激活态。在途期间吞点（见 [_busy]）；激活态
+  /// 由原生回调驱动，设备/系统不支持时意图回退并保持 false。
   Future<bool> toggle() async {
+    if (_busy) return _active;
     _desiredActive = !_desiredActive;
+    _markBusy();
     if (_desiredActive) {
       final ok = await start();
-      if (!ok) _desiredActive = false;
+      if (!ok) {
+        _desiredActive = false;
+        _clearBusy();
+      }
     } else {
       await stop();
     }
     return _active;
+  }
+
+  void _markBusy() {
+    _busy = true;
+    _busyGuard?.cancel();
+    // 兜底：原生异常路径漏发终态时不至于永久吞点
+    _busyGuard = Timer(const Duration(seconds: 3), _clearBusy);
+  }
+
+  void _clearBusy() {
+    _busy = false;
+    _busyGuard?.cancel();
+    _busyGuard = null;
   }
 
   /// 启动 PiP 悬浮窗（下发开启意图）。原生 startPictureInPicture 是异步
@@ -190,6 +216,7 @@ class LyricsPipService {
   }
 
   void _setActive(bool value) {
+    _clearBusy();
     if (_active == value) return;
     _active = value;
     // 原生终态与最近意图不一致（启动重试放弃/用户点小窗 X 关闭/系统回收）：

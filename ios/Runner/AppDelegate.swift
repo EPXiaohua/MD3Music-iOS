@@ -1181,7 +1181,14 @@ final class LyricsPipManager: NSObject {
     startRetry?.cancel()
     let work = DispatchWorkItem { [weak self] in
       guard let self = self, self.state == .starting, self.pendingIntent == true else { return }
-      guard let host = self.hostView, let controller = self.pipController else { return }
+      guard let host = self.hostView, let controller = self.pipController else {
+        // 基础设施未建成（无 root VC 等）：回 idle 并回报，否则 state 永久
+        // 卡在 starting，Dart 侧按钮永远失步
+        self.state = .idle
+        self.pendingIntent = nil
+        self.notifyState(active: false)
+        return
+      }
       guard !controller.isPictureInPictureActive else { return }
       let infraReady = self.hasPainted && host.window != nil
       if infraReady && controller.isPictureInPicturePossible {
