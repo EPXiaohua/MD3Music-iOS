@@ -367,7 +367,7 @@ struct MD3MusicWidgetView: View {
   /// 莫奈遮罩：封面主色自上而下加深（顶 30% 透出封面 → 底 78% 保证
   /// 按钮区可读）；无封面时用主题 primary 淡化铺底。
   private func scrimGradient(_ s: WidgetState) -> some View {
-    let accent = UIColor.coverAccent(from: s.coverImage) ?? UIColor(s.primary)
+    let accent = WidgetState.coverAccent(from: s.coverImage) ?? UIColor(s.primary)
     return LinearGradient(
       stops: [
         .init(color: Color(accent).opacity(0.30), location: 0),
