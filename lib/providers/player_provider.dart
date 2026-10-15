@@ -22,6 +22,7 @@ import '../core/services/automix/automix_planner.dart';
 import '../core/services/audio_source_load_deadline.dart';
 import '../core/services/desktop_lyric_service.dart';
 import '../core/services/diagnostic_logger.dart';
+import '../core/services/fm_widget_sync.dart';
 import '../core/services/home_widget_service.dart';
 import '../core/services/lyricon_provider_service.dart';
 import '../core/services/listening_grade_service.dart';
@@ -1107,6 +1108,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         await next();
       case 'previous':
         await previous();
+      default:
+        // 私人FM卡（iOS 中号小组件）命令转交 FmWidgetSync
+        if (action.startsWith('fm_')) {
+          await FmWidgetSync.instance.handleCommand(action);
+        }
     }
   }
 

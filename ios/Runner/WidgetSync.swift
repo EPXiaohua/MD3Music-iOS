@@ -143,7 +143,14 @@ final class WidgetSync {
       applyState(lastState: lastState)
       result(nil)
     case "updateFmWidget":
-      // 私人 FM 小组件暂无 iOS 版本，静默忽略
+      // 私人FM卡（iOS 中号小组件）：全量快照写 App Group，封面由这里
+      // 按 URL 下载到共享容器（对齐 Android PersonalFmWidgetProvider 的
+      // 封面缓存 + 失败冷却范式）
+      guard let snapshot = call.arguments as? [String: Any] else {
+        result(nil)
+        return
+      }
+      applyFmState(snapshot)
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -189,6 +196,78 @@ final class WidgetSync {
     try? data.write(to: url, options: .atomic)
   }
 
+  // MARK: - 私人FM卡（中号小组件）
+
+  /// FM 快照 key：Dart FmWidgetSync 推的 payload 全量透传（含 colors 12 色）
+  private static let fmStateKey = "widget_fm_state"
+  /// 快照槽位 key → 共享容器封面文件名
+  private static let fmCoverFiles = [
+    "coverUrl": "fm_cover.png",
+    "nextCover1": "fm_next_1.png",
+    "nextCover2": "fm_next_2.png",
+    "nextCover3": "fm_next_3.png",
+  ]
+  /// 槽位已成功写入的 URL（URL 没变就跳过下载）
+  private var fmWritten: [String: String] = [:]
+  /// 槽位在途下载的 URL
+  private var fmInFlight: [String: String] = [:]
+  /// 下载失败冷却：60s 内同 URL 不再重试（对齐 Android coverFailedUntil）
+  private var fmFailedUntil: [String: Date] = [:]
+
+  /// 写 FM 快照并按需下载封面。快照先落盘（占位图立即可见），封面就绪后
+  /// 再刷一次时间线（对应 Android 的 ACTION_FM_COVER_READY 重绘）。
+  private func applyFmState(_ snapshot: [String: Any]) {
+    guard let defaults = groupDefaults else { return }
+    var state = snapshot
+    state["updatedAt"] = Date().timeIntervalSince1970
+    if let data = try? JSONSerialization.data(withJSONObject: state) {
+      defaults.set(data, forKey: Self.fmStateKey)
+    }
+    for (key, file) in Self.fmCoverFiles {
+      let url = snapshot[key] as? String ?? ""
+      guard !url.isEmpty else { continue }
+      if fmWritten[file] == url || fmInFlight[file] == url { continue }
+      if let until = fmFailedUntil[url], until > Date() { continue }
+      fmInFlight[file] = url
+      downloadFmCover(url, file: file)
+    }
+    if #available(iOS 14.0, *) {
+      WidgetCenter.shared.reloadAllTimelines()
+    }
+  }
+
+  private func downloadFmCover(_ urlString: String, file: String) {
+    guard let url = URL(string: urlString) else {
+      fmInFlight.removeValue(forKey: file)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 8
+    request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.fmInFlight.removeValue(forKey: file)
+        let ok = (response as? HTTPURLResponse)?.statusCode.map {
+          (200..<300).contains($0)
+        } ?? false
+        if ok, let data, let image = UIImage(data: data),
+          let jpeg = image.jpegData(compressionQuality: 0.9),
+          let container = self.groupContainer
+        {
+          try? jpeg.write(
+            to: container.appendingPathComponent(file), options: .atomic)
+          self.fmWritten[file] = urlString
+          if #available(iOS 14.0, *) {
+            WidgetCenter.shared.reloadAllTimelines()
+          }
+        } else {
+          self.fmFailedUntil[urlString] = Date().addingTimeInterval(60)
+        }
+      }
+    }.resume()
+  }
+
   // MARK: - Widget 按钮命令（iOS 17 AppIntent 写入，app 回前台转发）
 
   /// 由 MD3Widget 的 AppIntent 调用：记录命令（下一步由 app 回前台转发 Dart）。
@@ -219,8 +298,14 @@ final class WidgetSync {
   func handleWidgetURL(_ url: URL) {
     guard url.scheme == "md3music", url.host == "widget" else { return }
     let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    guard action == "play_pause" || action == "next" || action == "previous"
-    else { return }
+    let allowed = [
+      "play_pause", "next", "previous",
+      // 私人FM卡（中号）按钮
+      "fm_play_pause", "fm_toggle_favorite", "fm_select_station",
+      "fm_open_track_1", "fm_open_track_2", "fm_open_track_3",
+      "fm_open_player", "fm_open_login",
+    ]
+    guard allowed.contains(action) else { return }
     Self.writeCommand(action)
     forwardPendingCommand()
   }

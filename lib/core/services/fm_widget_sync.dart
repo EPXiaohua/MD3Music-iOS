@@ -105,18 +105,94 @@ class FmWidgetSync {
     };
     // 封面点击：app 已被拉起，打开播放器页（与发现页 _openPlayerDetail
     // 同一条 fullPlayerRoute 路由，已有播放页在栈顶时不重复压栈）
-    MediaNotificationService.onWidgetFmOpenPlayer = () {
-      final nav = appNavigatorKey.currentState;
-      final navContext = appNavigatorKey.currentContext;
-      if (nav == null || navContext == null) return;
-      openFullPlayer(navContext);
-    };
+    MediaNotificationService.onWidgetFmOpenPlayer = _openPlayer;
     // 登录引导卡点击：app 已被拉起（MainActivity 转发），这里进登录页。
-    MediaNotificationService.onWidgetFmOpenLogin = () {
-      final nav = appNavigatorKey.currentState;
-      if (nav == null) return;
-      nav.push(MaterialPageRoute(builder: (_) => const LoginPage()));
-    };
+    MediaNotificationService.onWidgetFmOpenLogin = _openLogin;
+  }
+
+  void _openPlayer() {
+    final nav = appNavigatorKey.currentState;
+    final navContext = appNavigatorKey.currentContext;
+    if (nav == null || navContext == null) return;
+    openFullPlayer(navContext);
+  }
+
+  void _openLogin() {
+    final nav = appNavigatorKey.currentState;
+    if (nav == null) return;
+    nav.push(MaterialPageRoute(builder: (_) => const LoginPage()));
+  }
+
+  /// iOS 中号小组件（私人FM卡）按钮命令入口。与安卓同源动作走
+  /// MediaNotificationService 回调不同，iOS widget 命令经 App Group
+  /// widget_command -> 原生 WidgetSync -> player_provider 分流到这里。
+  /// 预告封面用槽位编号（fm_open_track_1/2/3）：命令串不带参数，
+  /// hash 由这里按与 [_push] 相同的算法重算。
+  Future<void> handleCommand(String action) async {
+    final kugou = _kugou;
+    final player = _player;
+    final favorites = _favorites;
+    if (kugou == null || player == null) return;
+    switch (action) {
+      case 'fm_play_pause':
+        if (_fmLoading) return;
+        // ignore: discarded_futures
+        PersonalFmWidgetActions.handlePlayPause(kugou: kugou, player: player);
+      case 'fm_toggle_favorite':
+        if (favorites == null) return;
+        // ignore: discarded_futures
+        PersonalFmWidgetActions.handleToggleFavorite(
+          kugou: kugou,
+          player: player,
+          favorites: favorites,
+        );
+      case 'fm_select_station':
+        if (_fmLoading) return;
+        markFmLoading(true);
+        try {
+          final current = await PersonalFmWidgetActions.restoreStationIndex();
+          await PersonalFmWidgetActions.handleSelectStation(
+            kugou: kugou,
+            index: (current + 1) % kFmStations.length,
+          );
+        } finally {
+          markFmLoading(false);
+        }
+      case 'fm_open_track_1' || 'fm_open_track_2' || 'fm_open_track_3':
+        final hash = _nextHashAt(
+          int.parse(action.substring('fm_open_track_'.length)) - 1,
+        );
+        if (hash == null) return;
+        // ignore: discarded_futures
+        PersonalFmWidgetActions.handleOpenTrack(
+          kugou: kugou,
+          player: player,
+          hash: hash,
+        );
+      case 'fm_open_player':
+        _openPlayer();
+      case 'fm_open_login':
+        _openLogin();
+    }
+  }
+
+  /// 与 [_push] 同一套计算：播放器当前曲之后第 [slot] 首预告曲的 hash。
+  String? _nextHashAt(int slot) {
+    final kugou = _kugou;
+    final player = _player;
+    if (kugou == null || player == null) return null;
+    final songs = kugou.personalFmSongs;
+    if (songs.isEmpty || slot < 0) return null;
+    final playingId = player.currentSong?.id;
+    final playingIndex = playingId == null
+        ? -1
+        : songs.indexWhere((s) => s.hash == playingId);
+    final currentIndex = playingIndex >= 0 ? playingIndex : 0;
+    final nextTracks = songs
+        .sublist(currentIndex + 1)
+        .take(3)
+        .toList();
+    return slot < nextTracks.length ? nextTracks[slot].hash : null;
   }
 
   void _scheduleSync() {
