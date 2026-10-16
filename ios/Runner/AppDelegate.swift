@@ -289,10 +289,21 @@ import AVKit
         let ext: String
         if let dot {
           base = String(rawName[..<dot])
-          ext = String(rawName[dot...])
+          ext = String(rawName[dot...]).lowercased()
         } else {
           base = rawName
           ext = ""
+        }
+        // 扩展名白名单 = Dart 扫描器 audioExtensions（lib/core/utils/audio_scanner.dart）。
+        // 选择器的 .audio 伞 UTI 会放进 .mid 等 conforms to audio 的非纯音频文件，
+        // 拷进去扫描器也不认（列表不显示），所以在拷贝源头直接拦掉。
+        let allowed: Set<String> = [
+          ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".ape",
+          ".wma", ".aif", ".aiff", ".aifc",
+        ]
+        guard allowed.contains(ext) else {
+          NSLog("[MD3Music] audio import skipped non-audio file: \(rawName)")
+          continue
         }
         var name = rawName
         if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
