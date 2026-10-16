@@ -15,7 +15,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/services/audio_service.dart';
 import '../core/services/audio_service_io.dart'
     hide AudioService, createAudioSource;
-import '../core/services/automix/automix_analysis.dart';
 import '../core/services/automix/automix_analysis_store.dart';
 import '../core/services/automix/automix_analyzer.dart';
 import '../core/services/automix/automix_planner.dart';
@@ -833,7 +832,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// 无损容器（判定口径同 `local_music_repository._inferQuality` 的扩展名分支）。
-  static const Set<String> _losslessCodecs = {'FLAC', 'APE', 'ALAC', 'WAV', 'DSD'};
+  static const Set<String> _losslessCodecs = {
+    'FLAC',
+    'APE',
+    'ALAC',
+    'WAV',
+    'DSD',
+  };
 
   /// 离线文件没带音质档时的如实展示。
   ///
@@ -3093,8 +3098,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 时间轴判断（是否接近尾部、曲子够不够长）在 [decideCrossfadePhase] 里。
   String? _crossfadeBlockReason() {
     if (!_crossfadeEnabled) return '开关未开启';
-    // 双播放器方案依赖 Media3（共享 audioSessionId、跳过第二个 MediaSession）
-    if (kIsWeb || !Platform.isAndroid) return '非 Android 平台';
+    // 双播放器叠化的平台支持：
+    // - Android：依赖 Media3 fork（共享 audioSessionId、辅路跳过 MediaSession）
+    // - iOS：EQ/频谱 tap 按 AVPlayerItem 附加（AudioEqualizer.swift 覆盖主/辅
+    //   两路），双 just_audio 播放器经 AVAudioSession 自然混音，无 Media3 依赖
+    // - 桌面端双播放器未验证，继续拦
+    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) {
+      return '平台不支持双播放器叠化';
+    }
     if (!_isPlaying) return '未在播放';
     if (_isResolvingUrl) return '正在解析播放链接';
     if (_handlingCompletion) return '正在处理播放结束';
@@ -6521,9 +6532,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (song.remoteType != SongRemoteType.none) {
         final resolved = await _resolvePlaybackUrl(song);
         if (resolved != null && resolved.isNotEmpty) {
-          result.add(song.remoteType == SongRemoteType.webdav
-              ? song
-              : song.copyWith(localPath: resolved));
+          result.add(
+            song.remoteType == SongRemoteType.webdav
+                ? song
+                : song.copyWith(localPath: resolved),
+          );
         } else {
           result.add(song);
         }
@@ -6623,8 +6636,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (song != null) {
         // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
         await SongMatchRepository().ensureLoaded();
-        final matchInfo =
-            song.isOnline ? null : SongMatchRepository().get(song.id);
+        final matchInfo = song.isOnline
+            ? null
+            : SongMatchRepository().get(song.id);
         final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
         // 本地歌曲优先读取内嵌歌词；单曲偏好开启时跳过，直接走在线
@@ -6711,7 +6725,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     final tracker = ListenReportService.instance.tracker;
     if (tracker.isTracking) {
       // ignore: discarded_futures
-      ListenReportService.instance.onSongEnded(reason: PlaybackEndReason.stopped);
+      ListenReportService.instance.onSongEnded(
+        reason: PlaybackEndReason.stopped,
+      );
     }
     // 云端播放历史同样在退出前结账：阈值内直接上传，失败落 pending 队列
     // （持久化，下次启动补传），进程被杀也不丢记录。
