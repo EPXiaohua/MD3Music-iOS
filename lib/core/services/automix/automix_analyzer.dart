@@ -150,7 +150,9 @@ class AutomixAnalyzer {
     required int windowMs,
   }) async {
     // 平台判断只针对真实 MethodChannel：走 handler 注入时（测试）不该被拦。
-    if (_channel != null && !Platform.isAndroid) return null;
+    // 原生实现：Android=AutomixAnalysisPlugin.kt（MediaCodec）、
+    // iOS=AutomixAnalysis.swift（AVAssetReader），两端输出契约一致。
+    if (_channel != null && !(Platform.isAndroid || Platform.isIOS)) return null;
     final args = <String, dynamic>{'uri': url, 'windowMs': windowMs};
     final raw = _handler != null
         ? await _handler!(MethodCall('decodeHead', args))

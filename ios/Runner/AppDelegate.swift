@@ -104,6 +104,10 @@ import AVKit
     HapticsBridge.shared.attach(messenger: messenger)
     MusicHapticsEngine.shared.attach(messenger: messenger)
 
+    // iOS AutoMix 分析用 PCM 解码器（对齐 Android AutomixAnalysisPlugin.kt）：
+    // 曲首 N 秒 → 单声道 Int16 小端 PCM，BPM/拍点/响度 DSP 在 Dart 侧。
+    AutomixAnalysisDecoder.shared.attach(messenger: messenger)
+
     // iOS 3D 封面（Depth Anything V2 推理 + push-pull/MI-GAN 修补 + 三层切割）。
     // 仅 3D 包定义 DEPTH_3D_LINKED（CI 写入链接 xcconfig）；标准包此段编译为空，
     // Dart 侧 MissingPluginException 走平面封面回退。
