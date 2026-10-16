@@ -74,10 +74,13 @@ struct WidgetState {
     return min(positionMs + max(0, elapsed), max(durationMs, 1))
   }
 
-  /// 封面主色（简化 vibrant）：缩到 24x24 统计饱和像素的色相分布，
-  /// 取最高频色相桶的平均色相/饱和度，亮度固定 0.62——对应 Android
-  /// 封面播放器用 Palette 取色做遮罩/按钮底色的行为。近灰封面返回 nil。
-  static func coverAccent(from image: UIImage?) -> UIColor? {
+  /// 封面取色（对齐 Android CoverPlayerWidgetProvider 的 Palette 流程）：
+  /// 缩到 24x24 统计——accent 取「有颜色」像素里最高频色相桶的平均
+  /// 色相/饱和度/亮度（对应 vibrantSwatch），scrimBase 取全像素平均色
+  /// （对应 dominantSwatch 近似，作遮罩基色）。近灰封面返回 nil。
+  static func coverPalette(
+    from image: UIImage?
+  ) -> (accent: UIColor, scrimBase: UIColor)? {
     guard let cg = image?.cgImage else { return nil }
     let w = 24, h = 24
     var pixels = [UInt8](repeating: 0, count: w * h * 4)
@@ -95,6 +98,8 @@ struct WidgetState {
     var bucketCount = [Int](repeating: 0, count: 24)
     var bucketHue = [Double](repeating: 0, count: 24)
     var bucketSat = [Double](repeating: 0, count: 24)
+    var bucketVal = [Double](repeating: 0, count: 24)
+    var sumR = 0.0, sumG = 0.0, sumB = 0.0, samples = 0.0
     var colored = 0
     for i in stride(from: 0, to: pixels.count, by: 4) {
       let a = Double(pixels[i + 3]) / 255
@@ -102,11 +107,15 @@ struct WidgetState {
       let r = Double(pixels[i]) / 255
       let g = Double(pixels[i + 1]) / 255
       let b = Double(pixels[i + 2]) / 255
+      sumR += r
+      sumG += g
+      sumB += b
+      samples += 1
       let mx = max(r, g, b)
       let mn = min(r, g, b)
       let v = mx
       let sat = mx == 0 ? 0 : (mx - mn) / mx
-      // 跳过近黑/近白/低饱和像素，只统计"有颜色"的部分
+      // 跳过近黑/近白/低饱和像素，accent 只统计"有颜色"的部分
       guard v > 0.22, v < 0.98, sat > 0.28 else { continue }
       var hue: Double
       if mx == mn {
@@ -123,15 +132,106 @@ struct WidgetState {
       bucketCount[bucket] += 1
       bucketHue[bucket] += hue / 6
       bucketSat[bucket] += sat
+      bucketVal[bucket] += v
       colored += 1
     }
-    guard colored > 8 else { return nil }
+    guard colored > 8, samples > 0 else { return nil }
     var best = 0
     for i in 1..<24 where bucketCount[i] > bucketCount[best] { best = i }
     guard bucketCount[best] > 0 else { return nil }
     let hue = bucketHue[best] / Double(bucketCount[best])
     let sat = min(max(bucketSat[best] / Double(bucketCount[best]), 0.45), 0.85)
-    return UIColor(hue: CGFloat(hue), saturation: CGFloat(sat), brightness: 0.62, alpha: 1)
+    // 亮度取桶内均值（vibrant 原色），不再强制 0.62
+    let val = min(max(bucketVal[best] / Double(bucketCount[best]), 0.35), 0.80)
+    let accent = UIColor(
+      hue: CGFloat(hue), saturation: CGFloat(sat), brightness: CGFloat(val), alpha: 1)
+    let scrimBase = UIColor(
+      red: CGFloat(sumR / samples), green: CGFloat(sumG / samples),
+      blue: CGFloat(sumB / samples), alpha: 1)
+    return (accent, scrimBase)
+  }
+}
+
+/// 小号封面播放器的取色结果（对齐 Android resolveAccent /
+/// ensureAccentReadable）：accent = 播放键圆底，onAccent = 播放键图标色，
+/// scrimBase = 遮罩渐变基色（封面主导色），scrimLight 决定文字用深/浅。
+struct CoverPalette {
+  var accent: UIColor
+  var onAccent: UIColor
+  var scrimBase: UIColor
+  var scrimLight: Bool
+
+  /// 无封面/近灰封面兜底：主题色按钮 + 深色遮罩（Android 同策略，
+  /// scrim 兜底色 0xFF10131A）。
+  static func fallback(primary: UIColor, onPrimary: UIColor) -> CoverPalette {
+    let base = UIColor(red: 0x10 / 255, green: 0x13 / 255, blue: 0x1A / 255, alpha: 1)
+    return CoverPalette(
+      accent: primary, onAccent: onPrimary, scrimBase: base,
+      scrimLight: luminance(base) > 0.5)
+  }
+
+  static func resolve(
+    image: UIImage?, primary: UIColor, onPrimary: UIColor
+  ) -> CoverPalette {
+    guard let raw = WidgetState.coverPalette(from: image) else {
+      return fallback(primary: primary, onPrimary: onPrimary)
+    }
+    let readable = ensureAccentReadable(raw.accent, scrimBase: raw.scrimBase)
+    let on: UIColor =
+      luminance(readable) > 0.5
+      ? UIColor(red: 0x1D / 255, green: 0x1B / 255, blue: 0x20 / 255, alpha: 1)
+      : .white
+    return CoverPalette(
+      accent: readable, onAccent: on, scrimBase: raw.scrimBase,
+      scrimLight: luminance(raw.scrimBase) > 0.5)
+  }
+
+  /// sRGB 相对亮度（同 Android ColorUtils.calculateLuminance）。
+  static func luminance(_ color: UIColor) -> CGFloat {
+    var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+    color.getRed(&r, green: &g, blue: &b, alpha: &a)
+    func linear(_ c: CGFloat) -> CGFloat {
+      c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+  }
+
+  /// accent 与遮罩底色亮度差不足 0.20 时，保持色相不变，把亮度往白/黑
+  /// 方向 blend 拉开到 0.30（clamp 0.10~0.75），保证播放键在遮罩上可读。
+  private static func ensureAccentReadable(
+    _ accent: UIColor, scrimBase: UIColor
+  ) -> UIColor {
+    var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+    accent.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+    let lumBase = luminance(scrimBase)
+    if abs(luminance(accent) - lumBase) >= 0.20 { return accent }
+    let brighten = lumBase < 0.5
+    var lo: CGFloat = 0.10, hi: CGFloat = 0.75
+    var best = UIColor(hue: h, saturation: s, brightness: brighten ? hi : lo, alpha: 1)
+    for _ in 0..<12 {
+      let mid = (lo + hi) / 2
+      let candidate = UIColor(hue: h, saturation: s, brightness: mid, alpha: 1)
+      let ok = abs(luminance(candidate) - lumBase) >= 0.30
+      if brighten {
+        if ok { hi = mid; best = candidate } else { lo = mid }
+      } else {
+        if ok { lo = mid; best = candidate } else { hi = mid }
+      }
+    }
+    return best
+  }
+
+  /// 文本色随遮罩明暗（对齐 Android：亮遮罩深墨字 0xE610131A、暗遮罩
+  /// 白字 0xF2FFFFFF）。
+  var textColor: Color {
+    scrimLight
+      ? Color(red: 0x10 / 255, green: 0x13 / 255, blue: 0x1A / 255).opacity(0.90)
+      : Color.white.opacity(0.95)
+  }
+  var subTextColor: Color {
+    scrimLight
+      ? Color(red: 0x10 / 255, green: 0x13 / 255, blue: 0x1A / 255).opacity(0.60)
+      : Color.white.opacity(0.70)
   }
 }
 
@@ -337,10 +437,28 @@ struct MD3MusicWidgetView: View {
         coverPlayerLayout(entry.state)
       }
     }
+    .widgetContentInset()
     .widgetBackground(background)
-    // 兜底：iOS 15/16 点击非按钮区域打开 app（按钮区域 Link 优先）；
-    // iOS 17+ 按钮走 AppIntent，其余区域同样能打开 app
-    .widgetURL(URL(string: "md3music://widget/open"))
+    // 兜底：iOS 15 全尺寸 + iOS 16 小号（small 不支持 Link 多交互区域）
+    // 整卡点按 = 播放/暂停；其余打开 app（按钮区域 Link/Button 优先）
+    .widgetURL(URL(string: fallbackTapURL))
+  }
+
+  /// 整组件点按兜底 URL：iOS 17+ 全尺寸与 iOS 16 medium/large 打开 app；
+  /// iOS 16 及以下小号因不支持多交互区域，整卡点击 = 播放/暂停。
+  private var fallbackTapURL: String {
+    if #available(iOSApplicationExtension 17.0, *) { return "md3music://widget/open" }
+    return family == .systemSmall
+      ? "md3music://widget/play_pause" : "md3music://widget/open"
+  }
+
+  /// 小号取色（对齐 Android resolveAccent：封面 vibrant + 可读性修正，
+  /// 无封面回退主题色 primary/onPrimary）。
+  private var coverPalette: CoverPalette {
+    CoverPalette.resolve(
+      image: entry.state.coverImage,
+      primary: UIColor(entry.state.primary),
+      onPrimary: UIColor(entry.state.onPrimary))
   }
 
   /// 组件背景层：小号 = 封面铺底 + 封面主色渐变遮罩（文字/按钮画在
@@ -358,46 +476,44 @@ struct MD3MusicWidgetView: View {
         } else {
           Color(UIColor(entry.state.primary))
         }
-        scrimGradient(entry.state)
+        scrimGradient(coverPalette)
       }
       .clipped()
     }
   }
 
-  /// 莫奈遮罩：封面主色自上而下加深（顶 30% 透出封面 → 底 78% 保证
-  /// 按钮区可读）；无封面时用主题 primary 淡化铺底。
-  private func scrimGradient(_ s: WidgetState) -> some View {
-    let accent = WidgetState.coverAccent(from: s.coverImage) ?? UIColor(s.primary)
-    return LinearGradient(
+  /// 遮罩：封面主导色自上而下加深（顶 20% 透出封面 → 底 88% 保证文字/
+  /// 按钮可读，对齐 Android scrim 渐变 alpha 0x33 → 0xE0）。
+  private func scrimGradient(_ palette: CoverPalette) -> some View {
+    LinearGradient(
       stops: [
-        .init(color: Color(accent).opacity(0.30), location: 0),
-        .init(color: Color(accent).opacity(0.55), location: 0.55),
-        .init(color: Color(accent).opacity(0.78), location: 1),
+        .init(color: Color(palette.scrimBase).opacity(0.20), location: 0),
+        .init(color: Color(palette.scrimBase).opacity(0.88), location: 1),
       ],
       startPoint: .top, endPoint: .bottom)
   }
 
-  /// 小号（Android 2x2 封面播放器）：中部歌名/歌手，底部三键。
+  /// 小号（Android 2x2 封面播放器）：中部歌名/歌手，底部三键。文字色
+  /// 随遮罩明暗切换（不再加阴影，可读性由遮罩保证）。
   private func coverPlayerLayout(_ s: WidgetState) -> some View {
-    VStack(spacing: 0) {
+    let palette = coverPalette
+    return VStack(spacing: 0) {
       Spacer(minLength: 0)
       VStack(spacing: 3) {
         Text(s.title.isEmpty ? "MD3Music" : s.title)
           .font(.system(size: 12, weight: .semibold))
-          .foregroundColor(.white)
-          .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+          .foregroundColor(palette.textColor)
           .lineLimit(1)
           .truncationMode(.tail)
         Text(s.artist.isEmpty ? "未在播放" : s.artist)
           .font(.system(size: 10))
-          .foregroundColor(.white.opacity(0.85))
-          .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+          .foregroundColor(palette.subTextColor)
           .lineLimit(1)
           .truncationMode(.tail)
       }
       .padding(.horizontal, 12)
       Spacer(minLength: 0)
-      transportRow(s)
+      transportRow(s, palette: palette)
         .padding(.bottom, 14)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -449,50 +565,56 @@ struct MD3MusicWidgetView: View {
     }
   }
 
-  /// 电台卡：左 112 大封面，右列 = 上排（歌名/歌手 + 收藏 + 播放）
-  /// + 底排（预告封面 x3 + 档位按钮）。行高对齐 Android：48 + 16 + 48 = 112。
+  /// 电台卡：左大封面，右列 = 上排（歌名/歌手 + 收藏 + 播放）+ 底排
+  /// （预告封面 x3 + 档位按钮）。按可用高度自适应：封面 84~104、上下
+  /// 排高 = (封面 - 14) / 2，保证内容不贴组件边缘被裁。
   private func fmRadioCard(_ fm: WidgetFmState) -> some View {
-    HStack(spacing: 12) {
-      fmCover(fm)
-      VStack(spacing: 0) {
-        HStack(spacing: 4) {
-          VStack(alignment: .leading, spacing: 3) {
-            Text(fm.title)
-              .font(.system(size: 14, weight: .medium))
-              .foregroundColor(fm.onSurface)
-              .lineLimit(2)
-              .truncationMode(.tail)
-            if !fm.artist.isEmpty {
-              Text(fm.artist)
-                .font(.system(size: 12))
-                .foregroundColor(fm.onSurfaceVariant)
-                .lineLimit(1)
+    GeometryReader { geo in
+      let coverSize = min(max(geo.size.height - 32, 84), 104)
+      let rowHeight = (coverSize - 14) / 2
+      HStack(spacing: 12) {
+        fmCover(fm, size: coverSize)
+        VStack(spacing: 0) {
+          HStack(spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
+              Text(fm.title)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(fm.onSurface)
+                .lineLimit(rowHeight < 42 ? 1 : 2)
                 .truncationMode(.tail)
+              if !fm.artist.isEmpty {
+                Text(fm.artist)
+                  .font(.system(size: 12))
+                  .foregroundColor(fm.onSurfaceVariant)
+                  .lineLimit(1)
+                  .truncationMode(.tail)
+              }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            fmFavoriteButton(fm, size: rowHeight)
+            fmPlayButton(fm, size: rowHeight)
           }
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-          fmFavoriteButton(fm)
-          fmPlayButton(fm)
-        }
-        .frame(height: 48)
-        HStack(spacing: 8) {
-          ForEach(0..<3, id: \.self) { i in
-            if !fm.nextHashes[i].isEmpty {
-              fmNextSlot(fm, i)
+          .frame(height: rowHeight)
+          HStack(spacing: 8) {
+            ForEach(0..<3, id: \.self) { i in
+              if !fm.nextHashes[i].isEmpty {
+                fmNextSlot(fm, i, size: rowHeight)
+              }
             }
+            Spacer(minLength: 0)
+            fmStationButton(fm, size: rowHeight * 0.8)
           }
-          Spacer(minLength: 0)
-          fmStationButton(fm)
+          .frame(height: rowHeight)
+          .padding(.top, 14)
         }
-        .frame(height: 48)
-        .padding(.top, 16)
+        .frame(height: coverSize)
       }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// 当前封面 112 圆角 16（点击打开播放器页），无图回退音符占位。
-  private func fmCover(_ fm: WidgetFmState) -> some View {
+  /// 当前封面（点击打开播放器页），无图回退音符占位。尺寸随卡片高度自适应。
+  private func fmCover(_ fm: WidgetFmState, size: CGFloat) -> some View {
     fmTappable(action: "fm_open_player") {
       ZStack {
         if let image = fm.cover {
@@ -502,28 +624,28 @@ struct MD3MusicWidgetView: View {
         } else {
           Rectangle().fill(fm.surfaceHighest)
           Image(systemName: "music.note")
-            .font(.system(size: 36))
+            .font(.system(size: size * 0.32))
             .foregroundColor(fm.onSurfaceVariant)
         }
       }
-      .frame(width: 112, height: 112)
-      .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+      .frame(width: size, height: size)
+      .clipShape(RoundedRectangle(cornerRadius: size * 0.143, style: .continuous))
     }
   }
 
   /// 收藏：已红心 primary 实心心，未红心 onSurfaceVariant 描边心。
-  private func fmFavoriteButton(_ fm: WidgetFmState) -> some View {
+  private func fmFavoriteButton(_ fm: WidgetFmState, size: CGFloat) -> some View {
     fmTappable(action: "fm_toggle_favorite") {
       Image(systemName: fm.isFavorite ? "heart.fill" : "heart")
-        .font(.system(size: 22))
+        .font(.system(size: size * 0.46))
         .foregroundColor(fm.isFavorite ? fm.primary : fm.onSurfaceVariant)
-        .frame(width: 48, height: 48)
+        .frame(width: size, height: size)
     }
   }
 
   /// 播放/暂停：primary 圆底 + onPrimary 图标，加载中显示静态转圈
   /// （RemoteViews 的弧线动画在 SwiftUI 里同样不可用）。
-  private func fmPlayButton(_ fm: WidgetFmState) -> some View {
+  private func fmPlayButton(_ fm: WidgetFmState, size: CGFloat) -> some View {
     fmTappable(action: "fm_play_pause") {
       ZStack {
         Circle().fill(fm.primary)
@@ -531,16 +653,16 @@ struct MD3MusicWidgetView: View {
           systemName: fm.isLoading
             ? "arrow.triangle.2.circlepath" : (fm.isPlaying ? "pause.fill" : "play.fill")
         )
-        .font(.system(size: 25, weight: .semibold))
+        .font(.system(size: size * 0.52, weight: .semibold))
         .foregroundColor(fm.onPrimary)
       }
-      .frame(width: 48, height: 48)
+      .frame(width: size, height: size)
     }
   }
 
-  /// 预告封面槽 48 圆角 12：点击后台起播对应曲（命令带槽位编号，
+  /// 预告封面槽：点击后台起播对应曲（命令带槽位编号，
   /// hash 由 Dart 侧按当前队列重算）。
-  private func fmNextSlot(_ fm: WidgetFmState, _ i: Int) -> some View {
+  private func fmNextSlot(_ fm: WidgetFmState, _ i: Int, size: CGFloat) -> some View {
     fmTappable(action: "fm_open_track_\(i + 1)") {
       ZStack {
         if let image = fm.nextCovers[i] {
@@ -550,18 +672,18 @@ struct MD3MusicWidgetView: View {
         } else {
           Rectangle().fill(fm.surfaceHighest)
           Image(systemName: "music.note")
-            .font(.system(size: 18))
+            .font(.system(size: size * 0.375))
             .foregroundColor(fm.onSurfaceVariant)
         }
       }
-      .frame(width: 48, height: 48)
-      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .frame(width: size, height: size)
+      .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
     }
   }
 
-  /// 档位按钮 40 圆钮：显示当前档位图标（0 红心/1 探索/2 小众/3 电台，
-  /// SF Symbols 对应 Android 的四档叠放图标），点击循环切下一档。
-  private func fmStationButton(_ fm: WidgetFmState) -> some View {
+  /// 档位按钮（0 红心/1 探索/2 小众/3 电台，SF Symbols 对应 Android 的
+  /// 四档叠放图标），点击循环切下一档。
+  private func fmStationButton(_ fm: WidgetFmState, size: CGFloat) -> some View {
     let icons = [
       "heart.fill", "safari", "diamond", "antenna.radiowaves.left.and.right",
     ]
@@ -570,10 +692,10 @@ struct MD3MusicWidgetView: View {
       ZStack {
         Circle().fill(fm.surfaceHigh)
         Image(systemName: icons[index])
-          .font(.system(size: 19))
+          .font(.system(size: size * 0.475))
           .foregroundColor(fm.onSurfaceVariant)
       }
-      .frame(width: 40, height: 40)
+      .frame(width: size, height: size)
     }
   }
 
@@ -607,30 +729,29 @@ struct MD3MusicWidgetView: View {
     }
   }
 
-  /// 三键行（小号封面播放器）：上一首 / 播放暂停 / 下一首，裸图标 +
-  /// 白色半透明圆底播放键。
-  private func transportRow(_ s: WidgetState) -> some View {
+  /// 三键行（小号封面播放器）：上一首 / 播放暂停 / 下一首。上一首/下一首
+  /// 图标 = 文本色；播放键圆底 = 封面 accent，图标随圆底明暗取深墨/白
+  /// （对齐 Android resolveAccent 的 onAccent）。
+  private func transportRow(_ s: WidgetState, palette: CoverPalette) -> some View {
     HStack(spacing: 26) {
       transportButton(action: "previous") {
         Image(systemName: "backward.end.fill")
           .font(.system(size: 14, weight: .semibold))
-          .foregroundColor(.white)
+          .foregroundColor(palette.textColor)
           .frame(width: 32, height: 32)
-          .shadow(color: .black.opacity(0.35), radius: 2)
       }
       transportButton(action: "play_pause") {
         Image(systemName: s.isPlaying ? "pause.fill" : "play.fill")
           .font(.system(size: 16.8, weight: .semibold))
-          .foregroundColor(Color(UIColor(white: 0.13, alpha: 1)))
+          .foregroundColor(Color(palette.onAccent))
           .frame(width: 40, height: 40)
-          .background(Circle().fill(Color.white.opacity(0.82)))
+          .background(Circle().fill(Color(palette.accent)))
       }
       transportButton(action: "next") {
         Image(systemName: "forward.end.fill")
           .font(.system(size: 14, weight: .semibold))
-          .foregroundColor(.white)
+          .foregroundColor(palette.textColor)
           .frame(width: 32, height: 32)
-          .shadow(color: .black.opacity(0.35), radius: 2)
       }
     }
   }
@@ -668,6 +789,18 @@ private extension View {
       containerBackground(for: .widget) { background }
     } else {
       padding(-16).background(background)
+    }
+  }
+
+  /// iOS 15/16 内容层安全边距：widgetBackground 用负 padding 把背景外扩
+  /// 铺满组件时，内容层也跟着外扩到组件边缘——加回 16pt 抵消，避免文字/
+  /// 按钮贴边被裁（iOS 17+ containerBackground 自带 content margin，不需要）。
+  @ViewBuilder
+  func widgetContentInset() -> some View {
+    if #available(iOSApplicationExtension 17.0, *) {
+      self
+    } else {
+      padding(16)
     }
   }
 }

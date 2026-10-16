@@ -298,6 +298,10 @@ Future<void> _restoreLyricPushPref() async {
     // 蓝牙歌词（独立开关）
     final btLyricEnabled = await settings.getBluetoothLyricEnabled();
     await DesktopLyricService.instance.setBluetoothLyricEnabled(btLyricEnabled);
+    // 原生侧开关同步恢复（设置页行为一致）：iOS 由 NowPlayingService 在
+    // init 前暂存、会话就绪后补发；Android 走原生通道覆盖共享开关。
+    // 缺了这步，冷启动后原生端仍是默认关闭，锁屏/控制中心看不到歌词替换。
+    await MediaNotificationService.setBluetoothLyricEnabled(btLyricEnabled);
 
     // 锁屏歌词（独立开关）：开启后歌词服务定时器运行以推送整首歌词
     // （样式全部跟随 AM 歌词偏好，与播放页 Zen 沉浸模式一致）

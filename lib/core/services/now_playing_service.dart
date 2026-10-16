@@ -19,6 +19,10 @@ class NowPlayingService {
   );
 
   bool _initialized = false;
+  // 蓝牙歌词开关在 init() 之前被调用时（冷启动 _restoreLyricPushPref
+  // 先于 PlayerProvider 初始化）先暂存，init() 会话就绪后补发原生。
+  bool _btLyricEnabled = false;
+  bool _btLyricPending = false;
 
   /// 远程命令回调（由 PlayerProvider 注入）。
   ///
@@ -43,6 +47,11 @@ class NowPlayingService {
       await session.setActive(true);
     } catch (e) {
       debugPrint('[NowPlaying] configure audio session failed: $e');
+    }
+    // 补发冷启动阶段暂存的蓝牙歌词开关（channel 已就绪）
+    if (_btLyricPending) {
+      _btLyricPending = false;
+      await setBluetoothLyricEnabled(_btLyricEnabled);
     }
   }
 
@@ -122,8 +131,14 @@ class NowPlayingService {
   }
 
   /// 蓝牙歌词开关：关闭时立即恢复锁屏真实标题/艺术家。
+  /// init() 之前调用时暂存不丢弃（冷启动恢复路径）。
   Future<void> setBluetoothLyricEnabled(bool enabled) async {
-    if (!_initialized || !Platform.isIOS) return;
+    if (!Platform.isIOS) return;
+    if (!_initialized) {
+      _btLyricEnabled = enabled;
+      _btLyricPending = true;
+      return;
+    }
     try {
       await _channel.invokeMethod('setBluetoothLyricEnabled', <String, dynamic>{
         'enabled': enabled,
