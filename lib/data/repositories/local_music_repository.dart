@@ -9,6 +9,7 @@ import '../models/artist.dart';
 import '../models/music_folder.dart';
 import '../models/song.dart';
 import '../../core/services/media_store_service.dart';
+import '../../core/services/remote/remote_storage_config.dart';
 import '../../core/utils/audio_scanner.dart';
 
 /// 本地音乐仓库：负责扫描设备存储中的音频文件并构建分类数据。
@@ -87,7 +88,9 @@ class LocalMusicRepository {
   Future<void> saveSongs(List<Song> songs) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final jsonList = songs.map((s) => s.toJson()).toList();
+      final jsonList = songs
+          .map((s) => {...s.toJson(), 'localQualityVersion': 1})
+          .toList();
       await prefs.setString(_cachedSongsKey, jsonEncode(jsonList));
       await prefs.setInt(_cachedAtKey, DateTime.now().millisecondsSinceEpoch);
       debugPrint('[LocalMusicRepository] 已缓存 ${songs.length} 首歌曲');
@@ -106,7 +109,19 @@ class LocalMusicRepository {
       final raw = prefs.getString(_cachedSongsKey);
       if (raw == null || raw.isEmpty) return [];
       final list = jsonDecode(raw) as List<dynamic>;
-      return list.map((e) => Song.fromJson(e as Map<String, dynamic>)).toList();
+      return list.map((e) {
+        final data = Map<String, dynamic>.from(e as Map);
+        final song = Song.fromJson(data);
+        if (data['localQualityVersion'] != 1 &&
+            !song.isOnline &&
+            song.remoteType == SongRemoteType.none) {
+          // 旧索引没有保存原始码率，无法恢复真实档位；保留歌曲，只撤销不可信标签。
+          // 重新扫描后会以正确的 bps 规则补回，不能用旧的“无损”反推码率。
+          data['quality'] = inferQuality(null, song.localPath);
+          return Song.fromJson(data);
+        }
+        return song;
+      }).toList();
     } catch (e) {
       debugPrint('[LocalMusicRepository] 读取缓存歌曲失败: $e');
       return [];
@@ -183,22 +198,26 @@ class LocalMusicRepository {
   /// 根据码率和文件扩展名推断本地音质标签。
   ///
   /// 规则：
-  /// - FLAC/APE/WAV → 'flac'（无损格式直接判定为无损）
-  /// - bitrate > 320kbps → 'flac'（码率超过 320 判定为无损）
-  /// - bitrate > 128kbps → '320'（高品质）
+  /// - 已知无损格式 → 'flac'，不凭码率大小推断无损或 Hi-Res
+  /// - bitrate > 128000 bps → '320'（高品质）
   /// - bitrate > 0 → '128'（标准音质）
   /// - bitrate == 0 且无法判定 → null
-  static String? _inferQuality(int? bitrate, String? filePath) {
+  /// MediaStore 与 audio_metadata_reader 均返回 bps，而非 kbps。
+  @visibleForTesting
+  static String? inferQuality(int? bitrate, String? filePath) {
     // 无损格式直接判定
     if (filePath != null) {
       final ext = filePath.toLowerCase().split('.').last;
-      if (ext == 'flac' || ext == 'ape' || ext == 'wav' || ext == 'aiff') {
+      if (ext == 'flac' ||
+          ext == 'ape' ||
+          ext == 'wav' ||
+          ext == 'aif' ||
+          ext == 'aiff') {
         return 'flac';
       }
     }
     if (bitrate == null || bitrate <= 0) return null;
-    if (bitrate > 320) return 'flac';
-    if (bitrate > 128) return '320';
+    if (bitrate > 128000) return '320';
     return '128';
   }
 
@@ -262,7 +281,11 @@ class LocalMusicRepository {
             localPath: filePath,
             artworkUri: albumArtUri ?? 'local://$filePath',
             isOnline: false,
-            quality: _inferQuality(bitrate, filePath),
+            // content URI/私有拷贝可能没有扩展名，使用 MediaStore 原始文件名。
+            quality: inferQuality(
+              bitrate,
+              (data['displayName'] as String?) ?? filePath,
+            ),
           ),
         );
       }
@@ -325,7 +348,7 @@ class LocalMusicRepository {
               // 用 local:// 前缀标识内嵌封面，UI 层通过 LocalArtworkCache 懒加载
               artworkUri: 'local://$filePath',
               isOnline: false,
-              quality: _inferQuality(bitrate, filePath),
+              quality: inferQuality(bitrate, filePath),
             ),
           );
         }

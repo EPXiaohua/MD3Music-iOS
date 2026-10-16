@@ -260,12 +260,19 @@ Path _buildCenterLine({
 /// 解算时被**垂直半径上限**（`(centerBottom - centerTop) / 2`）钳制以保证 stadium
 /// 成立：标准胶囊（高 = 2 × cornerRadius）下该钳制恰好等于 `cornerRadius - inset`，
 /// 与既有包边的中心线半径一致。
+///
+/// [barHeight] 是**条盒**高度（非进度盒）：中心线的垂直基准由进度盒中线
+/// （`size.height / 2`）连续移到条盒中心（`barHeight / 2`）。交叉过渡浮层里进度盒
+/// 高会由 2 长到整条高，若中心线恒取进度盒中线，中段包边会随进度盒下移、贴在条体
+/// 偏上处被封面盖住（2026-10-12 会诊 W2）。传 0（常驻条真身的 formT=0 调用点）时
+/// 退化为进度盒中线，与原行为逐像素一致。
 @visibleForTesting
 BarProgressGeometry resolveBarProgressGeometry({
   required Size size,
   required double formT,
   required double cornerRadius,
   double progress = 0.0,
+  double barHeight = 0.0,
   double gapSize = 0.0,
   StrokeCap strokeCap = StrokeCap.round,
 }) {
@@ -277,7 +284,15 @@ BarProgressGeometry resolveBarProgressGeometry({
     t,
   )!;
   final double inset = lerpDouble(0.0, kPlayerBarProgressRimInset, t)!;
-  final double midY = size.height / 2;
+  // 中心线 y 基准：从**进度盒中线**（`size.height / 2`，常驻条贴顶直线所在）
+  // 连续移到**条盒中心**（`barHeight / 2`，胶囊整圈的内缘）。若恒取进度盒中线，
+  // 进度盒高由 2 长到整条高时会带着整条中心线一起下移，中段包边贴在条体偏上处、
+  // 被后画的封面盖住（2026-10-12 会诊 W2：t=0.5 时 y≈21.8）。`barHeight <= 0`
+  // （常驻条真身的 formT=0 调用点）时退化为进度盒中线，与原行为逐像素一致。
+  final double boxMidY = size.height / 2;
+  final double midY = (t <= 0.0 || barHeight <= 0.0)
+      ? boxMidY
+      : lerpDouble(boxMidY, barHeight / 2, t)!;
   final double centerTop = lerpDouble(midY, inset, t)!;
   final double centerBottom = lerpDouble(midY, size.height - inset, t)!;
   final double maxRadius = (centerBottom - centerTop) / 2;
@@ -396,6 +411,7 @@ class PlayerBarProgressPainter extends CustomPainter {
     required this.trackColor,
     required this.activeColor,
     required this.cornerRadius,
+    this.barHeight = 0.0,
     this.gapSize = 0.0,
     this.strokeCap = StrokeCap.round,
     this.stopIndicatorSize = 0.0,
@@ -417,6 +433,12 @@ class PlayerBarProgressPainter extends CustomPainter {
   /// 中心线四角半径（调用方传 `lerp(0, discDiameter / 2)`）。
   final double cornerRadius;
 
+  /// 条盒高度（交叉过渡浮层传 `layout.barHeight`）：中心线的垂直基准由
+  /// **进度盒中线**连续移到**条盒中心**（见 [resolveBarProgressGeometry] 的
+  /// `midY`）。`<= 0`（常驻条真身的 formT=0 调用点）时退化为进度盒中线，与
+  /// 改动前逐像素一致。
+  final double barHeight;
+
   /// active 描边末端与 track 描边起端之间的间隙（直线态 = M3E 的 4dp
   /// [kPlayerBarProgressLineGap]；胶囊态传不传都无所谓，几何会按 formT 归零）。
   final double gapSize;
@@ -437,6 +459,7 @@ class PlayerBarProgressPainter extends CustomPainter {
       formT: formT,
       cornerRadius: cornerRadius,
       progress: progress,
+      barHeight: barHeight,
       gapSize: gapSize,
       strokeCap: strokeCap,
     );
@@ -511,6 +534,7 @@ class PlayerBarProgressPainter extends CustomPainter {
       oldDelegate.trackColor != trackColor ||
       oldDelegate.activeColor != activeColor ||
       oldDelegate.cornerRadius != cornerRadius ||
+      oldDelegate.barHeight != barHeight ||
       oldDelegate.gapSize != gapSize ||
       oldDelegate.strokeCap != strokeCap ||
       oldDelegate.stopIndicatorSize != stopIndicatorSize;

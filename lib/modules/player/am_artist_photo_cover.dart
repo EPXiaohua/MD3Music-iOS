@@ -89,6 +89,16 @@ class ArtistPhotoController extends ChangeNotifier {
     _currentUrl.value = urls.first;
   }
 
+  /// 轮播间隔变更（设置页改动后）：只按新间隔重起定时器。
+  ///
+  /// 刻意不重跑 [setHash]——那会清空当前图集并重新请求，画面要闪一下空白；
+  /// 间隔是纯调度参数，重起 [Timer.periodic] 即可。无图 / 单图时无事可做
+  /// （与 [_startTimer] 的启动条件保持一致）。
+  void setInterval(int intervalSeconds) {
+    if (_urls.length <= 1) return;
+    _startTimer(intervalSeconds);
+  }
+
   void _apply(List<String> urls) {
     final hadImages = hasImages;
     _urls = urls;
@@ -314,7 +324,9 @@ class AmArtistPhotoCover extends StatelessWidget {
     required this.currentUrl,
     this.feather = AmPhotoFeather.vertical,
     this.photoWidthFraction = 1.0,
-  }) : assert(photoWidthFraction > 0 && photoWidthFraction <= 1);
+    this.opacity = 1.0,
+  }) : assert(photoWidthFraction > 0 && photoWidthFraction <= 1),
+       assert(opacity >= 0 && opacity <= 1);
 
   /// 当前图片 URL（null = 无图，整层收缩）。
   final ValueListenable<String?> currentUrl;
@@ -324,6 +336,15 @@ class AmArtistPhotoCover extends StatelessWidget {
 
   /// 图片内容占绘制区域的宽度比例；遮罩与滤镜始终覆盖整页，避免内部硬裁剪接缝。
   final double photoWidthFraction;
+
+  /// 写真层自身的不透明度：1 = 原样，0 = 完全不可见。
+  ///
+  /// 对应设置页「写真背景透明度」，由调用方换算（该设置是**遮罩浓度**，
+  /// 值越大写真越淡，故这里传 `1 - artistPhotoOpacity`）。
+  ///
+  /// 作用在**整幅写真**（含模糊底与两层羽化罩）之上，因此羽化带已经透明的
+  /// 部分不会被染色 —— 若改成在外部叠一层带色遮罩，会连页面背景一起压暗。
+  final double opacity;
 
   static Widget _photo(String url, String role) => CachedNetworkImage(
     // 同 Stack 两枚图必须不同 key：重复 ValueKey(url) 在转场位移的
@@ -340,6 +361,13 @@ class AmArtistPhotoCover extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 写真整体不透明度（设置页「写真背景透明度」由调用方换算后传入）。
+    // 包在整幅写真之外，而非在外部叠一层带色遮罩——后者会把页面背景一起压暗。
+    if (opacity >= 1.0) return _buildPhoto();
+    return Opacity(opacity: opacity, child: _buildPhoto());
+  }
+
+  Widget _buildPhoto() {
     return ValueListenableBuilder<String?>(
       valueListenable: currentUrl,
       builder: (context, url, _) {

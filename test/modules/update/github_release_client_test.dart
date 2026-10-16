@@ -69,5 +69,22 @@ void main() {
       );
       expect(info.version, '5.6.5');
     });
+
+    test('剥离 +构建号 后缀，tagName 保留原样', () {
+      final info = ReleaseInfo.fromTag(
+        tagName: 'v5.8.1+47',
+        htmlUrl: 'https://github.com/EPXiaohua/MD3Music-iOS/releases/tag/v5.8.1%2B47',
+      );
+      expect(info.tagName, 'v5.8.1+47');
+      expect(info.version, '5.8.1');
+    });
+
+    test('剥离 -预发布 后缀', () {
+      final info = ReleaseInfo.fromTag(
+        tagName: 'v6.0.0-beta.1',
+        htmlUrl: 'https://example.com',
+      );
+      expect(info.version, '6.0.0');
+    });
   });
 }

@@ -6,19 +6,43 @@
 library;
 
 /// 从 busi_vip 列表中找到指定 `productType` 且已开通（`is_vip == 1`）的会员项。
-/// 对应 EchoMusic `busi_vip.find(v => v.product_type===X && v.is_vip===1)`；
-/// 找不到返回 null。
+///
+/// 同一业务线可能同时存在**多条**已开通记录——例如每日签到领取的 1 天畅听会员
+/// 与购买的长期畅听会员会在 `busi_vip` 里各占一条。此时必须取 `vip_end_time`
+/// **最晚**的一条：它才是该业务线当前生效的最终权益。旧实现取数组第一个匹配项，
+/// 会把签到领的短期会员当成最终状态展示（真机案例：账号购买的畅听VIP 有效期至
+/// 2027-09-22，用户中心却显示「23小时后到期」）。
+///
+/// 找不到返回 null；所有匹配项的 `vip_end_time` 均无法解析时，退回第一个匹配项。
 Map<String, dynamic>? findActiveBusiVip(
   List<Map<String, dynamic>>? list,
   String productType,
 ) {
   if (list == null) return null;
+  Map<String, dynamic>? best;
+  DateTime? bestEnd;
   for (final b in list) {
-    if (b['is_vip'] == 1 && b['product_type']?.toString() == productType) {
-      return b;
+    if (b['is_vip'] != 1) continue;
+    if (b['product_type']?.toString() != productType) continue;
+    final end = _parseVipEndTime(b['vip_end_time']);
+    if (best == null) {
+      // 首个匹配项先占位（其 vip_end_time 可能缺失或无法解析）
+      best = b;
+      bestEnd = end;
+    } else if (end != null && (bestEnd == null || end.isAfter(bestEnd))) {
+      best = b;
+      bestEnd = end;
     }
   }
-  return null;
+  return best;
+}
+
+/// 解析 `vip_end_time`（形如 "2027-09-22 00:00:00"）；空值或解析失败返回 null。
+DateTime? _parseVipEndTime(Object? value) {
+  if (value == null) return null;
+  final s = value.toString();
+  if (s.isEmpty) return null;
+  return DateTime.tryParse(s.replaceFirst(' ', 'T'));
 }
 
 /// 相对到期时间文案（移植自 EchoMusic Profile.vue 的 `getVipExpireText`）。

@@ -160,6 +160,22 @@ final ValueNotifier<bool> kSecondaryPlayerOnPrimaryPages =
 /// 常驻 Ticker / repeat（AGENTS §10）。
 final ValueNotifier<double> kBottomBarFormProgress = ValueNotifier<double>(0.0);
 
+/// 底栏形态**交棒飞行窗口**是否开启（`app.dart` 的 `_MainLayoutState` 写入）。
+///
+/// 与 [kBottomBarFormProgress]（动画进度）互补：进度在端点（0 / 1）无法区分
+/// 「静止」与「飞行刚起跑」，而交棒必须让**源真身与目的真身**在正确的那一帧各自
+/// 就位 —— 否则目的形态真身会抢闸画出（切换瞬间跳一下）。窗口用独立布尔：起跑与
+/// 「让位基准」同帧置 true、动画收敛/吸附置 false。`p` 保持端点值、由动画自身推进。
+final ValueNotifier<bool> kBarFormFlightActive = ValueNotifier<bool>(false);
+
+/// 交棒窗口内**哪一端真身是源形态**（true = 常驻条端为源）。
+///
+/// 窗口内两端真身**都保持挂载**（不改挂载条件 —— 卸载会重建封面 State），可见性
+/// 由它分流：**源端 onstage**（浮层天然盖在 Navigator 之上、把它盖住，故无需 offstage，
+/// `保挂载` 成立）、**目的端 offstage**（避免「浮层 + 目的真身」同屏双条）。收敛当帧
+/// 本值随窗口一起失效。
+final ValueNotifier<bool> kBarFormResidentIsSource = ValueNotifier<bool>(true);
+
 /// 底栏目标形态：0 = 常驻条，1 = 悬浮胶囊（**纯函数**，便于单测）。
 ///
 /// **为什么是这三个输入**（依据 `secondary_mini_player.dart:205-212` 的形态分支）：

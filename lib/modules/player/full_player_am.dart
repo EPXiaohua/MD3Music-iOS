@@ -202,6 +202,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   /// 「build 改字段不 setState」是同一约束）。
   String _photoScheduledHash = '';
 
+  /// 已应用到轮播定时器的间隔（秒）。设置页改「轮播间隔」后，播放中也要即时
+  /// 生效——比对它决定是否重起定时器（见 [_buildFullLayout]）。
+  int _photoIntervalApplied = 0;
+
   // 桌面歌词状态监听：长按歌词按钮 toggle 后同步 icon
   late final VoidCallback _onDesktopLyricChanged;
 
@@ -2062,15 +2066,19 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 拖拽展开模式下系统栏样式跟随展开进度，避免拖动过程提前切换（见 PlayerSystemUiScope）
     // 歌手写真：开关开 + 在线歌曲才加载（本地歌没有写真数据）。
     // 写真只进封面位置，不进页面背景——背景 Stack 恢复 09d705d 之前的形态。
-    final usePhotoBg = context.watch<ThemeProvider>().useArtistPhotoBackground;
-    final wantedPhotoHash = usePhotoBg && currentSong.isOnline
-        ? currentSong.id
-        : '';
+    final theme = context.watch<ThemeProvider>();
+    final usePhotoBg = theme.useArtistPhotoBackground;
+    final wantedPhotoHash =
+        usePhotoBg && currentSong.isOnline ? currentSong.id : '';
+    final photoInterval = theme.artistPhotoInterval;
+    // 设置页「写真背景透明度」是**遮罩浓度**（值越大写真越淡），这里换算成
+    // 写真层自身的不透明度。与 MD3 播放页读的是同一个 ThemeProvider 值。
+    final photoOpacity = 1.0 - theme.artistPhotoOpacity;
     if (wantedPhotoHash != _photoScheduledHash) {
       _photoScheduledHash = wantedPhotoHash;
+      _photoIntervalApplied = photoInterval;
       // 路由接管首帧：同步吃 static 缓存，杜绝方封面闪一帧（见 seedFromCache）
       _photoController.seedFromCache(wantedPhotoHash);
-      final photoInterval = context.read<ThemeProvider>().artistPhotoInterval;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
           // ignore: discarded_futures
@@ -2079,6 +2087,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             intervalSeconds: photoInterval,
           );
         }
+      });
+    } else if (photoInterval != _photoIntervalApplied) {
+      // 同一首歌播放中改「轮播间隔」：只按新间隔重起定时器，不清图、不重拉
+      // （重跑 setHash 会清空图集并重新请求，画面闪空白）；否则要等下一首才生效。
+      _photoIntervalApplied = photoInterval;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _photoController.setInterval(photoInterval);
       });
     }
     // 写真功能开着 → 关闭封面形变（文字形变保留）。每次 build 现写，
@@ -2122,22 +2137,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             _buildDarkOverlay(),
             // 写真统一放在页面背景层：紧凑手机覆盖顶栏到控制区，避免 PageView 与相邻区域的裁剪边缘露线。
             // 宽屏仍只铺左栏，并在左右外缘羽化；两种布局共用控制器与加载状态。
+            // 紧凑手机另加一层门控：**只在本页为封面页时显示**（见
+            // [_buildCompactPhotoBackground]）——滑到歌单/歌词/评论后歌词页不该
+            // 再有写真背景。
             if (getScreenType(MediaQuery.sizeOf(context).width) ==
                 ScreenType.compact)
               Positioned.fill(
-                child: ListenableBuilder(
-                  listenable: _photoController,
-                  builder: (context, _) => _photoCoverActive
-                      ? RepaintBoundary(
-                          child: IgnorePointer(
-                            child: AmArtistPhotoCover(
-                              currentUrl: _photoController.currentUrl,
-                              feather: AmPhotoFeather.vertical,
-                            ),
-                          ),
-                        )
-                      : const SizedBox.shrink(),
-                ),
+                child: _buildCompactPhotoBackground(photoOpacity),
               ),
             if (getScreenType(MediaQuery.sizeOf(context).width) !=
                 ScreenType.compact)
@@ -2152,6 +2158,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                               currentUrl: _photoController.currentUrl,
                               feather: AmPhotoFeather.rightEdge,
                               photoWidthFraction: 0.4,
+                              opacity: photoOpacity,
                             ),
                           ),
                         )
@@ -2189,6 +2196,47 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 紧凑手机（竖屏）的写真背景层：**只在本页为封面页时绘制**。
+  ///
+  /// 写真照旧铺满整页（背景层形态与羽化调校都不动），但页位置一旦离开封面页就
+  /// 不再渲染——用户要求「歌词界面没有写真背景，只在封面页显示」。
+  /// 判据取 [TabController.animation] 的连续值（= index + offset，由
+  /// [PlayerTabPager] 逐帧镜像写入），因此跟手滑走时写真随之淡出，
+  /// 不会在下标翻页那一帧硬切。宽屏没有封面 tab（`coverIndex == -1`），
+  /// 封面常驻左栏，不走本方法。
+  Widget _buildCompactPhotoBackground(double photoOpacity) {
+    final tabAnimation = _tabController.animation;
+    final coverPage = _tabLayout.coverIndex.toDouble();
+    return AnimatedBuilder(
+      // 只用它驱动「离封面页多远」的重算；写真本体由 child 传入，不随帧重建。
+      animation: tabAnimation ?? const AlwaysStoppedAnimation<double>(0.0),
+      builder: (context, child) {
+        final t = tabAnimation == null
+            ? 0.0
+            : (tabAnimation.value - coverPage).abs().clamp(0.0, 1.0);
+        // 已离开封面页一整页（歌单 / 歌词 / 评论）：整层不构建，
+        // 连模糊底与图片层一起省掉。
+        if (t >= 1.0) return const SizedBox.shrink();
+        // 0..1 之间跟手淡出：下标在滑程 50% 处才翻页，硬切会看到一次跳变。
+        return Opacity(opacity: 1 - t, child: child!);
+      },
+      child: ListenableBuilder(
+        listenable: _photoController,
+        builder: (context, _) => _photoCoverActive
+            ? RepaintBoundary(
+                child: IgnorePointer(
+                  child: AmArtistPhotoCover(
+                    currentUrl: _photoController.currentUrl,
+                    feather: AmPhotoFeather.vertical,
+                    opacity: photoOpacity,
+                  ),
+                ),
+              )
+            : const SizedBox.shrink(),
       ),
     );
   }

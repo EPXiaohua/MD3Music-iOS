@@ -1589,6 +1589,12 @@ class _MainLayoutState extends State<_MainLayout>
     // 不必再播一段 260ms）。
     _barFormTargetIsCapsule = _resolveBarFormTargetIsCapsule();
     _lastSyncedBarFormTabIndex = _selectedIndex;
+    // 窗口判据自起跑同帧写 true、源端标记置「常驻条端为源」：路由初始视口一定
+    // 是常驻条页（`_resolveBarFormTargetIsCapsule` 在冷启动恒 false），此后
+    // `_openBarFormFlight` 只在真切换时写。若不置位，首次动画的前半程判据仍闭着，
+    // 端点不登记/让位，浮层会对着空场画。`p` 保持 0，由动画自身推进。
+    kBarFormFlightActive.value = false;
+    kBarFormResidentIsSource.value = true;
     _barFormController = AnimationController(
       vsync: this,
       duration: kBottomChromeToggleDuration,
@@ -2763,6 +2769,20 @@ class _MainLayoutState extends State<_MainLayout>
     } else {
       _barFormController.reverse();
     }
+    // **同一帧**开窗 + 写源端（2026-10-12 会诊 W1）：判据曾只看 `0 < p < 1`，
+    // 但起跑帧 `p` 仍是端点值，目的真身要等 `p` 离开端点那一帧才让位 —— 空窗一帧，
+    // 目的真身抢闸画出（跳变）。窗口与让位都在这帧置位，`p` 端点值不影响判据。
+    _openBarFormFlight(_barFormTargetIsCapsule);
+  }
+
+  /// 开窗：写窗口开关 + 源端标记（是否从常驻条端发起）。
+  ///
+  /// 写入顺序刻意「先目的、后窗口」：让位 builder 与浮层都读 [kBarFormFlightActive]，
+  /// 若先开窗后写源端，同一帧内会先按**上一次的源端标记**分流一次 —— 回程（胶囊→条）
+  /// 时会短暂按「条端为源」让位，胶囊端真身漏画一帧。
+  void _openBarFormFlight(bool targetIsCapsule) {
+    kBarFormResidentIsSource.value = !targetIsCapsule;
+    kBarFormFlightActive.value = true;
   }
 
   /// 直接吸附到目标端点（不走交棒窗口）：reduced-motion、冷启动播种、
@@ -2773,6 +2793,10 @@ class _MainLayoutState extends State<_MainLayout>
     void apply() {
       if (!mounted) return;
       _barFormController.value = _barFormTargetIsCapsule ? 1.0 : 0.0;
+      // 吸附 = 无交棒，窗口必须关（2026-10-12 会诊 W2）：吸附发生在「目标形态真身
+      // 不在 / reduced-motion / 无导航事件的顺带重算」，此时窗口若残留为 true，
+      // 目的端真身会**永久 offstage**（没有任何回调再去关窗）。
+      kBarFormFlightActive.value = false;
     }
 
     // build / layout 阶段写全局进度会 markNeedsBuild 祖先（"setState during
@@ -2786,10 +2810,15 @@ class _MainLayoutState extends State<_MainLayout>
     }
   }
 
-  /// 交棒飞行收敛（或被吸附）时解冻常驻条端点快照。
+  /// 交棒飞行收敛（或被吸附）时解冻常驻条端点快照，并关窗。
   void _onBarFormStatusChanged(AnimationStatus status) {
     if (status == AnimationStatus.completed ||
         status == AnimationStatus.dismissed) {
+      // **先关窗、同帧再解冻端点**（顺序不可反，2026-10-12 会诊 W3）：端点登记
+      // 门控读窗口判据，若先解冻，登记会以「窗口开着」为由被拒收 —— 冻结快照
+      // 滞留旧值，下次交棒的浮层从错误端点起跑。关窗后门控即刻放行，
+      // `clearFrozenResidentRect` 触发的让位恢复在同一帧完成重登记。
+      kBarFormFlightActive.value = false;
       BottomBarMorphRegistry.instance.clearFrozenResidentRect();
     }
   }

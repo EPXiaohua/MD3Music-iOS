@@ -23,10 +23,8 @@ ReleaseInfo _release(String tag) => ReleaseInfo.fromTag(
 );
 
 /// 构造被测服务：注入假数据源、假当前版本、捕获提醒文案。
-({UpdateCheckService service, _FakeSource source, List<String> messages}) _build({
-  required ReleaseInfo? remote,
-  required String currentVersion,
-}) {
+({UpdateCheckService service, _FakeSource source, List<String> messages})
+_build({required ReleaseInfo? remote, required String currentVersion}) {
   final source = _FakeSource(remote);
   final messages = <String>[];
   final service = UpdateCheckService(
@@ -37,9 +35,6 @@ ReleaseInfo _release(String tag) => ReleaseInfo.fromTag(
   return (service: service, source: source, messages: messages);
 }
 
-Future<int> _hoursAgo(int hours) async => DateTime.now().millisecondsSinceEpoch -
-    Duration(hours: hours).inMilliseconds;
-
 void main() {
   test('提醒开关关闭时不发起查询', () async {
     SharedPreferences.setMockInitialValues({
@@ -47,36 +42,9 @@ void main() {
     });
     final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
 
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.skipped,
-    );
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.skipped);
     expect(ctx.source.calls, 0);
     expect(ctx.messages, isEmpty);
-  });
-
-  test('距上次检查不足 12 小时时跳过且不查询', () async {
-    SharedPreferences.setMockInitialValues({
-      'update_last_check_ms': DateTime.now().millisecondsSinceEpoch,
-    });
-    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
-
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.skipped,
-    );
-    expect(ctx.source.calls, 0);
-  });
-
-  test('超过 12 小时后正常查询', () async {
-    SharedPreferences.setMockInitialValues({
-      'update_last_check_ms': DateTime.now().millisecondsSinceEpoch -
-          const Duration(hours: 13).inMilliseconds,
-    });
-    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
-
-    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.notified);
-    expect(ctx.source.calls, 1);
   });
 
   test('发现新版本时提醒一次并记录版本与检查时间', () async {
@@ -88,20 +56,15 @@ void main() {
 
     final repo = SettingsRepository();
     expect(await repo.getUpdateLastNotifiedVersion(), '5.6.5');
-    expect(await repo.getUpdateLastCheckMs(), greaterThan(0));
   });
 
   test('同一版本不重复提醒', () async {
     SharedPreferences.setMockInitialValues({
-      'update_last_check_ms': await _hoursAgo(13),
       'update_last_notified_version': '5.6.5',
     });
     final ctx = _build(remote: _release('v5.6.5'), currentVersion: '5.6.0');
 
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.skipped,
-    );
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.skipped);
     expect(ctx.messages, isEmpty);
   });
 
@@ -109,10 +72,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     final ctx = _build(remote: _release('v5.6.0'), currentVersion: '5.6.0');
 
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.upToDate,
-    );
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.upToDate);
     expect(ctx.messages, isEmpty);
   });
 
@@ -120,65 +80,24 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     final ctx = _build(remote: null, currentVersion: '5.6.0');
 
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.failed,
-    );
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.failed);
     expect(ctx.messages, isEmpty);
     expect(await SettingsRepository().getUpdateLastNotifiedVersion(), '');
-    // 失败也记录检查时间：避免每次启动反复重试
-    expect(await SettingsRepository().getUpdateLastCheckMs(), greaterThan(0));
   });
 
   test('版本号无法解析时不误报', () async {
     SharedPreferences.setMockInitialValues({});
     final ctx = _build(remote: _release('latest'), currentVersion: '5.6.0');
 
-    expect(
-      await ctx.service.checkAndNotify(),
-      UpdateCheckOutcome.upToDate,
-    );
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.upToDate);
     expect(ctx.messages, isEmpty);
   });
 
-  test('force 绕过 12 小时最小间隔立即查询', () async {
-    SharedPreferences.setMockInitialValues({
-      'update_last_check_ms': DateTime.now().millisecondsSinceEpoch,
-    });
-    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
+  test('tag 含构建号时提醒文案不露出 +XX', () async {
+    SharedPreferences.setMockInitialValues({});
+    final ctx = _build(remote: _release('v5.8.1+47'), currentVersion: '5.8.0');
 
-    expect(
-      await ctx.service.checkAndNotify(force: true),
-      UpdateCheckOutcome.notified,
-    );
-    expect(ctx.source.calls, 1);
-    expect(ctx.messages, isNotEmpty);
-  });
-
-  test('force 绕过同版本只提醒一次的去重', () async {
-    SharedPreferences.setMockInitialValues({
-      'update_last_check_ms': await _hoursAgo(13),
-      'update_last_notified_version': '5.6.5',
-    });
-    final ctx = _build(remote: _release('v5.6.5'), currentVersion: '5.6.0');
-
-    expect(
-      await ctx.service.checkAndNotify(force: true),
-      UpdateCheckOutcome.notified,
-    );
-    expect(ctx.messages, isNotEmpty);
-  });
-
-  test('force 绕过提醒开关（手动检查是用户显式动作）', () async {
-    SharedPreferences.setMockInitialValues({
-      'settings_update_reminder_enabled': false,
-    });
-    final ctx = _build(remote: _release('v9.9.9'), currentVersion: '5.6.0');
-
-    expect(
-      await ctx.service.checkAndNotify(force: true),
-      UpdateCheckOutcome.notified,
-    );
-    expect(ctx.source.calls, 1);
+    expect(await ctx.service.checkAndNotify(), UpdateCheckOutcome.notified);
+    expect(ctx.messages, ['发现新版本 v5.8.1（当前 5.8.0），可在「设置 → 关于」中更新']);
   });
 }

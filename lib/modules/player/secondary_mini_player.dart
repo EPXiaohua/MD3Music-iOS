@@ -969,11 +969,13 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     // 整棵卡片（AGENTS §10）。卡体自己持有全部 `watch` 依赖；
     // 随 `standDown` 变化的**副作用**留在本 builder 内（不能进 `child` —— `child`
     // 只在**外层 State 重建**时才换新实例，`standDown` 翻转不会让外层重建）。
-    return ValueListenableBuilder<double>(
-      valueListenable: kBottomBarFormProgress,
+    return ListenableBuilder(
+      // 让位判据读窗口开关 + 源端标记（见 [bottomBarFormFlightListenable]）。
+      listenable: bottomBarFormFlightListenable,
       child: _SecondaryPlayerCardBody(this),
-      builder: (context, formProgress, child) {
-        final bool standDown = inBottomBarFormFlight();
+      builder: (context, child) {
+        // 胶囊端：窗口内**只有目的形态是常驻条时**让位（源形态留在画上，由浮层盖住）。
+        final bool standDown = barFormRealBarStandsDown(true);
         if (standDown) {
           // 让位期收口：让位被覆盖、几何随转场抖动，两条装饰驱动必须按下
           // （§10.4.3）。卡体此刻不重建（`child` 实例恒定），故这一步只能在此。

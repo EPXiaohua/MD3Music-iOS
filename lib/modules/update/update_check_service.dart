@@ -131,6 +131,7 @@ class UpdateCheckService {
 
   void _notify(ReleaseInfo release, String current) {
     final currentPart = current.isEmpty ? '' : '（当前 $current）';
-    _notifier('发现新版本 ${release.tagName}$currentPart，可在「设置 → 关于」中更新');
+    // 用剥离过构建号的 version 拼回 v 前缀：tagName 可能含 `+47`，展示层不露构建号
+    _notifier('发现新版本 v${release.version}$currentPart，可在「设置 → 关于」中更新');
   }
 }

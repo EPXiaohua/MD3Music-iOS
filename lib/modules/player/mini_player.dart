@@ -9,7 +9,6 @@ import '../../core/build_flags.dart';
 import '../../core/layout/bottom_chrome_dimens.dart';
 import '../../core/layout/bottom_chrome_scope.dart';
 import '../../core/layout/display_space.dart';
-import '../../core/layout/responsive_layout.dart';
 import '../../core/layout/tv_player_bar_focus_bridge.dart';
 import '../../core/layout/ui_density.dart';
 import '../../core/services/desktop_lyric_service.dart';
@@ -597,11 +596,14 @@ class _MiniPlayerState extends State<MiniPlayer>
     // **条体作为 `child` 传入**（见 [_MiniPlayerBarBody]）：窗口内每帧只翻
     // `Offstage` 标志，条体实例恒定 → `Element.updateChild` 见实例相同即短路，
     // 不再逐帧重建整棵条（AGENTS §10）。条体自己持有全部 `watch` 依赖。
-    return ValueListenableBuilder<double>(
-      valueListenable: kBottomBarFormProgress,
+    return ListenableBuilder(
+      // 让位判据读窗口开关 + 源端标记（见 [bottomBarFormFlightListenable]）——只订阅
+      // 进度会在开窗当帧不重建、不让位。
+      listenable: bottomBarFormFlightListenable,
       child: _MiniPlayerBarBody(this),
-      builder: (context, formProgress, child) {
-        final bool standDown = inBottomBarFormFlight();
+      builder: (context, child) {
+        // 常驻条端：窗口内**只有目的形态是胶囊时**让位（源形态留在画上，由浮层盖住）。
+        final bool standDown = barFormRealBarStandsDown(false);
         return Offstage(
           offstage: standDown,
           child: TickerMode(

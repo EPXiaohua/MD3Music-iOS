@@ -1,6 +1,8 @@
 package com.md3music.md3music
 
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.util.Log
 import io.flutter.embedding.engine.FlutterEngine
@@ -21,26 +23,40 @@ class DiagnosticLogPlugin {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
+                val mainHandler = Handler(Looper.getMainLooper())
                 Thread {
-                    // 环形缓冲优先：零 IO、零权限依赖，任何 ROM/时机都有内容。
-                    // logcat 退化为「尽力而为」的补充（Android 10+ READ_LOGS 收紧后
-                    // 曾多次整份缺失，导致诊断包无据可查）。
-                    val ringText = RingLog.ring.render(maxChars = MAX_OUTPUT_CHARS)
-                    val logcatText = runCatching { readLogcat() }.getOrElse { error ->
-                        Log.w(TAG, "读取 Android 日志失败", error)
-                        ""
-                    }
-                    val merged = buildString {
-                        append("===== 进程内环形日志（cap=")
-                        append(NativeLogBuffer.DEFAULT_CAPACITY)
-                        append("） =====\n")
-                        append(ringText)
-                        if (logcatText.isNotEmpty()) {
-                            append("\n\n===== logcat（尽力而为） =====\n")
-                            append(logcatText)
+                    // MD3Music fork（稳定性修复）：整个线程体 runCatching 兜底——裸线程
+                    // 的未捕获异常会走默认 handler 杀掉整个进程。
+                    val merged = runCatching {
+                        // 环形缓冲优先：零 IO、零权限依赖，任何 ROM/时机都有内容。
+                        // logcat 退化为「尽力而为」的补充（Android 10+ READ_LOGS 收紧后
+                        // 曾多次整份缺失，导致诊断包无据可查）。
+                        val ringText = RingLog.ring.render(maxChars = MAX_OUTPUT_CHARS)
+                        val logcatText = runCatching { readLogcat() }.getOrElse { error ->
+                            Log.w(TAG, "读取 Android 日志失败", error)
+                            ""
                         }
+                        buildString {
+                            append("===== 进程内环形日志（cap=")
+                            append(NativeLogBuffer.DEFAULT_CAPACITY)
+                            append("） =====\n")
+                            append(ringText)
+                            if (logcatText.isNotEmpty()) {
+                                append("\n\n===== logcat（尽力而为） =====\n")
+                                append(logcatText)
+                            }
+                        }
+                    }.getOrElse { error ->
+                        Log.e(TAG, "收集 Android 原生日志失败", error)
+                        null
                     }
-                    result.success(merged)
+                    // MD3Music fork（稳定性修复）：MethodChannel.Result 必须回主线程调用
+                    // （debug/profile 下 FlutterJNI 的 @UiThread 断言会抛 IllegalStateException），
+                    // 与同仓库其他插件的 mainHandler.post 惯例一致。
+                    mainHandler.post {
+                        if (merged != null) result.success(merged)
+                        else result.error("COLLECT_FAILED", "收集 Android 原生日志失败", null)
+                    }
                 }.start()
             }
     }

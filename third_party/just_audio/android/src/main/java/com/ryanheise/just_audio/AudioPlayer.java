@@ -130,6 +130,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     private ExoPlayer player;
     private volatile long latestExternalMetadataGeneration;
+    private PendingSessionMetadataUpdate pendingSessionMetadataUpdate;
     // MD3Music fork: 音量均衡（响度归一）增益装饰器。在 buildAudioSink 时创建，
     // 通过 setNormalizationGain(gainDb) 对当前曲目设固定线性增益（可放大/衰减）。
     private NormalizationGainAudioSink normalizationGainSink;
@@ -303,12 +304,26 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (this.audioSessionId != null) {
             for (Object rawAudioEffect : rawAudioEffects) {
                 Map<?, ?> json = (Map<?, ?>)rawAudioEffect;
-                AudioEffect audioEffect = decodeAudioEffect(rawAudioEffect, this.audioSessionId);
-                if ((Boolean)json.get("enabled")) {
-                    audioEffect.setEnabled(true);
+                // 单个效果挂载失败不得中断本方法：它由 ensurePlayerInitialized() 在
+                // `if (player == null)` 块内调用，而 player 已在该块前段赋值。一旦此处抛出，
+                // 块内其后的 player.addListener(this) 与 buildAndHostMediaSession() 会被
+                // **永久**跳过（后续调用因 player != null 不再进入该块）→ Player.Listener
+                // 从未注册 → onPlaybackStateChanged 不触发 → load() 挂上的 prepareResult
+                // 永不 resolve，Dart 侧 setAudioSource 卡到 15s 超时后放弃，play 命令永远
+                // 发不出来（表现为「已 READY 且缓冲完毕，但 pwr 恒为 false、无声」）。
+                // 实测联想 TB710FU（Android 16）上 AudioEffect 无法绑定 generateAudioSessionId()
+                // 生成的 session id。效果属增强项，挂不上不该影响播放。
+                try {
+                    AudioEffect audioEffect = decodeAudioEffect(rawAudioEffect, this.audioSessionId);
+                    if ((Boolean)json.get("enabled")) {
+                        audioEffect.setEnabled(true);
+                    }
+                    audioEffects.add(audioEffect);
+                    audioEffectsMap.put((String)json.get("type"), audioEffect);
+                } catch (Exception e) {
+                    android.util.Log.w("AudioFocusFork",
+                            "audio effect '" + json.get("type") + "' attach failed: " + e);
                 }
-                audioEffects.add(audioEffect);
-                audioEffectsMap.put((String)json.get("type"), audioEffect);
             }
         }
         enqueuePlaybackEvent();
@@ -402,6 +417,21 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             }
         }
         lastPlaylistLength = player.getMediaItemCount();
+    }
+
+    @Override
+    public void onMediaItemTransition(MediaItem mediaItem, int reason) {
+        PendingSessionMetadataUpdate update = pendingSessionMetadataUpdate;
+        if (update == null) return;
+        pendingSessionMetadataUpdate = null;
+        doApplySessionTitleArtistAndLyricInfo(
+                update.expectedMediaId,
+                update.generation,
+                update.title,
+                update.artist,
+                update.lyricInfo,
+                update.btTitle,
+                update.btArtist);
     }
 
     private boolean updateCurrentIndex() {
@@ -895,6 +925,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (artist != null && !artist.isEmpty()) metadata.setArtist(artist);
         String album = (String)tagMap.get("album");
         if (album != null && !album.isEmpty()) metadata.setAlbumTitle(album);
+        // MD3Music fork: 补齐上方注释承诺的 artUri 映射——切歌过渡瞬间会话元数据
+        // 即带封面 URI，SystemUI/vivo 原子随身听可立即取封面，不必等后台封面
+        // 线程注入（预取未命中时封面空档可达数秒）。
+        String artUri = (String)tagMap.get("artUri");
+        if (artUri != null && !artUri.isEmpty()) {
+            metadata.setArtworkUri(android.net.Uri.parse(artUri));
+        }
         builder.setMediaMetadata(metadata.build());
     }
 
@@ -1210,10 +1247,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 }
             });
             mediaSession = sessionBuilder.build();
-            // MD3Music fork: 记录活跃播放器，供 AudioPlaybackService 注入封面到媒体3会话
-            sActivePlayer = this;
-            // MD3Music fork: 若已注册 MediaSessionService host，把本会话归入服务以渲染 now playing 通知
-            ensureSessionHosted();
+            // MediaSession 可由交叉淡化预加载创建，不在构造时抢占活跃播放器或归入 host。
+            // 只有 play() 才确定活跃会话（play 内已含 sActivePlayer 收敛 + 会话重建 +
+            // syncSingleSessionToHost）；保留延迟到达的自定义按钮状态。
+            applyPendingSessionCustomActions();
     }
 
     // MD3Music fork: 关联系统的 MediaSession（见 ensurePlayerInitialized）
@@ -1335,22 +1372,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     try { ms.release(); } catch (Exception ignore) {}
                     other.mediaSession = null;
                 } catch (Exception ignore) {}
-            }
-        }
-    }
-
-    /// 实例方法：会话创建后调用，把当前播放器加入 host（若已注册）。
-    /// MD3Music fork（方向1）：仅当本实例是「活跃播放器」时才把会话加入 host；
-    /// 非活跃播放器不加入（且确保其已被 host 移除），保证系统只暴露活跃播放器的一个会话。
-    private void ensureSessionHosted() {
-        if (this == sActivePlayer) {
-            ensureActiveSessionHosted();
-        } else {
-            // 非活跃：确保从 host 移除，避免重新加入造成多会话
-            MediaSessionService host = sSessionHost;
-            if (host != null && mediaSession != null) {
-                try { if (host.isSessionAdded(mediaSession)) host.removeSession(mediaSession); }
-                catch (Exception ignore) {}
             }
         }
     }
@@ -1624,6 +1645,52 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     private static volatile CustomActionListener sCustomActionListener;
+    private static volatile SessionCustomActionsState sPendingSessionCustomActions;
+
+    private static final class SessionCustomActionsState {
+        final boolean desktopLyricEnabled;
+        final boolean isFavorited;
+        final boolean hasTranslation;
+        final int translationIconResId;
+        final int desktopLyricOnIcon;
+        final int desktopLyricOffIcon;
+        final int favoriteOnIcon;
+        final int favoriteOffIcon;
+
+        SessionCustomActionsState(
+                boolean desktopLyricEnabled,
+                boolean isFavorited,
+                boolean hasTranslation,
+                int translationIconResId,
+                int desktopLyricOnIcon,
+                int desktopLyricOffIcon,
+                int favoriteOnIcon,
+                int favoriteOffIcon) {
+            this.desktopLyricEnabled = desktopLyricEnabled;
+            this.isFavorited = isFavorited;
+            this.hasTranslation = hasTranslation;
+            this.translationIconResId = translationIconResId;
+            this.desktopLyricOnIcon = desktopLyricOnIcon;
+            this.desktopLyricOffIcon = desktopLyricOffIcon;
+            this.favoriteOnIcon = favoriteOnIcon;
+            this.favoriteOffIcon = favoriteOffIcon;
+        }
+    }
+
+    private void applyPendingSessionCustomActions() {
+        SessionCustomActionsState state = sPendingSessionCustomActions;
+        if (state == null) return;
+        applySessionCustomActions(
+                state.desktopLyricEnabled,
+                state.isFavorited,
+                state.hasTranslation,
+                state.translationIconResId,
+                state.desktopLyricOnIcon,
+                state.desktopLyricOffIcon,
+                state.favoriteOnIcon,
+                state.favoriteOffIcon);
+    }
+
     // 用 new Bundle() 而非 Bundle.EMPTY：后者要求 API 26+，本项目 minSdk 为 24/25。
     private static final SessionCommand CMD_TOGGLE_DESKTOP_LYRIC =
             new SessionCommand("com.md3music.toggle_desktop_lyric", new android.os.Bundle());
@@ -1655,13 +1722,18 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             int desktopLyricOffIcon,
             int favoriteOnIcon,
             int favoriteOffIcon) {
+        SessionCustomActionsState state = new SessionCustomActionsState(
+                desktopLyricEnabled, isFavorited, hasTranslation, translationIconResId,
+                desktopLyricOnIcon, desktopLyricOffIcon, favoriteOnIcon, favoriteOffIcon);
+        sPendingSessionCustomActions = state;
         AudioPlayer p = sActivePlayer;
         if (p != null) {
             p.applySessionCustomActions(
-                    desktopLyricEnabled, isFavorited, hasTranslation, translationIconResId,
-                    desktopLyricOnIcon, desktopLyricOffIcon, favoriteOnIcon, favoriteOffIcon);
+                    state.desktopLyricEnabled, state.isFavorited, state.hasTranslation,
+                    state.translationIconResId, state.desktopLyricOnIcon,
+                    state.desktopLyricOffIcon, state.favoriteOnIcon, state.favoriteOffIcon);
         } else {
-            Log.w("AudioFocusFork", "setActiveSessionCustomActions: no active AudioPlayer");
+            Log.i("AudioFocusFork", "deferred custom action update until active AudioPlayer is created");
         }
     }
 
@@ -1754,9 +1826,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         try {
             if (!isExternalMetadataGenerationCurrent(generation)) return;
             MediaItem cur = player.getCurrentMediaItem();
-            if (cur == null) return;
+            if (cur == null) {
+                // 会话元数据先于 MediaItem 到达（切歌竞态）：暂存，等
+                // onMediaItemTransition 后再落（6.0.2）。
+                deferSessionMetadataUpdate(
+                        expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
+                return;
+            }
             if (!matchesExpectedMediaItem(cur, expectedMediaId, title, artist)) {
-                logDiscardedIdentity("lyricInfo", cur, expectedMediaId);
+                deferSessionMetadataUpdate(
+                        expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
                 return;
             }
             MediaMetadata m = cur.mediaMetadata;
@@ -1807,6 +1886,46 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     + " titleChanged=" + titleChanged + " lyricChanged=" + lyricChanged);
         } catch (Exception e) {
             Log.w("AudioFocusFork", "doApplySessionTitleArtistAndLyricInfo failed: " + e);
+        }
+    }
+
+    private void deferSessionMetadataUpdate(
+            String expectedMediaId,
+            long generation,
+            String title,
+            String artist,
+            String lyricInfo,
+            String btTitle,
+            String btArtist) {
+        pendingSessionMetadataUpdate = new PendingSessionMetadataUpdate(
+                expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
+        Log.i("AudioFocusFork", "deferred session metadata until matching media item transition");
+    }
+
+    private static final class PendingSessionMetadataUpdate {
+        final String expectedMediaId;
+        final long generation;
+        final String title;
+        final String artist;
+        final String lyricInfo;
+        final String btTitle;
+        final String btArtist;
+
+        PendingSessionMetadataUpdate(
+                String expectedMediaId,
+                long generation,
+                String title,
+                String artist,
+                String lyricInfo,
+                String btTitle,
+                String btArtist) {
+            this.expectedMediaId = expectedMediaId;
+            this.generation = generation;
+            this.title = title;
+            this.artist = artist;
+            this.lyricInfo = lyricInfo;
+            this.btTitle = btTitle;
+            this.btArtist = btArtist;
         }
     }
 

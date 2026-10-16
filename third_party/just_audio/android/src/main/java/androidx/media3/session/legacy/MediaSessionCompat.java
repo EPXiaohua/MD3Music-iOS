@@ -4067,6 +4067,12 @@ public class MediaSessionCompat {
     @Override
     public void release() {
       mDestroyed = true;
+      // MD3Music fork（内存泄漏修复）：从 vivo lrc_change 重发的活跃 impl 列表移除。
+      // 此前言中仅在 setMetadata 时 add、release 不 remove——已释放会话滞留静态列表
+      // （泄漏），且 25s 重发定时器会持续对死会话调用 setExtras。
+      synchronized (sVivoLrcLock) {
+        sLiveApi21Impls.remove(this);
+      }
       mExtraControllerCallbacks.kill();
       if (Build.VERSION.SDK_INT == 27) {
         // This is a workaround for framework MediaSession's bug in API 27.

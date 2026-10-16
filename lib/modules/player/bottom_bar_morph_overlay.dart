@@ -199,22 +199,43 @@ Rect resolveCapsuleBodyRect({
   );
 }
 
-/// 底栏形态交叉过渡的**飞行窗口**判据（0 < p < 1）。
+/// 底栏形态交叉过渡的**飞行窗口**判据。
 ///
 /// **单一出处**：浮层渲染、两端真身让位（`Offstage`）与真身的端点登记门控
 /// 都必须读这一条 —— 判据一旦分叉就会出现「浮层在画但真身还在登记」之类的
 /// 半状态，把冻结的端点冲掉（见 [BottomBarMorphRegistry]）。
-/// 端点（p == 0 / p == 1）恒为 false，两端真身各归各位。
 ///
-/// **窗口判据与可见形变解耦**（K1）：这里读的是**未缓动**的窗口进度、整段铺满
-/// （≈740ms，见 [resolveMorphFlightDuration]）；可见形态另按帧时钟前置到窗口
-/// 开头的 [kBarFormVisibleMorphDuration] 内完成（见 [resolveVisibleBarFormProgress]），
-/// 窗口本身一帧不差。两端真身的让位/登记门控必须继续读这条，**不要**改用可见
-/// 形变进度 —— 那会让窗口在 260ms 处提前关闭、真身在转场未结束时接管那根条。
-bool inBottomBarFormFlight() {
-  final double p = kBottomBarFormProgress.value;
-  return p > 0.0 && p < 1.0;
+/// **为什么读 [kBarFormFlightActive] 而不是 `0 < p < 1`（2026-10-12 会诊 W1）**：
+/// `p` 在端点时无法区分「静止」与「飞行刚起跑」，而交棒必须在起跑那帧就让
+/// 目的真身让位 —— 否则目的真身抢闸画出（跳变）。窗口开关与让位同帧置位，
+/// `p` 保持端点值由动画自身推进。
+///
+/// **窗口判据与可见形变解耦**（K1）：窗口整段铺满（≈740ms，见
+/// [resolveMorphFlightDuration]）；可见形态另按帧时钟前置到窗口开头的
+/// [kBarFormVisibleMorphDuration] 内完成（见 [resolveVisibleBarFormProgress]）。
+/// 两端真身的让位/登记门控必须继续读这条，**不要**改用可见形变进度 —— 那会让
+/// 窗口在 260ms 处提前关闭、真身在转场未结束时接管那根条。
+bool inBottomBarFormFlight() => kBarFormFlightActive.value;
+
+/// 窗口内**某一形态的真身**是否应让位（`Offstage`）。
+///
+/// 窗口内两端真身都**保持挂载**（不改挂载条件），可见性由它分流：
+/// - **源端**不 offstage（浮层天然盖住它，`保挂载` 成立，封面 State 不重建）；
+/// - **目的端** offstage（避免「浮层 + 目的真身」同屏双条）。
+///
+/// [formIsCapsule]：被查询真身的形态（true = 悬浮胶囊端）。窗口外恒 false（各归各位）。
+bool barFormRealBarStandsDown(bool formIsCapsule) {
+  if (!inBottomBarFormFlight()) return false;
+  final bool residentIsSource = kBarFormResidentIsSource.value;
+  return formIsCapsule != !residentIsSource;
 }
+
+/// 浮层渲染 / 两端真身让位的公共订阅：窗口开关 + 窗口进度 + 源端标记。
+Listenable get bottomBarFormFlightListenable => Listenable.merge([
+  kBarFormFlightActive,
+  kBottomBarFormProgress,
+  kBarFormResidentIsSource,
+]);
 
 /// 转场收敛 → 底栏收起/恢复启动之间的固定延迟余量（两帧）。
 ///
@@ -353,7 +374,15 @@ MorphBarLayout resolveMorphBarLayout({
   final double barLeft = l(residentRect.left, capsuleRect.left);
   final double barTop = l(residentRect.top, capsuleRect.top);
   final double barWidth = l(residentRect.width, capsuleRect.width);
-  final double barHeight = l(kMorphResidentBarHeight, BottomChromeDimens.discDiameter);
+  // 常驻条端高度取**实测** `residentRect.height`（含底部净空 clearance）：真身高度
+  // = 内容 50 + `clearance.bottom`（无底栏 / 横屏侧栏 / 二级页时 ≈20dp），硬编码 50
+  // 会让端点矮一段、条底错位（2026-10-12 会诊 W3）。约定 `residentRect` 恒含净空
+  // （登记口径见 mini_player 的 `_scheduleRegisterResidentRect`，兜底见
+  // `_fallbackResidentRect`），故无需再加项。
+  final double barHeight = l(
+    residentRect.height,
+    BottomChromeDimens.discDiameter,
+  );
   final double barRadius = l(0.0, BottomChromeDimens.discDiameter / 2);
 
   // 封面盒（条内局部）：两端都锚在**可见封面**的真实左上角 —— 常驻条 left = 4
@@ -669,11 +698,11 @@ class BottomBarMorphOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (kTvBuild) return const SizedBox.shrink();
-    return ValueListenableBuilder<double>(
-      valueListenable: kBottomBarFormProgress,
-      builder: (context, p, _) {
+    return ListenableBuilder(
+      listenable: bottomBarFormFlightListenable,
+      builder: (context, _) {
         if (!inBottomBarFormFlight()) return const SizedBox.shrink();
-        return _MorphBarLayer(progress: p);
+        return _MorphBarLayer(progress: kBottomBarFormProgress.value);
       },
     );
   }
@@ -913,6 +942,11 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
                         painter: PlayerBarProgressPainter(
                           progress: playbackProgress,
                           formT: layout.t,
+                          // 中心线锚在**条盒**中心（不是进度盒中心）：进度盒高由 2
+                          // 长到整条高，若中心线恒取进度盒中线，中段包边会贴在条体
+                          // 偏上处、被后画的封面盖住（2026-10-12 会诊 W2）。端点不变
+                          // （t=0 退化为贴顶直线，t=1 = 条盒中心 = 胶囊真身中心）。
+                          barHeight: layout.barHeight,
                           trackColor: trackColor,
                           activeColor: colorScheme.primary,
                           cornerRadius: layout.barRadius,
