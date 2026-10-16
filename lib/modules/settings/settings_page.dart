@@ -51,7 +51,6 @@ import '../../providers/song_match_provider.dart';
 import '../coverflow/coverflow_source.dart';
 import '../onboarding/onboarding_page.dart';
 import '../onboarding/user_agreement_page.dart';
-import '../update/update_check_service.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/remote_control_provider.dart';
@@ -154,8 +153,8 @@ class _SettingsPageState extends State<SettingsPage>
   bool _legacyAppIconEnabled = false;
   // 上次已提醒的新版本号（形如 5.6.5，空串=无）。用于「更新最新版本」副标题提示。
   String _pendingUpdateVersion = '';
-  // 手动检查更新进行中（关于区块显示加载态，防重复点击）
-  bool _checkingUpdate = false;
+  // 启动检查记录到的 GitHub 最新版本号（空串=尚未检查过/关闭提醒）。
+  String _latestRemoteVersion = '';
   // 本地 API 服务器重启中（在线音乐区块显示加载态）
   bool _isRestarting = false;
   // 诊断日志导出进行中（关于区块显示加载态，防重复点击）
@@ -656,6 +655,8 @@ class _SettingsPageState extends State<SettingsPage>
         .getLegacyAppIconEnabled();
     final pendingUpdateVersion = await _settingsRepository
         .getUpdateLastNotifiedVersion();
+    final latestRemoteVersion = await _settingsRepository
+        .getUpdateLatestRemoteVersion();
     final desktopModeEnabled = await _settingsRepository
         .getDesktopModeEnabled();
     final predictiveBackEnabled = await _settingsRepository
@@ -683,6 +684,7 @@ class _SettingsPageState extends State<SettingsPage>
       _updateReminderEnabled = updateReminderEnabled;
       _legacyAppIconEnabled = legacyAppIconEnabled;
       _pendingUpdateVersion = pendingUpdateVersion;
+      _latestRemoteVersion = latestRemoteVersion;
       // 桌面布局改为直读全局判定源，这里同步全局值而非本地字段。
       // 写全局源而不是仅记日志：app.dart 的启动同步可能尚未跑到
       // （或被其它入口抢先写过），本页读到持久化值时顺手校正一次，
@@ -5644,23 +5646,6 @@ class _SettingsPageState extends State<SettingsPage>
             _setUpdateReminderEnabled(value);
           },
         ),
-        // search: 检查更新 立即检查 手动 update check
-        ListTile(
-          title: const Text('检查更新'),
-          subtitle: Text(
-            _checkingUpdate
-                ? '正在检查 GitHub 上的最新版本…'
-                : '立即手动检查，不受启动检查的 12 小时间隔限制',
-          ),
-          leading: _checkingUpdate
-              ? const SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.refresh_outlined),
-          onTap: _checkingUpdate ? null : _checkUpdateNow,
-        ),
         if (Platform.isAndroid) ...[
           // search: 图标 旧版 桌面图标 恢复
           SwitchListTile(
@@ -5677,11 +5662,13 @@ class _SettingsPageState extends State<SettingsPage>
         ListTile(
           title: const Text('更新最新版本'),
           subtitle: Text(
-            _pendingUpdateVersion.isEmpty
-                ? (Platform.isIOS
+            _pendingUpdateVersion.isNotEmpty
+                ? '有新版 v$_pendingUpdateVersion 可用，点击前往下载'
+                : _latestRemoteVersion.isNotEmpty
+                ? '最新版 v$_latestRemoteVersion · 点击前往 Releases 页'
+                : (Platform.isIOS
                       ? 'https://github.com/EPXiaohua/MD3Music-iOS/releases'
-                      : 'https://github.com/zzyoxml/md3Music/releases')
-                : '有新版 v$_pendingUpdateVersion 可用，点击前往下载',
+                      : 'https://github.com/zzyoxml/md3Music/releases'),
           ),
           leading: const Icon(Icons.system_update_outlined),
           trailing: const Icon(Icons.open_in_new, size: 18),
@@ -5811,35 +5798,6 @@ class _SettingsPageState extends State<SettingsPage>
     final uri = Uri.parse(url);
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
-  }
-
-  /// 手动检查更新：force 绕过启动检查的 12 小时间隔/同版本去重，
-  /// 让用户点按钮立刻拿到真实结果（发现新版本时服务层已 toast 提醒）。
-  Future<void> _checkUpdateNow() async {
-    if (_checkingUpdate) return;
-    setState(() => _checkingUpdate = true);
-    try {
-      final outcome = await UpdateCheckService.instance.checkAndNotify(
-        force: true,
-      );
-      switch (outcome) {
-        case UpdateCheckOutcome.notified:
-          // 服务层已提示「发现新版本 vX.Y.Z」；同步刷新「更新最新版本」副标题
-          final pending = await SettingsRepository()
-              .getUpdateLastNotifiedVersion();
-          if (mounted && pending.isNotEmpty) {
-            setState(() => _pendingUpdateVersion = pending);
-          }
-        case UpdateCheckOutcome.upToDate:
-          showToast('已是最新版本', long: true);
-        case UpdateCheckOutcome.failed:
-          showToast('检查失败，请稍后重试', long: true);
-        case UpdateCheckOutcome.skipped:
-          showToast('检查被跳过，请稍后重试', long: true);
-      }
-    } finally {
-      if (mounted) setState(() => _checkingUpdate = false);
     }
   }
 

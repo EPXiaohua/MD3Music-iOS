@@ -68,8 +68,10 @@ class SettingsRepository {
   static const String _keyLegacyAppIconEnabled =
       'settings_legacy_app_icon_enabled';
 
-  /// 上次网络检查的时间戳（ms）。属于记账状态而非用户设置，故不加 settings_ 前缀。
-  static const String _keyUpdateLastCheckMs = 'update_last_check_ms';
+  /// 最近一次检查到的远端最新版本号（形如 6.0.2）。属于记账状态而非用户
+  /// 设置，故不加 settings_ 前缀。供「更新最新版本」入口展示版本号。
+  static const String _keyUpdateLatestRemoteVersion =
+      'update_latest_remote_version';
 
   /// 上次已提醒过的版本号（形如 5.6.5），用于同一版本只提醒一次。同上，不加前缀。
   static const String _keyUpdateLastNotifiedVersion =
@@ -378,15 +380,15 @@ class SettingsRepository {
     await prefs.setBool(_keyLegacyAppIconEnabled, enabled);
   }
 
-  /// 上次成功发起 Release 检查的时间戳（ms）；未检查过返回 0。
-  Future<int> getUpdateLastCheckMs() async {
+  /// 最近检查到的远端最新版本号（形如 6.0.2）；未检查过返回空串。
+  Future<String> getUpdateLatestRemoteVersion() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getInt(_keyUpdateLastCheckMs) ?? 0;
+    return prefs.getString(_keyUpdateLatestRemoteVersion) ?? '';
   }
 
-  Future<void> setUpdateLastCheckMs(int milliseconds) async {
+  Future<void> setUpdateLatestRemoteVersion(String version) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_keyUpdateLastCheckMs, milliseconds);
+    await prefs.setString(_keyUpdateLatestRemoteVersion, version);
   }
 
   /// 上次已提醒的新版本号（形如 5.6.5）；未提醒过返回空串。

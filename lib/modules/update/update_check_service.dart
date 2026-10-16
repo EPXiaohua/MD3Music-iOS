@@ -18,7 +18,7 @@ enum UpdateCheckOutcome {
   /// 已是最新（或远端版本无法比较）
   upToDate,
 
-  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非移动端）
+  /// 本次跳过（开关关闭 / 同一版本已提醒 / 非移动端）
   skipped,
 
   /// 查询失败（网络等原因，静默）
@@ -31,7 +31,9 @@ typedef UpdateNotifier = void Function(String message);
 /// 版本更新检测与提醒。
 ///
 /// 职责边界：只负责「查最新版本 → 比本地版本 → 提醒一次」，
-/// 不做下载、不做安装、不展示更新日志。
+/// 不做下载、不做安装、不展示更新日志。只有发现新版本才 toast；
+/// 已是最新 / 网络异常一律静默。每次启动都会检查（开关开启时），
+/// 无时间节流；同一版本只提醒一次避免重复打扰。
 class UpdateCheckService {
   UpdateCheckService({
     ReleaseSource? source,
@@ -48,9 +50,6 @@ class UpdateCheckService {
 
   /// 启动后延迟多久检查：避开冷启动首帧与首屏接口竞争。
   static const Duration startupDelay = Duration(seconds: 8);
-
-  /// 两次网络查询的最小间隔（跨启动持久化）。
-  static const Duration minCheckInterval = Duration(hours: 12);
 
   final ReleaseSource _source;
   final SettingsRepository _settings;
@@ -88,39 +87,27 @@ class UpdateCheckService {
   }
 
   /// 检查并在发现新版本时提醒。返回值便于日志与测试断言。
-  ///
-  /// [force] 为 true 时绕过「12 小时最小间隔」与「同一版本只提醒一次」
-  /// 以及提醒开关（设置页「检查更新」等用户主动触发场景：用户点按钮
-  /// 就是要立刻拿结果，节流反而让按钮看起来失灵）；启动检查保持全部门控。
-  Future<UpdateCheckOutcome> checkAndNotify({bool force = false}) async {
+  Future<UpdateCheckOutcome> checkAndNotify() async {
     if (_running) return UpdateCheckOutcome.skipped;
     _running = true;
     try {
-      return await _run(force: force);
+      return await _run();
     } finally {
       _running = false;
     }
   }
 
-  Future<UpdateCheckOutcome> _run({bool force = false}) async {
-    if (!force && !await _settings.getUpdateReminderEnabled()) {
+  Future<UpdateCheckOutcome> _run() async {
+    if (!await _settings.getUpdateReminderEnabled()) {
       debugPrint('[UpdateCheck] 用户已关闭新版本提醒，跳过');
       return UpdateCheckOutcome.skipped;
     }
 
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final lastCheckMs = await _settings.getUpdateLastCheckMs();
-    if (!force &&
-        lastCheckMs > 0 &&
-        now - lastCheckMs < minCheckInterval.inMilliseconds) {
-      debugPrint('[UpdateCheck] 距上次检查不足 12 小时，跳过');
-      return UpdateCheckOutcome.skipped;
-    }
-
     final release = await _source.fetchLatest();
-    // 无论成败都记录时间戳：失败时不重试轰炸，下个窗口再试
-    await _settings.setUpdateLastCheckMs(now);
     if (release == null) return UpdateCheckOutcome.failed;
+    // 记录远端最新版本号：供设置页「更新最新版本」入口展示
+    // （已是最新也记录，入口处就能看到 GitHub 上的最新版本号）
+    await _settings.setUpdateLatestRemoteVersion(release.version);
 
     final current = await _readCurrentVersion();
     if (!isNewerRelease(release.version, current)) {
@@ -131,8 +118,7 @@ class UpdateCheckService {
     }
 
     // 同一版本只提醒一次：避免每次启动都弹同一个版本
-    if (!force &&
-        await _settings.getUpdateLastNotifiedVersion() == release.version) {
+    if (await _settings.getUpdateLastNotifiedVersion() == release.version) {
       debugPrint('[UpdateCheck] ${release.version} 已提醒过，跳过');
       return UpdateCheckOutcome.skipped;
     }

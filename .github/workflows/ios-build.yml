@@ -175,13 +175,8 @@ jobs:
         with:
           tag_name: ${{ steps.appver.outputs.tag }}
           name: MD3Music iOS ${{ steps.appver.outputs.tag }}
-          body: |
-            未签名 IPA：下载后自行签名安装（侧载工具均可）。
-
-            - `MD3Music-unsigned.ipa`：标准版（无 3D 封面，推荐）
-            - `MD3Music-3D-unsigned.ipa`：含 3D 封面支持版（内置 Depth Anything V2 深度模型与 MI-GAN 修补模型，设置中开启 3D 封面即可；生成失败时自动回退平面封面，包体约 +40MB）
-
-            本项目为上游安卓版 [zzyoxml/md3Music](https://github.com/zzyoxml/md3Music) 的 iOS 移植。
+          # 正文从仓库文件读取：发版时改 .github/RELEASE_NOTES.md 即可
+          body_path: .github/RELEASE_NOTES.md
           files: |
             build/ios/MD3Music-unsigned.ipa
             build/ios/MD3Music-3D-unsigned.ipa
