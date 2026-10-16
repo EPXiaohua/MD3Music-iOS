@@ -242,9 +242,12 @@ import AVKit
     }
     pendingResult = result
     pendingDocPickerKind = .audio
-    // 常见音频 UTI + 冷门扩展名动态构造（ape/wma 无标准 UTI）
+    // 常见音频 UTI + 冷门扩展名动态构造（ape/wma 无标准 UTI）。
+    // 不能放 .audio 伞类型：public.midi-audio 等仅「conforms to public.audio」
+    // 的容器（.mid）也会被选择器置为可选，选进来又永不显示。这里严格对齐
+    // 扫描器 audioExtensions 白名单，不在集合内的文件在选择器里直接置灰。
     var audioTypes: Set<UTType> = [
-      .audio, .mp3, .mpeg4Audio, .wav, .aiff,
+      .mp3, .mpeg4Audio, .wav, .aiff,
     ]
     for ext in ["ape", "wma", "opus", "ogg", "aif", "m4a", "aac", "flac"] {
       if let t = UTType(filenameExtension: ext) { audioTypes.insert(t) }
