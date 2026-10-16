@@ -130,7 +130,8 @@ final class AutomixAnalysisDecoder: NSObject {
       else { continue }
       // 单声道 16bit 交错 = 连续 Int16 小端，直接按字节追加
       // （Dart 侧 Int16List.view 零拷贝，与 Android 小端字节流同构）
-      pcm.append(p.assumingMemoryBound(to: UInt8.self), count: frames * 2)
+      pcm.append(
+        UnsafeRawPointer(p).assumingMemoryBound(to: UInt8.self), count: frames * 2)
       produced += frames
     }
     reader.cancelReading()
