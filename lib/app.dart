@@ -384,14 +384,16 @@ class _AppViewState extends State<_AppView> {
   void _applyDesktopShortcuts() {
     final config = context.read<ShortcutConfigProvider>();
     const quickActions = QuickActions();
-    // iconResource 是 Android drawable 名，iOS 的模板图标走资源目录，
-    // 传错名字会导致图标缺失，这里 iOS 置空（仅显示文字）
+    // iconResource：Android 按 drawable 资源名查找；iOS 走
+    // UIApplicationShortcutIcon(templateImageName:)，按 Assets.xcassets 的
+    // imageset 名查找（两端资源同名：ic_shortcut_*，iOS 侧在 Runner 资源里）。
+    // 传错名字会导致图标静默缺失（仅显示文字）。
     quickActions.setShortcutItems([
       for (final s in config.visibleShortcuts)
         ShortcutItem(
           type: 'action_open_${s.id}',
           localizedTitle: s.label,
-          icon: Platform.isAndroid ? s.iconResource : null,
+          icon: s.iconResource,
         ),
     ]);
   }

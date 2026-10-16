@@ -459,14 +459,25 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.remove(_legacyUiScaleKey);
   }
 
-  /// 设置「显示大小」档位（[kMinDisplayScale] ~ [kMaxDisplayScale]）。
-  Future<void> setDisplayScale(double scale) async {
+  /// 预览「显示大小」档位：只改内存并通知监听者，**不落盘**。
+  ///
+  /// 显示大小确认弹窗期间用它实时应用新档位。确认前进程被杀（滑掉后台等）时，
+  /// 还原逻辑没机会执行——若此刻新档位已在磁盘上，下次启动会直接以未确认的
+  /// 档位生效（真机复现）；只预览则磁盘仍是旧档位，重启自然回到确认前状态。
+  void previewDisplayScale(double scale) {
     final clamped = scale.clamp(kMinDisplayScale, kMaxDisplayScale);
     if (_displayScale == clamped) return;
     _displayScale = clamped;
     notifyListeners();
+  }
+
+  /// 把当前（预览）档位落盘，确认弹窗点「保留」后调用。
+  ///
+  /// 不复用 [previewDisplayScale] 的幂等早退语义——预览后内存已是新值，
+  /// 这里无条件写入。
+  Future<void> persistDisplayScale() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_displayScaleKey, clamped);
+    await prefs.setDouble(_displayScaleKey, _displayScale);
   }
 
   /// 加载底部导航栏文字显示行为的持久化值，默认始终不显示。

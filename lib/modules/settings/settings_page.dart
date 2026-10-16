@@ -6681,12 +6681,16 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
     _apply(pending, applied);
   }
 
-  /// 应用档位：落盘后弹确认框，10 秒内不点「保留」自动还原。
+  /// 应用档位：先**内存预览**再弹确认框，10 秒内不点「保留」自动还原（内存）。
   /// 极端档位下滑块与按钮自身也被放大/缩小，可能已无法再操作，必须留一条
   /// 不依赖用户交互的退路。
+  ///
+  /// **确认前不落盘**：滑掉后台杀进程时还原逻辑跑不到，若此刻已落盘，未确认
+  /// 的档位会在下次启动直接生效（真机复现）；只预览则磁盘仍是旧档位，重启回到
+  /// 确认前的状态。点「保留」才经 [ThemeProvider.persistDisplayScale] 写入。
   Future<void> _apply(double value, double previous) async {
     final theme = context.read<ThemeProvider>();
-    await theme.setDisplayScale(value);
+    theme.previewDisplayScale(value);
     if (!mounted) return;
     final keep = await showDialog<bool>(
       context: context,
@@ -6694,9 +6698,10 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
       builder: (_) => const _DisplayScaleConfirmDialog(),
     );
     if (!mounted) return;
-    if (keep != true) {
-      await theme.setDisplayScale(previous);
-      if (!mounted) return;
+    if (keep == true) {
+      await theme.persistDisplayScale();
+    } else {
+      theme.previewDisplayScale(previous);
     }
     setState(() => _pending = null);
   }
