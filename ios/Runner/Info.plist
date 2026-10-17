@@ -82,6 +82,9 @@
 	<!-- image_picker 插件：歌单截图导入 -->
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>需要访问相册以导入歌单截图</string>
+	<!-- ImageSaverPlugin：长按保存图片到「MD3Music」相册（.addOnly，只写不读） -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>需要保存图片到相册</string>
 	<key>NSCameraUsageDescription</key>
 	<string>需要访问相机以拍摄歌单截图</string>
 	<key>UILaunchStoryboardName</key>

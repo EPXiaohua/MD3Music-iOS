@@ -621,9 +621,12 @@
 }
 
 - (void)load:(NSDictionary *)source initialPosition:(CMTime)initialPosition initialIndex:(NSNumber *)initialIndex result:(FlutterResult)result {
-    if (_playing) {
-        [_player pause];
-    }
+    // MD3Music fork: 无条件暂停（上游是 if (_playing)）。切歌是硬切换，
+    // 新源装载期间旧音频必须立刻停住；且 Dart 侧 playing 状态在系统中断/
+    // 事件迟到时可能与 AVPlayer 实际状态脱节（以为暂停了实际还在响），
+    // 按标志位跳过 pause 会留下上一首的残留声。对已暂停的播放器 pause
+    // 是幂等空操作，无条件调用没有副作用。
+    [_player pause];
     if (_processingState == psLoading) {
         [self abortExistingConnection:NO];
     }
@@ -722,6 +725,12 @@
     }
 
     if (_playing) {
+        // MD3Music fork: 用 play() 起播（上游是 _player.rate = _speed）。
+        // 直接设 rate 不会激活 AVAudioSession —— 系统中断结束后会话处于
+        // 停用态时，下一次切歌就表现为「播放器在播、解码正常（频谱 tap
+        // 在解码层采到 PCM）但扬声器无声」。play() 负责重新激活会话，
+        // 再把 rate 恢复到用户倍速（play() 以默认速率恢复）。
+        [_player play];
         _player.rate = _speed;
     }
     [_player setVolume:_volume];
@@ -1090,6 +1099,9 @@
         _playResult = result;
     }
     _playing = YES;
+    // MD3Music fork: 与 load: 同理，用 play() 确保音频会话激活（直接设
+    // rate 在会话停用态下静音），再恢复用户倍速。
+    [_player play];
     _player.rate = _speed;
     [self updatePosition];
     if (@available(macOS 10.12, iOS 10.0, *)) {}

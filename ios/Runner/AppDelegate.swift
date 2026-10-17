@@ -82,6 +82,9 @@ import AVKit
         result(AppDelegate.deviceModelName())
       }
 
+    // 图片保存到相册（对齐 Android ImageSaverPlugin.kt）。
+    ImageSaverPlugin.shared.attach(messenger: messenger)
+
     // iOS 锁屏/控制中心 Now Playing 信息与远程命令。
     // Android 的锁屏/通知由 Media3 MediaSession 负责，不经过此 channel，
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
