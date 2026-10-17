@@ -136,7 +136,8 @@ import UIKit
 
     var assetPlaceholder: PHObjectPlaceholder?
     PHPhotoLibrary.shared().performChanges({
-      let request = PHAssetCreationRequest.creationRequestForAsset()
+      // Xcode 26 SDK：creationRequestForAsset() 已更名 forAsset()。
+      let request = PHAssetCreationRequest.forAsset()
       request.creationDate = Date()
       request.addResource(with: .photo, fileURL: src, options: nil)
       assetPlaceholder = request.placeholderForCreatedAsset
