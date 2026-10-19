@@ -4,8 +4,10 @@
 //
 //  iOS 软件均衡器：AVPlayer 不支持 AVAudioUnit 效果器，但支持
 //  AVAudioMix + MTAudioProcessingTap（解码后、输出前的 PCM 钩子）。
-//  在 tap 的 process 回调里做 10 段 peaking biquad（RBJ cookbook），
-//  AVPlayer 继续负责传输/流式/seek/缓冲，播放栈零重构。
+//  在 tap 的 process 回调里做 5 段 peaking biquad（RBJ cookbook），
+//  系数变更经逐样本 ramp 平滑过渡（无咔哒声，对齐 Android 系统
+//  Equalizer 的参数平滑行为），AVPlayer 继续负责传输/流式/seek/
+//  缓冲，播放栈零重构。
 //
 //  挂载链路：just_audio fork（UriAudioSource.createPlayerItem）每次创建
 //  AVPlayerItem 时发 NSNotification "JustAudioPlayerItemCreated"，
@@ -23,7 +25,7 @@ import MediaToolbox
 // MARK: - biquad 滤波器
 
 /// RBJ cookbook peaking biquad。gain==0 时该段不参与（恒等直通）。
-struct BiquadCoeffs {
+struct BiquadCoeffs: Equatable {
     var b0: Double = 1
     var b1: Double = 0
     var b2: Double = 0
@@ -32,8 +34,19 @@ struct BiquadCoeffs {
 }
 
 /// 单声道单段的运行状态（Direct Form I）。
+/// 系数变更不复位滤波器状态，而是从当前插值位置向目标系数做逐样本
+/// ramp（≈12ms）——直接换系数/清状态会让输出波形阶跃，听感为
+/// 「咔哒」噪声；Android 系统 Equalizer 由效果框架内部平滑，tap 侧
+/// 必须自己做等价过渡。
 struct BiquadState {
     var coeffs = BiquadCoeffs()
+    /// ramp 起点（启动时快照当前插值位置，中途重定向无缝）
+    var from = BiquadCoeffs()
+    /// ramp 终点
+    var to = BiquadCoeffs()
+    var rampPos = 0
+    /// 0 = 无 ramp
+    var rampLen = 0
     var x1: Double = 0
     var x2: Double = 0
     var y1: Double = 0
@@ -41,6 +54,20 @@ struct BiquadState {
 
     @inline(__always)
     mutating func apply(_ x: Double) -> Double {
+        if rampLen > 0 {
+            if rampPos >= rampLen {
+                coeffs = to
+                rampLen = 0
+            } else {
+                let t = Double(rampPos) / Double(rampLen)
+                coeffs.b0 = from.b0 + (to.b0 - from.b0) * t
+                coeffs.b1 = from.b1 + (to.b1 - from.b1) * t
+                coeffs.b2 = from.b2 + (to.b2 - from.b2) * t
+                coeffs.a1 = from.a1 + (to.a1 - from.a1) * t
+                coeffs.a2 = from.a2 + (to.a2 - from.a2) * t
+                rampPos += 1
+            }
+        }
         let y = coeffs.b0 * x + coeffs.b1 * x1 + coeffs.b2 * x2
             - coeffs.a1 * y1 - coeffs.a2 * y2
         x2 = x1
@@ -121,11 +148,11 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
         }
     }
 
-    // 有增益变更/采样率变化时重算系数（gain==0 的段直接跳过 = 完美直通）
+    // 有增益变更/采样率变化时重算目标系数并启动逐样本 ramp
     state.syncCoeffsIfNeeded()
 
-    // 频谱采样：取 EQ 处理前的原始信号。必须放在 activeBands guard 之前——
-    // EQ 关闭时 activeBands 为空，若在 guard 之后这里永远执行不到，
+    // 频谱采样：取 EQ 处理前的原始信号。必须放在 needsProcessing guard
+    // 之前——EQ 关闭时不需要滤波，若在 guard 之后这里永远执行不到，
     // Dart 端 1.5s 收不到 FFT 会误降级模拟模式（"设备不支持频谱"toast 根因）
     guard state.float32, state.channelCount > 0 else { return }
     guard frames > 0 else { return }
@@ -133,8 +160,9 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
     let buffers = UnsafeMutableAudioBufferListPointer(bufferListInOut)
     AudioEqualizer.spectrumFeed(buffers, sampleRateHz: state.sampleRate)
 
-    // EQ 关闭（无活动频段）时跳过滤波处理，tap 仅承担频谱采样职责
-    guard !state.activeBands.isEmpty else { return }
+    // 全部频段为单位直通且无过渡 ramp 时跳过滤波处理（单位系数输出
+    // 与输入逐位相同），tap 仅承担频谱采样职责
+    guard state.needsProcessing else { return }
     if state.nonInterleaved {
         for (c, buf) in buffers.enumerated() {
             guard c < state.channelCount, c < state.channels.count,
@@ -145,7 +173,7 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
             var filters = state.channels[c]
             for i in 0..<min(frames, sampleCount) {
                 var s = Double(samples[i])
-                for bi in state.activeBands {
+                for bi in filters.indices {
                     s = filters[bi].apply(s)
                 }
                 // 限幅防削波：多频段增益叠加可能使样本超出 ±1.0，
@@ -167,7 +195,7 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
                 var filters = state.channels[c]
                 for i in stride(from: c, to: total, by: ch) {
                     var s = Double(samples[i])
-                    for bi in state.activeBands {
+                    for bi in filters.indices {
                         s = filters[bi].apply(s)
                     }
                     // 同上：限幅防削波
@@ -177,6 +205,8 @@ let eqTapProcess: MTAudioProcessingTapProcessCallback = { tap, numberFrames, _, 
             }
         }
     }
+    // 收尾刷新旁路标志：所有段回到单位直通且 ramp 已结束 → 恢复跳过
+    state.refreshBypass()
 }
 
 // MARK: - tap 状态（init/finalize 持有，process 在实时音频线程访问）
@@ -188,10 +218,13 @@ final class EqTapState {
     var float32 = false
     var channels: [[BiquadState]] = []
     var lastAppliedVersion: Int = -1
-    /// 当前实际生效的频段索引（gain != 0 的段），空数组 = 全直通
-    var activeBands: [Int] = []
+    /// 是否需要滤波（任一段系数非单位直通或仍在 ramp）；否则整段跳过
+    var needsProcessing = false
 
-    /// 由音频线程调用：均衡器参数脏了就重算系数（更新极少，开销可忽略）
+    /// 由音频线程调用：均衡器参数脏了就让各段系数向目标值做逐样本
+    /// ramp（更新极少，开销可忽略）。不复位滤波器状态、不切换链路
+    /// 拓扑 —— 直接换系数/清状态会让输出波形阶跃，听感为咔哒声；
+    /// ramp 从当前插值位置出发，拖动滑杆时连续重定向也无缝。
     func syncCoeffsIfNeeded() {
         let shared = AudioEqualizer.shared
         os_unfair_lock_lock(&shared.lock)
@@ -199,22 +232,40 @@ final class EqTapState {
         guard lastAppliedVersion != shared.version else { return }
         lastAppliedVersion = shared.version
 
-        activeBands.removeAll()
-        if shared.enabled {
-            for (band, gain) in shared.gains.enumerated() where gain != 0 {
-                activeBands.append(band)
-            }
-        }
-        // 重算所有声道的系数（声道数未知时按当前数组算）
+        var anyTargetActive = false
+        var startedRamp = false
+        // 重算所有声道的目标系数（声道数未知时按当前数组算）
         for c in channels.indices {
             for (band, gain) in shared.gains.enumerated() where band < channels[c].count {
-                channels[c][band].coeffs = Self.peakCoeffs(
+                let target = Self.peakCoeffs(
                     freq: AudioEqualizer.bandFreqs[band],
                     sampleRate: sampleRate,
                     gainDb: shared.enabled ? gain : 0)
-                channels[c][band].reset()
+                var f = channels[c][band]
+                if f.coeffs == target && f.rampLen == 0 { continue }
+                if target != BiquadCoeffs() { anyTargetActive = true }
+                f.from = f.coeffs
+                f.to = target
+                f.rampPos = 0
+                f.rampLen = AudioEqualizer.coeffRampFrames
+                startedRamp = true
+                channels[c][band] = f
             }
         }
+        needsProcessing = anyTargetActive || startedRamp
+    }
+
+    /// process 末尾刷新旁路标志：所有段回到单位直通且 ramp 已结束
+    /// 时恢复整段跳过（EQ 关闭后 tap 仅承担频谱采样职责）。
+    func refreshBypass() {
+        var active = false
+        outer: for ch in channels {
+            for f in ch where f.rampLen > 0 || f.coeffs != BiquadCoeffs() {
+                active = true
+                break outer
+            }
+        }
+        needsProcessing = active
     }
 
     /// RBJ cookbook peaking EQ（Q=1.1，近似 10 段图示均衡器的带宽）
@@ -245,6 +296,10 @@ final class EqTapState {
     /// （android.media.audiofx.Equalizer 设备典型值：60/230/910/3600/14000）
     static let bandFreqs: [Double] = [60, 230, 910, 3600, 14000]
     static let bandCount = 5
+    /// 系数过渡长度（帧）：512 ≈ 12ms @44.1k —— 拖动滑杆/开关 EQ 时
+    /// 系数逐样本插值，消除切换咔哒声（对齐 Android 系统 Equalizer
+    /// 的参数平滑行为）
+    static let coeffRampFrames = 512
     /// 增益范围 mB（与 Android 侧同单位：毫贝，同范围 ±1500 mB = ±15 dB）
     static let minLevel = -1500
     static let maxLevel = 1500
