@@ -51,8 +51,9 @@ class _LibraryPageState extends State<LibraryPage>
   void initState() {
     super.initState();
     _tabController = TabController(
-      // iOS 沙箱下导入的音乐全部在 Imports 目录，「文件夹」视图无意义，隐藏
-      length: isIOSPlatform ? 4 : 5,
+      // 曲目/专辑/艺术家/文件夹/收藏 共 5 个（iOS 文件夹视图已随
+      // 授权文件夹 + Documents 扫描源一同启用）
+      length: 5,
       vsync: this,
     );
     _searchFocusNode = FocusNode();
@@ -170,7 +171,7 @@ class _LibraryPageState extends State<LibraryPage>
                         const Tab(text: '曲目'),
                         const Tab(text: '专辑'),
                         const Tab(text: '艺术家'),
-                        if (!isIOSPlatform) const Tab(text: '文件夹'),
+                        const Tab(text: '文件夹'),
                         const Tab(text: '收藏'),
                       ],
                       // 5 个 Tab 内容较窄，关闭滚动并居中分布到整行，
@@ -334,7 +335,13 @@ class _LibraryPageState extends State<LibraryPage>
             // 免得改了一边忘了另一边。
             void rescan() {
               Navigator.pop(ctx);
-              provider.loadLocalMusic();
+              // iOS：扫描 = 呼出文件夹授权（选择器），选完自动重扫；
+              // 重复选同一文件夹会去重并刷新。
+              if (isIOSPlatform) {
+                provider.authorizeMusicFolder();
+              } else {
+                provider.loadLocalMusic();
+              }
             }
 
             // 原addScanFolder 回调已并入 [_showScanFolderManagement]（那里才有列表上下文，
@@ -763,7 +770,13 @@ class _LibraryPageState extends State<LibraryPage>
           FilledButton.tonal(
             onPressed: () {
               _dismissSearchFocus();
-              context.read<LibraryProvider>().loadLocalMusic();
+              final provider = context.read<LibraryProvider>();
+              // iOS：扫描 = 呼出文件夹授权选择器，选完自动扫描
+              if (isIOSPlatform) {
+                provider.authorizeMusicFolder();
+              } else {
+                provider.loadLocalMusic();
+              }
             },
             child: const Text('扫描音乐'),
           ),
