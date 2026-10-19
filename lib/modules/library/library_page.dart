@@ -754,7 +754,7 @@ class _LibraryPageState extends State<LibraryPage>
           ),
           const Gap(AppSpacing.sm),
           Text(
-            isIOSPlatform ? '授权文件夹，扫描本地音乐' : '点击扫描按钮添加本地音乐',
+            '点击扫描按钮添加本地音乐',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
             ),
