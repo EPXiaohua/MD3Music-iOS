@@ -170,7 +170,8 @@ class LibraryProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // 请求存储权限（iOS 无需权限：只读 app 沙箱内的导入目录）
+      // 请求存储权限（iOS：应用 Documents 沙箱内无需权限，授权目录由
+      // 安全作用域书签授予访问权，同样不触发系统权限弹窗）
       if (!isIOSPlatform) {
         final hasPermission = await requestStoragePermission();
         if (!hasPermission) {
@@ -186,11 +187,11 @@ class LibraryProvider extends ChangeNotifier {
       _excludedFolders = await _repository.getExcludedFolders();
       _filterShortAudio = await _repository.getFilterShortAudio();
 
-      // 扫描（传入排除文件夹）。iOS 沙箱限制：外部媒体目录不可达，扫描源
-      // 只有导入目录（导入音乐 = 文件选择器拷贝进沙箱），Android 目录天然
-      // 不存在返回空，行为无害
+      // iOS 扫描源 = 应用 Documents（文件 App 可见，用户可直接投递音频）
+      // + 已授权文件夹（安全作用域书签，原位扫描原位播放，不拷贝）。
+      // Android 目录天然不存在返回空，行为无害
       final scanDirs = isIOSPlatform
-          ? [await _importsDirectory()]
+          ? [await _documentsDirectory(), ...await _resolveAuthorizedFolders()]
           : _scanFolders;
       final songs = await _repository.scanSongs(
         customFolders: scanDirs,
@@ -225,7 +226,15 @@ class LibraryProvider extends ChangeNotifier {
   }
 
   /// 通过文件夹选择器添加扫描目录。
+  ///
+  /// 与安卓同一套「扫描文件夹」UI，仅底层不同：iOS 走文件夹授权
+  /// （Files 选择器 + 安全作用域书签，添加后自动重扫），安卓走 SAF
+  /// （持久化 URI 权限，手动点扫描生效）。
   Future<bool> addScanFolder() async {
+    if (isIOSPlatform) {
+      final path = await authorizeMusicFolder();
+      return path != null;
+    }
     final path = await FolderPickerService.pickFolder();
     if (path == null) return false;
 
@@ -239,22 +248,35 @@ class LibraryProvider extends ChangeNotifier {
   /// 移除扫描目录。
   Future<void> removeScanFolder(String path) async {
     await _repository.removeFolder(path);
+    // iOS：同步清除原生的安全作用域书签，结束对该目录的授权访问
+    if (isIOSPlatform) {
+      try {
+        const channel = MethodChannel('com.md3music.md3music/audio_import');
+        await channel.invokeMethod<void>('removeMusicFolder', {'path': path});
+      } catch (e) {
+        _log('[LibraryProvider] remove native bookmark failed: $e');
+      }
+    }
     _scanFolders = await _repository.getSavedFolders();
     notifyListeners();
   }
 
   /// 删除本地歌曲（歌曲更多菜单）。
   ///
-  /// iOS：导入目录内的文件归 app 沙箱所有，删除时连同文件一起删除；
+  /// iOS：文件位于应用 Documents 内（旧版导入目录 / 文件 App 投递）时归
+  /// 沙箱所有，删除时连同文件一起删除；授权目录（沙箱外）只移出索引。
   /// 文件删除失败（已被系统清理等）不阻塞列表移除。其余平台仅移出索引。
   Future<void> deleteLocalSong(Song song) async {
     final path = song.localPath;
-    if (isIOSPlatform && path != null && path.contains('/Music/Imports/')) {
+    if (isIOSPlatform && path != null) {
       try {
-        final f = File(path);
-        if (await f.exists()) {
-          await f.delete();
-          _log('[LibraryProvider] deleted file: $path');
+        final docs = await getApplicationDocumentsDirectory();
+        if (path.startsWith('${docs.path}/')) {
+          final f = File(path);
+          if (await f.exists()) {
+            await f.delete();
+            _log('[LibraryProvider] deleted file: $path');
+          }
         }
       } catch (e) {
         _log('[LibraryProvider] delete file failed: $e');
@@ -266,44 +288,63 @@ class LibraryProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// iOS 导入目录：Documents/Music/Imports（app 沙箱内，无权限要求）。
-  Future<String> _importsDirectory() async {
+  /// iOS 音乐扫描根目录：应用 Documents（文件 App 可见，用户可直接投递）。
+  Future<String> _documentsDirectory() async {
     final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory(
-      '${docs.path}${Platform.pathSeparator}Music'
-      '${Platform.pathSeparator}Imports',
-    );
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    return dir.path;
+    return docs.path;
   }
 
-  /// iOS 导入音乐：原生 DocumentPicker 多选音频 → 原生拷贝进沙箱导入目录
-  /// （Documents/Music/Imports）→ 重扫。
-  ///
-  /// iOS 沙箱无法扫描系统媒体库，本地音乐的唯一来源就是把音频文件导入进
-  /// 沙箱。原生通道与字体/背景图导入同款（file_selector 的 iOS 实现在这台
-  /// 设备上不弹出选择器）。返回拷入的文件数；-1 = 通道/选择器失败，0 = 取消。
-  Future<int> importSongs() async {
-    if (!isIOSPlatform) return -1;
+  /// iOS：恢复已授权文件夹的访问（原生解析安全作用域书签并保持激活）。
+  /// 返回当前可访问的授权目录路径列表。
+  Future<List<String>> _resolveAuthorizedFolders() async {
     try {
-      debugPrint('[LibraryImport] opening picker...');
       const channel = MethodChannel('com.md3music.md3music/audio_import');
-      final count = await channel.invokeMethod<int>('pickAudioFiles') ?? 0;
-      debugPrint('[LibraryImport] imported $count files');
-      if (count <= 0) return 0;
+      final paths = await channel.invokeMethod<List<dynamic>>(
+        'resolveMusicFolders',
+      );
+      return paths?.cast<String>() ?? const [];
+    } catch (e) {
+      _log('[LibraryProvider] resolve authorized folders failed: $e');
+      return const [];
+    }
+  }
+
+  /// iOS：授权音乐文件夹（Files 文件夹选择器 + 安全作用域书签）→ 重扫。
+  ///
+  /// 授权目录原位扫描、原位播放，不再拷贝进沙箱（旧「导入」已移除）。书签
+  /// 持久化在原生侧（UserDefaults），冷启动由 [_resolveAuthorizedFolders]
+  /// 恢复访问。返回授权的路径；null = 用户取消或通道失败。
+  Future<String?> authorizeMusicFolder() async {
+    if (!isIOSPlatform) return null;
+    try {
+      const channel = MethodChannel('com.md3music.md3music/audio_import');
+      final path = await channel.invokeMethod<String>('pickMusicFolder');
+      if (path == null || path.isEmpty) return null;
+      await _repository.addFolder(path);
+      _scanFolders = await _repository.getSavedFolders();
+      notifyListeners();
       await loadLocalMusic();
-      return count;
+      return path;
     } catch (e) {
       // 直出（不经 kDebugMode 过滤）：诊断包需要采集到失败原因
-      debugPrint('[LibraryImport] import failed: $e');
-      return -1;
+      debugPrint('[LibraryImport] authorize folder failed: $e');
+      return null;
     }
   }
 
   /// 通过文件夹选择器添加排除目录。
+  ///
+  /// 排除只做路径过滤匹配：iOS 仅取路径（不建授权书签、不激活访问权），
+  /// 安卓走 SAF。
   Future<bool> addExcludedFolder() async {
+    if (isIOSPlatform) {
+      final path = await _pickIosFolderPath();
+      if (path == null) return false;
+      await _repository.addExcludedFolder(path);
+      _excludedFolders = await _repository.getExcludedFolders();
+      notifyListeners();
+      return true;
+    }
     final path = await FolderPickerService.pickFolder();
     if (path == null) return false;
 
@@ -311,6 +352,17 @@ class LibraryProvider extends ChangeNotifier {
     _excludedFolders = await _repository.getExcludedFolders();
     notifyListeners();
     return true;
+  }
+
+  /// iOS：文件夹选择器只取路径（排除目录用，不建授权书签）。
+  Future<String?> _pickIosFolderPath() async {
+    try {
+      const channel = MethodChannel('com.md3music.md3music/audio_import');
+      return await channel.invokeMethod<String>('pickFolderPath');
+    } catch (e) {
+      _log('[LibraryProvider] pick folder path failed: $e');
+      return null;
+    }
   }
 
   /// 移除排除目录。

@@ -344,20 +344,11 @@ class _LibraryPageState extends State<LibraryPage>
               _showScanFolderManagement(context);
             }
 
+            // iOS 与安卓同一套菜单：文件夹管理 UI 完全一致，仅底层不同
+            // （iOS = 文件夹授权 + 安全作用域书签；安卓 = SAF）。
             void manageExcluded() {
               Navigator.pop(ctx);
               _showExcludedFolderManagement(context);
-            }
-
-            // iOS：文件选择器导入音频进沙箱（provider 内部完成拷贝 + 重扫）
-            Future<void> importMusic() async {
-              Navigator.pop(ctx);
-              final n = await provider.importSongs();
-              if (n > 0) {
-                showToast('已导入 $n 个文件', long: true);
-              } else if (n < 0) {
-                showToast('导入失败，请重试', long: true);
-              }
             }
 
             final isIos = isIOSPlatform;
@@ -380,77 +371,52 @@ class _LibraryPageState extends State<LibraryPage>
                   Padding(
                     padding: const EdgeInsets.all(AppSpacing.lg),
                     child: Text(
-                      isIos ? '导入本地音乐' : '扫描本地音乐',
+                      '扫描本地音乐',
                       style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
                         fontWeight: FontWeight.w600,
                       ),
                     ),
                   ),
-                  // iOS：沙箱无法扫描系统媒体库，入口改为文件导入，扫描目录/
-                  // 排除目录管理一并隐藏；仅保留导入 + 刷新 + 过滤开关
-                  if (isIos)
-                    _tvSheetRow(
-                      importMusic,
-                      debugLabel: 'scan_menu_import',
-                      ListTile(
-                        leading: const Icon(Icons.library_add_outlined),
-                        title: const Text('导入音乐'),
-                        subtitle: const Text('从「文件」App 选择音频文件导入到本应用'),
-                        onTap: () => importMusic(),
-                      ),
-                      focusNode: _tvScanMenuFirstNode,
-                    )
-                  else ...[
-                    // tv: 首项持有显式焦点节点，由 [_tvEnsureSheetFocus] 在弹层
-                    // 挂载后主动请求（`autofocus` 在 m3e 弹层里不可靠）
-                    _tvSheetRow(
-                      rescan,
-                      debugLabel: 'scan_menu_rescan',
-                      ListTile(
-                        leading: const Icon(Icons.refresh),
-                        title: const Text('扫描音乐'),
-                        subtitle: const Text('扫描默认目录和已添加的文件夹'),
-                        onTap: rescan,
-                      ),
-                      focusNode: _tvScanMenuFirstNode,
-                    ),
-                    // 打开扫描文件夹管理面板（列出已添加项 + 移除）。
-                    // 此前直接调文件夹选择器，加完就看不到有哪些、也没法移除，
-                    // 用户以为没持久化（实际已存盘，见 LocalMusicRepository.saveFolders）。
-                    _tvSheetRow(
-                      manageScanFolders,
-                      debugLabel: 'scan_menu_add_folder',
-                      ListTile(
-                        leading: const Icon(Icons.create_new_folder_outlined),
-                        title: const Text('添加扫描文件夹'),
-                        subtitle: Text(
-                            '选择额外的文件夹进行扫描'
-                            '${provider.scanFolders.isEmpty ? '' : '（已添加 ${provider.scanFolders.length} 个）'}'),
-                        onTap: manageScanFolders,
-                      ),
-                    ),
-                    _tvSheetRow(
-                      manageExcluded,
-                      debugLabel: 'scan_menu_excluded',
-                      ListTile(
-                        leading: const Icon(Icons.folder_off_outlined),
-                        title: const Text('排除文件夹'),
-                        subtitle: Text(
-                            '已排除 ${provider.excludedFolders.length} 个文件夹'),
-                        onTap: manageExcluded,
-                      ),
-                    ),
-                  ],
-                  // iOS：重读导入目录（导入完成会自动刷新，此行兜底手动刷新）
+                  // tv: 首项持有显式焦点节点，由 [_tvEnsureSheetFocus] 在弹层
+                  // 挂载后主动请求（`autofocus` 在 m3e 弹层里不可靠）
                   _tvSheetRow(
                     rescan,
-                    debugLabel: isIos ? 'scan_menu_rescan_ios' : 'scan_menu_rescan',
+                    debugLabel: 'scan_menu_rescan',
                     ListTile(
                       leading: const Icon(Icons.refresh),
-                      title: Text(isIos ? '刷新' : '扫描音乐'),
+                      title: const Text('扫描音乐'),
                       subtitle: Text(
-                          isIos ? '重新读取已导入的音乐' : '扫描默认目录和已添加的文件夹'),
+                          isIos ? '重新扫描应用目录和已授权的文件夹' : '扫描默认目录和已添加的文件夹'),
                       onTap: rescan,
+                    ),
+                    focusNode: _tvScanMenuFirstNode,
+                  ),
+                  // 打开扫描文件夹管理面板（列出已添加项 + 移除）。
+                  // 此前直接调文件夹选择器，加完就看不到有哪些、也没法移除，
+                  // 用户以为没持久化（实际已存盘，见 LocalMusicRepository.saveFolders）。
+                  // iOS 同一入口：管理面板里的添加走文件夹授权选择器。
+                  _tvSheetRow(
+                    manageScanFolders,
+                    debugLabel: 'scan_menu_add_folder',
+                    ListTile(
+                      leading: const Icon(Icons.create_new_folder_outlined),
+                      title: const Text('添加扫描文件夹'),
+                      subtitle: Text(
+                          isIos ? '授权「文件」App 中的文件夹，原位扫描'
+                                : '选择额外的文件夹进行扫描'
+                                  '${provider.scanFolders.isEmpty ? '' : '（已添加 ${provider.scanFolders.length} 个）'}'),
+                      onTap: manageScanFolders,
+                    ),
+                  ),
+                  _tvSheetRow(
+                    manageExcluded,
+                    debugLabel: 'scan_menu_excluded',
+                    ListTile(
+                      leading: const Icon(Icons.folder_off_outlined),
+                      title: const Text('排除文件夹'),
+                      subtitle: Text(
+                          '已排除 ${provider.excludedFolders.length} 个文件夹'),
+                      onTap: manageExcluded,
                     ),
                   ),
                   // tv: 开关行同样要单停点；OK 键翻转取值
@@ -508,11 +474,18 @@ class _LibraryPageState extends State<LibraryPage>
 
             Future<void> addFolder() async {
               _dismissSearchFocus();
-              final success = await provider.addScanFolder();
+              // 与安卓同一入口，仅底层不同：iOS 走文件夹授权（添加后自动重扫），
+              // 安卓走 SAF（手动点扫描生效）。
+              final success = isIOSPlatform
+                  ? await provider.authorizeMusicFolder() != null
+                  : await provider.addScanFolder();
               if (success && ctx.mounted) {
                 setModalState(() {});
                 if (context.mounted) {
-                  showToast('已添加扫描文件夹，点击扫描音乐生效', long: true);
+                  showToast(
+                    isIOSPlatform ? '已添加授权文件夹并开始扫描' : '已添加扫描文件夹，点击扫描音乐生效',
+                    long: true,
+                  );
                 }
               }
             }
@@ -785,7 +758,9 @@ class _LibraryPageState extends State<LibraryPage>
           ),
           const Gap(AppSpacing.sm),
           Text(
-            isIOSPlatform ? '点击导入按钮添加本地音乐' : '点击扫描按钮添加本地音乐',
+            isIOSPlatform
+                ? '授权一个文件夹，或在「文件」App 中往本应用目录添加音频'
+                : '点击扫描按钮添加本地音乐',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
             ),
@@ -796,12 +771,12 @@ class _LibraryPageState extends State<LibraryPage>
               _dismissSearchFocus();
               final provider = context.read<LibraryProvider>();
               if (isIOSPlatform) {
-                provider.importSongs();
+                provider.authorizeMusicFolder();
               } else {
                 provider.loadLocalMusic();
               }
             },
-            child: Text(isIOSPlatform ? '导入音乐' : '扫描音乐'),
+            child: Text(isIOSPlatform ? '添加音乐文件夹' : '扫描音乐'),
           ),
         ],
       ),

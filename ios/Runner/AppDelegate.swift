@@ -11,11 +11,11 @@ import AVKit
     UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
   /// 待回复的 FlutterResult（各选择器互斥，同一时间只允许一个）
   private var pendingResult: FlutterResult?
-  /// 当前 UIDocumentPicker 的用途（字体单选 / 音频多选，回调按此分派）
+  /// 当前 UIDocumentPicker 的用途（字体单选 / 音乐文件夹授权 / 排除目录，回调按此分派）
   private var pendingDocPickerKind: DocPickerKind?
   private var channelsConfigured = false
 
-  private enum DocPickerKind { case font, audio }
+  private enum DocPickerKind { case font, musicFolder, folderPath }
 
   override func application(
     _ application: UIApplication,
@@ -61,14 +61,22 @@ import AVKit
         self?.pickBackgroundImage(result: result)
       }
 
-    // 本地音乐导入：UIDocumentPicker 多选音频，拷贝进沙箱后返回文件数
+    // 本地音乐文件夹授权：Files 文件夹选择器 + 安全作用域书签（重启可恢复），
+    // 授权目录原位扫描/播放（旧版「DocumentPicker 拷贝导入」已移除）。
     FlutterMethodChannel(name: "com.md3music.md3music/audio_import", binaryMessenger: messenger)
       .setMethodCallHandler { [weak self] call, result in
-        guard call.method == "pickAudioFiles" else {
+        switch call.method {
+        case "pickMusicFolder":
+          self?.pickMusicFolder(result: result)
+        case "pickFolderPath":
+          self?.pickFolderPath(result: result)
+        case "resolveMusicFolders":
+          self?.resolveMusicFolders(result: result)
+        case "removeMusicFolder":
+          self?.removeMusicFolder(call, result: result)
+        default:
           result(FlutterMethodNotImplemented)
-          return
         }
-        self?.pickAudioFiles(result: result)
       }
 
     // 真实机型（诊断日志用）。iOS 无 MediaStore，Dart 侧 Platform.operatingSystem
@@ -232,11 +240,17 @@ import AVKit
     presenter.present(picker, animated: true)
   }
 
-  // MARK: - 音频导入（本地音乐：DocumentPicker 多选，拷入沙箱后返回文件数）
+  // MARK: - 音乐文件夹授权（本地音乐：Files 文件夹选择器 + 安全作用域书签）
 
-  private func pickAudioFiles(result: @escaping FlutterResult) {
+  /// 已激活安全作用域的文件夹路径。授权后保持激活直到进程结束，
+  /// 供本次会话内的扫描与播放直接读取（stop 后 AVPlayer 会读不了）。
+  private var activeSecurityScopes = Set<String>()
+
+  private static let musicFolderBookmarksKey = "music_folder_bookmarks"
+
+  private func pickMusicFolder(result: @escaping FlutterResult) {
     guard pendingResult == nil else {
-      result(0)  // 已有选择器在运行，视为取消
+      result(nil)  // 已有选择器在运行，视为取消
       return
     }
     guard let presenter = presenter else {
@@ -244,22 +258,137 @@ import AVKit
       return
     }
     pendingResult = result
-    pendingDocPickerKind = .audio
-    // 常见音频 UTI + 冷门扩展名动态构造（ape/wma 无标准 UTI）。
-    // 不能放 .audio 伞类型：public.midi-audio 等仅「conforms to public.audio」
-    // 的容器（.mid）也会被选择器置为可选，选进来又永不显示。这里严格对齐
-    // 扫描器 audioExtensions 白名单，不在集合内的文件在选择器里直接置灰。
-    var audioTypes: Set<UTType> = [
-      .mp3, .mpeg4Audio, .wav, .aiff,
-    ]
-    for ext in ["ape", "wma", "opus", "ogg", "aif", "m4a", "aac", "flac"] {
-      if let t = UTType(filenameExtension: ext) { audioTypes.insert(t) }
-    }
+    pendingDocPickerKind = .musicFolder
     let picker = UIDocumentPickerViewController(
-      forOpeningContentTypes: Array(audioTypes), asCopy: true)
+      forOpeningContentTypes: [.folder], asCopy: false)
     picker.delegate = self
-    picker.allowsMultipleSelection = true
+    picker.allowsMultipleSelection = false
     presenter.present(picker, animated: true)
+  }
+
+  /// 授权成功：创建安全作用域书签持久化（冷启动可恢复访问），保持作用域
+  /// 激活供本次会话扫描/播放，返回路径给 Dart 存入扫描文件夹列表。
+  private func handleMusicFolderPicked(_ url: URL) -> String? {
+    let granted = url.startAccessingSecurityScopedResource()
+    do {
+      let bookmark = try url.bookmarkData()
+      storeMusicFolderBookmark(bookmark, forPath: url.path)
+      if granted { activeSecurityScopes.insert(url.path) }
+      return url.path
+    } catch {
+      NSLog("[MD3Music] music folder bookmark failed: \(error)")
+      if granted { url.stopAccessingSecurityScopedResource() }
+      return nil
+    }
+  }
+
+  /// 排除目录选择：只取路径做过滤匹配，不需要访问权
+  ///（不建书签、不激活安全作用域）。
+  private func pickFolderPath(result: @escaping FlutterResult) {
+    guard pendingResult == nil else {
+      result(nil)  // 已有选择器在运行，视为取消
+      return
+    }
+    guard let presenter = presenter else {
+      result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "无法获取展示控制器", details: nil))
+      return
+    }
+    pendingResult = result
+    pendingDocPickerKind = .folderPath
+    let picker = UIDocumentPickerViewController(
+      forOpeningContentTypes: [.folder], asCopy: false)
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    presenter.present(picker, animated: true)
+  }
+
+  /// 冷启动恢复已授权文件夹：解析书签 → 激活安全作用域 → 返回可访问路径。
+  /// 解析失败的书签（文件夹被删/授权被系统回收）顺带清除，自愈。
+  private func resolveMusicFolders(result: @escaping FlutterResult) {
+    let defaults = UserDefaults.standard
+    guard let bookmarks = defaults.array(forKey: Self.musicFolderBookmarksKey) as? [Data] else {
+      result([String]())
+      return
+    }
+    var paths: [String] = []
+    var survivors: [Data] = []
+    for data in bookmarks {
+      var stale = false
+      guard
+        let url = try? URL(
+          resolvingBookmarkData: data, options: [], relativeTo: nil,
+          bookmarkDataIsStale: &stale)
+      else { continue }
+      if url.startAccessingSecurityScopedResource() || activeSecurityScopes.contains(url.path) {
+        activeSecurityScopes.insert(url.path)
+        survivors.append(data)
+        paths.append(url.path)
+      }
+    }
+    defaults.set(survivors, forKey: Self.musicFolderBookmarksKey)
+    result(paths)
+  }
+
+  /// 移除授权文件夹：按路径匹配书签删除，并结束对应的安全作用域。
+  private func removeMusicFolder(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let path = (call.arguments as? [String: Any])?["path"] as? String,
+      !path.isEmpty
+    else {
+      result(FlutterError(code: "INVALID_ARGUMENT", message: "path is required", details: nil))
+      return
+    }
+    let defaults = UserDefaults.standard
+    let bookmarks = (defaults.array(forKey: Self.musicFolderBookmarksKey) as? [Data]) ?? []
+    let want = Self.normalizedMusicFolderPath(path)
+    var survivors: [Data] = []
+    var removedURL: URL?
+    for old in bookmarks {
+      var stale = false
+      guard
+        let url = try? URL(
+          resolvingBookmarkData: old, options: [], relativeTo: nil,
+          bookmarkDataIsStale: &stale)
+      else {
+        survivors.append(old)
+        continue
+      }
+      if Self.normalizedMusicFolderPath(url.path) == want {
+        removedURL = url
+      } else {
+        survivors.append(old)
+      }
+    }
+    defaults.set(survivors, forKey: Self.musicFolderBookmarksKey)
+    if let url = removedURL, activeSecurityScopes.remove(url.path) != nil {
+      // 平衡此前的 start；正在播放该目录歌曲时停止授权属预期行为
+      url.stopAccessingSecurityScopedResource()
+    }
+    result(nil)
+  }
+
+  private func storeMusicFolderBookmark(_ data: Data, forPath path: String) {
+    let defaults = UserDefaults.standard
+    var bookmarks = (defaults.array(forKey: Self.musicFolderBookmarksKey) as? [Data]) ?? []
+    let want = Self.normalizedMusicFolderPath(path)
+    // 同一路径去重：覆盖旧书签；解析不了的旧书签一并清掉
+    bookmarks.removeAll { old in
+      var stale = false
+      guard
+        let oldURL = try? URL(
+          resolvingBookmarkData: old, options: [], relativeTo: nil,
+          bookmarkDataIsStale: &stale)
+      else { return true }
+      return Self.normalizedMusicFolderPath(oldURL.path) == want
+    }
+    bookmarks.append(data)
+    defaults.set(bookmarks, forKey: Self.musicFolderBookmarksKey)
+  }
+
+  /// 路径比较前先归一化 /private 前缀（符号链接伪影，bookmark 解析结果
+  /// 与选择器返回的拼写可能不同）。
+  private static func normalizedMusicFolderPath(_ path: String) -> String {
+    path.hasPrefix("/private/") ? String(path.dropFirst("/private".count)) : path
   }
 
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
@@ -268,61 +397,17 @@ import AVKit
     let kind = pendingDocPickerKind
     pendingDocPickerKind = nil
     guard let src = urls.first, !urls.isEmpty else {
-      result(kind == .audio ? 0 : nil)
+      result(nil)
       return
     }
     switch kind {
-    case .audio:
-      result(handleAudioPicked(urls))
+    case .musicFolder:
+      result(handleMusicFolderPicked(src))
+    case .folderPath:
+      // 排除目录：仅取路径，无需访问权
+      result(src.path)
     default:
       handleFontPicked(src, result: result)
-    }
-  }
-
-  /// 音频导入：拷进 Documents/Music/Imports/（保留原文件名，同名加时间戳），
-  /// 返回成功拷入的文件数
-  private func handleAudioPicked(_ urls: [URL]) -> Int {
-    do {
-      let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-      let dir = docs.appendingPathComponent("Music/Imports", isDirectory: true)
-      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-      let ts = Int(Date().timeIntervalSince1970 * 1000)
-      var copied = 0
-      for src in urls {
-        let rawName = src.lastPathComponent
-        let dot = rawName.lastIndex(of: ".")
-        let base: String
-        let ext: String
-        if let dot {
-          base = String(rawName[..<dot])
-          ext = String(rawName[dot...]).lowercased()
-        } else {
-          base = rawName
-          ext = ""
-        }
-        // 扩展名白名单 = Dart 扫描器 audioExtensions（lib/core/utils/audio_scanner.dart）。
-        // 选择器的 .audio 伞 UTI 会放进 .mid 等 conforms to audio 的非纯音频文件，
-        // 拷进去扫描器也不认（列表不显示），所以在拷贝源头直接拦掉。
-        let allowed: Set<String> = [
-          ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".ape",
-          ".wma", ".aif", ".aiff", ".aifc",
-        ]
-        guard allowed.contains(ext) else {
-          NSLog("[MD3Music] audio import skipped non-audio file: \(rawName)")
-          continue
-        }
-        var name = rawName
-        if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
-          name = "\(base)_\(ts)\(ext)"
-        }
-        try FileManager.default.copyItem(
-          at: src, to: dir.appendingPathComponent(name))
-        copied += 1
-      }
-      return copied
-    } catch {
-      NSLog("[MD3Music] audio import copy failed: \(error)")
-      return 0
     }
   }
 
@@ -357,9 +442,9 @@ import AVKit
   func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
     guard let result = pendingResult else { return }
     pendingResult = nil
-    let kind = pendingDocPickerKind
     pendingDocPickerKind = nil
-    result(kind == .audio ? 0 : nil)
+    // 字体单选 / 文件夹授权：取消均回 nil（旧版音频多选回 0，已随导入移除）
+    result(nil)
   }
 
   // MARK: - 背景图片选择（对齐 Android SAF：拷贝到 Documents/background/ 后返回路径）
