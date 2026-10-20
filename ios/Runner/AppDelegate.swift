@@ -1447,8 +1447,12 @@ final class LyricsPipManager: NSObject {
   private func refreshCoverIfNeeded(size: CGSize) {
     guard !coverBlurPending else { return }
     let latest = NowPlayingManager.shared.lastArtworkImage
-    let sizeChanged =
-      blurredCover != nil && blurredCoverSize != size
+    // 尺寸抖动去抖：PiP 启动阶段条尺寸小幅变化会连环重模糊，每次
+    // 换背景都是一跳（表现为开头闪几下）；模糊图整幅拉伸，±4pt 内
+    // 的拉伸不可辨，不重出图
+    let sizeChanged = blurredCover != nil
+      && (abs(blurredCoverSize.width - size.width) > 4
+        || abs(blurredCoverSize.height - size.height) > 4)
     if latest !== coverImage {
       coverImage = latest
       // 旧模糊图保留到新图就绪再替换：模糊后原图不可辨，直接淡替即可；
@@ -1498,10 +1502,14 @@ final class LyricsPipManager: NSObject {
     guard let ci = CIImage(image: small),
       let filter = CIFilter(name: "CIGaussianBlur")
     else { return nil }
-    filter.setValue(ci, forKey: kCIInputImageKey)
+    // 高斯核在图像边缘外采样透明黑：直接模糊再裁剪，边缘会留一圈
+    // 半透明带（120px 图上带宽≈36px），画到 opaque 位图上时这圈带
+    // 混入未初始化底（分配器复用=上一帧内容）→ 歌词残影/边缘闪/黑羽化。
+    // 先 clamp 到边缘延展，模糊时向外沿用边色，裁剪后全图不透明。
+    filter.setValue(ci.clampedToExtent(), forKey: kCIInputImageKey)
     filter.setValue(12.0, forKey: kCIInputRadiusKey)
     guard let out = filter.outputImage else { return nil }
-    // 高斯核会向边缘外扩散出透明边，裁回画布尺寸
+    // clamp 后 extent 无界，裁回画布尺寸
     let cropped = out.cropped(to: CGRect(x: 0, y: 0, width: smallW, height: smallH))
     return ciContext.createCGImage(cropped, from: cropped.extent)
   }
@@ -1513,17 +1521,18 @@ final class LyricsPipManager: NSObject {
   func drawBar(in ctx: CGContext, size: CGSize) {
     let width = size.width
     let height = size.height
-    // 底色：sample buffer 视为不透明视频帧，无透明合成对象。有封面时铺
-    // 高斯模糊背景（已按条宽高比预裁，直接整幅拉伸），黑色遮罩的 alpha
-    // 即设置里的不透明度；无封面时实色黑。
+    // 底色：sample buffer 视为不透明视频帧，无透明合成对象。统一先铺
+    // 实色黑，有封面时再铺高斯模糊背景（已按条宽高比预裁，整幅拉伸）
+    // 并叠黑色遮罩（alpha = 设置里的不透明度）。
     refreshCoverIfNeeded(size: size)
+    // 先铺实色黑底：opaque 位图不清理底色，任何半透明来源（遮罩、
+    // 封面边缘）混上的都是未初始化内存（上一帧内容）= 残影/闪烁
+    ctx.setFillColor(UIColor.black.cgColor)
+    ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     if let blurred = blurredCover {
       UIImage(cgImage: blurred).draw(in: CGRect(x: 0, y: 0, width: width, height: height))
       ctx.setFillColor(
         UIColor.black.withAlphaComponent(CGFloat(configOpacity) / 100.0).cgColor)
-      ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
-    } else {
-      ctx.setFillColor(UIColor.black.cgColor)
       ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     }
 
