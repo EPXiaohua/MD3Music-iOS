@@ -1484,8 +1484,17 @@ final class LyricsPipManager: NSObject {
   /// 小图上做 CIGaussianBlur，绘制时整幅拉伸放大（进一步柔化，代价极低）。
   private static func makeBlurredCover(_ image: UIImage, targetSize: CGSize) -> CGImage? {
     let barAspect = targetSize.width / max(targetSize.height, 1)
-    let smallW: CGFloat = 120
-    let smallH = max(smallW / max(barAspect, 0.05), 1)
+    let outW: CGFloat = 120
+    let outH = max(outW / max(barAspect, 0.05), 1)
+    // 高斯核在图像边缘外采样（clamp 后为延展边色），裁剪后靠边的
+    // smear 带在封面边缘是深色时会成为黑边（条高仅 ~30px，半径 12
+    // 的核可污染近半张图）。外扩一圈渲染再模糊，只裁中心区——中心
+    // 离边 ≥pad，smear 带整体落在裁剪区外，clamp 仍保证全图不透明
+    //（无残影）。
+    let radius: CGFloat = 12
+    let pad = radius * 2
+    let smallW = outW + pad * 2
+    let smallH = outH + pad * 2
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
     let small = UIGraphicsImageRenderer(size: CGSize(width: smallW, height: smallH), format: format)
@@ -1502,15 +1511,11 @@ final class LyricsPipManager: NSObject {
     guard let ci = CIImage(image: small),
       let filter = CIFilter(name: "CIGaussianBlur")
     else { return nil }
-    // 高斯核在图像边缘外采样透明黑：直接模糊再裁剪，边缘会留一圈
-    // 半透明带（120px 图上带宽≈36px），画到 opaque 位图上时这圈带
-    // 混入未初始化底（分配器复用=上一帧内容）→ 歌词残影/边缘闪/黑羽化。
-    // 先 clamp 到边缘延展，模糊时向外沿用边色，裁剪后全图不透明。
     filter.setValue(ci.clampedToExtent(), forKey: kCIInputImageKey)
-    filter.setValue(12.0, forKey: kCIInputRadiusKey)
+    filter.setValue(Double(radius), forKey: kCIInputRadiusKey)
     guard let out = filter.outputImage else { return nil }
-    // clamp 后 extent 无界，裁回画布尺寸
-    let cropped = out.cropped(to: CGRect(x: 0, y: 0, width: smallW, height: smallH))
+    // clamp 后 extent 无界：裁取中心区（pad 以内无边缘 smear）
+    let cropped = out.cropped(to: CGRect(x: pad, y: pad, width: outW, height: outH))
     return ciContext.createCGImage(cropped, from: cropped.extent)
   }
 

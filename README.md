@@ -34,7 +34,7 @@ MD3Music-iOS 是 [MD3Music](https://github.com/zzyoxml/md3Music/) 的 **iOS 移�
 - **画中画悬浮歌词** — VideoCall 式 `AVPictureInPictureController`（`ContentSource`），300×22pt 单行细条悬浮歌词，无系统控件
 - **音频焦点** — `AVAudioSession` 中断通知对齐 Android Media3 焦点协议（LOSS/GAIN/TRANSIENT），被其他 App 抢占时应用内同步暂停
 - **长按快捷菜单** — quick_actions 动态注册（跟随设置页「桌面快捷方式」配置），冷启动/热路径均可路由到对应页面
-- **免签侧载兼容** — 运行时经私有 API 解析签名中的实际 App Group（兼容 isideload 等免费签名工具改写的 group 标识）
+- **免签侧载兼容** — 运行时经私有 API 解析签名中的实际 App Group（**仅兼容 [isideload](https://github.com/nab138/iloader) 改写的 group 标识**；AltStore 等其他工具签名后主应用可用，但小组件不会刷新）
 - **播放自愈** — 暂停后锁屏挂起导致的播放通道失效（-1004）自动重建播放器实例；本地服务器停摆自检重启
 
 ***
@@ -135,18 +135,18 @@ MD3Music-iOS 是 [MD3Music](https://github.com/zzyoxml/md3Music/) 的 **iOS 移�
 **通用**
 
 - **Flutter SDK** 3.47.0 或更高版本
-- **Rust** 1.70+（用于构建嵌入式 API 服务器，若使用已提交的产物可跳过）
+- **Rust** 1.70+（嵌入式 API 服务器为后期引入的组件；**Android 产物已提交仓库可跳过编译，iOS 产物未提交、构建前必须自行交叉编译**）
 
 **Android 额外要求**
 
 - **Android Studio** / VS Code
-- **Android NDK** 28（用于 Rust 交叉编译）
+- **Android NDK** 28（仅当需要重新编译 Rust 服务器时）
 
 **iOS 额外要求**
 
 - **macOS** + **Xcode 26** 或更高版本（iOS 依赖链要求）
-- Rust 目标 `aarch64-apple-ios`
-- iOS 构建产物 `libkugou_server.a`（放置于 `ios/rustlib/`）
+- Rust 目标 `aarch64-apple-ios`（`rustup target add aarch64-apple-ios`）
+- iOS 构建产物 `libkugou_server.a`（仓库**不含**此文件，需先执行下面的 `build_ios.sh` 生成到 `ios/rustlib/`，否则 Xcode 链接失败）
 
 ### 1. 克隆项目
 
@@ -161,9 +161,9 @@ cd MD3Music-iOS
 flutter pub get
 ```
 
-### 3. 构建 Rust 服务器（可选）
+### 3. 构建 Rust 服务器（iOS 必需，Android 可选）
 
-Rust 服务器产物已提交进 Git 仓库（Android 为 `libkugou_server.so`，iOS 为 `ios/rustlib/libkugou_server.a`），通常无需重新编译。仅当你修改了 `kugou_api_server/rust/src/` 下的代码时才需要重建：
+嵌入式 Rust 服务器为后期引入的组件。**Android 产物（4 个 ABI 的 `libkugou_server.so`）已提交进仓库，无需编译**；**iOS 产物 `ios/rustlib/libkugou_server.a` 体积较大未入库，仓库中不存在，本地构建 iOS 前必须先交叉编译**（GitHub Actions 的 ios-build 工作流会在构建前自动执行同一步骤）。仅当你修改了 `kugou_api_server/rust/src/` 下的代码时，Android 也需要重建：
 
 ```bash
 cd kugou_api_server/rust
@@ -199,11 +199,12 @@ flutter build apk --release --split-per-abi
 # build/app/outputs/flutter-apk/app-arm64-v8a-release.apk   (64 位)
 # build/app/outputs/flutter-apk/app-x86_64-release.apk      (模拟器)
 
-# iOS：构建未签名 ipa（供侧载工具签名，需开发者证书或免费 Apple ID）
+# iOS：构建未签名 ipa（供侧载工具签名；使用免费 Apple ID 签名即可，7 天有效期）
 flutter build ipa --release --no-codesign
 ```
 
-> **iOS 免签侧载**：可使用 [isideload](https://github.com/nab138/iloader) 侧载工具安装未签名 ipa。App 已内置运行时 App Group 自动解析（兼容签名工具改写 group 标识），无需修改工程配置。
+> **iOS 免签侧载（Apple ID 签名）**：使用 [isideload](https://github.com/nab138/iloader) 侧载工具 + 免费 Apple ID 签名安装未签名 ipa（7 天需续签）。
+> **App Group 兼容范围**：App 内置的运行时 App Group 自动解析**目前仅对 isideload 做了兼容**；AltStore/SideStore、爱思助手等其他签名侧载工具改写的 group 标识无法兼容——安装后主应用可用，但**桌面小组件收不到播放状态（不发请求/不刷新）**。
 
 ***
 
