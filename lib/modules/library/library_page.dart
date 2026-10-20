@@ -335,13 +335,7 @@ class _LibraryPageState extends State<LibraryPage>
             // 免得改了一边忘了另一边。
             void rescan() {
               Navigator.pop(ctx);
-              // iOS：扫描 = 呼出文件夹授权（选择器），选完自动重扫；
-              // 重复选同一文件夹会去重并刷新。
-              if (isIOSPlatform) {
-                provider.authorizeMusicFolder();
-              } else {
-                provider.loadLocalMusic();
-              }
+              provider.loadLocalMusic();
             }
 
             // 原addScanFolder 回调已并入 [_showScanFolderManagement]（那里才有列表上下文，
@@ -488,7 +482,11 @@ class _LibraryPageState extends State<LibraryPage>
               if (success && ctx.mounted) {
                 setModalState(() {});
                 if (context.mounted) {
-                  showToast('已添加扫描文件夹，点击扫描音乐生效', long: true);
+                  // iOS 授权后自动重扫，无需再点扫描
+                  showToast(
+                    isIOSPlatform ? '已授权文件夹' : '已添加扫描文件夹，点击扫描音乐生效',
+                    long: true,
+                  );
                 }
               }
             }
@@ -732,7 +730,7 @@ class _LibraryPageState extends State<LibraryPage>
           const M3ELoadingIndicator(),
           const Gap(AppSpacing.lg),
           Text(
-            isIOSPlatform ? '正在读取导入的音乐...' : '正在扫描本地音乐...',
+            '正在扫描本地音乐...',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
               color: colorScheme.onSurfaceVariant,
             ),
@@ -761,7 +759,8 @@ class _LibraryPageState extends State<LibraryPage>
           ),
           const Gap(AppSpacing.sm),
           Text(
-            '点击扫描按钮添加本地音乐',
+            // iOS 未授权过文件夹时，第一动作是授权（选完自动扫描）
+            isIOSPlatform ? '授权文件夹，自动扫描音乐' : '点击扫描按钮添加本地音乐',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
             ),
@@ -771,14 +770,14 @@ class _LibraryPageState extends State<LibraryPage>
             onPressed: () {
               _dismissSearchFocus();
               final provider = context.read<LibraryProvider>();
-              // iOS：扫描 = 呼出文件夹授权选择器，选完自动扫描
+              // iOS：呼出文件夹授权选择器，选完自动扫描
               if (isIOSPlatform) {
                 provider.authorizeMusicFolder();
               } else {
                 provider.loadLocalMusic();
               }
             },
-            child: const Text('扫描音乐'),
+            child: Text(isIOSPlatform ? '授权文件夹' : '扫描音乐'),
           ),
         ],
       ),

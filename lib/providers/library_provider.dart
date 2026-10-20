@@ -1,5 +1,4 @@
 import 'dart:async' show unawaited;
-import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -258,33 +257,6 @@ class LibraryProvider extends ChangeNotifier {
       }
     }
     _scanFolders = await _repository.getSavedFolders();
-    notifyListeners();
-  }
-
-  /// 删除本地歌曲（歌曲更多菜单）。
-  ///
-  /// iOS：文件位于应用 Documents 内（旧版导入目录 / 文件 App 投递）时归
-  /// 沙箱所有，删除时连同文件一起删除；授权目录（沙箱外）只移出索引。
-  /// 文件删除失败（已被系统清理等）不阻塞列表移除。其余平台仅移出索引。
-  Future<void> deleteLocalSong(Song song) async {
-    final path = song.localPath;
-    if (isIOSPlatform && path != null) {
-      try {
-        final docs = await getApplicationDocumentsDirectory();
-        if (path.startsWith('${docs.path}/')) {
-          final f = File(path);
-          if (await f.exists()) {
-            await f.delete();
-            _log('[LibraryProvider] deleted file: $path');
-          }
-        }
-      } catch (e) {
-        _log('[LibraryProvider] delete file failed: $e');
-      }
-    }
-    _indexedSongs = _indexedSongs.where((s) => s.id != song.id).toList();
-    await _repository.saveSongs(_indexedSongs);
-    _rebuildCategories();
     notifyListeners();
   }
 
