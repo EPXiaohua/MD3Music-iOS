@@ -629,21 +629,28 @@ final class EqTapState {
     private func attach(to item: AVPlayerItem) {
         guard item.audioMix == nil else { return }
         let asset = item.asset
-        // 先同步取音轨：通知在 createPlayerItem 时发出，item 尚未起播，
-        // 本地文件/已加载资产的音轨同步可得 —— tap 在起播前挂上，
-        // 避免「对已播放 item 补设 audioMix 被渲染器忽略」的未定义行为
-        //（表现为 tap 从不被调用、EQ 调了没反应，切歌重建 item 才恢复）。
-        if let track = asset.tracks(withMediaType: .audio).first {
-            installTap(item: item, track: track)
-            return
-        }
-        // 远程流首帧前同步轨道为空：异步加载后补挂（尽力而为）
-        asset.loadTracks(withMediaType: .audio) { [weak self] tracks, _ in
-            DispatchQueue.main.async {
-                // item 可能已被切歌释放
-                guard item.audioMix == nil,
-                      let track = tracks?.first else { return }
-                self?.installTap(item: item, track: track)
+        // 注意：必须异步 loadTracks。同步 asset.tracks 对远程流会阻塞主
+        // 线程/iOS16+ 直接抛异常（表现为播放在线音乐崩溃，杀后台重进
+        // 自动恢复播放再次卡死）。晚挂 audioMix 对已播放 item 理论上有
+        // 被忽略风险，但稳定包多年如此，不引入同步路径。
+        if #available(iOS 15.0, *) {
+            asset.loadTracks(withMediaType: .audio) { tracks, _ in
+                DispatchQueue.main.async {
+                    // item 可能已被切歌释放
+                    guard item.audioMix == nil,
+                          let track = tracks?.first else { return }
+                    self.installTap(item: item, track: track)
+                }
+            }
+        } else {
+            // 旧系统兜底：等 readyToPlay 后同步取音轨
+            var token: NSKeyValueObservation?
+            token = item.observe(\.status, options: [.initial]) { item, _ in
+                guard item.status == .readyToPlay else { return }
+                token?.invalidate()
+                guard item.audioMix == nil else { return }
+                self.installTap(item: item,
+                                track: item.asset.tracks(withMediaType: .audio).first)
             }
         }
     }
