@@ -1130,9 +1130,9 @@ struct LyricLockScreenView: View {
         .padding(.bottom, 14)
       }
     }
-    // iOS 16.2+ 走 containerBackground（placement 只有 .widget 一档，
-    // Live Activity 同样用它）；16.1 全幅铺
-    if #available(iOSApplicationExtension 16.2, *) {
+    // containerBackground 的 Live Activity 用法 iOS 17+ 才可用；16.x
+    // 直接全幅铺背景（16.x 锁屏卡支持自绘背景，无需系统容器）
+    if #available(iOSApplicationExtension 17.0, *) {
       content.containerBackground(for: .widget) { backgroundLayer }
     } else {
       content.background(backgroundLayer)
