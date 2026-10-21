@@ -1245,7 +1245,10 @@ class _SettingsPageState extends State<SettingsPage>
       description: '歌词推送与设备显示',
       body: _buildLyricTail,
       subpages: [
-        if (!kTvBuild) ...[
+        // 歌词推送三个协议（SuperLyric/LyricInfo/Lyricon）的接收端全是
+        // Android 系统机制（Binder / MediaSession extras），iOS 无对应
+        // 能力（Now Playing 禁止第三方读取），开关留着只会误导+耗电。
+        if (!kTvBuild && !Platform.isIOS) ...[
           SettingsSubpage(
             title: '歌词推送',
             icon: Icons.push_pin_outlined,
