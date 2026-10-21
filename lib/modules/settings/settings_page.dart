@@ -1245,10 +1245,7 @@ class _SettingsPageState extends State<SettingsPage>
       description: '歌词推送与设备显示',
       body: _buildLyricTail,
       subpages: [
-        // 歌词推送三个协议（SuperLyric/LyricInfo/Lyricon）的接收端全是
-        // Android 系统机制（Binder / MediaSession extras），iOS 无对应
-        // 能力（Now Playing 禁止第三方读取），开关留着只会误导+耗电。
-        if (!kTvBuild && !Platform.isIOS) ...[
+        if (!kTvBuild) ...[
           SettingsSubpage(
             title: '歌词推送',
             icon: Icons.push_pin_outlined,
@@ -1967,27 +1964,25 @@ class _SettingsPageState extends State<SettingsPage>
             await _settingsRepository.setBluetoothLyricCompressArt(value);
           },
         ),
-        // 锁屏歌词是 Android 悬浮窗挂到锁屏的方案（需悬浮窗/锁屏通知权限）；
-        // iOS 无此机制，隐藏整个区块
-        if (!isIOSPlatform) ...[
-          _buildGroupLabel('锁屏歌词', colorScheme),
-          // search: 锁屏
-          SwitchListTile(
-            title: const Text('锁屏歌词（实验性）'),
-            // 缺权限就完全不生效，属于必要前提；其余行为说明删除
-            subtitle: const Text('需开启悬浮窗、后台弹出界面与锁屏通知权限'),
-            value: _lockScreenLyricEnabled,
-            onChanged: (value) async {
-              AppHaptics.lightImpact(HapticCategory.control);
-              setState(() => _lockScreenLyricEnabled = value);
-              await _settingsRepository.setLockScreenLyricEnabled(value);
-              // 同步到歌词服务（启停定时器）与原生端（开关状态/关闭界面）
-              await DesktopLyricService.instance.setLockScreenLyricEnabled(
-                value,
-              );
-            },
+        // 锁屏歌词：Android 为悬浮窗挂到锁屏的方案（需悬浮窗/锁屏通知
+        // 权限）；iOS 为系统锁屏实时活动卡片（无需额外权限）。两端逻辑
+        // 不同但开关共用，描述按平台区分。
+        _buildGroupLabel('锁屏歌词', colorScheme),
+        // search: 锁屏
+        SwitchListTile(
+          title: const Text('锁屏歌词（实验性）'),
+          subtitle: Text(
+            isIOSPlatform ? '在系统锁屏界面显示实时歌词卡片' : '需开启悬浮窗、后台弹出界面与锁屏通知权限',
           ),
-        ],
+          value: _lockScreenLyricEnabled,
+          onChanged: (value) async {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _lockScreenLyricEnabled = value);
+            await _settingsRepository.setLockScreenLyricEnabled(value);
+            // 同步到歌词服务（启停定时器）与原生端（开关状态/关闭界面）
+            await DesktopLyricService.instance.setLockScreenLyricEnabled(value);
+          },
+        ),
         if (_flymeStatusBarLyricSupported) ...[
           _buildGroupLabel('魅族状态栏歌词', colorScheme),
           // search: 魅族 flyme 状态栏

@@ -1049,6 +1049,13 @@ enum LyricLiveStore {
     lines = rawLines.compactMap { $0 as? [String: Any] }.map { LyricLiveLine.parse($0) }
   }
 
+  /// 加载并返回当前歌词行（灵动岛展开区用：ViewBuilder 闭包里不能有
+  /// 裸函数调用语句，只能放 let 声明 + 视图）
+  static func currentLines(songId: String, rev: Int) -> [LyricLiveLine] {
+    load(songId: songId, rev: rev)
+    return lines
+  }
+
   /// 模糊封面（懒加载一次；App 侧按 songId 重写，rev 无关）
   static func coverImage() -> UIImage? {
     if coverBlurLoaded { return coverBlur }
@@ -1123,9 +1130,10 @@ struct LyricLockScreenView: View {
         .padding(.bottom, 14)
       }
     }
-    // iOS 16.2+ 走 containerBackground（系统内容边距语义）；16.1 全幅铺
+    // iOS 16.2+ 走 containerBackground（placement 只有 .widget 一档，
+    // Live Activity 同样用它）；16.1 全幅铺
     if #available(iOSApplicationExtension 16.2, *) {
-      content.containerBackground(for: .activity) { backgroundLayer }
+      content.containerBackground(for: .widget) { backgroundLayer }
     } else {
       content.background(backgroundLayer)
     }
@@ -1211,7 +1219,7 @@ struct LyricLockScreenView: View {
   }
 
   /// 逐词流式排布：词到点翻亮，未到点暗 20%（Text 拼接，同一行内自动换行）
-  func wordFlow(_ line: LyricLiveLine, pos: Int, size: CGFloat) -> Text {
+  func wordFlow(_ line: LyricLiveLine, pos: Int, size: CGFloat) -> some View {
     var content = Text("")
     var first = true
     for (text, start, _) in line.words {
@@ -1280,8 +1288,8 @@ struct LyricLiveActivityWidget: Widget {
           .lineLimit(1)
         }
         DynamicIslandExpandedRegion(.bottom) {
-          LyricLiveStore.load(songId: context.state.songId, rev: context.state.rev)
-          let lines = LyricLiveStore.lines
+          let lines = LyricLiveStore.currentLines(
+            songId: context.state.songId, rev: context.state.rev)
           let idx = context.state.lineIndex
           Group {
             if lines.isEmpty || idx < 0 || idx >= lines.count {
