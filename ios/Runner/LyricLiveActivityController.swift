@@ -62,7 +62,8 @@ struct LyricLiveActivityAttributes: ActivityAttributes {
   var sessionKey: String
 }
 
-@objc final class LyricLiveActivityController: NSObject {
+@available(iOS 16.2, *)
+final class LyricLiveActivityController: NSObject {
   static let shared = LyricLiveActivityController()
   private static let channelName = "com.md3music.md3music/lyric_live_activity"
 
@@ -78,11 +79,6 @@ struct LyricLiveActivityAttributes: ActivityAttributes {
   }
 
   private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard #available(iOS 16.1, *) else {
-      // 低版本：开关无效但不报错（Dart 侧照常走流程）
-      result(false)
-      return
-    }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
     case "setEnabled":
@@ -257,7 +253,6 @@ struct LyricLiveActivityAttributes: ActivityAttributes {
   }
 
   private func endAll() {
-    guard #available(iOS 16.1, *) else { return }
     let a = activity
     activity = nil
     Task {
