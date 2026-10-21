@@ -26,6 +26,7 @@
 		WGT0000000000000000000008 /* WidgetSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = WGT0000000000000000000007 /* WidgetSync.swift */; };
 		HAP0000000000000000000002 /* HapticsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = HAP0000000000000000000001 /* HapticsPlugin.swift */; };
 		IMS0000000000000000000002 /* ImageSaverPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = IMS0000000000000000000001 /* ImageSaverPlugin.swift */; };
+		LVA0000000000000000000002 /* LyricLiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = LVA0000000000000000000001 /* LyricLiveActivityController.swift */; };
 		BCT0000000000000000000002 /* BroadcastAudioHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCT0000000000000000000001 /* BroadcastAudioHandler.swift */; };
 		BCT0000000000000000000004 /* MD3MusicBroadcast.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = BCT0000000000000000000003 /* MD3MusicBroadcast.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
@@ -80,6 +81,7 @@
 		WGT0000000000000000000007 /* WidgetSync.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = WidgetSync.swift; sourceTree = "<group>"; };
 		HAP0000000000000000000001 /* HapticsPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = HapticsPlugin.swift; sourceTree = "<group>"; };
 		IMS0000000000000000000001 /* ImageSaverPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ImageSaverPlugin.swift; sourceTree = "<group>"; };
+		LVA0000000000000000000001 /* LyricLiveActivityController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LyricLiveActivityController.swift; sourceTree = "<group>"; };
 		BCT0000000000000000000001 /* BroadcastAudioHandler.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BroadcastAudioHandler.swift; sourceTree = "<group>"; };
 		BCT0000000000000000000003 /* MD3MusicBroadcast.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MD3MusicBroadcast.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		BCT0000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -208,6 +210,7 @@
 				WGT0000000000000000000007 /* WidgetSync.swift */,
 				HAP0000000000000000000001 /* HapticsPlugin.swift */,
 				IMS0000000000000000000001 /* ImageSaverPlugin.swift */,
+				LVA0000000000000000000001 /* LyricLiveActivityController.swift */,
 				AMX0000000000000000000001 /* AutomixAnalysis.swift */,
 				WGT0000000000000000000005 /* Runner.entitlements */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
@@ -437,6 +440,7 @@
 				WGT0000000000000000000008 /* WidgetSync.swift in Sources */,
 				HAP0000000000000000000002 /* HapticsPlugin.swift in Sources */,
 				IMS0000000000000000000002 /* ImageSaverPlugin.swift in Sources */,
+				LVA0000000000000000000002 /* LyricLiveActivityController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

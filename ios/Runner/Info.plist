@@ -46,6 +46,9 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<!-- 锁屏歌词（Live Activity，iOS 16.1+）：锁屏歌词卡由 MD3Widget 扩展渲染 -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -105,6 +105,10 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     LyricsPipManager.shared.attach(messenger: messenger)
 
+    // iOS 锁屏歌词（Live Activity，iOS 16.1+）。Android 锁屏歌词走
+    // LockScreenLyricActivity，同名 channel 由 MainActivity 实现，互不影响。
+    LyricLiveActivityController.shared.attach(messenger: messenger)
+
     // iOS 听歌识曲悬浮窗（系统画中画）。Android 悬浮识曲走 FloatingRecognitionService，
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     SongRecognitionPipManager.shared.attach(messenger: messenger)
