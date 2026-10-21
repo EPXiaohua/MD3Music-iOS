@@ -233,7 +233,7 @@ final class LyricLiveActivityController: NSObject {
     )
     if let activity = activity {
       Task {
-        await activity.update(state)
+        await activity.update(using: state)
       }
       result(true)
       return
