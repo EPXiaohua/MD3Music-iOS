@@ -1190,6 +1190,27 @@ class AudioService {
     } catch (e) {
       // ignore: avoid_print
       print('[Crossfade] start 失败: $e');
+      // 失败收尾（不能只打日志），按 promote 是否已发生分流：
+      // - 已 promote：incoming 是活动播放器 —— 恢复它的音量（否则以 0 音量
+      //   挂着播：「播放中、频谱动、无声」），回收 outgoing（否则旧歌残留）。
+      // - 未 promote：outgoing 仍是活动播放器 —— 恢复它的音量（斜坡可能
+      //   只写了一半），把 incoming 静音停掉。
+      // 「无声」与「残留声」两个报障同源于此前 catch 只打日志不清理。
+      if (identical(_activePlayer, incoming)) {
+        try {
+          await incoming.setVolume(_userVolume * _vnAttenLinearStandby);
+        } catch (_) {}
+        try {
+          await _retireFadedPlayer(outgoing);
+        } catch (_) {}
+      } else {
+        try {
+          await outgoing.setVolume(_userVolume * _vnAttenLinear);
+        } catch (_) {}
+        try {
+          await incoming.pause();
+        } catch (_) {}
+      }
     } finally {
       if (token == _crossfadeToken) {
         _setCrossfading(false);

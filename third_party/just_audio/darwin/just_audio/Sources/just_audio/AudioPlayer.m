@@ -1085,12 +1085,6 @@
 }
 
 - (void)play:(FlutterResult)result {
-    if (_playing) {
-        if (result) {
-            result(@{});
-        }
-        return;
-    }
     if (result) {
         if (_playResult) {
             //NSLog(@"INTERRUPTING PLAY");
@@ -1099,8 +1093,13 @@
         _playResult = result;
     }
     _playing = YES;
-    // MD3Music fork: 与 load: 同理，用 play() 确保音频会话激活（直接设
-    // rate 在会话停用态下静音），再恢复用户倍速。
+    // MD3Music fork: 无条件执行（上游 if (_playing) return 让 play 在
+    // 标志位与 AVPlayer 实际状态脱节时变成空操作 —— 系统中断把 AVPlayer
+    // 停住而 _playing 仍为 YES，之后每次切歌起播都静默失效，表现为
+    // 「播放器在播、频谱动但扬声器无声」）。AVPlayer play 幂等。
+    // 显式激活会话：AVPlayer 的隐式激活不保证覆盖所有停用场景
+    // （中断结束/识别等组件停用会话后），失效时同样表现为无声。
+    [[AVAudioSession sharedInstance] setActive:YES error:nil];
     [_player play];
     _player.rate = _speed;
     [self updatePosition];
@@ -1114,8 +1113,10 @@
 }
 
 - (void)pause {
-    if (!_playing) return;
     _playing = NO;
+    // MD3Music fork: 无条件 pause（上游 if (!_playing) return 让 pause 在
+    // 标志位与实际播放态脱节时变成空操作 —— 交叉淡化收尾 retire 旧播放器
+    // 时旧歌残留声的根源）。AVPlayer pause 幂等。
     [_player pause];
     [self updatePosition];
     [self broadcastPlaybackEvent];

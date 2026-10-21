@@ -1488,11 +1488,12 @@ final class LyricsPipManager: NSObject {
     let outH = max(outW / max(barAspect, 0.05), 1)
     // 高斯核在图像边缘外采样（clamp 后为延展边色），裁剪后靠边的
     // smear 带在封面边缘是深色时会成为黑边（条高仅 ~30px，半径 12
-    // 的核可污染近半张图）。外扩一圈渲染再模糊，只裁中心区——中心
-    // 离边 ≥pad，smear 带整体落在裁剪区外，clamp 仍保证全图不透明
-    //（无残影）。
+    // 的核可污染近半张图）。外扩一圈渲染再模糊，只裁中心区——
+    // 高斯核实际影响半径约 3σ=3×radius，pad 必须盖过它，否则边缘
+    // 深色仍会漏进画面（v6.0.6 实测 pad=2×radius 顶部仍有一条黑带）。
+    // clamp 仍保证全图不透明（无残影）。
     let radius: CGFloat = 12
-    let pad = radius * 2
+    let pad = radius * 3
     let smallW = outW + pad * 2
     let smallH = outH + pad * 2
     let format = UIGraphicsImageRendererFormat()
