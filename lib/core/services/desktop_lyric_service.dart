@@ -25,7 +25,6 @@ import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../services/kugou_api/lyric_lookup_result.dart';
 import 'media_notification_service.dart';
-import 'lock_screen_lyric_service.dart';
 import 'lyric_info_json_builder.dart';
 import 'lyrics_pip_service.dart';
 
@@ -155,8 +154,6 @@ class DesktopLyricService {
   bool _lockFullDirty = false;
   // - 无歌词列表时的占位文本（歌词加载中.../暂无歌词/歌词加载失败）
   String _lockPlaceholder = '';
-  // iOS Live Activity 当前主色（_pushLockScreenAccent 异步提取结果缓存）
-  int _lockLatestAccent = 0;
   // - 进度节流：上次轻量进度推送时刻与播放态（播放态翻转时立即推）
   final LockScreenProgressPushGate _lockProgressPushGate =
       LockScreenProgressPushGate();
@@ -992,20 +989,11 @@ class DesktopLyricService {
       _lockPlaceholder = '';
       _lockProgressPushGate.reset();
       _lockAccentToken++;
-      // iOS：Live Activity 桥接（Android 走 showLockScreenLyric，iOS 上
-      // 那两个调用落空 channel 已被 catch 掉，互不影响）
-      if (Platform.isIOS) {
-        unawaited(LockScreenLyricService.instance.setEnabled(true));
-      }
       // 通知原生端开关已开启（原生端后续由 ACTION_SCREEN_OFF 广播拉起界面）
       try {
         await MediaNotificationService.showLockScreenLyric();
       } catch (_) {}
     } else {
-      // iOS：结束 Live Activity
-      if (Platform.isIOS) {
-        unawaited(LockScreenLyricService.instance.setEnabled(false));
-      }
       // 关闭时关闭锁屏歌词界面
       try {
         await MediaNotificationService.hideLockScreenLyric();
@@ -1065,13 +1053,6 @@ class DesktopLyricService {
       displayMode: prefs.displayMode.index,
       useDynamicColor: prefs.useDynamicLyricColor,
     );
-    // iOS：Live Activity 同协议透传（整包歌词 + 轻量状态）。切歌时
-    // LockScreenLyricService 内部按 songId 去重整包，状态随轻量通道走。
-    if (Platform.isIOS) {
-      final songId = song?.id ?? '';
-      unawaited(LockScreenLyricService.instance.setLyrics(songId, lines));
-      _pushLockScreenStateForIOS();
-    }
     _lockProgressPushGate.markFullPush(
       nowMs: DateTime.now().millisecondsSinceEpoch,
       isPlaying: player?.isPlaying ?? false,
@@ -1087,10 +1068,6 @@ class DesktopLyricService {
     final token = ++_lockAccentToken;
     if (!useDynamic || artUrl == null || artUrl.isEmpty) {
       MediaNotificationService.updateLockScreenAccent(0);
-      if (Platform.isIOS) {
-        _lockLatestAccent = 0;
-        _pushLockScreenStateForIOS();
-      }
       return;
     }
     ArtworkColorExtractor.extract(artUrl)
@@ -1098,36 +1075,8 @@ class DesktopLyricService {
           if (token != _lockAccentToken || !_lockScreenLyricEnabled) return;
           final argb = color?.toARGB32() ?? 0;
           MediaNotificationService.updateLockScreenAccent(argb);
-          if (Platform.isIOS) {
-            _lockLatestAccent = argb;
-            _pushLockScreenStateForIOS();
-          }
         })
         .catchError((_) {});
-  }
-
-  /// iOS Live Activity 轻量状态推送（切行/seek/播放态/样式/主色变化时）。
-  /// LockScreenLyricService 内部做字段级去重；行内推进由扩展端墙钟自推进。
-  void _pushLockScreenStateForIOS() {
-    if (!_lockScreenLyricEnabled || !Platform.isIOS) return;
-    final player = _player;
-    final song = player?.currentSong;
-    final prefs = LyricPreferences.instance;
-    unawaited(LockScreenLyricService.instance.update(
-      songId: song?.id ?? '',
-      lineIndex: _currentLineIndex,
-      positionMs: player?.position.inMilliseconds ?? 0,
-      durationMs: player?.duration?.inMilliseconds ?? 0,
-      isPlaying: player?.isPlaying ?? false,
-      placeholder: _lockPlaceholder,
-      title: song?.displayName ?? '',
-      artist: song?.artist ?? '',
-      accent: _lockLatestAccent,
-      useDynamic: prefs.useDynamicLyricColor,
-      showSub:
-          prefs.showTranslation || prefs.displayMode == LyricDisplayMode.roma,
-      fontSize: prefs.fontSize,
-    ));
   }
 
   /// 锁屏歌词每 tick 推送入口：全量脏 → 整包重推；否则 500ms 节流轻量进度。
@@ -1148,10 +1097,6 @@ class DesktopLyricService {
         durationMs: player.duration?.inMilliseconds ?? 0,
         isPlaying: isPlaying,
       );
-      // iOS：切行/播放态变化时推 ContentState（内部去重，行内推进靠墙钟）
-      if (Platform.isIOS) {
-        _pushLockScreenStateForIOS();
-      }
     }
   }
 

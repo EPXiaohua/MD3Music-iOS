@@ -105,13 +105,6 @@ import AVKit
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     LyricsPipManager.shared.attach(messenger: messenger)
 
-    // iOS 锁屏歌词（Live Activity，ActivityKit API 标注 16.2+；低版本
-    // 不注册 channel，Dart 侧安静降级为不支持）。Android 锁屏歌词走
-    // LockScreenLyricActivity，同名 channel 由 MainActivity 实现，互不影响。
-    if #available(iOS 16.2, *) {
-      LyricLiveActivityController.shared.attach(messenger: messenger)
-    }
-
     // iOS 听歌识曲悬浮窗（系统画中画）。Android 悬浮识曲走 FloatingRecognitionService，
     // 本 channel 仅在 iOS Runner 内注册，互不影响。
     SongRecognitionPipManager.shared.attach(messenger: messenger)
@@ -878,7 +871,6 @@ final class LyricsPipManager: NSObject {
   // 线程重绘——模糊每封面只做一次，20fps 帧循环只多一次指针比较。
   private var coverImage: UIImage?
   private var blurredCover: CGImage?
-  private var blurredCoverSize: CGSize = .zero
   private var coverBlurPending = false
   private let coverQueue = DispatchQueue(label: "com.md3music.lyricspip.cover", qos: .utility)
   private static let ciContext = CIContext()
@@ -915,13 +907,13 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 条状画布尺寸（pt）：宽度固定 300；高度 = 基准高 × 字号缩放（18sp 归一，
-  /// 下限 8sp 防御持久层脏数据出 0 高帧）。单行基准 22pt、双行 44pt——
-  /// 设置页「版式 → 字号」滑杆即 PiP 高度滑杆。
-  private var barSize: CGSize {
-    let scale = CGFloat(max(configFontSize, 8) / 18.0)
-    return CGSize(width: 300, height: ((configDoubleLine ? 44.0 : 22.0) * scale).rounded())
-  }
+  /// 视频画布尺寸（pt）：固定 2.35:1 全幅卡片。PiP 窗口宽高比有系统上限
+  /// （约 2.39:1），此前按条宽高比（6.8~13.6:1）出帧，窗口装不下必然被
+  /// 系统 letterbox——PiP 顶部黑边即此，与帧内容无关。改为 2.35:1 后
+  /// 窗口比例 = 视频比例，内容满幅绘制，任何设备上都没有黑边。字号/
+  /// 行数只影响画布内文字布局，不再改变视频尺寸（比例恒定，也杜绝
+  /// 启动期尺寸抖动引发的窗口/帧比例微差黑边）。
+  private static let canvasSize = CGSize(width: 360, height: 153)
 
   private override init() {}
 
@@ -1087,18 +1079,11 @@ final class LyricsPipManager: NSObject {
     }
   }
 
-  /// 条高变化：同步离屏宿主/显示层尺寸、复位滚动状态并立即重出一帧。
-  /// 像素池按尺寸缓存（pixelBufferPool），barSize 变化自动重建；PiP 窗口
-  /// 随新帧宽高比自适应。
+  /// 字号/行数配置变化：复位滚动状态并立即重出一帧（画布尺寸恒定，
+  /// 像素池与 PiP 窗口比例不受影响）。
   private func applyBarSize() {
     scrollOffset = 0
     scrollLastUptime = 0
-    if let host = hostView {
-      host.frame = CGRect(
-        x: -barSize.width - 16, y: -8,
-        width: barSize.width, height: barSize.height)
-      sampleLayer.frame = host.bounds
-    }
     renderFrame()
   }
 
@@ -1238,8 +1223,8 @@ final class LyricsPipManager: NSObject {
     }
     // 1. 离屏宿主：layer 必须在窗口层级里 PiP 才会从它取帧；本体移出屏幕不显示
     let host = UIView(frame: CGRect(
-      x: -barSize.width - 16, y: -8,
-      width: barSize.width, height: barSize.height))
+      x: -Self.canvasSize.width - 16, y: -8,
+      width: Self.canvasSize.width, height: Self.canvasSize.height))
     host.backgroundColor = .clear
     host.isUserInteractionEnabled = false
     rootViewController.view.addSubview(host)
@@ -1372,10 +1357,10 @@ final class LyricsPipManager: NSObject {
     let format = UIGraphicsImageRendererFormat()
     format.scale = 2 // @2x 位图，小窗里文字足够清晰
     format.opaque = true
-    let renderer = UIGraphicsImageRenderer(size: barSize, format: format)
+    let renderer = UIGraphicsImageRenderer(size: Self.canvasSize, format: format)
     let image = renderer.image { ctx in
       // 渲染器上下文已是 UIKit 左上原点坐标系，与 drawBar 的坐标约定一致
-      self.drawBar(in: ctx.cgContext, size: barSize)
+      self.drawBar(in: ctx.cgContext, size: Self.canvasSize)
     }
     guard let cgImage = image.cgImage else { return nil }
 
@@ -1448,71 +1433,58 @@ final class LyricsPipManager: NSObject {
     return created
   }
 
-  // MARK: 模糊封面背景（切歌/条尺寸变化时后台重出一次）
+  // MARK: 模糊封面背景（切歌时后台重出一次）
 
-  /// 帧循环每帧调用：封面指针比对（廉价），变化或条尺寸变了才后台重模糊。
-  private func refreshCoverIfNeeded(size: CGSize) {
+  /// 帧循环每帧调用：封面指针比对（廉价），切歌时后台重模糊。
+  private func refreshCoverIfNeeded() {
     guard !coverBlurPending else { return }
     let latest = NowPlayingManager.shared.lastArtworkImage
-    // 尺寸抖动去抖：PiP 启动阶段条尺寸小幅变化会连环重模糊，每次
-    // 换背景都是一跳（表现为开头闪几下）；模糊图整幅拉伸，±4pt 内
-    // 的拉伸不可辨，不重出图
-    let sizeChanged = blurredCover != nil
-      && (abs(blurredCoverSize.width - size.width) > 4
-        || abs(blurredCoverSize.height - size.height) > 4)
-    if latest !== coverImage {
-      coverImage = latest
-      // 旧模糊图保留到新图就绪再替换：模糊后原图不可辨，直接淡替即可；
-      // 若先置 nil 回黑底，低遮罩不透明度下会黑↔封面闪烁
-      startCoverBlur(latest, size: size)
-    } else if sizeChanged {
-      startCoverBlur(latest, size: size)
-    }
+    guard latest !== coverImage else { return }
+    coverImage = latest
+    // 旧模糊图保留到新图就绪再替换：模糊后原图不可辨，直接淡替即可；
+    // 若先置 nil 回黑底，低遮罩不透明度下会黑↔封面闪烁
+    startCoverBlur(latest)
   }
 
-  private func startCoverBlur(_ image: UIImage?, size: CGSize) {
+  private func startCoverBlur(_ image: UIImage?) {
     coverBlurPending = true
     coverQueue.async { [weak self] in
-      let blurred = image.flatMap { Self.makeBlurredCover($0, targetSize: size) }
+      let blurred = image.flatMap { Self.makeBlurredCover($0) }
       DispatchQueue.main.async {
         guard let self else { return }
         self.coverBlurPending = false
         // 期间可能又切了歌：只在封面仍是最新的情况下落图，否则下帧重触发
         if let blurred, image === self.coverImage {
           self.blurredCover = blurred
-          self.blurredCoverSize = size
         }
         self.renderFrame()
       }
     }
   }
 
-  /// 封面 → 高斯模糊背景图：先按条宽高比 aspect-fill 中心裁到小尺寸，
-  /// 小图上做 CIGaussianBlur，绘制时整幅拉伸放大（进一步柔化，代价极低）。
-  private static func makeBlurredCover(_ image: UIImage, targetSize: CGSize) -> CGImage? {
-    let barAspect = targetSize.width / max(targetSize.height, 1)
-    let outW: CGFloat = 120
-    let outH = max(outW / max(barAspect, 0.05), 1)
+  /// 封面 → 正方形高斯模糊图（120×120）：模糊图与画布宽高比解耦，绘制时
+  /// aspect-fill 中心裁剪铺满画布。不再按条宽高比预裁——浮点 extent 裁剪
+  /// 的取整误差会让输出边缘漏出未覆盖/污染像素，表现为固定一侧的黑边。
+  private static func makeBlurredCover(_ image: UIImage) -> CGImage? {
+    let out: CGFloat = 120
     // 高斯核在图像边缘外采样（clamp 后为延展边色），裁剪后靠边的
-    // smear 带在封面边缘是深色时会成为黑边（条高仅 ~30px，半径 12
-    // 的核可污染近半张图）。外扩一圈渲染再模糊，只裁中心区——
-    // 高斯核在 3σ 处仍有 ~1% 幅度（pad=3×radius 时封面深色边缘仍以
-    // 细黑线漏进画面，v6.0.6 实测），pad 提到 5×radius（5σ 处幅度
+    // smear 带在封面边缘是深色时会成为黑边。外扩一圈渲染再模糊，只裁
+    // 中心区——高斯核在 3σ 处仍有 ~1% 幅度（pad=3×radius 时封面深色边缘
+    // 仍以细黑线漏进画面，v6.0.6 实测），pad 提到 5×radius（5σ 处幅度
     // ~1e-6，视觉为零）。clamp 仍保证全图不透明（无残影）。
     let radius: CGFloat = 12
     let pad = radius * 5
-    let smallW = outW + pad * 2
-    let smallH = outH + pad * 2
+    let smallSide = out + pad * 2
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
-    let small = UIGraphicsImageRenderer(size: CGSize(width: smallW, height: smallH), format: format)
+    let small = UIGraphicsImageRenderer(size: CGSize(width: smallSide, height: smallSide), format: format)
       .image { _ in
         let imgW = max(image.size.width, 1)
         let imgH = max(image.size.height, 1)
-        let scale = max(smallW / imgW, smallH / imgH)
+        let scale = max(smallSide / imgW, smallSide / imgH)
         image.draw(in: CGRect(
-          x: (smallW - imgW * scale) / 2,
-          y: (smallH - imgH * scale) / 2,
+          x: (smallSide - imgW * scale) / 2,
+          y: (smallSide - imgH * scale) / 2,
           width: imgW * scale,
           height: imgH * scale))
       }
@@ -1521,9 +1493,9 @@ final class LyricsPipManager: NSObject {
     else { return nil }
     filter.setValue(ci.clampedToExtent(), forKey: kCIInputImageKey)
     filter.setValue(Double(radius), forKey: kCIInputRadiusKey)
-    guard let out = filter.outputImage else { return nil }
+    guard let blurred = filter.outputImage else { return nil }
     // clamp 后 extent 无界：裁取中心区（pad 以内无边缘 smear）
-    let cropped = out.cropped(to: CGRect(x: pad, y: pad, width: outW, height: outH))
+    let cropped = blurred.cropped(to: CGRect(x: pad, y: pad, width: out, height: out))
     return ciContext.createCGImage(cropped, from: cropped.extent)
   }
 
@@ -1535,15 +1507,23 @@ final class LyricsPipManager: NSObject {
     let width = size.width
     let height = size.height
     // 底色：sample buffer 视为不透明视频帧，无透明合成对象。统一先铺
-    // 实色黑，有封面时再铺高斯模糊背景（已按条宽高比预裁，整幅拉伸）
-    // 并叠黑色遮罩（alpha = 设置里的不透明度）。
-    refreshCoverIfNeeded(size: size)
+    // 实色黑，有封面时再铺高斯模糊背景（aspect-fill 中心裁剪铺满，无
+    // 变形也无未覆盖边缘）并叠黑色遮罩（alpha = 设置里的不透明度）。
+    refreshCoverIfNeeded()
     // 先铺实色黑底：opaque 位图不清理底色，任何半透明来源（遮罩、
     // 封面边缘）混上的都是未初始化内存（上一帧内容）= 残影/闪烁
     ctx.setFillColor(UIColor.black.cgColor)
     ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     if let blurred = blurredCover {
-      UIImage(cgImage: blurred).draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+      // aspect-fill 中心裁剪铺满：方形模糊图按画布比例取中心，多余部分
+      // 裁掉——任何画布比例下都满幅覆盖，不拉伸变形、无漏边
+      let bw = CGFloat(blurred.width)
+      let bh = CGFloat(blurred.height)
+      let fillScale = max(width / bw, height / bh)
+      let dw = bw * fillScale
+      let dh = bh * fillScale
+      UIImage(cgImage: blurred).draw(in: CGRect(
+        x: (width - dw) / 2, y: (height - dh) / 2, width: dw, height: dh))
       ctx.setFillColor(
         UIColor.black.withAlphaComponent(CGFloat(configOpacity) / 100.0).cgColor)
       ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
@@ -1555,18 +1535,23 @@ final class LyricsPipManager: NSObject {
       let totalMs = Double(max(last.start + last.duration, 1))
       progress = min(max(estimatedPositionMs / totalMs, 0), 1)
     }
-    let barHeight = max(1.2, height * 0.07)
+    // 高度随画布比例取 7%，上限 5pt——卡片画布较高，等比放大会过粗
+    let barHeight = min(5, max(1.2, height * 0.07))
     ctx.setFillColor(UIColor.white.withAlphaComponent(0.15).cgColor)
     ctx.fill(CGRect(x: 0, y: height - barHeight, width: width, height: barHeight))
     ctx.setFillColor(UIColor.white.withAlphaComponent(0.85).cgColor)
     ctx.fill(CGRect(x: 0, y: height - barHeight, width: CGFloat(progress) * width, height: barHeight))
 
-    // 字号 = 设置字号 × 0.8（18sp → 14.4pt，与原 44pt 条观感一致）；
-    // 条高随字号缩放（barSize），文本行始终放得下
+    // 字号 = 设置字号 × 0.8（18sp → 14.4pt）；画布恒定，字号只影响文字
     let textAreaHeight = height - barHeight
     let dual = configDoubleLine
-    let rowHeight = dual ? textAreaHeight / 2 : textAreaHeight
     let fontSize = CGFloat(configFontSize) * 0.8
+    // 卡片画布较高：双行不再按半幅均分（行距过大），改为主副行围绕
+    // 中心紧凑排布（行距 ≈ 0.9×字号），单行居中——观感对齐歌词卡片
+    let lineGap = fontSize * 0.9
+    let rowHeight = dual ? lineGap * 2 : textAreaHeight
+    let rowCenter1 = textAreaHeight / 2 - (dual ? lineGap : 0)
+    let rowCenter2 = textAreaHeight / 2 + (dual ? lineGap : 0)
 
     // 占位文案（歌词加载中/暂无歌词/歌词加载失败）：跨两行居中
     if !placeholder.isEmpty {
@@ -1612,7 +1597,7 @@ final class LyricsPipManager: NSObject {
       // 未唱层：整行未唱色
       drawScrollingLine(
         ctx: ctx, glyphs: grayGlyphs(glyphs), font: font,
-        rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
         scrollOffset: scroll, padding: horizontalPadding)
       // 已唱层：clip 已唱宽度（蒙版右缘随播放右移、随行滚动平移）后重画渐变色
       let sungWidth = sungKaraokeWidth(glyphs: glyphs)
@@ -1622,7 +1607,7 @@ final class LyricsPipManager: NSObject {
         ctx.clip(to: CGRect(x: 0, y: 0, width: min(edgeX, width), height: height))
         drawScrollingLine(
           ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
-          rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+          rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
           scrollOffset: scroll, padding: horizontalPadding)
         ctx.restoreGState()
       }
@@ -1630,7 +1615,7 @@ final class LyricsPipManager: NSObject {
       // LRC/纯文本：整行渐变色（安卓 GradientTextView 的 LRC 路径同款）
       drawScrollingLine(
         ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
-        rowCenterY: rowHeight * 0.5, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
         scrollOffset: scroll, padding: horizontalPadding)
     }
 
@@ -1641,7 +1626,7 @@ final class LyricsPipManager: NSObject {
       // 两者节奏无关，跟着滚会被误读成副行在逐字推进（旧实现 bug）。
       drawScrollingLine(
         ctx: ctx, glyphs: nextGlyphs, font: nextFont,
-        rowCenterY: rowHeight * 1.5, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter2, rowHeight: rowHeight, width: width,
         scrollOffset: 0, padding: horizontalPadding)
     }
   }
