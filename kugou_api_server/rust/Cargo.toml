@@ -5,7 +5,10 @@ edition = "2021"
 
 [lib]
 name = "kugou_server"
-crate-type = ["cdylib", "rlib"]
+# staticlib 供 iOS 静态链接进可执行文件（DynamicLibrary.process() 加载符号）
+# iOS fork：上游此处无 staticlib（Android 只用 cdylib），静态链接产物
+# libkugou_server.a 是 build_ios.sh 的唯一交付物，缺失会让 iOS CI 失败。
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 tiny_http = "0.12"
