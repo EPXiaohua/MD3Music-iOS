@@ -53,6 +53,9 @@ class DepthCoverCache {
       base = await getExternalStorageDirectory();
     } on UnimplementedError {
       // Windows 的 path_provider 没有外部存储目录，沿用下面的应用文档目录回退。
+    } on UnsupportedError {
+      // iOS/macOS 的 path_provider 抛的是 UnsupportedError（不是 UnimplementedError）。
+      // 之前只捕后者，导致 iOS 上 _baseDir 必抛 → 深度缓存与推理全链路静默失败。
     }
     base ??= await getApplicationDocumentsDirectory();
     return '${base.path}${Platform.pathSeparator}stream_cache'

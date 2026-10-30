@@ -516,9 +516,14 @@ class ThemeProvider extends ChangeNotifier {
   /// 设置「显示大小」档位（[kMinDisplayScale] ~ [kMaxDisplayScale]）。
   Future<void> setDisplayScale(double scale) async {
     final clamped = scale.clamp(kMinDisplayScale, kMaxDisplayScale);
-    if (_displayScale == clamped) return;
-    _displayScale = clamped;
-    notifyListeners();
+    // 幂等短路只作用于内存与通知，**不能跳过落盘**：确认框流程先经
+    // [previewDisplayScale] 把值写进内存，再调用本方法保存；若这里因
+    // 「值未变」直接 return，「保留」就永远只改了内存、没有持久化，
+    // 重启后必然回到上一次真正落盘的旧档位。
+    if (_displayScale != clamped) {
+      _displayScale = clamped;
+      notifyListeners();
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_displayScaleKey, clamped);
   }
