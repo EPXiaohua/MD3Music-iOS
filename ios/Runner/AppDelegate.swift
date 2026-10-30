@@ -907,13 +907,20 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 视频画布尺寸（pt）：固定 5:1 细长条（对齐酷狗桌面歌词形态，实测
-  /// ~5.16:1 无黑边）。PiP 窗口高度基本固定（约 70pt），宽度随视频宽高比
-  /// 增加、封顶约 0.97 屏宽（≈5.2:1）——此前 6.8~13.6:1 的超宽帧超出上限，
-  /// 窗口被限宽后上下 letterbox，表现为 PiP 顶部黑边。5:1 在上限内，窗口
-  /// 与帧精确同比例，任何设备都无黑边。字号/行数只影响画布内文字布局，
-  /// 不再改变视频尺寸（比例恒定，杜绝窗口/帧比例微差黑边）。
-  private static let canvasSize = CGSize(width: 360, height: 72)
+  /// 条画布尺寸（pt）：宽恒 300，高 = 版式基准（单行 22 / 双行 44）×
+  /// 字号缩放（18sp 归一），但下限 60pt。下限原因：PiP 窗口面板对宽高比
+  /// 有实际上限（实测 ~5.2:1，窗口高度有下限）——视频比例超限会被窗口
+  /// letterbox，表现为 PiP 顶部黑边（旧版 22pt 单行条 13.6:1、44pt 双行条
+  /// 6.8:1 均超限）。高度 ≥60 → 比例 ≤5.0 恒在限内：小/中字号条高恒定、
+  /// 双行大字号（≥25sp）起条随字号变高；单行在限内放不进更矮的条，
+  /// 与主流实现一致（单行 = 高画布内文字单行居中）。
+  private var barSize: CGSize {
+    let scale = CGFloat(max(configFontSize, 8) / 18.0)
+    let height = max(60, ((configDoubleLine ? 44.0 : 22.0) * scale).rounded())
+    return CGSize(width: 300, height: height)
+  }
+  /// 上一次出帧的画布尺寸（applyBarSize 检测尺寸变化用）
+  private var lastBarSize: CGSize = .zero
 
   private override init() {}
 
@@ -1079,19 +1086,28 @@ final class LyricsPipManager: NSObject {
     }
   }
 
-  /// 字号/行数配置变化：复位滚动状态并立即重出一帧。画布尺寸恒定，但
-  /// 仍同步离屏宿主/显示层 frame——PiP 窗口尺寸取自 displayLayer bounds，
-  /// 必须与视频帧比例严格一致（失配 = 窗口内 letterbox 黑边）。
+  /// 字号/行数配置变化：同步离屏宿主/显示层 frame（PiP 窗口尺寸取自
+  /// displayLayer bounds，须与视频帧严格一致）、复位滚动并立即重出一帧。
+  /// 尺寸变化时窗口不会跟随改比例——PiP 激活中则重启小窗，让窗口按新
+  /// 比例重新定格（状态机收敛：stop → didStop → start），避免窗口内
+  /// letterbox 黑边；未激活时只影响后续开窗尺寸。
   private func applyBarSize() {
+    let size = barSize
+    let sizeChanged = lastBarSize != .zero && lastBarSize != size
+    lastBarSize = size
     scrollOffset = 0
     scrollLastUptime = 0
     if let host = hostView {
       host.frame = CGRect(
-        x: -Self.canvasSize.width - 16, y: -8,
-        width: Self.canvasSize.width, height: Self.canvasSize.height)
+        x: -size.width - 16, y: -8,
+        width: size.width, height: size.height)
       sampleLayer.frame = host.bounds
     }
     renderFrame()
+    if sizeChanged, pipController?.isPictureInPictureActive == true {
+      requestStop()
+      requestStart()
+    }
   }
 
   /// 估算当前播放位置：锚点 + 本机单调钟流逝（播放中原生自推进）。
@@ -1230,8 +1246,8 @@ final class LyricsPipManager: NSObject {
     }
     // 1. 离屏宿主：layer 必须在窗口层级里 PiP 才会从它取帧；本体移出屏幕不显示
     let host = UIView(frame: CGRect(
-      x: -Self.canvasSize.width - 16, y: -8,
-      width: Self.canvasSize.width, height: Self.canvasSize.height))
+      x: -barSize.width - 16, y: -8,
+      width: barSize.width, height: barSize.height))
     host.backgroundColor = .clear
     host.isUserInteractionEnabled = false
     rootViewController.view.addSubview(host)
@@ -1364,10 +1380,10 @@ final class LyricsPipManager: NSObject {
     let format = UIGraphicsImageRendererFormat()
     format.scale = 2 // @2x 位图，小窗里文字足够清晰
     format.opaque = true
-    let renderer = UIGraphicsImageRenderer(size: Self.canvasSize, format: format)
+    let renderer = UIGraphicsImageRenderer(size: barSize, format: format)
     let image = renderer.image { ctx in
       // 渲染器上下文已是 UIKit 左上原点坐标系，与 drawBar 的坐标约定一致
-      self.drawBar(in: ctx.cgContext, size: Self.canvasSize)
+      self.drawBar(in: ctx.cgContext, size: barSize)
     }
     guard let cgImage = image.cgImage else { return nil }
 
