@@ -1079,11 +1079,18 @@ final class LyricsPipManager: NSObject {
     }
   }
 
-  /// 字号/行数配置变化：复位滚动状态并立即重出一帧（画布尺寸恒定，
-  /// 像素池与 PiP 窗口比例不受影响）。
+  /// 字号/行数配置变化：复位滚动状态并立即重出一帧。画布尺寸恒定，但
+  /// 仍同步离屏宿主/显示层 frame——PiP 窗口尺寸取自 displayLayer bounds，
+  /// 必须与视频帧比例严格一致（失配 = 窗口内 letterbox 黑边）。
   private func applyBarSize() {
     scrollOffset = 0
     scrollLastUptime = 0
+    if let host = hostView {
+      host.frame = CGRect(
+        x: -Self.canvasSize.width - 16, y: -8,
+        width: Self.canvasSize.width, height: Self.canvasSize.height)
+      sampleLayer.frame = host.bounds
+    }
     renderFrame()
   }
 
