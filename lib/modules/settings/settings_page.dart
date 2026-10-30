@@ -1583,12 +1583,15 @@ class _SettingsPageState extends State<SettingsPage>
           builder: _buildAudioQualitySubpage,
         ),
         // search-sub: 硬解 offload 硬件解码 省电 直通 解码能力 矩阵
-        SettingsSubpage(
-          title: '硬件解码播放',
-          icon: Icons.memory_outlined,
-          description: '硬解开关、设备解码器能力与 offload 协商',
-          builder: _buildAudioOffloadSubpage,
-        ),
+        // 仅 Android：iOS 无 AudioTrack offload 通路（系统播放本身即硬解），
+        // 桌面/Web 同样无此能力，见 platform_capabilities.supportsAudioOffload。
+        if (supportsAudioOffload)
+          SettingsSubpage(
+            title: '硬件解码播放',
+            icon: Icons.memory_outlined,
+            description: '硬解开关、设备解码器能力与 offload 协商',
+            builder: _buildAudioOffloadSubpage,
+          ),
         // 桌面端隐藏整个「音效与音量」分类：它下面所有子项（均衡器 / 音效库 /
         // 蝰蛇母带 / 音量均衡 / 参考响度）都依赖 Android AudioSession 绑定，
         // 全部已按supportsSystemAudioEffects 等门控隐藏。分类留着只会让用户
@@ -1874,6 +1877,7 @@ class _SettingsPageState extends State<SettingsPage>
                       '清理深度图缓存',
                     }.contains(e.label)) &&
                 (supportsUsbExclusive || e.category != 'USB 独占') &&
+                (supportsAudioOffload || e.subpage != '硬件解码播放') &&
                 (supportsSystemAudioEffects ||
                     !_kAndroidOnlyAudioLabels.contains(e.label)) &&
                 (isAndroidPlatform ||
@@ -7928,6 +7932,8 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
 ///
 /// 单独成 widget 而非留在设置页里：拖动过程中的中间值只需要重建这一小块，
 /// 放在设置页会让每个 drag update 重建整页元素树，进而在拖动中途打断手势。
+/// 拖动中经 [ThemeProvider.previewDisplayScale] 实时预览（内存，全 UI 缩放），
+/// 抬手弹确认框，点「保留」才落盘，10 秒不确认自动还原。
 class _DisplayScaleTile extends StatefulWidget {
   const _DisplayScaleTile();
 
@@ -7937,6 +7943,7 @@ class _DisplayScaleTile extends StatefulWidget {
 
 class _DisplayScaleTileState extends State<_DisplayScaleTile> {
   /// 拖动中的临时值；null 表示显示 [ThemeProvider.displayScale] 的已应用档位。
+  /// 该值只驱动滑块自身显示；全局预览由 previewDisplayScale 承担。
   double? _pending;
 
   /// 手指是否还按在滑块上。
@@ -7951,33 +7958,38 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
   /// 因此提交时机改由 Listener 的真实 pointer up / cancel 决定。
   bool _pointerDown = false;
 
-  /// 抬手提交：值真的变了才应用，否则只清掉临时值。
+  /// 抬手提交：值真的变了才弹确认框，否则把预览弹回已应用档位。
   void _commit() {
     _pointerDown = false;
     final pending = _pending;
     final applied = context.read<ThemeProvider>().displayScale;
     if (pending == null || pending == applied) {
-      if (pending != null) setState(() => _pending = null);
+      if (pending != null) {
+        // 拖回原位：预览值弹回即可（applied 与 pending 相同时内存值未变）
+        setState(() => _pending = null);
+      }
       return;
     }
     // ignore: discarded_futures
     _apply(pending, applied);
   }
 
-  /// 应用档位：落盘后弹确认框，10 秒内不点「保留」自动还原。
-  /// 极端档位下滑块与按钮自身也被放大/缩小，可能已无法再操作，必须留一条
-  /// 不依赖用户交互的退路。
+  /// 弹确认框：拖动中已实时预览（内存），点「保留」才落盘，10 秒不确认
+  /// 自动还原。极端档位下滑块与按钮自身也被放大/缩小，可能已无法再操作，
+  /// 必须留一条不依赖用户交互的退路。
   Future<void> _apply(double value, double previous) async {
-    final theme = context.read<ThemeProvider>();
-    await theme.setDisplayScale(value);
     if (!mounted) return;
+    final theme = context.read<ThemeProvider>();
     final keep = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const _DisplayScaleConfirmDialog(),
     );
     if (!mounted) return;
-    if (keep != true) {
+    if (keep == true) {
+      await theme.setDisplayScale(value);
+      if (!mounted) return;
+    } else {
       await theme.setDisplayScale(previous);
       if (!mounted) return;
     }
@@ -8021,8 +8033,12 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
                           max: kMaxDisplayScale,
                           // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
                           label: '${value.toStringAsFixed(2)}x',
-                          // 拖动中只更新本地值，界面不缩放
-                          onChanged: (v) => setState(() => _pending = v),
+                          // 拖动中实时预览：临时值写进 ThemeProvider 内存
+                          // （全 UI 立即缩放，不落盘），抬手确认后才持久化。
+                          onChanged: (v) {
+                            setState(() => _pending = v);
+                            context.read<ThemeProvider>().previewDisplayScale(v);
+                          },
                           // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
                           // 这里只兜住键盘方向键那条没有指针的路径。
                           onChangeEnd: (_) {
@@ -8044,8 +8060,12 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
                           max: kMaxDisplayScale,
                           // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
                           label: '${value.toStringAsFixed(2)}x',
-                          // 拖动中只更新本地值，界面不缩放
-                          onChanged: (v) => setState(() => _pending = v),
+                          // 拖动中实时预览：临时值写进 ThemeProvider 内存
+                          // （全 UI 立即缩放，不落盘），抬手确认后才持久化。
+                          onChanged: (v) {
+                            setState(() => _pending = v);
+                            context.read<ThemeProvider>().previewDisplayScale(v);
+                          },
                           // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
                           // 这里只兜住键盘方向键那条没有指针的路径。
                           onChangeEnd: (_) {

@@ -523,6 +523,17 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.setDouble(_displayScaleKey, clamped);
   }
 
+  /// 「显示大小」拖动实时预览：只改内存（UI 立即缩放），**不落盘**。
+  ///
+  /// 供设置页滑块拖动中高频调用（安卓系统「显示大小」同款手感）；终值仍由
+  /// [setDisplayScale] 在用户确认后落盘，取消/超时还原也走它写回旧档。
+  void previewDisplayScale(double scale) {
+    final clamped = scale.clamp(kMinDisplayScale, kMaxDisplayScale);
+    if (_displayScale == clamped) return;
+    _displayScale = clamped;
+    notifyListeners();
+  }
+
   /// 加载底部导航栏文字显示行为的持久化值，默认始终不显示。
   ///
   /// 存储口径从「enum index」迁移为「enum name」（见 [setNavLabelBehavior]）：
