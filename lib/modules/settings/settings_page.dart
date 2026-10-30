@@ -7932,8 +7932,6 @@ class _LyricTimeOffsetTileState extends State<_LyricTimeOffsetTile> {
 ///
 /// 单独成 widget 而非留在设置页里：拖动过程中的中间值只需要重建这一小块，
 /// 放在设置页会让每个 drag update 重建整页元素树，进而在拖动中途打断手势。
-/// 拖动中经 [ThemeProvider.previewDisplayScale] 实时预览（内存，全 UI 缩放），
-/// 抬手弹确认框，点「保留」才落盘，10 秒不确认自动还原。
 class _DisplayScaleTile extends StatefulWidget {
   const _DisplayScaleTile();
 
@@ -7943,7 +7941,6 @@ class _DisplayScaleTile extends StatefulWidget {
 
 class _DisplayScaleTileState extends State<_DisplayScaleTile> {
   /// 拖动中的临时值；null 表示显示 [ThemeProvider.displayScale] 的已应用档位。
-  /// 该值只驱动滑块自身显示；全局预览由 previewDisplayScale 承担。
   double? _pending;
 
   /// 手指是否还按在滑块上。
@@ -7958,28 +7955,27 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
   /// 因此提交时机改由 Listener 的真实 pointer up / cancel 决定。
   bool _pointerDown = false;
 
-  /// 抬手提交：值真的变了才弹确认框，否则把预览弹回已应用档位。
+  /// 抬手提交：值真的变了才应用，否则只清掉临时值。
   void _commit() {
     _pointerDown = false;
     final pending = _pending;
     final applied = context.read<ThemeProvider>().displayScale;
     if (pending == null || pending == applied) {
-      if (pending != null) {
-        // 拖回原位：预览值弹回即可（applied 与 pending 相同时内存值未变）
-        setState(() => _pending = null);
-      }
+      if (pending != null) setState(() => _pending = null);
       return;
     }
     // ignore: discarded_futures
     _apply(pending, applied);
   }
 
-  /// 弹确认框：拖动中已实时预览（内存），点「保留」才落盘，10 秒不确认
-  /// 自动还原。极端档位下滑块与按钮自身也被放大/缩小，可能已无法再操作，
-  /// 必须留一条不依赖用户交互的退路。
+  /// 应用档位：先只写内存（UI 立即生效），点「保留」才落盘，10 秒内不
+  /// 确认自动还原——确认前杀后台，重启仍回到旧档位，未确认档不持久化。
+  /// 极端档位下滑块与按钮自身也被放大/缩小，可能已无法再操作，必须留一条
+  /// 不依赖用户交互的退路。
   Future<void> _apply(double value, double previous) async {
-    if (!mounted) return;
     final theme = context.read<ThemeProvider>();
+    theme.previewDisplayScale(value);
+    if (!mounted) return;
     final keep = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -7990,7 +7986,8 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
       await theme.setDisplayScale(value);
       if (!mounted) return;
     } else {
-      await theme.setDisplayScale(previous);
+      // 还原内存即可：旧档位本来就在盘里，未确认的新档绝不落盘。
+      theme.previewDisplayScale(previous);
       if (!mounted) return;
     }
     setState(() => _pending = null);
@@ -8033,12 +8030,8 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
                           max: kMaxDisplayScale,
                           // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
                           label: '${value.toStringAsFixed(2)}x',
-                          // 拖动中实时预览：临时值写进 ThemeProvider 内存
-                          // （全 UI 立即缩放，不落盘），抬手确认后才持久化。
-                          onChanged: (v) {
-                            setState(() => _pending = v);
-                            context.read<ThemeProvider>().previewDisplayScale(v);
-                          },
+                          // 拖动中只更新本地值，界面不缩放
+                          onChanged: (v) => setState(() => _pending = v),
                           // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
                           // 这里只兜住键盘方向键那条没有指针的路径。
                           onChangeEnd: (_) {
@@ -8060,12 +8053,8 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
                           max: kMaxDisplayScale,
                           // divisions 不传 = 无极调节（M3ESlider.divisions 为 int?）
                           label: '${value.toStringAsFixed(2)}x',
-                          // 拖动中实时预览：临时值写进 ThemeProvider 内存
-                          // （全 UI 立即缩放，不落盘），抬手确认后才持久化。
-                          onChanged: (v) {
-                            setState(() => _pending = v);
-                            context.read<ThemeProvider>().previewDisplayScale(v);
-                          },
+                          // 拖动中只更新本地值，界面不缩放
+                          onChanged: (v) => setState(() => _pending = v),
                           // 指针交互一律等 Listener 的 pointer up（见 _pointerDown 注释）；
                           // 这里只兜住键盘方向键那条没有指针的路径。
                           onChangeEnd: (_) {

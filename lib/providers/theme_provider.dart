@@ -523,10 +523,10 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.setDouble(_displayScaleKey, clamped);
   }
 
-  /// 「显示大小」拖动实时预览：只改内存（UI 立即缩放），**不落盘**。
+  /// 「显示大小」内存预览：UI 立即生效但**不落盘**。
   ///
-  /// 供设置页滑块拖动中高频调用（安卓系统「显示大小」同款手感）；终值仍由
-  /// [setDisplayScale] 在用户确认后落盘，取消/超时还原也走它写回旧档。
+  /// 供设置页确认框流程使用：抬手先预览（内存），点「保留」才经
+  /// [setDisplayScale] 持久化；未确认（取消/超时/杀后台）后重启仍回到旧档。
   void previewDisplayScale(double scale) {
     final clamped = scale.clamp(kMinDisplayScale, kMaxDisplayScale);
     if (_displayScale == clamped) return;
