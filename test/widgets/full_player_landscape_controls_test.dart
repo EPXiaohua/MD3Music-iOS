@@ -23,6 +23,7 @@ import 'package:md3music/modules/player/player_cover_morph.dart';
 import 'package:md3music/modules/player/player_cover_morph_layer.dart';
 import 'package:md3music/modules/player/player_tab_pager.dart';
 import 'package:md3music/modules/player/player_volume_state.dart';
+import 'package:md3music/modules/player/player_zen_bridge.dart';
 import 'package:md3music/modules/player/player_wide_pane.dart';
 import 'package:md3music/providers/comment_display_provider.dart';
 import 'package:md3music/providers/device_provider.dart';
@@ -1284,6 +1285,68 @@ void main() {
       );
     });
 
+    // ── Windows F11 → Zen：桥接与 peek 的收口语义 ──
+    //
+    // F11 的按键处理挂在应用根（`installWindowsF11Handler`），拿不到播放页 State，
+    // 只能经 `PlayerZenBridge` 回调进来。这里锁三件事：进/退都走同一条 Zen 路径、
+    // peek 中途按 F11 是「彻底退出」而不是又回到 Zen、以及播放页卸载后桥被摘干净。
+    testWidgets('$name F11 桥：进/退 Zen 与 peek 中途彻底退出', (tester) async {
+      await _runPlayerTest(
+        tester,
+        viewport: const Size(800, 360),
+        page: page,
+        body: (player) async {
+          expect(
+            PlayerZenBridge.instance.hasHandlers,
+            isTrue,
+            reason: '播放页挂载后必须向桥注册（否则 Windows F11 找不到它）',
+          );
+
+          // 桥 → 进 Zen（与长按封面同一条路径）
+          expect(PlayerZenBridge.instance.toggleZen(), isTrue);
+          await tester.pumpAndSettle();
+          expect(kPlayerZenImmersiveActive.value, isTrue, reason: '桥已把页面切进 Zen');
+
+          // 桥 → 退 Zen
+          expect(PlayerZenBridge.instance.toggleZen(), isTrue);
+          await tester.pumpAndSettle();
+          expect(kPlayerZenImmersiveActive.value, isFalse, reason: '桥能退出 Zen');
+          expect(_dim(tester), 1.0, reason: '退出 Zen 必须复位压暗因子');
+
+          // peek 中途按 F11：彻底退出，且倒计时被取消（4s 后不得自己回到 Zen）。
+          //
+          // 这里**不能用 tester.tap**：它在同一帧内完成 down+up，此时按压进度还是
+          // 0.0，`_cancelArtworkPress` 的 `value > 0` 守卫会早退 → 2000ms 长按计时器
+          // 继续跑，2 秒后把 Zen 又切回来（真机上人手按 ≥1 帧，不会触发）。
+          // 故显式按住一帧再松手，走真机同一条「短按 = 取消长按」路径。
+          expect(PlayerZenBridge.instance.toggleZen(), isTrue);
+          await tester.pumpAndSettle();
+          final coverPress = await tester.startGesture(
+            tester.getCenter(find.byType(PlayerCoverSlot).first),
+          );
+          await tester.pump(const Duration(milliseconds: 60));
+          await coverPress.up();
+          await tester.pump();
+          expect(kPlayerZenImmersiveActive.value, isFalse, reason: 'peek 期间是退出态');
+          expect(PlayerZenBridge.instance.toggleZen(), isTrue);
+          for (var i = 0; i < 50; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isFalse,
+            reason: 'peek 中途按 F11 是彻底退出，定时器不得再把 chrome 收回去',
+          );
+          expect(_dim(tester), 1.0, reason: '定时器已取消，因子不得残留 0.2');
+        },
+      );
+      expect(
+        PlayerZenBridge.instance.hasHandlers,
+        isFalse,
+        reason: '播放页卸载后必须注销，否则 F11 会打到已 dispose 的 State',
+      );
+    });
+
     // ── 横屏 Zen 唤出 chrome 的倒计时渐隐 ──
     //
     // 需求是「看得到还剩多久收回」：整段 4s 停留里 chrome 不透明度线性降到 20%，
@@ -1569,7 +1632,7 @@ void main() {
     });
   }
 
-  testWidgets('AM 传输按钮线宽 = 已播放进度条的 2 倍（侧键 4px）/ 3 倍（播放键 6px）', (
+  testWidgets('AM 传输按钮侧键线宽 = 已播放进度条的 2 倍（4px）', (
     tester,
   ) async {
     await _runPlayerTest(
@@ -1583,15 +1646,11 @@ void main() {
         // AM 页进度条是 PlayerSeekBar(md3Style: false) 的 2px 常态轨道（已播放段）；
         // iconic_morph 的 strokeWidth 是 24 基准 viewBox 单位、渲染时按 size/24
         // 缩放（_StaticIconPainter），故屏幕线宽 = strokeWidth × iconSize / 24。
+        // 中央播放/暂停已改用 PlayPauseMorphIcon 实心双轨形变（无描边宽度参数）。
         expect(
           controls.strokeWidth * controls.skipIconSize / 24,
           closeTo(4.0, 0.01),
           reason: '侧键线宽应为已播放进度条（2px）的两倍',
-        );
-        expect(
-          controls.playStrokeWidth * controls.playIconSize / 24,
-          closeTo(6.0, 0.01),
-          reason: '播放键线宽应为已播放进度条的三倍（保持比侧键更粗）',
         );
       },
     );

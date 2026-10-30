@@ -62,24 +62,16 @@ class DiagnosticExporter {
     final workDir = Directory('${tmpRoot.path}/diagnostic_report_$stamp')
       ..createSync(recursive: true);
 
-    // 3. 复制日志目录内全部文件（app.log / app.log.N / native_crash_*.txt /
-    //    recog_segment.wav 等二进制诊断样本按字节原样复制，不走文本清洗）
+    // 3. 复制日志目录内全部文件（app.log / app.log.N / native_crash_*.txt）
     if (logDir != null && logDir.existsSync()) {
       for (final entity in logDir.listSync()) {
         if (entity is File) {
           try {
-            final name = _baseName(entity.path);
-            final isText =
-                name.endsWith('.log') || name.endsWith('.txt');
-            if (isText) {
-              final content = entity.readAsStringSync();
-              File('${workDir.path}/$name').writeAsStringSync(
-                DiagnosticLogger.sanitizeDiagnosticText(content),
-                flush: true,
-              );
-            } else {
-              entity.copySync('${workDir.path}/$name');
-            }
+            final content = entity.readAsStringSync();
+            File('${workDir.path}/${_baseName(entity.path)}').writeAsStringSync(
+              DiagnosticLogger.sanitizeDiagnosticText(content),
+              flush: true,
+            );
           } catch (_) {
             // 单文件复制失败（占用/轮转竞争）不中断其余日志收集
           }

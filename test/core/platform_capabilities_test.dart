@@ -1,6 +1,5 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/platform_capabilities.dart';
 import 'package:md3music/providers/tab_config_provider.dart';
@@ -15,27 +14,32 @@ import 'package:md3music/modules/settings/settings_search_index.g.dart';
 ///   - USB 独占：USB Host + native cpp（UAC1 DAC 直写 usbdevfs）
 ///   - 听歌识曲：麦克风采集 + RMS 分析
 ///   - 预测性返回：Android 14+ 系统手势导航
-///   - 音乐频谱：Visualizer 采集 PCM 波形
-///   - 震动反馈：Vibrator 硬件（移动端；iOS 侧另走 UIFeedbackGenerator / CoreHaptics）
+///   - 震动反馈：Vibrator 硬件
 ///   - 桌面快捷方式：quick_actions_android
 ///
+/// **音乐频谱已不再是 Android 专属**（2026-10）：Windows runner 用 WASAPI 环回
+/// 采集本进程音频并做同款 FFT，与 Android 共用 `onFft` 协议，因此该能力在
+/// 两个平台都为 true，只保留"其它桌面平台为 false"的口径。
+///
 /// 本测试锁两件事：
-/// 1. 平台判定本身正确（桌面端全部为 false，Android 全部为 true）；
+/// 1. 平台判定本身正确（非 Windows / 非 Android 的桌面端为 false，Windows 自己的
+///    频谱为 true）；
 /// 2. **门控点确实存在** —— 防止将来有人把这些 `if` 删掉或改名后
 ///    入口又冒出来却没人发现（这正是本次问题的成因：入口一直没被门控）。
 void main() {
   group('平台判定', () {
-    test('桌面端（当前测试环境为 Windows）全部 Android 能力为 false', () {
+    test('桌面端 Android 专属能力为 false，音乐频谱按平台单独判定', () {
       // flutter test 跑在宿主平台；CI/开发机通常是 Windows 或 macOS。
-      // 这里不断言具体平台，只断言"非 Android 时全部为 false"。
+      // 这里不断言具体平台，只断言"非 Android 时 Android 专属能力全部为 false"。
       if (!isAndroidPlatform) {
         expect(supportsUsbExclusive, isFalse);
         expect(supportsSongRecognition, isFalse);
         expect(supportsPredictiveGesture, isFalse);
-        expect(supportsMusicSpectrum, isFalse);
         expect(supportsHaptics, isFalse);
         expect(supportsDesktopShortcut, isFalse);
         expect(isDesktopPlatform, isTrue);
+        // Windows 有 WASAPI 环回采集；mac/Linux 没有原生采集通路。
+        expect(supportsMusicSpectrum, isWindowsDesktop);
       }
     });
 
@@ -88,6 +92,77 @@ void main() {
       expect(supportsSystemAudioEffects, isA<bool>());
       expect(supportsViperMaster, isA<bool>());
       expect(supportsLoudnessNormalization, isA<bool>());
+    });
+
+    test('supportsUsbExclusive 排除 TV 构建（源码扫描）', () {
+      // kTvBuild 是编译期 const，测试进程无法覆盖；TV 包内该条件会被树摇折叠。
+      // 这里锁住定义本身，防止有人改回只看 isAndroidPlatform —— TV 构建既不编译
+      // USB 独占 C++ 驱动，也不注册 UsbAudioPlugin/DirectPcmPlugin（FEATURE_TV），
+      // 只判平台会让设置页与歌曲信息页露出点不动的死 UI。
+      final source = File(
+        'lib/core/platform_capabilities.dart',
+      ).readAsStringSync();
+      expect(
+        RegExp(
+          r'supportsUsbExclusive\s*=>\s*isAndroidPlatform\s*&&\s*!kTvBuild',
+        ).hasMatch(source),
+        isTrue,
+        reason: 'USB 独占在 TV 构建没有原生能力，必须与桌面端同口径隐藏',
+      );
+    });
+
+    test('频谱启动门控按平台能力而非 Platform.isAndroid（源码扫描）', () {
+      // 历史上两个播放页把频谱写死成 Platform.isAndroid，导致 Windows 即使
+      // 开了开关也永远不调用 SpectrumService.start()。能力化后必须走
+      // supportsMusicSpectrum，否则以后再加平台还会漏。
+      for (final path in <String>[
+        'lib/modules/player/full_player.dart',
+        'lib/modules/player/full_player_am.dart',
+      ]) {
+        final source = File(path).readAsStringSync();
+        expect(
+          source.contains('if (!supportsMusicSpectrum ||'),
+          isTrue,
+          reason: '$path 的 _tryStartSpectrum 必须按 supportsMusicSpectrum 门控',
+        );
+        expect(
+          source.contains('if (supportsMusicSpectrum)'),
+          isTrue,
+          reason: '$path 的界面设置弹层频谱开关必须按能力显示',
+        );
+      }
+      final settings = File(
+        'lib/modules/settings/settings_page.dart',
+      ).readAsStringSync();
+      expect(
+        settings.contains('if (supportsMusicSpectrum)'),
+        isTrue,
+        reason: '设置页「音乐频谱」子页入口必须按能力门控',
+      );
+    });
+
+    test('USB 独占 UI 门控点存在（设置页 + 歌曲信息页）', () {      final settings = File(
+        'lib/modules/settings/settings_page.dart',
+      ).readAsStringSync();
+      expect(
+        settings.contains('if (supportsUsbExclusive)'),
+        isTrue,
+        reason: '设置页「USB 独占」分类必须按能力门控',
+      );
+
+      final songInfo = File(
+        'lib/modules/player/song_info_page.dart',
+      ).readAsStringSync();
+      expect(
+        RegExp(r'if \(supportsUsbExclusive\) \.\.\.\[').hasMatch(songInfo),
+        isTrue,
+        reason: '歌曲信息页的 USB 独占区块必须按能力门控',
+      );
+      expect(
+        songInfo.contains('UsbExclusiveSection('),
+        isTrue,
+        reason: 'USB 独占区块应与设置页共用 UsbExclusiveSection',
+      );
     });
   });
 

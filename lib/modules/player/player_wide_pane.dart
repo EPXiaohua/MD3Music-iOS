@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 
+import 'package:flutter/widgets.dart' show MediaQueryData;
+
 import '../../widgets/player_dock/player_control_dock.dart';
 
 /// 宽屏（手机横屏 / Pad）左栏的**唯一**度量口径：一套按比例算出的左右内衬，
@@ -16,12 +18,43 @@ import '../../widgets/player_dock/player_control_dock.dart';
 class PlayerWidePane {
   const PlayerWidePane._();
 
+  /// 宽屏左右分栏：左栏占比。对称 1:1，否则 4:6。
+  ///
+  /// 左右两个 `Expanded` 的 flex（5:5 或 4:6）、右栏分档宽度、左栏内衬与顶栏
+  /// 尾部胶囊的右内衬都从这一个函数取占比，避免四份各写一遍后失同步。
+  /// 「对称与否」由设置开关 `kSymmetricWidePaneEnabled` 决定。
+  static double leftPaneFraction(bool symmetric) => symmetric ? 0.5 : 0.4;
+
   /// 左栏内衬 = 栏宽 × 5%，夹在 [12, 24]。
   ///
   /// 取值让手机横屏（左栏 320dp）落在 16dp —— 与改造前逐像素一致，
   /// 大屏才抬到 24dp 封顶，不至于让控制贴边。
-  static double gutter(double paneWidth) =>
-      (paneWidth * 0.05).clamp(12.0, 24.0);
+  ///
+  /// 下限 12 触发时整页同步收紧：左栏内衬、`bandFits` 的余量判断与顶栏尾部
+  /// 胶囊的右内衬都从这一个函数取值，左右边缘不会失衡；不要让右栏另行独立取
+  /// `gutter(0.6W)`——非对称分栏下右栏更宽，同一屏幕会算出比左栏更大的值
+  /// （典型宽度上 16 vs 24），两边内衬立刻错位。
+  /// 另注：右栏面板（播放列表 / 歌词 / 底部页签条与 dock）各自的横向内衬
+  /// 不归此口径管，属既有独立节奏（固定 16 / 24），不必也没法同源对齐。
+  ///
+  /// [override] 非 null 时（用户开启「自定义宽屏边距」）**完全取代**比例算法：
+  /// 直接返回该值，不再夹 [12, 24]——0 即无边距，48 即 48dp 固定内衬。
+  /// null 时按上面的自动口径计算。
+  static double gutter(double paneWidth, {double? override}) =>
+      override ?? (paneWidth * 0.05).clamp(12.0, 24.0);
+
+  /// 横屏挖孔/异形屏对称补偿：取左右安全区较大者统一补偿两侧。
+  ///
+  /// SafeArea 默认左吃左、右吃右，挖孔只在一侧时左右起点不齐（左栏封面
+  /// 缩进挖孔宽，右栏内容却贴边）；这里改为取 `max(padding.left, padding.right)`
+  /// 一个值对称加在两侧，左右内容起点相等。
+  /// 异常值钳制：NaN、负数或 >128（挖孔补偿不可能这么宽，多为平台脏数据）
+  /// 一律按 0 处理，避免个别机型把整页推开。Windows/桌面无挖孔时结果为 0，
+  /// 行为与不加补偿一致。
+  static double cutoutSymmetricInset(MediaQueryData mq) {
+    double clampInset(double v) => (v.isNaN || v < 0 || v > 128) ? 0 : v;
+    return math.max(clampInset(mq.padding.left), clampInset(mq.padding.right));
+  }
 
   /// 封面 → 曲名的行距。
   static const double titleGap = 16.0;

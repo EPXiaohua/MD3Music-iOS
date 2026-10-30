@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -168,6 +170,28 @@ class AppHaptics {
         .catchError((_) {});
   }
 
+  /// 当前平台是否存在可用的震动能力（Windows / Linux / macOS 桌面与 Web 都没有）。
+  ///
+  /// **为什么必须在这里短路**：桌面端（`md3music/haptics` 通道只在 Android 注册，
+  /// 见 `MainActivity.kt`）每次触点都会先发一次注定 `MissingPluginException` 的
+  /// 原生调用，超时/失败后再回落 `HapticFeedback`——而桌面 embedder 同样没有实现
+  /// 该方法，于是**每次点击都白走两趟平台通道 + 起一个 300ms 看门狗 `Timer`**。
+  /// 这些开销恰好压在「点按钮→下一帧」上（Windows 断点实测：鼠标点击暂停比空格
+  /// 暂停多出整窗掉帧），而桌面上本来也震不了，所以直接短路、调用点零改动。
+  static bool get _platformHasHaptics {
+    if (kIsWeb) return false;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+        return true;
+      case TargetPlatform.fuchsia:
+      case TargetPlatform.linux:
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+        return false;
+    }
+  }
+
   /// 统一的发震动入口：先过闸门，再决定用类别指定类型还是调用点自身强度。
   ///
   /// [defaultNativeType] 为 null 的调用点（等价于裸 `HapticFeedback.*`）平时只走
@@ -177,6 +201,7 @@ class AppHaptics {
     String? defaultNativeType, {
     required void Function() fallback,
   }) {
+    if (!_platformHasHaptics) return;
     if (!allows(category)) return;
     final type = _types[category]?.nativeName ?? defaultNativeType;
     if (type == null) {

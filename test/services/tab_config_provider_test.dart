@@ -8,6 +8,22 @@ import '../../lib/providers/tab_config_provider.dart';
 /// 需求：默认 Tab 顺序为 发现(discover) → 收藏(favorites) →
 /// LaunchPad(launchpad) → 本地音乐(library) → 我的(user)；其余可选 Tab 默认隐藏。
 void main() {
+  test('标准版移除主页设置入口，旧持久化配置也不能重新打开', () async {
+    SharedPreferences.setMockInitialValues({
+      'settings_tab_order': ['settings', 'discover', 'user'],
+      'settings_hidden_tabs': <String>[],
+    });
+    final provider = TabConfigProvider();
+    for (var i = 0; i < 10; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    expect(provider.allTabs.any((tab) => tab.id == 'settings'), isFalse);
+    expect(provider.visibleIndexOf('settings'), -1);
+    await provider.toggleTabVisibility('settings');
+    expect(provider.visibleIndexOf('settings'), -1);
+    provider.dispose();
+  });
+
   testWidgets('全新安装：默认 Tab 为 发现/收藏/LaunchPad/本地音乐/我的，其余可选隐藏', (tester) async {
     SharedPreferences.setMockInitialValues({});
     final provider = TabConfigProvider();

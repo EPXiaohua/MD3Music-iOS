@@ -9,6 +9,7 @@ import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/apple_lyrics/renderers/line_renderer.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// LineRenderer 单元测试
 ///
@@ -24,7 +25,9 @@ void main() {
   late LineRenderer renderer;
   late LyricLine line;
 
-  setUp(() {
+  setUp(() async {
+    SharedPreferences.setMockInitialValues({'lyric_line_balance': true});
+    await LyricPreferences.instance.load();
     renderer = LineRenderer();
     line = const LyricLine(
       startTime: 0,
@@ -860,6 +863,33 @@ void main() {
         planRows(otherLongLine),
         reason: '换行（不同 rowTexts）应重排，且重排次数 = 新行视觉行数',
       );
+    });
+  });
+
+  // ==================== 行级颜色覆盖（当前行 / 上方已播行） ====================
+  group('行级颜色覆盖', () {
+    test('非当前行也使用调用方传入的覆盖色（不再按 isActive 门控）', () {
+      // 「上方行使用已播颜色」开启时上方已播行 isActive=false，
+      // 但仍必须用当前行的高亮色绘制。
+      const int override = 0xFF3366CC;
+      renderer.setLineState(
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+        activeColorValue: override,
+      );
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 20);
+      expect(renderer.lastPaintedTextColorValue, equals(override));
+    });
+
+    test('未传覆盖色时回退主题歌词色', () {
+      LyricLayout.textColorValue = 0xFF112233;
+      addTearDown(() => LyricLayout.textColorValue = 0xFFFFFFFF);
+      renderer.setLineState(
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+      );
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 20);
+      expect(renderer.lastPaintedTextColorValue, equals(0xFF112233));
     });
   });
 }

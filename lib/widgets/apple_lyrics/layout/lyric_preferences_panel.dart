@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 
@@ -6,6 +8,7 @@ import '../../../core/remote/remote_slider.dart';
 import '../../../core/services/custom_font_loader.dart';
 import '../../../core/utils/app_toast.dart';
 import 'lyric_preferences.dart';
+import '../../lyric_color_setting_tile.dart';
 
 /// 歌词字号/行间距/字体调节面板。
 ///
@@ -129,6 +132,10 @@ class LyricPreferencesPanel extends StatelessWidget {
                 trailing: const Icon(Icons.chevron_right, size: 18),
                 onTap: () => _showFontSourceSheet(context, prefs),
               ),
+              LyricColorSettingTile(
+                color: prefs.customTextColor,
+                onChanged: prefs.setCustomTextColor,
+              ),
             ],
           ),
         );
@@ -163,7 +170,8 @@ class LyricPreferencesPanel extends StatelessWidget {
     switch (source) {
       case LyricFontSource.system:
       case LyricFontSource.bundled: // 已废弃（内置 SimHei 已移除），等同 system
-        return '系统默认（手机字体优先）';
+        // Windows 的 system 档走便携包内置思源黑体（见 LyricLayout.fontFamily）。
+        return Platform.isWindows ? '默认（思源黑体）' : '系统默认（手机字体优先）';
       case LyricFontSource.custom:
         return '自定义字体';
     }
@@ -197,8 +205,12 @@ class LyricPreferencesPanel extends StatelessWidget {
                       : Icons.radio_button_unchecked,
                   color: Theme.of(ctx).colorScheme.primary,
                 ),
-                title: const Text('系统默认'),
-                subtitle: const Text('使用手机系统字体（推荐）'),
+                title: Text(Platform.isWindows ? '默认（思源黑体）' : '系统默认'),
+                subtitle: Text(
+                  Platform.isWindows
+                      ? '使用应用内置的思源黑体（推荐）'
+                      : '使用手机系统字体（推荐）',
+                ),
                 onTap: () async {
                   await prefs.setFontSource(LyricFontSource.system);
                   if (ctx.mounted) Navigator.pop(ctx);
@@ -247,10 +259,19 @@ class LyricPreferencesPanel extends StatelessWidget {
     }
     // 先保存路径并加载字体（_tryLoadCustomFont 内部会注册 FontLoader）
     await prefs.setCustomFontPath(path);
-    // 再切换来源为 custom（即使加载失败也切换，UI 自然降级为系统字体）
+    // 再切换来源为 custom（即使加载失败也切换，UI 自然降级为默认字体）
     await prefs.setFontSource(LyricFontSource.custom);
     if (!context.mounted) return;
-    final loaded = prefs.effectiveFontFamily != null;
-    showToast(loaded ? '已应用自定义字体到歌词' : '字体加载失败，已降级为系统字体', long: true);
+    // 判据必须是 customFontLoaded：Windows 的 system 档 effectiveFontFamily 也非
+    // null（内置思源黑体），用它判断会把「回落到默认字体」误报成「自定义已生效」。
+    final loaded = prefs.customFontLoaded;
+    showToast(
+      loaded ? '已应用自定义字体到歌词' : '字体加载失败，已降级为$_defaultFontName',
+      long: true,
+    );
   }
+
+  /// 「系统默认」档实际使用的字体名（用于降级提示）。
+  String get _defaultFontName =>
+      Platform.isWindows ? '内置思源黑体' : '系统字体';
 }

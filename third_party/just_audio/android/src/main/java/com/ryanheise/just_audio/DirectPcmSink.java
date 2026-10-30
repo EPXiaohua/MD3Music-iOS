@@ -64,6 +64,9 @@ public final class DirectPcmSink extends ForwardingAudioSink {
             throws ConfigurationException {
         DirectPcmController.onFormatConfigured(
                 inputFormat.sampleRate, inputFormat.channelCount, inputFormat.pcmEncoding);
+        // MD3Music fork: 把 sink 实际收到的格式交给硬解状态（offload 时这里是压缩码流，
+        // 普通播放时是 audio/raw PCM），供设置页展示「当前曲目编码」与能力对照。
+        AudioOffloadController.onFormat(inputFormat);
         // 不改写格式：本次不做进程内重采样，AudioTrack 率恒等于源率。
         // 率与 DAC 原生率不一致时由 AudioFlinger 重采样 —— 状态区会如实标注
         // 「非 bit-perfect」，而不是悄悄对齐（对齐方案见计划 P1）。

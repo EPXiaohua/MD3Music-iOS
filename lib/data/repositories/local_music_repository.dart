@@ -9,6 +9,7 @@ import '../models/artist.dart';
 import '../models/music_folder.dart';
 import '../models/song.dart';
 import '../../core/services/media_store_service.dart';
+import '../../core/services/folder_picker_service.dart';
 import '../../core/services/remote/remote_storage_config.dart';
 import '../../core/utils/audio_scanner.dart';
 
@@ -43,6 +44,7 @@ class LocalMusicRepository {
   }) => songs.where((song) {
     final path = song.localPath;
     return (path == null || !_isExcluded(path, excludedFolders)) &&
+        (song.folderPath == null || !_isExcluded(song.folderPath!, excludedFolders)) &&
         (!filterShortAudio || song.duration > const Duration(seconds: 60));
   }).toList();
 
@@ -178,10 +180,9 @@ class LocalMusicRepository {
   /// 暴露为静态方法以便单测直接断言（Windows 端路径行为需要回归保护）。
   static bool isExcluded(String filePath, List<String> excludedFolders) {
     if (excludedFolders.isEmpty) return false;
-    final normalized = filePath.replaceAll('\\', '/');
+    final normalized = _normalizeComparablePath(filePath);
     for (final excluded in excludedFolders) {
-      final normalizedExcluded = excluded
-          .replaceAll('\\', '/')
+      final normalizedExcluded = _normalizeComparablePath(excluded)
           .replaceFirst(RegExp(r'/+$'), '');
       // 确保是目录级别匹配（excluded 是路径前缀，且后面跟着 / 或完全相等）
       if (normalized == normalizedExcluded ||
@@ -190,6 +191,29 @@ class LocalMusicRepository {
       }
     }
     return false;
+  }
+
+  /// 不同 SAF 授权根可能把同一个目录编码成不同 tree URI；统一按底层 document id
+  /// 比较，避免排除一个 U 盘目录后从另一授权根再次扫描进列表。
+  static String _normalizeComparablePath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    if (normalized.startsWith('storage://')) return normalized;
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || uri.scheme != 'content') {
+      return normalized.replaceFirst(RegExp(r'/+$'), '');
+    }
+    final segments = uri.pathSegments;
+    final documentIndex = segments.indexOf('document');
+    final treeIndex = segments.indexOf('tree');
+    final idIndex = documentIndex >= 0 ? documentIndex + 1 : treeIndex + 1;
+    if (idIndex <= 0 || idIndex >= segments.length) return normalized;
+    final documentId = segments[idIndex];
+    final colon = documentId.indexOf(':');
+    if (colon < 0) return '${uri.authority}/$documentId';
+    final volume = documentId.substring(0, colon).toLowerCase();
+    final relative = documentId.substring(colon + 1).replaceAll('\\', '/');
+    if (volume == 'primary') return '/storage/emulated/0/$relative';
+    return 'storage://$volume/$relative'.replaceFirst(RegExp(r'/+$'), '');
   }
 
   bool _isExcluded(String filePath, List<String> excludedFolders) =>
@@ -232,6 +256,7 @@ class LocalMusicRepository {
   Future<void> _collectFromMediaStore(
     List<Song> songs,
     Set<String> seenPaths,
+    Set<String> seenStorageKeys,
     List<String> excluded,
   ) async {
     try {
@@ -241,17 +266,34 @@ class LocalMusicRepository {
       );
       for (final data in mediaStoreFiles) {
         final rawPath = data['filePath'] as String?;
+        final displayName = data['displayName'] as String?;
+        if (Platform.isAndroid &&
+            isAndroidUnsupportedAudioFile(displayName ?? rawPath ?? '')) {
+          debugPrint('[LocalMusicRepository] 跳过 Android 默认解码链路不支持的格式: $displayName');
+          continue;
+        }
         if (rawPath == null || rawPath.isEmpty || !seenPaths.add(rawPath)) {
           continue;
         }
         // content:// 解析失败时保留原值，由 PlayerProvider 兜底重试，
         // 因此这里声明为非空 String（解析成功赋新值，失败沿用 rawPath）。
         var filePath = rawPath;
+        String? folderPath;
+        final volumeName = data['volumeName'] as String? ?? '';
+        if (volumeName.isNotEmpty && volumeName != 'external_primary') {
+          // 可移除卷按需在播放时解析 URI，不能扫描时复制整张 U 盘到私有存储。
+          final relative = (data['relativePath'] as String? ?? '')
+              .replaceFirst(RegExp(r'/+$'), '');
+          folderPath = 'storage://$volumeName/$relative';
+          final name = displayName ?? '';
+          final path = relative.isEmpty ? name : '$relative/$name';
+          seenStorageKeys.add('$volumeName:$path'.toLowerCase());
+        }
 
         // 把 `content://` 提前解析为真实文件路径。
         // 这样 PlayerProvider 拿到的是绝对路径而不是 content URI，
         // just_audio 可以直接播放（不解析 content:// 协议会导致"播放没声音"）。
-        if (filePath.startsWith('content://')) {
+        if (filePath.startsWith('content://') && folderPath == null) {
           try {
             final resolved = await MediaStoreService.resolveLocalPath(filePath);
             if (resolved != null && resolved.isNotEmpty) {
@@ -264,7 +306,8 @@ class LocalMusicRepository {
         }
 
         // 排除文件夹过滤（解析为真实路径后再判断）
-        if (_isExcluded(filePath, excluded)) {
+        if (_isExcluded(filePath, excluded) ||
+            (folderPath != null && _isExcluded(folderPath, excluded))) {
           debugPrint('[LocalMusicRepository] 排除文件: $filePath');
           continue;
         }
@@ -279,6 +322,7 @@ class LocalMusicRepository {
             album: (data['album'] as String?) ?? '未知专辑',
             duration: Duration(milliseconds: (data['durationMs'] as int?) ?? 0),
             localPath: filePath,
+            folderPath: folderPath,
             artworkUri: albumArtUri ?? 'local://$filePath',
             isOnline: false,
             // content URI/私有拷贝可能没有扩展名，使用 MediaStore 原始文件名。
@@ -307,50 +351,98 @@ class LocalMusicRepository {
     final excluded = excludedFolders ?? [];
     final songs = <Song>[];
     final seenPaths = <String>{};
+    final seenStorageKeys = <String>{};
 
     // MediaStore 是 Android 专属能力（依赖 android/app 的 MediaStore 桥）。
     // Windows 上调用只会拿到 MissingPluginException 白跑一趟并打一条
     // 误导性日志，直接跳过，扫描全部走文件系统源。
     if (!Platform.isWindows) {
-      await _collectFromMediaStore(songs, seenPaths, excluded);
+      await _collectFromMediaStore(songs, seenPaths, seenStorageKeys, excluded);
     }
 
-    // 2. 文件系统补充：扫描默认目录 + 用户自定义目录
-    final scanDirs = <String>[...defaultScanDirsForPlatform];
-    if (customFolders != null) {
-      for (final f in customFolders) {
-        if (!scanDirs.contains(f)) scanDirs.add(f);
+    // 2. 用户通过系统文件选择器授权的目录（含未被 MediaStore 索引的 U 盘）。
+    for (final treeUri in
+        customFolders?.where(FolderPickerService.isTreeUri) ?? <String>[]) {
+      try {
+        final rows = await FolderPickerService.queryTreeAudioFiles(treeUri);
+        for (final data in rows) {
+          final uri = data['filePath'] as String?;
+          final folder = data['folderPath'] as String? ?? treeUri;
+          final name = data['displayName'] as String? ?? '';
+          final storageKey = (data['storageKey'] as String? ?? '').toLowerCase();
+          if (uri == null || uri.isEmpty ||
+              isAndroidUnsupportedAudioFile(name) ||
+              _isExcluded(folder, excluded) ||
+              (storageKey.isNotEmpty && seenStorageKeys.contains(storageKey)) ||
+              !seenPaths.add(uri)) {
+            continue;
+          }
+          songs.add(Song(
+            id: 'local_$uri',
+            title: data['title'] as String? ?? name,
+            artist: data['artist'] as String? ?? '未知艺术家',
+            album: data['album'] as String? ?? '未知专辑',
+            duration: Duration(
+              milliseconds: (data['durationMs'] as num?)?.toInt() ?? 0,
+            ),
+            localPath: uri,
+            folderPath: folder,
+            artworkUri: data['artworkUri'] as String?,
+            localLyrics: data['localLyrics'] as String?,
+            isOnline: false,
+            quality: inferQuality((data['bitrate'] as num?)?.toInt(), name),
+          ));
+        }
+      } catch (error) {
+        debugPrint('[LocalMusicRepository] SAF 目录扫描失败: $treeUri, $error');
       }
     }
 
-    final filePaths = collectAudioFiles(scanDirs, excludedDirs: excluded);
+    // 3. 文件系统补充：扫描默认目录 + 非 SAF 自定义目录
+    final scanDirs = <String>[...defaultScanDirsForPlatform];
+    if (customFolders != null) {
+      for (final f in customFolders) {
+        if (!FolderPickerService.isTreeUri(f) && !scanDirs.contains(f)) {
+          scanDirs.add(f);
+        }
+      }
+    }
+
+    final filePaths = await compute(collectAudioFilesInIsolate, {
+      'roots': scanDirs,
+      'excluded': excluded,
+    });
     debugPrint('[LocalMusicRepository] 文件系统扫描到 ${filePaths.length} 个文件');
 
     if (filePaths.isNotEmpty) {
       // 过滤掉已经通过 MediaStore 添加的文件（去重）
       final newPaths = filePaths.where((p) => !seenPaths.contains(p)).toList();
       if (newPaths.isNotEmpty) {
-        final results = await compute(scanAudioFilesInIsolate, newPaths);
-        for (final data in results) {
-          final filePath = data['filePath'] as String;
-          if (!seenPaths.add(filePath)) continue;
-          final bitrate = data['bitrate'] as int?;
-          songs.add(
-            Song(
-              id: 'local_$filePath',
-              title: data['title'] as String,
-              artist: data['artist'] as String,
-              album: data['album'] as String,
-              duration: Duration(
-                milliseconds: (data['durationMs'] as int?) ?? 0,
+        // 限制单次跨 Isolate 的结果体积，避免大音乐库一次性回传造成峰值内存过高。
+        for (var start = 0; start < newPaths.length; start += 64) {
+          final end = (start + 64).clamp(0, newPaths.length);
+          final results = await compute(scanAudioFilesInIsolate, newPaths.sublist(start, end));
+          for (final data in results) {
+            final filePath = data['filePath'] as String;
+            if (!seenPaths.add(filePath)) continue;
+            final bitrate = data['bitrate'] as int?;
+            songs.add(
+              Song(
+                id: 'local_$filePath',
+                title: data['title'] as String,
+                artist: data['artist'] as String,
+                album: data['album'] as String,
+                duration: Duration(
+                  milliseconds: (data['durationMs'] as int?) ?? 0,
+                ),
+                localPath: filePath,
+                // 用 local:// 前缀标识内嵌封面，UI 层通过 LocalArtworkCache 懒加载
+                artworkUri: 'local://$filePath',
+                isOnline: false,
+                quality: inferQuality(bitrate, filePath),
               ),
-              localPath: filePath,
-              // 用 local:// 前缀标识内嵌封面，UI 层通过 LocalArtworkCache 懒加载
-              artworkUri: 'local://$filePath',
-              isOnline: false,
-              quality: inferQuality(bitrate, filePath),
-            ),
-          );
+            );
+          }
         }
       }
     }
@@ -408,17 +500,17 @@ class LocalMusicRepository {
   List<MusicFolder> buildFolders(List<Song> songs) {
     final folderMap = <String, List<Song>>{};
     for (final song in songs) {
-      final path = song.localPath;
+      final path = song.folderPath ?? song.localPath;
       if (path == null) continue;
       final normalized = path.replaceAll('\\', '/');
-      final dir = normalized.substring(0, normalized.lastIndexOf('/'));
+      final dir = song.folderPath ??
+          normalized.substring(0, normalized.lastIndexOf('/'));
       folderMap.putIfAbsent(dir, () => []).add(song);
     }
     return folderMap.entries.map((entry) {
-      final parts = entry.key.split('/').where((p) => p.isNotEmpty);
       return MusicFolder(
         path: entry.key,
-        name: parts.isNotEmpty ? parts.last : entry.key,
+        name: FolderPickerService.displayName(entry.key),
         songIds: entry.value.map((s) => s.id).toList(),
       );
     }).toList()..sort((a, b) => a.name.compareTo(b.name));

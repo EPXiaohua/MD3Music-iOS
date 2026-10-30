@@ -10,6 +10,10 @@
     <string name="fm_widget_description">私人 FM 电台小组件</string>
     <string name="cover_widget_label">封面播放器</string>
     <string name="cover_widget_description">全封面 2×2 播放器小组件</string>
+    <string name="concept_widget_label">圆环播放器</string>
+    <string name="concept_widget_description">4×1 圆环封面播放器小组件</string>
+    <string name="concept_favorite_desc">收藏</string>
+    <string name="concept_mode_desc">播放模式</string>
     <string name="widget_prev_desc">上一首</string>
     <string name="fm_default_title">点播放，开启你的电台</string>
     <string name="fm_login_title">登录后开启你的专属电台</string>

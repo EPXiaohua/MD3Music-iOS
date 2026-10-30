@@ -208,6 +208,66 @@ void main() {
     }
   });
 
+  test('点击展开曲线是非线性 S 型：两头慢、中段快（三段位移都量化钉死）', () {
+    // 用户报「点击展开的非线性效果不明显（要慢—快—慢）」的直接回归钉。
+    // 只断言半程/3⁄4 程看不出形状：旧值 (0.35,0.1,0.2,1) 那两条都过，
+    // 但它头 10% 就走掉 6%、45–55% 段只有 1.07 倍均速（中段等于匀速）、
+    // 后 25% 只剩 3.6% 位移——形状是「冲完—贴墙」，不是 S。
+    final Curve c = M3ExpressiveMotion.panelExpandEasing;
+    double at(double t) => c.transform(t);
+
+    // ① 起步慢：头 10% 时间的位移必须小（旧值 6.05% 之所以不算慢，是因为它
+    //    随后立刻冲到峰值；这里再加一条「中段平均速度必须显著高于整体均速」）。
+    expect(
+      at(0.1),
+      lessThan(0.05),
+      reason: '前 10% 时间应只走掉 <5% 位移（慢起步看得见）；实测旧值 6.05%',
+    );
+    // ② 中段快：45–55% 这段的平均速度是整体均速的倍数。线性 = 1.0。
+    final double midSpeed = (at(0.55) - at(0.45)) / 0.1;
+    expect(
+      midSpeed,
+      greaterThanOrEqualTo(1.6),
+      reason: '中段平均速度必须明显快于均速（否则读不出「中间快」）；'
+          '旧值此处仅 1.07（等于匀速）',
+    );
+    // ③ 末端慢着陆但不是静止：后 25% 时间还得走掉一段可见位移。
+    expect(
+      1.0 - at(0.75),
+      greaterThan(0.03),
+      reason: '末段位移为 0 即提前定格（掉帧感来源）；旧值仅 0.036 且已贴墙',
+    );
+    // ④ 位移铺满：半程 ≥0.6、3⁄4 程 ≤0.985（与上面那条用例同口径，双保险）。
+    expect(at(0.5), inInclusiveRange(0.6, 0.9));
+    expect(at(0.75), lessThanOrEqualTo(0.985));
+    // ⑤ 单调：任何 t 增大位移都不得回退（形变层靠单调做封面/槽位交接）。
+    double prev = -1.0;
+    for (int i = 0; i <= 100; i++) {
+      final double v = at(i / 100.0);
+      expect(v, greaterThanOrEqualTo(prev), reason: 't=${i / 100.0} 处位移回退');
+      prev = v;
+    }
+  });
+
+  test('续展曲线与 S 型分工：拖拽收尾保持旧形状（慢起步会顿挫）', () {
+    // 起点是手指的两条路径（上拉松手续展、顶栏下拉后弹回全屏）必须保持
+    // **前置冲刺型**：起步斜率 ≈0.29 倍均速、半程 ≥0.75。换成 S 型会让
+    // 「跟手 → 自动」的交接出现一次速度塌陷（画面先刹一停）。
+    final Curve settle = M3ExpressiveMotion.panelSettleEasing;
+    expect(settle.transform(0.0), 0.0);
+    expect(settle.transform(1.0), 1.0);
+    expect(
+      settle.transform(0.5),
+      greaterThanOrEqualTo(0.75),
+      reason: '续展必须快起步（半程 ≥0.75）；慢起步的 S 型在手指交接处是顿挫',
+    );
+    expect(
+      settle.transform(0.1),
+      greaterThan(M3ExpressiveMotion.panelExpandEasing.transform(0.1)),
+      reason: '同一时刻续展进度必须高于点击进入（起步更快）——两条曲线的分工',
+    );
+  });
+
   testWidgets('展开位移铺满全程：半程进度落在 0.5~0.9（不再前置冲刺）', (
     WidgetTester tester,
   ) async {

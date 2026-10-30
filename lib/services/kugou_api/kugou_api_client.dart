@@ -14,6 +14,7 @@ import 'kugou_endpoints.dart';
 import 'kugou_models.dart';
 import 'lyric_lookup_result.dart';
 import 'comment_send_result.dart';
+import 'favorite_list_paging.dart';
 import '../local_server_lifecycle.dart';
 
 /// 一次广告领取（/youth/vip → /youth/v1/ad/play_report）的判定结果。
@@ -766,6 +767,9 @@ class KugouApiClient {
   }
 
   Future<void> clearCookies() async {
+    // v34：对齐其余登录态写者（setLoginCookies/switchToUser/removeAccount 均
+    // 先 ensure）——init 读回 Keystore 在途时，同步清空会被续延的 init 覆写。
+    await _ensureInitialized();
     final oldUserid = _userid;
 
     _token = null;
@@ -806,6 +810,15 @@ class KugouApiClient {
   String? get vipToken => _vipToken;
   String? get dfid => _dfid;
   bool get isLoggedIn => _token != null && _userid != null;
+
+  /// 登录态就绪快照：`_initFromStorage` 在构造函数里异步启动（Keystore/prefs
+  /// 读取有延迟），启动恢复/连车唤醒等链路在凭证载入前同步读 [isLoggedIn]
+  /// 会误判"未登录"。需要据登录态分流的调用一律先 await 本方法。
+  Future<bool> isLoggedInWhenReady() async {
+    await _ensureInitialized();
+    return isLoggedIn;
+  }
+
   bool get hasVipToken => _vipToken != null && _vipToken!.isNotEmpty;
 
   Future<void> registerDevice() async {
@@ -2594,23 +2607,75 @@ class KugouApiClient {
     return await _get(KugouEndpoints.playlistTags);
   }
 
-  // ==================== Sheet ====================
+  // ==================== Sheet (曲谱) ====================
 
-  Future<Map<String, dynamic>?> getSheetExplore({int page = 1}) async {
+  /// 歌曲曲谱列表（匿名可用）。参数为 album_audio_id（即 MixSongID）。
+  /// [instruments] 曲谱类型：1 吉他 / 2 尤克里里 / 3 钢琴 / 4 简谱。
+  /// [level] 难度：吉他（1 进阶 / 2 基础 / 0 中级），尤克里里/钢琴（0 基础 / 1 进阶），
+  /// 简谱（0 基础）。
+  ///
+  /// 注意后端读的是 `album_audio_id`（上游 sheet_song.js 的 paramsMap），
+  /// 历史实现误传 `id` 导致上游永远查不到数据。
+  Future<Map<String, dynamic>?> getSheetSong(
+    String albumAudioId, {
+    int instruments = 1,
+    int level = 0,
+  }) async {
     return await _get(
-      KugouEndpoints.sheetExplore,
-      queryParameters: {'page': page},
+      KugouEndpoints.sheetSong,
+      queryParameters: {
+        'album_audio_id': albumAudioId,
+        'instruments': instruments,
+        'level': level,
+      },
     );
   }
 
+  /// 曲谱详情（需登录）。返回谱面文件名等元数据，谱面渲染用列表项的
+  /// `jump_url`（酷狗官方 H5 渲染页）。
   Future<Map<String, dynamic>?> getSheetDetail(String id) async {
     return await _get(KugouEndpoints.sheetDetail, queryParameters: {'id': id});
   }
 
-  Future<Map<String, dynamic>?> getSheetSong(String id) async {
-    return await _get(KugouEndpoints.sheetSong, queryParameters: {'id': id});
+  /// 曲谱广场（推荐曲谱，匿名可用）。
+  Future<Map<String, dynamic>?> getSheetExplore({
+    int page = 1,
+    int pagesize = 30,
+    int instruments = 1,
+    int level = 0,
+    int tagid = 0,
+  }) async {
+    return await _get(
+      KugouEndpoints.sheetExplore,
+      queryParameters: {
+        'page': page,
+        'pagesize': pagesize,
+        'instruments': instruments,
+        'level': level,
+        'tagid': tagid,
+      },
+    );
   }
 
+  /// 曲谱排行榜（匿名可用）。
+  Future<Map<String, dynamic>?> getSheetRank({
+    int page = 1,
+    int pagesize = 30,
+    int instruments = 1,
+    int level = 0,
+  }) async {
+    return await _get(
+      KugouEndpoints.sheetRank,
+      queryParameters: {
+        'page': page,
+        'pagesize': pagesize,
+        'instruments': instruments,
+        'level': level,
+      },
+    );
+  }
+
+  /// 曲谱标签（匿名可用），返回的 tagid 传给 [getSheetExplore]。
   Future<Map<String, dynamic>?> getSheetTags() async {
     return await _get(KugouEndpoints.sheetTags);
   }
@@ -3332,6 +3397,250 @@ class KugouApiClient {
     }
   }
 
+  // ============ MV 音频兜底（对齐 EchoMusic stores/player/mvAudio.ts） ============
+
+  /// 解析 `/kmr/audio/mv` 响应为 MV 候选列表（纯函数，便于单测）。
+  ///
+  /// 响应结构：`data` 为二维数组，`data[0]` 是该歌曲的多个 MV 版本记录。
+  /// 兼容一维数组 / 单对象形态。片源来自记录内 `h265`/`h264`/`mkv` 编码映射。
+  static List<MvCandidate> parseMvCandidates(Map<String, dynamic> json) {
+    int? pi(dynamic v) {
+      if (v is num) return v.toInt();
+      if (v is String && v.trim().isNotEmpty) return int.tryParse(v.trim());
+      return null;
+    }
+
+    String? ps(dynamic v) {
+      if (v is String) {
+        final t = v.trim();
+        return t.isEmpty ? null : t;
+      }
+      if (v is num) return v.toString();
+      return null;
+    }
+
+    final data = json['data'];
+    final List<dynamic> records;
+    if (data is List && data.isNotEmpty) {
+      final first = data.first;
+      records = first is List ? first : data;
+    } else if (data is Map) {
+      records = <dynamic>[data];
+    } else {
+      // 无 data / data 非容器：视为无 MV（对齐 EchoMusic resolveMvRecords）
+      return const <MvCandidate>[];
+    }
+
+    final result = <MvCandidate>[];
+    for (final raw in records) {
+      if (raw is! Map) continue;
+      final record = raw.cast<String, dynamic>();
+      // duration：>1000 视为毫秒，归一为秒；其余按秒
+      final rawDuration = pi(record['duration']);
+      final durationSeconds = rawDuration == null || rawDuration <= 0
+          ? 0
+          : (rawDuration > 1000 ? rawDuration ~/ 1000 : rawDuration);
+      result.add(
+        MvCandidate(
+          videoId: ps(record['video_id'] ?? record['id']) ?? '',
+          hash: ps(record['hash']),
+          durationSeconds: durationSeconds,
+          recommend: pi(record['is_recommend']) == 1,
+          isPublish: pi(record['is_publish']),
+          isUgc: pi(record['is_ugc']),
+          isShort: pi(record['is_short']),
+          isOther: pi(record['is_other']),
+          status: pi(record['__status']),
+          sources: _parseMvSources(record),
+        ),
+      );
+    }
+    return result;
+  }
+
+  /// 从单条 MV 记录收集片源（`h265`/`h264`/`mkv` 三个编码映射）。
+  static List<MvSource> _parseMvSources(Map<String, dynamic> record) {
+    const qualityOrder = <List<String>>[
+      ['fhd', '1080P'],
+      ['hd', '720P'],
+      ['qhd', '540P'],
+      ['sd', '432P'],
+      ['ld', '270P'],
+    ];
+    const codecs = <List<String>>[
+      ['h265', 'H.265'],
+      ['h264', 'H.264'],
+      ['mkv', 'MKV'],
+    ];
+    final sources = <MvSource>[];
+    final seen = <String>{};
+    for (final codec in codecs) {
+      final map = record[codec[0]];
+      if (map is! Map) continue;
+      final codecMap = map.cast<String, dynamic>();
+      for (final q in qualityOrder) {
+        final rawHash = codecMap['${q[0]}_hash'];
+        final hash = (rawHash is String ? rawHash.trim() : '');
+        if (hash.isEmpty) continue;
+        if (!seen.add(hash.toLowerCase())) continue;
+        final rawSize = codecMap['${q[0]}_filesize'];
+        sources.add(
+          MvSource(
+            hash: hash,
+            label: q[1],
+            codec: codec[1],
+            size: rawSize is num
+                ? rawSize.toInt()
+                : int.tryParse(rawSize?.toString() ?? ''),
+          ),
+        );
+      }
+    }
+    return sources;
+  }
+
+  /// 从候选列表中挑出最佳「曲库 MV」（纯函数）。
+  ///
+  /// 过滤规则对齐 EchoMusic `pickCatalogMv`：官方发布、明确非 UGC / 非平台短视频 /
+  /// 非其他版本、时长 > 0、有片源；再按 `recommend` 降序取首个。
+  static MvCandidate? pickCatalogMv(List<MvCandidate> candidates) {
+    final eligible = candidates
+        .where(
+          (c) =>
+              c.isPublish == 1 &&
+              c.isUgc != null &&
+              c.isUgc == 0 &&
+              c.isShort != null &&
+              c.isShort == 0 &&
+              c.isOther != null &&
+              c.isOther == 0 &&
+              (c.status == null || c.status == 1) &&
+              c.durationSeconds > 0 &&
+              c.hasSources,
+        )
+        .toList();
+    if (eligible.isEmpty) return null;
+    eligible.sort(
+      (a, b) => (b.recommend ? 1 : 0) - (a.recommend ? 1 : 0),
+    );
+    return eligible.first;
+  }
+
+  /// 按 album_audio_id 查询歌曲关联的 MV 候选列表。
+  ///
+  /// 与 [getMvByAlbumAudioId] 不同：本方法保留整份列表与筛选所需标记、
+  /// 并请求含片源 hash 的 fields。失败返回空列表，不改动既有方法行为。
+  Future<List<MvCandidate>> getMvCandidates(
+    String albumAudioId, {
+    String fields = 'mkv,tags,h264,h265,authors',
+  }) async {
+    if (albumAudioId.isEmpty) return const [];
+    final json = await _get(
+      KugouEndpoints.kmrAudioMv,
+      queryParameters: {'album_audio_id': albumAudioId, 'fields': fields},
+    );
+    if (json == null) return const [];
+    try {
+      return parseMvCandidates(json);
+    } catch (e) {
+      debugPrint('[getMvCandidates] parse error: $e');
+      return const [];
+    }
+  }
+
+  /// 从 `/video/url` 响应中提取全部可用播放地址（纯函数，便于单测）。
+  ///
+  /// 收集口径对齐 EchoMusic `extractVideoUrl`：`downurl` / `url` / `play_url` /
+  /// `backupdownurl`（数组），仅保留 `http(s)` 开头的条目，按 hash 小写命中 key
+  /// （缺失时回落 `data` 首项）。
+  static List<String> extractVideoUrls(Map<String, dynamic> json, String hash) {
+    final data = json['data'];
+    if (data is! Map) return const [];
+    final map = data.cast<String, dynamic>();
+    final entry =
+        map[hash.toLowerCase()] ?? (map.values.isNotEmpty ? map.values.first : null);
+    if (entry is! Map) return const [];
+    final record = entry.cast<String, dynamic>();
+    final urls = <String>[];
+    void add(dynamic v) {
+      if (v is! String) return;
+      final t = v.trim();
+      if ((t.startsWith('http://') || t.startsWith('https://')) &&
+          !urls.contains(t)) {
+        urls.add(t);
+      }
+    }
+
+    add(record['downurl']);
+    add(record['url']);
+    add(record['play_url']);
+    final backups = record['backupdownurl'];
+    if (backups is List) {
+      for (final b in backups) {
+        add(b);
+      }
+    }
+    return urls;
+  }
+
+  /// 根据视频 hash 获取全部可用播放地址（主 + 备用）。
+  ///
+  /// 收集口径见 [extractVideoUrls]。保持原始 http —— MV CDN 不支持 https
+  /// （见 [getVideoUrl] 注释）。
+  Future<List<String>> getVideoUrls(String hash) async {
+    if (hash.isEmpty) return const [];
+    final json = await _get(
+      KugouEndpoints.videoUrl,
+      queryParameters: {'hash': hash},
+    );
+    if (json == null) return const [];
+    try {
+      return extractVideoUrls(json, hash);
+    } catch (e) {
+      debugPrint('[getVideoUrls] parse error: $e');
+      return const [];
+    }
+  }
+
+  /// 解析某歌曲（按 album_audio_id）的 MV 音频播放地址列表。
+  ///
+  /// 流程对齐 EchoMusic `resolveMvAudioSource`：查询 MV 列表 → 挑最佳曲库 MV →
+  /// 片源按编码族去重（各取较小者）、整体按体积升序取最多 3 个 → 并发请求
+  /// `/video/url` → 按顺序汇总 URL（去重）。无可用 MV 或全部取址失败返回空列表。
+  Future<List<String>> resolveMvAudioUrls(String albumAudioId) async {
+    final candidates = await getMvCandidates(albumAudioId);
+    final mv = pickCatalogMv(candidates);
+    if (mv == null) return const [];
+
+    // 体积未知/为 0 的片源视为「很大」，排到最后（对齐 EchoMusic `size || Infinity`）。
+    int sizeKey(MvSource s) =>
+        (s.size == null || s.size == 0) ? 0x7fffffff : s.size!;
+    final ordered = [...mv.sources]..sort((a, b) => sizeKey(a) - sizeKey(b));
+    final byCodec = <String, MvSource>{};
+    for (final source in ordered) {
+      byCodec.putIfAbsent(source.codec, () => source);
+    }
+    final picked = byCodec.values.take(3).toList();
+
+    final results = await Future.wait(
+      picked.map((s) async {
+        try {
+          return await getVideoUrls(s.hash);
+        } catch (_) {
+          return <String>[];
+        }
+      }),
+    );
+
+    final urls = <String>[];
+    for (final group in results) {
+      for (final url in group) {
+        if (!urls.contains(url)) urls.add(url);
+      }
+    }
+    return urls;
+  }
+
   /// 获取 MV 弹幕原始响应。
   ///
   /// [videoId] 与 [hash] 至少一个非空（Rust 侧会校验并返回 400）。
@@ -3559,17 +3868,41 @@ class KugouApiClient {
 
   // 微信扫码 - 生成 uuid + 二维码
   Future<Map<String, dynamic>?> createLoginWx() async {
-    return await _get(KugouEndpoints.loginWxCreate);
+    return await _getAllowNonOk(KugouEndpoints.loginWxCreate, noCache: true);
   }
 
   // 微信扫码 - 轮询状态
+  // noCache：Rust 侧对 /login/wx/check 已强制 bypass，这里再带一次避免任何
+  // 中间层（apicache 之外的代理/缓存）复用旧状态；timestamp 防上游缓存。
   Future<Map<String, dynamic>?> checkLoginWx(String uuid) async {
-    return await _get(
+    if (uuid.isEmpty) return null;
+    return await _getAllowNonOk(
       KugouEndpoints.loginWxCheck,
       queryParameters: {
         'uuid': uuid,
         'timestamp': DateTime.now().millisecondsSinceEpoch,
       },
+      noCache: true,
+    );
+  }
+
+  // QQ 扫码 - 生成二维码 + 会话（qrsig / ptqrtoken / pt_login_sig / ...）
+  Future<Map<String, dynamic>?> createLoginQqQr() async {
+    return await _getAllowNonOk(KugouEndpoints.loginQqQrCreate, noCache: true);
+  }
+
+  // QQ 扫码 - 轮询状态。会话字段必须原样回传（缺一上游即回参数错误）。
+  Future<Map<String, dynamic>?> checkLoginQqQr(
+    Map<String, dynamic> session,
+  ) async {
+    if (session.isEmpty) return null;
+    return await _getAllowNonOk(
+      KugouEndpoints.loginQqQrCheck,
+      queryParameters: {
+        ...session,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      },
+      noCache: true,
     );
   }
 
@@ -3870,16 +4203,48 @@ class KugouApiClient {
       if (isLoggedIn && userid != null) 'userid': userid!,
     };
     if (type != null) params['type'] = type;
-    return await _get(
+    final result = await _get(
       KugouEndpoints.userPlaylist,
       queryParameters: params,
       noCache: noCache,
     );
+    // 顺手记下 total_ver 作为写接口（/playlist/sort|pic|update）的乐观锁，
+    // 避免每次写前都先拉一遍列表。只在拿到非 0 值时更新，防止失败响应把它抹掉。
+    final totalVer = parseUserPlaylistTotalVer(result);
+    if (totalVer > 0) lastKnownPlaylistTotalVer = totalVer;
+    return result;
   }
 
-  Future<Map<String, dynamic>?> getUserFollow({bool noCache = false}) async {
-    return await _get(KugouEndpoints.userFollow, noCache: noCache);
+  /// 收藏页完整同步，避免过滤掉专辑后列表不满一屏而永远触发不了滚动分页。
+  Future<Map<String, dynamic>?> getAllUserPlaylists({bool noCache = false}) =>
+      loadFavoritePages(
+        pageSize: 30,
+        listKeys: const ['info', 'list'],
+        fetch: (page) => getUserPlaylist(page: page, pagesize: 30, noCache: noCache),
+        identity: (row) => '${row['type']}:${row['source']}:'
+            '${row['global_collection_id'] ?? row['listid'] ?? row['id'] ?? jsonEncode(row)}',
+      );
+
+  Future<Map<String, dynamic>?> getUserFollow({
+    bool noCache = false,
+    int? page,
+    int? pagesize,
+  }) async {
+    return await _get(KugouEndpoints.userFollow, noCache: noCache,
+      queryParameters: {
+        if (page != null) 'page': page,
+        if (pagesize != null) 'pagesize': pagesize,
+      },
+    );
   }
+
+  Future<Map<String, dynamic>?> getAllUserFollow({bool noCache = false}) =>
+      loadFavoritePages(
+        pageSize: 100,
+        listKeys: const ['lists', 'info', 'list', 'fans'],
+        fetch: (page) => getUserFollow(page: page, pagesize: 100, noCache: noCache),
+        identity: (row) => '${row['singerid'] ?? row['singer_id'] ?? row['userid'] ?? row['id'] ?? jsonEncode(row)}',
+      );
 
   Future<Map<String, dynamic>?> getUserFollowMessage(
     String userId, {
@@ -4265,6 +4630,33 @@ class KugouApiClient {
 
   // ==================== Playlist Management ====================
 
+  /// 最近一次 `/user/playlist` 成功返回的歌单总版本号（`total_ver`）。
+  ///
+  /// 云端把 `total_ver` 当乐观锁：`/playlist/sort`、`/playlist/pic`、
+  /// `/playlist/update` 都必填，过期会被上游拒绝。刷新歌单列表时顺手记下，
+  /// 写操作直接用，避免每次写都先拉一遍列表。取不到时为 0（对齐 JS
+  /// `Number(x || 0)`）。
+  int lastKnownPlaylistTotalVer = 0;
+
+  /// 从 `/user/playlist` 响应里解析 `total_ver`（兼容 data 段与顶层两种位置）。
+  static int parseUserPlaylistTotalVer(Map<String, dynamic>? json) {
+    if (json == null) return 0;
+    final data = json['data'];
+    if (data is Map) {
+      for (final key in const ['total_ver', 'list_ver']) {
+        final v = data[key];
+        final n = v is num ? v.toInt() : int.tryParse('$v');
+        if (n != null && n > 0) return n;
+      }
+    }
+    for (final key in const ['total_ver', 'list_ver']) {
+      final v = json[key];
+      final n = v is num ? v.toInt() : int.tryParse('$v');
+      if (n != null && n > 0) return n;
+    }
+    return 0;
+  }
+
   Future<Map<String, dynamic>?> createPlaylist(
     String name, {
     int type = 0,
@@ -4297,7 +4689,12 @@ class KugouApiClient {
     if (globalCollectionId != null && globalCollectionId.isNotEmpty) {
       params['list_create_gid'] = globalCollectionId;
     }
-    return await _get(KugouEndpoints.playlistAdd, queryParameters: params);
+    // 写接口：绕过本地 apicache（其 key 不含 token，且写后要立刻看到新列表）
+    return await _get(
+      KugouEndpoints.playlistAdd,
+      queryParameters: params,
+      noCache: true,
+    );
   }
 
   /// 收藏专辑
@@ -4314,9 +4711,18 @@ class KugouApiClient {
       'list_create_listid': albumId,
       'list_create_gid': '',
     };
-    return await _get(KugouEndpoints.playlistAdd, queryParameters: params);
+    return await _get(
+      KugouEndpoints.playlistAdd,
+      queryParameters: params,
+      noCache: true,
+    );
   }
 
+  /// 删除自建歌单 / 取消收藏歌单。
+  ///
+  /// [type] 语义在删除类端点里是 **1 = 自建、0 = 收藏**（与 [updatePlaylistInfo]
+  /// / [setPlaylistCover] 的 0 = 自建、1 = 收藏**相反**，
+  /// 见 `module/playlist_del.js` 与 `module/playlist_update.js`)。
   Future<Map<String, dynamic>?> deletePlaylist(
     String listid, {
     int type = 1,
@@ -4324,6 +4730,7 @@ class KugouApiClient {
     return await _get(
       KugouEndpoints.playlistDel,
       queryParameters: {'listid': listid, 'type': type},
+      noCache: true,
     );
   }
 
@@ -4334,6 +4741,7 @@ class KugouApiClient {
     return await _get(
       KugouEndpoints.playlistTracksAdd,
       queryParameters: {'listid': listid, 'data': data},
+      noCache: true,
     );
   }
 
@@ -4344,14 +4752,108 @@ class KugouApiClient {
     return await _get(
       KugouEndpoints.playlistTracksDel,
       queryParameters: {'listid': listid, 'fileids': fileids},
+      noCache: true,
     );
   }
 
-  Future<Map<String, dynamic>?> collectSheet(String specialId) async {
-    return await _post(
-      KugouEndpoints.sheetCollection,
-      data: {'specialid': specialId},
+  /// 对「我的歌单」列表排序（[data] 形如 `listid|type|sort,...`）。
+  ///
+  /// [totalVer] 取自 `/user/playlist` 的 `total_ver`（见
+  /// [lastKnownPlaylistTotalVer]）；data 内逐条的 type 仍是 0 = 自建、1 = 收藏。
+  /// 排序成功会使云端 `total_ver` 递增（响应 `data.total_ver` 为新值），
+  /// 成功后回写乐观锁，避免紧随的 `/playlist/pic|update` 带过期版本被拒。
+  Future<Map<String, dynamic>?> sortPlaylists(
+    String data, {
+    int totalVer = 0,
+  }) async {
+    final result = await _get(
+      KugouEndpoints.playlistSort,
+      queryParameters: {'total_ver': totalVer, 'data': data},
+      noCache: true,
     );
+    if (result != null &&
+        (result['status'] == 1 || result['error_code'] == 0)) {
+      final ver = parseUserPlaylistTotalVer(result);
+      if (ver > 0) lastKnownPlaylistTotalVer = ver;
+    }
+    return result;
+  }
+
+  /// 修改歌单封面为**系统内置封面**（[data] 形如 `listid|type|pic,...`）。
+  ///
+  /// pic 支持完整 URL（`https://imge.kugou.com/stdmusic/{size}/xxx.jpg`）或
+  /// 云端相对路径（`stdmusic/xxx.jpg`），Rust 侧会自动取末段补前缀。
+  /// **自定义封面请走 [uploadPlaylistCover] + [updatePlaylistInfo] 的 pic 参数。**
+  Future<Map<String, dynamic>?> setPlaylistCover(
+    String data, {
+    int totalVer = 0,
+    int type = 0,
+  }) async {
+    return await _get(
+      KugouEndpoints.playlistPic,
+      queryParameters: {'total_ver': totalVer, 'type': type, 'data': data},
+      noCache: true,
+    );
+  }
+
+  /// 上传歌单自定义封面，成功返回 `{status: 1, FileName: '...jpg'}`。
+  ///
+  /// [filePath] 是**设备本地文件路径**，Rust 侧直接读原始字节上传图床
+  /// （不走 base64，避免大图多一次编解码）。拿到 FileName 后必须再调
+  /// [updatePlaylistInfo] 传 `pic: 'custom/<FileName>'` 才会真正生效。
+  Future<Map<String, dynamic>?> uploadPlaylistCover(
+    String filePath, {
+    String type = 'custom',
+    String extendName = '.jpg',
+  }) async {
+    return await _post(
+      KugouEndpoints.playlistPicUpload,
+      data: {'file': filePath, 'type': type, 'extendName': extendName},
+      noCache: true,
+    );
+  }
+
+  /// 修改「我的歌单」的名称 / 排序 / 标签 / 简介 / 自定义封面。
+  ///
+  /// [type] **0 = 自建/我喜欢，1 = 收藏**（与删除类端点相反）。
+  /// [name] 与 [pic] 传 null 表示**不改动**该项（不是清空）；`tags`/`intro`
+  /// 传空串才是清空。[totalVer] 见 [lastKnownPlaylistTotalVer]。
+  /// [pic] 自定义封面格式为 `custom/<FileName>`（由 [uploadPlaylistCover] 返回）。
+  /// [isPri] / [sort] 为歌单当前隐私态与排序位，原样回传（v4 协议官方恒发），
+  /// 避免保存时擅自改公开或置顶。
+  Future<Map<String, dynamic>?> updatePlaylistInfo({
+    required String listid,
+    required int totalVer,
+    int type = 0,
+    String? name,
+    int sort = 0,
+    String? tags,
+    String? intro,
+    String? pic,
+    bool? isPri,
+  }) async {
+    final params = <String, dynamic>{
+      'listid': listid,
+      'total_ver': totalVer,
+      'type': type,
+      'sort': sort,
+      'tags': tags ?? '',
+      'intro': intro ?? '',
+    };
+    // 缺省不下发：上游把空 name 当成「改名成空」，是不可逆的静默损坏
+    if (name != null && name.isNotEmpty) params['name'] = name;
+    if (pic != null && pic.isNotEmpty) params['pic'] = pic;
+    if (isPri != null) params['is_pri'] = isPri ? 1 : 0;
+    final result = await _get(
+      KugouEndpoints.playlistUpdate,
+      queryParameters: params,
+      noCache: true,
+    );
+    // v4 modify_list 成功后返回新的列表级 total_ver（乐观锁已 +1）。
+    // 顺手更新缓存，避免紧接着的第二次编辑用过期的 version 被拒。
+    final newVer = result?['data']?['total_ver'];
+    if (newVer is int && newVer > 0) lastKnownPlaylistTotalVer = newVer;
+    return result;
   }
 
   // ==================== Youth Channel ====================
@@ -4644,6 +5146,30 @@ class KugouApiClient {
     } catch (e) {
       return null;
     }
+  }
+
+  /// 分页读取专辑完整歌曲列表。专辑歌曲接口默认只返回 30 首；收藏专辑也必须
+  /// 使用 album_id 分页，不能用歌单接口的返回条数推断专辑是否完整。
+  Future<KugouAlbumSongs?> getAlbumSongsAll(String albumId) async {
+    const pageSize = 30;
+    const maxPages = 1000;
+    final songs = <KugouSongDetail>[];
+    var total = 0;
+    for (var page = 1; page <= maxPages; page++) {
+      final result = await getAlbumSongs(
+        albumId,
+        page: page,
+        pagesize: pageSize,
+      );
+      if (result == null) return null;
+      if (page == 1) total = result.total;
+      songs.addAll(result.songs);
+      if ((total > 0 && songs.length >= total) ||
+          result.songs.length < pageSize) {
+        break;
+      }
+    }
+    return KugouAlbumSongs(songs: songs, total: total);
   }
 
   Future<List<KugouSongDetail>?> getPlaylistTrackAll({

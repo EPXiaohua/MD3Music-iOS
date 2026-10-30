@@ -10,7 +10,6 @@ import '../../core/layout/adaptive_navigator.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/entry_transition_gate.dart';
-import '../../core/widgets/app_background.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
@@ -642,22 +641,28 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
         if (displaySongs.isNotEmpty)
           M3ESortButton<_SortBy>(
             tooltip: '排序',
+            // 图标随升/降序切换（与歌单页一致）
+            icon: _sortAscending
+                ? Icons.arrow_upward_rounded
+                : Icons.arrow_downward_rounded,
             current: _sortBy,
             options: const [
               (value: _SortBy.time, label: '章节顺序'),
               (value: _SortBy.title, label: '章节名称'),
               (value: _SortBy.duration, label: '时长'),
             ],
-            onPicked: (value, repeated) {
+            onPicked: (value) {
               setState(() {
-                if (repeated) {
-                  // 再次点当前项：只翻转升/降序
-                  _sortAscending = !_sortAscending;
-                } else {
-                  _sortBy = value;
-                  // 章序默认正序（第 1 集在最上面），其余默认降序
-                  _sortAscending = value == _SortBy.time ? false : true;
-                }
+                _sortBy = value;
+                // 章序默认正序（第 1 集在最上面），其余默认降序
+                _sortAscending = value == _SortBy.time ? false : true;
+                _invalidateDisplaySongs();
+              });
+            },
+            ascending: _sortAscending,
+            onDirectionChanged: (ascending) {
+              setState(() {
+                _sortAscending = ascending;
                 _invalidateDisplaySongs();
               });
             },
@@ -696,7 +701,6 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
             return Stack(
               fit: StackFit.expand,
               children: [
-                if (useBackgroundImage) const WallpaperHeaderBackground(),
                 Container(
                   decoration: BoxDecoration(
                     gradient: LinearGradient(

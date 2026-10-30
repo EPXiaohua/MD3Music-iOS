@@ -440,5 +440,54 @@ void main() {
           reason: 'resetInitialJump 后应重新瞬移到位');
       controller.dispose();
     });
+
+    test('16. snap=true 直接瞬移到目标，不产生弹簧动画', () {
+      final controller = LyricScrollController();
+      controller.setViewportSize(const Size(400, 600));
+      controller.setCurrentLine(
+        0,
+        isSeeking: false,
+        lineHeight: 40,
+        intervalMs: 500,
+      );
+      // 行 0 → 行 2：targetY = -(80 + 20 - 210) = 110
+      controller.setCurrentLine(
+        2,
+        isSeeking: false,
+        lineHeight: 40,
+        intervalMs: 120,
+        snap: true,
+      );
+      expect(controller.posY, closeTo(110, 1e-9),
+          reason: '快速连切兜底应直接到位');
+      expect(controller.currentTarget, closeTo(110, 1e-9));
+      expect(controller.tick(0.016), isFalse, reason: '瞬移后无需弹簧推进');
+      expect(controller.isConverged, isTrue);
+      controller.dispose();
+    });
+
+    test('17. 用户拖动中 snap=true 不抢走滚动位置', () {
+      final controller = LyricScrollController();
+      controller.setViewportSize(const Size(400, 600));
+      controller.setCurrentLine(
+        0,
+        isSeeking: false,
+        lineHeight: 40,
+        intervalMs: 500,
+      );
+      controller.onUserScroll(50);
+      final double draggedY = controller.posY;
+
+      controller.setCurrentLine(
+        2,
+        isSeeking: false,
+        lineHeight: 40,
+        intervalMs: 120,
+        snap: true,
+      );
+      expect(controller.posY, closeTo(draggedY, 1e-9),
+          reason: '拖动期间不应被快速切行兜底抢回');
+      controller.dispose();
+    });
   });
 }

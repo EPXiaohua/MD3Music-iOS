@@ -1058,6 +1058,14 @@ import java.util.List;
     for (int i = 0; i < availableCommands.size(); i++) {
       actions |= convertCommandToPlaybackStateActions(availableCommands.get(i));
     }
+    // MD3Music fork v49：vivo 原子随身听按 PlaybackState actions 位决定"点击列表项"
+    // 是否下发 playFromMediaId——该位由 COMMAND_SET_MEDIA_ITEM 推导，而本 App
+    // 队列为 Dart 自维护（media3 时间线不用），运行时 commands 通常不含此位；
+    // 真机实测岛列表有内容但点击无命令发出（melodist 参考实现显式声明该位）。
+    // 仅 vivo/iQOO 生效，非 vivo 零变化。
+    if (com.ryanheise.just_audio.AudioPlayer.isShadowPlaybackMirrorEnabled()) {
+      actions |= PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID;
+    }
     long queueItemId =
         isCommandAvailable(COMMAND_GET_TIMELINE)
             ? LegacyConversions.convertToQueueItemId(getCurrentMediaItemIndex())

@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Directory;
+import 'dart:io' show Directory, Platform;
 
 import 'package:chewie/chewie.dart';
 // chewie 未公开导出 PlayerNotifier（只在内部子树提供）。页面按钮组要与进度条
@@ -30,6 +30,7 @@ import '../../providers/dlna_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../utils/landscape_immersive.dart';
 import 'dlna_cast_sheet.dart';
+import 'player_video_active.dart';
 
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:path_provider/path_provider.dart';
@@ -109,6 +110,12 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   /// 弹幕总透明度（读取自设置，默认 1.0）。
   double _danmakuOpacity = 1.0;
 
+  /// v54：MV 弹幕颜色哨值解析（同歌曲弹幕口径：null=跟随弹幕池，-1=随机）。
+  static Color? _mvColorOf(int? value) =>
+      value == null || value < 0 ? null : Color(value);
+
+  static bool _mvIsRandomColor(int? value) => value != null && value < 0;
+
   /// 本地弹幕仓储，用于持久化用户发送的弹幕。
   LocalDanmakuStore? _danmakuStore;
 
@@ -144,9 +151,12 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
 
   /// tv: 右上角按钮组的焦点节点 —— 菜单键唤出后焦点自动落到组内第一个
   /// 可见按钮（弹幕开关），收起时交还视频面。
-  final FocusNode _tvDanmakuBtnFocus = FocusNode(debugLabel: 'tv/mv-btn-danmaku');
-  final FocusNode _tvFullscreenBtnFocus =
-      FocusNode(debugLabel: 'tv/mv-btn-fullscreen');
+  final FocusNode _tvDanmakuBtnFocus = FocusNode(
+    debugLabel: 'tv/mv-btn-danmaku',
+  );
+  final FocusNode _tvFullscreenBtnFocus = FocusNode(
+    debugLabel: 'tv/mv-btn-fullscreen',
+  );
   final FocusNode _tvPipBtnFocus = FocusNode(debugLabel: 'tv/mv-btn-pip');
 
   /// 弹幕远端发送在途中：用于禁用发送按钮防连点。
@@ -155,12 +165,20 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   @override
   void initState() {
     super.initState();
+    if (Platform.isWindows) {
+      SettingsRepository.windowsLiveSettingsRevision.addListener(
+        _reloadWindowsDanmakuSettings,
+      );
+    }
     // 记录并暂停背景音频
     final player = context.read<PlayerProvider>();
     _wasPlayingBefore = player.isPlaying;
     if (_wasPlayingBefore) {
       player.pause();
     }
+    // 桌面方向键层让行：本页期间 ←/→ 不该落到（已暂停的）背景音频上，
+    // 否则退出 MV 继续播放时会从被暗改过的位置起播（见 player_video_active.dart）。
+    enterVideoPlayback();
     // 监听投屏状态：投屏 MV 时暂停本地视频，停止投屏时恢复
     final dlna = context.read<DlnaProvider>();
     dlna.addListener(_onDlnaStateChanged);
@@ -173,7 +191,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     // 读取「自动画中画」开关：决定按 Home 是否自动进入（默认关闭）
     SettingsRepository().getAutoPipEnabled().then((enabled) {
       if (!mounted) return;
-      setState(() => _autoPipEnabled = enabled);
+      setState(() => _autoPipEnabled = Platform.isWindows ? false : enabled);
       _syncPipActive();
     });
     // USB 独占开启时 MV 无系统音频：若开启「播放 MV 时自动关闭独占」则进入即关闭
@@ -187,7 +205,24 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       if (!mounted) return;
       setState(() => _danmakuOpacity = opacity);
     });
+    // v54：MV 弹幕速度/颜色镜像回填（getter 读盘回填静态镜像；build 处
+    // ListenableBuilder 直接读镜像实时生效）。
+    unawaited(SettingsRepository().getMvDanmakuSpeed());
+    unawaited(SettingsRepository().getMvDanmakuColor());
     _loadMv();
+  }
+
+  void _reloadWindowsDanmakuSettings() async {
+    final settings = SettingsRepository();
+    final enabled = await settings.getMvDanmakuEnabled();
+    final opacity = await settings.getMvDanmakuOpacity();
+    if (!mounted) return;
+    final becameEnabled = enabled && !_danmakuEnabled.value;
+    setState(() {
+      _danmakuEnabled.value = enabled;
+      _danmakuOpacity = opacity;
+    });
+    if (becameEnabled) unawaited(_loadRemoteDanmaku());
   }
 
   /// 进入 MV 播放时自动关闭 USB 独占（绕过 AudioFlinger，MV 无声），并 Toast 提示。
@@ -205,7 +240,13 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
 
   @override
   void dispose() {
+    if (Platform.isWindows) {
+      SettingsRepository.windowsLiveSettingsRevision.removeListener(
+        _reloadWindowsDanmakuSettings,
+      );
+    }
     _disposed = true;
+    exitVideoPlayback();
     // 移除投屏状态监听
     try {
       context.read<DlnaProvider>().removeListener(_onDlnaStateChanged);
@@ -275,8 +316,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     final playing = controller?.value.isPlaying ?? false;
     final aspectRatio = controller?.value.aspectRatio;
     PipService.instance.setVideoActive(
-      _autoPipEnabled && playing,
-      aspectRatio: (aspectRatio != null && aspectRatio > 0) ? aspectRatio : null,
+      !Platform.isWindows && _autoPipEnabled && playing,
+      aspectRatio: (aspectRatio != null && aspectRatio > 0)
+          ? aspectRatio
+          : null,
     );
   }
 
@@ -530,7 +573,8 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     } else {
       return;
     }
-    if ((videoId == null || videoId.isEmpty) && (hash == null || hash.isEmpty)) return;
+    if ((videoId == null || videoId.isEmpty) && (hash == null || hash.isEmpty))
+      return;
 
     final duration = _detail?.duration ?? controller.value.duration;
     if (duration <= Duration.zero) {
@@ -578,7 +622,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     setState(() => _danmakuEntries = merged);
   }
 
-  Future<void> _initVideoController(String url, {required bool autoPlay}) async {
+  Future<void> _initVideoController(
+    String url, {
+    required bool autoPlay,
+  }) async {
     _currentVideoUrl = url;
     try {
       final controller = VideoPlayerController.networkUrl(Uri.parse(url));
@@ -803,7 +850,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         children: [
           const M3ELoadingIndicator(),
           const SizedBox(height: 16),
-          Text('正在加载 MV...', style: TextStyle(color: colorScheme.onSurfaceVariant)),
+          Text(
+            '正在加载 MV...',
+            style: TextStyle(color: colorScheme.onSurfaceVariant),
+          ),
         ],
       ),
     );
@@ -816,13 +866,19 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.music_off_outlined, size: 64, color: colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.music_off_outlined,
+              size: 64,
+              color: colorScheme.onSurfaceVariant,
+            ),
             const SizedBox(height: 16),
             Text('该歌曲暂无 MV', style: textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               '没有找到这首歌的 MV 资源',
-              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -844,7 +900,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             Text(
               _errorMessage,
               textAlign: TextAlign.center,
-              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 16),
             FilledButton.tonalIcon(
@@ -936,14 +994,27 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
           // 弹幕层：位于 Chewie 之上、手势透传（IgnorePointer 在层内）。
           // key 绑定 controller 实例 —— 切换清晰度会重建控制器，必须随之重建，
           // 否则 Ticker 会继续读已 dispose 的控制器。
+          // v54：速度/颜色走静态镜像（设置页改动实时生效，速度变化重建
+          // 渲染缓存——设置页低频操作，可接受）。
           if (_controller != null && _chewieController != null)
-            MvDanmakuLayer(
-              key: ObjectKey(_controller),
-              controller: _controller!,
-              entries: _danmakuEntries,
-              enabled: _danmakuEnabled.value,
-              opacity: _danmakuOpacity,
-              onControllerCreated: (c) => _danmakuController = c,
+            ListenableBuilder(
+              listenable: Listenable.merge([
+                SettingsRepository.mvDanmakuSpeed,
+                SettingsRepository.mvDanmakuColor,
+              ]),
+              builder: (context, _) => MvDanmakuLayer(
+                key: ObjectKey(_controller),
+                controller: _controller!,
+                entries: _danmakuEntries,
+                enabled: _danmakuEnabled.value,
+                opacity: _danmakuOpacity,
+                speedScale: SettingsRepository.mvDanmakuSpeed.value,
+                overrideColor: _mvColorOf(
+                    SettingsRepository.mvDanmakuColor.value),
+                randomColor:
+                    _mvIsRandomColor(SettingsRepository.mvDanmakuColor.value),
+                onControllerCreated: (c) => _danmakuController = c,
+              ),
             ),
           // 右上角按钮组：弹幕开关 / 全屏 / （非全屏时）画中画
           if (_chewieController != null)
@@ -998,7 +1069,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
                         children: [
                           _buildDanmakuToggleButton(),
                           const SizedBox(width: 8),
-                          _buildFullscreenButton(fullscreen: _isFullscreen.value),
+                          _buildFullscreenButton(
+                            fullscreen: _isFullscreen.value,
+                          ),
                           // 画中画与全屏互斥，全屏时收起点
                           if (!_isFullscreen.value && _pipSupported.value) ...[
                             const SizedBox(width: 8),
@@ -1028,7 +1101,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   Widget _buildVideoSurface() {
     final Widget surface = _chewieController != null
         ? Chewie(controller: _chewieController!)
-        : const Center(child: M3ECircularProgressIndicator(color: Colors.white));
+        : const Center(
+            child: M3ECircularProgressIndicator(color: Colors.white),
+          );
     if (!kTvBuild) return surface;
     if (!_isFullscreen.value) return ExcludeFocus(child: surface);
     return DpadFocusable(
@@ -1425,7 +1500,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
                 isScrollControlled: true,
                 // 实色背景：与播放页投屏弹层保持一致（全局 M3E 主题默认 0.97
                 // alpha 会让 MV 画面透出，压在视频上不易辨认）。
-                backgroundColor: Theme.of(context).colorScheme.surfaceContainerLow,
+                backgroundColor: Theme.of(
+                  context,
+                ).colorScheme.surfaceContainerLow,
                 builder: (_) => DlnaCastSheet(
                   mvUrl: _currentVideoUrl,
                   mvTitle: widget.song.displayName,
@@ -1444,7 +1521,11 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
-          Icon(Icons.high_quality_outlined, size: 20, color: colorScheme.onSurfaceVariant),
+          Icon(
+            Icons.high_quality_outlined,
+            size: 20,
+            color: colorScheme.onSurfaceVariant,
+          ),
           const SizedBox(width: 8),
           Text('清晰度', style: textTheme.labelLarge),
           const Spacer(),
@@ -1492,9 +1573,15 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             runSpacing: 8,
             children: [
               if (detail?.duration != null)
-                _infoChip(Icons.timer_outlined, _formatDuration(detail!.duration!)),
+                _infoChip(
+                  Icons.timer_outlined,
+                  _formatDuration(detail!.duration!),
+                ),
               if (detail?.playCountLabel.isNotEmpty == true)
-                _infoChip(Icons.play_circle_outline, '播放 ${detail!.playCountLabel}'),
+                _infoChip(
+                  Icons.play_circle_outline,
+                  '播放 ${detail!.playCountLabel}',
+                ),
               if (song.album.isNotEmpty)
                 _infoChip(Icons.album_outlined, song.album),
             ],
@@ -1505,7 +1592,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             const SizedBox(height: 4),
             Text(
               detail.desc!,
-              style: textTheme.bodyMedium?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodyMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ],

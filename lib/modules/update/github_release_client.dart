@@ -21,14 +21,7 @@ String? parseTagFromRedirectLocation(String? location) {
     if (end >= 0) tag = tag.substring(0, end);
   }
   tag = tag.trim();
-  if (tag.isEmpty) return null;
-  // GitHub 会把 tag 名 URL 编码进 Location 头（如 + → %2B），先还原再返回，
-  // 否则含 build 号的 tag（v5.7.0+45）会解析成无法比较的版本串
-  try {
-    return Uri.decodeComponent(tag);
-  } on FormatException {
-    return tag;
-  }
+  return tag.isEmpty ? null : tag;
 }
 
 /// GitHub Release 客户端：REST API 为主链路，HTML 302 为回退链路。
@@ -59,22 +52,29 @@ class GithubReleaseClient implements ReleaseSource {
   static String get userAgent =>
       Platform.isIOS ? 'MD3Music-iOS' : 'MD3Music-Android';
 
-  static Uri get apiLatestUri =>
-      Uri.parse('https://api.github.com/repos/$owner/$repo/releases/latest');
-  static Uri get htmlLatestUri =>
-      Uri.parse('https://github.com/$owner/$repo/releases/latest');
+  static final Uri apiLatestUri = Uri.parse(
+    'https://api.github.com/repos/$owner/$repo/releases/latest',
+  );
+  static final Uri htmlLatestUri = Uri.parse(
+    'https://github.com/$owner/$repo/releases/latest',
+  );
 
-  static Uri get _fallbackHtmlUri =>
-      Uri.parse('https://github.com/$owner/$repo/releases');
+  static final Uri _fallbackHtmlUri = Uri.parse(
+    'https://github.com/$owner/$repo/releases',
+  );
 
   final Dio _dio;
 
   @override
   Future<ReleaseInfo?> fetchLatest() async {
-    final viaApi = await _fetchViaApi();
+    final viaApi = await fetchLatestDetails();
     if (viaApi != null) return viaApi;
     return _fetchViaRedirect();
   }
+
+  /// 读取完整 Release 元数据。Windows 自动更新需要更新日志与 ZIP 资产，
+  /// 因此不使用只有 tag 的 302 回退结果。
+  Future<ReleaseInfo?> fetchLatestDetails() => _fetchViaApi();
 
   /// 主链路：GitHub REST API。
   Future<ReleaseInfo?> _fetchViaApi() async {
@@ -99,11 +99,30 @@ class GithubReleaseClient implements ReleaseSource {
         return null;
       }
       final htmlUrl = (response.data!['html_url'] as String?)?.trim();
+      final body = (response.data!['body'] as String?) ?? '';
+      final bareVersion = tagName.replaceFirst(RegExp(r'^[vV]'), '');
+      final assetName = 'md3music-windows-$bareVersion.zip';
+      final assets = response.data!['assets'];
+      Map<String, dynamic>? windowsAsset;
+      if (assets is List) {
+        for (final value in assets) {
+          if (value is Map<String, dynamic> &&
+              value['name'] == assetName) {
+            windowsAsset = value;
+            break;
+          }
+        }
+      }
+      final digest = windowsAsset?['digest'] as String?;
       return ReleaseInfo.fromTag(
         tagName: tagName,
         htmlUrl: (htmlUrl == null || htmlUrl.isEmpty)
             ? _fallbackHtmlUri.toString()
             : htmlUrl,
+        body: body,
+        windowsZipUrl: windowsAsset?['browser_download_url'] as String?,
+        windowsZipSize: windowsAsset?['size'] as int?,
+        windowsZipDigest: digest,
       );
     } catch (error) {
       debugPrint('[UpdateCheck] API 查询失败：$error');
@@ -127,7 +146,9 @@ class GithubReleaseClient implements ReleaseSource {
         response.headers.value('location'),
       );
       if (tagName == null) {
-        debugPrint('[UpdateCheck] 回退链路未解析出 tag（status=${response.statusCode}）');
+        debugPrint(
+          '[UpdateCheck] 回退链路未解析出 tag（status=${response.statusCode}）',
+        );
         return null;
       }
       return ReleaseInfo.fromTag(

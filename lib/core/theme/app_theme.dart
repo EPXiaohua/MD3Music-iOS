@@ -1,16 +1,28 @@
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/cupertino.dart' show CupertinoPageTransitionsBuilder;
 import 'package:flutter/services.dart';
 
 import '../widgets/app_background.dart';
 
-/// 路由过渡：M3 FadeForwards 动效 + 页面自带背景。
+/// 仅在路由过渡中遮住旧页面；静止后交给 MaterialApp.builder 的唯一全局壁纸。
+/// 保持节点挂载，避免动画两端切换背景子树导致页面重新挂载。
+Widget _transitionBackground(
+  Animation<double> animation,
+  Animation<double> secondaryAnimation,
+) => AnimatedBuilder(
+  animation: Listenable.merge([animation, secondaryAnimation]),
+  builder: (context, child) => Opacity(
+    opacity: animation.value < 1 || secondaryAnimation.isAnimating ? 1 : 0,
+    child: child,
+  ),
+  child: const AppBackground(),
+);
+
+/// 路由过渡：M3 FadeForwards 动效 + 过渡期背景遮罩。
 ///
 /// 启用全局背景图时页面背景透明，路由过渡中新旧页面内容会叠加重叠。
-/// 本 builder 给每个 MaterialPageRoute 的过渡 child **内嵌 [AppBackground]**，
-/// 使背景图作为页面的一部分一起滑动入场（随画面位移，无跳变），且背景图
-/// 不透明盖住下层旧页面（无重叠）。对所有 MaterialPageRoute 全局生效。
+/// 转场时给每个 MaterialPageRoute 的 child 内嵌 [AppBackground]，
+/// 遮住下层旧页面；静止后停止绘制，避免嵌套路由把同一壁纸叠加多次。
 class _BgSafeFadeForwardsBuilder extends PageTransitionsBuilder {
   const _BgSafeFadeForwardsBuilder();
 
@@ -22,10 +34,13 @@ class _BgSafeFadeForwardsBuilder extends PageTransitionsBuilder {
     Animation<double> secondaryAnimation,
     Widget child,
   ) {
-    // 背景作为页面底层，随 FadeForwards 一起滑动/淡入
+    // 背景只在过渡期作为页面底层，随 FadeForwards 一起滑动/淡入。
     final withBg = Stack(
       fit: StackFit.expand,
-      children: [const AppBackground(), child],
+      children: [
+        _transitionBackground(animation, secondaryAnimation),
+        child,
+      ],
     );
     // FadeForwards 基础动效：新页面右侧滑入 + 淡入（无白色屏障层）
     return FadeForwardsPageTransitionsBuilder().buildTransitions(
@@ -58,45 +73,15 @@ class BgSafePredictiveBackBuilder extends PageTransitionsBuilder {
     Animation<double> secondaryAnimation,
     Widget child,
   ) {
-    // 背景作为页面底层，随过渡一起入场（与 FadeForwards 版同策略）
+    // 背景仅在过渡期入场（与 FadeForwards 版同策略）。
     final withBg = Stack(
       fit: StackFit.expand,
-      children: [const AppBackground(), child],
+      children: [
+        _transitionBackground(animation, secondaryAnimation),
+        child,
+      ],
     );
     return const PredictiveBackPageTransitionsBuilder().buildTransitions(
-      route,
-      context,
-      animation,
-      secondaryAnimation,
-      withBg,
-    );
-  }
-}
-
-/// 路由过渡：iOS 原生 Cupertino 动效 + 页面自带背景。
-///
-/// 与 Android 两个 builder 同策略：给每个路由过渡 child 内嵌 [AppBackground]。
-/// iOS 原先走系统默认（无 builder），页面全靠根 Stack 的单层全局背景 +
-/// 透明 Scaffold 透出；iPhone（A11 + Impeller）上从二级页返回主界面时该层
-/// 偶发渲染失效，表现为背景消失。Android 侧因每页自带不透明背景层，
-/// 过渡后背景必然随页面恢复（闪白一瞬是图片重解码）。iOS 对齐同一机制：
-/// 背景内嵌进过渡，随页面一起滑动，返回后页面自身永远携带背景层。
-class BgSafeCupertinoBuilder extends PageTransitionsBuilder {
-  const BgSafeCupertinoBuilder();
-
-  @override
-  Widget buildTransitions<T>(
-    PageRoute<T> route,
-    BuildContext context,
-    Animation<double> animation,
-    Animation<double> secondaryAnimation,
-    Widget child,
-  ) {
-    final withBg = Stack(
-      fit: StackFit.expand,
-      children: [const AppBackground(), child],
-    );
-    return const CupertinoPageTransitionsBuilder().buildTransitions(
       route,
       context,
       animation,
@@ -174,15 +159,22 @@ class AppTheme {
   static ThemeData lightThemeFromSeed(
     Color seedColor, {
     String? fontFamily,
+    Color? textColor,
     bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
     bool predictiveBack = false,
   }) {
-    final colorScheme = ColorScheme.fromSeed(
+    var colorScheme = ColorScheme.fromSeed(
       seedColor: seedColor,
       brightness: Brightness.light,
     );
+    if (textColor != null) {
+      colorScheme = colorScheme.copyWith(
+        onSurface: textColor,
+        onSurfaceVariant: Color.lerp(textColor, colorScheme.surface, 0.25)!,
+      );
+    }
     return _buildTheme(
       colorScheme,
       Brightness.light,
@@ -205,6 +197,7 @@ class AppTheme {
     Color seedColor, {
     bool useOledBlack = false,
     String? fontFamily,
+    Color? textColor,
     bool emphasized = true,
     NavigationDestinationLabelBehavior labelBehavior =
         NavigationDestinationLabelBehavior.alwaysHide,
@@ -225,6 +218,12 @@ class AppTheme {
         surfaceContainerHighest: const Color(0xFF1A1A1A),
         // onSurface 等前景色保持不变，确保文字对比度
         // inverseSurface 保持不变，确保 Snackbar 反色正常
+      );
+    }
+    if (textColor != null) {
+      colorScheme = colorScheme.copyWith(
+        onSurface: textColor,
+        onSurfaceVariant: Color.lerp(textColor, colorScheme.surface, 0.25)!,
       );
     }
     return _buildTheme(
@@ -254,14 +253,12 @@ class AppTheme {
       brightness: brightness,
       // 全局路由过渡：Android 用 FadeForwards（滑动 + 淡入）+ 过渡期间
       // 背景遮罩（避免透明页面过渡重叠，完成后再露出背景图）。
-      // iOS 用原生 Cupertino 动效 + 同样的页面自带背景
-      // （BgSafeCupertinoBuilder：修复返回主界面时背景消失，见类注释）。
+      // 其余平台（iOS/macOS）保留系统默认 Cupertino 过渡。
       pageTransitionsTheme: PageTransitionsTheme(
         builders: {
           TargetPlatform.android: predictiveBack
               ? const BgSafePredictiveBackBuilder()
               : const _BgSafeFadeForwardsBuilder(),
-          TargetPlatform.iOS: const BgSafeCupertinoBuilder(),
         },
       ),
       // fontFamily 为 null 时，Flutter 会走系统字体链（Android 上是 Roboto +
@@ -288,8 +285,10 @@ class AppTheme {
         // 导致浅色主题下状态栏图标变白看不清。
         systemOverlayStyle: SystemUiOverlayStyle(
           statusBarColor: Colors.transparent,
-          statusBarIconBrightness: isLight ? Brightness.dark : Brightness.light,
-          statusBarBrightness: isLight ? Brightness.light : Brightness.dark,
+          statusBarIconBrightness:
+              isLight ? Brightness.dark : Brightness.light,
+          statusBarBrightness:
+              isLight ? Brightness.light : Brightness.dark,
         ),
         // 显式传 fontFamily，确保 AppBar 标题在切换自定义字体时立即生效
         // （ThemeData.fontFamily 不会自动注入到 *ThemeData 中独立设置的 TextStyle）
@@ -495,8 +494,7 @@ class AppTheme {
   /// 给 [base] 的所有文字层级统一附加 [shadows]
   /// （TextTheme.apply 不支持 shadows，只能逐级 copyWith）。
   static TextTheme applyTextShadows(TextTheme base, List<Shadow> shadows) {
-    TextStyle? withShadows(TextStyle? style) =>
-        style?.copyWith(shadows: shadows);
+    TextStyle? withShadows(TextStyle? style) => style?.copyWith(shadows: shadows);
     return base.copyWith(
       displayLarge: withShadows(base.displayLarge),
       displayMedium: withShadows(base.displayMedium),

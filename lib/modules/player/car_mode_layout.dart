@@ -37,17 +37,17 @@ const double kCarModePanelMinWidth = 196.0;
 
 /// 面板停靠位置。
 enum CarModePanelSide {
-  /// 左侧常驻（默认）。
+  /// 左侧常驻。
   left,
 
   /// 右侧常驻。
   right;
 
-  /// 从持久化的 int 还原；越界 / 缺失一律回到 [CarModePanelSide.left]。
+  /// 从持久化的 int 还原；越界 / 缺失一律回到 [CarModePanelSide.right]。
   static CarModePanelSide fromIndex(int? index) =>
       index != null && index >= 0 && index < CarModePanelSide.values.length
       ? CarModePanelSide.values[index]
-      : CarModePanelSide.left;
+      : CarModePanelSide.right;
 }
 
 /// 自动启用车机模式的屏幕长比阈值（短边 / 长边）。

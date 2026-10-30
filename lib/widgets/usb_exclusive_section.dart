@@ -74,9 +74,6 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   /// 从音频文件头解析的原始位深（FLAC/WAV），null=未知（有损格式不显示位深）。
   int? _headerBitDepth;
 
-  /// 从音频文件头解析的源格式（iOS 无 ExoPlayer TrackGroup 时的兜底数据源）。
-  Map<String, int?>? _headerInfo;
-
   /// 已拉取源格式的歌曲 id（去重，切歌才重新请求）。
   String? _sourceSongId;
 
@@ -155,16 +152,6 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
           await AudioFormatUtils.parseAudioBitDepth(song?.url, song?.localPath);
       if (mounted) {
         setState(() => _headerBitDepth = headerBits);
-      }
-    } catch (_) {
-      // 文件头解析失败静默处理
-    }
-    try {
-      // 平台无关兜底：iOS 无 TrackGroup/原生 USB 状态，采样率/声道从文件头解析
-      final info =
-          await AudioFormatUtils.parseAudioSourceInfo(song?.url, song?.localPath);
-      if (mounted) {
-        setState(() => _headerInfo = info);
       }
     } catch (_) {
       // 文件头解析失败静默处理
@@ -288,14 +275,8 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     // 源文件：歌曲原始格式（TrackGroup 采样率/声道 + 文件头位深 + codec 名）
     final src = _sourceFormat;
     final hasSrc = src != null && src['hasData'] == true;
-    final hdr = _headerInfo;
-    // TrackGroup 缺失（iOS）时用文件头解析兜底
-    final srcRate = hasSrc
-        ? ((src['sampleRate'] as num?)?.toInt() ?? 0)
-        : (hdr?['sampleRate'] ?? 0);
-    final srcCh = hasSrc
-        ? ((src['channelCount'] as num?)?.toInt() ?? 0)
-        : (hdr?['channels'] ?? 0);
+    final srcRate = hasSrc ? ((src['sampleRate'] as num?)?.toInt() ?? 0) : 0;
+    final srcCh = hasSrc ? ((src['channelCount'] as num?)?.toInt() ?? 0) : 0;
     final srcCodec = hasSrc ? src['codec'] as String? : null;
     // FLAC 扩展 extractor 会在 extractor 层直接解码为 raw PCM（2026-09-14 定位），
     // 此时 TrackGroup 的 mime 是 audio/raw（解码后 PCM，不含容器/位深信息）。
@@ -668,6 +649,23 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
           child: ExpansionTile(
+            // PageStorage 串台修复（2026-10-21 复现测试实锤）。
+            //
+            // 症状：点开「调试信息」后整块变成「此处内容加载出错」——
+            // 真异常是 `type 'bool' is not a subtype of type 'double?'`，抛在
+            // ScrollPosition.restoreScrollOffset（widget 定位 selectable_text 内的
+            // EditableText），由 _FallbackErrorWidget 顶成红块。与 troubleshooting
+            // §4.13 同症状、不同根因。
+            //
+            // 根因：标识符 = 从自身向上到最近 PageStorage 之间收集到的全部
+            // PageStorageKey（page_storage.dart `_allKeys`）。设置页二级列表的
+            // ListView 带 PageStorageKey，本折叠块和诊断文本都在它下面，于是
+            // 两边的标识符**完全相同**（都是 [list]）：Expansible 把「是否展开」
+            // 的 bool 写进去，SelectableText 的 Scrollable 再按 `double?` 读回来
+            // 当滚动偏移。框架要求同一 bucket 内每个 scrollable 有唯一
+            // PageStorageKey，这里照做：折叠块与诊断文本各挂一枚，使三条链
+            // （列表 [list]、折叠块 [tile,list]、文本 [text,tile,list]）互不相同。
+            key: const PageStorageKey<String>('usb_exclusive_debug_tile'),
             tilePadding: EdgeInsets.zero,
             dense: true,
             leading: Icon(Icons.bug_report_outlined,
@@ -703,6 +701,8 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                       ),
                     ),
                     SelectableText(
+                      key: const PageStorageKey<String>(
+                          'usb_exclusive_debug_text'),
                       _status.entries
                           .map((e) => '${e.key}: ${e.value}')
                           .join('\n'),
@@ -952,6 +952,8 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             ],
             singleSelect: true,
             showChipAnimation: false,
+            // 外层 20 = 条目外角 12 + 列表内边距 8，同心圆（默认 28 过大）
+            containerRadius: AppRadius.dropdownPanel,
             // 未读取到 DAC 能力时禁用（只有"自适应"），避免下发 DAC 不支持的格式
             enabled: enabled,
             fieldStyle: M3EDropdownFieldStyle(

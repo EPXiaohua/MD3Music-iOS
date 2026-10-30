@@ -486,6 +486,12 @@ class MusicHapticsService with WidgetsBindingObserver {
   /// 因此连续两次重算不会把 owner 永久泄漏在采集上。
   Future<void> _updateCapture() async {
     final wants = _wantsCapture;
+    // 「退后台还要不要采集」与「本服务是否持采集」是两件事：scope=always 时本服务
+    // 在后台仍要 PCM 特征帧驱动马达，必须挡住 SpectrumService 的后台停采集。
+    // 放在 owner 增删判定之前——scope 变化但 owner 不变时同样要同步这个信号。
+    _spectrum.setBackgroundCaptureRequired(
+      _enabled && AppHaptics.enabled && _scope == MusicHapticsScope.always,
+    );
     if (wants == _captureOwned) return;
     _captureOwned = wants;
     DiagnosticLogger.instance.info(

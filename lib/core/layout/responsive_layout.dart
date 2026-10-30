@@ -1,4 +1,5 @@
 import 'package:dpad/dpad.dart';
+import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
@@ -37,6 +38,37 @@ const Duration kBottomChromeToggleDuration = Duration(milliseconds: 260);
 bool usesNavigationRail(double width) => width >= compactBreakpoint;
 bool usesTwoPane(double width) => width >= twoPaneBreakpoint;
 
+/// 横屏 NavigationRail 槽位宽的默认档（首次实测回填前的占位，与
+/// `_ResponsiveScaffoldState._railWidth` 的初值同源；rail 实际宽随文字档位由
+/// [_MeasureWidth] 实测，见 [navigationRailReservedWidth]）。
+const double kNavigationRailDefaultWidth = 96.0;
+
+/// 横屏 rail 与内容区之间的分隔线占位宽（`VerticalDivider(thickness: 1,
+/// width: 1)`，见 `_buildRailLayout`）。
+const double kNavigationRailDividerWidth = 1.0;
+
+/// 横屏 rail 布局下内容区左缘的保留宽度（rail 槽位 + 分隔线，实测值）。
+///
+/// rail 本体挂在 `ResponsiveScaffold` 子树内，形变浮层挂在 Navigator 之上（树外），
+/// 宽度没法经 InheritedWidget 传递 —— 由 [_MeasureWidth] 实测回填（`onWidth`
+/// 回调里与本 State 的 `_railWidth` 一并写入），布局外的端点解析消费方读这份
+/// 全局值。未布局前回落到默认档（[kNavigationRailDefaultWidth] + 分隔线）。
+double navigationRailReservedWidth =
+    kNavigationRailDefaultWidth + kNavigationRailDividerWidth;
+
+/// 横屏 rail 槽位 + 分隔线**当前可见**的左缘保留宽（随滑出/滑入动画逐帧收缩，
+/// 静止在场 = [navigationRailReservedWidth]，完全收起 = 0）。
+///
+/// 与 [navigationRailReservedWidth] 同一条「布局外回填」通道：由 `_buildRailLayout`
+/// 的逐帧 builder 写入（只写字段、不触发 setState，AGENTS §10）。消费者是形态
+/// 交棒浮层的胶囊端点解析 —— 横屏 push 交棒时 rail 要等路由转场收敛才起 260ms
+/// 滑出动画，而浮层的可见形变前置在窗口开头 260ms 内走完（K1）；胶囊端点的左缘
+/// 保留若按结算快照冻结成 0，形变会在 rail 仍在场时就把胶囊推到全宽（左缘盖住
+/// rail，真机横屏报障的「点击瞬间与落定后侧边边距不一致」）。逐帧读本值，胶囊
+/// 端点即与 rail 槽位同帧同步收敛。竖屏 / rail 未布局时恒 0（初值即 0，rail
+/// builder 首帧写入后与在场事实一致）。
+double navigationRailVisibleInset = 0.0;
+
 ScreenType getScreenType(double width) {
   if (width < compactBreakpoint) return ScreenType.compact;
   if (width < expandedBreakpoint) return ScreenType.medium;
@@ -70,6 +102,11 @@ bool isPadLayout(BuildContext context) {
 /// 非 build 上下文里被调用（`context.watch` 会抛异常），值型订阅更安全；顶层
 /// `_MainLayout` 监听它触发整棵子树重建（与 `kCoverFlowImmersive` 同模式）。
 final ValueNotifier<bool> kDesktopModeEnabled = ValueNotifier<bool>(false);
+
+/// 内容双栏（master-detail）开关；关闭不影响侧栏导航。历史名
+/// [kWindowsTwoPaneEnabled] 保留：开关现已三端通用（设置页「启用双栏布局」），
+/// 非 Windows 由 main.dart 播种默认 true（宽屏双栏行为不回退），Windows 默认关。
+final ValueNotifier<bool> kWindowsTwoPaneEnabled = ValueNotifier<bool>(false);
 
 /// 播放器形态总开关（SecondaryMiniPlayerHost 渲染悬浮条还是底部常驻条）。
 ///
@@ -121,6 +158,9 @@ final ValueNotifier<bool> kPlaylistCoverTransitionEnabled =
 /// 与悬浮条形态开关放同一处，宿主订阅后即时生效。
 final ValueNotifier<bool> kSecondaryPlayerProgressEnabled =
     ValueNotifier<bool>(true);
+
+/// 悬浮播放器整体透明度（0.2~1.0，默认完全不透明）。
+final ValueNotifier<double> kSecondaryPlayerOpacity = ValueNotifier<double>(1.0);
 
 /// 一级页面（每 tab 的内层 Navigator 首路由 / 栈底主布局内的 tab 页）是否也用悬浮底栏。
 ///
@@ -375,7 +415,9 @@ class ResponsiveScaffold extends StatefulWidget {
 }
 
 class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
-    with SingleTickerProviderStateMixin {
+    // TickerProviderStateMixin：State 持两个动画控制器（_chromeHide + _railHide），
+    // SingleTicker 会抛 "multiple tickers were created"。
+    with TickerProviderStateMixin {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   /// 底栏收起进度：0 = 完整在场，1 = 已让位。
@@ -385,9 +427,9 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
   /// （`BottomChromeScope.bottomChromeCollapse`）。
   late final AnimationController _chromeHide;
 
-  /// 收起走 `panelCollapseEasing`（轻推起步、软着陆），展开走
-  /// `panelExpandEasing`（迟起步、中段主导、末端趋零）—— 与播放页面板同一套
-  /// 运动语汇，两种"让位/落位"读起来一致。
+  /// 收起走 `chromeSinkEasing`（轻推起步、软着陆），展开走 `chromeRiseEasing`
+  /// （平滑 ease-out、软着陆）—— 沉底利落、回升柔和，与常驻 MiniPlayer 的
+  /// 收展走同一套运动语汇（见 `M3ExpressiveMotion` 底栏组注释）。
   late final Animation<double> _chromeHideCurve;
 
   /// 系统「减弱动态效果」：转场直接落端点、不播动画。
@@ -395,6 +437,17 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
   /// 在 [didChangeDependencies] 里缓存（那里建立 MediaQuery 依赖合规），
   /// [didUpdateWidget] 用这份缓存值决定播动画还是直接落端点。
   bool _reduceMotion = false;
+
+  /// 横屏侧栏的滑出动画控制器/曲线（与竖屏底栏同规格、独立驱动，理由见
+  /// initState 注释）。
+  late final AnimationController _railHide;
+  late final Animation<double> _railHideCurve;
+
+  /// NavigationRail 的实测宽度（滑出槽位按它收缩）。由 [_MeasureWidth] 在
+  /// 首次布局时回填，兜底 96 = M3 rail 带 label 的默认宽；实测不触发
+  /// setState——槽位宽度在 AnimatedBuilder builder 内逐帧重读字段，量到
+  /// 新值自动生效。
+  double _railWidth = kNavigationRailDefaultWidth;
 
   /// tv: 导航项焦点节点池，两个变体各一份（icon / selectedIcon），
   /// 在本 State 生命周期结束时统一 dispose。理由见 [_tvWrapNavIcon]。
@@ -411,6 +464,7 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
   @override
   void dispose() {
     _chromeHide.dispose();
+    _railHide.dispose();
     for (final node in _navNodes.values) {
       node.dispose();
     }
@@ -449,8 +503,22 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
     );
     _chromeHideCurve = CurvedAnimation(
       parent: _chromeHide,
-      curve: M3ExpressiveMotion.panelCollapseEasing,
-      reverseCurve: M3ExpressiveMotion.panelExpandEasing,
+      curve: M3ExpressiveMotion.chromeSinkEasing,
+      reverseCurve: M3ExpressiveMotion.chromeRiseEasing,
+    );
+    // 横屏侧栏的滑出动画：与竖屏底栏同规格（同时长/同曲线），但**独立驱动**
+    // ——rail 的显隐目标（hideRailNavigation ?? hideNavigation）允许与底栏
+    // （hideNavigation）分叉（「二级页面隐藏菜单底栏」开关只作用于底栏），
+    // 复用 _chromeHideCurve 会在分叉场景拿错进度。
+    _railHide = AnimationController(
+      vsync: this,
+      duration: kBottomChromeToggleDuration,
+      value: (widget.hideRailNavigation ?? widget.hideNavigation) ? 1.0 : 0.0,
+    );
+    _railHideCurve = CurvedAnimation(
+      parent: _railHide,
+      curve: M3ExpressiveMotion.chromeSinkEasing,
+      reverseCurve: M3ExpressiveMotion.chromeRiseEasing,
     );
     _bounceKeys = _initBounceKeys(widget.railDestinations.length);
     _selectedBounceKeys = _initBounceKeys(widget.railDestinations.length);
@@ -485,6 +553,19 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
         _chromeHide.forward();
       } else {
         _chromeHide.reverse();
+      }
+    }
+    // 横屏侧栏滑出：跟 rail 自己的显隐目标（可能与底栏分叉，见 initState 注释）。
+    final bool hideRail = widget.hideRailNavigation ?? widget.hideNavigation;
+    final bool oldHideRail =
+        oldWidget.hideRailNavigation ?? oldWidget.hideNavigation;
+    if (hideRail != oldHideRail) {
+      if (_reduceMotion || kTvBuild) {
+        _railHide.value = hideRail ? 1.0 : 0.0;
+      } else if (hideRail) {
+        _railHide.forward();
+      } else {
+        _railHide.reverse();
       }
     }
   }
@@ -728,9 +809,6 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
   }
 
   Widget _buildRailLayout(ScreenType screenType) {
-    // 侧栏收起与否默认与底栏同源；主布局会单独传"路由栈是否离开栈底"，使横屏
-    // 侧栏不受「二级页面隐藏菜单底栏」开关影响。
-    final hideRail = widget.hideRailNavigation ?? widget.hideNavigation;
     // 横屏侧栏文字跟随设置页「底部导航栏文字」三档
     //（NavigationBarThemeData.labelBehavior，与竖屏 NavigationBar 同源），
     // 映射到原生 NavigationRail 的 labelType。
@@ -755,67 +833,149 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
         bottom: false,
         child: Row(
           children: [
-            // Visibility(maintainState) 内部用 Offstage 隐藏：元素树结构保持稳定，
-            // hideNavigation 切换时 body（Expanded 子项）不会卸载重建，避免页面
-            // dispose→重建死循环导致横屏无法滑动/点击。
-            Visibility(
-              visible: !hideRail,
-              maintainState: true,
-              // tv: 主导航分区（memoryKey 'tv/main-nav'，与竖屏 NavigationBar
-              // 同一条路径共用；二者按宽度互斥，不会同屏双 Region）。正常构建
-              // 原样返回 NavigationRail。
-              child: _tvWrapNavRegion(
-                NavigationRail(
-                  selectedIndex: widget.selectedIndex,
-                  onDestinationSelected: _handleDestinationSelected,
-                  // 每个 tab 的图标外包自定义胶囊（icon 与 selectedIcon 各占一个
-                  // key 槽位，同一时刻只有其一在树中；选中时显示胶囊，
-                  // 点击/切换后胶囊水平超出回弹，图标不动）
-                  destinations: [
-                    for (int i = 0; i < widget.railDestinations.length; i++)
-                      NavigationRailDestination(
-                        // tv: 逐项包 DpadFocusable（首项兼作 autofocus 锚点，
-                        // 一次性门控防重挂载抢焦点）。NavigationRailDestination
-                        // 不是 widget，只能包 icon/selectedIcon。正常构建原样
-                        // 返回 _CapsuleBounce。
-                        icon: _tvWrapNavIcon(
-                          i,
-                          _CapsuleBounce(
-                            key: _bounceKeys[i],
-                            selected: widget.selectedIndex == i,
-                            child: widget.railDestinations[i].icon,
+            // 横屏侧栏滑出：原来是 Visibility(maintainState) 硬切（Offstage 瞬间
+            // 消失/出现，morph 转场时非常突兀）。现改为与竖屏底栏同一套逐帧动画
+            // 语言——槽位宽度按收起进度收缩（SizedBox），rail 本体保持固有宽、
+            // 在槽位内**右缘对齐**（Align centerRight），左缘超出部分被 ClipRect
+            // 裁掉——视觉即「rail 向屏幕左外侧滑出」，内容区随槽位收缩平滑扩展。
+            //
+            // 约束安全：整条链全部有界（Row 高度来自 Scaffold body；rail 收
+            // SizedBox(width: 恒定) 的 tight 宽约束，与原 Row loose 下按固有宽
+            // 布局等价）。不能用 OverflowBox(maxHeight: infinity) / UnconstrainedBox
+            // 放开约束——rail 内部的 flex Column 会在无界方向崩（真机/测试复现）。
+            //
+            // rail **恒挂载**：Visibility 只在滑出完成后切 Offstage 省绘制
+            // （maintainState 语义不变，body 不会因换型卸载重建）。TV 构建不接
+            // 动画（_railHide 在 didUpdateWidget 里瞬时落端点），行为等价硬切。
+            AnimatedBuilder(
+              animation: _railHideCurve,
+              builder: (context, _) {
+                final hideRail =
+                    widget.hideRailNavigation ?? widget.hideNavigation;
+                final double c = kTvBuild
+                    ? (hideRail ? 1.0 : 0.0)
+                    : _railHideCurve.value.clamp(0.0, 1.0);
+                // 同帧回填「当前可见的左缘保留宽」（_MeasureWidth 同款只写字段
+                // 通道）：滑出全程逐帧收缩，供形态交棒浮层的胶囊端点跟随 rail
+                // 滑出进度（见 navigationRailVisibleInset 的说明）。
+                navigationRailVisibleInset =
+                    navigationRailReservedWidth * (1 - c).clamp(0.0, 1.0);
+                return Visibility(
+                  // 滑出完成才 Offstage（收起方向 + 进度到 1，与竖屏底栏同口径）；
+                  // 反向恢复的起步帧进度仍是 1.0，hideRail 已翻 false → 立即回树。
+                  visible: !(hideRail && c >= 1.0),
+                  maintainState: true,
+                  child: ClipRect(
+                    child: SizedBox(
+                      width: _railWidth * (1 - c).clamp(0.0, 1.0),
+                      // OverflowBox 的两个关键：
+                      // - 宽度 tight 钉在 [_railWidth]：rail 不随槽位收缩被压扁
+                      //   （否则 _MeasureWidth 会把收缩后的宽度回填进基准，形成
+                      //   「越收越窄、回不到满宽」的反馈环）；
+                      // - 高度经 LayoutBuilder 传**父级有界约束**（直接给 infinity
+                      //   会让 rail 内部的 flex Column 在无界高度崩，测试复现）。
+                      child: LayoutBuilder(
+                        builder: (context, outer) => OverflowBox(
+                          alignment: Alignment.centerRight,
+                          minWidth: _railWidth,
+                          maxWidth: _railWidth,
+                          minHeight: outer.minHeight,
+                          maxHeight: outer.maxHeight,
+                          child: _MeasureWidth(
+                            onWidth: (w) {
+                              if (w.isFinite && w > 0) {
+                                _railWidth = w;
+                                // 同步布局外消费方（形变浮层的胶囊端点解析）：
+                                // rail 实际占用 = 槽位 + 分隔线。
+                                navigationRailReservedWidth =
+                                    w + kNavigationRailDividerWidth;
+                              }
+                            },
+                            // tv: 主导航分区（memoryKey 'tv/main-nav'，与竖屏
+                            // NavigationBar 同一条路径共用；二者按宽度互斥，不会
+                            // 同屏双 Region）。正常构建原样返回 NavigationRail。
+                            child: _tvWrapNavRegion(
+                              NavigationRail(
+                                selectedIndex: widget.selectedIndex,
+                                onDestinationSelected: _handleDestinationSelected,
+                                // 每个 tab 的图标外包自定义胶囊（icon 与 selectedIcon
+                                // 各占一个 key 槽位，同一时刻只有其一在树中；选中时
+                                // 显示胶囊，点击/切换后胶囊水平超出回弹，图标不动）
+                                destinations: [
+                                  for (int i = 0; i < widget.railDestinations.length; i++)
+                                    NavigationRailDestination(
+                                      // tv: 逐项包 DpadFocusable（首项兼作 autofocus
+                                      // 锚点，一次性门控防重挂载抢焦点）。
+                                      // NavigationRailDestination 不是 widget，只能包
+                                      // icon/selectedIcon。正常构建原样返回 _CapsuleBounce。
+                                      icon: _tvWrapNavIcon(
+                                        i,
+                                        _CapsuleBounce(
+                                          key: _bounceKeys[i],
+                                          selected: widget.selectedIndex == i,
+                                          child: widget.railDestinations[i].icon,
+                                        ),
+                                      ),
+                                      selectedIcon: _tvWrapNavIcon(
+                                        i,
+                                        _CapsuleBounce(
+                                          key: _selectedBounceKeys[i],
+                                          selected: widget.selectedIndex == i,
+                                          child: widget.railDestinations[i].selectedIcon,
+                                        ),
+                                      ),
+                                      label: widget.railDestinations[i].label,
+                                    ),
+                                ],
+                                leading: widget.floatingActionButton,
+                                labelType: labelType,
+                                // 原生胶囊已由 theme 关闭（indicatorColor transparent），
+                                // 胶囊统一由 _CapsuleBounce 绘制
+                                indicatorColor: Colors.transparent,
+                                // 图标组垂直居中排列（groupAlignment 0 = 居中，-1 = 顶部）。
+                                // tab 过多时 NavigationRail 内部自动滚动。宽度/间距均为
+                                // 原生固定规格。
+                                groupAlignment: 0.0,
+                              ),
+                            ),
                           ),
                         ),
-                        selectedIcon: _tvWrapNavIcon(
-                          i,
-                          _CapsuleBounce(
-                            key: _selectedBounceKeys[i],
-                            selected: widget.selectedIndex == i,
-                            child: widget.railDestinations[i].selectedIcon,
-                          ),
-                        ),
-                        label: widget.railDestinations[i].label,
                       ),
-                  ],
-                  leading: widget.floatingActionButton,
-                  labelType: labelType,
-                  // 原生胶囊已由 theme 关闭（indicatorColor transparent），
-                  // 胶囊统一由 _CapsuleBounce 绘制
-                  indicatorColor: Colors.transparent,
-                  // 图标组垂直居中排列（groupAlignment 0 = 居中，-1 = 顶部）。
-                  // tab 过多时 NavigationRail 内部自动滚动。宽度/间距均为原生固定规格。
-                  groupAlignment: 0.0,
-                ),
-              ),
+                    ),
+                  ),
+                );
+              },
             ),
-            Visibility(
-              visible: !hideRail,
-              maintainState: true,
-              child: VerticalDivider(
-                thickness: 1,
-                width: 1,
-                color: Theme.of(context).colorScheme.outlineVariant,
-              ),
+            // 分隔线与侧栏同节奏：槽位宽度随收起进度归零 + 淡出（1px 线滑出无意义）。
+            AnimatedBuilder(
+              animation: _railHideCurve,
+              builder: (context, _) {
+                final hideRail =
+                    widget.hideRailNavigation ?? widget.hideNavigation;
+                final double c = kTvBuild
+                    ? (hideRail ? 1.0 : 0.0)
+                    : _railHideCurve.value.clamp(0.0, 1.0);
+                return Visibility(
+                  visible: !(hideRail && c >= 1.0),
+                  maintainState: true,
+                  child: ClipRect(
+                    child: SizedBox(
+                      width: (1 - c).clamp(0.0, 1.0),
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: Opacity(
+                          opacity: 1 - c,
+                          child: VerticalDivider(
+                            thickness: 1,
+                            width: 1,
+                            color: Theme.of(context).colorScheme.outlineVariant,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
             Expanded(child: screenType == ScreenType.expanded
                 ? widget.expandedBody ?? widget.mediumBody ?? widget.body
@@ -824,6 +984,41 @@ class _ResponsiveScaffoldState extends State<ResponsiveScaffold>
         ),
       ),
     );
+  }
+}
+
+/// 量取 child 布局宽度并回调（rail 滑出槽位用）：在 performLayout 末尾读
+/// size，**只回填字段、不触发 setState**——消费方（槽位宽度）在逐帧动画的
+/// builder 里重读字段，量到新值自然生效。
+class _MeasureWidth extends SingleChildRenderObjectWidget {
+  const _MeasureWidth({required this.onWidth, super.child});
+
+  final ValueChanged<double> onWidth;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderMeasureWidth(onWidth);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    covariant _RenderMeasureWidth renderObject,
+  ) {
+    renderObject.onWidth = onWidth;
+  }
+}
+
+class _RenderMeasureWidth extends RenderProxyBox {
+  _RenderMeasureWidth(this.onWidth);
+
+  ValueChanged<double> onWidth;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    if (child != null && size.width.isFinite && size.width > 0) {
+      onWidth(size.width);
+    }
   }
 }
 

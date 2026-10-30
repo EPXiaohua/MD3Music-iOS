@@ -15,6 +15,16 @@ import '../core/utils/hex_color.dart';
 Color _glyphColorOn(Color background) =>
     background.computeLuminance() >= 0.19 ? Colors.black87 : Colors.white;
 
+/// 复用色轮与十六进制输入，供主题色及字体颜色设置使用。
+Future<Color?> showCustomColorPicker(
+  BuildContext context, {
+  required Color initial,
+  String title = '自定义主题色',
+}) => showDialog<Color>(
+  context: context,
+  builder: (_) => _CustomColorPickerDialog(initial: initial, title: title),
+);
+
 /// 预设种子色 + 自定义颜色选择面板。
 ///
 /// 8 格圆形网格（4 列 × 2 行）：前 7 格为预设色，最后 1 格（第二排最右）为
@@ -38,10 +48,7 @@ class SeedColorPicker extends StatelessWidget {
   }
 
   Future<void> _openCustomPicker(BuildContext ctx) async {
-    final picked = await showDialog<Color>(
-      context: ctx,
-      builder: (_) => _CustomColorPickerDialog(initial: currentColor),
-    );
+    final picked = await showCustomColorPicker(ctx, initial: currentColor);
     if (picked != null) onSelected(picked);
   }
 
@@ -142,8 +149,9 @@ class SeedColorPicker extends StatelessWidget {
 /// 自定义颜色选择对话框：HSV 色轮（圆环选色相 + 半径选饱和度）+ 亮度滑块。
 class _CustomColorPickerDialog extends StatefulWidget {
   final Color initial;
+  final String title;
 
-  const _CustomColorPickerDialog({required this.initial});
+  const _CustomColorPickerDialog({required this.initial, required this.title});
 
   @override
   State<_CustomColorPickerDialog> createState() =>
@@ -219,7 +227,7 @@ class _CustomColorPickerDialogState extends State<_CustomColorPickerDialog> {
     final color = _hsv.toColor();
     final scheme = Theme.of(context).colorScheme;
     return AlertDialog(
-      title: const Text('自定义主题色'),
+      title: Text(widget.title),
       // 弹出键盘后可滚动，避免对话框内容被裁切
       content: SingleChildScrollView(
         child: Column(

@@ -1,3 +1,5 @@
+import '../../core/services/folder_picker_service.dart';
+
 /// 本地音乐文件夹数据模型。
 ///
 /// 表示一个包含音频文件的目录，用于"文件夹"浏览模式。
@@ -22,6 +24,9 @@ class MusicFolder {
   /// 用于 UI 显示的文件夹名：从完整路径提取最后一段。
   /// 若路径为 `/storage/emulated/0/Music`，则返回 `Music`。
   String get displayName {
+    if (FolderPickerService.isTreeUri(path)) {
+      return FolderPickerService.displayName(path);
+    }
     final parts = path.split('/').where((p) => p.isNotEmpty);
     return parts.isNotEmpty ? parts.last : path;
   }

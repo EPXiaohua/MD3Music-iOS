@@ -9,6 +9,10 @@ import 'package:material_ui/material_ui.dart';
 import '../../core/layout/ui_density.dart';
 
 /// MiniPlayer 封面圆角（dp）。与 `mini_player.dart` 里 ClipRRect 的取值一致。
+///
+/// 这是**常驻条**（方图 + 6dp 圆角）的起点圆角；悬浮胶囊是正圆（29dp）、
+/// 圆盘是 28dp —— 那两种形态由 mini 侧经 [PlayerCoverMorphBus.publishMini] 的
+/// `cornerRadius` 上报，本常量只作为缺省值与旧行为基准。
 const double kCoverMorphMiniRadius = 6.0;
 
 /// FullPlayer 封面圆角（dp）。
@@ -24,6 +28,10 @@ const double kCoverMorphTilt = 0.026;
 
 /// 飞行轨迹的弓高系数：沿直线中点额外上提 `|位移| × 该系数` 的距离。
 /// 两端为 0，只让中段略微"抬"一下，避免死板的匀速直线感。
+///
+/// **现在只作用于文字侧**（[coverMorphTargetRect]）。封面飞行改用平抛轨迹
+/// （[coverMorphFlightRect]）：`t²` 本身就带弧度，再叠弓高会把起段抬起来、
+/// 观感发飘，所以封面侧不再叠加这一项。
 const double kCoverMorphBow = 0.04;
 
 /// 形变插值参数。
@@ -31,6 +39,20 @@ const double kCoverMorphBow = 0.04;
 /// **直接等于** [playerExpansion]：它已经带上了跟手线性 / 松手 easeOutCubic /
 /// 点击 expressiveEasing，再叠第二条曲线等于把缓动做两遍，起飞会明显发飘。
 double coverMorphT(double expansion) => expansion.clamp(0.0, 1.0);
+
+/// 平抛的**竖直项**：`t²`（先慢后快）。
+///
+/// 平抛运动的两个分量天生就是「匀速 + 匀加速」：水平 `x ∝ t`、竖直 `y ∝ t²`。
+/// 封面飞行借这个形状：横向（朝屏幕中央）走匀速，纵向与尺寸走本函数的加速项
+/// —— 起段几乎只往中间挤、不怎么向上，越过中央后猛地上冲并放大。
+///
+/// 判据与非有限值的处置照抄 [coverMorphTextSteppedProgress]：`clamp` 对 NaN
+/// 比较不出大小（会原样返回 NaN），所以先挡掉。
+double coverMorphAcceleratedProgress(double t) {
+  if (!t.isFinite) return 0.0;
+  final e = t.clamp(0.0, 1.0);
+  return e * e;
+}
 
 /// 圆角过渡，返回**局部坐标**下的半径。
 ///
@@ -41,15 +63,64 @@ double coverMorphT(double expansion) => expansion.clamp(0.0, 1.0);
 /// settled 尺寸（336dp），随后整棵子树被缩放。所以屏幕上的实际圆角 =
 /// 局部半径 × scale。不除的话起点处只有 `6 × (44/336) ≈ 0.8dp`，而 MiniPlayer
 /// 封面是 6dp —— 交接瞬间圆角会「突变」成近直角。
-double coverMorphLocalRadius(double t, double scale) {
-  final onScreen = kCoverMorphMiniRadius +
-      (kCoverMorphFullRadius - kCoverMorphMiniRadius) * t.clamp(0.0, 1.0);
+///
+/// [startRadius] 是**源形态**封面的真实屏幕圆角：常驻条 6（方图）、悬浮胶囊
+/// 29（正圆）、悬浮圆盘 28。默认值保持常驻条口径，既有调用点行为不变。
+double coverMorphLocalRadius(
+  double t,
+  double scale, {
+  double startRadius = kCoverMorphMiniRadius,
+  double endRadius = kCoverMorphFullRadius,
+}) {
+  final double start = startRadius.isFinite && startRadius >= 0
+      ? startRadius
+      : kCoverMorphMiniRadius;
+  final double end = endRadius.isFinite && endRadius >= 0
+      ? endRadius
+      : kCoverMorphFullRadius;
+  final onScreen = start + (end - start) * t.clamp(0.0, 1.0);
   return scale <= 0 ? onScreen : onScreen / scale;
 }
 
 /// 飞行中的倾角（弧度）：两端 0、中点最大。
 double coverMorphTilt(double t) =>
     kCoverMorphTilt * math.sin(math.pi * t.clamp(0.0, 1.0));
+
+/// 把角度差归一到 `(-π, π]`（相位回绕用）。
+///
+/// **为什么要它**：圆盘封面的旋转相位是 `[0, 2π)` 的值，每转完一圈就回绕到 0。
+/// 直接对 `终值 − 起值` 求插值，回绕那一帧会出现"差 2π"的假跳变；而逐帧对
+/// 插值结果取最短路径又会在「差值恰好跨过 π」那一帧把整张封面拧 180°
+/// （`start + delta × t` 里 delta 从 +π 翻到 −π，非端点帧差了 `2π × t`）。
+/// 正确做法是**对差值本身做连续跟踪**（见 `player_cover_morph_layer.dart` 的
+/// `_spinDeltaFor`）：首帧取本函数的结果，之后每帧
+/// `delta += wrapPi(raw − delta)`，于是 delta 连续演化、永不跳变。
+///
+/// 非有限值按 0 处理（`clamp` 对 NaN 比较不出大小，会原样返回 NaN）。
+double coverMorphWrapPi(double delta) {
+  if (!delta.isFinite) return 0.0;
+  const double tau = 2 * math.pi;
+  double d = delta % tau;
+  if (d > math.pi) d -= tau;
+  if (d <= -math.pi) d += tau;
+  return d;
+}
+
+/// 本帧的封面旋转角：`起点角 + 连续差 × 进度`。
+///
+/// [delta] 必须是**已展开**的终值差（可跨圈，见 [coverMorphWrapPi]），不是
+/// `wrapPi` 过的裸差。两端严格落在端点上：`t=0` 与源形态当前角逐值相等，
+/// `t=1` 与目的形态同相（差整数圈 = 视觉等价）。
+double coverMorphFlightAngle({
+  required double start,
+  required double delta,
+  required double t,
+}) {
+  final double s = start.isFinite ? start : 0.0;
+  final double d = delta.isFinite ? delta : 0.0;
+  final double e = t.isFinite ? t.clamp(0.0, 1.0) : 0.0;
+  return s + d * e;
+}
 
 /// ── 文字侧的档位（第五轮，治 `textLayout`）────────────────────────────────
 ///
@@ -115,10 +186,14 @@ Rect coverSettledVisualRect({
   );
 }
 
-/// 本帧的封面目标矩形：两端与端点严格相等，中间带一点向上弓高。
+/// 本帧的**文字块**目标矩形：两端与端点严格相等，中间带一点向上弓高。
 ///
 /// 两端必须是**严格的端点矩形**（`t` 取 0/1 时不叠弓高），否则形变层在
 /// `playerExpansion` 跨过 0 / 1 那一刻与真实封面之间会出现亚像素错位。
+///
+/// 封面一侧已改走平抛轨迹（见 [coverMorphFlightRect]）；本函数现在只服务文字块
+/// —— 文字与封面的「文字/封面尺寸比」在两端差异极大，本来就不做整体缩放，
+/// 位置保持线性 + 弓高最稳（用户要求：只改封面，文字不动）。
 Rect coverMorphTargetRect({
   required Rect mini,
   required Rect settled,
@@ -130,6 +205,43 @@ Rect coverMorphTargetRect({
   final travel = (settled.center.dy - mini.center.dy).abs();
   final lift = -travel * kCoverMorphBow * math.sin(math.pi * e);
   return base.shift(Offset(0, lift));
+}
+
+/// 本帧的**封面**目标矩形：类平抛轨迹（横向匀速 + 纵向/尺寸 `t²` 加速）。
+///
+/// **观感要的是什么**：起段封面先往屏幕中央挤（横向多、向上少），越过中央之后
+/// 才猛地上冲并放大（向上多、横向少）—— 和平抛运动的两个分量同形状：
+/// 水平 `x ∝ t`、竖直 `y ∝ t²`。故三条轴各自选一条：
+/// - 圆心 `dx`：线性（匀速）；
+/// - 圆心 `dy`：[coverMorphAcceleratedProgress]（先慢后快）；
+/// - 边长（宽高）：同 `dy`，与向上那一冲同拍 —— 圆角与缩放都由边长派生，
+///   所以圆角天然跟着 `t²` 走（见 `player_cover_morph_layer.dart` 的调用点）。
+///
+/// **收起为什么自动原路返回**：本函数是 `t` 的**纯函数**，不含任何方向、时序、
+/// 上一帧状态。下拉收起只是同一个 `t` 从 1 走回 0，于是每个 `t` 落在同一个矩形上，
+/// 轨迹精确重合 —— 不需要（也不能）为返回写第二条曲线。
+///
+/// **不叠弓高**：`t²` 本身就给了弧度，再抬一次会把起段抬起来、观感发飘。
+/// 两端仍返回**严格的端点矩形**（`Rect.lerp` 在 0 / 1 处），保证
+/// `playerExpansion` 跨过端点那一刻与真实封面像素对齐。
+Rect coverMorphFlightRect({
+  required Rect mini,
+  required Rect settled,
+  required double t,
+}) {
+  if (!t.isFinite) return mini;
+  final e = t.clamp(0.0, 1.0);
+  if (e <= 0.0 || e >= 1.0) return Rect.lerp(mini, settled, e)!;
+  final q = coverMorphAcceleratedProgress(e);
+  final c = Offset(
+    mini.center.dx + (settled.center.dx - mini.center.dx) * e,
+    mini.center.dy + (settled.center.dy - mini.center.dy) * q,
+  );
+  return Rect.fromCenter(
+    center: c,
+    width: mini.width + (settled.width - mini.width) * q,
+    height: mini.height + (settled.height - mini.height) * q,
+  );
 }
 
 /// 把「本帧实测的封面矩形」换算成「页面归位（dy=0）时的矩形」。
@@ -176,8 +288,39 @@ class PlayerCoverMorphBus {
   /// MiniPlayer 封面在屏幕上的矩形（由**可见**的那份 MiniPlayer 上报）。
   Rect? miniRect;
 
+  /// 源形态封面的**真实屏幕圆角**（dp）。
+  ///
+  /// 三种底部形态的封面轮廓完全不同：常驻条是 44×44 方图 + 6dp 圆角、悬浮胶囊
+  /// 是 58×58 正圆（29）、悬浮圆盘是 56×56 正圆（28）。形变层若一律从 6dp 起跳，
+  /// 胶囊/圆盘点开那一帧圆角会「突变成直角」（正圆 → 近方角），这是肉眼可见的
+  /// 断裂。故由 mini 侧在 paint 探针里一并上报，形变层按它做起点。
+  ///
+  /// 缺省 [kCoverMorphMiniRadius]（常驻条口径）——未上报时行为与改动前一致。
+  double miniCoverCornerRadius = kCoverMorphMiniRadius;
+
+  /// 源形态封面当前**旋转角**（弧度）。
+  ///
+  /// 悬浮圆盘在播放时随唱片旋转（`_discAngle` 累加），而形变层原本固定从 0 起跳，
+  /// 于是「转着的唱片被点开」会先瞬间回正、再飞走 —— 展开方向与视觉锚点都对不上。
+  /// 上报后形变层按 `angle * (1 - t)` 把它**连续归零**到播放页封面的正位。
+  ///
+  /// 常驻条 / 胶囊不旋转，恒 0。
+  double miniCoverRotation = 0.0;
+
   /// FullPlayer 封面「页面归位」后的屏幕矩形。
   Rect? settledRect;
+
+  /// 终点**可见封面**相对 [settledRect] 的单侧内缩比例（`0..0.45`）。
+  ///
+  /// 方形封面路径恒 0（可见封面就是整个槽位盒）；频谱圆盘（style 0/1）传
+  /// `SpectrumArtwork.barReserveRatio`（0.12）—— 真身把可见圆画在槽位盒**居中**
+  /// 且四周各留 12% 给环形频谱柱，故终点矩形 = 盒矩形 deflate(边长 × 比例)，
+  /// 终点圆角 = 该矩形边长 / 2（正圆）。
+  ///
+  /// **由槽位上报而不是形变层自己判断**：形变层拿到的只有矩形，无法知道这一页
+  /// 此刻画的是方图还是圆盘；槽位是唯一知道「自己包着什么」的地方（与
+  /// `settledArtworkScale` / `settledArtworkAnchor` 同一口径）。
+  double settledInsetRatio = 0.0;
 
   /// 页面本地 → 屏幕的缩放比（`DisplayScaleScope` 非 1.0 档位时 ≠ 1）。
   double pageToScreen = 1.0;
@@ -185,9 +328,11 @@ class PlayerCoverMorphBus {
   /// 页面本帧施加的位移（页面本地坐标），由路由过渡 / 拖拽覆盖层在 build 阶段写入。
   Offset pageOffset = Offset.zero;
 
-  /// **封面**形变是否可用。频谱圆盘 / 写真 / 3D 深度封面 / 动态封面 /
-  /// 车机常驻面板为 false，此时封面一侧完全不介入，行为与改动前完全一致。
-  /// 文字一侧另有 [textEligible]（与本字段**故意不同源**）。
+  /// **封面**形变是否可用。写真 / 车机常驻面板为 false，此时封面一侧完全不介入，
+  /// 行为与改动前完全一致。文字一侧另有 [textEligible]（与本字段**故意不同源**）。
+  ///
+  /// **频谱圆盘（style 0/1）不再压制封面**：圆盘形状（居中内缩 + 正圆 + 唱片角）
+  /// 由 [settledInsetRatio] 与飞行层现算的终点角完整描述，形变层画得出它。
   bool eligible = false;
 
   /// 形变层画什么（与两端保持同一套参数，保证交接处像素级对齐）。
@@ -207,6 +352,71 @@ class PlayerCoverMorphBus {
 
   /// 登记的歌曲 id：切歌后旧值立即失效，避免用 A 的封面飞向 B 的位置。
   String? songId;
+
+  // ── 迷你端点的「立即重测」注册表 ─────────────────────────────────────────
+  //
+  // **要治的是什么**（真机日志实锤：起点被写成 L=-78.5 之后再无修正）：
+  // [miniRect] / [miniTextRect] 只在探针 **paint** 时写。而页面会被路由转场
+  // 整块平移（tab 切换的左右滑、`_UpFadeMainRoute` 的上移淡出），那一帧量到的
+  // 就是**平移中**的矩形，写进登记簿后：
+  // 1. 转场落定并不再有新的 paint（静止的胶囊没有逐帧脏区，进度环只重绘
+  //    `CustomPaint` 那一层，不带探针）；
+  // 2. 更要命的是转场一开始封面就让位给飞行层（`Opacity(0)`），而
+  //    `RenderOpacity` 在 alpha=0 时**整个子树不 paint** → 探针在飞行期间
+  //    根本不跑，压根没有自我修正的机会。
+  // 于是起点被钉死在「偏左半个转场位移」上，展开起点与收起终点同时错位，
+  // 只有重启（必然全量重绘）才恢复 —— 正是「普通条切悬浮条之后封面动画起点
+  // 偏到屏幕外」的成因。
+  //
+  // **为什么是注册闭包而不是别的路子**：
+  // - 加 `GlobalKey` 重新量：MiniPlayer 封面在 `AnimatedSwitcher` 里会有
+  //   新旧两份并存，Duplicate GlobalKey 直接断言（本文件下方有同样的说明）；
+  // - 只在 paint 里写 + 强制重绘：要为了一个数值把整条 bar 标脏，且 alpha=0
+  //   那侧根本不 paint，绕不开；
+  // - 在**用之前**重测（这里）是唯一与「谁在画」解耦的做法：飞行层是常驻的，
+  //   它在**从收起端起飞那一程的首帧**把注册表里的探针叫一遍（收起程不叫，
+  //   理由见调用方注释），量到的就是结算位置 —— `getTransformTo` 经由各祖先的
+  //   `applyPaintTransform` 取矩阵，而那些矩阵由 widget 属性在 layout 阶段写好，
+  //   不依赖子树被 paint 过。
+  final List<VoidCallback> _miniRemeasurers = <VoidCallback>[];
+
+  /// 注册一个迷你端点探针的重测闭包（由 [_RenderCoverGeometryProbe] 在 attach
+  /// 时登记、detach 时摘掉）。
+  void registerMiniRemeasurer(VoidCallback remeasure) {
+    if (!_miniRemeasurers.contains(remeasure)) _miniRemeasurers.add(remeasure);
+  }
+
+  /// 摘掉重测闭包（探针销毁时调用；不在册时静默）。
+  void unregisterMiniRemeasurer(VoidCallback remeasure) {
+    _miniRemeasurers.remove(remeasure);
+  }
+
+  /// 立刻重测所有迷你端点（封面 + 文字）。
+  ///
+  /// 逐帧成本 = 0：只在**每段飞行的首帧**与**端点帧**各调一次（见
+  /// `player_cover_morph_layer.dart` 的调用点），且 [publishMini] /
+  /// [publishMiniText] 自带判等，值没变不会 `_bump`。
+  /// 先拷贝再遍历：探针回调里可能 detach（切歌/切形态正好发生在这一帧）。
+  void remeasureMiniSources() {
+    if (_miniRemeasurers.isEmpty) return;
+    for (final VoidCallback m in List<VoidCallback>.of(_miniRemeasurers)) {
+      m();
+    }
+  }
+
+  /// 本段飞行是否已经重测过迷你端点（端点帧复位，见形变层的调用时机）。
+  bool miniRemeasuredThisFlight = false;
+
+  /// 上一帧的 `playerExpansion`（形变层每帧写一次）。
+  ///
+  /// 用途只有一个：判断本段飞行是**从哪一端起飞**的。重测只允许在「从 0 起」
+  /// 这一程做（见 [remeasureMiniSources] 的调用方说明）：
+  /// - 收起那一程（从 1 落回 0）时，常驻条被壳层的 `_UpFadeMainRoute` 平移
+  ///   带着飞（t>0.5 上移 15%），探针此刻量到的是**飞行中**的位置，重测等于
+  ///   把新的一次偏移写进登记簿；
+  /// - 拖拽跟手程（`playerDragActive`）里胶囊本身就在动，探针逐帧 paint，
+  ///   值永远是新鲜的，不需要也不该重测。
+  double lastExpansion = 0.0;
 
   /// 播放页封面**稳定态**的缩放：播放中 1.0，暂停 0.85（频谱圆盘恒 1.0）。
   ///
@@ -245,13 +455,23 @@ class PlayerCoverMorphBus {
   TextStyle? fullTitleStyle;
   TextStyle? fullSubtitleStyle;
 
+  /// 源形态文字块的**行对齐**（飞行起点的水平摆位）。
+  ///
+  /// 缺省 [Alignment.centerLeft] = 常驻条口径（两行贴块左缘）。悬浮胶囊真身是
+  /// **逐行居中**（`CrossAxisAlignment.center` + `textAlign: center`），必须上报
+  /// [Alignment.center]：飞行层起点若一律用 centerLeft，胶囊一交棒给飞行层，
+  /// 居中文字就会**整体跳到块左缘**（真机反馈「上拉时文字位置突变到左边」）。
+  /// 块矩形本身量的是紧贴行的外接框，两端宽度都是最长行宽 —— 只有摆位方向
+  /// 需要随源形态切换。
+  Alignment miniTextAlign = Alignment.centerLeft;
+
   /// 播放页标题块的水平对齐（竖屏居中 / 横屏左对齐），飞行途中从"左对齐"过渡过去。
   Alignment fullTitleAlign = Alignment.centerLeft;
 
   /// 本次转场是否接管文字块。
   ///
   /// 与封面的 [eligible] **不同源**（各自锁存，见 [latchedTextEligible]）：
-  /// 频谱圆盘 / 写真只压封面一侧，文字照飞。分开存只是为了让「槽位隐藏条件」与
+  /// 写真等只压封面一侧，文字照飞。分开存只是为了让「槽位隐藏条件」与
   /// 「形变层绘制条件」逐字一致，不会出现某一侧被判据差异漏掉而留出空洞。
   bool textEligible = false;
 
@@ -330,10 +550,12 @@ class PlayerCoverMorphBus {
 
   /// 本次转场**锁存**的文字侧资格。
   ///
-  /// **刻意与 [latchedCoverEligible] 分成两路**：频谱圆盘（圆形裁切 + 旋转，
-  /// 形变层还原不出）与写真封面只抑制**封面**一侧，文字形变照旧（用户要求）。
-  /// 共用一个锁存时「先到者胜」会把某一侧的答案强加给另一侧 —— 表现为
-  /// 圆盘开着时歌名跟着飞、封面也跟着飞（本该只飞歌名）。
+  /// **刻意与 [latchedCoverEligible] 分成两路**：写真封面 / 车机面板只抑制
+  /// **封面**一侧，文字形变照旧（用户要求）。共用一个锁存时「先到者胜」会把某一侧
+  /// 的答案强加给另一侧 —— 表现为「封面不飞、歌名也跟着不飞」。
+  ///
+  /// **频谱圆盘不在任一压制名单里**（它现在两侧都飞）：形状由 [settledInsetRatio]
+  /// 与终点角描述，文字本来就与封面形状无关。
   bool? latchedTextEligible;
 
   /// 解析本次转场的**封面**形变资格：**在转场起点锁存，全程不再改变**。
@@ -354,7 +576,8 @@ class PlayerCoverMorphBus {
   ///
   /// **资格必须是同步可读的**：跟手覆盖层里的播放页是当场新建的，首帧就在
   /// 0<p<1，此时它自己的异步偏好（频谱开关）必然还是默认值。判据里凡是异步
-  /// 状态，一律先落成全局镜像（见 `kSpectrumDiscCoverActive`）。
+  /// 状态，一律先落成全局镜像（见 `kSpectrumDiscCoverActive`）——本字段现在只装
+  /// 结构条件，但**终点形状**（[settledInsetRatio]）仍要靠那份镜像同步求值。
   bool resolveCoverEligible({required double expansion, required bool live}) {
     if (expansion <= 0.0 || expansion >= 1.0) {
       latchedCoverEligible = null;
@@ -378,31 +601,58 @@ class PlayerCoverMorphBus {
     return live;
   }
 
-  /// MiniPlayer 上报自己的封面矩形。
-  void publishMini(Rect rect) {
-    if (miniRect == rect) return;
+  /// MiniPlayer 上报自己的封面矩形（含源形态的圆角与旋转角）。
+  ///
+  /// [cornerRadius]：封面的**屏幕**圆角（常驻条 6 / 胶囊 29 / 圆盘 28）；
+  /// [rotation]：封面当前旋转角（弧度，圆盘播放时非 0）。
+  /// 两者都参与「变更判据」，否则形变层会在旋转/形变收敛后停在旧值上。
+  void publishMini(
+    Rect rect, {
+    double cornerRadius = kCoverMorphMiniRadius,
+    double rotation = 0.0,
+  }) {
+    final double r = cornerRadius.isFinite && cornerRadius >= 0
+        ? cornerRadius
+        : kCoverMorphMiniRadius;
+    final double angle = rotation.isFinite ? rotation : 0.0;
+    if (miniRect == rect &&
+        miniCoverCornerRadius == r &&
+        miniCoverRotation == angle) {
+      return;
+    }
     miniRect = rect;
+    miniCoverCornerRadius = r;
+    miniCoverRotation = angle;
     _bump();
   }
 
   /// MiniPlayer 上报「歌曲名 + 歌手」文字块。
+  ///
+  /// [lineAlign] = 源形态的行对齐（见 [miniTextAlign]）：常驻条缺省贴左，
+  /// 胶囊传 [Alignment.center]。
   void publishMiniText({
     required Rect rect,
     required String title,
     required String subtitle,
     required TextStyle? titleStyle,
     required TextStyle? subtitleStyle,
+    Alignment lineAlign = Alignment.centerLeft,
   }) {
+    final align = (lineAlign.x.isFinite && lineAlign.y.isFinite)
+        ? lineAlign
+        : Alignment.centerLeft;
     final changed = miniTextRect != rect ||
         miniTitleText != title ||
         miniSubtitleText != subtitle ||
         miniTitleStyle != titleStyle ||
-        miniSubtitleStyle != subtitleStyle;
+        miniSubtitleStyle != subtitleStyle ||
+        miniTextAlign != align;
     miniTextRect = rect;
     miniTitleText = title;
     miniSubtitleText = subtitle;
     miniTitleStyle = titleStyle;
     miniSubtitleStyle = subtitleStyle;
+    miniTextAlign = align;
     if (changed) _bump();
   }
 
@@ -450,6 +700,9 @@ class PlayerCoverMorphBus {
   ///
   /// [logicalSize] 是探针子树的**布局**尺寸（页面本地坐标）；[measured] 是同一次
   /// paint 量到的屏幕矩形。缩放比由二者相除得出。
+  ///
+  /// [settledInsetRatio] 是终点可见封面相对该矩形的单侧内缩比例（频谱圆盘 0.12，
+  /// 其余 0，口径见 [PlayerCoverMorphBus.settledInsetRatio]）。
   void publishFull({
     required Rect measured,
     required Size logicalSize,
@@ -463,6 +716,7 @@ class PlayerCoverMorphBus {
     required bool eligible,
     required double settledArtworkScale,
     required Alignment settledArtworkAnchor,
+    double settledInsetRatio = 0.0,
   }) {
     final scale = (logicalSize.width <= 0 || measured.width <= 0)
         ? 1.0
@@ -472,9 +726,12 @@ class PlayerCoverMorphBus {
       pageOffset: pageOffset,
       pageToScreen: scale,
     );
+    final double inset = settledInsetRatio.isFinite
+        ? settledInsetRatio.clamp(0.0, 0.45)
+        : 0.0;
     // 归位矩形在一次转场里是常量（页面布局不变，只有 dy 在动），所以逐帧
-    // publishFull 通常不会触发 _bump；只有真正变化（切歌 / 转屏 / 资格翻转）
-    // 才通知形变层，避免播放页每次重绘都空转重建一次形变层。
+    // publishFull 通常不会触发 _bump；只有真正变化（切歌 / 转屏 / 资格翻转 /
+    // 方图↔圆盘切换）才通知形变层，避免播放页每次重绘都空转重建一次形变层。
     // 与参数同名的字段必须保留 `this.` 前缀以便区分；未遮蔽的去掉以免
     // 触发 unnecessary_this。
     final changed =
@@ -488,7 +745,8 @@ class PlayerCoverMorphBus {
         shadowColor != this.shadowColor ||
         eligible != this.eligible ||
         settledArtworkScale != this.settledArtworkScale ||
-        settledArtworkAnchor != this.settledArtworkAnchor;
+        settledArtworkAnchor != this.settledArtworkAnchor ||
+        inset != this.settledInsetRatio;
     settledRect = settled;
     pageToScreen = scale;
     this.songId = songId;
@@ -500,6 +758,7 @@ class PlayerCoverMorphBus {
     this.eligible = eligible;
     this.settledArtworkScale = settledArtworkScale;
     this.settledArtworkAnchor = settledArtworkAnchor;
+    this.settledInsetRatio = inset;
     if (changed) _bump();
   }
 
@@ -507,6 +766,8 @@ class PlayerCoverMorphBus {
   @visibleForTesting
   void reset() {
     miniRect = null;
+    miniCoverCornerRadius = kCoverMorphMiniRadius;
+    miniCoverRotation = 0.0;
     settledRect = null;
     pageToScreen = 1.0;
     pageOffset = Offset.zero;
@@ -519,14 +780,21 @@ class PlayerCoverMorphBus {
     songId = null;
     settledArtworkScale = 1.0;
     settledArtworkAnchor = Alignment.center;
+    settledInsetRatio = 0.0;
     latchedCoverEligible = null;
     latchedTextEligible = null;
+    // 本段飞行的三个瞬时状态：复位后下一个用例从「不在转场中」开始。
+    // 注册表 [_miniRemeasurers] **不清**：里面的探针还挂在活着的渲染树上，
+    // 清了就把它们的自愈通道悄悄摘掉了（detach 时才该摘）。
+    miniRemeasuredThisFlight = false;
+    lastExpansion = 0.0;
     miniTextRect = null;
     settledTextRect = null;
     miniTitleText = null;
     miniSubtitleText = null;
     miniTitleStyle = null;
     miniSubtitleStyle = null;
+    miniTextAlign = Alignment.centerLeft;
     fullTitleText = null;
     fullSubtitleText = null;
     fullTitleStyle = null;
@@ -541,7 +809,7 @@ class PlayerCoverMorphBus {
 /// 封面此刻是否真的可见（形变资格里**与「哪个 FullPlayer 实例」无关**的那部分）。
 ///
 /// **只装「结构门」**（车机面板 + 当前 tab 是否含封面），**不装封面独有的压制项**
-/// （频谱圆盘 / 写真）：本信号被封面与文字两侧共用（[PlayerCoverMorphBus.willDraw]
+/// （写真）：本信号被封面与文字两侧共用（[PlayerCoverMorphBus.willDraw]
 /// 与 `textWillDraw` 都读它），把封面那一侧的答案写进来会把文字连贯一起掐掉。
 /// 封面独有的压制走各自锁存的 `eligible` / `textEligible`。
 ///
@@ -568,16 +836,22 @@ final ValueNotifier<bool> playerCoverVisible = ValueNotifier<bool>(true);
 ///
 /// 回调里**只允许写全局字段，不得 `setState`**（paint 阶段触发重建会崩）。
 class CoverGeometryProbe extends SingleChildRenderObjectWidget {
+  /// 参数：屏幕矩形 + 子树的布局尺寸（页面本地坐标）。
+  final void Function(Rect screenRect, Size logicalSize) onRect;
+
+  /// 本探针量的是**迷你端**（常驻条 / 胶囊的封面或文字块）吗？只有迷你端需要
+  /// 注册「立即重测」闭包（见 [PlayerCoverMorphBus.remeasureMiniSources] 的
+  /// 成因说明）。播放页那侧不用：飞行期间页面每帧都在重绘，槽位探针照旧 publish。
+  final bool isMiniSource;
+
   const CoverGeometryProbe({
     super.key,
     required this.onRect,
     // 走父类的 `child` 字段（`Widget get child`），不再重复声明一份：
     // 重复声明会触发 overridden_fields / annotate_overrides。
     required Widget super.child,
+    this.isMiniSource = false,
   });
-
-  /// 参数：屏幕矩形 + 子树的布局尺寸（页面本地坐标）。
-  final void Function(Rect screenRect, Size logicalSize) onRect;
 
   @override
   RenderObject createRenderObject(BuildContext context) =>
@@ -585,14 +859,16 @@ class CoverGeometryProbe extends SingleChildRenderObjectWidget {
       // 那时探针整棵**重新 mount**、只走 createRenderObject，不补这里
       // spaceRef 会永远停在 null（上报仍是窗口像素）。
       _RenderCoverGeometryProbe(onRect)
-        ..spaceRef = DisplayScaleReference.anchorOf(context);
+        ..spaceRef = DisplayScaleReference.anchorOf(context)
+        ..isMiniSource = isMiniSource;
 
   @override
   void updateRenderObject(BuildContext context, RenderObject renderObject) {
     (renderObject as _RenderCoverGeometryProbe)
       ..onRect = onRect
       // 设计像素锚点；不在 DisplayScaleScope 内为 null → 回退根空间（现状不变）。
-      ..spaceRef = DisplayScaleReference.anchorOf(context);
+      ..spaceRef = DisplayScaleReference.anchorOf(context)
+      ..isMiniSource = isMiniSource;
   }
 }
 
@@ -606,6 +882,71 @@ class _RenderCoverGeometryProbe extends RenderProxyBox {
 
   /// 测量目标空间（[DisplayScaleScope] 锚点）；null = RenderView 根。
   RenderObject? spaceRef;
+
+  /// 迷你端探针：登记进 [PlayerCoverMorphBus] 的重测注册表。
+  ///
+  /// 值 setter 而非构造参数：`updateRenderObject` 用 cascade 补属性，改构造签名
+  /// 会牵动全部调用点。挂载/摘除都幂等（[PlayerCoverMorphBus.registerMiniRemeasurer]
+  /// 内部判重），widget 侧值在生命周期里不变，实际只会各跑一次。
+  bool isMiniSource = false;
+
+  /// 重测闭包（**存字段**：`remeasureMini` 的 tear-off 每次都是新对象，
+  /// 不存下来就无法在 detach 时按同一身份摘除，注册表会只增不减）。
+  VoidCallback? _remeasureHandle;
+
+  @override
+  void attach(PipelineOwner owner) {
+    super.attach(owner);
+    if (isMiniSource && _remeasureHandle == null) {
+      _remeasureHandle = remeasureMini;
+      PlayerCoverMorphBus.instance.registerMiniRemeasurer(_remeasureHandle!);
+    }
+  }
+
+  @override
+  void detach() {
+    final VoidCallback? h = _remeasureHandle;
+    if (h != null) {
+      PlayerCoverMorphBus.instance.unregisterMiniRemeasurer(h);
+      _remeasureHandle = null;
+    }
+    super.detach();
+  }
+
+  /// **不经 paint** 重测一次并上报（由飞行层在每段转场的首帧/端点帧调用）。
+  ///
+  /// 与 [paint] 里的路径同一个 [_measureAndReport]：`getTransformTo` 只要求
+  /// `attached`（断言见 rendering/object.dart），而祖先的平移/缩放在 **layout
+  /// 阶段**就已写进各自 layer 的矩阵，所以非 paint 时机量到的与 paint 时一致。
+  ///
+  /// 守卫三条：
+  /// - `attached` / `hasSize`：照抄 paint 那两个条件，未挂载或还没布局过的探针
+  ///   一律不量（否则 `size` 取到断言/零值，反而把登记簿写坏）；
+  /// - **祖先链上有 `Offstage(offstage: true)` 就跳过**：这是本方法唯一比 paint
+  ///   多出来的风险面。`Offstage` 的子树照样**参与布局**（`RenderOffstage` 保留
+  ///   上一次的 size），只是不 paint —— 所以平时它一个字都不写，而重测会把它
+  ///   量出来。底栏形态交棒的让位、以及被不透明路由压在下面的那根条，走的都是
+  ///   `Offstage`；让不在屏幕上的那一侧写入登记簿，等于把「看不见的那根条的
+  ///   位置」当成飞行起点，比现在这个 bug 更糟。paint 天然拦住了这种情况
+  ///   （不画就不跑），这里必须显式拦。
+  void remeasureMini() {
+    if (!attached || !hasSize) return;
+    if (_offstageInAncestors) return;
+    _measureAndReport();
+  }
+
+  /// 祖先链里是否存在被摘掉的 `Offstage`（只在重测时跑，一段转场一两次，成本可忽）。
+  ///
+  /// 用 `offstage` 而不是 `childVisible`：本 SDK 的 `RenderOffstage` 只有前者
+  /// （`paint`/`hitTest`/语义遍历各自 `if (offstage) return`）。
+  bool get _offstageInAncestors {
+    RenderObject? node = parent;
+    while (node != null) {
+      if (node is RenderOffstage && node.offstage) return true;
+      node = node.parent;
+    }
+    return false;
+  }
 
   @override
   void paint(PaintingContext context, Offset offset) {

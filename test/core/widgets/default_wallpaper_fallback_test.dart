@@ -179,10 +179,14 @@ void main() {
         reason: '仅「主题色」提示语与禁用态两处允许使用；'
             '开关显示（_useBackgroundImage）必须读 useBackgroundImage',
       );
+      // 赋值来源允许两种等价写法：直接在 build 内 `context.read<ThemeProvider>()`，
+      // 或上游重构后由方法参数 `themeProvider` 传入（2026-10-24 合并上游后）。
+      // 关键约束不变：必须读**用户开关** useBackgroundImage。
       expect(
-        code.contains(
-          'final useBackgroundImage = context.read<ThemeProvider>().useBackgroundImage;',
-        ),
+        RegExp(
+          r'final\s+useBackgroundImage\s*=\s*'
+          r'(?:context\.read<ThemeProvider>\(\)|themeProvider)\.useBackgroundImage;',
+        ).hasMatch(code),
         isTrue,
         reason: '设置页开关赋值必须读 useBackgroundImage（2026-10-12 回归）',
       );

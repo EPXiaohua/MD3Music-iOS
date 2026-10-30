@@ -43,6 +43,13 @@ jobs:
         working-directory: kugou_api_server/rust
         run: cargo build --release
 
+      # 4.5 发布/CI 产物**不带 3D 封面**（与 ci.yml、main.yml 同口径）。
+      #     3D 封面在 Windows 上属可选能力，只在本地开发时用
+      #     `scripts\md3.ps1 windows -With3D` 构建：那条路径会传
+      #     ENABLE_DEPTH_3D / DEPTH_BACKEND 两个 define，并按固定版本 + SHA256 下载
+      #     ONNX Runtime 运行时、把深度模型一起随包（见 scripts/tasks/windows.ps1 头部
+      #     常量与 W12.2 文档）。因此这里既不缓存/下载 ORT，也不传 define。
+
       # 5. Flutter 依赖
       - name: Flutter pub get
         run: flutter pub get
@@ -78,13 +85,12 @@ jobs:
           Copy-Item $dlls.FullName build/windows/x64/runner/Release/ -Force
           Write-Host "已随包 $($dlls.Count) 个运行库：$($dlls.Name -join ', ')"
 
-      # 8. 压缩为便携 zip
+      # 8. 复用本地便携打包逻辑：根启动器 + App/（包含全部运行依赖）
+      #    不带 -With3D：与构建口径一致（发布包不含 3D 封面）。
       - name: Package portable zip
         shell: pwsh
         run: |
-          $ver = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*','' -split '\+')[0]
-          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "md3music-windows-$ver.zip" -CompressionLevel Optimal
-          Get-Item "md3music-windows-$ver.zip" | Select-Object Name,Length
+          ./scripts/tasks/windows.ps1 -PackageOnly -NoPause -OutDir .
 
       # 9. 上传 artifact（可在 Actions 页下载）
       - name: Upload artifact

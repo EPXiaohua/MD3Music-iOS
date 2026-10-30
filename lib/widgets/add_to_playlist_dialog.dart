@@ -5,6 +5,7 @@ import '../core/utils/app_toast.dart';
 import '../services/kugou_api/kugou_api_client.dart';
 import '../services/kugou_api/kugou_models.dart';
 import '../utils/playlist_order_utils.dart';
+import '../utils/playlist_write_payload.dart';
 import 'smart_artwork_image.dart';
 
 /// 「添加到歌单」共享对话框：歌曲列表项菜单与播放页更多菜单共用。
@@ -226,8 +227,7 @@ Future<void> addSongToPlaylist(
   showToast('已添加到「$name」');
 
   // 构造歌曲数据 — 酷狗API要求的格式：歌名|hash|albumId|albumAudioId
-  final songData =
-      '${song.title}|${song.id}|${song.albumId ?? 0}|${int.tryParse(song.albumAudioId ?? '') ?? 0}';
+  final songData = buildTrackAddData(song);
   debugPrint(
     '[AddToPlaylist] listid=$listid name=${playlist['name']} songData=$songData',
   );

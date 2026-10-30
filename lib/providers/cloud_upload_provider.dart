@@ -89,6 +89,7 @@ class CloudUploadProvider extends ChangeNotifier {
   final List<CloudUploadTask> _tasks = [];
   bool _running = false;
   bool _matchLoaded = false;
+  int _matchLoadGeneration = 0;
   bool _matchEnabled = true;
   int _successSinceIdle = 0;
   int _completedGeneration = 0;
@@ -128,16 +129,37 @@ class CloudUploadProvider extends ChangeNotifier {
   Future<void> ensureMatchLoaded() async {
     if (_matchLoaded) return;
     _matchLoaded = true;
+    final generation = _matchLoadGeneration;
+    var enabled = _matchEnabled;
     try {
-      _matchEnabled = await SettingsRepository().getCloudUploadMatchEnabled();
+      enabled = await SettingsRepository().getCloudUploadMatchEnabled();
     } catch (e) {
       debugPrint('[CloudUpload] 读取匹配开关失败: $e');
     }
+    if (generation != _matchLoadGeneration) return;
+    _matchEnabled = enabled;
     notifyListeners();
+  }
+
+  /// Windows 重置后废弃在途读取，再从同一设置存储刷新匹配偏好。
+  void prepareWindowsSettingsReset() {
+    if (!Platform.isWindows) return;
+    ++_matchLoadGeneration;
+    _matchLoaded = false;
+  }
+
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    prepareWindowsSettingsReset();
+    await ensureMatchLoaded();
   }
 
   Future<void> setMatchEnabled(bool enabled) async {
     if (_matchEnabled == enabled) return;
+    if (Platform.isWindows) {
+      ++_matchLoadGeneration;
+      _matchLoaded = true;
+    }
     _matchEnabled = enabled;
     notifyListeners();
     try {

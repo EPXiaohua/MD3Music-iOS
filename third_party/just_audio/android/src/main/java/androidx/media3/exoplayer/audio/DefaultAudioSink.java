@@ -72,6 +72,7 @@ import com.ryanheise.just_audio.UsbAudioSinkController;
 // MD3Music fork: 系统 Direct PCM 档的实时标志（float 强制 / 低延迟 / 缓冲），
 // 以及 @hide API（setPerformanceMode / getLatency）的反射封装。
 import com.ryanheise.just_audio.DirectPcmController;
+import com.ryanheise.just_audio.AudioOffloadController;
 import com.ryanheise.just_audio.DirectPcmCapabilities;
 import com.ryanheise.just_audio.OutputLatencyProbe;
 import com.google.common.collect.ImmutableList;
@@ -1469,6 +1470,8 @@ public final class DefaultAudioSink implements AudioSink {
   public void setOffloadMode(@OffloadMode int offloadMode) {
     Assertions.checkState(Util.SDK_INT >= 29);
     this.offloadMode = offloadMode;
+    // MD3Music fork: 记录「请求了什么」，供设置页区分「没请求」与「请求了但被设备拒绝」。
+    AudioOffloadController.onModeRequested(offloadMode);
   }
 
   @RequiresApi(29)
@@ -1543,6 +1546,15 @@ public final class DefaultAudioSink implements AudioSink {
       OutputLatencyProbe.detach();
       audioTrack = null;
     }
+    // MD3Music fork: pending inputBuffer 的清理必须与「AudioTrack 是否已初始化」解耦。
+    // 独占拦截期间 delegate 收不到 handleBuffer（数据被 UsbAudioSinkController 拦走），
+    // 若此时 AudioTrack 已被释放（isAudioTrackInitialized()==false），resetSinkStateForFlush()
+    // 被守卫挡住 → inputBuffer 仍指向上一次未消费完的缓冲；解除独占后 renderer 转发的新缓冲
+    // 会撞 handleBuffer() 的 checkArgument(inputBuffer == null || buffer == inputBuffer)
+    // → IllegalArgumentException → ExoPlaybackException errorCode=1004（实测于 2026-09-12）。
+    // AudioTrack 已初始化时上面已清过，这两行为幂等空操作。
+    inputBuffer = null;
+    inputBufferAccessUnitCount = 0;
     writeExceptionPendingExceptionHolder.clear();
     initializationExceptionPendingExceptionHolder.clear();
     skippedOutputFrameCountAtLastPosition = 0;
@@ -1723,11 +1735,16 @@ public final class DefaultAudioSink implements AudioSink {
 
   /**
    * MD3Music fork: 是否实际请求 float 输出 = 构建期的 {@code enableFloatOutput} 与
-   * 32bit 播放开关（实时静态标志）取或。开关开启后下一首歌 configure 即生效，无需重建播放器。
+   * 「32bit 播放支持」开关（{@code UsbAudioSinkController} 的实时静态标志）取或。
+   * 开关开启后下一首歌 configure 即生效，无需重建播放器。
    *
-   * <p>MD3Music fork: USB 独占时强制禁用 float —— 独占直写路径中 float 无收益
-   * （native 仍需转 DAC 位深），且部分设备 float 解码输出异常（噪音/变速，见
-   * AudioPlayer 的 setEnableAudioFloatOutput(false) 注释）。独占恒走整数 RAW 路径。
+   * <p>独占恒走整数 RAW 路径（float 在直写路径无收益：native 仍需转 DAC 位深；且部分设备
+   * float 解码输出异常，见 AudioPlayer 的 setEnableAudioFloatOutput(false) 注释）。
+   *
+   * <p>非独占时由 32bit 开关决定：开 → 24/32bit 高规格源经 toFloat 处理器走 float32
+   * AudioTrack；关 → 走 toInt16 降为 16bit 整数，任何设备都能正确播放。
+   * 注意：本 fork 构建期 {@code enableFloatOutput} 恒为 false，此处必须显式取或开关标志，
+   * 否则该开关在非独占场景完全失效。
    */
    private boolean floatOutputRequested() {
     if (UsbAudioSinkController.isEnabled()) {
@@ -2352,8 +2369,14 @@ public final class DefaultAudioSink implements AudioSink {
               .setSessionId(audioSessionId)
               .setOffloadedPlayback(outputMode == OUTPUT_MODE_OFFLOAD)
               .build();
-      boolean lowLatencyRequested = DirectPcmController.isLowLatencyEnabled();
-      applyDirectPcmPerformanceMode(audioTrack);
+      // MD3Music fork: offload 轨道不请求 LOW_LATENCY —— 它由 HAL/DSP 直通播放，
+      // performance mode 无意义；同时低延迟档会把缓冲砍半，那是 PCM/fast 通道的诉求，
+      // 与 offload 的「编码帧 50s」缓冲语义冲突。
+      boolean lowLatencyRequested =
+          outputMode != OUTPUT_MODE_OFFLOAD && DirectPcmController.isLowLatencyEnabled();
+      if (outputMode != OUTPUT_MODE_OFFLOAD) {
+        applyDirectPcmPerformanceMode(audioTrack);
+      }
       // MD3Music fork: 回填 AudioTrack 实测值（率/缓冲/延迟/performanceMode），
       // 状态面板与 logcat 摘要据此显示「实际」而非「请求了什么」。
       DirectPcmController.onAudioTrackCreated(audioTrack, lowLatencyRequested);

@@ -9,6 +9,7 @@ import '../../core/build_flags.dart';
 import '../../core/remote/tv_card_focus.dart';
 import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/layout/page_layout.dart';
 import '../../core/utils/app_toast.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/kugou_provider.dart';
@@ -31,7 +32,7 @@ const double _kHeroCoverMax = 320.0;
 /// 可给卡片，于是封面的地板上限约 156 ≈ 0.37 × 420。取 0.36 让动作按钮**落在首屏内**
 /// ——这正是把按钮留在卡片里的前提；再高就要靠滚动才摸得到播放键了。
 /// 更矮的横屏（360 一类）由 [_kLandscapeCoverMin] 兜住可辨识度，差额交给整页
-/// `SingleChildScrollView`：分栏要保证的是右列档位与队列不再被压到一整屏之下。
+/// `SingleChildScrollView`；即将播放队列跟在左列卡片下方。
 const double _kLandscapeCoverHeightFraction = 0.36;
 const double _kLandscapeCoverMin = 120.0;
 
@@ -43,14 +44,14 @@ const double _kLandscapeCoverMin = 120.0;
 const double _kLandscapeHeroMinTextWidth = 160.0;
 
 /// 横屏两栏的左右配比：左列卡片内部横排（封面 + 文字 + 动作按钮），右列只放
-/// 两组切换器与即将播放队列。
+/// 推荐选项卡片；即将播放队列放在左列 FM 卡片下方。
 const int _kTwoPaneLeftFlex = 7;
 const int _kTwoPaneRightFlex = 5;
 
 /// 私人 FM 独立页面。
 ///
 /// UI 采用 Material 3 Expressive（m3e_core）：大封面 hero + 即将播放分段队列，
-/// 档位 / 歌池用 [M3EToggleButtonGroup]，动作钮用 [M3EFilledButton]。
+/// 档位 / 歌池用等宽选择卡片，动作钮用 [M3EFilledButton]。
 /// 业务逻辑（取数、续播、反馈上报、状态持久化、TV 焦点）保持不变。
 ///
 /// 注意：本页只用 `material_ui` + `m3e_core`，**不得**引入
@@ -484,67 +485,71 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => SafeArea(
+    top: false,
+    bottom: false,
+    child: LayoutBuilder(builder: _buildPage),
+  );
+
+  Widget _buildPage(BuildContext context, BoxConstraints constraints) {
     final kugou = Provider.of<KugouProvider>(context);
     final player = Provider.of<PlayerProvider>(context);
     final cs = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
-
-    final isLoggedIn = kugou.isLoggedIn;
     final songs = kugou.personalFmSongs;
     final currentTrack = songs.isNotEmpty ? songs[0] : null;
     final isPlaying =
         player.currentSong?.id == currentTrack?.hash && player.isPlaying;
-
-    final List<KugouSongDetail> sideTracks = songs.length > 1
+    final sideTracks = songs.length > 1
         ? songs.sublist(1).take(_visibleSideCount).toList()
         : const <KugouSongDetail>[];
+    final sideGutter = (constraints.maxWidth - ContentWidth.resolveWidth(
+        context, constraints.maxWidth)) / 2;
 
     return Scaffold(
       appBar: ScrollAwareAppBar(
         title: '私人 FM',
         opaque: true,
         tabId: 'fm',
+        titleSpacing: sideGutter + AppSpacing.lg,
         scrollController: _scrollController,
       ),
-      body: SingleChildScrollView(
-        controller: _scrollController,
-        // 底部叠加系统手势条（小横条）高度，避免末项被压住
-        padding: EdgeInsets.only(
-          left: AppSpacing.lg,
-          right: AppSpacing.lg,
-          top: AppSpacing.md,
-          bottom: AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
-        ),
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(
-              maxWidth: AppLayout.maxContentWidth,
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '实时推荐会根据你的反馈持续更新',
-                  style: textTheme.bodyMedium?.copyWith(
-                    color: cs.onSurfaceVariant.withValues(alpha: 0.6),
-                  ),
+      body: ContentWidth(
+        child: SingleChildScrollView(
+          controller: _scrollController,
+          // 与本地音乐使用同一内容宽度/页边距；保留宿主注入的播放栏占位。
+          padding: EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.md,
+            AppSpacing.lg,
+            AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '实时推荐会根据你的反馈持续更新',
+                style: textTheme.bodyMedium?.copyWith(
+                  color: cs.onSurfaceVariant,
                 ),
-                const Gap(AppSpacing.xl),
-                if (!isLoggedIn)
-                  _buildEmptyState(cs, textTheme)
-                else
-                  _buildRecommendationBody(
-                    cs,
-                    textTheme,
-                    currentTrack,
-                    sideTracks,
-                    isPlaying,
-                  ),
-                const Gap(AppSpacing.xxl),
-              ],
-            ),
+              ),
+              const Gap(AppSpacing.lg),
+              if (!kugou.isLoggedIn)
+                _buildEmptyState(cs, textTheme)
+              else
+                _buildRecommendationBody(
+                  cs,
+                  textTheme,
+                  currentTrack,
+                  sideTracks,
+                  isPlaying,
+                  twoPane:
+                      constraints.maxWidth >= 600 &&
+                      MediaQuery.orientationOf(context) ==
+                          Orientation.landscape,
+                ),
+              const Gap(AppSpacing.lg),
+            ],
           ),
         ),
       ),
@@ -553,28 +558,23 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
 
   /// 登录后的推荐主体：竖屏单栏，横屏两栏。
   ///
-  /// **横屏分栏的动机**：竖屏把「卡片 → 档位 → 队列」竖着摞三块，横屏时视口高度
-  /// 只剩一半出头，队列几乎要到屏幕外才看得见。分栏后左列是完整的「正在播」卡片
-  /// （封面 + 信息 + 动作按钮，内部改横排压缩高度），右列只有两组切换器与即将播放。
+  /// 横屏左列是完整的「正在播」卡片与即将播放，右列是推荐选项卡片；
+  /// 两列顶部对齐，队列与 FM 卡片等宽。竖屏仍按 FM → 推荐选项 → 队列排列。
   ///
   /// **动作按钮留在卡片里**（[wide] 横排，而不是把它们搬去右列）：红心 / 不喜欢 /
   /// 播放控制的就是左列那首歌，和歌名封面同属一个语义块；单独搬走会让卡片变成
   /// 一张只能看的图，操作和对象分处两栏也要眼睛先做配对。
   ///
-  /// 分栏判据只取方向、不看宽度：横屏即分栏（内容区另有 [AppLayout.maxContentWidth]
-  /// 上限，见 [build]），窄横屏也仍有 400dp 以上的可用高度。
+  /// 横屏且局部可用宽度足够才分栏；窄面板回退单栏，避免按整屏方向硬塞两列。
   Widget _buildRecommendationBody(
     ColorScheme cs,
     TextTheme textTheme,
     KugouSongDetail? currentTrack,
     List<KugouSongDetail> sideTracks,
-    bool isPlaying,
-  ) {
-    final bool twoPane =
-        MediaQuery.orientationOf(context) == Orientation.landscape;
-
+    bool isPlaying, {
+    required bool twoPane,
+  }) {
     if (!twoPane) {
-      // 竖屏路径逐字保持原样（含 tv 包装的位置）。
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -583,9 +583,9 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
             isPlaying: isPlaying,
             child: _buildHeroCard(cs, textTheme, currentTrack, isPlaying),
           ),
-          const Gap(AppSpacing.xl),
-          _buildControls(),
-          const Gap(AppSpacing.xl),
+          const Gap(AppSpacing.lg),
+          _buildControls(cs, textTheme),
+          const Gap(AppSpacing.lg),
           _buildUpcomingQueue(cs, textTheme, sideTracks),
         ],
       );
@@ -599,30 +599,31 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
         // 落点就还在这一层（见 [_buildTvTransportKeys]）。
         Expanded(
           flex: _kTwoPaneLeftFlex,
-          child: _buildTvTransportKeys(
-            currentTrack: currentTrack,
-            isPlaying: isPlaying,
-            child: _buildHeroCard(
-              cs,
-              textTheme,
-              currentTrack,
-              isPlaying,
-              wide: true,
-            ),
-          ),
-        ),
-        const Gap(AppSpacing.xl),
-        // ── 右列：档位/歌池 → 即将播放 ──
-        Expanded(
-          flex: _kTwoPaneRightFlex,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildControls(),
-              const Gap(AppSpacing.xl),
-              _buildUpcomingQueue(cs, textTheme, sideTracks),
+              _buildTvTransportKeys(
+                currentTrack: currentTrack,
+                isPlaying: isPlaying,
+                child: _buildHeroCard(
+                  cs,
+                  textTheme,
+                  currentTrack,
+                  isPlaying,
+                  wide: true,
+                ),
+              ),
+              if (sideTracks.isNotEmpty) ...[
+                const Gap(AppSpacing.lg),
+                _buildUpcomingQueue(cs, textTheme, sideTracks),
+              ],
             ],
           ),
+        ),
+        const Gap(AppSpacing.lg),
+        Expanded(
+          flex: _kTwoPaneRightFlex,
+          child: _buildControls(cs, textTheme),
         ),
       ],
     );
@@ -670,61 +671,130 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
 
   // ────────────────────────────── 推荐控制 ──────────────────────────────
 
-  /// 档位（推荐模式）+ 歌池（推荐来源）两组 connected 按钮，水平居中，
-  /// 放在「即将播放」队列上方。
-  Widget _buildControls() {
-    final modeIndex = _modeOptions.indexWhere(
-      (o) => o['value'] == _selectedMode,
+  /// 两组推荐选项共用一张卡片：行首、行尾对齐，每组内的选项等宽。
+  Widget _buildControls(ColorScheme cs, TextTheme textTheme) {
+    return Container(
+      key: const ValueKey('fm-recommendation-controls'),
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      decoration: BoxDecoration(
+        borderRadius: AppRadius.xlAll,
+        color: cs.surfaceContainerLow,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('推荐模式', style: textTheme.titleSmall),
+          const Gap(AppSpacing.md),
+          _buildOptionCards(
+            cs,
+            textTheme,
+            'mode',
+            _modeOptions,
+            _selectedMode,
+            (value) => _selectStrategy(mode: value as String),
+          ),
+          const Gap(AppSpacing.lg),
+          Text('推荐依据', style: textTheme.titleSmall),
+          const Gap(AppSpacing.md),
+          _buildOptionCards(
+            cs,
+            textTheme,
+            'pool',
+            _songPoolOptions,
+            _selectedSongPoolId,
+            (value) => _selectStrategy(songPoolId: value as int),
+          ),
+        ],
+      ),
     );
-    final poolIndex = _songPoolOptions.indexWhere(
-      (o) => o['value'] == _selectedSongPoolId,
-    );
+  }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        // tv: 切换器是连体按钮组，自带焦点节点，靠区域语义导航，不再逐个包
-        // DpadFocusable（避免双停点，与歌手页 Tab 行同口径）。
-        TvScrollRegion(
-          memoryKey: 'tv/fm-mode',
-          child: Center(
-            child: M3EToggleButtonGroup(
-              actions: [
-                for (final o in _modeOptions)
-                  M3EToggleButtonGroupAction(label: Text(o['label'] as String)),
-              ],
-              size: M3EButtonSize.sm,
-              density: M3EButtonGroupDensity.compact,
-              selectedIndex: modeIndex,
-              onSelectedIndexChanged: (index) {
-                if (index == null || index < 0) return;
-                _selectStrategy(mode: _modeOptions[index]['value'] as String);
-              },
-            ),
-          ),
-        ),
-        const Gap(AppSpacing.md),
-        TvScrollRegion(
-          memoryKey: 'tv/fm-pool',
-          child: Center(
-            child: M3EToggleButtonGroup(
-              actions: [
-                for (final o in _songPoolOptions)
-                  M3EToggleButtonGroupAction(label: Text(o['label'] as String)),
-              ],
-              size: M3EButtonSize.sm,
-              density: M3EButtonGroupDensity.compact,
-              selectedIndex: poolIndex,
-              onSelectedIndexChanged: (index) {
-                if (index == null || index < 0) return;
-                _selectStrategy(
-                  songPoolId: _songPoolOptions[index]['value'] as int,
-                );
-              },
-            ),
-          ),
-        ),
-      ],
+  Widget _buildOptionCards(
+    ColorScheme cs,
+    TextTheme textTheme,
+    String group,
+    List<Map<String, dynamic>> options,
+    Object selected,
+    ValueChanged<Object> onSelected,
+  ) {
+    final style = textTheme.labelLarge;
+    return TvScrollRegion(
+      memoryKey: 'tv/fm-$group',
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // 以真实字号计算文字预算，不缩小无障碍字体；窄列放不下时整行换列。
+          double minWidth = 48;
+          for (final option in options) {
+            final painter = TextPainter(
+              text: TextSpan(text: option['label'] as String, style: style),
+              textDirection: Directionality.of(context),
+              textScaler: MediaQuery.textScalerOf(context),
+            )..layout();
+            final width = painter.width + AppSpacing.sm * 2;
+            if (width > minWidth) minWidth = width;
+            painter.dispose();
+          }
+          var columns = options.length;
+          while (columns > 1 &&
+              (constraints.maxWidth - AppSpacing.sm * (columns - 1)) / columns <
+                  minWidth) {
+            columns = columns == 4 ? 2 : 1;
+          }
+          final width =
+              (constraints.maxWidth - AppSpacing.sm * (columns - 1)) / columns;
+          return Wrap(
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.sm,
+            children: [
+              for (final option in options)
+                SizedBox(
+                  width: width,
+                  child: Semantics(
+                    selected: option['value'] == selected,
+                    inMutuallyExclusiveGroup: true,
+                    child: TvCardFocus(
+                      debugLabel: 'fm-$group-${option['value']}',
+                      onSelect: () => onSelected(option['value'] as Object),
+                      child: M3EFilledButton.tonal(
+                        key: ValueKey('fm-$group-${option['value']}'),
+                        onPressed: () => onSelected(option['value'] as Object),
+                        decoration: M3EButtonDecoration(
+                          minimumSize: const Size(0, 48),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.sm,
+                            vertical: AppSpacing.md,
+                          ),
+                          borderRadius: AppRadius.lg,
+                          backgroundColor: WidgetStatePropertyAll(
+                            option['value'] == selected
+                                ? cs.primary
+                                : cs.surfaceContainerHighest,
+                          ),
+                          foregroundColor: WidgetStatePropertyAll(
+                            option['value'] == selected
+                                ? cs.onPrimary
+                                : cs.onSurfaceVariant,
+                          ),
+                        ),
+                        child: Text(
+                          option['label'] as String,
+                          style: style?.copyWith(
+                            color: option['value'] == selected
+                                ? cs.onPrimary
+                                : cs.onSurfaceVariant,
+                          ),
+                          maxLines: 1,
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
+      ),
     );
   }
 
@@ -755,27 +825,28 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
         if (wide) {
           // 封面边长同时受三个预算夹制：竖屏同源的宽度上限、横排的高度预算、
           // 以及「给文字侧留出地板」的宽度预算。
-          final double heightBudget = (MediaQuery.sizeOf(context).height *
-                  _kLandscapeCoverHeightFraction)
-              .clamp(_kLandscapeCoverMin, _kHeroCoverMax);
+          final double heightBudget =
+              (MediaQuery.sizeOf(context).height *
+                      _kLandscapeCoverHeightFraction)
+                  .clamp(_kLandscapeCoverMin, _kHeroCoverMax);
           final double sideBySide =
               inner - AppSpacing.xl - _kLandscapeHeroMinTextWidth;
           final double coverSize = min2(
-            min2(heightBudget, sideBySide > _kLandscapeCoverMin
-                ? sideBySide
-                : _kLandscapeCoverMin),
+            min2(
+              heightBudget,
+              sideBySide > _kLandscapeCoverMin
+                  ? sideBySide
+                  : _kLandscapeCoverMin,
+            ),
             _kHeroCoverMax,
           );
           return Container(
+            key: const ValueKey('fm-hero-card'),
             width: double.infinity,
-            padding: const EdgeInsets.all(AppSpacing.xl),
+            padding: const EdgeInsets.all(AppSpacing.lg),
             decoration: BoxDecoration(
               borderRadius: AppRadius.xlAll,
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [cs.surfaceContainerHigh, cs.surfaceContainerLow],
-              ),
+              color: cs.surfaceContainerLow,
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -799,19 +870,17 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
           );
         }
 
-        final double widthBudget =
-            inner > _kHeroCoverMax ? _kHeroCoverMax : inner;
+        final double widthBudget = inner > _kHeroCoverMax
+            ? _kHeroCoverMax
+            : inner;
 
         return Container(
+          key: const ValueKey('fm-hero-card'),
           width: double.infinity,
           padding: const EdgeInsets.all(AppSpacing.xl),
           decoration: BoxDecoration(
             borderRadius: AppRadius.xlAll,
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [cs.surfaceContainerHigh, cs.surfaceContainerLow],
-            ),
+            color: cs.surfaceContainerLow,
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -861,9 +930,7 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
               : '点击播放，开始为你实时推荐',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: textTheme.bodyMedium?.copyWith(
-            color: cs.onSurfaceVariant,
-          ),
+          style: textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
         ),
         if (currentTrack != null) ...[
           const Gap(AppSpacing.md),
@@ -975,7 +1042,9 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
 
     final Widget dislike = TvCardFocus(
       // tv: 单停点，OK = 原 onTap（不喜欢）。
-      onSelect: currentTrack != null ? () => _handleDislike(currentTrack) : null,
+      onSelect: currentTrack != null
+          ? () => _handleDislike(currentTrack)
+          : null,
       debugLabel: 'fm-dislike',
       child: M3EFilledButton.tonal(
         onPressed: currentTrack != null
@@ -1090,6 +1159,7 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
     if (sideTracks.isEmpty) return const SizedBox.shrink();
 
     return Column(
+      key: const ValueKey('fm-upcoming-queue'),
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
@@ -1107,8 +1177,8 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
               horizontal: AppSpacing.md,
               vertical: AppSpacing.sm,
             ),
-            outerRadius: 24,
-            innerRadius: 8,
+            outerRadius: AppRadius.xl,
+            innerRadius: AppRadius.sm,
             gap: 2,
             color: cs.surfaceContainerLow,
             haptic: M3EHapticFeedback.none,
@@ -1235,7 +1305,11 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
       height: size,
       color: cs.surfaceContainerHighest,
       alignment: Alignment.center,
-      child: Icon(Icons.music_note, size: size * 0.36, color: cs.onSurfaceVariant),
+      child: Icon(
+        Icons.music_note,
+        size: size * 0.36,
+        color: cs.onSurfaceVariant,
+      ),
     );
   }
 }

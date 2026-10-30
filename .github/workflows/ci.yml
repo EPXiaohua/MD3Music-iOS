@@ -300,7 +300,8 @@ jobs:
 
       # 自动创建 Release 并上传 APK（仅 push 到 main/master 时）
       - name: Create CI Release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ci-${{ github.sha }}
@@ -357,6 +358,13 @@ jobs:
         working-directory: kugou_api_server/rust
         run: cargo build --release
 
+      # 注意：CI 产物**不带 3D 封面**（与 main.yml 发布包同口径）。3D 封面在 Windows
+      # 上属可选能力，只在本地开发时用 `scripts\md3.ps1 windows -With3D` 构建：
+      # 那条路径会传 ENABLE_DEPTH_3D / DEPTH_BACKEND 两个 define，并按固定版本 +
+      # SHA256 下载 ONNX Runtime 运行时、把深度模型一起随包。这里不再缓存/下载 ORT，
+      # 也不传 define —— 打包步骤不带 -With3D 时 windows.ps1 还会剔除 Release 里的
+      # 3D 残留（本地 3D 构建留下的 onnxruntime*.dll / depth_model\ 不会被带进 zip）。
+
       - name: Flutter pub get
         run: flutter pub get
 
@@ -389,9 +397,7 @@ jobs:
       - name: Package portable zip
         shell: pwsh
         run: |
-          $ver = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*','' -split '\+')[0]
-          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "md3music-windows-$ver.zip" -CompressionLevel Optimal
-          Get-Item "md3music-windows-$ver.zip" | Select-Object Name,Length
+          ./scripts/tasks/windows.ps1 -PackageOnly -NoPause -OutDir .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -403,7 +409,8 @@ jobs:
 
       # 追加 Windows zip 到 Android job 创建的 CI Release（同一个 tag）
       - name: Append Windows zip to CI Release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ci-${{ github.sha }}

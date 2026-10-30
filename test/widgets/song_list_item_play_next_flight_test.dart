@@ -121,6 +121,39 @@ void main() {
     }
   });
 
+  testWidgets('仅在线歌曲显示添加到歌单，本地歌曲仍可下一首播放', (tester) async {
+    final env = (await tester.runAsync(
+      () => boot(hasCurrentSong: false),
+    ))!;
+    const localSong = Song(
+      id: 'local-menu-target',
+      title: '本地歌曲',
+      artist: '本地歌手',
+      album: '本地专辑',
+      duration: Duration(minutes: 3),
+      localPath: '/music/local-menu-target.mp3',
+    );
+    try {
+      await tester.pumpWidget(env.host(const SongListItem(song: localSong)));
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+      expect(find.text('添加到歌单'), findsNothing);
+      expect(find.text('下一首播放'), findsOneWidget);
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      await tester.pumpWidget(env.host(SongListItem(song: song)));
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+      expect(find.text('添加到歌单'), findsOneWidget);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await env.dispose(tester);
+    }
+  });
+
   testWidgets('降级路径：无播放歌曲 → 不收缩不飞行，旧行为 pop+toast',
       (tester) async {
     final env = (await tester.runAsync(

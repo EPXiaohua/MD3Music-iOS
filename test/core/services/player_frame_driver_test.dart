@@ -43,6 +43,22 @@ void main() {
     }
   });
 
+  testWidgets('inactive 可见失焦时仍保持帧驱动运行', (tester) async {
+    final driver = PlayerFrameDriver.instance;
+    void noop() {}
+    try {
+      driver.addListener(noop);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      expect(driver.isRunning, isTrue);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      expect(driver.isRunning, isFalse);
+    } finally {
+      driver.removeListener(noop);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    }
+  });
+
   testWidgets('挂起期间订阅清空，回前台后不得空转', (tester) async {
     final driver = PlayerFrameDriver.instance;
     void noop() {}

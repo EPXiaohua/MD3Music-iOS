@@ -17,6 +17,8 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
@@ -36,6 +38,7 @@ import 'renderers/emphasize_effect.dart';
 import 'renderers/interlude_dots.dart';
 import 'renderers/line_renderer.dart';
 import 'renderers/word_renderer.dart';
+import 'utils/lyric_line_color.dart';
 
 /// 行形变 scale 的可读下限，保证 `fontSize × scale` 不跌破字重对应的字号下限。
 double _minLegibleLineScale(double fontSize) {
@@ -93,8 +96,9 @@ class AppleLyricsView extends StatefulWidget {
   /// 专辑封面提取色（动态字体颜色用，仅 AM 播放器传入）。
   ///
   /// 非 null 且 [LyricPreferences.useDynamicLyricColor] 开启且 [forceDarkBackground]
-  /// 为 true 时，当前行歌词颜色按「70% 白 + 30% 提取色」混色；
-  /// 非当前行保持默认白色不变。
+  /// 为 true 时，当前行歌词颜色按「白色 + 提取色 ×
+  /// [LyricPreferences.dynamicColorMixRatio]」混色（默认 15% 提取色）；
+  /// 非当前行保持默认歌词色，除非 [LyricPreferences.useAboveLinesPlayedColor] 开启。
   final Color? accentColor;
 
   /// 歌曲 BPM（节拍/分钟），可空。
@@ -326,6 +330,10 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   @visibleForTesting
   bool get ecoTimerActiveForTest => _ecoDriverBound;
 
+  /// 滚动控制器（仅测试用：验证鼠标滚轮滚动与 5s 自动回弹）。
+  @visibleForTesting
+  LyricScrollController get scrollControllerForTest => _scrollController;
+
   // P0-A：驱动源可见性门控状态。
   //
   // Ticker 由 TickerMode/引擎自动 mute，但 eco Timer 不受任何可见性约束——
@@ -370,6 +378,27 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           ? _reusedPerLineScales[i]
           : double.nan;
 
+  /// 当前滚动弹簧位置。仅测试用：验证快速连切兜底把 posY 直接瞬移到目标。
+  @visibleForTesting
+  double get scrollPosYForTest => _scrollController.posY;
+
+  /// 当前滚动弹簧目标。仅测试用：与 [scrollPosYForTest] 相等即代表已直接到位。
+  @visibleForTesting
+  double get scrollTargetForTest => _scrollController.currentTarget;
+
+  /// 最近一次切行是否走了快速兜底。仅测试用。
+  @visibleForTesting
+  bool get lastSwitchWasFastForTest => _lastSwitchWasFast;
+
+  /// 第 i 行 WordRenderer 上一次绘制算出的 sweep（扫光）前端位置（行内坐标）。
+  ///
+  /// 仅测试用：验证 [LyricFillMode.sweep] 下前端非负且随播放进度向右推进。
+  /// 该行尚无渲染器（未绘制/非逐字行）时返回 NaN。
+  @visibleForTesting
+  double sweepFrontForTest(int i) =>
+      // ignore: invalid_use_of_visible_for_testing_member
+      _wordRenderers[i]?.sweepFrontDebug ?? double.nan;
+
   /// P1-C：上次间奏检测时的权威播放时间（毫秒）。
   ///
   /// 间奏检测只依赖 currentTimeMs（positionStream 约 200ms 更新一次），
@@ -379,12 +408,19 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   int _lastInterludeCheckTimeMs = -1;
 
   // ============== 动态字体颜色（仅 AM 播放器，默认关闭） ==============
-  // 开启后当前行歌词颜色按「70% 白 + 30% 封面提取色」混色，
-  // 非当前行保持默认白色。颜色由 build 根据 accentColor 计算一次，
-  // _onTick 与 painter 每帧读取，避免每帧 Color.lerp 分配。
+  // 开启后当前行歌词颜色按「白色 + 封面提取色 × 混色比例」混色，
+  // 非当前行保持默认歌词色（除非「上方行使用已播颜色」开关开启）。
+  // 颜色由 build 根据 accentColor 计算一次，_onTick 与 painter 每帧读取，
+  // 避免每帧 Color.lerp 分配。
 
-  /// 当前行动态字体颜色（ARGB int），null 表示不使用（回退默认白色）。
+  /// 当前行动态字体颜色（ARGB int），null 表示不使用（回退默认歌词色）。
   int? _activeLineColorValue;
+
+  /// 上方行使用的颜色覆盖值（ARGB int），null 表示不覆盖。
+  ///
+  /// 仅当「上方行使用已播颜色」开关开启且 [_activeLineColorValue] 非空时
+  /// 等于 [_activeLineColorValue]，否则为 null（上方行沿用默认歌词色）。
+  int? _aboveLineColorValue;
 
   // overscan 视口缓冲行数：pad 端 15、手机端 10。在 build 中根据最短边更新
   int _overscan = 10;
@@ -565,6 +601,43 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 级联瀑布向上覆盖的可见行上限：起点不低于 currentLineIndex - K，
   /// 避免极端滚动/切歌跳变时起点过低拖出全屏。
   static const int _cascadeTopLimit = 8;
+
+  // ============== 快速连切兜底 ==============
+
+  /// 当前行切换间隔小于该值（ms）时视为一次快速切行。
+  ///
+  /// 单次快速切行仍走弹簧（快歌偶发的密集行不应硬切）；只有**连续两次及以上**
+  /// 快速切行才启动兜底。级联延迟（60~750ms）在连续快速切行时永远等不到释放，
+  /// 等待行被抵消量一直钉住，表现为整块歌词「卡住」；此时直接瞬移到新行位置。
+  static const double _fastSwitchThresholdMs = 300;
+
+  /// 连续快速切行次数（间隔 < [_fastSwitchThresholdMs]）。
+  ///
+  /// 每次切行按当前间隔递增或清零；>= 2 时才走快速兜底。
+  int _consecutiveFastSwitches = 0;
+
+  /// 上一次检测到当前行索引变化的单调帧时钟（ms），-1 表示尚未记录。
+  double _lastLineSwitchFrameMs = -1;
+
+  /// 独立于 Ticker 生命周期的单调帧时钟（ms）。
+  ///
+  /// `Ticker` 停止后重启会把 `elapsed` 归零（[_startTickerIfNeeded] 同步重置
+  /// `_lastElapsed`），直接用它测切行间隔会在非逐字歌词「停帧省电」场景
+  /// 失效；本值每帧累加 dt，跨 Ticker 重启保持单调。
+  double _frameClockMs = 0;
+
+  /// 最近一次切行是否走了快速兜底（仅测试用）。
+  bool _lastSwitchWasFast = false;
+
+  /// 缩放弹簧上一帧覆盖的窗口 [_scaleWindowStart, _scaleWindowEnd)。
+  ///
+  /// 窗口外行在离开窗口时已被钉到稳态，后续帧只需处理「本帧离开窗口」的行，
+  /// 不必每帧遍历全部歌词行。
+  int _scaleWindowStart = 0;
+  int _scaleWindowEnd = 0;
+
+  /// 上一帧的缩放稳态值，用于检测 steady 变化（字体大小 / enableScale）。
+  double _lastScaleSteady = double.nan;
 
   /// 预计算每行实际高度（含自动换行）。
   ///
@@ -1085,9 +1158,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 所有行的 scale 弹簧是否已收敛（供停 Ticker 判定）。
   ///
   /// 每行独立持有 scale 弹簧后，离场/进场的缩放动画未收敛前不能停 Ticker。
+  /// 只检查当前行 ± overscan 窗口：窗口外弹簧在离开窗口时已被钉到稳态，
+  /// 无需每帧遍历全表（长歌词 200+ 行时是纯白耗）。
   bool _arePerLineScalesConverged() {
-    for (final s in _perLineScaleSprings.values) {
-      if (!s.isSettled) return false;
+    final int len = widget.lines.length;
+    final int startI = math.max(0, _currentLineIndex - _overscan);
+    final int endI = math.min(len, _currentLineIndex + _overscan);
+    for (int i = startI; i < endI; i++) {
+      final Spring? s = _perLineScaleSprings[i];
+      if (s != null && !s.isSettled) return false;
     }
     return true;
   }
@@ -1103,7 +1182,9 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 只推进当前行 ± overscan 窗口内的行（与 renderer/偏移同范围）；
   /// 窗口外的行钉在稳态 inactive——绘制按视口裁剪，与当前行无关，用户手动
   /// 滚动到远处时窗口外行不能停留在建表初始值 1.0（否则出现"没缩小"的行）。
-  bool _tickPerLineScales(double dt) {
+  ///
+  /// [snap] 为 true（快速连切兜底）时不做弹簧推进，窗口内直接瞬变到目标。
+  bool _tickPerLineScales(double dt, {bool snap = false}) {
     final int len = widget.lines.length;
     final double active = LyricLayout.activeScale;
     final double inactive = widget.enableScale
@@ -1117,6 +1198,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     final double steady = math.max(inactive, minLegible);
     if (_reusedPerLineScales.length != len) {
       _reusedPerLineScales = List<double>.filled(len, steady);
+      _scaleWindowStart = 0;
+      _scaleWindowEnd = 0;
     }
     final int overscan = _overscan;
     final int startI = math.max(0, _currentLineIndex - overscan);
@@ -1131,15 +1214,24 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         // 首次创建直接落在目标，避免从默认 1.0 一路动画到目标造成"飘"
         initialPosition: target,
       );
-      // 目标变化时 setTarget：行切换触发放大/缩小的连贯过渡
-      if (spring.target != target) {
-        spring.setTarget(target);
+      if (snap) {
+        // 快速连切兜底：跳过弹簧，直接落在目标
+        spring.setPosition(target, 0);
+      } else {
+        // 目标变化时 setTarget：行切换触发放大/缩小的连贯过渡
+        if (spring.target != target) {
+          spring.setTarget(target);
+        }
+        if (!spring.isSettled) {
+          spring.tick(dt);
+          anyChanged = true;
+        }
       }
-      if (!spring.isSettled) {
-        spring.tick(dt);
+      final double display = math.max(spring.position, minLegible);
+      if (_reusedPerLineScales[i] != display) {
+        _reusedPerLineScales[i] = display;
         anyChanged = true;
       }
-      _reusedPerLineScales[i] = math.max(spring.position, minLegible);
     }
     // 窗口外的行钉在稳态 inactive。窗口只覆盖当前行 ± overscan，绘制却按
     // 视口裁剪——用户手动滚动到远离当前行的区域（或大屏/小字号使视口超出
@@ -1147,14 +1239,23 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // activeScale(1.0)，显示成"没缩小"的行。
     // 同时把窗口外已存在的弹簧瞬移到稳态（setPosition），否则该行重新进入
     // 窗口时会从旧位置（如曾作为当前行的 1.0）先弹回再缩，硬切穿帮。
-    // 钉住是幂等的：值已等于稳态时 anyChanged 不置位、弹簧保持 settled，
-    // 不会阻止 Ticker 收敛停帧。
-    for (int i = 0; i < startI; i++) {
-      if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
+    //
+    // 性能：只处理「上一帧窗口内、本帧已离开窗口」的行（O(离开行数)），
+    // 不再每帧遍历全部歌词行；steady 变化（字体大小 / enableScale）时整表兜底。
+    if (steady != _lastScaleSteady) {
+      _lastScaleSteady = steady;
+      for (int i = 0; i < len; i++) {
+        if (i >= startI && i < endI) continue;
+        if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
+      }
+    } else {
+      for (int i = _scaleWindowStart; i < _scaleWindowEnd && i < len; i++) {
+        if (i >= startI && i < endI) continue;
+        if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
+      }
     }
-    for (int i = endI; i < len; i++) {
-      if (_pinLineScaleToSteady(i, steady)) anyChanged = true;
-    }
+    _scaleWindowStart = startI;
+    _scaleWindowEnd = endI;
     return anyChanged;
   }
 
@@ -1162,6 +1263,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 瞬移到稳态（position = target = steady、速度 0、settled）。
   /// 返回显示值是否发生变化（供重绘门控；幂等钉住返回 false）。
   bool _pinLineScaleToSteady(int i, double steady) {
+    if (i < 0 || i >= _reusedPerLineScales.length) return false;
     bool changed = false;
     final Spring? spring = _perLineScaleSprings[i];
     if (spring != null && (spring.target != steady || !spring.isSettled)) {
@@ -1223,6 +1325,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// - WordRenderer/LineRenderer 内部绑定：清空 _wordRenderers/_lineRenderers,
   ///   让它们用新字体重新测量 word 宽度（_ensureBound）并重置 alpha 状态
   void _onPreferencesChanged() {
+    // 辉光触发阈值随偏好即时重算（判定方式 / 固定时长 / 系数变化后立即生效，
+    // 无需等切歌；resolveThresholdMs 为纯计算，成本可忽略）
+    final int newGlowThresholdMs = EmphasizeEffect.resolveThresholdMs(
+      lines: widget.lines,
+      songBpm: widget.songBpm,
+    );
+    if (newGlowThresholdMs != _glowThresholdMs) {
+      _glowThresholdMs = newGlowThresholdMs;
+    }
     // 字体/字重变化时失效所有依赖字体测量的缓存
     final currentFontFamily = LyricLayout.fontFamily;
     final currentFontWeight = LyricLayout.fontWeight.value;
@@ -1448,6 +1559,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // 避免 DateTime.now() 在测试中返回真实墙钟时间导致弹簧不推进。
     double dt = (elapsed - _lastElapsed).inMicroseconds / 1000000.0;
     _lastElapsed = elapsed;
+    // 单调帧时钟：跨 Ticker 重启保持连续（见字段注释）
+    _frameClockMs += dt * 1000;
 
     // 检测 Ticker 曾被 mute（TabBarView 切走 / App 退后台 / 长时间卡顿）：
     // 恢复后首帧 dt 会等于切走时长（远大于正常帧间隔）。mute 期间
@@ -1531,6 +1644,23 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // 1.5 行切换副行交接 + 收起推进（必须在下方 renderer 注入与滚动目标
     // 计算之前执行，保证本帧渲染用的就是交接后的进度，切换帧视觉与上一帧
     // 严格连续，不存在"旧副行闪一帧再消失"的中间态）。
+    //
+    // 快速连切兜底判定：连续两次及以上「切换间隔 < 300ms」才跳过弹簧直接到位。
+    // 单次快速切行仍走弹簧，避免正常快歌的个别密集行被硬切；连续快速切行时
+    // 级联延迟 60~750ms 永远等不到释放，等待行被抵消量一直钉住 → 整块歌词卡住。
+    bool fastLineSwitch = false;
+    if (_currentLineIndex != _previousLineIndex) {
+      final double nowMs = _frameClockMs;
+      final double lastMs = _lastLineSwitchFrameMs;
+      final bool quickGap =
+          lastMs >= 0 && nowMs - lastMs >= 0 &&
+          nowMs - lastMs < _fastSwitchThresholdMs;
+      _consecutiveFastSwitches = quickGap ? _consecutiveFastSwitches + 1 : 0;
+      // 首次切行（lastMs < 0）计数为 0；连续 >= 2 次才启用兜底
+      fastLineSwitch = _consecutiveFastSwitches >= 2;
+      _lastLineSwitchFrameMs = nowMs;
+      _lastSwitchWasFast = fastLineSwitch;
+    }
     if (_currentLineIndex != _previousLineIndex) {
       // 上一行副行收起登记：从当前展开进度继续收（c0 = 1 - p），
       // 收起起点 = 切换瞬间的副行实际位置，无跳变。
@@ -1563,11 +1693,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           ? _transCollapsing.remove(_currentLineIndex)
           : null;
       _translationExpandProgress = resume != null ? 1.0 - resume : 0.0;
+      // 快速连切时副行过渡不可能完成（450ms~1s），残留收起表只会让
+      // _transDeltaBefore/_transExtraHeightFor 每帧多算，直接清空，
+      // 展开进度在步骤 7.5 直接落到目标。
+      if (fastLineSwitch) _transCollapsing.clear();
     }
     // 退场行副行收起推进：暂停时也推进（UI 过渡而非播放驱动），收完移除，
     // 保证 animConverged 判定与静态停帧不被残留占位阻塞。
     // 快连切时旧条目沿用最新过渡速率（近似，多条目仅在极快连切时短暂共存）。
-    if (_transCollapsing.isNotEmpty) {
+    if (!fastLineSwitch && _transCollapsing.isNotEmpty) {
       final double collapseDecay = 1 - math.exp(-_transSwitchRate * dt);
       final List<int> done = <int>[];
       _transCollapsing.forEach((k, v) {
@@ -1627,13 +1761,16 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         // 间奏激活或占位还在收起时都用柔和 spring（stiffness=40, damping=10），
         // 让歌词跟随占位收起时有阻尼感而非瞬移
         isInterludeActive: _interludeExpandProgress > 0.01,
+        // 快速连切兜底：直接切到新行位置，不做弹簧过渡
+        snap: fastLineSwitch,
       );
     }
     _scrollController.tick(dt);
 
     // 3. 推进每行独立的 scale 弹簧（离场缩 0.850 / 进场放 1.0，均连贯）
     // 返回是否有缩放动画仍在进行，供下方重绘门控与收敛判定使用。
-    final bool anyScaleChanged = _tickPerLineScales(dt);
+    // 快速连切帧直接瞬变到目标，不做弹簧推进。
+    final bool anyScaleChanged = _tickPerLineScales(dt, snap: fastLineSwitch);
 
     // 4. 推进每行的 renderer
     // 性能优化：只 tick 视口附近的行（前后各 15 行），避免 200+ 行全量 tick。
@@ -1657,6 +1794,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
                 ? LyricLayout.inactiveScale
                 : LyricLayout.activeScale);
       final bool useWordRenderer = isActive && line.hasWordTiming;
+      // 行级文字颜色覆盖：当前行用高亮色；上方已播行由独立开关决定
+      // （开关关闭时 [_aboveLineColorValue] 为 null，不覆盖）。两个渲染器
+      // 都只在需要覆盖时才拿到非 null 值（LineRenderer 不再自行按 isActive 门控）。
+      final int? lineColorValue = lineColorOverrideValue(
+        activeLineColorValue: _activeLineColorValue,
+        aboveLineColorValue: _aboveLineColorValue,
+        isActive: isActive,
+        isAboveCurrent: i < _currentLineIndex,
+      );
       // 纯文本歌词无时间轴时强制关闭高斯模糊
       final bool blurActive =
           hasTimestamps && LyricPreferences.instance.useGaussianBlur;
@@ -1677,7 +1823,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           scale: scale,
           blurFade: _blurFade,
           blurActive: blurActive,
-          activeColorValue: _activeLineColorValue,
+          activeColorValue: lineColorValue,
         );
         // 用平滑时间驱动逐字动画（上浮/字内渐变），避免 positionStream 5fps 卡顿
         // isPlaying 用于冻结自驱动波浪：暂停/未就绪时波浪不推进，防止辉光持续
@@ -1715,7 +1861,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           scale: scale,
           blurFade: _blurFade,
           blurActive: blurActive,
-          activeColorValue: _activeLineColorValue,
+          activeColorValue: lineColorValue,
         );
         renderer.tick(dt);
         if (!renderer.isConverged) anyRendererAnimating = true;
@@ -1804,19 +1950,24 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         LyricPreferences.instance.showTranslation &&
         _lineHasAuxText(_currentLineIndex);
     final double transExpandTarget = transVisible ? 1.0 : 0.0;
-    final double transRate = _transCollapsing.isNotEmpty
-        ? _transSwitchRate
-        : (_currentLineIndex >= 0 && _lineHasAuxText(_currentLineIndex)
-              ? _fadeRateForMs(widget.lines[_currentLineIndex].duration)
-              : 14.0);
-    _translationExpandProgress +=
-        (transExpandTarget - _translationExpandProgress) *
-        (1 - math.exp(-transRate * dt));
-    if (_translationExpandProgress < 0.001) _translationExpandProgress = 0;
+    if (fastLineSwitch) {
+      // 快速连切兜底：副行过渡不可能完成，直接落到目标高度，
+      // 保证行定位（_transExtraHeightFor/_transDeltaBefore）与视觉同步
+      _translationExpandProgress = transExpandTarget;
+    } else {
+      final double transRate = _transCollapsing.isNotEmpty
+          ? _transSwitchRate
+          : (_currentLineIndex >= 0 && _lineHasAuxText(_currentLineIndex)
+                ? _fadeRateForMs(widget.lines[_currentLineIndex].duration)
+                : 14.0);
+      _translationExpandProgress +=
+          (transExpandTarget - _translationExpandProgress) *
+          (1 - math.exp(-transRate * dt));
+      if (_translationExpandProgress < 0.001) _translationExpandProgress = 0;
+    }
 
     // 8. 级联弹簧延迟：检测当前行切换，从限幅后的视口顶部行自上而下错峰牵引
     if (_currentLineIndex >= 0 && _currentLineIndex != _previousLineIndex) {
-      final now = _lastElapsed.inMicroseconds / 1000.0;
       // 行切换时不再手动 reset scale：新当前行切换前作为非当前行已 settle 在
       // inactiveScale，_tickPerLineScales 下一帧检测到 target 变 activeScale，
       // 会自然从 0.850 弹到 1.0；离场行 target 变 inactiveScale，从 1.0 平滑缩回。
@@ -1853,113 +2004,128 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       } else {
         _entryBlurProgress = 1.0;
       }
-      _cascadeTopLine = _computeCascadeTopLine(); // 缓存起点（含限幅）
-      // 上一轮仍在等待期的行：先用旧基准把抵消量结算进弹簧基数，再重置基准。
-      // 快歌切换间隔小于等待期（≤280ms）时，若直接重置 _cascadePosY，
-      // 这些行的有效偏移会瞬间回跳一个 holdOffset —— 又一次瞬移。
-      final double pendingHold = _cascadePosY - _scrollController.posY;
-      if (pendingHold.abs() > 0.01 && _delayStartTimes.isNotEmpty) {
-        for (final k in _delayStartTimes.keys.toList()) {
-          if (_delayStartTimes[k]! >= 0) {
-            final s = _perLineSpringFor(k);
-            s.setPosition(s.position + pendingHold, 0);
-            s.setTarget(0);
-            _delayStartTimes[k] = -1;
+      if (fastLineSwitch) {
+        // 快速连切兜底：跳过级联登记（延迟 60~750ms 永远等不到释放），
+        // 直接把全部偏移弹簧归零、抵消基准对齐当前位置。
+        _cascadeTopLine = math.max(0, _currentLineIndex - _cascadeTopLimit);
+        _delayStartTimes.clear();
+        for (final s in _perLineSprings.values) {
+          s.setPosition(0, 0);
+        }
+        _cascadePosY = _scrollController.posY;
+      } else {
+        final double now = _lastElapsed.inMicroseconds / 1000.0;
+        _cascadeTopLine = _computeCascadeTopLine(); // 缓存起点（含限幅）
+        // 上一轮仍在等待期的行：先用旧基准把抵消量结算进弹簧基数，再重置基准。
+        // 快歌切换间隔小于等待期（≤280ms）时，若直接重置 _cascadePosY，
+        // 这些行的有效偏移会瞬间回跳一个 holdOffset —— 又一次瞬移。
+        final double pendingHold = _cascadePosY - _scrollController.posY;
+        if (pendingHold.abs() > 0.01 && _delayStartTimes.isNotEmpty) {
+          for (final k in _delayStartTimes.keys.toList()) {
+            if (_delayStartTimes[k]! >= 0) {
+              final s = _perLineSpringFor(k);
+              s.setPosition(s.position + pendingHold, 0);
+              s.setTarget(0);
+              _delayStartTimes[k] = -1;
+            }
           }
         }
-      }
-      // 记录抵消基准：等待期内该行偏移 = 本值 − 当前 posY，即停在切换瞬间的位置。
-      // 本帧两者相等 → 抵消量为 0 → 有效偏移等于上一帧残留，不存在瞬时位移。
-      _cascadePosY = _scrollController.posY;
-      final int startI = _cascadeTopLine;
-      final int endI = math.min(
-        widget.lines.length,
-        _currentLineIndex + _overscan,
-      );
-      // 只登记延迟起点，**绝不 setPosition 播种偏移**：
-      // 旧实现 `spring.setPosition(offset, 0)` 是瞬时赋值，切换帧整块歌词
-      // 会先向下抖最多一个行距的固定比例、再逐行弹回，形成"两段动画 + 瞬移"。
-      // 上一轮残留的弹簧值原样保留，释放时叠加进新起点，保证连续。
-      // 「错峰从当前行开始」开启时：错峰起点 = 当前行再往上一行（上一行
-      // delay=0 领头回位，当前行带一步延迟跟随），其上方行立即释放（-1），
-      // 不参与「按住等错峰」，随全局滚动同步回位。首行时起点即当前行。
-      if (LyricPreferences.instance.staggerFromCurrentLine) {
-        final int staggerStartLine = math.max(0, _currentLineIndex - 1);
-        for (int i = startI; i < endI; i++) {
-          _delayStartTimes[i] = i < staggerStartLine ? -1 : now;
+        // 记录抵消基准：等待期内该行偏移 = 本值 − 当前 posY，即停在切换瞬间的位置。
+        // 本帧两者相等 → 抵消量为 0 → 有效偏移等于上一帧残留，不存在瞬时位移。
+        _cascadePosY = _scrollController.posY;
+        final int startI = _cascadeTopLine;
+        final int endI = math.min(
+          widget.lines.length,
+          _currentLineIndex + _overscan,
+        );
+        // 只登记延迟起点，**绝不 setPosition 播种偏移**：
+        // 旧实现 `spring.setPosition(offset, 0)` 是瞬时赋值，切换帧整块歌词
+        // 会先向下抖最多一个行距的固定比例、再逐行弹回，形成"两段动画 + 瞬移"。
+        // 上一轮残留的弹簧值原样保留，释放时叠加进新起点，保证连续。
+        // 「错峰从当前行开始」开启时：错峰起点 = 当前行再往上一行（上一行
+        // delay=0 领头回位，当前行带一步延迟跟随），其上方行立即释放（-1），
+        // 不参与「按住等错峰」，随全局滚动同步回位。首行时起点即当前行。
+        if (LyricPreferences.instance.staggerFromCurrentLine) {
+          final int staggerStartLine = math.max(0, _currentLineIndex - 1);
+          for (int i = startI; i < endI; i++) {
+            _delayStartTimes[i] = i < staggerStartLine ? -1 : now;
+          }
+        } else {
+          for (int i = startI; i < endI; i++) {
+            _delayStartTimes[i] = now;
+          }
         }
-      } else {
-        for (int i = startI; i < endI; i++) {
-          _delayStartTimes[i] = now;
-        }
+        // 清除起点以下(视口外/限幅外)与过旧的延迟记录
+        _delayStartTimes.removeWhere((k, _) => k < startI);
       }
-      // 清除起点以下(视口外/限幅外)与过旧的延迟记录
-      _delayStartTimes.removeWhere((k, _) => k < startI);
     }
     _previousLineIndex = _currentLineIndex;
 
     // 推进每行偏移弹簧（自上而下瀑布：从 _cascadeTopLine 开始）
     // 性能优化：只覆盖 [_cascadeTopLine, currentLineIndex + overscan] 视口内行，
     // 视口外的行弹簧偏移对渲染不可见，无需每帧推进。
-    final int springStartI = _cascadeTopLine;
-    final int springEndI = math.min(
-      widget.lines.length,
-      _currentLineIndex + overscan,
-    );
+    // 快速连切兜底帧：偏移已全部归零、延迟表已清空，整段级联计算直接跳过。
     // P1-G: 顺带聚合"弹簧偏移是否有显著变化（>0.5px）"，替代
     // _hasPerLineOffsetChanged 的二次 O(N) 遍历。仅检查视口内行——
     // 视口外行偏移对渲染不可见，无需触发重绘。
     bool anySpringOffsetChanged = false;
-    // AMLL 风格级联延迟：delayMs 为逐行累积延迟，baseStepMs 为当前错峰步长。
-    // 步长 / 上限 / 衰减均可由用户在设置页"歌词动画"调节（无极）。
-    // 循环外读一次偏好，避免每帧重复访问。
-    final double cascadeMaxDelay = LyricPreferences.instance.cascadeMaxDelayMs;
-    final double cascadeBaseStep = LyricPreferences.instance.cascadeBaseStepMs;
-    final double cascadeDecay = LyricPreferences.instance.cascadeStepDecay;
-    final bool staggerFromCurrent =
-        LyricPreferences.instance.staggerFromCurrentLine;
-    // 错峰起点行：开启 = 当前行再往上一行（上一行领头回位）；关闭 = 视口
-    // 顶部行（此时累加不受起点门控，见下方 delayMs 累加条件）。
-    final int staggerStartLine = staggerFromCurrent
-        ? math.max(0, _currentLineIndex - 1)
-        : _cascadeTopLine;
-    double delayMs = 0;
-    double baseStepMs = cascadeBaseStep;
     final double posYNow = _scrollController.posY;
-    final double nowMs = _lastElapsed.inMicroseconds / 1000.0;
-    // 抵消量：切换帧为 0，随全局 posY 上移而增大（= 该行"本该已经走掉"的距离）
-    final double holdOffset = _cascadePosY - posYNow;
-    for (int i = springStartI; i < springEndI; i++) {
-      final double lineDelay = math.min(delayMs, cascadeMaxDelay);
-      final double? start = _delayStartTimes[i];
-      final bool held = start != null && start >= 0;
-      if (held && (nowMs - start) >= lineDelay) {
-        // 延迟到期 → 释放：弹簧起点 = 残留值 + 当前抵消量，目标 0。
-        // 从抵消量接着弹回，而不是从 0 重新跳过去，保证整条曲线连续。
-        final s = _perLineSpringFor(i);
-        s.setPosition(s.position + holdOffset, 0);
-        s.setTarget(0);
-        _delayStartTimes[i] = -1;
-      } else if (!held) {
-        // 已释放（或从未参与级联）：正常推进弹簧直到收敛。
-        // 等待期内刻意不 tick —— 弹簧冻结在残留基数上，作为释放时的起点。
-        _perLineSprings[i]?.tick(dt);
-      }
-      if (i < _reusedPerLineOffsets.length &&
-          (_effectiveLineOffset(i) - _reusedPerLineOffsets[i]).abs() > 0.5) {
-        anySpringOffsetChanged = true;
-      }
-      // 为下一行累加本轮步长；且越过当前行后，步长对本轮下一次使用递减。
-      // AMLL 语义：先累加本行（当前行用未衰减步长），再衰减供下一行使用
-      // （baseDelay *= 1/1.05），实现"越过当前行后先密后疏、总延迟收敛"。
-      // 「错峰从当前行开始」开启时：起点行（当前行-1）之前的行不累加延迟
-      // ——起点行 delay=0，当前行带一步延迟，向下逐行递增（上方行即使有
-      // 残留登记也早已释放，累加值无效）。
-      if (!staggerFromCurrent || i >= staggerStartLine) {
-        delayMs += baseStepMs;
-      }
-      if (i >= _currentLineIndex) {
-        baseStepMs *= cascadeDecay;
+    if (!fastLineSwitch) {
+      final int springStartI = _cascadeTopLine;
+      final int springEndI = math.min(
+        widget.lines.length,
+        _currentLineIndex + overscan,
+      );
+      // AMLL 风格级联延迟：delayMs 为逐行累积延迟，baseStepMs 为当前错峰步长。
+      // 步长 / 上限 / 衰减均可由用户在设置页"歌词动画"调节（无极）。
+      // 循环外读一次偏好，避免每帧重复访问。
+      final double cascadeMaxDelay = LyricPreferences.instance.cascadeMaxDelayMs;
+      final double cascadeBaseStep = LyricPreferences.instance.cascadeBaseStepMs;
+      final double cascadeDecay = LyricPreferences.instance.cascadeStepDecay;
+      final bool staggerFromCurrent =
+          LyricPreferences.instance.staggerFromCurrentLine;
+      // 错峰起点行：开启 = 当前行再往上一行（上一行领头回位）；关闭 = 视口
+      // 顶部行（此时累加不受起点门控，见下方 delayMs 累加条件）。
+      final int staggerStartLine = staggerFromCurrent
+          ? math.max(0, _currentLineIndex - 1)
+          : _cascadeTopLine;
+      double delayMs = 0;
+      double baseStepMs = cascadeBaseStep;
+      final double nowMs = _lastElapsed.inMicroseconds / 1000.0;
+      // 抵消量：切换帧为 0，随全局 posY 上移而增大（= 该行"本该已经走掉"的距离）
+      final double holdOffset = _cascadePosY - posYNow;
+      for (int i = springStartI; i < springEndI; i++) {
+        final double lineDelay = math.min(delayMs, cascadeMaxDelay);
+        final double? start = _delayStartTimes[i];
+        final bool held = start != null && start >= 0;
+        if (held && (nowMs - start) >= lineDelay) {
+          // 延迟到期 → 释放：弹簧起点 = 残留值 + 当前抵消量，目标 0。
+          // 从抵消量接着弹回，而不是从 0 重新跳过去，保证整条曲线连续。
+          final s = _perLineSpringFor(i);
+          s.setPosition(s.position + holdOffset, 0);
+          s.setTarget(0);
+          _delayStartTimes[i] = -1;
+        } else if (!held) {
+          // 已释放（或从未参与级联）：正常推进弹簧直到收敛。
+          // 等待期内刻意不 tick —— 弹簧冻结在残留基数上，作为释放时的起点。
+          _perLineSprings[i]?.tick(dt);
+        }
+        if (i < _reusedPerLineOffsets.length &&
+            (_effectiveLineOffset(i) - _reusedPerLineOffsets[i]).abs() > 0.5) {
+          anySpringOffsetChanged = true;
+        }
+        // 为下一行累加本轮步长；且越过当前行后，步长对本轮下一次使用递减。
+        // AMLL 语义：先累加本行（当前行用未衰减步长），再衰减供下一行使用
+        // （baseDelay *= 1/1.05），实现"越过当前行后先密后疏、总延迟收敛"。
+        // 「错峰从当前行开始」开启时：起点行（当前行-1）之前的行不累加延迟
+        // ——起点行 delay=0，当前行带一步延迟，向下逐行递增（上方行即使有
+        // 残留登记也早已释放，累加值无效）。
+        if (!staggerFromCurrent || i >= staggerStartLine) {
+          delayMs += baseStepMs;
+        }
+        if (i >= _currentLineIndex) {
+          baseStepMs *= cascadeDecay;
+        }
       }
     }
 
@@ -2327,6 +2493,32 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     );
   }
 
+  /// 鼠标滚轮滚动（Windows 桌面）：滚轮事件不走拖拽手势竞技场，
+  /// 必须 Listener.onPointerSignal 显式接收。
+  ///
+  /// 方向语义：scrollDelta.dy > 0（滚轮向下）= 看后面的行 → posY 减小，
+  /// 与 scrollController.posY 的「越负内容越靠后」约定一致，故取负号。
+  /// 驱动源处理同 [_onVerticalDragUpdate]：弹簧已收敛时驱动源已停，
+  /// 必须先踢活（解锁满帧），否则滚轮事件后画面不动；滚完由 _onTick
+  /// 的 eco 重估自动锁回 60fps。5s 自动回弹由 controller 倒计时链路接管。
+  ///
+  /// **Shift+滚轮让位**：按住 Shift（框架 `ScrollBehavior.pointerAxisModifiers`）
+  /// 时滚轮被外层 `PlayerTabPager` 的 PageView 翻转为横向轴切页——此时本视图
+  /// 必须不注册 resolver 回调，否则两层都处理（框架 Scrollable 注册在前、
+  /// 本 Listener 命中路径更深却在 resolver 里「先到先得」，实测两端都会动）。
+  /// 与框架 `Scrollable._pointerSignalEventDelta` 同一套修饰键口径。
+  void _onPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    if (pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        pressed.contains(LogicalKeyboardKey.shiftRight)) {
+      return;
+    }
+    _ecoUnlocked = true;
+    _syncEcoDriver();
+    _scrollController.onUserWheelScroll(-event.scrollDelta.dy);
+  }
+
   // ============== 构建 ==============
 
   @override
@@ -2335,29 +2527,31 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     final shortestSide = MediaQuery.of(context).size.shortestSide;
     _overscan = shortestSide >= 600 ? 15 : 10;
     // 动态字体颜色：仅 AM 播放器（深色背景）且开关开启且提取到封面颜色时，
-    // 当前行歌词颜色 = 85% 白 + 15% 提取色；否则回退默认白色（null）。
-    // 混色后再兜底提升明度（≥0.78），保证深色背景上的可读性；
+    // 当前行歌词颜色 = 白色与提取色按「混色比例」线性混色；自定义歌词文字色
+    // 优先级更高。混色后再兜底提升明度（≥0.78），保证深色背景上的可读性；
     // 仅抬升明度、保留色相与饱和度，视觉上仍是封面色调的浅色。
-    if (widget.forceDarkBackground &&
-        LyricPreferences.instance.useDynamicLyricColor &&
-        widget.accentColor != null) {
-      final mixed = Color.lerp(Colors.white, widget.accentColor!, 0.15)!;
-      final hsl = HSLColor.fromColor(mixed);
-      _activeLineColorValue = hsl
-          .withLightness(math.max(hsl.lightness, 0.78))
-          .toColor()
-          .toARGB32();
-    } else {
-      _activeLineColorValue = null;
-    }
+    final customTextColor = LyricPreferences.instance.customTextColor;
+    _activeLineColorValue = resolveActiveLineColorValue(
+      useDynamicColor: widget.forceDarkBackground &&
+          LyricPreferences.instance.useDynamicLyricColor,
+      accentColor: widget.accentColor,
+      customTextColor: customTextColor,
+      mixRatio: LyricPreferences.instance.dynamicColorMixRatio,
+    );
+    // 上方行是否跟随已播颜色：独立开关，默认关闭（= 历史白色背景行）。
+    _aboveLineColorValue =
+        LyricPreferences.instance.useAboveLinesPlayedColor
+            ? _activeLineColorValue
+            : null;
     // 根据主题亮度设置歌词文字颜色：
     // - AM 风格（forceDarkBackground=true）→ 始终白色
     // - 深色主题 → 白色
     // - 浅色主题 → 黑色
     final isLightTheme = Theme.of(context).brightness == Brightness.light;
-    LyricLayout.textColorValue = (widget.forceDarkBackground || !isLightTheme)
-        ? 0xFFFFFFFF
-        : 0xFF000000;
+    LyricLayout.textColorValue = customTextColor?.toARGB32() ??
+        ((widget.forceDarkBackground || !isLightTheme)
+            ? 0xFFFFFFFF
+            : 0xFF000000);
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2425,6 +2619,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
             blurReadyLineIndices: _lineBlurImages.keys,
             textColorValue: LyricLayout.textColorValue,
             activeLineColorValue: _activeLineColorValue,
+            aboveLineColorValue: _aboveLineColorValue,
             linesGeneration: _linesGeneration,
             lineHeightsGeneration: _lineHeightsGeneration,
             lineTopsGeneration: _lineTopsGeneration,
@@ -2470,6 +2665,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           _painter!.blurReadyLineIndices = _lineBlurImages.keys;
           _painter!.textColorValue = LyricLayout.textColorValue;
           _painter!.activeLineColorValue = _activeLineColorValue;
+          _painter!.aboveLineColorValue = _aboveLineColorValue;
           _painter!.linesGeneration = _linesGeneration;
           _painter!.lineHeightsGeneration = _lineHeightsGeneration;
           _painter!.lineTopsGeneration = _lineTopsGeneration;
@@ -2482,7 +2678,14 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           child: CustomPaint(painter: _painter, size: Size.infinite),
         );
 
-        return GestureDetector(
+        // 鼠标滚轮（桌面端）：包一层 Listener 接收 PointerSignalEvent，
+        // 触屏拖拽/点击路径不受影响（见 _onPointerSignal）。
+        // behavior: opaque——Listener 默认 deferToChild 在 CustomPaint
+        // 等不参与命中的子级上会漏掉滚轮信号。
+        return Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerSignal: _onPointerSignal,
+          child: GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapDown: widget.doubleTapToJump ? null : _onTapDown,
           onTapUp: widget.doubleTapToJump ? null : _onTapUp,
@@ -2519,6 +2722,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
                   )
                 : lyricsContent,
           ),
+        ),
         );
       },
     );
@@ -2641,6 +2845,26 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           ? (widgetPivotY / imageHeight) * 2 - 1
           : 0;
 
+      // 上方已播行着色：模糊图按主题色烘焙、在合成期用 ColorFilter 整体染色
+      // （srcIn 只换 RGB、保留模糊 alpha），因此颜色变化不触发离屏重渲染，
+      // 切换开关 / 拖动混色比例都能即时生效。
+      final int? blurTintValue = lineColorOverrideValue(
+        activeLineColorValue: _activeLineColorValue,
+        aboveLineColorValue: _aboveLineColorValue,
+        isActive: false,
+        isAboveCurrent: i < _currentLineIndex,
+      );
+      Widget blurImage = RawImage(image: image, fit: BoxFit.fill);
+      if (blurTintValue != null) {
+        blurImage = ColorFiltered(
+          colorFilter: ColorFilter.mode(
+            Color(blurTintValue),
+            BlendMode.srcIn,
+          ),
+          child: blurImage,
+        );
+      }
+
       layers.add(
         Positioned(
           top: y - geom.padding,
@@ -2652,7 +2876,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
             child: Transform.scale(
               scale: k,
               alignment: Alignment(alignX, alignY),
-              child: RawImage(image: image, fit: BoxFit.fill),
+              child: blurImage,
             ),
           ),
         ),
@@ -3102,6 +3326,9 @@ class _LyricsPainter extends CustomPainter {
   Iterable<int> blurReadyLineIndices;
   int textColorValue;
   int? activeLineColorValue;
+
+  /// 上方行颜色覆盖值（ARGB），null = 不覆盖（上方行沿用 [textColorValue]）。
+  int? aboveLineColorValue;
   int linesGeneration;
   int lineHeightsGeneration;
   int lineTopsGeneration;
@@ -3144,6 +3371,7 @@ class _LyricsPainter extends CustomPainter {
     this.blurReadyLineIndices = const <int>[],
     required this.textColorValue,
     required this.activeLineColorValue,
+    required this.aboveLineColorValue,
     required this.linesGeneration,
     required this.lineHeightsGeneration,
     required this.lineTopsGeneration,
@@ -3367,6 +3595,13 @@ class _LyricsPainter extends CustomPainter {
       // 否则 → LineRenderer（整行模式：1 次 layout/帧，含非当前行的 KRC 行）
       // 性能优化：非当前行不需要逐字渐变，用 LineRenderer 大幅减少 layout 次数
       final bool useWordRenderer = isActive && line.hasWordTiming;
+      // 行级颜色覆盖：与 _onTick 同一口径（当前行高亮色 / 上方已播行开关）。
+      final int? lineColorValue = lineColorOverrideValue(
+        activeLineColorValue: activeLineColorValue,
+        aboveLineColorValue: aboveLineColorValue,
+        isActive: isActive,
+        isAboveCurrent: i < currentLineIndex,
+      );
       if (useWordRenderer) {
         // 逐字模式：当前行的 KRC 行
         final renderer = wordRenderers[i] ?? WordRenderer();
@@ -3375,7 +3610,7 @@ class _LyricsPainter extends CustomPainter {
           scale: alphaScale,
           blurFade: blurFade,
           blurActive: blurActive,
-          activeColorValue: activeLineColorValue,
+          activeColorValue: lineColorValue,
         );
         renderer.paintLine(
           canvas,
@@ -3396,7 +3631,7 @@ class _LyricsPainter extends CustomPainter {
           scale: alphaScale,
           blurFade: blurFade,
           blurActive: blurActive,
-          activeColorValue: activeLineColorValue,
+          activeColorValue: lineColorValue,
         );
         renderer.paintLine(
           canvas,

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
@@ -66,8 +67,14 @@ class _CoverFlowPageState extends State<CoverFlowPage> {
   void initState() {
     super.initState();
     kCoverFlowSource.addListener(_onSourceChanged);
-    // provider 内 5 分钟 TTL，重复进入自动复用缓存；跨天失效自动重拉
-    _loadForSource(kCoverFlowSource.value);
+    // provider 内 5 分钟 TTL，重复进入自动复用缓存；跨天失效自动重拉。
+    // 首拉延迟到首帧后：getPersonalFm 等在 provider 空闲时会同步
+    // _beginLoading → notifyListeners，挂在 initState 里会在 build
+    // 期间 markNeedsBuild（debug 断言崩溃，与 FM 页/发现页同口径延后）。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _loadForSource(kCoverFlowSource.value);
+    });
   }
 
   @override
@@ -317,6 +324,19 @@ class _CoverFlowViewState extends State<_CoverFlowView>
   bool _refreshArmed = true;
   double _overscrollPull = 0;
 
+  /// 鼠标滚轮增量累积（触控板小步长合并成整页翻动用，见 [_onWheelSignal]）。
+  double _wheelAccum = 0;
+
+  /// 滚轮翻页的目标基址：与动画位置 [_page] 解耦——快速滚动时上一个吸附
+  /// 动画还在中途（_page 是中间值），若按 `_page.round()` 累加会丢步；
+  /// 以此为基址累加 [steps]，滚轮停止后动画自然吸附到最终目标。
+  /// 非滚轮入口（拖拽 / TV 键 / 点击聚焦）会把它清空归位（见 [_resetWheelTarget]）。
+  double? _wheelTargetPage;
+
+  /// 滚轮空闲检测：滚轮停止 120ms 后清掉 [_wheelTargetPage] 基址，
+  /// 下次滚动从静止位置重新计步。
+  Timer? _wheelIdleTimer;
+
   // 布局参数（每次 build 由 LayoutBuilder 重算，横竖屏切换自动生效）
   bool _isPortrait = true;
   double _mainAxis = 0; // 主轴（滑动方向）尺寸
@@ -328,6 +348,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
 
   @override
   void dispose() {
+    _wheelIdleTimer?.cancel();
     _snap?.dispose();
     _pageNotifier.dispose();
     super.dispose();
@@ -385,10 +406,18 @@ class _CoverFlowViewState extends State<_CoverFlowView>
     _snap!.forward();
   }
 
+  /// 非滚轮入口接管翻页时清掉滚轮基址：下一次滚轮从当前动画位置重新计步，
+  /// 避免拖拽/按键把画面带到别处后，旧基址还在旧位置上跳变。
+  void _resetWheelTarget() {
+    _wheelTargetPage = null;
+    _wheelAccum = 0;
+  }
+
   // ---- 手势：竖屏垂直、横屏水平；跟手滑动 + 惯性吸附 + 越界刷新 ----
 
   void _onDragStart(DragStartDetails d) {
     _snap?.stop(); // 打断吸附动画，继续跟手
+    _resetWheelTarget(); // 触摸接管翻页：滚轮基址作废
     _dragStartPage = _page;
     _dragCumulative = 0;
     _overscrollPull = 0;
@@ -434,6 +463,47 @@ class _CoverFlowViewState extends State<_CoverFlowView>
         .clamp(0, widget.songs.length - 1)
         .toDouble();
     _animateTo(target);
+  }
+
+  /// 鼠标滚轮翻页（Windows 桌面）：滚轮事件不走拖拽手势竞技场，
+  /// 必须 Listener.onPointerSignal 显式接收。
+  ///
+  /// 离散步进：一格滚轮（Windows 引擎 ≈100 逻辑像素）= 翻一张封面；
+  /// 触控板的小步长增量累积到一格才翻。滚轮向下 = 列表前进（下一首），
+  /// 与常规列表一致（注意与触屏拖拽方向相反：拖拽是内容跟手）。
+  /// 复用 [_animateTo]（自带 onPageChanged 上报 → 自动补货链路）；
+  /// 首/尾边界直接夹住，不触发下拉刷新（那是拖拽越界专属语义）。
+  void _onWheelSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    _handleWheelDelta(event.scrollDelta.dy);
+  }
+
+  void _handleWheelDelta(double dy) {
+    final n = widget.songs.length;
+    if (n <= 1) return;
+    // 只认主轴滚轮：横屏主轴是水平方向，但滚轮习惯上仍驱动列表前进
+    // （iTunes CoverFlow 同口径）；横向滚轮（dx）忽略。
+    _wheelAccum += dy;
+    const double notch = 100.0;
+    final steps = (_wheelAccum / notch).truncate();
+    if (steps == 0) return;
+    _wheelAccum -= steps * notch;
+    // 基址与动画位置解耦：快速滚动时上次吸附动画还在中途，按 _page.round()
+    // 累加会拿中间值丢步；用 _wheelTargetPage 一路累加，滚轮停后自然吸附。
+    // 首格（基址为空）从当前动画位置取整起步，衔接触摸/按键停留的位置。
+    final base = _wheelTargetPage ?? _page.round().toDouble();
+    final maxPage = (n - 1).toDouble();
+    final target = (base + steps).clamp(0.0, maxPage);
+    _wheelTargetPage = target;
+    if (target != _page) _animateTo(target);
+    // 滚轮停止（120ms 无新事件）后清基址：下次滚动从静止位置重新计步。
+    // 动画本身 500ms 仍在跑、不受影响；120ms > 常见滚轮事件间隔（Windows
+    // 连滚约 30~50ms/格），小于一次吸附动画时长。
+    _wheelIdleTimer?.cancel();
+    _wheelIdleTimer = Timer(const Duration(milliseconds: 120), () {
+      _wheelTargetPage = null;
+      _wheelAccum = 0;
+    });
   }
 
   @override
@@ -485,7 +555,14 @@ class _CoverFlowViewState extends State<_CoverFlowView>
                         final db = (b - page).abs();
                         return db.compareTo(da);
                       });
-                      return GestureDetector(
+                      // 鼠标滚轮（桌面端）：包一层 Listener 接收 PointerSignalEvent，
+                      // 触屏拖拽路径不受影响（见 _onWheelSignal）。
+                      // behavior: opaque——Listener 默认 deferToChild 在「卡片层
+                      // 尚未命中」的空隙（如卡片间扇形空档）会漏掉滚轮信号。
+                      return Listener(
+                        behavior: HitTestBehavior.opaque,
+                        onPointerSignal: _onWheelSignal,
+                        child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onVerticalDragStart: _isPortrait ? _onDragStart : null,
                         onVerticalDragUpdate: _isPortrait ? _onDragUpdate : null,
@@ -521,6 +598,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
                                 ),
                               ),
                           ],
+                        ),
                         ),
                       );
                     },
@@ -575,6 +653,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
       final delta = key == LogicalKeyboardKey.arrowLeft ? -1 : 1;
       final target =
           (_page.round() + delta).clamp(0, songs.length - 1).toDouble();
+      _resetWheelTarget(); // 按键接管翻页：滚轮基址作废
       _animateTo(target);
       return KeyEventResult.handled;
     }
@@ -588,6 +667,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
         _playFromIndex(center);
         openFullPlayer(context);
       } else {
+        _resetWheelTarget(); // 按键接管聚焦：滚轮基址作废
         _animateTo(center.toDouble());
       }
       return KeyEventResult.handled;
@@ -700,6 +780,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
                     _playFromIndex(index);
                     openFullPlayer(context);
                   } else {
+                    _resetWheelTarget(); // 点击接管聚焦：滚轮基址作废
                     _animateTo(index.toDouble());
                   }
                 },

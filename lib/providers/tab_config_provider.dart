@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../core/platform_capabilities.dart';
+import '../core/build_flags.dart';
 import '../data/repositories/settings_repository.dart';
 
 /// 主页 Tab 配置项。
@@ -74,16 +75,17 @@ const List<TabItem> kOptionalTabs = [
   TabItem(id: 'audiobook', label: '听书'),
   TabItem(id: 'scene', label: '场景音乐'),
   TabItem(id: 'channel', label: '频道'),
+  TabItem(id: 'sheet', label: '曲谱'),
   TabItem(id: 'brush', label: '刷刷'),
   TabItem(id: 'listen_together', label: '一起听'),
-  TabItem(id: 'settings', label: '设置', pinnedTitle: true),
+  // 标准版设置只从“我的”进入，避免作为主页 Tab 破坏车机面板生命周期。
+  if (kTvBuild) TabItem(id: 'settings', label: '设置', pinnedTitle: true),
 ];
 
 /// 所有可用 Tab（默认显示 + 可选）。
 ///
-/// **平台过滤**：听歌识曲在 Android（麦克风 + RMS 分析链路）与 iOS
-/// （麦克风采集 + PiP 悬浮窗识别）均有实现，仅桌面端
-/// （Windows/macOS/Linux）点进去只会得到一个不工作的页面。
+/// **平台过滤**：听歌识曲依赖 Android 麦克风采集 + RMS 分析链路，
+/// 桌面端（Windows/macOS/Linux）点进去只会得到一个不工作的页面。
 /// 故在**源头**就剔除 —— 设置页「主页管理」、底部导航、LaunchPad 托盘
 /// 共用本列表，一处过滤三处生效；持久化的旧顺序里若含 recognition
 /// 也会被 [_recomputeVisible] 顺带忽略。
@@ -115,8 +117,10 @@ class TabConfigProvider extends ChangeNotifier {
   List<TabItem> get allTabs => _allTabs;
   Set<String> get hiddenTabs => _hiddenTabs;
 
+  late final Future<void> settingsReady;
+
   TabConfigProvider() {
-    _load();
+    settingsReady = _load();
   }
 
   Future<void> _load() async {

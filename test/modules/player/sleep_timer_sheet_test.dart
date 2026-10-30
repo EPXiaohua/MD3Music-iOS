@@ -1,7 +1,8 @@
 // 「定时关闭」面板装配测试。
 //
 // 覆盖：旧滑杆已移除、表盘在场、手动输入分钟与表盘双向同步、输入超范围钳到
-// 24 小时、点击中央形状开始计时并关闭面板、「关闭定时」仍在。
+// 24 小时、点击中央形状开始计时并关闭面板、「关闭定时」仍在、
+// 「结束后减少待机耗电」开关切换并同步 Provider。
 //
 // dispose 必须放在 test body 里（try/finally），不能用 addTearDown：
 // package:test 的 tearDown 在 flutter_test 的 _verifyInvariants **之后** 才跑，
@@ -62,11 +63,12 @@ void main() {
     }
   });
 
-  testWidgets('手动输入分钟数（最大 24h）会同步到表盘', (tester) async {
+  testWidgets('手动输入分钟数（最大 24h）实时同步到表盘', (tester) async {
     final player = await openSheet(tester);
     try {
+      // 无「应用」按钮：enterText 触发 onChanged 即时生效，不需要收起键盘
+      expect(find.text('应用'), findsNothing);
       await tester.enterText(find.byType(TextField), '90');
-      await tester.testTextInput.receiveAction(TextInputAction.done);
       await tester.pumpAndSettle();
 
       expect(find.text('1 小时'), findsOneWidget);
@@ -76,11 +78,25 @@ void main() {
     }
   });
 
+  testWidgets('点击手动输入的应用会启动定时并关闭面板', (tester) async {
+    final player = await openSheet(tester);
+    try {
+      await tester.enterText(find.byType(TextField), '15');
+      await tester.tap(find.text('应用'));
+      await tester.pumpAndSettle();
+
+      expect(player.sleepTimerMode, SleepTimerMode.countdown);
+      expect(player.sleepTimerRemaining, isNotNull);
+      expect(find.byType(SleepTimerDial), findsNothing);
+    } finally {
+      await disposePlayer(tester, player);
+    }
+  });
+
   testWidgets('手动输入超过 1440 会被钳到 24 小时', (tester) async {
     final player = await openSheet(tester);
     try {
       await tester.enterText(find.byType(TextField), '9999');
-      await tester.testTextInput.receiveAction(TextInputAction.done);
       await tester.pumpAndSettle();
 
       expect(find.text('24 小时'), findsOneWidget);
@@ -112,10 +128,33 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('关闭定时'), findsOneWidget);
+      // 新增「结束后减少待机耗电」开关后内容超出 600px 测试视口，
+      // 「关闭定时」被推出屏外，先滚到可见再点。
+      await tester.ensureVisible(find.text('关闭定时'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('关闭定时'));
       await tester.pumpAndSettle();
 
       expect(player.sleepTimerMode, SleepTimerMode.off);
+    } finally {
+      await disposePlayer(tester, player);
+    }
+  });
+
+  testWidgets('「结束后减少待机耗电」开关在场，切换即同步 Provider', (tester) async {
+    final player = await openSheet(tester);
+    try {
+      final tile = find.widgetWithText(SwitchListTile, '结束后减少待机耗电');
+      expect(tile, findsOneWidget);
+      expect(player.killBackgroundOnTimerEnd, isFalse);
+
+      // 开关同样可能被推出 600px 测试视口，先滚到可见再点
+      await tester.ensureVisible(tile);
+      await tester.pumpAndSettle();
+      await tester.tap(tile);
+      await tester.pumpAndSettle();
+
+      expect(player.killBackgroundOnTimerEnd, isTrue);
     } finally {
       await disposePlayer(tester, player);
     }

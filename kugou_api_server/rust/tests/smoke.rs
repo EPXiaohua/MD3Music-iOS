@@ -134,6 +134,110 @@ fn aes_cbc_matches_cryptojs() {
     assert_eq!(pt, plain);
 }
 
+/// **密文长度非 block size 整数倍时必须返回空 Vec，不得 panic。**
+///
+/// 回归的是真机崩溃：profile 包冷启动后点歌单相关功能 →
+/// `SIGABRT` + `Slice must be the same length as the array`。
+/// 链路：`playlist::cloud_roundtrip` → `crypto::playlist_aes_decrypt`
+/// → `aes_cbc_decrypt` → `GenericArray::clone_from_slice(blk)`；
+/// `data.chunks(bs)` 的短末块会让它 panic，而 `Cargo.toml` 是
+/// `panic = "abort"` → 整个进程直接崩（不是 Dart 侧能兜的异常）。
+///
+/// 触发条件：上游对 `/v1/modify_*` 返回**未加密**内容（网关错误页 / 纯 JSON /
+/// HTML），长度几乎不可能恰好是 16 的倍数。
+///
+/// 这里用 `catch_unwind` 断言「没 panic」——正是为了把「崩溃」变成「可断言的失败」。
+/// 注意**不能**靠 `catch_unwind` 去兜生产路径：abort 下它拦不住，
+/// 真正的修复是 `aes_cbc_decrypt` 里的长度前置守卫。
+#[test]
+fn aes_cbc_decrypt_rejects_unaligned_ciphertext() {
+    use kugou_server::crypto::aes_cbc_decrypt;
+
+    let key = b"0123456789abcdef";
+    let iv = b"0123456789abcdef";
+
+    // 各种非 16 倍数长度（含 1、15、17、60：60 是本地复现用的真实长度）
+    for len in [1usize, 2, 15, 17, 31, 60, 61] {
+        let data = vec![0x41u8; len];
+        let result = std::panic::catch_unwind(|| {
+            aes_cbc_decrypt(key, iv, &data)
+        });
+        assert!(
+            result.is_ok(),
+            "长度 {} (非 16 倍数) 触发了 panic —— 这就是 profile 包崩溃的根因",
+            len
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "长度 {} 应返回空 Vec（调用方按解密失败处理）",
+            len
+        );
+    }
+
+    // 空输入同样不得 panic（非法 base64 经 unwrap_or_default 也会走到这）
+    let empty: Vec<u8> = Vec::new();
+    let result = std::panic::catch_unwind(|| aes_cbc_decrypt(key, iv, &empty));
+    assert!(result.is_ok(), "空输入不得 panic");
+    assert!(result.unwrap().is_empty());
+}
+
+/// 对齐的密文与 roundtrip 不受守卫影响（守卫只挡非 16 倍数）。
+#[test]
+fn aes_cbc_decrypt_empty_and_aligned_still_work() {
+    use kugou_server::crypto::{aes_cbc_decrypt, playlist_aes_decrypt, playlist_aes_encrypt};
+
+    let key = b"0123456789abcdef";
+    let iv = b"0123456789abcdef";
+
+    // 16 的倍数（含刚好一块、空 padding 场景）
+    for len in [16usize, 32, 48, 128] {
+        let data = vec![0x42u8; len];
+        let result = std::panic::catch_unwind(|| aes_cbc_decrypt(key, iv, &data));
+        assert!(result.is_ok(), "对齐长度 {} 不得 panic", len);
+    }
+
+    // 完整 roundtrip：加密 → 解密 → 原文
+    let (aes_key, b64) = playlist_aes_encrypt(r#"{"listid":11,"total_ver":9}"#);
+    let dec = playlist_aes_decrypt(&aes_key, &b64);
+    assert_eq!(dec["listid"], serde_json::json!(11));
+    assert_eq!(dec["total_ver"], serde_json::json!(9));
+}
+
+/// `playlist_aes_decrypt` 对**未加密**上游响应必须回 `Null`（不是空串）。
+///
+/// 空串会被调用方当成「一条内容为空的业务响应」，`Null` 才能走
+/// `cloud_roundtrip` 的失败分支并带上原因。
+#[test]
+fn playlist_aes_decrypt_returns_null_for_unaligned() {
+    use kugou_server::crypto::{base64_decode, playlist_aes_decrypt};
+    use serde_json::Value;
+
+    let aes_key = "abc123";
+
+    // 上游返回纯 JSON（未加密）：其 base64 解码后长度 60，非 16 倍数
+    let plain = r#"{"status":0,"error_code":131001,"error_msg":"token invalid"}"#;
+    let b64 = {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        STANDARD.encode(plain.as_bytes())
+    };
+    assert_eq!(base64_decode(&b64).len() % 16, 12, "构造的输入应确实非 16 倍数");
+
+    let dec = playlist_aes_decrypt(aes_key, &b64);
+    assert_eq!(
+        dec,
+        Value::Null,
+        "未加密响应必须解析成 Null，让调用方走失败分支"
+    );
+
+    // 完全非 base64 的输入（HTML 错误页）同样回 Null，不得 panic
+    let dec2 = std::panic::catch_unwind(|| {
+        playlist_aes_decrypt(aes_key, "<html>502 Bad Gateway</html>")
+    });
+    assert!(dec2.is_ok(), "非 base64 输入不得 panic");
+    assert_eq!(dec2.unwrap(), Value::Null);
+}
+
 fn tcp_request(port: u16, raw: &str) -> String {
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr).expect("connect");
@@ -238,6 +342,13 @@ fn server_responds_404_and_cors() {
         // 两条各归各的 handler（上游可达 200 / 不可达 502，均非 404）。
         "GET /user/preference HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         "POST /user/preference/update HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        // 曲谱：5 条查询路由必须命中（2026-10-24 实测匿名可用；detail 需登录，
+        // 上游可达 200 / 不可达 502，均非 404）。
+        "GET /sheet/song?album_audio_id=68435136 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /sheet/detail?id=68435136_1_0 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /sheet/explore HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /sheet/rank HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "GET /sheet/tags HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
     ];
     for raw in paths {
         let resp = tcp_request(port, raw);
@@ -1049,8 +1160,7 @@ fn video_barrage_send_route_order() {
 /// 路由注册顺序：`/user/preference/update` 必须出现在 `/user/preference` 之前。
 /// 前缀匹配会把更新请求误送进查询 handler，顺序错误即回归。
 #[test]
-fn user_preference_update_route_order() {
-    use kugou_server::modules::{register, ModuleFn};
+fn user_preference_update_route_order() {    use kugou_server::modules::{register, ModuleFn};
     let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
     register(&mut routes);
     let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
@@ -1399,3 +1509,799 @@ fn audio_ktv_total_probe() {
     assert!(!resp.contains("Cannot GET"), "route 404: {}", resp);
     kugou_server::server::stop();
 }
+
+// ============================================================================
+// 歌单写端点（tracks/sort、sort、pic、pic/upload、update）
+// 参考 MakcRe/KuGouMusicApi@main 的 module/playlist_{tracks_sort,sort,pic,pic_upload,update}.js
+// 与 util/request.js 的 createCloudRequest。
+// ============================================================================
+
+/// 5 条歌单写端点必须全部注册，且没有被更短的前缀路由遮蔽。
+///
+/// `/playlist/pic/upload` 与 `/playlist/pic` 是本次唯一的**新增**遮蔽风险对
+/// （同 `/user/update/avatar` 于 `/user/update`、`/video/barrage/send` 于
+/// `/video/barrage` 的既有坑）：`prefix_match` 是段前缀匹配，upload 注册在后
+/// 就会被 `/playlist/pic` 抢先命中，封面上传永远拿不到 FileName 而静默返回解析失败。
+#[test]
+fn playlist_write_routes_registered_and_unshadowed() {
+    use kugou_server::modules::{register, ModuleFn};
+    let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
+    register(&mut routes);
+    let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
+
+    for target in [
+        "/playlist/tracks/sort",
+        "/playlist/sort",
+        "/playlist/pic/upload",
+        "/playlist/pic",
+        "/playlist/update",
+    ] {
+        let idx = paths
+            .iter()
+            .position(|p| *p == target)
+            .unwrap_or_else(|| panic!("{} 未注册", target));
+        for (i, route) in paths.iter().enumerate() {
+            if i >= idx {
+                break;
+            }
+            // 段前缀（前一段必须落在 '/' 上），比它短且注册在前才会遮蔽
+            let shadows = target.len() > route.len()
+                && target.starts_with(route)
+                && target.as_bytes().get(route.len()) == Some(&b'/');
+            assert!(
+                !shadows,
+                "{} 注册在前会遮蔽 {}（前缀匹配会先命中前者）",
+                route, target
+            );
+        }
+    }
+}
+
+/// `/playlist/tracks/sort` 的 data 形状：`fileid|sort` 逗号分隔 → `[{fileid,sort}]`。
+///
+/// 端口 `module/playlist_tracks_sort.js:10-13`。`Number(x || 0)` 语义：非数字/缺失
+/// 一律 0（不是跳过该条），否则上游会按「第 0 条不存在」静默丢弃整个排序请求。
+#[test]
+fn playlist_tracks_sort_resource_pairs() {
+    use kugou_server::modules::playlist::build_tracks_sort_resource;
+    use serde_json::json;
+
+    let r = build_tracks_sort_resource("120|2,130|0");
+    assert_eq!(
+        r,
+        json!([{ "fileid": 120, "sort": 2 }, { "fileid": 130, "sort": 0 }])
+    );
+
+    // 单条、缺 sort、非数字 fileid
+    assert_eq!(
+        build_tracks_sort_resource("120"),
+        json!([{ "fileid": 120, "sort": 0 }])
+    );
+    assert_eq!(
+        build_tracks_sort_resource("abc|"),
+        json!([{ "fileid": 0, "sort": 0 }])
+    );
+    // 空串 → 一条全 0 记录（与 JS ''.split(',') → [''] 一致）
+    assert_eq!(
+        build_tracks_sort_resource(""),
+        json!([{ "fileid": 0, "sort": 0 }])
+    );
+}
+
+/// `/playlist/sort` 的 data 形状：`listid|type|sort` 逗号分隔。
+///
+/// 端口 `module/playlist_sort.js:10-13`。sort 按类别（自建/收藏）**分开编号**，
+/// 故同一条 data 里 type 会混用，不能被归并。
+#[test]
+fn playlist_list_sort_resource_pairs() {
+    use kugou_server::modules::playlist::build_list_sort_resource;
+    use serde_json::json;
+
+    let r = build_list_sort_resource("11|0|0,22|0|1,33|1|0");
+    assert_eq!(
+        r,
+        json!([
+            { "listid": 11, "type": 0, "sort": 0 },
+            { "listid": 22, "type": 0, "sort": 1 },
+            { "listid": 33, "type": 1, "sort": 0 },
+        ])
+    );
+    // 缺 type/sort → 0
+    assert_eq!(
+        build_list_sort_resource("11"),
+        json!([{ "listid": 11, "type": 0, "sort": 0 }])
+    );
+}
+
+/// 封面路径归一：完整 URL 取末段补 `stdmusic/`，已是相对路径则原样。
+///
+/// 端口 `module/playlist_pic.js:13`——不做这层归一，上游会拿到 URL 当相对路径
+/// 存库，封面显示为空白。
+#[test]
+fn playlist_pic_normalizes_stdmusic_prefix() {
+    use kugou_server::modules::playlist::{build_pic_resource, normalize_stdmusic_pic};
+    use serde_json::json;
+
+    assert_eq!(
+        normalize_stdmusic_pic(
+            "https://imge.kugou.com/stdmusic/240/20210111/20210111184454391203.jpg"
+        ),
+        "stdmusic/20210111184454391203.jpg"
+    );
+    assert_eq!(
+        normalize_stdmusic_pic("http://imge.kugou.com/stdmusic/{size}/a.jpg"),
+        "stdmusic/a.jpg"
+    );
+    // 已带前缀的相对路径保持不变（否则会变成 stdmusic/stdmusic/x.jpg）
+    assert_eq!(
+        normalize_stdmusic_pic("stdmusic/20210111/x.jpg"),
+        "stdmusic/20210111/x.jpg"
+    );
+    // 裸文件名
+    assert_eq!(normalize_stdmusic_pic("x.jpg"), "stdmusic/x.jpg");
+
+    // data 逐条带 type
+    let r = build_pic_resource("11|0|stdmusic/a.jpg,22|1|http://x.com/s/b.jpg", 0);
+    assert_eq!(
+        r,
+        json!([
+            { "listid": 11, "type": 0, "pic": "stdmusic/a.jpg" },
+            { "listid": 22, "type": 1, "pic": "stdmusic/b.jpg" },
+        ])
+    );
+    // 显式留空的 type 槽（`listid||pic`）→ 回落调用方 default_type
+    assert_eq!(
+        build_pic_resource("11||stdmusic/a.jpg", 1),
+        json!([{ "listid": 11, "type": 1, "pic": "stdmusic/a.jpg" }])
+    );
+    // 字段不足的畸形条目（`listid|onlyone`）：pic 槽缺失 → 归一成 "stdmusic/"，
+    // type 槽被 "onlyone" 占位 → 0。JS 这里会拼出 "stdmusic/undefined"，
+    // Rust 侧不复制那个 null 字符串化怪癖。
+    assert_eq!(
+        build_pic_resource("11|onlyone", 1),
+        json!([{ "listid": 11, "type": 0, "pic": "stdmusic/" }])
+    );
+}
+
+/// `/playlist/update` 的 dataMap：`name` / `pic` 缺省时**不得出现**该键。
+///
+/// 端口 `module/playlist_update.js:23-29` 的 `if (params.name)` / `if (params.pic)`。
+/// 传空串等于把歌单改名成空 / 清掉封面，是不可逆的静默数据损坏。
+#[test]
+fn playlist_update_optional_fields() {
+    use kugou_server::modules::playlist::build_update_map;
+    use serde_json::json;
+
+    // 只改名称：tags/intro 仍然是恒在的空串（JS 的 `params.tags || ''`）
+    let m = build_update_map(&json!({ "listid": 11, "total_ver": 9, "name": "新名字" }));
+    assert_eq!(m["listid"], json!(11));
+    assert_eq!(m["total_ver"], json!(9));
+    assert_eq!(m["type"], json!(0));
+    assert_eq!(m["sort"], json!(0));
+    assert_eq!(m["tags"], json!(""));
+    assert_eq!(m["intro"], json!(""));
+    assert_eq!(m["name"], json!("新名字"));
+    assert!(!m.contains_key("pic"), "pic 缺省时不得下发");
+
+    // 名称空串 → 不改名；pic 传入 → 下发
+    let m = build_update_map(&json!({ "listid": 11, "name": "", "pic": "custom/x.jpg" }));
+    assert!(
+        !m.contains_key("name"),
+        "name 空串时不得下发（会被上游当成改名成空）"
+    );
+    assert_eq!(m["pic"], json!("custom/x.jpg"));
+
+    // 收藏歌单：type=1 必须原样透传（与 /playlist/del 的 1=自建 语义相反）
+    let m = build_update_map(&json!({ "listid": 33, "type": 1, "tags": "华语,流行" }));
+    assert_eq!(m["type"], json!(1));
+    assert_eq!(m["tags"], json!("华语,流行"));
+
+    // is_pri：调用方显式传入才插入；缺省不得补 0（会把隐私歌单改成公开）
+    let m = build_update_map(&json!({ "listid": 33, "is_pri": 1 }));
+    assert_eq!(m["is_pri"], json!(1));
+    let m = build_update_map(&json!({ "listid": 33 }));
+    assert!(!m.contains_key("is_pri"), "is_pri 缺省时不得补 0");
+}
+
+/// v4 modify_list 的 body 形状：业务字段透传 + `userid`/`enckey`/`encstr` 形态正确。
+///
+/// 形态错了上游不会给业务错误，而是鉴权层直接拒（v1 时代 1005 profile 配 3116
+/// token 就是恒 20017），故在此钉住：
+/// - `enckey` = RSA(128 byte seed 段) → **256 位大写 hex**（2048-bit RSA 块）；
+/// - `encstr` = Base64，解码后长度必须是 16 的倍数（AES-CBC）；
+/// - `userid` 来自 cookie，业务字段原样保留。
+#[test]
+fn playlist_v4_body_shape() {
+    use kugou_server::crypto::base64_decode;
+    use kugou_server::modules::playlist::{build_update_map, build_v4_body};
+    use serde_json::{json, Value};
+
+    let q = json!({
+        "cookie": { "userid": "10086", "token": "tok" },
+        "listid": 35,
+        "total_ver": 119,
+        "type": 0,
+        "sort": 3,
+        "tags": "",
+        "intro": "",
+        "name": "新名字",
+        "is_pri": 1,
+    });
+    let dm = Value::Object(build_update_map(&q));
+    let body = build_v4_body(&q, &dm);
+
+    // 业务字段透传
+    assert_eq!(body["listid"], json!(35));
+    assert_eq!(body["total_ver"], json!(119));
+    assert_eq!(body["name"], json!("新名字"));
+    assert_eq!(body["is_pri"], json!(1));
+    assert_eq!(body["sort"], json!(3));
+    assert_eq!(body["userid"], json!(10086));
+
+    // enckey：256 位大写 hex（酷狗 RSA 公钥为 1024-bit → 128 字节 → 256 hex）
+    let enckey = body["enckey"].as_str().expect("enckey is string");
+    assert_eq!(enckey.len(), 256, "RSA-1024 → 256 hex 字符");
+    assert!(
+        enckey
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)),
+        "enckey 必须大写 hex（小写会被上游判签名错误）: {enckey}"
+    );
+
+    // encstr：合法 Base64 且解码长度 16 对齐（AES-CBC 密文）
+    let encstr = body["encstr"].as_str().expect("encstr is string");
+    let decoded = base64_decode(encstr);
+    assert_eq!(decoded.len() % 16, 0, "AES-CBC 密文长度必须 16 对齐");
+    assert!(!decoded.is_empty());
+}
+
+/// 实网探针（默认 `#[ignore]`）：v4 `modify_list` 协议验证。
+///
+/// 2026-10-14 排查「编辑歌单无法保存」：v1 旧协议发标准版 1005 profile，上游对
+/// 3116 签发的 token 恒返 `error_code=20017`。本探针用 crate 自己的请求管线发
+/// **v4 + enckey/encstr + 概念版 profile** 的 no-op 请求（所有值取歌单当前状态，
+/// 服务端落库结果与探针前一致），验证协议是否被接受。
+///
+/// 用法（需要真机 token，勿提交敏感值）：
+/// ```text
+/// KG_LIVE=1 KG_TOKEN=<token> KG_USERID=<uid> KG_DFID=<dfid> KG_MID=<mid> \
+/// KG_LISTID=35 KG_TOTAL_VER=119 KG_SORT=0 KG_IS_PRI=1 KG_NAME=小白3110的歌单 \
+/// cargo test --test smoke playlist_v4_modify_live_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "live network probe; requires KG_LIVE=1 and real credentials"]
+fn playlist_v4_modify_live_probe() {
+    use kugou_server::modules::{playlist, Ctx};
+    use serde_json::json;
+
+    if std::env::var("KG_LIVE").is_err() {
+        return;
+    }
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let q = json!({
+        "cookie": {
+            "userid": env("KG_USERID"),
+            "token": env("KG_TOKEN"),
+            "dfid": env("KG_DFID"),
+            "KUGOU_API_MID": env("KG_MID"),
+        },
+        "listid": env("KG_LISTID").parse::<i64>().unwrap_or(0),
+        "total_ver": env("KG_TOTAL_VER").parse::<i64>().unwrap_or(0),
+        "type": 0,
+        "sort": env("KG_SORT").parse::<i64>().unwrap_or(0),
+        "tags": "",
+        "intro": "",
+        "is_pri": env("KG_IS_PRI").parse::<i64>().unwrap_or(0),
+        "name": env("KG_NAME"),
+    });
+    let ctx = Ctx {
+        ip: String::new(),
+        body_bytes: None,
+    };
+    match playlist::handle_update(&q, &ctx) {
+        Ok(res) => println!(
+            "[v4-probe] upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+        Err(res) => println!(
+            "[v4-probe] ERR upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+    }
+}
+
+/// 实网探针（默认 `#[ignore]`）：v1 契约 + 概念版身份的 `modify_list_sort` 验证。
+///
+/// /playlist/sort 于 2026-10-15 修复：[handle_sort] 走 v1 契约 + 概念版身份
+///（cloud_roundtrip_v1_concept）。**no-op 用法**：`KG_SORT_DATA` 传当前云端
+/// 真实顺序（每条 `listid|type|sort`，type 0=自建/1=收藏，sort 从 0 编号），
+/// 服务端落库结果与探针前一致。响应 `data.total_ver` 为新版本号（会 +1）。
+///
+/// 用法（需要真机 token，勿提交敏感值）：
+/// ```text
+/// KG_LIVE=1 KG_TOKEN=<token> KG_USERID=<uid> KG_DFID=<dfid> KG_MID=<mid> \
+/// KG_TOTAL_VER=<total_ver> KG_SORT_DATA="8|0|0,35|0|1" \
+/// cargo test --test smoke playlist_v4_list_sort_live_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "live network probe; requires KG_LIVE=1 and real credentials"]
+fn playlist_v4_list_sort_live_probe() {
+    use kugou_server::modules::{playlist, Ctx};
+    use serde_json::json;
+
+    if std::env::var("KG_LIVE").is_err() {
+        return;
+    }
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let q = json!({
+        "cookie": {
+            "userid": env("KG_USERID"),
+            "token": env("KG_TOKEN"),
+            "dfid": env("KG_DFID"),
+            "KUGOU_API_MID": env("KG_MID"),
+        },
+        "total_ver": env("KG_TOTAL_VER").parse::<i64>().unwrap_or(0),
+        "data": env("KG_SORT_DATA"),
+    });
+    let ctx = Ctx {
+        ip: String::new(),
+        body_bytes: None,
+    };
+    match playlist::handle_sort(&q, &ctx) {
+        Ok(res) => println!(
+            "[v4-sort-probe] upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+        Err(res) => println!(
+            "[v4-sort-probe] ERR upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+    }
+}
+
+/// 实网探针（默认 `#[ignore]`）：v4 列表排序候选协议逐个试射。
+///
+/// 2026-10-15 排查「/playlist/sort 迁移 v4 后上游回 20010」的诊断记录（保留供
+/// 同族 `/v1/modify_song_sort|modify_list_pic` 迁移时复用）。当日结论：
+/// - A-D：`/cloudlist.service/v4/modify_list_sort` **不存在**——网关对未知子路径
+///   统一回 `{"status":0,"error_code":20010}`，与 total_ver/data 取值无关；
+/// - E：v1 URL 认 HTTP 层但不认 v4 明文 body（网关 502）；
+/// - G1a/G1b：v1 URL + playlistAES 体 + 概念版身份 → 上游解密成功但回 20010
+///   （body 格式不符）；
+/// - **G2：v1 契约（createCloudRequest 原始密文体）+ 概念版身份 → `status=1`、
+///   逐条 `code=1`、`total_ver` 递增 —— 已成为 [handle_sort] 的生产路径**；
+/// - H：`/cloudlist.service/v4/sort_list` → 404（未路由），与 20010 可区分。
+///
+/// 用法（需要真机 token，勿提交敏感值）：
+/// ```text
+/// KG_LIVE=1 KG_TOKEN=<token> KG_USERID=<uid> KG_DFID=<dfid> KG_MID=<mid> \
+/// KG_TOTAL_VER=<total_ver> KG_SORT_DATA="<listid|type|sort,...>" \
+/// cargo test --test smoke playlist_v4_sort_variants_live_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "live network probe; requires KG_LIVE=1 and real credentials"]
+fn playlist_v4_sort_variants_live_probe() {
+    use kugou_server::modules::playlist::{
+        aes_roundtrip, build_list_sort_resource, cloud_roundtrip_v1_concept, cloud_roundtrip_v4,
+        handle_sort,
+    };
+    use kugou_server::modules::Ctx;
+    use kugou_server::request::ModuleResponse;
+    use serde_json::json;
+
+    if std::env::var("KG_LIVE").is_err() {
+        return;
+    }
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let q = || {
+        json!({
+            "cookie": {
+                "userid": env("KG_USERID"),
+                "token": env("KG_TOKEN"),
+                "dfid": env("KG_DFID"),
+                "KUGOU_API_MID": env("KG_MID"),
+            }
+        })
+    };
+    let ctx = Ctx {
+        ip: String::new(),
+        body_bytes: None,
+    };
+    let total_ver = env("KG_TOTAL_VER").parse::<i64>().unwrap_or(0);
+    let sort_data = env("KG_SORT_DATA");
+    let run = |label: &str, r: Result<ModuleResponse, ModuleResponse>| match r {
+        Ok(res) => println!(
+            "[sort-variants] {label}: OK upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+        Err(res) => println!(
+            "[sort-variants] {label}: ERR upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+    };
+
+    // A：现安装协议（复现基线）
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let r = cloud_roundtrip_v4(
+        &q(),
+        &ctx,
+        "/cloudlist.service/v4/modify_list_sort",
+        &dm,
+    );
+    run("A v4+array+total_ver", r);
+
+    // B：total_ver=0
+    let dm = json!({ "total_ver": 0, "data": build_list_sort_resource(&sort_data) });
+    let r = cloud_roundtrip_v4(
+        &q(),
+        &ctx,
+        "/cloudlist.service/v4/modify_list_sort",
+        &dm,
+    );
+    run("B v4+array+ver0", r);
+
+    // C：不存在的 listid（安全，不落库）
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource("999999|1|0") });
+    let r = cloud_roundtrip_v4(
+        &q(),
+        &ctx,
+        "/cloudlist.service/v4/modify_list_sort",
+        &dm,
+    );
+    run("C v4+fake-listid", r);
+
+    // D：data 传裸字符串（v1 风格）
+    let dm = json!({ "total_ver": total_ver, "data": sort_data });
+    let r = cloud_roundtrip_v4(
+        &q(),
+        &ctx,
+        "/cloudlist.service/v4/modify_list_sort",
+        &dm,
+    );
+    run("D v4+raw-string", r);
+
+    // E：v1 URL 走 v4 管线（默认签名 + enckey/encstr）
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let r = cloud_roundtrip_v4(&q(), &ctx, "/v1/modify_list_sort", &dm);
+    run("E v1-url+v4-pipeline", r);
+
+    // G1a：v1 URL 走 aes_roundtrip（概念版身份 + playlistAES body，delete_list 同款），delete 风格 params
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let userid: i64 = env("KG_USERID").parse().unwrap_or(0);
+    let params = json!({
+        "last_time": 1792057100i64,
+        "last_area": "gztx",
+        "userid": userid,
+        "token": env("KG_TOKEN"),
+    });
+    let r = aes_roundtrip(&q(), &ctx, None, "/v1/modify_list_sort", &dm, params, false, false,
+        &[("x-router", "cloudlist.service.kugou.com")]);
+    run("G1a v1-url+playlistAES+delete-params", r);
+
+    // G1b：同 G1a 但极简 params
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let r = aes_roundtrip(&q(), &ctx, None, "/v1/modify_list_sort", &dm, json!({}), false, false,
+        &[("x-router", "cloudlist.service.kugou.com")]);
+    run("G1b v1-url+playlistAES+minimal-params", r);
+
+    // G2：v1 契约（原始密文 body + 极简 query + not_signature）+ 概念版身份
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let r = cloud_roundtrip_v1_concept(&q(), &ctx, "/v1/modify_list_sort", &dm);
+    run("G2 v1-contract+concept-identity", r);
+
+    // H：v4 候选路径存在性（sort_list）
+    let dm = json!({ "total_ver": total_ver, "data": build_list_sort_resource(&sort_data) });
+    let r = cloud_roundtrip_v4(&q(), &ctx, "/cloudlist.service/v4/sort_list", &dm);
+    run("H v4-sort_list", r);
+
+    // 对照组：现安装的 handle_sort（与 A 等价，确认探针与真机行为一致）
+    let qh = json!({
+        "cookie": {
+            "userid": env("KG_USERID"),
+            "token": env("KG_TOKEN"),
+            "dfid": env("KG_DFID"),
+            "KUGOU_API_MID": env("KG_MID"),
+        },
+        "total_ver": total_ver,
+        "data": sort_data,
+    });
+    let r = handle_sort(&qh, &ctx);
+    match r {
+        Ok(res) => println!(
+            "[sort-variants] F handle_sort: OK upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+        Err(res) => println!(
+            "[sort-variants] F handle_sort: ERR upstream_status={} body={}",
+            res.status,
+            res.body.to_string_utf8()
+        ),
+    }
+}
+
+/// 云歌单服务签名 key 必须与参考实现的固定向量逐字节一致。
+///
+/// 端口 `util/request.js:308` 的
+/// `md5(appid + appkey + clientver + clienttime).toLowerCase()`，其中
+/// appid=1005、appkey=`OIlwieks28dk2k092lksi2UIkp`、clientver=20489
+/// （`util/config.json` 的 `appid`/`clientver` + `CLOUDLIST_CONF.default.appkey`）。
+/// 期望值由同一公式独立算出（PowerShell `MD5.Create()`），不是拿实现反填的。
+#[test]
+fn playlist_cloud_key_matches_reference() {
+    use kugou_server::modules::playlist::cloud_key;
+
+    assert_eq!(cloud_key(1_700_000_000), "a1f65b6a8fe7e191521406ce8661ae02");
+    // 小写（上游对大小写敏感，大写会被判签名错误）
+    let k = cloud_key(1_700_000_001);
+    assert_eq!(k, k.to_lowercase());
+    assert_ne!(k, cloud_key(1_700_000_000));
+}
+
+/// 云歌单写接口的失败判定必须与 Dart `PlaylistEditPage._save` 同口径：
+/// `status == 1` 或 `error_code == 0` 为成功，其余（含字段缺失/非对象）为失败。
+///
+/// 该判定驱动 `cloud_roundtrip` 的诊断日志分支（2026-10-14「编辑歌单无法保存」排查），
+/// 判错会把成功请求打成 FAILED 或把无声业务拒绝漏成 ok。
+#[test]
+fn playlist_cloud_body_is_failure_matches_dart_criteria() {
+    use kugou_server::modules::playlist::cloud_body_is_failure;
+    use serde_json::json;
+
+    // 成功形态
+    assert!(!cloud_body_is_failure(&json!({ "status": 1 })));
+    assert!(!cloud_body_is_failure(&json!({ "status": 1, "data": {} })));
+    assert!(!cloud_body_is_failure(&json!({ "error_code": 0 })));
+    assert!(!cloud_body_is_failure(
+        &json!({ "status": 0, "error_code": 0 })
+    ));
+    // 失败形态：显式业务错误 / 空对象 / 只有 status 非 1
+    assert!(cloud_body_is_failure(&json!({ "status": 0 })));
+    assert!(cloud_body_is_failure(&json!({ "status": 90001 })));
+    assert!(cloud_body_is_failure(
+        &json!({ "status": 0, "error_code": 40001 })
+    ));
+    assert!(cloud_body_is_failure(&json!({})));
+    // 非对象一律按失败（Dart 侧会当非 Map 丢弃）
+    assert!(cloud_body_is_failure(&json!(null)));
+    assert!(cloud_body_is_failure(&json!("oops")));
+    assert!(cloud_body_is_failure(&json!([1, 2])));
+}
+
+/// 封面上传的 `file` / `type` / `extendName` 必须能从 **JSON body** 里读到。
+///
+/// `server.rs` 把 JSON body 整体塞进 `query["body"]`、**不**合并到顶层
+/// （见 `build_query` 的 `body_is_buffer` 分支），而 Dart 侧
+/// `uploadPlaylistCover` 是 `_post(data: {...})`，三个参数全在 body。
+/// 只读顶层 query 会让 file 判定为空 → 一律返回「文件不存在」，
+/// type / extendName 静默退回默认值（不报错，只是行为不对）。
+///
+/// 这里直接断言 query 对象的形状 + 该模块的取参函数，不触发网络与文件 IO。
+#[test]
+fn playlist_pic_upload_params_from_body() {
+    use serde_json::json;
+
+    // 模拟 server.rs build_query 对 POST + application/json 的产出：
+    // 业务参数在 body 下，顶层只有 cookie。
+    let q = json!({
+        "cookie": { "userid": "10086", "token": "tok" },
+        "body": {
+            "file": "/tmp/cover.jpg",
+            "type": "custom",
+            "extendName": ".png"
+        }
+    });
+
+    let body = q.get("body").and_then(|v| v.as_object()).unwrap();
+    assert_eq!(
+        body.get("file").and_then(|v| v.as_str()),
+        Some("/tmp/cover.jpg")
+    );
+    // 顶层没有这些键 —— 正是「只读顶层」会踩空的原因
+    assert!(q.get("file").is_none());
+    assert!(q.get("type").is_none());
+}
+
+/// 封面上传的取参函数：query 优先、回落 body、都没有则为空串（不是 panic）。
+#[test]
+fn playlist_cover_body_str_fallback() {
+    use kugou_server::modules::playlist::cover_body_str;
+    use serde_json::json;
+
+    // body 命中
+    let q = json!({ "body": { "file": "/a/b.jpg", "type": "custom" } });
+    assert_eq!(cover_body_str(&q, "file"), "/a/b.jpg");
+    assert_eq!(cover_body_str(&q, "type"), "custom");
+    // query 优先于 body
+    let q = json!({ "file": "/query.jpg", "body": { "file": "/body.jpg" } });
+    assert_eq!(cover_body_str(&q, "file"), "/query.jpg");
+    // 都没有 → 空串（调用方据此回落默认值 / 报「文件不存在」）
+    let q = json!({ "body": {} });
+    assert_eq!(cover_body_str(&q, "extendName"), "");
+    assert_eq!(cover_body_str(&json!({}), "file"), "");
+    // body 不是对象（GET 场景无 body）→ 空串，不得 panic
+    assert_eq!(cover_body_str(&json!({ "body": "raw" }), "file"), "");
+}
+
+
+/// 登录扫码路由顺序：QQ 两条必须在 `/login` 之前注册。
+/// 本项目 `prefix_match` 是路径段前缀匹配，`/login` 若排在前面会把
+/// `/login/qq/qr/create|check` 全部吞进密码登录 handler。
+#[test]
+fn qq_qr_login_routes_registered_before_login() {
+    use kugou_server::modules::{register, ModuleFn};
+    let mut routes: Vec<(&'static str, ModuleFn)> = Vec::new();
+    register(&mut routes);
+    let paths: Vec<&str> = routes.iter().map(|(p, _)| *p).collect();
+
+    let login_idx = paths
+        .iter()
+        .position(|p| *p == "/login")
+        .expect("/login 未注册");
+    for target in ["/login/qq/qr/create", "/login/qq/qr/check", "/login/wx/create", "/login/wx/check"] {
+        let idx = paths
+            .iter()
+            .position(|p| *p == target)
+            .unwrap_or_else(|| panic!("{target} 未注册"));
+        assert!(
+            idx < login_idx,
+            "{target} 必须注册在 /login 之前（前缀匹配会把它送进密码登录 handler）"
+        );
+    }
+}
+
+/// 微信 / QQ 扫码 check 的入参校验：缺字段时直接 400，不发起上游请求。
+/// （上游请求会被网络/风控影响，测试只锁「本地参数校验」这一段契约。）
+#[test]
+fn qr_check_endpoints_reject_missing_params_without_upstream_call() {
+    use kugou_server::modules::{login, Ctx};
+    use serde_json::json;
+
+    let ctx = Ctx {
+        ip: "127.0.0.1".to_string(),
+        body_bytes: None,
+    };
+
+    let err = login::handle_wx_check(&json!({}), &ctx).expect_err("缺 uuid 必须 400");
+    assert_eq!(err.status, 400);
+    assert!(err.body.to_json()["msg"].as_str().unwrap().contains("uuid"));
+
+    let err = login::handle_qq_qr_check(&json!({}), &ctx).expect_err("缺会话字段必须 400");
+    assert_eq!(err.status, 400);
+    let msg = err.body.to_json()["msg"].as_str().unwrap().to_string();
+    assert!(msg.contains("qrsig"), "提示应列出缺失字段: {msg}");
+    assert!(msg.contains("/login/qq/qr/create"), "提示应指引先调 create: {msg}");
+}
+
+/// 微信 / QQ 扫码登录实网探针（默认 `#[ignore]`，需外网）：
+/// `cargo +stable-x86_64-pc-windows-gnu test --test smoke qr_login_probe -- --ignored --nocapture`
+///
+/// 覆盖两条链路里「能离线验证的部分」之外的真实上游往返：
+/// 1. `/login/wx/create` → 必须 200 且带 `uuid` + `qrcode.qrcodebase64`；
+/// 2. `/login/wx/check?uuid=<空>` → 必须 400（本地参数校验，不发上游）；
+/// 3. `/login/qq/qr/create` → 打印结果。成功时必须带 qrsig/ptqrtoken/二维码；
+///    失败时必须是结构化的 `{status:0,msg}`（不允许 panic / 非 JSON）。
+/// 4. `/login/qq/qr/check` 用 create 的会话轮询一次，打印 status
+///    （`wait` / `blocked` 都算通过 —— blocked 是上游 WAF 的已知外部限制，
+///    见 docs/2026-10-17-qq-wx-qr-login-notes.md §4）。
+#[test]
+#[ignore = "live network probe; hits weixin.qq.com / ptlogin2.qq.com"]
+fn qr_login_probe() {
+    use serde_json::Value;
+    let _guard = SERVER_LOCK.lock().unwrap();
+    let port: u16 = 18091;
+    let dir = std::env::temp_dir()
+        .join("kugou_smoke_probe")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(kugou_server::server::start(port, dir), Some(port));
+
+    // ---- 微信 create ----
+    let raw = tcp_request(
+        port,
+        "GET /login/wx/create HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+    println!("=== /login/wx/create ===\n{}", &body[..body.len().min(400)]);
+    assert!(!raw.contains("Cannot GET"), "wx create route 404: {}", raw);
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if v.get("uuid").is_some() {
+            assert!(
+                v["qrcode"]["qrcodebase64"].as_str().is_some_and(|s| !s.is_empty()),
+                "微信二维码缺少 qrcodebase64: {v}"
+            );
+            println!("✓ 微信二维码生成成功 uuid={}", v["uuid"]);
+        } else {
+            println!("⚠ 微信 create 未成功（上游拒绝）: {v}");
+        }
+    }
+
+    // ---- 微信 check 缺参 ----
+    let raw = tcp_request(
+        port,
+        "GET /login/wx/check HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(raw.contains("400 Bad Request"), "缺 uuid 必须 400: {}", raw);
+    println!("✓ /login/wx/check 缺 uuid → 400");
+
+    // ---- QQ create ----
+    let raw = tcp_request(
+        port,
+        "GET /login/qq/qr/create HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    println!("=== /login/qq/qr/create ===\n{}", &body[..body.len().min(300)]);
+    assert!(!raw.contains("Cannot GET"), "qq create route 404: {}", raw);
+    let v: Value = serde_json::from_str(&body).expect("qq create 必须返回 JSON");
+    if v.get("qrsig").is_some() {
+        assert!(
+            v["ptqrtoken"].as_i64().is_some_and(|n| n > 0),
+            "ptqrtoken 必须是正整数: {v}"
+        );
+        assert!(
+            v["qrcode"].as_str().is_some_and(|s| s.len() > 100),
+            "二维码 base64 过短: {v}"
+        );
+        println!("✓ QQ 二维码生成成功 qrsig_len={} ptqrtoken={}",
+            v["qrsig"].as_str().unwrap_or("").len(),
+            v["ptqrtoken"]
+        );
+
+        // ---- QQ check（用刚拿到的会话轮询一次）----
+        let qs = format!(
+            "qrsig={}&ptqrtoken={}&pt_login_sig={}&pt_openlogin_data={}&xlogin_url={}&cookie={}",
+            enc(v["qrsig"].as_str().unwrap_or("")),
+            v["ptqrtoken"],
+            enc(v["pt_login_sig"].as_str().unwrap_or("")),
+            enc(v["pt_openlogin_data"].as_str().unwrap_or("")),
+            enc(v["xlogin_url"].as_str().unwrap_or("")),
+            enc(v["cookie"].as_str().unwrap_or("")),
+        );
+        let raw = tcp_request(
+            port,
+            &format!(
+                "GET /login/qq/qr/check?{} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                qs
+            ),
+        );
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        println!("=== /login/qq/qr/check ===\n{}", &body[..body.len().min(400)]);
+        let cv: Value = serde_json::from_str(body).expect("qq check 必须返回 JSON");
+        let status = cv["status"].as_str().unwrap_or("");
+        assert!(
+            matches!(status, "wait" | "scanned" | "expired" | "blocked" | "error"),
+            "未预期的 QQ check 状态: {cv}"
+        );
+        if status == "blocked" {
+            println!("⚠ QQ 轮询被上游拦截（已知外部限制，见 docs 2026-10-17 §4）: {cv}");
+        } else {
+            println!("✓ QQ 轮询状态 = {status}");
+        }
+    } else {
+        println!("⚠ QQ create 未成功: {v}");
+    }
+
+    kugou_server::server::stop();
+}
+
+/// 探针用：最小 query 值百分号编码（保留 `%` 以免二次编码）。
+fn enc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+

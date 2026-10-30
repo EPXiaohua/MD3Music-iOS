@@ -1,5 +1,7 @@
 import 'package:flutter/widgets.dart';
 
+import '../../core/layout/bottom_chrome_dimens.dart';
+
 /// 底部播放区域的形态。
 ///
 /// **为什么要显式区分形态**：展开起点几何原先只从一条全局可变量
@@ -29,15 +31,16 @@ enum PlayerBarForm {
 /// 视口插值 —— 两者一错位，转场看起来就是"控件脱开自己的槽位在飞"。快照把
 /// 采集时刻的 [screenHeight] 一并记下，消费端可以据此判断视口是否已变。
 ///
-/// [panelRect] 的口径与常驻条一致：**含底部净空、底端到屏底**（见
-/// `full_player_route.dart` 的 `panelAnchorFor`），两形态必须同口径，否则
-/// 面板下沿与底栏位移对不上。
+/// [panelRect] 的口径：**可见本体**（悬浮胶囊是 64 高、左右 16dp 内缩、底端
+/// 距屏底 12dp；常驻条是通栏、含底部净空、底端到屏底）。两形态必须同口径，
+/// 否则「面板起点 == 用户点的那个控件」不成立。
 @immutable
 class PlayerMorphScene {
   const PlayerMorphScene({
     required this.panelRect,
     required this.screenHeight,
     required this.form,
+    this.cornerRadius,
   });
 
   /// 展开起点矩形（设计像素）：顶端 = 面板上沿，底端 = 屏底。
@@ -49,9 +52,31 @@ class PlayerMorphScene {
   /// 采集时的形态。
   final PlayerBarForm form;
 
+  /// 源形态的**外轮廓圆角**（dp）。null = 按 [form] 推导（见 [panelRadius]）。
+  ///
+  /// 显式可传是为了让采集端把「胶囊当前实际半径」写死进来：胶囊的半径由
+  /// `BottomChromeDimens.discDiameter / 2` 推导，而圆盘态**就是**一个正圆
+  /// （半径 = 直径/2，恰好等价于高度一半的圆角矩形），两者同值但语义不同，
+  /// 由采集端写明比消费端猜更可靠。
+  final double? cornerRadius;
+
   /// 面板上沿 Y（设计像素）。
   double get panelTop => panelRect.top;
 
   /// 面板高度（设计像素）= 屏底 − 上沿。
   double get panelHeight => panelRect.height;
+
+  /// 本次转场的起点圆角（dp）。
+  ///
+  /// 缺省按形态推导：胶囊 / 圆盘 = 直径的一半（32，圆盘态即正圆），常驻条 /
+  /// 未知 = 0（方角，与引入圆角之前逐像素一致）。
+  double get panelRadius {
+    final r = cornerRadius;
+    if (r != null && r.isFinite && r >= 0) return r;
+    return switch (form) {
+      PlayerBarForm.floatingCapsule || PlayerBarForm.floatingDisc =>
+        BottomChromeDimens.discDiameter / 2,
+      PlayerBarForm.residentBar || PlayerBarForm.unknown => 0.0,
+    };
+  }
 }

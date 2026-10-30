@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:md3music/core/layout/bottom_chrome_dimens.dart';
+import 'package:md3music/core/layout/responsive_layout.dart';
 import 'package:md3music/modules/player/bottom_bar_morph_overlay.dart';
 import 'package:md3music/modules/player/player_bar_progress_painter.dart';
 
@@ -24,7 +25,6 @@ void main() {
 
   MorphBarLayout at(double p) => resolveMorphBarLayout(
     p: p,
-    screenWidth: w,
     residentRect: resident,
     capsuleRect: capsule,
   );
@@ -105,6 +105,237 @@ void main() {
     expect(g.coverLeft, closeTo(3.5, 1e-9));
     expect(g.coverTop, closeTo(3.5, 1e-9));
     expect(g.lyricOpacity, 0.5);
+  });
+
+  group('收缩圆盘端点（collapse 参数）', () {
+    // 圆盘端矩形：右停靠、64×64、底部净空与展开胶囊同口径。
+    final Rect disc = resolveCapsuleBodyRect(
+      screenSize: const Size(w, h),
+      safeBottom: 0,
+      collapse: 1.0,
+      dockSide: SecondaryPlayerDockSide.right,
+    );
+  MorphBarLayout discAt(double p, {double collapse = 1.0, double angle = 0.0}) =>
+      resolveMorphBarLayout(
+        p: p,
+        residentRect: resident,
+        capsuleRect: disc,
+        capsuleCollapse: collapse,
+        capsuleDiscAngle: angle,
+      );
+
+    test('resolveCapsuleBodyRect：各停靠位的圆盘几何', () {
+      expect(disc.width, BottomChromeDimens.discDiameter);
+      expect(disc.height, BottomChromeDimens.discDiameter);
+      expect(disc.right, w - kMorphCapsuleSideInset);
+      final left = resolveCapsuleBodyRect(
+        screenSize: const Size(w, h),
+        safeBottom: 0,
+        collapse: 1.0,
+        dockSide: SecondaryPlayerDockSide.left,
+      );
+      expect(left.left, kMorphCapsuleSideInset);
+      final center = resolveCapsuleBodyRect(
+        screenSize: const Size(w, h),
+        safeBottom: 0,
+        collapse: 1.0,
+        dockSide: SecondaryPlayerDockSide.center,
+      );
+      expect(center.left, closeTo((w - BottomChromeDimens.discDiameter) / 2, 1e-9));
+      // collapse=0 时任何停靠位都与旧展开口径逐字节相等（回归保护；高 64 =
+      // discDiameter，底部净空 12 已含在 top 里 —— 与上方 fixture 的高 76 口径
+      // 不同，fixture 是「含净空的宿主量法」，此处按本体口径断言）。
+      for (final side in SecondaryPlayerDockSide.values) {
+        final expanded = resolveCapsuleBodyRect(
+          screenSize: const Size(w, h),
+          safeBottom: 0,
+          dockSide: side,
+        );
+        expect(expanded, Rect.fromLTWH(kMorphCapsuleSideInset,
+            h - 12.0 - BottomChromeDimens.discDiameter,
+            w - kMorphCapsuleSideInset * 2, BottomChromeDimens.discDiameter));
+      }
+    });
+
+    test('p=1 逐值等于圆盘端点（封面 56@inset4、行隐、角度对齐）', () {
+      final g = discAt(1, angle: 1.25);
+      expect(g.barWidth, BottomChromeDimens.discDiameter);
+      expect(g.barRadius, BottomChromeDimens.discDiameter / 2);
+      expect(g.coverSize, kMorphDiscCoverSize);
+      expect(g.coverSize, 56.0);
+      expect(g.coverLeft, kMorphDiscCoverInset);
+      expect(g.coverLeft, 4.0);
+      expect(g.coverTop, kMorphDiscCoverInset);
+      expect(g.coverRadius, closeTo(28.0, 1e-9));
+      expect(g.rowOpacity, 0.0);
+      expect(g.coverRotation, 1.25);
+      // p=0（常驻端）行可见、角度归零。
+      final r = discAt(0, angle: 1.25);
+      expect(r.rowOpacity, 1.0);
+      expect(r.coverRotation, 0.0);
+    });
+
+    test('collapse=0 端点与既有胶囊端点逐字节相等（回归保护）', () {
+      final g = resolveMorphBarLayout(
+        p: 1,
+        residentRect: resident,
+        capsuleRect: capsule,
+        capsuleCollapse: 0.0,
+        capsuleDiscAngle: 0.7,
+      );
+      expect(g.coverSize, kMorphCapsuleCoverSize);
+      expect(g.coverLeft, kMorphCapsuleCoverInset);
+      expect(g.rowOpacity, 1.0);
+      // 角度端点 = 调用方传值 × t：展开态调用方恒传 0，故既有展开交棒不旋转。
+      expect(g.coverRotation, 0.7);
+    });
+
+    test('中间值（collapse=0.4）端点解析式断言', () {
+      final rect04 = resolveCapsuleBodyRect(
+        screenSize: const Size(w, h),
+        safeBottom: 0,
+        collapse: 0.4,
+        dockSide: SecondaryPlayerDockSide.right,
+      );
+      final expectWidth = 368.0 + (64.0 - 368.0) * 0.4;
+      expect(rect04.width, closeTo(expectWidth, 1e-9));
+      expect(rect04.right, w - kMorphCapsuleSideInset);
+      final g = discAt(1, collapse: 0.4);
+      expect(g.coverSize, closeTo(58.0 + (56.0 - 58.0) * 0.4, 1e-9));
+      expect(g.rowOpacity, closeTo(0.6, 1e-9));
+    });
+  });
+
+  group('横屏 rail 布局端点（宽 800、rail 保留宽、无底栏净空）', () {
+    const double lw = 800.0;
+    const double lh = 400.0;
+    // rail 保留宽 = 默认槽位 96 + 分隔线 1（与 responsive_layout 同源常量；
+    // navigationRailReservedWidth 是实测回填的全局可变量，测试用常量档）。
+    const double railReserve =
+        kNavigationRailDefaultWidth + kNavigationRailDividerWidth;
+    // 常驻条端点：body 区从 rail 右缘起、贴屏底（横屏没有底部导航栏）。
+    final Rect railResident = Rect.fromLTWH(
+      railReserve,
+      lh - kMorphResidentBarHeight,
+      lw - railReserve,
+      kMorphResidentBarHeight,
+    );
+    // 胶囊端点：结算态无底栏（navVisibleAtSettle=false）、内容区让出 rail。
+    final Rect railCapsule = resolveCapsuleBodyRect(
+      screenSize: const Size(lw, lh),
+      safeBottom: 0,
+      navVisibleAtSettle: false,
+      leadingReserve: railReserve,
+    );
+
+    MorphBarLayout railAt(double p) => resolveMorphBarLayout(
+      p: p,
+      residentRect: railResident,
+      capsuleRect: railCapsule,
+    );
+
+    test('resolveCapsuleBodyRect：横屏 rail 口径（左缘右移、无底栏净空）', () {
+      // center 停靠取**内容区**中心（不是屏幕中心）：左缘 = rail 保留宽 + 16。
+      expect(railCapsule.left, railReserve + kMorphCapsuleSideInset);
+      expect(
+        railCapsule.width,
+        lw - railReserve - kMorphCapsuleSideInset * 2,
+      );
+      expect(railCapsule.right, lw - kMorphCapsuleSideInset);
+      // 结算态无底栏 → 底端只留 12dp 贴底距，不再抬高一个底栏槽位。
+      expect(railCapsule.bottom, lh - 12.0);
+    });
+
+    test('p = 0 逐值等于常驻条端点（横屏 body 口径）', () {
+      final g = railAt(0);
+      expect(g.t, 0.0);
+      expect(g.barLeft, railResident.left);
+      expect(g.barLeft, railReserve);
+      expect(g.barTop, railResident.top);
+      expect(g.barWidth, railResident.width);
+      expect(g.barWidth, lw - railReserve);
+      expect(g.barHeight, kMorphResidentBarHeight);
+      expect(g.barRadius, 0.0);
+      // 内容行恒相对条体盒：左起笔不随条盒左缘漂移（旧式 − barLeft 会推出盒外）。
+      expect(g.rowLeft, kMorphResidentTextLeft);
+      expect(g.rowRight, railResident.width - kMorphResidentRowRight);
+    });
+
+    test('p = 1 逐值等于胶囊端点（横屏 rail 布局）', () {
+      final g = railAt(1);
+      expect(g.t, 1.0);
+      expect(g.barLeft, railReserve + kMorphCapsuleSideInset);
+      expect(g.barTop, lh - 12.0 - BottomChromeDimens.discDiameter);
+      expect(g.barWidth, lw - railReserve - kMorphCapsuleSideInset * 2);
+      expect(g.barHeight, BottomChromeDimens.discDiameter);
+      expect(g.barRadius, BottomChromeDimens.discDiameter / 2);
+      expect(g.coverLeft, kMorphCapsuleCoverInset);
+      expect(g.coverSize, kMorphCapsuleCoverSize);
+      expect(g.rowLeft, kMorphCapsuleTextLeft);
+      expect(
+        g.rowRight,
+        (lw - railReserve - kMorphCapsuleSideInset * 2) -
+            kMorphCapsuleRowRight,
+      );
+    });
+
+    test('结算态底栏在场（竖屏口径）时胶囊抬升一个底栏槽位', () {
+      const double navBar = 64.0;
+      final withNav = resolveCapsuleBodyRect(
+        screenSize: const Size(lw, lh),
+        safeBottom: 0,
+        navBarHeight: navBar,
+        navVisibleAtSettle: true,
+        leadingReserve: railReserve,
+      );
+      expect(withNav.bottom, lh - 12.0 - navBar);
+    });
+
+    test('收缩圆盘在横屏 rail 口径的轨道内停靠', () {
+      final disc = resolveCapsuleBodyRect(
+        screenSize: const Size(lw, lh),
+        safeBottom: 0,
+        collapse: 1.0,
+        dockSide: SecondaryPlayerDockSide.right,
+        leadingReserve: railReserve,
+      );
+      expect(disc.width, BottomChromeDimens.discDiameter);
+      // 右停靠贴内容区右缘：rail 保留宽 + 右内缩 16 + 盘径 64。
+      expect(disc.right, lw - kMorphCapsuleSideInset);
+      final left = resolveCapsuleBodyRect(
+        screenSize: const Size(lw, lh),
+        safeBottom: 0,
+        collapse: 1.0,
+        dockSide: SecondaryPlayerDockSide.left,
+        leadingReserve: railReserve,
+      );
+      expect(left.left, railReserve + kMorphCapsuleSideInset);
+    });
+
+    test('Pad 限宽轨道（maxTrackWidth）与真身 trackW 同式', () {
+      const double cap = BottomChromeDimens.discTrackMaxWidth;
+      final capped = resolveCapsuleBodyRect(
+        screenSize: const Size(lw, lh),
+        safeBottom: 0,
+        leadingReserve: railReserve,
+        maxTrackWidth: cap,
+      );
+      // 内容区 800−97=703、减两侧 16 → 671 > 400，轨道限到 400 并居中停靠：
+      // 左缘 = rail 保留宽 + (内容区宽 − 轨道宽)/2。
+      expect(capped.width, cap);
+      expect(capped.left, railReserve + (lw - railReserve - cap) / 2);
+      // 轨道未超限时与不限宽逐字节相等（回归保护）。
+      final uncapped = resolveCapsuleBodyRect(
+        screenSize: const Size(w, h),
+        safeBottom: 0,
+        maxTrackWidth: cap,
+      );
+      final plain = resolveCapsuleBodyRect(
+        screenSize: const Size(w, h),
+        safeBottom: 0,
+      );
+      expect(uncapped, plain);
+    });
   });
 
   group('进度 stop 点在形变两端的连续性', () {

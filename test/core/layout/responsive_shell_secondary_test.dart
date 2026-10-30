@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:md3music/core/layout/adaptive_navigator.dart';
+import 'package:md3music/core/layout/responsive_layout.dart';
 import 'package:md3music/core/layout/responsive_shell.dart';
 import 'package:md3music/providers/tab_config_provider.dart';
 
@@ -12,6 +13,12 @@ import 'package:md3music/providers/tab_config_provider.dart';
 /// 定级收口在同一处意味着：悬浮播放条按二级处理（用悬浮条而非固定在菜单栏上方的
 /// 常驻条）的页面，底栏收起的认定必然一致，反之亦然。
 void main() {
+  // 双栏开关三端通用后显式开启：用例断言的是详情面板的二级上报链路。
+  setUp(() {
+    kWindowsTwoPaneEnabled.value = true;
+  });
+  tearDown(() => kWindowsTwoPaneEnabled.value = false);
+
   // 标题左对齐（pinnedTitle）才算一级；标题居中的 tab 与播放条一样按二级处理。
   const pinnedTab = TabItem(id: 'testtab', label: 'T', pinnedTitle: true);
   const centeredTab = TabItem(id: 'testtab', label: 'T');

@@ -2,6 +2,8 @@ import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../core/build_flags.dart';
+import '../core/remote/tv_hint_bar.dart';
+import '../core/remote/tv_player_back_focus.dart';
 
 /// 上一曲/暂停/下一曲三按钮联合动画控件。
 ///
@@ -57,6 +59,15 @@ class MD3ETransportRow extends StatefulWidget {
   /// 按钮间距
   final double spacing;
 
+  /// tv: 是否给**中央播放键**自动聚焦（TV 首焦点锚点，AGENTS §12.4 规则 1
+  /// 「一屏只给一个 autofocus，给主动作」）。
+  ///
+  /// 只在 `kTvBuild` 分支的 `DpadFocusable` 上生效；默认 false，既有调用点
+  /// （车机窄面板、非 TV 构建）零变化。**一次性门控由调用方负责**——本组件
+  /// 只在收到 true 的这一帧把焦点拉过来，之后的页面重建由调用方传 false，
+  /// 否则每次重建都会把焦点从用户手上抢回播放键。
+  final bool autofocusPlay;
+
   const MD3ETransportRow({
     super.key,
     required this.isPlaying,
@@ -66,6 +77,7 @@ class MD3ETransportRow extends StatefulWidget {
     this.sideButtonSize = 56,
     this.playButtonSize = 72,
     this.spacing = 8,
+    this.autofocusPlay = false,
   });
 
   @override
@@ -237,8 +249,32 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     });
   }
 
+  /// tv: 中央播放键的焦点节点——播放页返回键要把焦点交回播放键
+  /// （见 `tv_player_back_focus.dart` 的 `TvPlayerPlayFocusBridge`）。
+  /// 非 TV 构建恒 null：不创建、不登记，触屏路径零变化。
+  FocusNode? _tvPlayFocus;
+
+  /// tv: 取播放键节点并登记到移交桥（登记幂等，见桥的 `register`）。
+  ///
+  /// 「登记」放在取用处而不是 `initState`：本组件可能在动画中被重建，
+  /// 登记必须跟着构建走（同 `TvNavFocusBridge.register` 的处置）。
+  FocusNode? get _tvPlayFocusNode {
+    if (!kTvBuild) return null;
+    final FocusNode node =
+        _tvPlayFocus ??= FocusNode(debugLabel: 'transport_播放/暂停');
+    TvPlayerPlayFocusBridge.instance.register(node);
+    return node;
+  }
+
   @override
   void dispose() {
+    // tv: 播放键节点随本 State 销毁，并先摘登记再释放（释放后访问会断言）。
+    final FocusNode? tvPlayFocus = _tvPlayFocus;
+    if (tvPlayFocus != null) {
+      TvPlayerPlayFocusBridge.instance.unregister(tvPlayFocus);
+      tvPlayFocus.dispose();
+      _tvPlayFocus = null;
+    }
     _controller.dispose();
     _pressController.dispose();
     super.dispose();
@@ -499,13 +535,19 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
           ),
         );
 
+        // 整簇自建重绘边界（修「Windows 鼠标点暂停整窗卡一下」）：按压反馈与
+        // 上一曲/下一曲的形变都在本簇内逐帧推进，外层没有边界时每一帧的
+        // `markNeedsPaint` 都会冒泡到最近边界、把整页连坐重绘；按空格不跑这段
+        // 按压动画，所以同一条链路不卡。
+        final Widget bounded = RepaintBoundary(child: row);
+
         // tv: 槽位显隐/形变切换会让几何遍历在动画中跨组乱跳（P-F），TV 构建
         // 下把三按钮收进同一遍历组，左右键按视觉位置在组内排序；触屏构建
         // 不包，widget 树与改动前完全一致。
         if (kTvBuild) {
-          return FocusTraversalGroup(child: row);
+          return FocusTraversalGroup(child: bounded);
         }
-        return row;
+        return bounded;
       },
     );
   }
@@ -769,6 +811,10 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
         onTapCancel: _handlePressCancel,
         enabled: interaction.enabled,
         isCenterPlay: true,
+        // tv: 首焦点锚点只给这一处（唯一的中央播放键渲染路径）。
+        autofocus: widget.autofocusPlay,
+        // tv: 播放键节点（返回键移交目标，见 _tvPlayFocusNode）。
+        focusNode: _tvPlayFocusNode,
       ),
     );
   }
@@ -1080,6 +1126,8 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
     required bool enabled,
     double heightFactor = 1.0,
     bool isCenterPlay = false,
+    bool autofocus = false,
+    FocusNode? focusNode,
   }) {
     // widthFactor 是相对 playButtonSize 的比例（因为 Positioned.width = playButtonSize）
     final currentWidth = size * widthFactor;
@@ -1149,9 +1197,25 @@ class _MD3ETransportRowState extends State<MD3ETransportRow>
       return DpadFocusable(
         debugLabel: 'transport_$label',
         enabled: enabled && opacity > 0.01,
+        // tv: 首焦点锚点（只有中央播放键会被调用方置位；见 autofocusPlay）。
+        autofocus: autofocus,
+        // tv: 播放键节点由本 State 自持（见 _tvPlayFocusNode）。
+        focusNode: focusNode,
         onSelect: () {
           onTapDown?.call();
           onTapUp?.call();
+        },
+        // tv: 焦点落在本键时在提示条上给出键位说明（失焦清除）。
+        onFocusChange: (focused) {
+          if (!focused) {
+            TvHintBarScope.clear();
+            return;
+          }
+          TvHintBarScope.show(switch (label) {
+            '下一首' => 'OK 下一首',
+            '上一首' => 'OK 上一首',
+            _ => 'OK 播放/暂停',
+          });
         },
         child: body,
       );

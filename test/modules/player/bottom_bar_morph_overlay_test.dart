@@ -57,14 +57,17 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues(<String, Object>{});
-    // 全局进度是跨用例共享的 ValueNotifier，必须显式复位。
+    // 全局进度/窗口开关是跨用例共享的 ValueNotifier，必须显式复位。
     kBottomBarFormProgress.value = 0.0;
+    kBarFormFlightActive.value = false;
+    kBarFormResidentIsSource.value = true;
     player = _FakePlayer(song());
     carMode = CarModeProvider();
   });
 
   tearDown(() {
     kBottomBarFormProgress.value = 0.0;
+    kBarFormFlightActive.value = false;
     player.dispose();
     carMode.dispose();
   });
@@ -95,19 +98,22 @@ void main() {
     expect(find.byKey(_kBarTextKey), findsNothing);
   });
 
-  testWidgets('飞行窗口内（0 < p < 1）渲染那一根条', (tester) async {
+  testWidgets('飞行窗口内（开关开）渲染那一根条', (tester) async {
     _setViewport(tester, _kPhonePortrait);
     kBottomBarFormProgress.value = 0.0;
+    kBarFormFlightActive.value = false;
     await tester.pumpWidget(host());
 
     kBottomBarFormProgress.value = 0.5;
+    kBarFormFlightActive.value = true;
     await tester.pump();
     expect(find.byKey(_kBarTextKey), findsOneWidget);
     // 两端共享的播放控制与桌面歌词按钮都在（浮层不写第三份行内容）。
     expect(find.byType(PlayerBarTransport), findsOneWidget);
     expect(find.byType(PlayerBarLyricButton), findsOneWidget);
 
-    // 回到端点即收干净。
+    // 关窗（收敛到端点）即收干净。
+    kBarFormFlightActive.value = false;
     kBottomBarFormProgress.value = 0.0;
     await tester.pump();
     expect(find.byKey(_kBarTextKey), findsNothing);

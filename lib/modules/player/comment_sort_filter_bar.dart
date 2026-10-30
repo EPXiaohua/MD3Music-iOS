@@ -4,9 +4,11 @@
 // 1. 三个控件的高度口径集中在这里，且只有这一处真值（见 kCommentBarControlHeight）；
 // 2. 可脱离评论数据加载单独打 widget 测试。
 
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../widgets/tv_dropdown_menu.dart';
 import '../../services/kugou_api/comment_sort.dart';
@@ -85,6 +87,15 @@ class CommentSortFilterBar extends StatelessWidget {
   }
 
   Widget _buildSortGroup() {
+    // tv: TV 构建换自有分段控件。M3EToggleButtonGroup 的每一段都是 M3E 自建的
+    // 焦点节点（真机 logcat 可见 `M3EToggleButtonGroup Button N`），聚焦时 M3E 的
+    // `FocusRing` 无条件绘制（m3e_core 的 `m3e_button.dart:488`，没有关闭参数），
+    // 与全局 `TvFocusHighlight` 叠成两层框（用户 2026-10-18 真机实测）。
+    // 自有控件由 `DpadFocusable` 单停点驱动：聚焦只有全局一层框，OK = 选中
+    // （不是「聚焦即切换」——排序切换会触发评论重载，不能跟着焦点走）。
+    if (kTvBuild) {
+      return _TvSortSegments(sortMode: sortMode, isAmStyle: isAmStyle, onChanged: onSortModeChanged);
+    }
     // AM 皮肤下选中段更亮、未选中段更淡；MD3 走默认分组底色。
     final groupDecoration = isAmStyle
         ? M3EToggleButtonDecoration(
@@ -149,6 +160,11 @@ class CommentSortFilterBar extends StatelessWidget {
   }
 
   Widget _buildComposeButton() {
+    // tv: 同分段控件——`M3EFilledButton` 聚焦时同样由 M3E 的 FocusRing 绘制焦点环，
+    // 与全局 `TvFocusHighlight` 叠成两层。TV 构建换自有按钮（单停点 + 自绘容器）。
+    if (kTvBuild) {
+      return _TvComposeButton(isAmStyle: isAmStyle, onCompose: onCompose);
+    }
     return M3EFilledButton(
       onPressed: onCompose,
       tooltip: '写评论',
@@ -176,6 +192,122 @@ class CommentSortFilterBar extends StatelessWidget {
             ),
       semanticLabel: '写评论',
       child: const Icon(Icons.edit_outlined, size: 18),
+    );
+  }
+}
+
+/// tv: 评论区排序分段的 TV 自有实现（最热 / 最新 / 最早）。
+///
+/// ## 为什么不用 `M3EToggleButtonGroup`
+///
+/// M3E 的每一段都是它自建的焦点节点（真机 logcat：`M3EToggleButtonGroup Button N`），
+/// 聚焦时 M3E 的 `FocusRing` 无条件绘制，与全局 `TvFocusHighlight` 叠成两层框。
+/// 自有实现在 `DpadFocusable` 单停点之下，只剩全局一层。
+///
+/// ## 交互
+///
+/// 左右键在段间移动焦点、**OK 才切换**排序——「聚焦即切换」会让评论列表跟着
+/// 焦点重载，手感与流量都不对（这与播放页 Tab 刻意采用「聚焦即切」相反，因为
+/// 那边切页是纯视觉、无网络请求）。
+///
+/// 段序与 [CommentSortMode.values] 一一对应。
+class _TvSortSegments extends StatelessWidget {
+  const _TvSortSegments({
+    required this.sortMode,
+    required this.isAmStyle,
+    required this.onChanged,
+  });
+
+  final CommentSortMode sortMode;
+  final bool isAmStyle;
+  final ValueChanged<CommentSortMode> onChanged;
+
+  /// 段文案；顺序必须与 [CommentSortMode.values] 一致（最热 / 最新 / 最早）。
+  static const List<String> _labels = <String>['最热', '最新', '最早'];
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    // 配色口径与触屏分支的 M3E 分组一致：AM 皮肤用半透明白、MD3 用主题分组色。
+    final Color selectedBg = isAmStyle
+        ? const Color(0x2EFFFFFF)
+        : cs.secondaryContainer;
+    final Color selectedFg = isAmStyle
+        ? Colors.white
+        : cs.onSecondaryContainer;
+    final Color unselectedFg = isAmStyle
+        ? const Color(0xB3FFFFFF)
+        : cs.onSurfaceVariant;
+
+    return DpadRegion(
+      memoryKey: 'tv/comment-sort',
+      debugLabel: 'tv-comment-sort',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          for (int i = 0; i < _labels.length; i++)
+            DpadFocusable(
+              debugLabel: 'tv/comment-sort-$i',
+              onSelect: () {
+                AppHaptics.selectionClick(HapticCategory.control);
+                onChanged(CommentSortMode.values[i]);
+              },
+              child: Container(
+                height: kCommentBarControlHeight,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: i == sortMode.index ? selectedBg : Colors.transparent,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  _labels[i],
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: i == sortMode.index
+                        ? FontWeight.w600
+                        : FontWeight.w400,
+                    color: i == sortMode.index ? selectedFg : unselectedFg,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// tv: 「写评论」的 TV 自有按钮（见 `CommentSortFilterBar._buildComposeButton` 的注释）。
+class _TvComposeButton extends StatelessWidget {
+  const _TvComposeButton({required this.isAmStyle, required this.onCompose});
+
+  final bool isAmStyle;
+  final VoidCallback onCompose;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final Color bg = isAmStyle
+        ? const Color(0x1FFFFFFF)
+        : cs.surfaceContainerHighest;
+    final Color fg = isAmStyle ? Colors.white : cs.onSurfaceVariant;
+    return DpadFocusable(
+      debugLabel: 'tv/comment-compose',
+      onSelect: onCompose,
+      child: Semantics(
+        button: true,
+        label: '写评论',
+        child: Container(
+          width: kCommentBarControlHeight,
+          height: kCommentBarControlHeight,
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Icon(Icons.edit_outlined, size: 18, color: fg),
+        ),
+      ),
     );
   }
 }

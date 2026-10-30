@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dpad/dpad.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
@@ -6,6 +8,7 @@ import 'package:m3e_core/m3e_core.dart';
 import '../../core/build_flags.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
+import '../../data/repositories/settings_repository.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/player_top_bar_actions.dart';
 import 'sleep_timer_dial.dart';
@@ -99,7 +102,8 @@ TopBarTrailingSegment? sleepTimerTopBarSegment({
 }
 
 /// 弹出「定时关闭」面板：圆形时钟盘（拖动套圈，上限 24 小时）+
-/// 分钟手动输入 + 「定时结束后播完当前歌曲」+「关闭定时」。
+/// 分钟手动输入 + 「定时结束后播完当前歌曲」+「结束后减少待机耗电」+
+/// 「关闭定时」。
 ///
 /// 与旧版的差别：旧的 1–90 分钟 `M3ESlider` 已移除，改为调完点**中央形状**
 /// 才真正提交（拖动过程不再即时改写定时）。
@@ -108,6 +112,19 @@ void showSleepTimerSheet({
   required PlayerProvider player,
 }) {
   final rootContext = context;
+  // 冷启动回读：该偏好持久化在 SettingsRepository，而 Provider 内存字段随
+  // 进程生成默认 false。弹层是唯一改动入口且切换时同步内存字段，但进程重启
+  // 后内存字段可能落后于持久化值，打开弹层时异步回读一次对齐；回读落地前
+  // 用户已抢先切换的，以内存值为准，不用持久化旧值覆盖（比较回读前的快照）。
+  final killBackgroundAtOpen = player.killBackgroundOnTimerEnd;
+  unawaited(
+    SettingsRepository().getSleepTimerKillBackground().then((persisted) {
+      if (persisted != killBackgroundAtOpen &&
+          player.killBackgroundOnTimerEnd == killBackgroundAtOpen) {
+        player.setKillBackgroundOnTimerEnd(persisted);
+      }
+    }),
+  );
   // 初始值：已有定时时显示剩余分钟数（clamp 到合法区间），否则默认 30
   final initialMinutes = (player.sleepTimerRemaining?.inMinutes ?? 30).clamp(
     kSleepTimerMinMinutes,
@@ -129,6 +146,7 @@ void showSleepTimerSheet({
           listenable: player,
           builder: (context, _) {
             final stopAfterCurrentTrack = player.stopAfterTimerEnds;
+            final killBackground = player.killBackgroundOnTimerEnd;
             return StatefulBuilder(
               builder: (context, setSheetState) {
                 void setMinutes(int next) => setSheetState(
@@ -142,7 +160,7 @@ void showSleepTimerSheet({
                     Theme.of(rootContext).colorScheme.onSurfaceVariant;
                 return Padding(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                  // 表盘最高 300dp，加上输入行与两个 tile 在横屏/小屏会超出
+                  // 表盘最高 300dp，加上输入行与三个 tile 在横屏/小屏会超出
                   // 屏高。`isScrollControlled: true` 的弹层不限高，必须显式给
                   // 上界，否则 SingleChildScrollView 拿不到有界高度、直接溢出
                   // 而不是滚动。
@@ -222,7 +240,7 @@ void showSleepTimerSheet({
                           ),
                         ),
                         const SizedBox(height: 12),
-                        _ManualMinuteField(minutes: minutes, onSubmit: setMinutes),
+                        _ManualMinuteField(minutes: minutes, onChanged: setMinutes),
                         const SizedBox(height: 4),
                         // 「定时结束后播完当前歌曲」开关：开启后定时到点不打断
                         // 播放，等当前正在播的这首自然播完再暂停；偏好到点后保留。
@@ -236,6 +254,27 @@ void showSleepTimerSheet({
                               next
                                   ? '定时结束后将播完当前歌曲再暂停'
                                   : '已取消「定时结束后播完当前歌曲」',
+                              long: true,
+                            );
+                          },
+                        ),
+                        // 「结束后减少待机耗电」开关：开启后定时到点（含
+                        // 「播完当前歌曲」收尾）在停播落盘后继续停本地服务并
+                        // 结束任务，不驻留后台；切换即持久化并同步 Provider。
+                        SwitchListTile(
+                          secondary: const Icon(Icons.battery_saver_outlined),
+                          title: const Text('结束后减少待机耗电'),
+                          subtitle: const Text('倒计时结束后停止后台服务并退出应用'),
+                          value: killBackground,
+                          onChanged: (next) {
+                            player.setKillBackgroundOnTimerEnd(next);
+                            SettingsRepository().setSleepTimerKillBackground(
+                              next,
+                            );
+                            showToast(
+                              next
+                                  ? '定时结束后将停止后台服务并退出应用'
+                                  : '已取消「结束后减少待机耗电」',
                               long: true,
                             );
                           },
@@ -262,16 +301,16 @@ void showSleepTimerSheet({
   );
 }
 
-/// 分钟手动输入（1–1440）。
+/// 分钟手动输入（1–1440），输入实时生效（无「应用」按钮）。
 ///
 /// 独立成 StatefulWidget 是为了自己持有并 dispose [TextEditingController]：
 /// 控制器不能声明在 `StatefulBuilder` 的 builder 里（每次重建都会丢内容），
 /// 声明在外面则没人 dispose。
 class _ManualMinuteField extends StatefulWidget {
-  const _ManualMinuteField({required this.minutes, required this.onSubmit});
+  const _ManualMinuteField({required this.minutes, required this.onChanged});
 
   final int minutes;
-  final ValueChanged<int> onSubmit;
+  final ValueChanged<int> onChanged;
 
   @override
   State<_ManualMinuteField> createState() => _ManualMinuteFieldState();
@@ -286,6 +325,10 @@ class _ManualMinuteFieldState extends State<_ManualMinuteField> {
     super.initState();
     _controller = TextEditingController(text: '${widget.minutes}');
     _focusNode = FocusNode();
+    // 失焦时回填当前合法值：清空/非法的中间态不写回状态，离开时收口
+    _focusNode.addListener(() {
+      if (!_focusNode.hasFocus) _controller.text = '${widget.minutes}';
+    });
   }
 
   @override
@@ -304,40 +347,28 @@ class _ManualMinuteFieldState extends State<_ManualMinuteField> {
     super.dispose();
   }
 
-  void _submit() {
+  /// 实时应用：每个 keystroke 都解析并上报；空/非数字是输入中间态，跳过不写。
+  void _apply() {
     final parsed = int.tryParse(_controller.text);
-    if (parsed == null) {
-      // 非法输入（空/非数字）回填当前值，不静默改状态
-      _controller.text = '${widget.minutes}';
-      return;
-    }
-    widget.onSubmit(parsed);
-    _focusNode.unfocus();
+    if (parsed == null) return;
+    widget.onChanged(parsed);
   }
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        Expanded(
-          child: TextField(
-            controller: _controller,
-            focusNode: _focusNode,
-            contextMenuBuilder: buildAppTextContextMenu,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            decoration: const InputDecoration(
-              labelText: '手动输入',
-              suffixText: '分钟',
-              isDense: true,
-            ),
-            onSubmitted: (_) => _submit(),
-          ),
-        ),
-        const SizedBox(width: 8),
-        TextButton(onPressed: _submit, child: const Text('应用')),
-      ],
+    return TextField(
+      controller: _controller,
+      focusNode: _focusNode,
+      contextMenuBuilder: buildAppTextContextMenu,
+      keyboardType: TextInputType.number,
+      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+      decoration: const InputDecoration(
+        labelText: '手动输入',
+        suffixText: '分钟',
+        isDense: true,
+      ),
+      onChanged: (_) => _apply(),
+      onSubmitted: (_) => _focusNode.unfocus(),
     );
   }
 }

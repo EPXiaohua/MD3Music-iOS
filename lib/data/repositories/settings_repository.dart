@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -9,6 +12,83 @@ import '../../modules/player/car_mode_layout.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 
 class SettingsRepository {
+  /// 只删除用户设置；不能用 prefs.clear() 或 secureStorage.deleteAll()，
+  /// 否则会同时清掉账号、登录凭据、收藏与播放记录。常驻服务需重启后重读默认值。
+  Future<void> resetAllSettingsToDefaults() async {
+    final prefs = await SharedPreferences.getInstance();
+    const prefixes = [
+      'settings_',
+      'lyric_',
+      'md3_lyric_',
+      'lyricon_',
+      'super_lyric_',
+      'eq_',
+      'viper_eq_gain_',
+      'usb_',
+    ];
+    const extraKeys = {
+      'theme_mode',
+      'use_dynamic_color',
+      'use_cover_dynamic_color',
+      'use_am_style_player',
+      'manual_seed_color',
+      'use_oled_black',
+      'ui_display_scale',
+      'ui_scale',
+      'nav_label_behavior',
+      'font_source',
+      'custom_font_path',
+      'custom_text_color',
+      'use_artist_photo_background',
+      'artist_photo_interval',
+      'artist_photo_opacity',
+      'use_background_image',
+      'background_image_path',
+      'background_blur',
+      'am_player_blur',
+      'background_opacity',
+      'use_background_monet',
+      'use_text_shadow',
+      'text_shadow_blur',
+      'emphasized_typography',
+      'grid_columns',
+      'desktop_sidebar_width',
+      'desktop_detail_ratio',
+      'comment_display_font_size',
+      'device_type',
+      'enable_32bit_output',
+      'player_volume',
+      'local_music_scan_folders',
+      'local_music_excluded_folders',
+      'local_music_filter_short_audio',
+    };
+    final keys = prefs.getKeys().where((key) {
+      // 签到日期是账号数据，不是设置；游客与每个账号的记录均保留。
+      if (key == 'settings_signed_days' ||
+          key.startsWith('settings_signed_days_')) {
+        return false;
+      }
+      return extraKeys.contains(key) ||
+          prefixes.any((prefix) => key.startsWith(prefix));
+    }).toList();
+    // MCP 的访问令牌也属于可重置的配置，但不能触碰酷狗账号安全存储。
+    await _mcpSecureStorage.delete(key: _keyMcpTokenSecure);
+    for (final key in keys) {
+      if (!await prefs.remove(key)) {
+        throw StateError('还原设置失败：$key');
+      }
+    }
+    if (Platform.isWindows) windowsSettingsResetRevision.value++;
+  }
+
+  // Windows 的播放/MV 页面可能被桌面标签页保活，设置变更后通知已挂载页面刷新。
+  static final ValueNotifier<int> windowsLiveSettingsRevision = ValueNotifier(
+    0,
+  );
+  // Windows 全部设置还原后，通知仍保活的外壳重读未由 Provider 托管的布局偏好。
+  static final ValueNotifier<int> windowsSettingsResetRevision = ValueNotifier(
+    0,
+  );
   static const String _keyThemeMode = 'settings_theme_mode';
   static const String _keyDefaultQuality = 'settings_default_quality';
   // 按网络区分的音质（WiFi / 移动网络）；未设置时回退到 _keyDefaultQuality
@@ -24,6 +104,8 @@ class SettingsRepository {
       'settings_startup_auto_play_source';
   static const String _keyStartupAutoPlayOpenPage =
       'settings_startup_auto_play_open_page';
+  static const String _keyIdleKeepaliveStopMinutes =
+      'settings_idle_keepalive_stop_minutes';
   // 早期预留的死键，全仓无任何调用方，勿与上面的启动自动播放混用。
   static const String _keyAutoPlay = 'settings_auto_play';
   static const String _keyShowLyrics = 'settings_show_lyrics';
@@ -36,6 +118,17 @@ class SettingsRepository {
   static const String _keyMvDanmakuEnabled = 'settings_mv_danmaku_enabled';
   static const String _keyMvDanmakuOpacity = 'settings_mv_danmaku_opacity';
   static const String _keySongDanmakuEnabled = 'settings_song_danmaku_enabled';
+  // MD3Music fork v46：歌曲弹幕速度倍率（0.5~2.0，1.0=默认 120px/s）与颜色
+  //（int color value，null=跟随弹幕池/默认白）。静态镜像供播放页即时生效。
+  static const String _keySongDanmakuSpeed = 'settings_song_danmaku_speed';
+  static const String _keySongDanmakuColor = 'settings_song_danmaku_color';
+  // MD3Music fork v47：只看弹幕（隐藏播放页"发弹幕"按钮）。
+  static const String _keySongDanmakuReadOnly = 'settings_song_danmaku_read_only';
+  // MD3Music fork v52：歌曲弹幕透明度（0.1~1.0，1.0=不透明）。
+  static const String _keySongDanmakuOpacity = 'settings_song_danmaku_opacity';
+  // MD3Music fork v54：MV 弹幕速度与颜色。
+  static const String _keyMvDanmakuSpeed = 'settings_mv_danmaku_speed';
+  static const String _keyMvDanmakuColor = 'settings_mv_danmaku_color';
 
   /// 封面流歌单源（CoverFlowSource.rawValue：'daily' / 'personalFm' / 'homeDiscover'）。
   /// 存原始字符串而非 int 下标：枚举顺序是 UI 契约，持久化不跟它走。
@@ -68,10 +161,8 @@ class SettingsRepository {
   static const String _keyLegacyAppIconEnabled =
       'settings_legacy_app_icon_enabled';
 
-  /// 最近一次检查到的远端最新版本号（形如 6.0.2）。属于记账状态而非用户
-  /// 设置，故不加 settings_ 前缀。供「更新最新版本」入口展示版本号。
-  static const String _keyUpdateLatestRemoteVersion =
-      'update_latest_remote_version';
+  /// 上次网络检查的时间戳（ms）。属于记账状态而非用户设置，故不加 settings_ 前缀。
+  static const String _keyUpdateLastCheckMs = 'update_last_check_ms';
 
   /// 上次已提醒过的版本号（形如 5.6.5），用于同一版本只提醒一次。同上，不加前缀。
   static const String _keyUpdateLastNotifiedVersion =
@@ -108,6 +199,19 @@ class SettingsRepository {
   /// 键公开：`runBootstrap` 首帧前播种要读同一个键，勿再写字面量。
   static const String desktopModeEnabledPreferenceKey =
       'settings_desktop_mode_enabled';
+
+  static const String windowsTwoPaneEnabledPreferenceKey =
+      'settings_windows_two_pane_enabled';
+
+  Future<bool> getWindowsTwoPaneEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(windowsTwoPaneEnabledPreferenceKey) ?? false;
+  }
+
+  Future<void> setWindowsTwoPaneEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(windowsTwoPaneEnabledPreferenceKey, enabled);
+  }
 
   /// 是否启用桌面外壳。未设置时默认 false（不使用新横屏界面）。
   Future<bool> getDesktopModeEnabled() async {
@@ -170,6 +274,23 @@ class SettingsRepository {
     await prefs.setBool(predictiveBackEnabledPreferenceKey, enabled);
   }
 
+  /// 定时关闭「结束后减少待机耗电」开关（定时关闭弹层内切换）。
+  /// 默认关闭；开启后定时到点（含「播完当前歌曲」收尾）在停播落盘之后
+  /// 停止本地 Rust 服务并结束应用任务，不驻留后台。
+  static const String sleepTimerKillBackgroundPreferenceKey =
+      'settings_sleep_timer_kill_background';
+
+  /// 是否启用定时结束后退出应用以省电。未设置时默认关闭。
+  Future<bool> getSleepTimerKillBackground() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(sleepTimerKillBackgroundPreferenceKey) ?? false;
+  }
+
+  Future<void> setSleepTimerKillBackground(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(sleepTimerKillBackgroundPreferenceKey, enabled);
+  }
+
   /// 歌单封面连贯过渡总开关（列表卡片封面飞进详情页头）。默认开启。
   static const String playlistCoverTransitionEnabledPreferenceKey =
       'settings_playlist_cover_transition_enabled';
@@ -181,15 +302,32 @@ class SettingsRepository {
 
   Future<void> setPlaylistCoverTransitionEnabled(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(
-      playlistCoverTransitionEnabledPreferenceKey,
-      enabled,
-    );
+    await prefs.setBool(playlistCoverTransitionEnabledPreferenceKey, enabled);
   }
 
   /// 悬浮播放器的进度指示开关。默认开启（未设置时返回 true）。
   static const String secondaryPlayerProgressPreferenceKey =
       'settings_secondary_player_progress';
+
+  /// 悬浮播放器整体透明度（0.2~1.0，默认完全不透明）。
+  static const String secondaryPlayerOpacityPreferenceKey =
+      'settings_secondary_player_opacity';
+
+  Future<double> getSecondaryPlayerOpacity() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getDouble(secondaryPlayerOpacityPreferenceKey) ?? 1.0).clamp(
+      0.2,
+      1.0,
+    );
+  }
+
+  Future<void> setSecondaryPlayerOpacity(double opacity) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(
+      secondaryPlayerOpacityPreferenceKey,
+      opacity.clamp(0.2, 1.0),
+    );
+  }
 
   Future<bool> getSecondaryPlayerProgress() async {
     final prefs = await SharedPreferences.getInstance();
@@ -380,15 +518,15 @@ class SettingsRepository {
     await prefs.setBool(_keyLegacyAppIconEnabled, enabled);
   }
 
-  /// 最近检查到的远端最新版本号（形如 6.0.2）；未检查过返回空串。
-  Future<String> getUpdateLatestRemoteVersion() async {
+  /// 上次成功发起 Release 检查的时间戳（ms）；未检查过返回 0。
+  Future<int> getUpdateLastCheckMs() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyUpdateLatestRemoteVersion) ?? '';
+    return prefs.getInt(_keyUpdateLastCheckMs) ?? 0;
   }
 
-  Future<void> setUpdateLatestRemoteVersion(String version) async {
+  Future<void> setUpdateLastCheckMs(int milliseconds) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_keyUpdateLatestRemoteVersion, version);
+    await prefs.setInt(_keyUpdateLastCheckMs, milliseconds);
   }
 
   /// 上次已提醒的新版本号（形如 5.6.5）；未提醒过返回空串。
@@ -442,6 +580,7 @@ class SettingsRepository {
   Future<void> setMvDanmakuEnabled(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyMvDanmakuEnabled, value);
+    if (Platform.isWindows) windowsLiveSettingsRevision.value++;
   }
 
   /// MV 弹幕总透明度（PiliPlus `danmakuOpacity` 的对应物）。
@@ -454,14 +593,16 @@ class SettingsRepository {
   Future<void> setMvDanmakuOpacity(double value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_keyMvDanmakuOpacity, value.clamp(0.1, 1.0));
+    if (Platform.isWindows) windowsLiveSettingsRevision.value++;
   }
 
   /// 歌曲弹幕开关。默认关闭 —— 与 MV 弹幕同一口径。
   /// 播放页低频读内存镜像即可，避免每帧异步读 SharedPreferences；
   /// 设置页修改后经镜像即时生效，无需重进播放页（同步时机对齐 lyricTimeOffsetMs：
   /// getter 读盘后回填、setter 写盘前先更新）。
-  static final ValueNotifier<bool> songDanmakuEnabled =
-      ValueNotifier<bool>(false);
+  static final ValueNotifier<bool> songDanmakuEnabled = ValueNotifier<bool>(
+    false,
+  );
 
   Future<bool> getSongDanmakuEnabled() async {
     final prefs = await SharedPreferences.getInstance();
@@ -474,6 +615,154 @@ class SettingsRepository {
     songDanmakuEnabled.value = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keySongDanmakuEnabled, value);
+  }
+
+  /// AM 横屏播放页右栏左右边缘渐隐开关。默认开启。
+  /// 与 songDanmakuEnabled 同一口径：播放页读内存镜像，设置页修改后即时生效
+  /// （getter 读盘后回填、setter 写盘前先更新），无需重进播放页。
+  static final ValueNotifier<bool> amLandscapeEdgeFade = ValueNotifier<bool>(
+    true,
+  );
+
+  static const String _keyAmLandscapeEdgeFade =
+      'settings_am_landscape_edge_fade';
+
+  /// 是否启用 AM 横屏播放页右栏左右边缘渐隐遮罩。未设置时默认开启。
+  Future<bool> getAmLandscapeEdgeFade() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getBool(_keyAmLandscapeEdgeFade) ?? true;
+    amLandscapeEdgeFade.value = v;
+    return v;
+  }
+
+  Future<void> setAmLandscapeEdgeFade(bool value) async {
+    amLandscapeEdgeFade.value = value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyAmLandscapeEdgeFade, value);
+  }
+
+  /// MD3Music fork v46：歌曲弹幕速度倍率（0.5~2.0）。静态镜像供
+  /// 播放页即时生效（同 songDanmakuEnabled 模式：getter 读盘回填、setter
+  /// 写盘前先更新）。v59：默认改 0.5（用户拍板的口径）。
+  static final ValueNotifier<double> songDanmakuSpeed =
+      ValueNotifier<double>(0.5);
+
+  Future<double> getSongDanmakuSpeed() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = (prefs.getDouble(_keySongDanmakuSpeed) ?? 0.5).clamp(0.5, 2.0);
+    songDanmakuSpeed.value = v;
+    return v;
+  }
+
+  Future<void> setSongDanmakuSpeed(double value) async {
+    final v = value.clamp(0.5, 2.0);
+    songDanmakuSpeed.value = v;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keySongDanmakuSpeed, v);
+  }
+
+  /// MD3Music fork v46：歌曲弹幕颜色（int ARGB；null=跟随弹幕池/默认白；
+  /// v49：-1=随机哨值——每条弹幕从固定调色板随机取色）。
+  /// v55：镜像初始值 -1——回填前的首帧也走随机（与 getter 默认口径一致）。
+  static final ValueNotifier<int?> songDanmakuColor =
+      ValueNotifier<int?>(-1);
+
+  Future<int?> getSongDanmakuColor() async {
+    final prefs = await SharedPreferences.getInstance();
+    final hasColor = prefs.containsKey(_keySongDanmakuColor);
+    // v54：未设置时默认随机（-1 哨值）——用户此前拍板的默认口径；显式选过
+    // 任何档位（含跟随=null）的老用户不受影响。
+    final v = hasColor ? prefs.getInt(_keySongDanmakuColor) : -1;
+    songDanmakuColor.value = v;
+    return v;
+  }
+
+  Future<void> setSongDanmakuColor(int? value) async {
+    songDanmakuColor.value = value;
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null) {
+      await prefs.remove(_keySongDanmakuColor);
+    } else {
+      await prefs.setInt(_keySongDanmakuColor, value);
+    }
+  }
+
+  /// MD3Music fork v47：只看弹幕——隐藏播放页右下角的"发弹幕"按钮。
+  /// 默认关（按钮显示）。静态镜像供播放页即时生效。
+  static final ValueNotifier<bool> songDanmakuReadOnly =
+      ValueNotifier<bool>(false);
+
+  Future<bool> getSongDanmakuReadOnly() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getBool(_keySongDanmakuReadOnly) ?? false;
+    songDanmakuReadOnly.value = v;
+    return v;
+  }
+
+  Future<void> setSongDanmakuReadOnly(bool value) async {
+    songDanmakuReadOnly.value = value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keySongDanmakuReadOnly, value);
+  }
+
+  /// MD3Music fork v52：歌曲弹幕透明度（0.1~1.0；1.0=不透明）。
+  /// v59：默认改 0.8（用户拍板的口径）。
+  static final ValueNotifier<double> songDanmakuOpacity =
+      ValueNotifier<double>(0.8);
+
+  Future<double> getSongDanmakuOpacity() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = (prefs.getDouble(_keySongDanmakuOpacity) ?? 0.8).clamp(0.1, 1.0);
+    songDanmakuOpacity.value = v;
+    return v;
+  }
+
+  Future<void> setSongDanmakuOpacity(double value) async {
+    final v = value.clamp(0.1, 1.0);
+    songDanmakuOpacity.value = v;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keySongDanmakuOpacity, v);
+  }
+
+  /// MD3Music fork v54：MV 弹幕速度倍率（0.5~2.0，1.0=默认时长 10s）与
+  /// 颜色（int ARGB；-1=随机哨值，null=跟随弹幕池；默认随机）。静态镜像
+  /// 同歌曲弹幕组模式。
+  static final ValueNotifier<double> mvDanmakuSpeed =
+      ValueNotifier<double>(1.0);
+
+  static final ValueNotifier<int?> mvDanmakuColor =
+      ValueNotifier<int?>(-1);
+
+  Future<double> getMvDanmakuSpeed() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = (prefs.getDouble(_keyMvDanmakuSpeed) ?? 1.0).clamp(0.5, 2.0);
+    mvDanmakuSpeed.value = v;
+    return v;
+  }
+
+  Future<void> setMvDanmakuSpeed(double value) async {
+    final v = value.clamp(0.5, 2.0);
+    mvDanmakuSpeed.value = v;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_keyMvDanmakuSpeed, v);
+  }
+
+  Future<int?> getMvDanmakuColor() async {
+    final prefs = await SharedPreferences.getInstance();
+    final hasColor = prefs.containsKey(_keyMvDanmakuColor);
+    final v = hasColor ? prefs.getInt(_keyMvDanmakuColor) : -1;
+    mvDanmakuColor.value = v;
+    return v;
+  }
+
+  Future<void> setMvDanmakuColor(int? value) async {
+    mvDanmakuColor.value = value;
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null) {
+      await prefs.remove(_keyMvDanmakuColor);
+    } else {
+      await prefs.setInt(_keyMvDanmakuColor, value);
+    }
   }
 
   /// 「听歌数据云同步」总开关，默认开启。
@@ -491,6 +780,22 @@ class SettingsRepository {
   Future<void> setUploadListeningDuration(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyUploadListeningDuration, value);
+  }
+
+  /// 「听歌统计记录」开关（本地听歌统计入库，默认开启）。
+  /// 与上面的「听歌数据云同步」相互独立：只总控 ListenStatsRecordService
+  /// 的本地落库，不影响云端播放历史/上报链路。
+  static const String _keyListenStatsRecordingEnabled =
+      'settings_listen_stats_recording_enabled';
+
+  Future<bool> getListenStatsRecordingEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyListenStatsRecordingEnabled) ?? true;
+  }
+
+  Future<void> setListenStatsRecordingEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyListenStatsRecordingEnabled, value);
   }
 
   /// 逐字歌词时间偏移（ms，内存缓存）。播放页每帧高频读取，
@@ -517,7 +822,8 @@ class SettingsRepository {
 
   Future<double> getDesktopLyricFontSize() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getDouble('settings_dl_font_size') ?? 18.0;
+    return prefs.getDouble('settings_dl_font_size') ??
+        (Platform.isWindows ? 40.0 : 18.0);
   }
 
   Future<void> setDesktopLyricFontSize(double size) async {
@@ -535,6 +841,16 @@ class SettingsRepository {
     await prefs.setBool('settings_dl_double_line', v);
   }
 
+  Future<bool> getDesktopLyricAllowHorizontalMove() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool('settings_dl_allow_horizontal_move') ?? true;
+  }
+
+  Future<void> setDesktopLyricAllowHorizontalMove(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('settings_dl_allow_horizontal_move', v);
+  }
+
   Future<int> getDesktopLyricOpacity() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getInt('settings_dl_opacity') ?? 50;
@@ -548,7 +864,9 @@ class SettingsRepository {
   Future<int> getDesktopLyricGradientStart() async {
     final prefs = await SharedPreferences.getInstance();
     // toUnsigned(32)：修复前原生回灌的负数 Kotlin Int 可能还留在盘里
-    return (prefs.getInt('settings_dl_grad_start') ?? 0xFF00E5FF).toUnsigned(32);
+    return (prefs.getInt('settings_dl_grad_start') ?? 0xFF00E5FF).toUnsigned(
+      32,
+    );
   }
 
   Future<void> setDesktopLyricGradientStart(int v) async {
@@ -1008,6 +1326,24 @@ class SettingsRepository {
     await prefs.setBool(_keyViperTapeQualityEnabled, value);
   }
 
+  // ===== 硬件解码播放（系统 audio offload 直通）=====
+  static const String _keyAudioOffloadEnabled =
+      'settings_audio_offload_enabled';
+
+  /// 是否允许把解码与输出整段交给系统音频服务做硬件直通（offload），默认关闭。
+  ///
+  /// 与蝰蛇母带同属「音质通路」设置：开关本身只是一份用户意图，真正的生效还
+  /// 要过 `AudioOffloadService` 的平台/互斥条件判定。
+  Future<bool> getAudioOffloadEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyAudioOffloadEnabled) ?? false;
+  }
+
+  Future<void> setAudioOffloadEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyAudioOffloadEnabled, value);
+  }
+
   // ===== 暂停淡入淡出 =====
   static const String _keyPauseFadeEnabled = 'settings_pause_fade_enabled';
 
@@ -1071,6 +1407,21 @@ class SettingsRepository {
   Future<void> setAutomixEnabled(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyAutomixEnabled, value);
+  }
+
+  // ===== 过滤 Live/现场版本 =====
+  static const String _keySkipLiveEnabled = 'settings_skip_live_enabled';
+
+  /// 过滤 Live/现场版本。开启后自动连播/列表起播/队列点选自动跳过标题命中
+  /// Live/现场的歌曲（手动单独点播一首不受影响）。
+  Future<bool> getSkipLiveEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keySkipLiveEnabled) ?? false;
+  }
+
+  Future<void> setSkipLiveEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keySkipLiveEnabled, value);
   }
 
   // ===== 音量均衡（响度归一） =====
@@ -1152,6 +1503,66 @@ class SettingsRepository {
   Future<void> setLandscapeDetachedControls(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(landscapeDetachedControlsPreferenceKey, value);
+  }
+
+  /// 横屏/宽屏播放详情页「左右对称分栏」开关。
+  /// 默认开启 = 左右栏 1:1 对称；关闭后左栏收窄为 4:10 中的 4（即 4:6），
+  /// 右栏歌词/歌单等内容获得更多宽度。
+  /// 占比唯一来源见 `PlayerWidePane.leftPaneFraction`。
+  static const String symmetricWidePanePreferenceKey =
+      'settings_symmetric_wide_pane';
+
+  /// 横屏/宽屏左右分栏是否对称（1:1）。未设置时默认开启。
+  Future<bool> getSymmetricWidePane() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(symmetricWidePanePreferenceKey) ?? true;
+  }
+
+  Future<void> setSymmetricWidePane(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(symmetricWidePanePreferenceKey, value);
+  }
+
+  /// 宽屏（横屏/平板）左栏内衬的手动覆盖值（dp）。
+  /// null = 自动（按 `PlayerWidePane.gutter` 比例算法，屏宽 × 5% 夹 12–24）；
+  /// 非 null（0–48）= 固定内衬，0 即无边距。
+  /// 取值范围 0–48：与设置页滑条量程一致，超范围值读出时按 null（自动）处理。
+  static const String widePaneMarginPreferenceKey = 'settings_wide_pane_margin';
+
+  /// 读取宽屏内衬覆盖值。未设置或越界（<0 / >48 / NaN）时返回 null（自动）。
+  Future<double?> getWidePaneMargin() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!prefs.containsKey(widePaneMarginPreferenceKey)) return null;
+    final v = prefs.getDouble(widePaneMarginPreferenceKey);
+    if (v == null || v.isNaN || v < 0 || v > 48) return null;
+    return v;
+  }
+
+  /// 写入宽屏内衬覆盖值；传 null 表示恢复自动并移除该键（避免残留脏值）。
+  Future<void> setWidePaneMargin(double? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null) {
+      await prefs.remove(widePaneMarginPreferenceKey);
+      return;
+    }
+    await prefs.setDouble(widePaneMarginPreferenceKey, value);
+  }
+
+  /// 宽屏布局是否忽略挖孔（刘海）对称补偿。仅在宽屏内衬覆盖值
+  /// （[getWidePaneMargin]）非 null（自定义边距开启）时生效：开启后宽屏布局
+  /// 不做挖孔对称补偿（inset=0），内容延伸到挖孔/刘海区域真贴边，遮挡自担。
+  static const String widePaneIgnoreCutoutPreferenceKey =
+      'settings_wide_pane_ignore_cutout';
+
+  /// 是否忽略挖孔避让。未设置时默认关闭（保留挖孔对称补偿）。
+  Future<bool> getWidePaneIgnoreCutout() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(widePaneIgnoreCutoutPreferenceKey) ?? false;
+  }
+
+  Future<void> setWidePaneIgnoreCutout(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(widePaneIgnoreCutoutPreferenceKey, value);
   }
 
   /// 顶栏「胶囊按钮收缩」开关（竖屏把睡眠定时 / 一起听与 ⋯ 合成一颗只露图标的胶囊）。
@@ -1328,16 +1739,17 @@ class SettingsRepository {
   // 键名与 MusicHapticsService 内的常量必须逐字一致：两侧各持一份真相时，
   // 症状是"设置页打开了但重启后又是关的"。
 
-  static const String _keyMusicHapticsEnabled = 'settings_music_haptics_enabled';
-  static const String _keyMusicHapticsStrength = 'settings_music_haptics_strength';
+  static const String _keyMusicHapticsEnabled =
+      'settings_music_haptics_enabled';
+  static const String _keyMusicHapticsStrength =
+      'settings_music_haptics_strength';
   static const String _keyMusicHapticsSensitivity =
       'settings_music_haptics_sensitivity';
-  static const String _keyMusicHapticsWaveform = 'settings_music_haptics_waveform';
+  static const String _keyMusicHapticsWaveform =
+      'settings_music_haptics_waveform';
   static const String _keyMusicHapticsSnare = 'settings_music_haptics_snare';
-  static const String _keyMusicHapticsOffset =
-      'settings_music_haptics_offset';
-  static const String _keyMusicHapticsScope =
-      'settings_music_haptics_scope';
+  static const String _keyMusicHapticsOffset = 'settings_music_haptics_offset';
+  static const String _keyMusicHapticsScope = 'settings_music_haptics_scope';
 
   /// 音乐节奏震动总开关，默认**关闭**：这是个会持续驱动马达的功能，
   /// 默认开会在用户不知情的情况下耗电发热。
@@ -1365,7 +1777,10 @@ class SettingsRepository {
   /// 检测灵敏度 0.3~3.0，默认 1.0。越大越容易触发。
   Future<double> getMusicHapticsSensitivity() async {
     final prefs = await SharedPreferences.getInstance();
-    return (prefs.getDouble(_keyMusicHapticsSensitivity) ?? 1.0).clamp(0.3, 3.0);
+    return (prefs.getDouble(_keyMusicHapticsSensitivity) ?? 1.0).clamp(
+      0.3,
+      3.0,
+    );
   }
 
   Future<void> setMusicHapticsSensitivity(double value) async {
@@ -1606,6 +2021,7 @@ class SettingsRepository {
   static const String _keyLandscapeImmersive = 'settings_landscape_immersive';
   static const String _keyShowQualityDowngradeToast =
       'settings_show_quality_downgrade_toast';
+  static const String _keyMvAudioFallback = 'settings_mv_audio_fallback';
 
   /// 是否完全忽略音频焦点（不响应来电 / 导航 / 拔耳机等中断），默认关闭。
   Future<bool> getIgnoreAudioFocus() async {
@@ -1648,6 +2064,7 @@ class SettingsRepository {
   Future<void> setZenCoverLongPress(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyZenCoverLongPress, value);
+    if (Platform.isWindows) windowsLiveSettingsRevision.value++;
   }
 
   /// 全屏播放器横屏自动沉浸（隐藏状态栏/导航栏）开关，默认开启。
@@ -1670,6 +2087,18 @@ class SettingsRepository {
   Future<void> setShowQualityDowngradeToast(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyShowQualityDowngradeToast, value);
+  }
+
+  /// 「音频播放失败时尝试 MV 音频」开关，默认关闭。
+  /// 普通音频获取/解码失败后，尝试曲库 MV 音轨并从头播放。
+  Future<bool> getMvAudioFallbackEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyMvAudioFallback) ?? false;
+  }
+
+  Future<void> setMvAudioFallbackEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyMvAudioFallback, value);
   }
 
   // ===== 记忆播放状态 =====
@@ -1728,6 +2157,16 @@ class SettingsRepository {
     await prefs.setBool(_keyStartupAutoPlayOpenPage, value);
   }
 
+  Future<int> getIdleKeepaliveStopMinutes() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_keyIdleKeepaliveStopMinutes) ?? 10;
+  }
+
+  Future<void> setIdleKeepaliveStopMinutes(int minutes) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_keyIdleKeepaliveStopMinutes, minutes);
+  }
+
   // ===== 本地音乐评论区 =====
   static const String _keyCloseLocalMusicComments =
       'settings_close_local_music_comments';
@@ -1774,6 +2213,7 @@ class SettingsRepository {
   Future<void> setDynamicAlbumCover(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyDynamicAlbumCover, value);
+    if (Platform.isWindows) windowsLiveSettingsRevision.value++;
   }
 
   /// 移动网络下是否也加载动态封面，默认关闭（单首视频约 9.5MB；
@@ -1866,7 +2306,7 @@ class SettingsRepository {
     );
   }
 
-  /// 常驻播放器面板的停靠位置，默认左侧。
+  /// 常驻播放器面板的停靠位置，默认右侧。
   Future<CarModePanelSide> getCarModePanelSide() async {
     final prefs = await SharedPreferences.getInstance();
     return CarModePanelSide.fromIndex(prefs.getInt(_keyCarModePanelSide));

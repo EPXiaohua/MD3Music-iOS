@@ -7,6 +7,10 @@ import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../providers/kugou_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import 'search_section_header.dart';
+
+/// 榜单词行与榜名 chip 的统一行高:两列排布下保证左右列、词行与 chip 节奏一致。
+const double _hotRowExtent = 36;
 
 /// 搜索页空状态的「热门搜索」榜单卡。
 ///
@@ -28,6 +32,9 @@ class HotSearchBoardCard extends StatefulWidget {
 }
 
 class _HotSearchBoardCardState extends State<HotSearchBoardCard> {
+  /// 单列词数:pageSize 拆成两列(左列前半、右列后半)。
+  static const int _wordsPerColumn = HotSearchBoardCard.pageSize ~/ 2;
+
   int _boardIndex = 0;
   int _page = 0;
 
@@ -55,9 +62,14 @@ class _HotSearchBoardCardState extends State<HotSearchBoardCard> {
         if (state.status == HotSearchStatus.failed) {
           return _Shell(
             title: '热门搜索',
-            trailing: M3ETextButton(
-              onPressed: () => provider.loadHotSearch(forceRefresh: true),
-              child: const Text('重试'),
+            // tv: 与「清空」「探索入口」同规格的动作单停点。
+            trailing: TvCardFocus(
+              onSelect: () => provider.loadHotSearch(forceRefresh: true),
+              debugLabel: 'hot-retry',
+              child: SearchSectionAction(
+                label: '重试',
+                onTap: () => provider.loadHotSearch(forceRefresh: true),
+              ),
             ),
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: AppSpacing.xl),
@@ -87,9 +99,13 @@ class _HotSearchBoardCardState extends State<HotSearchBoardCard> {
         return _Shell(
           title: '热门搜索',
           trailing: pages > 1
-              ? M3ETextButton(
-                  onPressed: () => setState(() => _page = page + 1),
-                  child: const Text('换一批'),
+              ? TvCardFocus(
+                  onSelect: () => setState(() => _page = page + 1),
+                  debugLabel: 'hot-next-page',
+                  child: SearchSectionAction(
+                    label: '换一批',
+                    onTap: () => setState(() => _page = page + 1),
+                  ),
                 )
               : null,
           child: Column(
@@ -104,12 +120,43 @@ class _HotSearchBoardCardState extends State<HotSearchBoardCard> {
                 }),
               ),
               const Gap(AppSpacing.sm),
-              for (var i = 0; i < visible.length; i++)
-                _WordRow(
-                  rank: start + i + 1,
-                  keyword: visible[i],
-                  onTap: () => widget.onKeywordTap(visible[i]),
-                ),
+              // 两列 2×5:左列第 1-5 名、右列第 6-10 名,列距 md。
+              // 相比单列 10 行,卡高约从 460dp 压到 260dp;
+              // 每页词数(pageSize)与「换一批」分页行为保持不变。
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < _wordsPerColumn; i++)
+                          if (i < visible.length)
+                            _WordRow(
+                              rank: start + i + 1,
+                              keyword: visible[i],
+                              onTap: () => widget.onKeywordTap(visible[i]),
+                            ),
+                      ],
+                    ),
+                  ),
+                  const Gap(AppSpacing.md),
+                  Expanded(
+                    child: Column(
+                      children: [
+                        for (var i = _wordsPerColumn;
+                            i < HotSearchBoardCard.pageSize;
+                            i++)
+                          if (i < visible.length)
+                            _WordRow(
+                              rank: start + i + 1,
+                              keyword: visible[i],
+                              onTap: () => widget.onKeywordTap(visible[i]),
+                            ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ],
           ),
         );
@@ -118,7 +165,14 @@ class _HotSearchBoardCardState extends State<HotSearchBoardCard> {
   }
 }
 
-/// 卡壳：标题行 + 可选右侧动作 + 内容，统一容器样式与内边距。
+/// 卡壳：标题行 + 可选右侧动作 + 内容。
+///
+/// 改版去壳裸排：与搜索历史 / 探索段同构(统一 [SearchSectionHeader] +
+/// lg 水平基准)，不再用 surfaceContainerLow 圆角卡单独成盒。
+/// 树上仍必须有 Material 祖先(内部 InkWell 依赖)，包一层透明 Material：
+/// 搜索页把本卡挂在没有 Material 祖先的树上时会抛
+/// 「No Material widget found」并被全局 _FallbackErrorWidget 顶成
+/// 「此处内容加载出错」（2026-10-04 真机堆栈）。
 class _Shell extends StatelessWidget {
   const _Shell({required this.title, required this.child, this.trailing});
 
@@ -128,45 +182,24 @@ class _Shell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tt = Theme.of(context).textTheme;
-    // 卡片本体必须是 Material：搜索页把本卡挂在没有 Material 祖先的树上，
-    // 内部 InkWell 会抛「No Material widget found」并被全局 _FallbackErrorWidget
-    // 顶成「此处内容加载出错」（2026-10-04 真机堆栈）。
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-          AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
-      child: Material(
-        color: cs.surfaceContainerLow,
-        borderRadius: AppRadius.lgAll,
-        clipBehavior: Clip.antiAlias,
-        child: Padding(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SearchSectionHeader(
+          title: title,
+          // null-aware:trailing 为空时动作区不产生任何元素。
+          actions: [?trailing],
+        ),
+        Padding(
           padding: const EdgeInsets.fromLTRB(
-              AppSpacing.lg, AppSpacing.md, AppSpacing.md, AppSpacing.md),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      title,
-                      style:
-                          tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  ?trailing,
-                ],
-              ),
-              const Gap(AppSpacing.sm),
-              child,
-            ],
+              AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.md),
+          child: Material(
+            color: Colors.transparent,
+            child: child,
           ),
         ),
-      ),
+      ],
     );
   }
 }
@@ -188,7 +221,7 @@ class _BoardChips extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
     return SizedBox(
-      height: 36,
+      height: _hotRowExtent,
       child: TvScrollRegion(
         memoryKey: 'tv/hot-boards',
         child: ListView.separated(
@@ -208,9 +241,10 @@ class _BoardChips extends StatelessWidget {
                   child: Align(
                     child: Text(
                       boards[i].name,
+                      // 未选中态弱化用 onSurfaceVariant 颜色表达,不改字重。
                       style: tt.labelLarge?.copyWith(
-                        color: active ? cs.onPrimaryContainer : cs.onSurfaceVariant,
-                        fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                        color:
+                            active ? cs.onPrimaryContainer : cs.onSurfaceVariant,
                       ),
                     ),
                   ),
@@ -242,6 +276,9 @@ class _WordRow extends StatelessWidget {
   final String keyword;
   final VoidCallback onTap;
 
+  /// 序号列宽:留足两位数序号的呼吸,不与词文贴死。
+  static const double _rankWidth = 32;
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
@@ -250,31 +287,34 @@ class _WordRow extends StatelessWidget {
     final row = InkWell(
       onTap: onTap,
       borderRadius: AppRadius.mdAll,
-      child: Padding(
-        padding:
-            const EdgeInsets.symmetric(horizontal: AppSpacing.xs, vertical: 7),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 26,
-              child: Text(
-                '$rank',
-                style: tt.labelLarge?.copyWith(
-                  color: isTop3 ? cs.error : cs.onSurfaceVariant,
-                  fontWeight: isTop3 ? FontWeight.w700 : FontWeight.w400,
+      // 行高固定,两列排布下左右列行节奏严格对齐。
+      child: SizedBox(
+        height: _hotRowExtent,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+          child: Row(
+            children: [
+              SizedBox(
+                width: _rankWidth,
+                child: Text(
+                  '$rank',
+                  style: tt.labelLarge?.copyWith(
+                    // 前三位用 primary 强调,字重交给主题原生样式。
+                    color: isTop3 ? cs.primary : cs.onSurfaceVariant,
+                  ),
                 ),
               ),
-            ),
-            const Gap(AppSpacing.sm),
-            Expanded(
-              child: Text(
-                keyword,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: tt.bodyMedium?.copyWith(color: cs.onSurface),
+              const Gap(AppSpacing.sm),
+              Expanded(
+                child: Text(
+                  keyword,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: tt.bodyMedium?.copyWith(color: cs.onSurface),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

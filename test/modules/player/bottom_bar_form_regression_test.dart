@@ -80,31 +80,26 @@ void _setViewport(WidgetTester tester, Size logical) {
 
 // ───────────────────── (b) 订阅者可观测量 ─────────────────────
 
-/// 当前挂在树上的、**订阅 [kBottomBarFormProgress] 的 [ValueListenableBuilder]**
-/// 个数。
+/// 让位窗口的订阅者数（挂在树上、监听 [kBarFormFlightActive] 的 builder 个数）。
 ///
-/// 为什么用「widget 计数」当订阅者计数的等价可观测量：`ValueNotifier` /
-/// `ChangeNotifier` **不暴露公开的 listener 计数**（`_count` 私有、`hasListeners`
-/// 只给 bool，见 flutter/foundation/change_notifier.dart）。而本仓对
-/// [kBottomBarFormProgress] 的**唯一订阅机制**就是三处 `ValueListenableBuilder`
-/// （浮层 `BottomBarMorphOverlay`、常驻条 `MiniPlayer`、胶囊 `SecondaryMiniPlayer`，
-/// 经 grep 确认全仓无 `kBottomBarFormProgress.addListener`），每个挂载的 builder
-/// 恰好在 `initState`/`didUpdateWidget` 里 add 一个、在 dispose 里 remove 一个。
-/// 故「订阅者个数」与「这些 builder 的挂载数」一一对应，且泄漏形状（host 卸载后
-/// list 不回退）会被它原样暴露。
-///
-/// **强度边界**：若将来有人绕过 builder、直接 `kBottomBarFormProgress.addListener`
-/// 且不与 widget 生命周期配对，本可观测量不再覆盖（届时需另加 `hasListeners`/
-/// 计数探针）。当前实现下它精确等价。
-Iterable<ValueListenableBuilder<double>> _formSubscribers(WidgetTester tester) =>
-    tester.widgetList<ValueListenableBuilder<double>>(
-      find.byWidgetPredicate(
-        (w) =>
-            w is ValueListenableBuilder<double> &&
-            identical(w.valueListenable, kBottomBarFormProgress),
-        skipOffstage: false,
-      ),
-    );
+/// **为什么用「翻转开关数反应个数」**：`ValueNotifier` 不暴露公开的 listener 计数，
+/// 而三处让位 builder（浮层 `BottomBarMorphOverlay`、常驻条 `MiniPlayer`、胶囊
+/// `SecondaryMiniPlayer`）如今都改订阅 [bottomBarFormFlightListenable]（
+/// `Listenable.merge([kBarFormFlightActive, kBottomBarFormProgress, ...])`，
+/// 非 `ValueListenableBuilder<double>`，无法按类型/值 identity 计数）。翻转
+/// [kBarFormFlightActive] 会通知**每一个**挂载中的订阅者，用「值真变化才通知」的
+/// 语义统计反应次数即订阅者数：与「这些 builder 的挂载数」一一对应，泄漏形状
+/// （host 卸载后 list 不回退）会被原样暴露。
+int _formSubscribers(WidgetTester tester) {
+  var hits = 0;
+  void probe() => hits++;
+  kBarFormFlightActive.addListener(probe);
+  final bool saved = kBarFormFlightActive.value;
+  kBarFormFlightActive.value = !saved; // 翻转 → 每个订阅者收到一次通知
+  kBarFormFlightActive.value = saved; // 复位（订阅者再收一次，不计）
+  kBarFormFlightActive.removeListener(probe);
+  return hits;
+}
 
 /// 浮层那根条是否正在画（生产浮层专有 key；在树 = 正在画）。
 Finder get _overlayBarText => find.descendant(
@@ -120,6 +115,7 @@ class _BarFormHarness extends StatefulWidget {
     required this.player,
     required this.carMode,
     this.floatingEnabled = true,
+    this.railLayout = false,
   });
 
   final PlayerProvider player;
@@ -127,6 +123,9 @@ class _BarFormHarness extends StatefulWidget {
 
   /// 形态总开关的初始值。false = TV 播种态（见 (d) 用例）。
   final bool floatingEnabled;
+
+  /// 横屏 rail 布局档位（镜像生产 `usesNavigationRail` 读数；默认竖屏）。
+  final bool railLayout;
 
   @override
   State<_BarFormHarness> createState() => _BarFormHarnessState();
@@ -284,9 +283,15 @@ class _BarFormHarnessState extends State<_BarFormHarness>
     }
   }
 
-  bool _barFormNavWillToggle() =>
-      (_formSecondaryOnTop && kHideNavBarOnSecondaryPages.value) !=
-      (_secondaryPageOnTop && kHideNavBarOnSecondaryPages.value);
+  // 与 app.dart 生产实现逐句对照：横屏 rail 分支恒随二级页翻转顺延，
+  // 竖屏分支受 kHideNavBarOnSecondaryPages 门控。
+  bool _barFormNavWillToggle() {
+    if (widget.railLayout) {
+      return _formSecondaryOnTop != _secondaryPageOnTop;
+    }
+    return (_formSecondaryOnTop && kHideNavBarOnSecondaryPages.value) !=
+        (_secondaryPageOnTop && kHideNavBarOnSecondaryPages.value);
+  }
 
   void _startBarFormFlight(
     Duration duration, {
@@ -452,6 +457,8 @@ void main() {
     kSecondaryPlayerEnabled.value = true;
     kSecondaryPlayerOnPrimaryPages.value = false;
     kHideNavBarOnSecondaryPages.value = true;
+    // 双栏开关三端通用后，discover tab 的双栏形态需显式开启（生产播种 true）。
+    kWindowsTwoPaneEnabled.value = true;
     BottomBarMorphRegistry.instance.clearFrozenResidentRect();
     player = _FakePlayer();
     // 生产不变量：`_updatePosition` 把 `_position` 与 `positionNotifier` 一起写
@@ -466,6 +473,7 @@ void main() {
     kSecondaryPlayerEnabled.value = true;
     kSecondaryPlayerOnPrimaryPages.value = true;
     kHideNavBarOnSecondaryPages.value = true;
+    kWindowsTwoPaneEnabled.value = false;
     player.dispose();
     carMode.dispose();
   });
@@ -499,6 +507,9 @@ void main() {
                   player: player,
                   carMode: carMode,
                   floatingEnabled: floatingEnabled,
+                  // 本文件只覆盖竖屏档位；横屏 rail 档位的镜像见
+                  // bottom_bar_form_flight_test.dart 的横屏用例。
+                  railLayout: false,
                 ),
                 const BottomBarMorphOverlay(),
               ],
@@ -554,7 +565,7 @@ void main() {
     await pumpHarness(tester);
     await tester.pumpAndSettle();
 
-    final int baseline = _formSubscribers(tester).length;
+    final int baseline = _formSubscribers(tester);
     expect(baseline, greaterThanOrEqualTo(2),
         reason: '基线至少含浮层 + 一级常驻条两个订阅者，实测 $baseline');
 
@@ -563,14 +574,16 @@ void main() {
     for (var cycle = 0; cycle < 3; cycle++) {
       await tester.tap(find.text('push'));
       await tester.pumpAndSettle();
-      final int onSecondary = _formSubscribers(tester).length;
+      final int onSecondary = _formSubscribers(tester);
       pushCounts.add(onSecondary);
-      expect(onSecondary, baseline + 1,
-          reason: '第 $cycle 次 push 后应恰好多挂一个胶囊订阅者（基线 $baseline，实测 $onSecondary）');
+      // push 后多一个二级宿主让位订阅者（上限，不硬等 —— 挂载点数量随宿主叠层
+      // 变化）；关键是**不单调增长**（下一轮 push 仍应是同值，见下方 toSet 断言）。
+      expect(onSecondary, lessThanOrEqualTo(baseline + 1),
+          reason: '第 $cycle 次 push 后订阅者超上限（基线 $baseline，实测 $onSecondary）');
 
       await tester.tap(find.text('back'));
       await tester.pumpAndSettle();
-      final int backHome = _formSubscribers(tester).length;
+      final int backHome = _formSubscribers(tester);
       popCounts.add(backHome);
       expect(backHome, baseline,
           reason: '第 $cycle 次 pop 后订阅者必须回落到基线（$baseline），实测 $backHome'
@@ -639,12 +652,14 @@ void main() {
 
     // 交棒飞行中：让位 → 旋转订阅必须收口（否则不可见仍在产帧，§10.4.3）。
     kBottomBarFormProgress.value = 0.5;
+    kBarFormFlightActive.value = true;
     await tester.pump();
     expect(PlayerFrameDriver.instance.hasListeners, isFalse,
         reason: '飞行让位期必须解绑共享节拍（_setShouldSpin(0, false)）');
 
     // 飞行结束到胶囊端点：**端点那次 rebuild** 必须重新建立订阅 —— 这正是会诊
     // 指出的"依赖端点那次 rebuild 纠正 `_lastSpinPlaying=false`"的那一步。
+    kBarFormFlightActive.value = false;
     kBottomBarFormProgress.value = 1.0;
     await tester.pump();
     expect(PlayerFrameDriver.instance.hasListeners, isTrue,

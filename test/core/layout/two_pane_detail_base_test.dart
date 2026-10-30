@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/layout/adaptive_navigator.dart';
+import 'package:md3music/core/layout/responsive_layout.dart';
 import 'package:md3music/core/layout/responsive_shell.dart';
 import 'package:md3music/providers/tab_config_provider.dart';
 
@@ -15,6 +16,13 @@ import 'package:md3music/providers/tab_config_provider.dart';
 /// 真双栏（≥1000dp）未选中时的占位是设计行为，必须保留。
 void main() {
   const emptyText = '从左侧选择一项查看详情';
+
+  // 双栏开关三端通用后，宽屏（1280）用例需显式开启；单栏（400）用例关掉
+  // 也仍是单栏几何，不受影响。
+  setUp(() {
+    kWindowsTwoPaneEnabled.value = true;
+  });
+  tearDown(() => kWindowsTwoPaneEnabled.value = false);
 
   Future<void> pumpFavorites(WidgetTester tester, double width) async {
     tester.view.devicePixelRatio = 1;

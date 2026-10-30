@@ -39,6 +39,7 @@ import androidx.media3.common.AuxEffectInfo;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.decoder.flac.FlacLibrary;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.audio.AudioProcessor;
@@ -97,6 +98,13 @@ import java.util.Objects;
 public class MediaCodecAudioRenderer extends MediaCodecRenderer implements MediaClock {
 
   private static final String TAG = "MediaCodecAudioRenderer";
+  /**
+   * [UsbDiag] P0-5：压缩音频的 KEY_MAX_INPUT_SIZE 钳制值（字节）。
+   * 实测（2026-09-12 20:15 会话）：c2.android.flac.decoder 请求 69138 时实际分配 32768
+   * （>64KB 的请求被拒并回退默认），请求 65536 时如实分配；192k FLAC 大块帧样本实测
+   * 36430~53552 字节，65536 恰好覆盖且落在可采纳范围。
+   */
+  private static final int CODEC_MAX_INPUT_SIZE_CLAMP = 64 * 1024;
 
   /**
    * Custom key used to indicate bits per sample by some decoders on Vivo devices. For example
@@ -109,6 +117,8 @@ public class MediaCodecAudioRenderer extends MediaCodecRenderer implements Media
   private final AudioSink audioSink;
 
   private int codecMaxInputSize;
+  /** [UsbDiag] P0-5：FLAC 解码器清单探针只打一次。 */
+  private boolean diagFlacDecoderListLogged;
   private boolean codecNeedsDiscardChannelsWorkaround;
   private boolean codecNeedsVorbisToAndroidChannelMappingWorkaround;
   @Nullable private Format inputFormat;
@@ -277,6 +287,17 @@ public class MediaCodecAudioRenderer extends MediaCodecRenderer implements Media
       throws DecoderQueryException {
     if (!MimeTypes.isAudio(format.sampleMimeType)) {
       return RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE);
+    }
+    // [UsbDiag] P0-5（2026-09-12）：c2.android.flac.decoder 的输入缓冲存在 64KB 硬上限
+    // （KEY_MAX_INPUT_SIZE>65536 会被拒并回退 32KB 默认），而 192k FLAC 大块帧样本实测
+    // 36~69KB → 超限帧被丢 + flushCodec 退化成 ~100Hz churn（数秒静默/抽帧）。
+    // 此类文件改报「超出能力」→ TrackSelector 选用 libflac 扩展渲染器（输入缓冲可增长）；
+    // 扩展不可用或帧不超限时仍走 MediaCodec（保持硬件/C2 路径）。
+    if (MimeTypes.AUDIO_FLAC.equals(format.sampleMimeType)
+        && FlacLibrary.isAvailable()
+        && format.maxInputSize != Format.NO_VALUE
+        && format.maxInputSize > 65536) {
+      return RendererCapabilities.create(C.FORMAT_EXCEEDS_CAPABILITIES);
     }
     @TunnelingSupport
     int tunnelingSupport = Util.SDK_INT >= 21 ? TUNNELING_SUPPORTED : TUNNELING_NOT_SUPPORTED;
@@ -529,6 +550,16 @@ public class MediaCodecAudioRenderer extends MediaCodecRenderer implements Media
   protected void onCodecError(Exception codecError) {
     Log.e(TAG, "Audio codec error", codecError);
     eventDispatcher.audioCodecError(codecError);
+  }
+
+  /**
+   * [UsbDiag] P0-5 v4：音频帧自解码（FLAC 帧间独立），样本超限时**不 flush**——
+   * 只丢该帧，解码器继续下一帧。flush 会让 codec 进入过渡态并使渲染循环空转，
+   * 实测在连续超限帧时退化成 ~100Hz churn（数秒静默，见 20:15 诊断包）。
+   */
+  @Override
+  protected boolean shouldFlushCodecOnInsufficientCapacity() {
+    return false;
   }
 
   @Override
@@ -948,7 +979,50 @@ public class MediaCodecAudioRenderer extends MediaCodecRenderer implements Media
     mediaFormat.setInteger(MediaFormat.KEY_SAMPLE_RATE, format.sampleRate);
     MediaFormatUtil.setCsdBuffers(mediaFormat, format.initializationData);
     // Set codec max values.
-    MediaFormatUtil.maybeSetInteger(mediaFormat, MediaFormat.KEY_MAX_INPUT_SIZE, codecMaxInputSize);
+    // [UsbDiag] P0-5 根因修复 v2（2026-09-12，实测数据见 20:15 诊断包）：
+    // c2.android.flac.decoder 对 KEY_MAX_INPUT_SIZE 的处理有坑：
+    //   · 请求 69138（= 提取器给出的 Format.maxInputSize）→ 实际分配 **32768**（回退默认缓冲）
+    //   · 请求 65536 → 实际分配 65536（如实采纳）
+    // 而 192k FLAC（大块帧）的压缩样本实测 36430~53552 字节 > 32768 → 每样本触发
+    // MediaCodecRenderer.feedInputBuffer 的 InsufficientCapacityException → 丢样本 +
+    // flushCodec() ~100Hz → 解码器永处过渡态（dequeueInputBufferIndex 恒 -1）→ 永不产出
+    // → 无 handleBuffer → 位置冻结 → 数秒静默。
+    // 对策：压缩音频（非 raw PCM）统一钳制 KEY_MAX_INPUT_SIZE = 65536——既覆盖实测最大
+    // 样本（53552），又落在 codec 如实采纳的范围内；raw PCM 走 bypass/直通不处理。
+    // 判据日志：'codec format: … → KEY_MAX_INPUT_SIZE=…' + 'feed: codec input buffer capacity=…'
+    int effectiveMaxInputSize = codecMaxInputSize;
+    boolean rawPcm = MimeTypes.AUDIO_RAW.equals(codecMimeType);
+    if (!rawPcm) {
+      effectiveMaxInputSize = CODEC_MAX_INPUT_SIZE_CLAMP;
+    }
+    Log.i(TAG, "codec format: mime=" + codecMimeType + " raw=" + rawPcm
+        + " maxInputSize=" + codecMaxInputSize + " → KEY_MAX_INPUT_SIZE=" + effectiveMaxInputSize);
+    MediaFormatUtil.maybeSetInteger(mediaFormat, MediaFormat.KEY_MAX_INPUT_SIZE, effectiveMaxInputSize);
+    // [UsbDiag] P0-5：一次性列出设备全部 FLAC 解码器——若 c2.android.flac.decoder 的
+    // 64KB 输入缓冲上限无法满足大块帧文件，评估是否存在可用的替代解码器。
+    if (!diagFlacDecoderListLogged && !rawPcm) {
+      diagFlacDecoderListLogged = true;
+      try {
+        StringBuilder sb = new StringBuilder("flac decoders on device:");
+        for (android.media.MediaCodecInfo info
+            : new android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
+                .getCodecInfos()) {
+          try {
+            for (String type : info.getSupportedTypes()) {
+              if (MediaFormat.MIMETYPE_AUDIO_FLAC.equals(type)) {
+                sb.append("\n    ").append(info.getName());
+                break;
+              }
+            }
+          } catch (IllegalArgumentException ignored) {
+            // 部分 vendor codec 对 getSupportedTypes 抛 IAE，跳过即可
+          }
+        }
+        Log.i(TAG, sb.toString());
+      } catch (Throwable t) {
+        Log.i(TAG, "flac decoder probe failed: " + t);
+      }
+    }
     // Set codec configuration values.
     if (Util.SDK_INT >= 23) {
       mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0 /* realtime priority */);

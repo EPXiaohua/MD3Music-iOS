@@ -22,6 +22,7 @@ import '../login/login_page.dart';
 import '../settings/settings_page.dart';
 import 'cloud_music_page.dart';
 import 'listen_ranking_page.dart';
+import 'listen_wrapped_page.dart';
 import 'blacklist_page.dart';
 import 'login_devices_page.dart';
 import 'music_preference_page.dart';
@@ -1259,6 +1260,12 @@ class _UserCenterPageState extends State<UserCenterPage> {
             }),
             _actionItem(cs, Icons.bar_chart, '排行', () {
               AdaptiveNav.openDetail(context, (_) => const ListenRankingPage());
+            }),
+            _actionItem(cs, Icons.auto_awesome, '年度总结', () {
+              AdaptiveNav.openDetail(
+                context,
+                (_) => const ListenWrappedPage(),
+              );
             }),
             _actionItem(cs, Icons.cloud, '云盘', () {
               AdaptiveNav.openDetail(context, (_) => const CloudMusicPage());

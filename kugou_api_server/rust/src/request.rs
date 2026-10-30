@@ -759,44 +759,78 @@ fn body_is_error(body: &BodyValue) -> bool {
     }
 }
 
-/// Direct raw HTTP GET (replicating lyric.js which calls `axios` directly,
-/// bypassing the signing machinery). params are serialized like axios default.
-pub fn raw_get(url: &str, params: &Value) -> Result<ModuleResponse, ModuleResponse> {
-    let mut full = url.to_string();
-    let qs = serialize_params(params);
-    if !qs.is_empty() {
-        if full.contains('?') {
-            full = format!("{}&{}", full, qs);
-        } else {
-            full = format!("{}?{}", full, qs);
-        }
-    }
-    let resp = match agent().get(&full).call() {
-        Ok(r) => r,
-        Err(e) => return Err(transport_error_with(e.to_string())),
-    };
-    let status = resp.status();
-    let body = match read_response_body(resp.into_reader()) {
-        Ok(body) => body,
-        Err(error) => return Err(transport_error_with(error)),
-    };
-    Ok(ModuleResponse {
-        status,
-        body: BodyValue::from_bytes(&body),
-        cookie: Vec::new(),
-        headers: HashMap::new(),
-    })
+/// 一次原始上游交互的完整结果。
+///
+/// 与 [ModuleResponse] 的区别：`raw_get`/`raw_request` 只把 body 交给模块，
+/// Set-Cookie 与「跟随重定向之后的最终 URL」都被丢弃。QQ 扫码登录这两项都要
+/// （xlogin / ptqrshow 的会话 cookie、扫码成功后 proxy.htm 跳转里的
+/// openid+access_token），故单独给出可捕获结构。
+pub struct RawCapture {
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// **原始** `Set-Cookie` 头值（未裁剪）。需要 `k=v` 的调用方用
+    /// [cookie_pairs]；`raw_get`/`raw_request` 的老语义由 [Self::to_response]
+    /// 用 `parse_cookie_string` 还原。
+    pub cookies: Vec<String>,
+    /// ureq 跟随重定向后的最终地址；不跟随重定向时即请求地址。
+    pub final_url: String,
+    /// 仅不跟随重定向时有值（3xx 的 Location 头原样）。
+    pub location: Option<String>,
 }
 
-/// Direct raw HTTP request with method + params + optional body + headers,
-/// replicating bare `axios({...})` calls (wechat modules). No signing.
-pub fn raw_request(
+/// JS `c.split(';')[0]` 的 Set-Cookie → `(name, value)`（首个 `=` 切分）。
+pub fn cookie_pairs(raw: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for c in raw {
+        let kv = c.split(';').next().unwrap_or("");
+        if let Some(idx) = kv.find('=') {
+            if idx > 0 {
+                out.push((kv[..idx].to_string(), kv[idx + 1..].to_string()));
+            }
+        }
+    }
+    out
+}
+
+impl RawCapture {
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    pub fn to_response(self) -> ModuleResponse {
+        // 与改造前 raw_get / raw_request 完全一致：body 透传，cookie 丢弃
+        // （既有调用方如 lyric / dycover / user 都不读响应 cookie）。
+        ModuleResponse {
+            status: self.status,
+            body: BodyValue::from_bytes(&self.body),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// 不跟随重定向的 agent（QQ 扫码的 proxy.htm 跳转必须手工走：
+/// ureq 在重定向时会剥掉 Cookie 头，而 QQ 的跳转依赖会话 cookie）。
+fn agent_no_redirect() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(20))
+                .redirects(0)
+                .build()
+        })
+        .clone()
+}
+
+fn raw_fetch_inner(
     method: &str,
     url: &str,
     params: &Value,
     data: BodyData,
     headers: &HashMap<String, String>,
-) -> Result<ModuleResponse, ModuleResponse> {
+    follow_redirects: bool,
+) -> Result<RawCapture, ModuleResponse> {
     let mut full = url.to_string();
     let qs = serialize_params(params);
     if !qs.is_empty() {
@@ -806,7 +840,8 @@ pub fn raw_request(
             full = format!("{}?{}", full, qs);
         }
     }
-    let mut req = agent().request(method, &full);
+    let client = if follow_redirects { agent() } else { agent_no_redirect() };
+    let mut req = client.request(method, &full);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -849,16 +884,64 @@ pub fn raw_request(
         Err(e) => return Err(transport_error_with(e.to_string())),
     };
     let status = resp.status();
+    let final_url = resp.get_url().to_string();
+    let location = resp.header("location").map(|s| s.to_string());
+    let cookies: Vec<String> = resp
+        .all("set-cookie")
+        .into_iter()
+        .map(crate::util::parse_cookie_string)
+        .collect();
     let body = match read_response_body(resp.into_reader()) {
         Ok(body) => body,
         Err(error) => return Err(transport_error_with(error)),
     };
-    Ok(ModuleResponse {
+    Ok(RawCapture {
         status,
-        body: BodyValue::from_bytes(&body),
-        cookie: Vec::new(),
-        headers: HashMap::new(),
+        body,
+        cookies,
+        final_url,
+        location,
     })
+}
+
+/// 原始 HTTP 交互，保留 Set-Cookie 与最终 URL；3xx 自动跟随（ureq 默认）。
+pub fn raw_fetch(
+    method: &str,
+    url: &str,
+    params: &Value,
+    data: BodyData,
+    headers: &HashMap<String, String>,
+) -> Result<RawCapture, ModuleResponse> {
+    raw_fetch_inner(method, url, params, data, headers, true)
+}
+
+/// 原始 HTTP 交互但**不跟随重定向**（`location` 由调用方手工处理）。
+pub fn raw_fetch_no_redirect(
+    method: &str,
+    url: &str,
+    params: &Value,
+    data: BodyData,
+    headers: &HashMap<String, String>,
+) -> Result<RawCapture, ModuleResponse> {
+    raw_fetch_inner(method, url, params, data, headers, false)
+}
+
+/// Direct raw HTTP GET (replicating lyric.js which calls `axios` directly,
+/// bypassing the signing machinery). params are serialized like axios default.
+pub fn raw_get(url: &str, params: &Value) -> Result<ModuleResponse, ModuleResponse> {
+    raw_fetch("GET", url, params, BodyData::None, &HashMap::new()).map(|r| r.to_response())
+}
+
+/// Direct raw HTTP request with method + params + optional body + headers,
+/// replicating bare `axios({...})` calls (wechat modules). No signing.
+pub fn raw_request(
+    method: &str,
+    url: &str,
+    params: &Value,
+    data: BodyData,
+    headers: &HashMap<String, String>,
+) -> Result<ModuleResponse, ModuleResponse> {
+    raw_fetch(method, url, params, data, headers).map(|r| r.to_response())
 }
 
 fn transport_error_with(msg: String) -> ModuleResponse {

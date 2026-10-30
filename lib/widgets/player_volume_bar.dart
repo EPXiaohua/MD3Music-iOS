@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../core/build_flags.dart';
+import '../core/remote/tv_hint_bar.dart';
 import '../core/remote/tv_volume_stepper.dart';
 import '../core/services/output_mode_coordinator.dart';
 import '../core/services/usb_audio_service.dart';
@@ -300,7 +301,12 @@ class _PlayerVolumeBarState extends State<PlayerVolumeBar> {
         ),
         onFocusChange: (focused) {
           // 失焦（上下键移出/路由切换）立即落定，不留「看不见还挂着」的待写盘
-          if (!focused) _tvStepper?.flush();
+          if (focused) {
+            TvHintBarScope.show('左右键调整音量 · OK 静音/取消静音');
+          } else {
+            _tvStepper?.flush();
+            TvHintBarScope.clear();
+          }
         },
         child: row,
       );

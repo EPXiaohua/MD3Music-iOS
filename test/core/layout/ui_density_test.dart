@@ -20,6 +20,14 @@ void main() {
     gestureSettings: DeviceGestureSettings(touchSlop: 18),
   );
 
+  test('Windows 与 Android 默认显示大小均为 1.00x', () {
+    expect(defaultDisplayScaleForPlatform(TargetPlatform.windows), 1.0);
+    expect(
+      defaultDisplayScaleForPlatform(TargetPlatform.android),
+      kDefaultDisplayScale,
+    );
+  });
+
   group('applyDisplayScale', () {
     test('1.0 档原样返回，不产生新对象', () {
       expect(applyDisplayScale(base, kDefaultDisplayScale), same(base));

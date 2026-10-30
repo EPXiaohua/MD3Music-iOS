@@ -73,7 +73,15 @@ class MusicHapticsPlugin(context: Context) {
 
     private val vibrator: Vibrator? = resolveVibrator(appContext)
     private val hasVibrator = vibrator?.hasVibrator() == true
-    private val hasAmplitudeControl = vibrator?.hasAmplitudeControl() == true
+    /**
+     * `hasAmplitudeControl()` 自 API 26（O）才存在，minSdk 24 必须守卫：
+     * 无守卫时 Android 7.x 设备（廉价 TV 盒子如 rk3128）一进 MainActivity 就
+     * `NoSuchMethodError` 冷启动必崩（issue #130）。`&&` 短路保证低版本根本不解析
+     * 该方法；探测不到即按"无振幅控制"显式降级（平滑波形置灰，只发短脉冲），
+     * 与设置页的降级文案语义一致。
+     */
+    private val hasAmplitudeControl =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && vibrator?.hasAmplitudeControl() == true
 
     /** `VibrationEffect` 自 API 26 起存在；低版本只能退到 `vibrate(long)`。 */
     private val supportsEffects = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O

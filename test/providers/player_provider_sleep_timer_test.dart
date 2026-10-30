@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:md3music/data/repositories/settings_repository.dart';
 import 'package:md3music/providers/player_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -125,6 +126,64 @@ void main() {
         player.dispose();
         await tester.pump();
       }
+    });
+  });
+
+  group('「结束后减少待机耗电」偏好', () {
+    testWidgets('默认关闭，切换只记内存态且不激活定时', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final player = PlayerProvider();
+      try {
+        expect(player.killBackgroundOnTimerEnd, isFalse);
+
+        player.setKillBackgroundOnTimerEnd(true);
+
+        expect(player.killBackgroundOnTimerEnd, isTrue);
+        expect(
+          player.sleepTimerMode,
+          SleepTimerMode.off,
+          reason: '还没设定时，不应处于激活态',
+        );
+        expect(player.isSleepTimerActive, isFalse);
+      } finally {
+        await tester.pump();
+        player.dispose();
+        await tester.pump();
+      }
+    });
+
+    testWidgets('取消定时不清掉该偏好（与持久化值保持一致）', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final player = PlayerProvider();
+      try {
+        player.setKillBackgroundOnTimerEnd(true);
+        player.setSleepTimer(const Duration(minutes: 10));
+
+        player.setSleepTimer(null);
+
+        expect(player.sleepTimerMode, SleepTimerMode.off);
+        expect(
+          player.killBackgroundOnTimerEnd,
+          isTrue,
+          reason: '该偏好持久化在 SettingsRepository，'
+              '关闭定时只清定时与播完偏好，内存字段不应与持久化值脱钩',
+        );
+      } finally {
+        await tester.pump();
+        player.dispose();
+        await tester.pump();
+      }
+    });
+
+    test('SettingsRepository 往返：默认 false，写入后读回 true', () async {
+      SharedPreferences.setMockInitialValues({});
+      final repo = SettingsRepository();
+
+      expect(await repo.getSleepTimerKillBackground(), isFalse);
+
+      await repo.setSleepTimerKillBackground(true);
+
+      expect(await repo.getSleepTimerKillBackground(), isTrue);
     });
   });
 }

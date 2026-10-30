@@ -247,8 +247,64 @@ import org.checkerframework.checker.initialization.qual.Initialized;
     sessionCompat.setActive(true);
   }
 
+  // MD3Music fork v22（车机歌词对轴）：车机（ucar/JoviCar）拿到整段 LRC 后自己按
+  // PlaybackState 进度滚动，播放进度就是它的时钟基准。而 legacy 会话的 PlaybackState
+  // 此前只在离散事件（切歌/暂停/seek/换播放器）时才刷新，播放中一路冻结 —— 车机拿着
+  // 一个不动的进度去滚 LRC，歌词与歌声自然对不上（手机端用自己的 position 逐行算，
+  // 所以手机同步、车机不同步）。
+  // 这里在播放中按固定节奏补刷 legacy 播放态：进度由 createPlaybackStateCompat()
+  // 现取，position 带 lastPositionUpdateTime，外推后车机拿到的就是当前进度。
+  private static final long LEGACY_PROGRESS_REFRESH_INTERVAL_MS = 500;
+
+  private final Runnable legacyProgressRefreshRunnable =
+      this::refreshLegacyProgressWhilePlaying;
+
+  private void refreshLegacyProgressWhilePlaying() {
+    // MD3Music fork v25：补一道 isReleased 门禁，与
+    // MediaSessionImpl#notifyPeriodicSessionPositionInfoChangesOnHandler 的 closed
+    // 检查同源（closed 在 release() 落位）。removeCallbacksAndMessages 只摘已入队
+    // 回调，跨线程交错时正在执行的实例会在摘除后自行 postDelayed 重启；有这道门，
+    // 下一轮直接自熄。
+    if (sessionImpl.isReleased() || !sessionImpl.getPlayerWrapper().isPlaying()) {
+      return;
+    }
+    updateLegacySessionPlaybackState(sessionImpl.getPlayerWrapper());
+    // MD3Music fork v22（诊断）：车机滚 LRC 的时钟基准就是这条进度。下轮实测抓
+    // logcat 过滤 MD3CarLyrics，能直接看出「车机看到的进度」是否在走、走得对不对。
+    PlaybackStateCompat state = sessionImpl.getPlayerWrapper().createPlaybackStateCompat();
+    android.util.Log.i(
+        "MD3CarLyrics",
+        "legacy progress refresh: state=" + state.getState()
+            + " pos=" + state.getPosition()
+            + " speed=" + state.getPlaybackSpeed());
+    sessionImpl
+        .getApplicationHandler()
+        .postDelayed(legacyProgressRefreshRunnable, LEGACY_PROGRESS_REFRESH_INTERVAL_MS);
+  }
+
+  /**
+   * MD3Music fork v22：启动/停止播放中的 legacy 进度补刷。
+   *
+   * <p>与 {@link #onIsPlayingChanged} 的离散刷新互补：那个只在开始/结束时触发，这里
+   * 保证播放期间进度持续更新（车机滚 LRC 的时钟基准）。
+   */
+  private void startLegacyProgressRefresh() {
+    sessionImpl.getApplicationHandler().removeCallbacks(legacyProgressRefreshRunnable);
+    if (sessionImpl.getPlayerWrapper().isPlaying()) {
+      sessionImpl
+          .getApplicationHandler()
+          .postDelayed(legacyProgressRefreshRunnable, LEGACY_PROGRESS_REFRESH_INTERVAL_MS);
+    }
+  }
+
+  private void stopLegacyProgressRefresh() {
+    sessionImpl.getApplicationHandler().removeCallbacks(legacyProgressRefreshRunnable);
+  }
+
   @SuppressWarnings("PendingIntentMutability") // We can't use SaferPendingIntent.
   public void release() {
+    // MD3Music fork v22：会话释放时停掉进度补刷，避免 handler 回调悬空。
+    stopLegacyProgressRefresh();
     if (Util.SDK_INT < 31) {
       if (broadcastReceiverComponentName == null) {
         // No broadcast receiver available. Playback resumption not supported.
@@ -390,6 +446,14 @@ import org.checkerframework.checker.initialization.qual.Initialized;
 
   @Override
   public void onPlayFromMediaId(@Nullable String mediaId, @Nullable Bundle extras) {
+    // MD3Music fork v40：App 可注入点播钩子——vivo 原子随身听按 media id 回播列表项，
+    // 默认实现会把"只有 mediaId、没有 URI"的 item 塞进 ExoPlayer（播不出且污染
+    // media3 时间线，App 队列是 Dart 自维护的）。钩子返回 true 表示已消费。
+    // 钩子声明在 MediaSessionService（public）——本类包私有，App 侧引用不到。
+    MediaSessionService.PlayFromMediaIdHook hook = MediaSessionService.playFromMediaIdHook;
+    if (hook != null && hook.onPlayFromMediaId(mediaId)) {
+      return;
+    }
     handleMediaRequest(
         createMediaItemForMediaRequest(
             mediaId, /* mediaUri= */ null, /* searchQuery= */ null, extras),
@@ -811,19 +875,62 @@ import org.checkerframework.checker.initialization.qual.Initialized;
   public void updateLegacySessionPlaybackState(PlayerWrapper playerWrapper) {
     postOrRun(
         sessionImpl.getApplicationHandler(),
-        () -> sessionCompat.setPlaybackState(playerWrapper.createPlaybackStateCompat()));
+        () -> {
+          PlaybackStateCompat playbackState = playerWrapper.createPlaybackStateCompat();
+          sessionCompat.setPlaybackState(playbackState);
+          // MD3Music fork（方向3·shadow 播放态镜像）：活跃会话发布后同步给 shadow。
+          mirrorPlaybackStateToShadowSessionsIfActive(playbackState);
+        });
   }
 
   public void updateLegacySessionPlaybackStateAndQueue(PlayerWrapper playerWrapper) {
     postOrRun(
         sessionImpl.getApplicationHandler(),
         () -> {
-          sessionCompat.setPlaybackState(playerWrapper.createPlaybackStateCompat());
+          PlaybackStateCompat playbackState = playerWrapper.createPlaybackStateCompat();
+          sessionCompat.setPlaybackState(playbackState);
+          // MD3Music fork（方向3·shadow 播放态镜像）：与 updateLegacySessionPlaybackState 同源。
+          mirrorPlaybackStateToShadowSessionsIfActive(playbackState);
           controllerLegacyCbForBroadcast.updateQueue(
               playerWrapper.getAvailableCommands().contains(Player.COMMAND_GET_TIMELINE)
                   ? playerWrapper.getCurrentTimeline()
                   : Timeline.EMPTY);
         });
+  }
+
+  /// MD3Music fork（方向3·shadow 播放态镜像）：
+  /// 仅当【本会话正是当前活跃会话】时，把刚发布的 PlaybackState 同步进
+  /// 其它存活（shadow）会话；shadow 自己的发布（paused/旧态）不广播，
+  /// 避免用旧态覆盖刚镜像的新态。会话身份经 sessionImpl 的内部引用比较，
+  /// 开关门控在 AudioPlayer.SHADOW_SESSION_MODE（vivo/iQOO）。
+  private void mirrorPlaybackStateToShadowSessionsIfActive(PlaybackStateCompat state) {
+    MediaSession activeSession = com.ryanheise.just_audio.AudioPlayer.getActiveMediaSession();
+    if (activeSession == null) return;
+    if (!com.ryanheise.just_audio.AudioPlayer.isShadowPlaybackMirrorEnabled()) return;
+    if (sessionImpl.getInstanceForShadowMirrorIdentity() != activeSession) return;
+    MediaSessionCompat.mirrorPlaybackStateToShadows(state, sessionCompat);
+    com.ryanheise.just_audio.AudioPlayer.logShadowPlaybackSync(state);
+  }
+
+  /// MD3Music fork（方向3·队列镜像，v36）：活跃会话每次发布队列（含清空）时同步
+  /// 影子——原子岛钉的是首个会话（shadow），收敛保活后影子自身时间线已清空，列
+  /// 表面板块因此空到底。快照时序问题（岛先连、队列后发）也由每次活跃发布刷新覆盖。
+  /// 队列条目复用本会话已转换好的一批（封面按既有异步链携带），不重复解码。
+  private void mirrorQueueToShadowSessionsIfActive(@Nullable List<QueueItem> queue) {
+    MediaSession activeSession = com.ryanheise.just_audio.AudioPlayer.getActiveMediaSession();
+    if (activeSession == null) return;
+    if (!com.ryanheise.just_audio.AudioPlayer.isShadowPlaybackMirrorEnabled()) return;
+    if (sessionImpl.getInstanceForShadowMirrorIdentity() != activeSession) return;
+    @Nullable CharSequence title = null;
+    try {
+      title = sessionCompat.getController().getQueueTitle();
+    } catch (Throwable t) {
+      // 标题快照失败仅影响列表标题，不阻断队列镜像
+    }
+    MediaSessionCompat.mirrorQueueToShadows(queue, title, sessionCompat);
+    Log.i(
+        "AudioFocusFork",
+        "shadow queue mirror: items=" + (queue == null ? -1 : queue.size()));
   }
 
   private void handleMediaRequest(MediaItem mediaItem, boolean play) {
@@ -1146,7 +1253,13 @@ import org.checkerframework.checker.initialization.qual.Initialized;
         throws RemoteException {
       // Note: This method does not use any of the given arguments.
       updateLegacySessionPlaybackState(sessionImpl.getPlayerWrapper());
+      // MD3Music fork v22：开播瞬间就起进度补刷（isPlaying 的翻转可能稍晚到达，
+      // playWhenReady 更早，覆盖「连车自动续播」这类冷启动场景）。
+      if (playWhenReady) {
+        startLegacyProgressRefresh();
+      }
     }
+
 
     @Override
     public void onPlaybackSuppressionReasonChanged(
@@ -1165,6 +1278,12 @@ import org.checkerframework.checker.initialization.qual.Initialized;
     @Override
     public void onIsPlayingChanged(int seq, boolean isPlaying) throws RemoteException {
       updateLegacySessionPlaybackState(sessionImpl.getPlayerWrapper());
+      // MD3Music fork v22：播放开始/结束决定进度补刷的开关（车机歌词对轴用）。
+      if (isPlaying) {
+        startLegacyProgressRefresh();
+      } else {
+        stopLegacyProgressRefresh();
+      }
     }
 
     @Override
@@ -1217,6 +1336,10 @@ import org.checkerframework.checker.initialization.qual.Initialized;
     private void updateQueue(Timeline timeline) {
       if (!isQueueEnabled() || timeline.isEmpty()) {
         setQueue(sessionCompat, /* queue= */ null);
+        // MD3Music fork（方向3·队列镜像）：活跃会话的队列清空也要同步影子
+        // （播放列表清空/引擎收敛后影子不得残留旧列表）；非活跃影子的自身
+        // 清空事件经 IfActive 门自然跳过，不会抹掉已镜像的队列。
+        mirrorQueueToShadowSessionsIfActive(null);
         return;
       }
       List<MediaItem> mediaItemList = LegacyConversions.convertToMediaItemList(timeline);
@@ -1280,6 +1403,8 @@ import org.checkerframework.checker.initialization.qual.Initialized;
         // which means we can safely send long lists.
         setQueue(sessionCompat, queueItemList);
       }
+      // MD3Music fork（方向3·队列镜像）：活跃队列发布即同步影子。
+      mirrorQueueToShadowSessionsIfActive(queueItemList);
     }
 
     @Override
@@ -1490,7 +1615,9 @@ import org.checkerframework.checker.initialization.qual.Initialized;
         return;
       }
       Uri sessionUri = intent.getData();
-      if (!Util.areEqual(sessionUri, sessionUri)) {
+      // MD3Music fork v28d：守卫补实——此前写成了 sessionUri 自比较恒等，
+      // 判空逻辑从未生效。正确口径是与本会话自身的 URI 比较。
+      if (!Util.areEqual(sessionUri, sessionImpl.getUri())) {
         return;
       }
       KeyEvent keyEvent = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:md3music/core/layout/adaptive_navigator.dart';
+import 'package:md3music/core/layout/responsive_layout.dart';
 
 /// AdaptiveNav.openDetail 的分派钉子（封面连贯过渡对齐原生 Hero 的地基）：
 ///
@@ -17,6 +18,12 @@ import 'package:md3music/core/layout/adaptive_navigator.dart';
 void main() {
   const phoneSize = Size(400, 800);
   const tabletSize = Size(1280, 853);
+
+  // 双栏开关三端通用后，宽屏双栏用例需显式开启（全局 notifier 初值 false）。
+  setUp(() {
+    kWindowsTwoPaneEnabled.value = true;
+  });
+  tearDown(() => kWindowsTwoPaneEnabled.value = false);
 
   Future<GlobalKey<NavigatorState>> pumpHarness(
     WidgetTester tester, {
@@ -56,6 +63,9 @@ void main() {
     final rootObserver = _RecordingObserver();
     final detailKey = await pumpHarness(tester, rootObserver: rootObserver);
 
+    expect(DetailPaneScope.isTwoPaneOf(
+        tester.element(find.text('打开详情'))), isFalse);
+
     await tester.tap(find.text('打开详情'));
     await tester.pumpAndSettle();
 
@@ -73,6 +83,12 @@ void main() {
     addTearDown(tester.view.reset);
     final rootObserver = _RecordingObserver();
     final detailKey = await pumpHarness(tester, rootObserver: rootObserver);
+
+    final masterContext = tester.element(find.text('打开详情'));
+    expect(DetailPaneContent.isTwoPaneOf(masterContext), isFalse,
+        reason: '主列表不在右侧详情内容作用域内');
+    expect(DetailPaneScope.isTwoPaneOf(masterContext), isTrue,
+        reason: '查看更多应从主列表的双栏作用域识别右侧面板');
 
     await tester.tap(find.text('打开详情'));
     await tester.pumpAndSettle();

@@ -5,11 +5,15 @@ import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../core/build_flags.dart';
+import '../core/remote/tv_reorder.dart';
 import '../core/utils/app_haptics.dart';
+import '../core/utils/app_toast.dart';
 import '../data/models/song.dart';
 import '../modules/player/playlist_swipe.dart';
 import '../providers/player_provider.dart';
 import 'm3e_sort_sheet.dart';
+import 'm3e_undo_pill_host.dart';
 import 'player_artwork_image.dart';
 import 'playing_spectrum_indicator.dart';
 
@@ -62,7 +66,7 @@ class PlayerPlaylistView extends StatefulWidget {
   });
 
   @override
-  State<PlayerPlaylistView> createState() => _PlayerPlaylistViewState();
+  State<PlayerPlaylistView> createState() => PlayerPlaylistViewState();
 }
 
 /// 面板配色：AM 皮肤（深色背景上的白色系）与 MD3 皮肤（主题莫奈色）两套。
@@ -156,10 +160,37 @@ class PlaylistScrollAnchor {
   void dispose() => _controller.dispose();
 }
 
-class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
+/// 面板的对外状态句柄：宿主持有 `GlobalKey<PlayerPlaylistViewState>`。
+///
+/// 唯一用途是播放页返回键的收口点（`PopScope`）：先问「列表是否在编辑模式」，
+/// 是则先退出编辑模式、不收起播放页。面板挂在 `PageView(children:)` 上
+/// （cacheExtent=0），切到别的页签时整棵子树被销毁 —— 那时 `currentState`
+/// 为 null，编辑状态本来也随之消失，宿主据此直接放行即可，无需额外记账。
+class PlayerPlaylistViewState extends State<PlayerPlaylistView> {
   /// 滚动控制器来自宿主持有的 [PlaylistScrollAnchor]：本 State 会被 PageView
   /// 连子树一起销毁，所以控制器与「为哪首歌定位过」都不能存在这里。
   ScrollController get _scrollController => widget.scrollAnchor.controller;
+
+  /// tv: 遥控拖拽排序状态机（左键拿起/上下连发移动/OK 或左键放下）。
+  /// 非 TV 构建不接线（itemBuilder 门控），本对象零副作用。
+  late final TvReorderController _reorder = TvReorderController(
+    itemCount: () {
+      if (!mounted) return 0;
+      return context.read<PlayerProvider>().playlist.length;
+    },
+    onReorder: (oldIndex, newIndex) {
+      if (!mounted) return;
+      context.read<PlayerProvider>().reorderPlaylist(oldIndex, newIndex);
+    },
+    labelOf: (index) {
+      if (!mounted) return '';
+      final playlist = context.read<PlayerProvider>().playlist;
+      return index >= 0 && index < playlist.length
+          ? playlist[index].displayName
+          : '';
+    },
+    onToast: (msg, {long = false}) => showToast(msg, long: long),
+  );
 
   /// 编辑模式（多选 + 拖拽重排）
   bool _editMode = false;
@@ -170,6 +201,11 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
   /// 当前排序维度与升降序（与歌单页同一套交互：重复点同项切换升降）
   PlaylistSortBy _sortBy = PlaylistSortBy.queue;
   bool _sortAscending = true;
+
+  /// 撤销条（M3E M3UndoPill）：删歌后给「撤销 / 确认」窗口。
+  /// 队列删除是本地操作、已即时生效，onConfirm 为空操作；undo 走
+  /// [PlayerProvider.restorePlaylistEntries] 按原索引恢复。
+  final ValueNotifier<M3EUndoRequest?> _undoRequest = ValueNotifier(null);
 
   // ── 「从右往左滑 → 下一个 tab」的跟手跟踪 ──
   //
@@ -212,6 +248,10 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
 
   @override
   void dispose() {
+    // 控制器属于本 State 生命周期；既有方法体（ScrollController 注释段）保持原样。
+    _reorder.dispose();
+    // 队列删除已即时生效（onConfirm 为空操作），宿主卸载无需结算动作
+    _undoRequest.dispose();
     // 控制器属于宿主的 [PlaylistScrollAnchor]，不由本 State 释放。
     super.dispose();
   }
@@ -344,6 +384,16 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
     });
   }
 
+  /// 是否处于编辑模式（宿主返回键据此决定「先退出编辑」还是「收起播放页」）。
+  bool get editMode => _editMode;
+
+  /// 供宿主返回键调用：在编辑模式则退出并返回 true（表示本次返回已被消费）。
+  bool exitEditModeIfActive() {
+    if (!_editMode) return false;
+    _exitEditMode();
+    return true;
+  }
+
   void _toggleSelection(String songId) {
     setState(() {
       if (!_selectedIds.remove(songId)) _selectedIds.add(songId);
@@ -363,19 +413,14 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
     });
   }
 
-  /// 排序菜单选中某项：同项再点切换升降序（repeated），换项则回到升序
+  /// 排序菜单选中某项：换项回到升序；方向由面板分段控件单独切换
   void _onSortSelected(
     PlaylistSortBy value,
-    PlayerProvider playerProvider, {
-    required bool repeated,
-  }) {
+    PlayerProvider playerProvider,
+  ) {
     setState(() {
-      if (repeated) {
-        _sortAscending = !_sortAscending;
-      } else {
-        _sortBy = value;
-        _sortAscending = true;
-      }
+      _sortBy = value;
+      _sortAscending = true;
     });
     playerProvider.sortPlaylist(_sortBy, ascending: _sortAscending);
   }
@@ -411,8 +456,21 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    // 删除前快照（原索引 + 歌曲对象）：撤销条 undo 时按原位恢复
+    final entries = <({int index, Song song})>[
+      for (var i = 0; i < playerProvider.playlist.length; i++)
+        if (_selectedIds.contains(playerProvider.playlist[i].id))
+          (index: i, song: playerProvider.playlist[i]),
+    ];
     await playerProvider.removeManyFromPlaylist(Set.of(_selectedIds));
-    if (mounted) _exitEditMode();
+    if (mounted) {
+      _exitEditMode();
+      _undoRequest.value = M3EUndoRequest(
+        label: '已从播放列表移除 $count 首歌曲',
+        onUndo: () => playerProvider.restorePlaylistEntries(entries),
+        onConfirm: () {},
+      );
+    }
   }
 
   @override
@@ -480,13 +538,22 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
           child: LayoutBuilder(
             builder: (context, constraints) {
               _panelWidth = constraints.maxWidth;
-              return Column(
+              return Stack(
                 children: [
-                  _editMode
-                      ? _buildEditHeader(playerProvider, playlist, colors)
-                      : _buildNormalHeader(playerProvider, playlist, colors),
-                  Expanded(
-                    child: _buildList(playerProvider, playlist, data, colors),
+                  Column(
+                    children: [
+                      _editMode
+                          ? _buildEditHeader(playerProvider, playlist, colors)
+                          : _buildNormalHeader(playerProvider, playlist, colors),
+                      Expanded(
+                        child: _buildList(playerProvider, playlist, data, colors),
+                      ),
+                    ],
+                  ),
+                  // M3E 撤销条：悬浮在面板底部（M3UndoPill 自带 Positioned）
+                  M3EUndoPillHost(
+                    request: _undoRequest,
+                    horizontalPadding: 20,
                   ),
                 ],
               );
@@ -613,8 +680,12 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
               (value: PlaylistSortBy.title, label: '标题'),
               (value: PlaylistSortBy.duration, label: '时长'),
             ],
-            onPicked: (value, repeated) =>
-                _onSortSelected(value, playerProvider, repeated: repeated),
+            onPicked: (value) => _onSortSelected(value, playerProvider),
+            ascending: _sortAscending,
+            onDirectionChanged: (ascending) {
+              setState(() => _sortAscending = ascending);
+              playerProvider.sortPlaylist(_sortBy, ascending: ascending);
+            },
           ),
         ),
       ),
@@ -633,6 +704,108 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
     ({int fingerprint, int currentIndex, bool isPlaying}) data,
     _PanelColors colors,
   ) {
+    // 行构建器：两个列表实现共用（避免两处各写一遍切歌/勾选逻辑）。
+    Widget rowAt(BuildContext context, int index) {
+      final song = playlist[index];
+      final item = _buildItem(
+        index: index,
+        song: song,
+        isCurrent: index == data.currentIndex,
+        isPlaying: data.isPlaying,
+        playerProvider: playerProvider,
+        colors: colors,
+      );
+      // tv: 整行单停点 + 排序方向键（左键拿起/上下移动/OK 或左键放下）。
+      if (!kTvBuild) return item;
+      return TvReorderItem(
+        index: index,
+        controller: _reorder,
+        onSelect: () {
+          if (_editMode) {
+            _toggleSelection(song.id);
+          } else {
+            // 点击切歌（不关闭面板，留在容器）——与 ListTile.onTap 同逻辑。
+            playerProvider.playSongAt(index);
+          }
+        },
+        child: item,
+      );
+    }
+
+    final Widget empty = Center(
+      child: Text(
+        '播放列表为空',
+        style: Theme.of(
+          context,
+        ).textTheme.bodyMedium?.copyWith(color: colors.secondary),
+      ),
+    );
+
+    // tv: TV 构建**不用** M3E 的 dismissible 列表。M3E 给每个槽位自建了一个
+    // InkWell 焦点节点（debugLabel `M3EDismissibleSlot`），它包在 itemBuilder
+    // 的输出**之外**，于是 dpad 落在 M3E 的节点上，行内 `TvReorderItem` 的
+    // OK（切歌）与左键（拿起排序）回调**永远收不到**——2026-10-18 真机实测：
+    // 左键无法拿起歌曲、OK 无法切歌（真机 logcat 的 primaryFocus 就是
+    // `M3EDismissibleSlot`）。TV 上滑动删除本来也做不出来（遥控无横滑），
+    // 因此退回普通 ListView，让 `TvReorderItem` 成为整行唯一停点。
+    final Widget list = kTvBuild
+        ? (playlist.isEmpty
+              ? empty
+              : ListView.builder(
+                  controller: _scrollController,
+                  itemCount: playlist.length,
+                  itemBuilder: rowAt,
+                ))
+        : M3EReorderableDismissibleList(
+            itemCount: playlist.length,
+            scrollController: _scrollController,
+            // key 由 M3E 内部用 KeyedSubtree 套用，保证重排 / 滑删后列表项状态稳定
+            keyBuilder: (index) => ValueKey(playlist[index].id),
+            // 关闭 M3E 自带的把手图标：本项目在编辑模式用行内自定义把手
+            buildDefaultDragHandles: false,
+            // 队列项自带 ListTile 底色与波纹，因此去掉 M3E 卡片的背景 / 圆角 / 间距 /
+            // 内边距，避免出现双层圆角与双重背景
+            style: const M3EDismissibleCardStyle(
+              outerRadius: 0,
+              innerRadius: 0,
+              gap: 0,
+              padding: EdgeInsets.zero,
+              color: Colors.transparent,
+              // 只允许「从左向右」滑动删除：反向（从右向左）不响应，避免误触。
+              // startToEnd = 从左向右；endToStart = 从右向左；none = 完全禁用。
+              // 注意不能靠「不传 onDismiss」来禁用——上游是
+              // `onDismissCallback?.call(...) ?? true`，不传回调等于默认放行。
+              direction: DismissDirection.startToEnd,
+            ),
+            // 浮层：原 proxyDecorator 只做半透明、不加底色与阴影，这里等价处理
+            dragElevation: 0,
+            dragPlaceholderColor: Colors.transparent,
+            onDismiss: (index, direction) async {
+              // 编辑模式（多选）下不接受滑动删除：返回 false 让 M3E 回弹，
+              // 避免与「点整行切换勾选」的手势语义冲突
+              if (_editMode) return false;
+              // 删除前快照：撤销条 undo 时按原位恢复（删除当前播放歌曲的
+              // 索引校正由 removeFromPlaylist 内部负责）
+              final song = playerProvider.playlist[index];
+              await playerProvider.removeFromPlaylist(index);
+              _undoRequest.value = M3EUndoRequest(
+                label: '已移除「${song.displayName}」',
+                onUndo: () =>
+                    playerProvider.restorePlaylistEntries([(index: index, song: song)]),
+                onConfirm: () {},
+              );
+              return true;
+            },
+            onReorder: (oldIndex, newIndex) {
+              // M3E 的 newIndex 语义与 ReorderableListView 完全一致（均以「移除前」
+              // 的插入位传参，源码里 to > from 时补 +1），因此直接沿用原调用，
+              // 由 reorderPlaylist 内部继续做 `if (oldIndex < newIndex) newIndex -= 1`
+              playerProvider.reorderPlaylist(oldIndex, newIndex);
+            },
+            itemBuilder: rowAt,
+            emptyBuilder: (context) => empty,
+          );
+
     return ShaderMask(
       shaderCallback: (Rect bounds) {
         const double fadeHeight = 24.0;
@@ -650,61 +823,7 @@ class _PlayerPlaylistViewState extends State<PlayerPlaylistView> {
         ).createShader(bounds);
       },
       blendMode: BlendMode.dstIn,
-      child: M3EReorderableDismissibleList(
-        itemCount: playlist.length,
-        scrollController: _scrollController,
-        // key 由 M3E 内部用 KeyedSubtree 套用，保证重排 / 滑删后列表项状态稳定
-        keyBuilder: (index) => ValueKey(playlist[index].id),
-        // 关闭 M3E 自带的把手图标：本项目在编辑模式用行内自定义把手
-        buildDefaultDragHandles: false,
-        // 队列项自带 ListTile 底色与波纹，因此去掉 M3E 卡片的背景 / 圆角 / 间距 /
-        // 内边距，避免出现双层圆角与双重背景
-        style: const M3EDismissibleCardStyle(
-          outerRadius: 0,
-          innerRadius: 0,
-          gap: 0,
-          padding: EdgeInsets.zero,
-          color: Colors.transparent,
-          // 只允许「从左向右」滑动删除：反向（从右向左）不响应，避免误触。
-          // startToEnd = 从左向右；endToStart = 从右向左；none = 完全禁用。
-          // 注意不能靠「不传 onDismiss」来禁用——上游是
-          // `onDismissCallback?.call(...) ?? true`，不传回调等于默认放行。
-          direction: DismissDirection.startToEnd,
-        ),
-        // 浮层：原 proxyDecorator 只做半透明、不加底色与阴影，这里等价处理
-        dragElevation: 0,
-        dragPlaceholderColor: Colors.transparent,
-        onDismiss: (index, direction) async {
-          // 编辑模式（多选）下不接受滑动删除：返回 false 让 M3E 回弹，
-          // 避免与「点整行切换勾选」的手势语义冲突
-          if (_editMode) return false;
-          // 删除当前播放歌曲的索引校正由 removeFromPlaylist 内部负责
-          await playerProvider.removeFromPlaylist(index);
-          return true;
-        },
-        onReorder: (oldIndex, newIndex) {
-          // M3E 的 newIndex 语义与 ReorderableListView 完全一致（均以「移除前」
-          // 的插入位传参，源码里 to > from 时补 +1），因此直接沿用原调用，
-          // 由 reorderPlaylist 内部继续做 `if (oldIndex < newIndex) newIndex -= 1`
-          playerProvider.reorderPlaylist(oldIndex, newIndex);
-        },
-        itemBuilder: (context, index) => _buildItem(
-          index: index,
-          song: playlist[index],
-          isCurrent: index == data.currentIndex,
-          isPlaying: data.isPlaying,
-          playerProvider: playerProvider,
-          colors: colors,
-        ),
-        emptyBuilder: (context) => Center(
-          child: Text(
-            '播放列表为空',
-            style: Theme.of(
-              context,
-            ).textTheme.bodyMedium?.copyWith(color: colors.secondary),
-          ),
-        ),
-      ),
+      child: list,
     );
   }
 

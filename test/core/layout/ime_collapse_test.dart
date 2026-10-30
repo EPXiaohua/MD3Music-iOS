@@ -212,4 +212,42 @@ void main() {
     await tester.pump();
     expect(height(tester), barHeight);
   });
+
+  // 子树被不透明路由盖住时 ticker 静音，此时发出的收起动画会挂在起点
+  // （value=0、isAnimating=true）。设置页搜索框聚焦正是这个形态：焦点随后
+  // 释放、目标翻回可见，挂起的 forward 若不取消，返回首页（ticker 恢复）
+  // 那帧会续跑到收没端点，miniplayer 永久消失。
+  testWidgets('静音期挂起的收起动画被目标翻转取消，ticker 恢复后不收没内容', (tester) async {
+    Widget host(bool tickerEnabled) => MaterialApp(
+          home: Scaffold(
+            resizeToAvoidBottomInset: false,
+            body: TickerMode(
+              enabled: tickerEnabled,
+              child: const ImeCollapse(
+                child: SizedBox(key: barKey, height: barHeight),
+              ),
+            ),
+          ),
+        );
+
+    await tester.pumpWidget(host(true));
+    await tester.pumpAndSettle();
+    expect(height(tester), barHeight);
+
+    // ticker 静音期聚焦：forward 挂起在 value=0。
+    await tester.pumpWidget(host(false));
+    kTextInputFocused.value = true;
+    await tester.pump();
+
+    // 静音期焦点释放：目标翻回可见，挂起的 forward 必须被取消而非按 value 早退。
+    kTextInputFocused.value = false;
+    await tester.pump();
+
+    // ticker 恢复（等同返回首页）后内容必须仍完整可见。
+    await tester.pumpWidget(host(true));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(height(tester), barHeight);
+    expect(find.byKey(barKey), findsOneWidget);
+  });
 }

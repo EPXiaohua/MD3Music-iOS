@@ -3,12 +3,15 @@ import 'dart:math' as math;
 import 'dart:ui' show PathMetric;
 
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/gestures.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/physics.dart';
 
 import '../../core/theme/motion_constants.dart';
+import '../../core/build_flags.dart';
 import '../../core/layout/bottom_chrome_dimens.dart';
+import '../../core/layout/display_space.dart';
 import '../../core/layout/ime_collapse.dart';
 import '../../core/layout/page_title_alignment.dart';
 import '../../core/layout/responsive_layout.dart';
@@ -130,6 +133,11 @@ class _SecondaryMiniPlayerHostState extends State<SecondaryMiniPlayerHost> {
 
   @override
   Widget build(BuildContext context) {
+    // tv: MiniPlayer 已移入顶栏第一层（tv_shell.dart），页面级的悬浮条 /
+    // 底部常驻条一律退场 —— 与桌面布局的透传同语义，且必须在形态开关之前
+    // 判定（开关开着时 _buildHost 会渲染悬浮胶囊，详情双栏底部就会浮出一条，
+    // 2026-10-16 真机实锤）。
+    if (kTvBuild) return widget.child;
     // 播放器形态的两个开关（设置页可关）：关闭时直渲染内容、不预留底部空间。
     // 用 ListenableBuilder 订阅全局开关，切换后各页宿主即时生效，不依赖上层重建。
     return ListenableBuilder(
@@ -255,9 +263,16 @@ class _SecondaryMiniPlayerHostState extends State<SecondaryMiniPlayerHost> {
       right: 0,
       bottom: 0,
       child: ImeCollapse(
-        child: SecondaryMiniPlayer(
-          collapsed: _collapsed,
-          onRequestExpand: _expandManually,
+        child: ValueListenableBuilder<double>(
+          valueListenable: kSecondaryPlayerOpacity,
+          builder: (context, opacity, child) => Opacity(
+            opacity: opacity,
+            child: child,
+          ),
+          child: SecondaryMiniPlayer(
+            collapsed: _collapsed,
+            onRequestExpand: _expandManually,
+          ),
         ),
       ),
     );
@@ -439,7 +454,7 @@ double capsuleChromeOpacity(double expansion) =>
 ///
 /// 判据与常驻条封面（`mini_player.dart` 的 `coverLayerWillDraw`）及播放页
 /// `PlayerCoverSlot` 同源：`expansion > 0` 且形变层真的在画时二进制让位
-/// （`Opacity 0`），形变层不接管（频谱圆盘 / 写真 / 系统减弱动画）时保持可见。
+/// （`Opacity 0`），形变层不接管（写真 / 车机面板 / 系统减弱动画）时保持可见。
 /// 额外的 [invisibleAt] 项保证**远端端点**（`playerExpansion == 1`）整条不可见：
 /// 该进度下展开面板已铺满、胶囊在其之下，但裸露的封面仍要收干净。
 double capsuleCoverOpacity(
@@ -449,20 +464,32 @@ double capsuleCoverOpacity(
 }) =>
     (expansion > 0.0 && (layerWillDraw || expansion >= invisibleAt)) ? 0.0 : 1.0;
 
-/// 由「胶囊自身 render box 在锚点空间下的矩形」构造形态快照（纯函数）。
+/// 由「胶囊可见本体在锚点空间下的矩形」构造形态快照（纯函数）。
 ///
-/// [panelRect] 的口径与常驻条**完全一致**：含底部净空、底端到屏底 —— 即胶囊
-/// 宿主 box（SafeArea 底部安全区 + 12dp 底距 + 64dp 胶囊）在锚点空间下的矩形。
+/// [panelRect] 的口径 = **可见本体**（不是宿主外框）：胶囊 64 高、左右各 16dp
+/// 内缩（Pad 下限宽 400 且贴停靠侧）、底端距屏底 12dp。展开面板的 `p=0` 窗口
+/// 与它逐值相等，用户看到的就是「胶囊自己在长」。
+///
+/// [cornerRadius] 缺省按形态推导（胶囊/圆盘 = 32），显式传入用于把采集端算出的
+/// 实际半径写死进来。
 /// [collapsed] 为真时是圆盘形态，否则为展开胶囊。
 PlayerMorphScene capsuleMorphScene({
   required Rect panelRect,
   required double screenHeight,
   required bool collapsed,
+  double? cornerRadius,
 }) => PlayerMorphScene(
   panelRect: panelRect,
   screenHeight: screenHeight,
   form: collapsed ? PlayerBarForm.floatingDisc : PlayerBarForm.floatingCapsule,
+  cornerRadius: cornerRadius,
 );
+
+/// 悬浮胶囊 / 圆盘的**外轮廓圆角**（dp）= 直径的一半。
+///
+/// 圆盘态是一个正圆，用「半径 = 高度一半的圆角矩形」表达恰好等价；胶囊态是
+/// 两端半圆的跑道形，同样取它。两者同值不是巧合，而是同一个几何量的两种形态。
+const double kCapsuleOutlineRadius = BottomChromeDimens.discDiameter / 2;
 
 // —— 悬浮播放器进度指示的几何（State 与 [_SecondaryProgressPainter] 共用）——
 
@@ -615,6 +642,43 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
   /// 进度变化，两者共用一个 AnimatedBuilder —— 只重挂稳定子树、不重建内容。
   late final Listenable _morphAndExpansion;
 
+  // —— 上拉展开 FullPlayer（与常驻条 MiniPlayer 同一套手势语义）——
+  //
+  // 为什么手势用 Listener 而不是 GestureDetector 的 vertical drag：
+  // 1. 卡片上已有「横向拖动圆盘 + 长按拾起 + 点击」三条识别器，再加一条垂直
+  //    识别器会让竞技场判定变复杂（斜向滑动谁赢、长按是否被抢）；
+  // 2. 常驻条 MiniPlayer 已用 Listener + 自己算 slop/主导轴，两处保持同一套
+  //    判据，手感才一致（尤其「斜着滑不该误触发」这一条）。
+  // 关键约束同常驻条：**手势期间绝不 push 路由**（push 会切断事件流），
+  // 跟手显示由 Navigator 之上的覆盖层承担；松手后再 push 并让路由从当前进度续展开。
+
+  /// 当前跟踪的 pointer（null = 无上拉会话）。
+  int? _pullPointer;
+  /// 起手位置（设计像素）与累计上拉距离。
+  double _pullDownX = 0;
+  double _pullDownY = 0;
+  double _pullDistance = 0;
+  /// 是否已确认「垂直上拉」手势。up 之后到下一次 down 之前保持 true，
+  /// 用来屏蔽同一次手势里后续派发的 tap / 横向拖动回调。
+  bool _pullActivated = false;
+  /// 起手那一刻胶囊**可见本体**的矩形（设计像素、锚点空间）。
+  Rect _pullBodyRect = Rect.zero;
+  /// 速度/加速度估计（向上为正，按事件时间戳差分）。
+  double? _pullLastVelocity;
+  double? _pullLastY;
+  Duration? _pullLastSampleTime;
+  double _pullAcceleration = 0;
+
+  /// 松手未达阈值时的回弹（一次性，见 [DragReleaseAnimator]）。
+  late final DragReleaseAnimator _pullRelease;
+
+  /// 胶囊**可见本体**的 key：上拉起点 / 形态快照都从这里量矩形。
+  ///
+  /// 量的是 `Material` 那一层（宽 = 形变后的胶囊宽、高 = 64、圆角 32），
+  /// 不是宿主外框（`SafeArea` + 12dp 底距 + 全宽）—— 后者比可见本体宽 32、
+  /// 横偏 16，拿它当展开起点会让面板一上来就比真身宽一圈。
+  final GlobalKey _pillKey = GlobalKey();
+
   // 收起为圆盘时，环形进度/封面需要跟随唱片旋转。
   // 若把 _spin 直接驱动在动画链上：展开态旋转为 0（_spin.value*0），
   // 但 kAnimationListener 仍会被 controller 通知；而 FadeTransition 只是
@@ -641,14 +705,18 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
   @override
   void initState() {
     super.initState();
+    // duration 仅是兜底标称值（实际形变走 SpringSimulation 驱动，见
+    // _onCollapsedChanged）；与 chrome 动效同档，避免出现第二个时长口径。
     _morph = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 320),
+      duration: kBottomChromeToggleDuration,
       value: widget.collapsed.value ? 1.0 : 0.0,
     );
     // 弹簧终态重算收口：形变收敛不保证伴随末帧 build，漏掉会让展开态的
     // 共享节拍订阅残留（见 [_onMorphStatusChanged]）。dispose 成对解绑。
     _morph.addStatusListener(_onMorphStatusChanged);
+    // 收缩态逐 tick 直写登记簿（交棒端点冻结取值，见 _registerCollapseState）。
+    _morph.addListener(_registerCollapseState);
     _spin = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 12),
@@ -682,6 +750,8 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     _offsetAndLift = Listenable.merge([_dragOffset, _liftCurve]);
     // 展开交接与形态几何合用一个驱动源（同上，只建一次）。
     _morphAndExpansion = Listenable.merge([_morph, playerExpansion]);
+    // 上拉松手未达阈值时的回弹（一次性 forward，不常驻）。
+    _pullRelease = DragReleaseAnimator(this);
   }
 
   /// 共享 `Timer` 不受 `TickerMode` 约束（§10.3），必须自行同步挂起。
@@ -832,6 +902,9 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     _discAngle =
         (_discAngle + stepRatio * 2 * math.pi * _morph.value) %
         (2 * math.pi);
+    // 圆盘旋转期间 `_morph` 已停、listener 不再触发，角度在此续写登记
+    // （交棒起飞帧要与其逐角度对齐，见 _registerCollapseState）。
+    if (_morph.value > 0) _registerCollapseState();
   }
 
   /// 进度采样的唯一收口：只在「开关开 + 播放中 + 时长已知 + 卡片可见 + 前台」时
@@ -934,10 +1007,12 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     widget.collapsed.removeListener(_onCollapsedChanged);
     kSecondaryPlayerProgressEnabled.removeListener(_onProgressSwitchChanged);
     _morph.removeStatusListener(_onMorphStatusChanged);
+    _morph.removeListener(_registerCollapseState);
     if (_boundToDriver) {
       PlayerFrameDriver.instance.removeListener(_onSpinTick);
       _boundToDriver = false;
     }
+    _pullRelease.dispose();
     _snap.dispose();
     _lift.dispose();
     _dragOffset.dispose();
@@ -1022,6 +1097,9 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     // 判据读**实时的** [inBottomBarFormFlight]（而非外层传入的快照）：卡体是稳定
     // 实例、不随 `standDown` 翻转重建，实时读值才能始终与当前窗口状态一致。
     if (!inBottomBarFormFlight()) _scheduleRegisterCapsuleRect();
+    // 收缩态同步登记一次：新页面挂出的展开胶囊要把上一页残留的收缩值归零
+    //（`_morph` 此后不动、listener 不触发，全靠这次与拖拽/旋转处的续写）。
+    _registerCollapseState();
     // 飞行期只挂载不绘制：不重挂旋转/进度驱动，否则「保挂载」会变成「恢复产帧」
     // —— 形状还是那个形状，只是驱动收口继续按下（§10.4.3）。让位期解绑 → 收敛
     // 后由外层 builder 的 [_armDriversAtSettle] 补挂（卡体自身不重建）。
@@ -1174,17 +1252,28 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
 
   /// 水平拖拽 + 松手吸附。仅折叠态（[_discDraggable]）生效；垂直滚动事件
   /// 不被抢占（用水平手势识别器），手指在圆盘上上下滑仍可滚动页面。
-  void _onDiscHorizontalDragStart(DragStartDetails details) =>
-      _beginDiscDrag(_DiscDragSource.pointerDrag);
+  ///
+  /// 上拉展开已识别（[_pullActivated]）时整条链路让位：同一次手势里竞技场
+  /// 仍会 sweep 到这些回调，不挡住就会「上拉到一半圆盘突然横向吸附」。
+  void _onDiscHorizontalDragStart(DragStartDetails details) {
+    if (_pullActivated) return;
+    _beginDiscDrag(_DiscDragSource.pointerDrag);
+  }
 
-  void _onDiscHorizontalDragUpdate(DragUpdateDetails details, double trackW) =>
-      _moveDiscDrag(details.delta.dx, trackW);
+  void _onDiscHorizontalDragUpdate(DragUpdateDetails details, double trackW) {
+    if (_pullActivated) return;
+    _moveDiscDrag(details.delta.dx, trackW);
+  }
 
-  void _onDiscHorizontalDragEnd(DragEndDetails details, double trackW) =>
-      _endDiscDrag(_DiscDragSource.pointerDrag, trackW);
+  void _onDiscHorizontalDragEnd(DragEndDetails details, double trackW) {
+    if (_pullActivated) return;
+    _endDiscDrag(_DiscDragSource.pointerDrag, trackW);
+  }
 
-  void _onDiscHorizontalDragCancel(double trackW) =>
-      _endDiscDrag(_DiscDragSource.pointerDrag, trackW);
+  void _onDiscHorizontalDragCancel(double trackW) {
+    if (_pullActivated) return;
+    _endDiscDrag(_DiscDragSource.pointerDrag, trackW);
+  }
 
   /// 长按识别成功（按住满 500ms 且未越过 slop）= 原地拾起圆盘。
   ///
@@ -1192,6 +1281,7 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
   /// 所以后续位移必须由 [_onLongPressMoveUpdate] 上报，否则长按会锁死拖拽 ——
   /// 这正是「浮起表示可拖拽、实际却拖不动」的冲突根源。
   void _onLongPressStart(LongPressStartDetails details) {
+    if (_pullActivated) return;
     // 用按下点作差分基准：否则拾起后的第一次移动会被当成"建立基准"而吃掉，
     // 手指先动的那一段没有响应（跟手性缺陷）。
     _longPressLastLocalX = details.localPosition.dx;
@@ -1207,6 +1297,7 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     LongPressMoveUpdateDetails details,
     double trackW,
   ) {
+    if (_pullActivated) return;
     final double x = details.localPosition.dx;
     final double? last = _longPressLastLocalX;
     _longPressLastLocalX = x;
@@ -1216,6 +1307,7 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
 
   void _onLongPressEnd(double trackW) {
     _longPressLastLocalX = null;
+    if (_pullActivated) return;
     _endDiscDrag(_DiscDragSource.longPress, trackW);
   }
 
@@ -1240,6 +1332,8 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     _snapStartOffset = x - slots[best];
     if (kSecondaryPlayerDock.value != target) {
       kSecondaryPlayerDock.value = target;
+      // 停靠位提交即时续写登记（此刻 `_morph` 不动，listener 不会触发）。
+      _registerCollapseState();
       unawaited(
         SettingsRepository().setSecondaryPlayerDockRaw(target.name),
       );
@@ -1357,8 +1451,9 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
             ),
           );
         },
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
+        child: _pullGesture(
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
           onHorizontalDragStart: _onDiscHorizontalDragStart,
           onHorizontalDragUpdate: (d) => _onDiscHorizontalDragUpdate(d, trackW),
           onHorizontalDragEnd: (d) => _onDiscHorizontalDragEnd(d, trackW),
@@ -1378,18 +1473,21 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
               ? () => _onLongPressEnd(trackW)
               : null,
           onTap: () {
+            // 上拉展开已识别（含 up 后 sweep 阶段）不响应点击
+            if (_pullActivated) return;
             AppHaptics.click(HapticCategory.navigation);
             if (_morph.value > 0.5) {
               widget.onRequestExpand(); // 收起态：点击只展开
             } else {
               // 展开态：点击进完整播放页 —— 采集此刻的真实几何作为展开起点。
               // 悬浮胶囊**从不写**全局锚点（只有常驻条写），不传场景的话
-              // panelAnchorFor 只能读到常驻条留下的陈旧矩形或合成兜底，
+              // panelGeometryFor 只能读到常驻条留下的陈旧矩形或合成兜底，
               // 面板起点就会与用户点的这个控件对不上。
               openFullPlayer(context, scene: _captureMorphScene());
             }
           },
           child: Material(
+            key: _pillKey,
             elevation: 0,
             // 底色与常驻条同源取色（复用 resolveMiniPlayerBackground），两形态切换零色差；
             // 壁纸档 0.2 是 2026-10-10 确认的决定，辨识度由胶囊既有投影（下方 shadow）承担。
@@ -1464,7 +1562,27 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
             ),
           ),
         ),
+        ),
       ),
+    );
+  }
+
+  /// 上拉展开的手势外壳（`Listener`，`!kTvBuild` 才挂）。
+  ///
+  /// 用 `Listener` 而非再加一条垂直拖动识别器：卡片上已有横向拖动 / 长按 / 点击
+  /// 三条识别器，垂直拖动一旦进场会让竞技场判定复杂化（斜向谁赢、长按是否被抢）；
+  /// 常驻条 MiniPlayer 也是 Listener + 自己算 slop/主导轴，两处同一套判据。
+  ///
+  /// 命中区域 = 卡片本体（`Listener` 是 proxy，不改变布局盒），不会扩到胶囊之外。
+  Widget _pullGesture(Widget child) {
+    if (kTvBuild) return child;
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: _onPullDown,
+      onPointerMove: _onPullMove,
+      onPointerUp: _onPullUp,
+      onPointerCancel: _onPullCancel,
+      child: child,
     );
   }
 
@@ -1503,6 +1621,9 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
               subtitleStyle: styles.subtitle,
               crossAxisAlignment: CrossAxisAlignment.center,
               textAlign: TextAlign.center,
+              // 飞行起点行对齐 = 胶囊真身的逐行居中。缺省 centerLeft 是常驻条
+              // 口径，胶囊不传的话交棒瞬间文字整体跳左（真机报障 ①）。
+              miniLineAlign: Alignment.center,
             ),
           ),
           // 播放控制与常驻条、交叉过渡浮层共用 [PlayerBarTransport]。
@@ -1512,39 +1633,211 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     );
   }
 
-  /// 采集本次展开的形态快照（点击那一刻）。
+  /// 胶囊**可见本体**在锚点空间（设计像素）下的矩形。
   ///
-  /// [PlayerMorphScene.panelRect] 的口径与常驻条**完全一致**（含底部净空、
-  /// 底端到屏底）：常驻条量的是"自身 render box 在锚点空间下的矩形"
-  /// （`mini_player.dart` 的 `_onRawDown`），本胶囊量的是同一个 box —— 它把
-  /// `SafeArea`（底部安全区）+ 12dp 底距 + 64dp 胶囊一起包住，底端即屏底。
-  /// 量法照抄常驻条：`localToGlobal(ancestor: _scaleAnchor)` 取左上角，
-  /// 尺寸取同一 box 的布局尺寸（同空间、同坐标系）。
+  /// 量的是 `Material` 那一层（`_pillKey`）：宽 = 形变后的胶囊宽（手机 = 视口 −
+  /// 32，Pad = min(轨道, 400)）、高恒为 [_disc]（64）、圆角 32 —— 这正是用户在
+  /// 屏幕上看到的那一块。宿主外框（`SafeArea` + 12dp 底距 + 全宽）比它宽 32、
+  /// 横偏 16，只能用于「内容底部预留」与底栏交棒端点，**不能**当展开起点：
+  /// 拿它做起点，面板一上来就比真身宽一圈，形变读起来是「一个更宽的窗口凭空
+  /// 出现」而不是「胶囊自己在长」。
   ///
-  /// box 尚未布局（理论不可达：点击必然发生在已绘制之后）时退化为胶囊几何的
-  /// 贴底条，绝不回落到桌面播放栏高那套（那是移动端根本不存在的形态）。
+  /// 兜底（box 尚未布局 / 测试裸挂）走 [resolveCapsuleBodyRect]：与形态交棒浮层
+  /// 的胶囊端点**同一个解析式**，Pad 限宽与停靠侧都对得上。
+  Rect _captureBodyRect() {
+    final RenderBox? box =
+        _pillKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box != null && box.attached && box.hasSize) {
+      return box.localToGlobal(Offset.zero, ancestor: _scaleAnchor) & box.size;
+    }
+    final MediaQueryData mq = MediaQuery.of(context);
+    // 与浮层端点同口径：横屏 rail 布局让出 rail+分隔线的左缘保留宽、Pad 布局
+    // 限宽到 discTrackMaxWidth、停靠位取全局值（正常路径走上方实测 box，此处
+    // 只兜底 box 未布局 / 测试裸挂场景）。
+    return resolveCapsuleBodyRect(
+      screenSize: mq.size,
+      safeBottom: mq.viewPadding.bottom,
+      leadingReserve: usesNavigationRail(mq.size.width)
+          ? navigationRailReservedWidth
+          : 0.0,
+      maxTrackWidth: isPadLayout(context)
+          ? BottomChromeDimens.discTrackMaxWidth
+          : 0.0,
+      dockSide: kSecondaryPlayerDock.value,
+    );
+  }
+
+  /// 采集本次展开的形态快照（点击 / 上拉那一刻）。
+  ///
+  /// 口径 = **可见本体**（见 [_captureBodyRect]）+ 外轮廓圆角 32。展开面板的
+  /// `p=0` 窗口与它逐值相等，于是「悬浮条外轮廓 → 覆盖全屏」这条形变从第一帧
+  /// 就与真身重合；圆角则从这里插值到设备上报的屏幕 r 角。
   PlayerMorphScene _captureMorphScene() {
     final MediaQueryData mq = MediaQuery.of(context);
-    final double screenHeight = mq.size.height;
     final bool collapsed = _morph.value > 0.5;
-    final RenderBox? box = context.findRenderObject() as RenderBox?;
-    if (box == null || !box.hasSize) {
-      return capsuleMorphScene(
-        panelRect: Rect.fromLTWH(
-          0,
-          math.max(0, screenHeight - BottomChromeDimens.discReservedBottom),
-          mq.size.width,
-          BottomChromeDimens.discReservedBottom,
-        ),
-        screenHeight: screenHeight,
-        collapsed: collapsed,
+    return capsuleMorphScene(
+      panelRect: _captureBodyRect(),
+      screenHeight: mq.size.height,
+      collapsed: collapsed,
+      cornerRadius: kCapsuleOutlineRadius,
+    );
+  }
+
+  // ── 上拉展开：Listener 原始指针事件 ──
+  //
+  // 与常驻条 `mini_player.dart` 同一套语义（那里有完整的原因说明）：
+  // - 原始指针是**窗口坐标**，必须先经 [toDisplaySpace] 换算成设计像素，
+  //   否则非 1.0 显示档下累计距离与阈值不在同一坐标系；
+  // - 手势期间绝不 push 路由，跟手显示交给 Navigator 之上的覆盖层；
+  // - 确认垂直上拉（超 slop 且垂直占主导）后才置 `playerDragActive`，
+  //   斜向滑动留给横向切歌 / 圆盘拖动。
+
+  void _onPullDown(PointerDownEvent e) {
+    if (_pullPointer != null) return; // 已在跟踪其他手指
+    // 用户重新按住 = 接管上一次回弹
+    _pullRelease.stop();
+    _pullPointer = e.pointer;
+    final down = toDisplaySpace(context, e.position);
+    _pullDownX = down.dx;
+    _pullDownY = down.dy;
+    _pullDistance = 0.0;
+    _pullActivated = false;
+    _pullLastVelocity = null;
+    _pullLastY = down.dy;
+    _pullLastSampleTime = e.timeStamp;
+    _pullAcceleration = 0.0;
+    _pullBodyRect = _captureBodyRect();
+  }
+
+  void _onPullMove(PointerMoveEvent e) {
+    if (e.pointer != _pullPointer) return;
+    final p = toDisplaySpace(context, e.position);
+    final deltaY = _pullDownY - p.dy; // 向上为正（设计像素）
+    final deltaX = (p.dx - _pullDownX).abs();
+    if (!_pullActivated) {
+      // 圆盘正在被拖动 / 已拾起时不吃上拉：那是另一条会话
+      if (_dragSource != null) return;
+      if (deltaY < kTouchSlop || deltaY <= deltaX) return;
+      _pullActivated = true;
+      // 起点矩形成组登记：矩形 + 外轮廓圆角。覆盖层与路由都读这一份。
+      publishPlayerDragOrigin(
+        top: _pullBodyRect.top,
+        bottom: _pullBodyRect.bottom,
+        left: _pullBodyRect.left,
+        width: _pullBodyRect.width,
+        radius: kCapsuleOutlineRadius,
+      );
+      playerDragActive.value = true;
+    }
+    _pullDistance = deltaY.clamp(0.0, double.infinity);
+    // 速度/加速度按事件时间戳差分（向上为正）
+    final ts = e.timeStamp;
+    if (_pullLastSampleTime != null && _pullLastY != null) {
+      final dt = (ts - _pullLastSampleTime!).inMicroseconds / 1e6;
+      if (dt > 0) {
+        final v = (_pullLastY! - p.dy) / dt;
+        if (_pullLastVelocity != null) {
+          _pullAcceleration = (v - _pullLastVelocity!) / dt;
+        }
+        _pullLastVelocity = v;
+      }
+    }
+    _pullLastY = p.dy;
+    _pullLastSampleTime = ts;
+    // 进度 = 上滑距离 / 完整展开距离（胶囊顶端 = 面板上沿起点）
+    if (_pullBodyRect.top > 0) {
+      playerExpansion.value = (_pullDistance / _pullBodyRect.top).clamp(
+        0.0,
+        1.0,
       );
     }
-    final Offset origin = box.localToGlobal(Offset.zero, ancestor: _scaleAnchor);
-    return capsuleMorphScene(
-      panelRect: origin & box.size,
-      screenHeight: screenHeight,
-      collapsed: collapsed,
+  }
+
+  void _onPullUp(PointerUpEvent e) {
+    if (e.pointer != _pullPointer) return;
+    _pullPointer = null;
+    // 不在此重置 _pullActivated：up 之后竞技场 sweep 仍会派发 tap /
+    // onHorizontalDragEnd，必须保持守卫直到下一次 down（与常驻条同款）。
+    if (!_pullActivated) return;
+    final expand = shouldExpandPlayer(
+      dragDistance: _pullDistance,
+      screenHeight: MediaQuery.sizeOf(context).height,
+      velocity: _pullLastVelocity ?? 0.0,
+      acceleration: _pullAcceleration,
+    );
+    if (expand) {
+      _expandFromPull();
+    } else {
+      _settleBackFromPull();
+    }
+  }
+
+  void _onPullCancel(PointerCancelEvent e) {
+    if (e.pointer != _pullPointer) return;
+    _pullPointer = null;
+    if (!_pullActivated) return;
+    // 系统打断（来电 / 手势被抢）：用户没有期待动画，瞬时归零。
+    _pullRelease.stop();
+    playerDragActive.value = false;
+    playerExpansion.value = 0.0;
+  }
+
+  /// 松手判定展开：push 路由并让路由从当前进度续展开。
+  ///
+  /// 交接细节见 [handOffDragToRoute]（覆盖层让位与路由续播同帧完成）。
+  /// **必须走 rootNavigator**：胶囊可能挂在某个 tab 的内层 Navigator 里，
+  /// 用最近的 Navigator 会把播放页 push 进 tab 内部（盖不住导航栏与侧栏）。
+  void _expandFromPull() {
+    final double progress = playerExpansion.value;
+    // 防重复入栈（与 openFullPlayer 同语义）：栈里已有播放页就放弃本次上拉。
+    if (activePlayerRoute != null) {
+      _pullRelease.stop();
+      playerDragActive.value = false;
+      playerExpansion.value = 0.0;
+      return;
+    }
+    if (_pullBodyRect.top <= 0.0 || progress <= 0.0) {
+      _pullRelease.stop();
+      playerDragActive.value = false;
+      playerExpansion.value = 0.0;
+      return;
+    }
+    AppHaptics.lightImpact(HapticCategory.gesture);
+    final scene = capsuleMorphScene(
+      panelRect: _pullBodyRect,
+      screenHeight: MediaQuery.sizeOf(context).height,
+      collapsed: _morph.value > 0.5,
+      cornerRadius: kCapsuleOutlineRadius,
+    );
+    final route = fullPlayerRoute(
+      context,
+      scene: scene,
+      dragOriginTop: _pullBodyRect.top,
+      dragOriginBottom: _pullBodyRect.bottom,
+      screenHeight: MediaQuery.sizeOf(context).height,
+    );
+    handOffDragToRoute(
+      navigator: Navigator.of(context, rootNavigator: true),
+      route: route,
+      progress: progress,
+      onOverlayRelease: () {
+        if (!mounted) return;
+        playerDragActive.value = false;
+      },
+    );
+  }
+
+  /// 松手未达阈值：把面板动画回弹到 0（不再单帧硬归零）。
+  ///
+  /// 回弹期间保持 `playerDragActive`（覆盖层继续画），结束后再让位给真身 ——
+  /// 否则面板消失的那一帧会露出「什么都还没回来」的空档。
+  void _settleBackFromPull() {
+    _pullRelease.settleBack(
+      reduceMotion: _reduceMotion,
+      onDone: () {
+        if (!mounted) return;
+        playerDragActive.value = false;
+      },
     );
   }
 
@@ -1563,11 +1856,34 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (inBottomBarFormFlight()) return;
+      // 只登记「本路由是栈顶」的结算态（与 residentRect 同口径）：IndexedStack
+      // 保活的后台 tab 胶囊也在 build，它们的几何会污染端点快照；转场平移中
+      // 的登记同样不写（pop 起飞用的是 pop 前最后一次结算值）。
+      if (ModalRoute.of(context)?.isCurrent != true) return;
       final box = context.findRenderObject() as RenderBox?;
       if (box == null || !box.hasSize) return;
       final origin = box.localToGlobal(Offset.zero, ancestor: _scaleAnchor);
       BottomBarMorphRegistry.instance.capsuleRect = origin & box.size;
     });
+  }
+
+  /// 收缩态三件套（圆盘进度/停靠位/封面角度）的登记收口，直写
+  /// [BottomBarMorphRegistry] 的活字段。
+  ///
+  /// **不能走 build/postFrame**：收缩动画只重建卡片内层的 AnimatedBuilder，
+  /// 卡片本体（[_buildPlayerCard]）在收缩后不再 rebuild，postFrame 登记会停在
+  /// 收缩前的旧值 —— 交棒冻结取到 0，浮层首帧仍按展开胶囊盖住圆盘（真机
+  /// 报障「返回一瞬间变展开态」即此）。改为挂在 `_morph` 的 listener 上
+  /// （每个收缩 tick 与落定都同步），旋转角度另在 [_onSpinTick] 续写、停靠位
+  /// 在拖拽提交处续写。普通字段直写，无 notify、零重建成本。
+  void _registerCollapseState() {
+    if (inBottomBarFormFlight()) return;
+    // 与 capsuleRect 同口径的门控：只登记栈顶路由的结算态，防后台保活 tab 污染。
+    if (_capsuleRoute?.isCurrent != true) return;
+    final registry = BottomBarMorphRegistry.instance;
+    registry.capsuleCollapseT = _morph.value.clamp(0.0, 1.0);
+    registry.capsuleDockSide = kSecondaryPlayerDock.value;
+    registry.capsuleDiscAngle = _discAngle;
   }
 
   /// 封面的稳定内核：只随歌曲变化，形变与旋转逐帧都不重建它（见 [_buildMorph]
@@ -1619,9 +1935,29 @@ class _SecondaryMiniPlayerState extends State<SecondaryMiniPlayer>
             // 刻意包在 `Transform.scale` **外面**（仍在 58 的布局盒内）：
             // 量到的是稳定的 58×58 外接方框，不随形变/旋转逐帧抖动（放进
             // `Transform.scale` 里会让矩形每帧变化、每次都 `_bump` 形变层）。
+            //
+            // **上报的是「可见」矩形而不是布局盒**：本胶囊的封面是**正圆**
+            // （胶囊态直径 58、圆盘态 56），而布局盒恒为 58。形变层按上报矩形
+            // 当起点，若直接给 58 的盒子，圆盘态会从「比真身大 2dp 的方块」起飞。
+            // 因此在这里按 `coverVisible / _kCoverDecode` 把盒子缩到可见尺寸；
+            // 圆角直接给半径（正圆），旋转角给当前唱片角 —— 三者一起构成
+            // 「正圆 + 当前角度」这个真实起点。
             child: CoverGeometryProbe(
-              onRect: (rect, _) =>
-                  PlayerCoverMorphBus.instance.publishMini(rect),
+              // 迷你端探针：注册「不经 paint 重测」入口（胶囊在转场结束后往往
+              // 不再产生新的 paint，见 [CoverGeometryProbe.isMiniSource]）。
+              isMiniSource: true,
+              onRect: (rect, _) {
+                final double visible = rect.width * coverScale;
+                PlayerCoverMorphBus.instance.publishMini(
+                  Rect.fromCenter(
+                    center: rect.center,
+                    width: visible,
+                    height: visible,
+                  ),
+                  cornerRadius: visible / 2,
+                  rotation: _discAngle,
+                );
+              },
               child: Transform.scale(
                 scale: coverScale,
                 child: AnimatedBuilder(

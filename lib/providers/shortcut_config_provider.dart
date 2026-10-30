@@ -117,8 +117,10 @@ class ShortcutConfigProvider extends ChangeNotifier {
   /// 关闭的快捷方式 id 集合。
   Set<String> get hiddenIds => _hiddenIds;
 
+  late final Future<void> settingsReady;
+
   ShortcutConfigProvider() {
-    _load();
+    settingsReady = _load();
   }
 
   static Set<String> _defaultHiddenIds() => {

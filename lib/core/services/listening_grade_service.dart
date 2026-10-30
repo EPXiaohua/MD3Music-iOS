@@ -62,7 +62,7 @@ class ListeningGradeService {
     if (_started) return;
     _started = true;
     if (kIsWeb || !Platform.isAndroid) return;
-    _ensureTimerScheduled();
+    if (_onlinePlaying) _ensureTimerScheduled();
   }
 
   /// 确保在主 isolate 启动心跳定时器（view 就绪后再真正创建 Timer）。
@@ -74,9 +74,12 @@ class ListeningGradeService {
   /// 重试；后台 headless isolate 没有 view 也不渲染帧，addPostFrameCallback
   /// 不会回调，因此天然不会创建第二个定时器（与原有并发保护意图一致）。
   void _ensureTimerScheduled() {
+    if (!_started || !_onlinePlaying) return;
     if (_timer != null) return;
     if (PlatformDispatcher.instance.views.isEmpty) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _ensureTimerScheduled());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_started && _onlinePlaying) _ensureTimerScheduled();
+      });
       return;
     }
     _timer = Timer.periodic(_interval, (_) => _onTick());
@@ -85,6 +88,12 @@ class ListeningGradeService {
   /// PlayerProvider 推送：当前是否正在播放在线歌曲。
   void setListeningOnline(bool value) {
     _onlinePlaying = value;
+    if (value) {
+      _ensureTimerScheduled();
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
   }
 
   /// 查询到服务器 d_sec 后调用：记录服务器值，本地基准只升不降，避免上报被拒。

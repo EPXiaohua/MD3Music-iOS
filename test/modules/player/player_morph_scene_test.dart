@@ -101,6 +101,98 @@ void main() {
     });
   });
 
+  group('panelRadius（起点外轮廓圆角）', () {
+    test('显式 cornerRadius 优先', () {
+      final scene = PlayerMorphScene(
+        panelRect: const Rect.fromLTWH(16, 793, 368, 64),
+        screenHeight: kScreen,
+        form: PlayerBarForm.floatingCapsule,
+        cornerRadius: 12,
+      );
+      expect(scene.panelRadius, 12);
+    });
+
+    test('胶囊 / 圆盘缺省 = 直径/2（32），圆盘即正圆', () {
+      for (final form in [PlayerBarForm.floatingCapsule, PlayerBarForm.floatingDisc]) {
+        final scene = PlayerMorphScene(
+          panelRect: const Rect.fromLTWH(16, 793, 368, 64),
+          screenHeight: kScreen,
+          form: form,
+        );
+        expect(
+          scene.panelRadius,
+          BottomChromeDimens.discDiameter / 2,
+          reason: '$form 的起点圆角必须与真身可见轮廓一致',
+        );
+      }
+    });
+
+    test('常驻条 / unknown 缺省 = 方角（与引入圆角之前一致）', () {
+      for (final form in [PlayerBarForm.residentBar, PlayerBarForm.unknown]) {
+        final scene = PlayerMorphScene(
+          panelRect: const Rect.fromLTWH(0, 709, 400, 80),
+          screenHeight: kScreen,
+          form: form,
+        );
+        expect(scene.panelRadius, 0.0);
+      }
+    });
+
+    test('非法 cornerRadius 回退按形态推导', () {
+      final scene = PlayerMorphScene(
+        panelRect: const Rect.fromLTWH(16, 793, 368, 64),
+        screenHeight: kScreen,
+        form: PlayerBarForm.floatingCapsule,
+        cornerRadius: double.nan,
+      );
+      expect(scene.panelRadius, BottomChromeDimens.discDiameter / 2);
+    });
+
+    test('panelGeometryFor：scene 的矩形与圆角原样透传（钳进当前屏）', () {
+      final scene = PlayerMorphScene(
+        panelRect: const Rect.fromLTWH(16, 793, 368, 64),
+        screenHeight: kScreen,
+        form: PlayerBarForm.floatingCapsule,
+        cornerRadius: 32,
+      );
+      final g = makeRoute(scene: scene).panelGeometryFor(const Size(400, kScreen));
+      expect(g.rect, const Rect.fromLTWH(16, 793, 368, 64));
+      expect(g.radius, 32);
+    });
+
+    test('panelGeometryFor：无 scene 时读全局锚点的横向范围与圆角', () {
+      publishPlayerDragOrigin(
+        top: 700,
+        bottom: 764,
+        left: 16,
+        width: 368,
+        radius: 32,
+      );
+      addTearDown(() => publishPlayerDragOrigin(top: 0, bottom: 0));
+      final g = makeRoute().panelGeometryFor(const Size(400, kScreen));
+      expect(g.rect, const Rect.fromLTWH(16, 700, 368, 64));
+      expect(g.radius, 32);
+    });
+
+    test('panelGeometryFor：常驻条（通栏、不写横向）→ 整屏宽 + 方角', () {
+      publishPlayerDragOrigin(top: 700, bottom: 780);
+      addTearDown(() => publishPlayerDragOrigin(top: 0, bottom: 0));
+      final g = makeRoute().panelGeometryFor(const Size(400, kScreen));
+      expect(g.rect, const Rect.fromLTWH(0, 700, 400, 80));
+      expect(g.radius, 0.0);
+    });
+
+    test('panelGeometryFor 的纵向与 panelAnchorFor 同源（底栏下沉量的依据）', () {
+      publishPlayerDragOrigin(top: 640, bottom: 720, left: 16, width: 368, radius: 32);
+      addTearDown(() => publishPlayerDragOrigin(top: 0, bottom: 0));
+      final route = makeRoute();
+      final anchor = route.panelAnchorFor(kScreen);
+      final g = route.panelGeometryFor(const Size(400, kScreen));
+      expect(g.rect.top, anchor.top);
+      expect(g.rect.height, anchor.height);
+    });
+  });
+
   group('兜底改为胶囊几何', () {
     test('无 scene / 无拖拽参数 / 全局锚点为 0：高 = discReservedBottom、底端 = 屏底', () {
       final anchor = makeRoute().panelAnchorFor(kScreen);

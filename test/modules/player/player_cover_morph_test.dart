@@ -130,6 +130,123 @@ void main() {
     });
   });
 
+  group('coverMorphFlightRect（封面飞行的平抛轨迹）', () {
+    // 与 coverMorphTargetRect 那组同一套端点：迷你条贴左下的小方块、播放页居中方块。
+    const mini = Rect.fromLTWH(20, 1800, 44, 44);
+    const settled = Rect.fromLTWH(180, 400, 720, 720);
+    // 端点圆心与边长的跨度，下面按平抛公式手算期望值时要用。
+    const dxSpan = 540 - 42; // 横向：mini 圆心 42 → settled 圆心 540
+    const dySpan = 760 - 1822; // 纵向：向上，所以是负值
+    const sizeSpan = 720 - 44;
+
+    Rect flight(double t) =>
+        coverMorphFlightRect(mini: mini, settled: settled, t: t);
+
+    test('两端严格等于端点（交接处与真实封面像素对齐）', () {
+      expect(flight(0), mini);
+      expect(flight(1), settled);
+    });
+
+    test('t 越界被钳进 [0,1]', () {
+      expect(flight(-1), mini);
+      expect(flight(2), settled);
+    });
+
+    test('横向圆心匀速（线性），纵向圆心按 t² 加速', () {
+      // 平抛的两条分量：x ∝ t，y ∝ t²。
+      for (final t in [0.25, 0.5, 0.75]) {
+        final q = t * t;
+        final c = flight(t).center;
+        expect(
+          c.dx,
+          closeTo(42 + dxSpan * t, 0.001),
+          reason: 't=$t 的横向应等于线性插值',
+        );
+        expect(
+          c.dy,
+          closeTo(1822 + dySpan * q, 0.001),
+          reason: 't=$t 的纵向应等于 t² 插值',
+        );
+      }
+    });
+
+    test('中点纵向落后于直线（先横移、后上冲），但仍严格位于两端之间', () {
+      final mid = flight(0.5);
+      final linearY = 1822 + dySpan * 0.5;
+      expect(
+        mid.center.dy,
+        greaterThan(linearY),
+        reason: '起段向上少：中点必须比直线更靠下（更贴近迷你条）',
+      );
+      expect(mid.center.dy, lessThan(mini.center.dy));
+      expect(mid.center.dy, greaterThan(settled.center.dy));
+    });
+
+    test('边长同样按 t² 先慢后快（中点 213，不是线性的 382）', () {
+      expect(flight(0.25).width, closeTo(44 + sizeSpan * 0.0625, 0.001));
+      expect(flight(0.5).width, closeTo(44 + sizeSpan * 0.25, 0.001));
+      expect(flight(0.75).width, closeTo(44 + sizeSpan * 0.5625, 0.001));
+    });
+
+    test('早段位移以横向为主、末段以纵向为主（这就是平抛的观感）', () {
+      final early = flight(0.2).center - flight(0.1).center;
+      final late = flight(1.0).center - flight(0.9).center;
+      expect(
+        early.dy.abs(),
+        lessThan(early.dx.abs()),
+        reason: '起段：横移多、上移少',
+      );
+      expect(
+        late.dy.abs(),
+        greaterThan(late.dx.abs()),
+        reason: '末段：上移多、横移少',
+      );
+    });
+
+    test('收起原路返回：同一个 t 在升序与降序两条采样序列上矩形逐位相等', () {
+      // 轨迹必须是 t 的**纯函数**（不含方向/时序状态），下拉收起才会精确重合。
+      final up = [
+        for (var i = 0; i <= 10; i++) flight(i / 10),
+      ];
+      final down = [
+        for (var i = 10; i >= 0; i--) flight(i / 10),
+      ];
+      for (var i = 0; i <= 10; i++) {
+        expect(
+          up[i],
+          down[10 - i],
+          reason: 't=${i / 10}：展开与收起落在同一矩形才是原路返回',
+        );
+      }
+    });
+
+    test('非方形端点不崩（宽高各自插值）', () {
+      final r = coverMorphFlightRect(
+        mini: const Rect.fromLTWH(0, 1000, 40, 20),
+        settled: const Rect.fromLTWH(100, 100, 200, 400),
+        t: 0.5,
+      );
+      expect(r.width, closeTo(40 + 160 * 0.25, 0.001));
+      expect(r.height, closeTo(20 + 380 * 0.25, 0.001));
+    });
+  });
+
+  group('coverMorphAcceleratedProgress（平抛的竖直项）', () {
+    test('端点精确、中途是 t²', () {
+      expect(coverMorphAcceleratedProgress(0), 0.0);
+      expect(coverMorphAcceleratedProgress(0.25), closeTo(0.0625, 1e-12));
+      expect(coverMorphAcceleratedProgress(0.5), closeTo(0.25, 1e-12));
+      expect(coverMorphAcceleratedProgress(0.75), closeTo(0.5625, 1e-12));
+      expect(coverMorphAcceleratedProgress(1), 1.0);
+    });
+
+    test('越界钳进 [0,1]，非有限值退化成 0', () {
+      expect(coverMorphAcceleratedProgress(-1), 0.0);
+      expect(coverMorphAcceleratedProgress(2), 1.0);
+      expect(coverMorphAcceleratedProgress(double.nan), 0.0);
+    });
+  });
+
   group('文字形变（歌曲名 + 歌手）', () {
     late PlayerCoverMorphBus bus;
 
@@ -620,13 +737,13 @@ void main() {
       expect(bus.resolveCoverEligible(expansion: 0.2, live: true), isTrue);
     });
 
-    test('封面 / 文字两路锁存相互独立：频谱圆盘下只锁文字', () {
+    test('封面 / 文字两路锁存相互独立：写真等只锁封面一路', () {
       final bus = PlayerCoverMorphBus.instance;
       bus.reset();
-      // 频谱圆盘：封面不合格（形变层画不出圆形裁切 + 旋转），文字合格
+      // 封面不合格（写真 / 车机面板等封面独有的压制），文字合格
       expect(bus.resolveCoverEligible(expansion: 0.2, live: false), isFalse);
       expect(bus.resolveTextEligible(expansion: 0.2, live: true), isTrue);
-      // 途中频谱被关掉也**不**改判封面那一路（锁存语义不变）
+      // 途中状态被翻转也**不**改判封面那一路（锁存语义不变）
       expect(bus.resolveCoverEligible(expansion: 0.7, live: true), isFalse);
       expect(bus.resolveTextEligible(expansion: 0.7, live: false), isTrue);
       // 端点复位两路都清
@@ -994,17 +1111,20 @@ void main() {
                 as BorderRadius)
             .topLeft
             .x;
-        final targetWidth = 44 + (720 - 44) * p;
+        // 圆角与边长同拍，两者都走平抛的加速项 q = p²
+        final targetWidth = 44 + (720 - 44) * p * p;
         return local * (targetWidth / 720);
       }
 
       playerExpansion.value = 0.25;
       await tester.pump();
-      expect(screenRadiusAt(0.25), closeTo(8.5, 1e-6)); // 6 + (16-6) * 0.25
+      // q = 0.0625 → 6 + (16-6) * 0.0625
+      expect(screenRadiusAt(0.25), closeTo(6.625, 1e-6));
 
       playerExpansion.value = 0.75;
       await tester.pump();
-      expect(screenRadiusAt(0.75), closeTo(13.5, 1e-6)); // 6 + (16-6) * 0.75
+      // q = 0.5625 → 6 + (16-6) * 0.5625
+      expect(screenRadiusAt(0.75), closeTo(11.625, 1e-6));
     });
 
     testWidgets('playerExpansion 为 0（迷你态）不画任何东西', (tester) async {
@@ -1019,16 +1139,17 @@ void main() {
       expect(layerClip(), findsNothing);
     });
 
-    testWidgets('中途的屏幕圆角是 11（局部半径已按 scale 放大）', (tester) async {
+    testWidgets('中途的屏幕圆角是 8.5（局部半径已按 scale 放大）', (tester) async {
       playerExpansion.value = 0.5;
       await pumpLayer(tester);
       final local = (tester.widget<ClipRRect>(layerClip()).borderRadius
               as BorderRadius)
           .topLeft
           .x;
-      // p=0.5：目标边长 = (44 + 720) / 2 = 382，scale = 382/720
-      final scale = (44 + (720 - 44) * 0.5) / 720;
-      expect(local * scale, closeTo(11, 1e-6));
+      // p=0.5：平抛的加速项 q=0.25 → 目标边长 = 44 + 676×0.25 = 213，scale = 213/720
+      final scale = (44 + (720 - 44) * 0.25) / 720;
+      // 圆角同样按 q：6 + (16-6)×0.25 = 8.5
+      expect(local * scale, closeTo(8.5, 1e-6));
     });
 
     testWidgets('中途的盒子尺寸仍是 settled 尺寸（不被外层约束挤压）', (tester) async {
@@ -1041,7 +1162,7 @@ void main() {
       expect(box.size, const Size(720, 720));
     });
 
-    testWidgets('中途的方块中心落在两端中心之间（弓高只作用在纵向）', (tester) async {
+    testWidgets('中途的方块中心：横向匀速、纵向落后于直线（平抛）', (tester) async {
       playerExpansion.value = 0.5;
       await pumpLayer(tester);
       final box = tester.renderObject<RenderBox>(layerClip());
@@ -1049,31 +1170,35 @@ void main() {
       // （不能用 getRect：它的 size 是经逆变换推导的量，旋转下不是视觉包围盒）。
       final center = box.localToGlobal(box.size.center(Offset.zero));
       final linearCenter = Offset.lerp(mini.center, settled.center, 0.5)!;
+      // 横向仍逐点等于线性插值（平抛的水平分量匀速）
       expect(center.dx, closeTo(linearCenter.dx, 0.5));
-      // 弓高让中点比直线更靠上，但仍严格位于两端之间
-      expect(center.dy, lessThan(linearCenter.dy));
+      // 纵向走 q=t²=0.25：中点比直线**更靠下**（起段向上少），但仍严格位于两端之间
+      expect(center.dy, greaterThan(linearCenter.dy));
+      expect(center.dy, lessThan(mini.center.dy));
       expect(center.dy, greaterThan(settled.center.dy));
     });
 
-    testWidgets('中途的左上角落在两端左上角之间（自下而上飞）', (tester) async {
+    testWidgets('中途的方块整体仍在两端的纵向之间（自下而上飞）', (tester) async {
       playerExpansion.value = 0.5;
       await pumpLayer(tester);
       final box = tester.renderObject<RenderBox>(layerClip());
       final tl = box.localToGlobal(Offset.zero);
-      expect(tl.dx, greaterThan(mini.left));
-      expect(tl.dx, lessThan(settled.left));
+      // 平抛下盒宽已缩到 213，左上角**横向**可以略越过 settled 的左缘（盒子比
+      // 终点小、中心在途中），所以只锁纵向：仍在两端之间、没飞出屏幕。
+      expect(tl.dy, greaterThan(0));
       expect(tl.dy, greaterThan(settled.top));
       expect(tl.dy, lessThan(mini.top));
     });
 
-    testWidgets('中途的边长按进度线性插值 44 → 720', (tester) async {
+    testWidgets('中途的边长按平抛加速项插值 44 → 720（先慢后快）', (tester) async {
       playerExpansion.value = 0.5;
       await pumpLayer(tester);
       final box = tester.renderObject<RenderBox>(layerClip());
       final tl = box.localToGlobal(Offset.zero);
       final tr = box.localToGlobal(Offset(box.size.width, 0));
       // 旋转不改变向量长度，故边长与倾角无关，可直接断言
-      expect((tr - tl).distance, closeTo(44 + (720 - 44) * 0.5, 0.5));
+      // q = 0.5² = 0.25 → 44 + 676×0.25 = 213（线性口径是 382）
+      expect((tr - tl).distance, closeTo(44 + (720 - 44) * 0.25, 0.5));
     });
 
     testWidgets('eligible=false（频谱圆盘 / 3D / 动态封面 / 车机）时完全不介入', (tester) async {

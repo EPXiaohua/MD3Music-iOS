@@ -252,4 +252,92 @@ void main() {
       AudioServiceLoader.setTestOverride(null);
     }
   });
+
+  group('「结束后减少待机耗电」：到点触发退出回调（假回调，不真杀进程）', () {
+    test('倒计时到点且开关开启：调用退出回调', () async {
+      SharedPreferences.setMockInitialValues({});
+      installConnectivityMocks();
+      final audio = ControlledAudioService();
+      AudioServiceLoader.setTestOverride(() async => audio);
+      late final PlayerProvider player;
+      try {
+        player = PlayerProvider();
+        await player.audioReady.timeout(const Duration(seconds: 10));
+
+        var exitCalls = 0;
+        player.onSleepTimerExit = () async => exitCalls++;
+        player.setKillBackgroundOnTimerEnd(true);
+        player.setSleepTimer(const Duration(seconds: 1));
+        await Future<void>.delayed(const Duration(milliseconds: 1300));
+
+        expect(exitCalls, 1, reason: '到点应调用注入的退出回调');
+        expect(player.sleepTimerMode, SleepTimerMode.off);
+      } finally {
+        player.dispose();
+        await audio.dispose();
+        AudioServiceLoader.setTestOverride(null);
+      }
+    });
+
+    test('倒计时到点且开关关闭：不调用退出回调', () async {
+      SharedPreferences.setMockInitialValues({});
+      installConnectivityMocks();
+      final audio = ControlledAudioService();
+      AudioServiceLoader.setTestOverride(() async => audio);
+      late final PlayerProvider player;
+      try {
+        player = PlayerProvider();
+        await player.audioReady.timeout(const Duration(seconds: 10));
+
+        var exitCalls = 0;
+        player.onSleepTimerExit = () async => exitCalls++;
+        player.setSleepTimer(const Duration(seconds: 1));
+        await Future<void>.delayed(const Duration(milliseconds: 1300));
+
+        expect(exitCalls, 0, reason: '开关关闭时到点只暂停，不走退出序列');
+        expect(audio.pauseCommandCount, 1);
+      } finally {
+        player.dispose();
+        await audio.dispose();
+        AudioServiceLoader.setTestOverride(null);
+      }
+    });
+
+    test('endOfTrack 播完且开关开启：调用退出回调，不再单独暂停', () async {
+      SharedPreferences.setMockInitialValues({});
+      installConnectivityMocks();
+      final audio = ControlledAudioService();
+      AudioServiceLoader.setTestOverride(() async => audio);
+      late final PlayerProvider player;
+      try {
+        player = PlayerProvider();
+        await player.audioReady.timeout(const Duration(seconds: 10));
+        await startPlaylist(player, audio);
+
+        var exitCalls = 0;
+        player.onSleepTimerExit = () async => exitCalls++;
+        player.setKillBackgroundOnTimerEnd(true);
+        await armEndOfTrack(player);
+
+        // 当前首（非末曲）自然播完 → 走退出序列，而不是普通 pause
+        await Future<void>.delayed(guardWindow);
+        player.debugFeedPositionForTest(shortMp3);
+        audio.emitCompleted();
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+
+        expect(exitCalls, 1, reason: '播完收尾应调用注入的退出回调');
+        expect(
+          audio.pauseCommandCount,
+          0,
+          reason: '退出回调内 stopForAppExit 会停播，Provider 不再单独 pause',
+        );
+        expect(player.sleepTimerMode, SleepTimerMode.off);
+        expect(player.currentSong?.id, 'sleep-a', reason: '不应切到下一首');
+      } finally {
+        player.dispose();
+        await audio.dispose();
+        AudioServiceLoader.setTestOverride(null);
+      }
+    });
+  });
 }

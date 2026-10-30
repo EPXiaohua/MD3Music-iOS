@@ -67,4 +67,51 @@ void main() {
     expect(scales.first, closeTo(1.0, 0.001), reason: '背景层应在栈底');
     expect(scales.last, closeTo(1.06, 0.001), reason: '前景层应在栈顶');
   });
+
+  // ── 修补底板（「图片修补没生效」的修复）──────────────────────────────────
+  //
+  // 三条深度带铺满 0..1、合成后 = 原图完整，而修补结果只进 layer0 的背景带
+  // （主体 ≈0.9 不在该带里）→ 不铺一张修补底板，前景移开时露出的就是原图里
+  // 那份主体（错位重影），用户看到的就是「修补没生效」。
+  group('修补底板 backgroundPath', () {
+    Future<void> pumpWithPlate(WidgetTester tester, {required bool withPlate}) {
+      final plate = '${tmp.path}/bg_fill.png';
+      File(plate).writeAsBytesSync(base64Decode(_kPngBase64));
+      return tester.pumpWidget(
+        MaterialApp(
+          home: DepthParallaxCover(
+            layerPaths:
+                [0, 1, 2].map((i) => '${tmp.path}/layer$i.png').toList(),
+            backgroundPath: withPlate ? plate : null,
+            tiltStream: tilt.call(),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('有底板 → 4 张图，且底板在栈最底层（内部第 1 个图）', (tester) async {
+      await pumpWithPlate(tester, withPlate: true);
+      await tester.pump();
+      expect(find.byType(Image), findsNWidgets(4));
+      // 底板与 layer0 同变换（scale 1.0）；顺序上底板必须是第一个
+      final images = tester.widgetList<Image>(find.byType(Image)).toList();
+      expect(images.length, 4);
+      final firstPath = (images.first.image as FileImage).file.path;
+      expect(firstPath, endsWith('bg_fill.png'),
+          reason: '底板必须最先（最底层）：它只在前景移开处露出');
+      final scales = tester
+          .widgetList<Transform>(find.byType(Transform))
+          .map((t) => t.transform.storage[0])
+          .toList();
+      expect(scales.first, closeTo(1.0, 0.001), reason: '底板与背景层同尺度');
+      expect(scales.last, closeTo(1.06, 0.001), reason: '前景仍在栈顶');
+    });
+
+    testWidgets('无底板（旧缓存 / Android）→ 仍是 3 层，行为与旧版一致',
+        (tester) async {
+      await pumpWithPlate(tester, withPlate: false);
+      await tester.pump();
+      expect(find.byType(Image), findsNWidgets(3));
+    });
+  });
 }

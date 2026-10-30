@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../../core/utils/lyric_timeline.dart';
 import 'dart:io' show Platform;
 import 'dart:math' as math;
 
@@ -11,7 +12,9 @@ import 'package:provider/provider.dart';
 
 import '../../core/build_flags.dart';
 import '../../core/platform_capabilities.dart';
+import '../../core/remote/tv_hint_bar.dart';
 import '../../core/remote/tv_menu_key_shortcuts.dart';
+import '../../core/remote/tv_player_back_focus.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/remote/remote_slider.dart';
 import '../../core/services/audio_service.dart';
@@ -22,9 +25,11 @@ import '../../core/services/equalizer_service.dart';
 import '../../core/services/media_notification_service.dart';
 import '../../core/services/music_haptics_service.dart';
 import '../../core/services/spectrum_service.dart';
+import '../../core/services/windows_fullscreen.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../widgets/depth_cover_host.dart';
 import '../../widgets/marquee_text.dart';
+import '../../widgets/player_dock/tv_player_edge_action.dart';
 import '../../widgets/player_top_bar_actions.dart';
 import '../../widgets/player_top_bar_tab_dots.dart';
 import '../../core/utils/local_lyric_loader.dart';
@@ -41,6 +46,7 @@ import '../coverflow/coverflow_page.dart';
 import '../listen_together/widgets/listen_together_trailing.dart';
 import '../settings/equalizer_settings_page.dart';
 import '../library/song_match_sheet.dart';
+import '../sheet/song_sheet_sheet.dart';
 import '../sound/sounds_page.dart';
 import 'artist_photo_background.dart';
 import 'audio_quality_dialog.dart';
@@ -67,6 +73,8 @@ import 'player_volume_state.dart';
 import 'player_wide_pane.dart';
 import 'playlist_swipe_driver.dart';
 import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
+import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
+import '../../widgets/apple_lyrics/utils/lyric_credit_filter.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../utils/landscape_immersive.dart';
 import '../../widgets/md3_lyric_preferences.dart';
@@ -78,15 +86,18 @@ import '../../widgets/dynamic_cover_view.dart';
 import '../../widgets/player_artwork_image.dart';
 import '../../widgets/player_seek_bar.dart';
 import '../../widgets/player_tab_strip.dart';
+import '../../widgets/tv_player_tab_bar.dart';
 import '../../widgets/player_dock/dock_skin.dart';
 import '../../widgets/player_dock/player_control_dock.dart';
 import '../../widgets/player_dock/zen_fade.dart';
 import '../../widgets/player_volume_bar.dart';
 import '../../widgets/player_playlist_view.dart';
+import '../../widgets/playback_hint_pills.dart';
 import '../../widgets/playback_status_feedback.dart';
 import '../../widgets/spectrum_artwork.dart';
 import '../../widgets/spectrum_background.dart';
 import 'car_mode_exit.dart';
+import 'cover_switch_physics.dart';
 import 'dlna_cast_sheet.dart';
 import 'full_player_route.dart';
 import 'lyric_flight_batcher.dart';
@@ -96,6 +107,9 @@ import 'player_cover_morph.dart';
 import 'player_cover_shadow.dart';
 import 'player_cover_morph_layer.dart';
 import 'player_page_role.dart';
+import 'player_zen_bridge.dart';
+import 'widgets/cover_switch_pager.dart';
+import 'widgets/title_switch_fade.dart';
 import 'widgets/song_danmaku_host.dart';
 
 /// 预加载封面图片到磁盘缓存，防止切换时白屏
@@ -153,6 +167,12 @@ class _FullPlayerState extends State<FullPlayer>
   /// 分支挂着面板（见 [_pagerKey] 的说明），所以三个挂载点共用这一份是安全的。
   final PlaylistScrollAnchor _playlistScroll = PlaylistScrollAnchor();
 
+  /// 播放列表面板的句柄：返回键要问它「是否在编辑模式」。
+  /// 与 [_pagerKey] 同一口径 —— 三个布局分支各有一处 PlayerPlaylistView，
+  /// 同一时刻只构建其中之一，故单 key 足够。
+  final GlobalKey<PlayerPlaylistViewState> _playlistKey =
+      GlobalKey<PlayerPlaylistViewState>();
+
   /// 控制页手势锁：进度条 / 音量条都是水平拖动，按下期间必须锁掉
   /// PageView 的横滑，否则滑条与切页抢手势（滑到一半页面被切走）。
   /// 由滑条那一行的 Listener（[_lockSliderRowSwipe]）置位复位，pager 的 physics
@@ -164,14 +184,20 @@ class _FullPlayerState extends State<FullPlayer>
   int _lyricFetchGeneration = 0;
   String _lyrics = '';
   List<LyricLine> _lyricMetadata = const [];
+  /// 未经「屏蔽歌词作者信息」过滤的完整解析结果 + 原始歌词文本：
+  /// 过滤开关/正则在设置页变化时由此即时重派生显示内容，无需重新取词。
+  List<LyricLine> _lyricMetadataRaw = const [];
+  String _lyricRawText = '';
+  /// 上次派生显示列表时的过滤开关/正则快照（无关偏好通知不重派生）。
+  bool _derivedFilterEnabled = false;
+  String _derivedFilterPattern = '';
   bool _hasTranslation = false;
   bool _hasRoma = false;
   bool _isLoadingLyrics = false;
 
   /// 歌词类提交的转场排队器：转场窗口内排队、落位后一次性应用（见 [LyricFlightBatcher]）。
-  late final LyricFlightBatcher _lyricBatcher = LyricFlightBatcher(
-    isHostMounted: () => mounted,
-  );
+  late final LyricFlightBatcher _lyricBatcher =
+      LyricFlightBatcher(isHostMounted: () => mounted);
   String? _lastSongId;
 
   /// 歌词已获取时歌曲的元数据键（id:秒时长:albumAudioId）。
@@ -193,15 +219,20 @@ class _FullPlayerState extends State<FullPlayer>
   late final Animation<double> _artworkFadeAnimation;
   String? _previousArtworkUrl;
 
+  /// 封面横滑 pager 的句柄。三个布局分支各有一处 pager，同一时刻只建其一，
+  /// 因此单 key 足够（与 [_pagerKey] 同一口径）。
+  final GlobalKey<CoverSwitchPagerState> _coverPagerKey =
+      GlobalKey<CoverSwitchPagerState>();
+
+  /// 上一次切歌事件观察到的队列下标；与「新下标」一起算出滑动方向。
+  int? _lastPagerIndex;
+
   /// 当前生效的 tab 结构（含封面 tab / 含评论 tab）。
   /// TabController.length、TabBarView.children、底部导航条 items 全部由它派生；
   /// 任一输入变化（屏幕宽度、切歌、设置开关）都必须先调用 [_syncTabLayout]
   /// 重算，保证三者始终一致。
-  PlayerTabLayout _tabLayout = (
-    hasCover: true,
-    hasComments: true,
-    hasControls: false,
-  );
+  PlayerTabLayout _tabLayout =
+      (hasCover: true, hasComments: true, hasControls: false);
   // 写真背景是否实际有图片可显示：写真无图时不隐藏左侧封面，避免封面消失
   bool _photoBgHasImages = false;
 
@@ -273,8 +304,13 @@ class _FullPlayerState extends State<FullPlayer>
   int get _zenPeekSteps =>
       _zenPeekDuration.inMilliseconds ~/ _zenPeekInterval.inMilliseconds;
   int _zenPeekStep = 0;
-  // 长按封面进入 Zen 模式开关（设置→播放，默认开启；关闭后禁用长按）
+
+  /// 长按封面进入 Zen 模式开关（设置→播放，默认开启；关闭后禁用长按）
   bool _zenLongPressEnabled = true;
+
+  /// Windows F11 → Zen 的桥回调（注册/注销要同一个引用，故存字段）。
+  late final bool Function() _zenToggleHandler = _f11ToggleZen;
+
   // 专辑动态封面开关（设置页「播放页样式」与播放页「界面设置」共用；默认开启）
   bool _dynamicCoverEnabled = true;
 
@@ -319,8 +355,8 @@ class _FullPlayerState extends State<FullPlayer>
   /// - 车机常驻面板：不是全屏页，没有 MiniPlayer 可对位；
   /// - 封面此刻是否真的可见（竖屏停在歌单 / 歌词 / 评论 tab，见下）。
   ///
-  /// **刻意不含频谱圆盘**：文字块与封面形状无关，频谱圆盘开着时歌名照飞
-  /// （用户要求）。封面一侧另有 [_coverMorphEligible]，两者**故意不同源**。
+  /// **刻意不含封面形状**：文字块与封面形状无关。频谱圆盘已经不再压制封面
+  /// （见 [_coverMorphEligible]），但两者仍然**故意不同源**：写真等只压封面一侧。
   ///
   /// **刻意不含「3D 深度封面 / 动态封面视频是否已就绪」**：它们只在播放页挂载
   /// 之后才异步就绪（实测约 250ms，正好落在拖拽途中）。放进资格判定有两个致命
@@ -342,14 +378,25 @@ class _FullPlayerState extends State<FullPlayer>
 
   /// **封面**连贯是否接管本次转场。
   ///
-  /// 在 [_morphTextEligible] 之上再压一条频谱圆盘：圆形裁切 + 旋转封面，
-  /// 形变层画的是一张平面方图，还原不出这个形状（真机表现：方封面一路飞到
-  /// 播放页中段才突然变圆）。
+  /// 与文字侧同源：**频谱圆盘（style 0/1）不再压制封面**。圆盘形状由槽位上报的
+  /// `settledInsetRatio`（可见圆在槽位盒内居中内缩 `SpectrumArtwork.barReserveRatio`）
+  /// 与飞行层现算的终点角（共享唱片相位，见 `SpectrumDiscSpin`）完整描述，形变层
+  /// 画得出它；改动前因为"形变层只会画方图"而整体退出，观感是圆盘模式下上滑
+  /// 完全没有封面动画（用户要求补上）。
   ///
-  /// 读 [kSpectrumDiscCoverActive] 同步镜像，保证跟手覆盖层第一帧的锁存就拿到
-  /// 真值 —— 早前直接读本页的 `_spectrumEnabled`，覆盖层首帧恒为 false，
-  /// 锁存把「频谱开着」误判成「可形变」，于是**每次上滑都会飞出方封面**。
-  bool get _coverMorphEligible => _morphTextEligible && !_isDiscCover;
+  /// 读 [kSpectrumDiscCoverActive] 同步镜像决定**终点形状**（见
+  /// [_coverMorphSettledInset]）：跟手覆盖层第一帧就在 0<p<1，本页的异步偏好
+  /// 还没读到，形状判据必须同步可读。早前直接读 `_spectrumEnabled`，覆盖层首帧
+  /// 恒为 false，锁存把「频谱开着」误判成「落方图」，于是每次上滑都飞出方封面。
+  bool get _coverMorphEligible => _morphTextEligible;
+
+  /// 封面形变的**终点形状**：频谱圆盘时可见圆在槽位盒内单侧内缩
+  /// [SpectrumArtwork.barReserveRatio]，其余（含 style 2 背景层）恒 0（方图）。
+  ///
+  /// 与 [_buildCoverArtwork] 里 `_isDiscCover` 的分流同源：那一处决定真身画圆盘
+  /// 还是方图，这里必须给出同一答案，否则交接帧会「飞到方框位置上再变成圆」。
+  double get _coverMorphSettledInset =>
+      _isDiscCover ? SpectrumArtwork.barReserveRatio : 0.0;
 
   // 进度条拖动状态：记录拖动前是否正在播放，拖动结束后恢复
   bool _wasPlayingBeforeDrag = false;
@@ -370,6 +417,14 @@ class _FullPlayerState extends State<FullPlayer>
   // 环绕频谱透明度（style 0/1 分开记忆，默认不透明）
   double _spectrumBarOpacity = 1.0;
   double _spectrumCurveOpacity = 1.0;
+
+  /// 播放列表处于编辑模式时消费本次「退出播放页」请求：先退出编辑。
+  ///
+  /// 返回 true 表示已消费（调用方必须直接 return，不要继续收起播放页）。
+  /// 面板不在当前页签时 `currentState` 为 null —— 此时面板连同编辑状态已被
+  /// PageView 销毁，直接放行。系统返回键与顶栏收起按钮共用本判定。
+  bool _exitPlaylistEditModeIfActive() =>
+      _playlistKey.currentState?.exitEditModeIfActive() ?? false;
 
   void _collapseByButton() {
     // 车机模式：面板常驻，任何入口都不得收起。
@@ -708,13 +763,41 @@ class _FullPlayerState extends State<FullPlayer>
     }
   }
 
+  /// tv: 播放页首焦点锚点的一次性门控。
+  ///
+  /// 只允许**首帧**把 autofocus 交给中央播放键；之后（弹层关闭、切 tab 回来、
+  /// 异步数据到达引发的重建）一律传 false，否则每次重建都会把焦点从用户手上
+  /// 抢回播放键（口径同 `tv_shell.dart` 的 `_autofocusDone` 与
+  /// `responsive_layout.dart` 的 `_tvNavAutofocusDone`）。
+  bool _tvAutofocusDone = false;
+
   @override
   void initState() {
     super.initState();
+    if (kTvBuild) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tvAutofocusDone = true;
+      });
+      // tv: 注册全局返回键兜底（见 [TvPlayerBackFallback]）——焦点丢回路由
+      // FocusScope 时页内拦截器收不到按键，由 `_handleTvBack` 在 pop 前咨询本页。
+      // 车机常驻面板不占返回键语义（面板不该被返回键收起）。
+      if (!widget.dockMode) {
+        TvPlayerBackFallback.instance.register(_tvHandleBackFallback);
+      }
+    }
     // 音乐震动「播放页启用」范围以本页在场为准（含拖拽覆盖层实例；
     // 覆盖层与接管的页面路由可能短暂并存，服务侧用计数消化，勿改回布尔）。
     MusicHapticsService.instance.setPlayerPageActive(true);
     WidgetsBinding.instance.addObserver(this);
+    // MD3Music fork v31：歌词命令口改注册集合（先注册的存活实例不再被
+    // 后注册实例的注销挤掉，重放"进了但停的不是歌词页"即不会在拖拽
+    // 路径复活）。
+    registerPlayerLyricsCommand(_goDockLyrics);
+    if (Platform.isWindows) {
+      SettingsRepository.windowsLiveSettingsRevision.addListener(
+        _reloadWindowsPlayerSettings,
+      );
+    }
     _tabController = TabController(
       length: _tabLayout.length,
       vsync: this,
@@ -737,6 +820,18 @@ class _FullPlayerState extends State<FullPlayer>
     kLandscapeDetachedControlsEnabled.addListener(
       _onDetachedControlsSettingChanged,
     );
+    // 「横屏左右对称分栏」开关变化：宽屏左右栏 1:1 / 4:6 重新分（分栏变化
+    // 不影响 tab 结构，直接 setState 即可）。
+    kSymmetricWidePaneEnabled.addListener(_onSymmetricPaneSettingChanged);
+    // 「自定义宽屏边距」滑条变化：宽屏左栏内衬（含顶栏尾部胶囊）重算，
+    // 同样不影响 tab 结构，与对称分栏共用同一个 setState 回调。
+    kWidePaneMarginOverride.addListener(_onSymmetricPaneSettingChanged);
+    // 「忽略挖孔避让」开关变化：宽屏挖孔对称补偿重算，同样共用 setState 回调。
+    kWidePaneIgnoreCutoutEnabled.addListener(_onSymmetricPaneSettingChanged);
+    // 「屏蔽歌词作者信息」开关/正则变化：即时重派生歌词显示内容（见
+    // [_onCreditFilterPrefsChanged]）。AM 歌词偏好是全局真值源，MD3 播放页
+    // 同样订阅它做内容过滤（样式仍走 Md3LyricPreferences，互不干扰）。
+    LyricPreferences.instance.addListener(_onCreditFilterPrefsChanged);
     _artworkFadeController = AnimationController(
       duration: const Duration(milliseconds: 1000),
       vsync: this,
@@ -772,6 +867,8 @@ class _FullPlayerState extends State<FullPlayer>
       _loadSpectrumSetting();
       _loadZenPressSetting();
       _loadDynamicCoverSetting();
+      // Windows F11 → Zen：全局按键处理层经此回调找到本页（见 PlayerZenBridge）。
+      PlayerZenBridge.instance.register(_zenToggleHandler);
     });
   }
 
@@ -780,6 +877,11 @@ class _FullPlayerState extends State<FullPlayer>
     final enabled = await SettingsRepository().getDynamicAlbumCover();
     if (!mounted || enabled == _dynamicCoverEnabled) return;
     setState(() => _dynamicCoverEnabled = enabled);
+  }
+
+  void _reloadWindowsPlayerSettings() {
+    _loadZenPressSetting();
+    _loadDynamicCoverSetting();
   }
 
   /// 刷新「界面设置」菜单里的动态封面开关与当前歌曲状态。
@@ -846,8 +948,8 @@ class _FullPlayerState extends State<FullPlayer>
     final bgHeight = await SettingsRepository().getSpectrumBgHeight();
     final barOpacity = await SettingsRepository().getSpectrumBarOpacity();
     final curveOpacity = await SettingsRepository().getSpectrumCurveOpacity();
-    final visualizerFallback = await SettingsRepository()
-        .getSpectrumVisualizerFallback();
+    final visualizerFallback =
+        await SettingsRepository().getSpectrumVisualizerFallback();
     if (!mounted) return;
     SpectrumService.instance.bandCount = bandCount;
     setState(() {
@@ -884,7 +986,8 @@ class _FullPlayerState extends State<FullPlayer>
   /// 因此仅在播放时调用。Kotlin 端先尝试特定 sessionId，失败回退到 0。
   /// iOS 走 EQ tap 的 PCM 截取 FFT（AudioEqualizer.spectrumFeed）。
   Future<void> _tryStartSpectrum({bool isPlaying = false}) async {
-    if ((!Platform.isAndroid && !Platform.isIOS) ||
+    // Android（PCM/Visualizer）与 Windows（WASAPI 环回）都有原生采集通路。
+    if (!supportsMusicSpectrum ||
         !mounted ||
         _isDragOverlay ||
         !_spectrumEnabled) {
@@ -966,7 +1069,7 @@ class _FullPlayerState extends State<FullPlayer>
   ///
   ///   这里必须写**结构门**（[_morphTextEligible]）而不是 [_coverMorphEligible]：
   ///   该信号被封面与文字两侧共用（`willDraw` / `textWillDraw` 都读它），写成封面
-  ///   那一侧会把频谱圆盘 / 写真对封面的压制**连带压掉文字连贯** —— 表现为
+  ///   那一侧会把写真等封面独有的压制**连带压掉文字连贯** —— 表现为
   ///   「封面不飞了，歌名也跟着不飞了」，与「只关封面、文字照飞」的要求相反。
   void _publishMorphSignals() {
     final i = _tabController.index;
@@ -1029,6 +1132,14 @@ class _FullPlayerState extends State<FullPlayer>
   void _onDetachedControlsSettingChanged() {
     if (!mounted) return;
     _syncTabLayout();
+  }
+
+  /// 「横屏左右对称分栏」开关 / 「自定义宽屏边距」滑条变化：
+  /// 分栏比例随之在 1:1 / 4:6 间切换、左栏内衬随之按覆盖值重算。
+  /// 两者都只影响 Row 的 flex 与内衬宽度，不动 tab 结构，直接 setState 重算。
+  void _onSymmetricPaneSettingChanged() {
+    if (!mounted) return;
+    setState(() {});
   }
 
   @override
@@ -1107,19 +1218,40 @@ class _FullPlayerState extends State<FullPlayer>
     _loadDynamicCoverSetting();
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
+    final int slideDirection = coverSlideDirectionForIndexChange(
+      fromIndex: _lastPagerIndex ?? player.currentIndex,
+      toIndex: player.currentIndex,
+      playlistLength: player.playlist.length,
+    );
+    _lastPagerIndex = player.currentIndex;
     if (song != null && song.id != _lastSongId) {
-      // 封面淡入淡出：song 已经是新歌，_previousArtworkUrl 是上一首的封面
-      if (_previousArtworkUrl != null &&
-          _previousArtworkUrl != song.artworkUri) {
-        final newUrl = song.artworkUri;
-        _artworkFadeController
-          ..reset()
-          ..forward().then((_) {
-            // 动画结束后才更新，确保淡出期间旧封面引用不丢失
-            if (mounted) _previousArtworkUrl = newUrl;
-          });
-      } else {
+      final pager = _coverPagerKey.currentState;
+      if (pager != null && pager.hasPendingCommit) {
+        // 拖动刚提交、正在等 provider 真正切歌：页引用平移了 delta，
+        // 进度同步平移即可保持画面逐像素连续（见 CoverSwitchPager.rebase）。
+        pager.rebase(slideDirection);
         _previousArtworkUrl = song.artworkUri;
+      } else if (slideDirection != 0) {
+        // 方向明确：先对齐旧封面引用，避免 pager 内的当前页再叠一次淡入淡出，
+        // 再播放「新封面滑入」。
+        _previousArtworkUrl = song.artworkUri;
+        pager?.playChange(slideDirection);
+      } else {
+        // 方向未知（歌单点歌 / 一起听同步 / 冷启动恢复 / 连续跳过）：不滑动，
+        // 沿用改动前的封面淡入淡出兜底。
+        if (_previousArtworkUrl != null &&
+            _previousArtworkUrl != song.artworkUri) {
+          final newUrl = song.artworkUri;
+          _artworkFadeController
+            ..reset()
+            ..forward().then((_) {
+              // 动画结束后才更新，确保淡出期间旧封面引用不丢失
+              if (mounted) _previousArtworkUrl = newUrl;
+            });
+        } else {
+          _previousArtworkUrl = song.artworkUri;
+        }
+        pager?.resetToIdle();
       }
       _fetchLyrics(song);
       // 预加载上一首和下一首的封面，防止切换时白屏
@@ -1169,8 +1301,30 @@ class _FullPlayerState extends State<FullPlayer>
     }
   }
 
+  /// tv: 全局返回键兜底（`app.dart::_handleTvBack` 在 pop 前调用）。
+  ///
+  /// 只在「本页确实在场」时接手：拖拽覆盖层实例（`_isDragOverlay`）不参与——
+  /// 它只是跟手过程的预览，真正接管的是路由实例，两者同时挂载时让路由那份处理。
+  /// 返回 false = 没救（焦点已在控制 chrome 区 / 桥里无播放键），调用方照常 pop。
+  bool _tvHandleBackFallback() {
+    if (!mounted || _isDragOverlay) return false;
+    return tvPlayerTryFocusPlay();
+  }
+
   @override
   void dispose() {
+    if (kTvBuild && !widget.dockMode) {
+      TvPlayerBackFallback.instance.unregister(_tvHandleBackFallback);
+    }
+    PlayerZenBridge.instance.unregister(_zenToggleHandler);
+    // 与 initState 的命令口注册成对：只摘除自己的撕取（集合 remove），
+    // 存活实例（路由/面板）不受影响。
+    unregisterPlayerLyricsCommand(_goDockLyrics);
+    if (Platform.isWindows) {
+      SettingsRepository.windowsLiveSettingsRevision.removeListener(
+        _reloadWindowsPlayerSettings,
+      );
+    }
     // 未完成展开就收起时，移除拖拽展开的监听（未切换系统栏，无需恢复）
     _dragRoute?.controller.removeStatusListener(_onDragRouteStatus);
     _zenPressController.dispose();
@@ -1178,9 +1332,13 @@ class _FullPlayerState extends State<FullPlayer>
       context.read<PlayerProvider>().removeListener(_onPlayerSongChanged);
     } catch (_) {}
     DesktopLyricService.instance.removeListener(_onDesktopLyricChanged);
+    LyricPreferences.instance.removeListener(_onCreditFilterPrefsChanged);
     kLandscapeDetachedControlsEnabled.removeListener(
       _onDetachedControlsSettingChanged,
     );
+    kSymmetricWidePaneEnabled.removeListener(_onSymmetricPaneSettingChanged);
+    kWidePaneMarginOverride.removeListener(_onSymmetricPaneSettingChanged);
+    kWidePaneIgnoreCutoutEnabled.removeListener(_onSymmetricPaneSettingChanged);
     WidgetsBinding.instance.removeObserver(this);
     // 播放页离场：音乐震动的「播放页启用」计数减一
     MusicHapticsService.instance.setPlayerPageActive(false);
@@ -1198,6 +1356,9 @@ class _FullPlayerState extends State<FullPlayer>
     _stopSpectrum();
     // 播放器卸载：若仍在 Zen 中，清除全局标志，避免主界面 _SystemUiUpdater 被永久短路
     if (_zenMode) kPlayerZenImmersiveActive.value = false;
+    // Windows 窗口全屏兜底：peek 中途 / 直接关播放页都可能没走 _exitZenMode。
+    // 无 Zen 持有的快照时是 no-op，不会误关用户手动开的全屏。
+    WindowsFullscreen.exitZen();
     kPlayerLandscapeImmersiveActive.value = false;
     // 退出播放器时恢复系统栏；若仍处于封面流页横屏沉浸（从封面流进入播放器后返回），
     // 则保持沉浸，避免返回后状态栏闪现。
@@ -1245,12 +1406,18 @@ class _FullPlayerState extends State<FullPlayer>
     // 已隐藏的 TabBar/控件上。
     if (kTvBuild) FocusManager.instance.primaryFocus?.unfocus();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Windows 桌面：immersiveSticky 无实现，真全屏要靠原生窗口样式
+    // （否则任务栏与边框照旧可见 = 「Zen 不能完全全屏」）。
+    WindowsFullscreen.enterZen();
     kPlayerZenImmersiveActive.value = true;
     _syncLandscapeImmersiveFlag();
   }
 
   /// 退出 Zen 沉浸模式：恢复所有 UI 元素和系统栏。
-  void _exitZenMode() {
+  ///
+  /// [keepWindowFullscreen]：peek（单击封面唤出 chrome）的临时退出用它 ——
+  /// 4 秒后会自动回 Zen，若此时跟着退全屏，窗口会缩小再放大两次。
+  void _exitZenMode({bool keepWindowFullscreen = false}) {
     // 显式退出要终止「唤出 4 秒后自动收回」的倒计时，否则用户刚长按退出、
     // 定时器又把 chrome 收回去。放在 !_zenMode 守卫之前：peek 期间 _zenMode
     // 已经是 false，守卫会直接 return、取消不到。
@@ -1259,6 +1426,9 @@ class _FullPlayerState extends State<FullPlayer>
     // 同样必须在守卫之前复位：peek 期间 _zenMode 已是 false，放守卫后面会残留 0.2
     // 的压暗因子，下次唤出 chrome 时它直接是暗的。
     _zenChromeDim.value = 1.0;
+    // Windows 窗口全屏的恢复同样必须在守卫之前：peek 期间 _zenMode 已是 false，
+    // 放守卫后面会让 peek 中途按 F11 退不出全屏。
+    if (!keepWindowFullscreen) WindowsFullscreen.exitZen();
     if (!_zenMode) return;
     setState(() => _zenMode = false);
     _zenController.reverse();
@@ -1267,13 +1437,37 @@ class _FullPlayerState extends State<FullPlayer>
     _syncLandscapeImmersiveFlag();
   }
 
+  /// Windows F11：播放页在场且在最上层时切换 Zen，返回 true 表示消费了本次按键。
+  ///
+  /// 拖拽覆盖层实例（`_isDragOverlay`）与车机面板都不接管：前者只是跟手预览，
+  /// 后者不是全屏页（不接管窗口）。被歌单页等盖住时（`!isCurrent`）也不接管，
+  /// 否则用户按 F11 切窗口全屏会莫名把背景里的播放页切进 Zen。
+  bool _f11ToggleZen() {
+    if (!mounted || _isDragOverlay || widget.dockMode) return false;
+    if (ModalRoute.of(context)?.isCurrent != true) return false;
+    if (context.read<PlayerProvider>().currentSong == null) return false;
+    // peek 期间（chrome 已临时唤出、4s 后自动回 Zen）：F11 视为「彻底退出 Zen」，
+    // 同时取消倒计时与压暗因子，否则定时器会在已回 Zen 后再把因子按到 0.2。
+    if (_zenPeekTimer != null) {
+      _exitZenMode();
+      return true;
+    }
+    if (_zenMode) {
+      _exitZenMode();
+    } else {
+      _enterZenMode();
+    }
+    return true;
+  }
+
   /// Zen 下单击封面：唤出 chrome，[_zenPeekDuration] 后自动收回（计划 §2.2 ③）。
   ///
   /// 用 Timer 不用 Ticker —— 这不是跟手动效，没必要按 vsync 产帧（AGENTS §10.1）。
   /// 整段停留同时在渐隐：不透明度从 100% 线性降到 [_zenPeekEndDim]，抵达的那一帧即收回。
   void _peekChromeFromZen() {
     if (!_zenMode) return;
-    _exitZenMode();
+    // 窗口保持全屏：4 秒后自动回 Zen，跟着退全屏会看到窗口缩小再放大。
+    _exitZenMode(keepWindowFullscreen: true);
     _zenPeekStep = 0;
     // 斜坡与收回共用一个 tick：抵达 [_zenPeekEndDim] 的那一帧就是恢复 Zen 的那一帧。
     _zenPeekTimer = Timer.periodic(_zenPeekInterval, (timer) {
@@ -1335,7 +1529,13 @@ class _FullPlayerState extends State<FullPlayer>
     if (_zenPressOrigin == null) return;
     _zenPressOrigin = null;
     _zenHintHapticFired = false;
-    if (_zenPressController.value > 0.0) _zenPressController.reverse();
+    if (_zenPressController.value > 0.0) {
+      _zenPressController.reverse();
+    } else {
+      // 同一帧内完成的点按（鼠标快击 / 事件合并）：进度还是 0，reverse() 走不到
+      // 这里，ticker 会继续跑满 2000ms 把页面误切进 Zen。必须显式停掉。
+      _zenPressController.stop();
+    }
   }
 
   /// 按压进度回调：跨过 [_zenHintStart]（提示层开始淡入）时轻震一次，
@@ -1491,8 +1691,7 @@ class _FullPlayerState extends State<FullPlayer>
     // 同步登记元数据键（含时长与专辑 id）：防止切歌分支绕过监听里的
     // 键比对判定，同键不重取；取词失败时键已登记、与原 id 判重语义一致
     final songId = song.id as String;
-    final metadataKey =
-        '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
+    final metadataKey = '${song.id}:${song.duration.inSeconds}:${song.albumAudioId ?? ''}';
     if (songId == _lastSongId && metadataKey == _lastLyricMetadataKey) return;
     _lastLyricMetadataKey = metadataKey;
     _lastSongId = songId;
@@ -1503,17 +1702,15 @@ class _FullPlayerState extends State<FullPlayer>
         _isLoadingLyrics = true;
         _lyrics = '';
         _lyricMetadata = const [];
+        _lyricMetadataRaw = const [];
+        _lyricRawText = '';
         _hasTranslation = false;
         _hasRoma = false;
       });
     });
 
     // 正文首包和最终补全共用展示入口，旧歌曲的回调不能覆盖当前歌词。
-    void showLyrics(
-      String lyricText, {
-      String? translationText,
-      String? romaText,
-    }) {
+    void showLyrics(String lyricText, {String? translationText, String? romaText}) {
       _lyricBatcher.schedule(() {
         if (!mounted || generation != _lyricFetchGeneration) return;
         final parsedLyrics = LyricParserChain.parse(
@@ -1526,8 +1723,17 @@ class _FullPlayerState extends State<FullPlayer>
           // MD3 渲染器（LyricsView）内置的 LRC/KRC 正则无法解析 TTML 与
           // 增强型 LRC（尖括号逐字）。统一用 LyricParserChain 解析得到主歌词行，
           // 再序列化为标准 LRC 文本交给 LyricsView（保持其滚动/换行/点击逻辑不变）。
-          _lyrics = _toLyricsViewText(lyricText);
-          _lyricMetadata = parsedLyrics;
+          // 「屏蔽歌词作者信息」开启时改走序列化路径：只写入过滤后的行，
+          // 名单行不再原样透传给 LyricsView 自解析。
+          _lyricMetadataRaw = parsedLyrics;
+          _lyricRawText = lyricText;
+          _lyricMetadata = LyricCreditFilter.filterLines(parsedLyrics);
+          _derivedFilterEnabled = LyricCreditFilter.enabled;
+          _derivedFilterPattern = LyricPreferences.instance.creditPattern;
+          _lyrics = _derivedFilterEnabled
+              ? _serializeLines(_lyricMetadata)
+              : _toLyricsViewText(lyricText);
+          // 副行可用性用未过滤列表判定：名单行被滤不应连带关掉翻译开关。
           _hasTranslation = parsedLyrics.any(
             (line) => line.translation != null && line.translation!.isNotEmpty,
           );
@@ -1574,25 +1780,18 @@ class _FullPlayerState extends State<FullPlayer>
         final kugouProvider = context.read<KugouProvider>();
         // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中传空 hash
         // 让酷狗 API 完全基于 songName 搜索歌词
-        final matchedHash = (matchInfo != null && matchInfo.isMatched)
-            ? matchInfo.hash
-            : null;
-        final lyricHash =
-            matchedHash ?? ((song is Song && !song.isOnline) ? '' : songId);
+        final matchedHash =
+            (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
+        final lyricHash = matchedHash ??
+            ((song is Song && !song.isOnline) ? '' : songId);
         // 搜索关键词用"歌名 艺术家"提高匹配准确度
         final searchName = (song is Song && song.artist != '未知艺术家')
             ? '${song.title} ${song.artist}'
             : song.title;
-        final lyric = await kugouProvider.getLyric(
-          lyricHash,
-          songName: searchName,
+        final lyric = await kugouProvider.getLyric(lyricHash, songName: searchName,
           onProgress: (partial) => showLyrics(
-            partial.displayKrcLyric ??
-                partial.displayLrcLyric ??
-                partial.displayLyric ??
-                '',
-            translationText: partial.translatedContent,
-            romaText: partial.romaContent,
+            partial.displayKrcLyric ?? partial.displayLrcLyric ?? partial.displayLyric ?? '',
+            translationText: partial.translatedContent, romaText: partial.romaContent,
           ),
         );
         if (mounted && generation == _lyricFetchGeneration) {
@@ -1606,11 +1805,7 @@ class _FullPlayerState extends State<FullPlayer>
         }
       }
 
-      showLyrics(
-        lyricText,
-        translationText: translationText,
-        romaText: romaText,
-      );
+      showLyrics(lyricText, translationText: translationText, romaText: romaText);
     } catch (e) {
       _lyricBatcher.schedule(() {
         if (!mounted || generation != _lyricFetchGeneration) return;
@@ -1618,6 +1813,8 @@ class _FullPlayerState extends State<FullPlayer>
           _isLoadingLyrics = false;
           _lyrics = '';
           _lyricMetadata = const [];
+          _lyricMetadataRaw = const [];
+          _lyricRawText = '';
           _hasTranslation = false;
           _hasRoma = false;
         });
@@ -1680,6 +1877,30 @@ class _FullPlayerState extends State<FullPlayer>
     return sb.toString();
   }
 
+  /// 「屏蔽歌词作者信息」开关/正则变化回调：从保存的 raw 数据即时重派生显示内容。
+  ///
+  /// 只在过滤相关的两项偏好真正变化时执行（字号等无关通知直接返回）；
+  /// 开启时统一走「解析 → 过滤 → 序列化」路径，关闭时恢复原有透传逻辑。
+  void _onCreditFilterPrefsChanged() {
+    final filterEnabled = LyricCreditFilter.enabled;
+    final filterPattern = LyricPreferences.instance.creditPattern;
+    if (filterEnabled == _derivedFilterEnabled &&
+        filterPattern == _derivedFilterPattern) {
+      return;
+    }
+    _derivedFilterEnabled = filterEnabled;
+    _derivedFilterPattern = filterPattern;
+    _lyricBatcher.schedule(() {
+      if (!mounted) return;
+      setState(() {
+        _lyricMetadata = LyricCreditFilter.filterLines(_lyricMetadataRaw);
+        _lyrics = filterEnabled
+            ? _serializeLines(_lyricMetadata)
+            : _toLyricsViewText(_lyricRawText);
+      });
+    });
+  }
+
   /// 封面淡入淡出：旧封面淡出 + 新封面淡入，400ms easeInOut。
   Widget _buildCrossfadeArtwork(
     String? artworkUrl,
@@ -1740,15 +1961,25 @@ class _FullPlayerState extends State<FullPlayer>
     );
   }
 
-  /// tv: 遥控菜单键 → 更多菜单（与顶栏「更多」按钮同源 [_showMoreMenu]）。
-  /// CallbackShortcuts 的 Focus 不可聚焦、不参与遍历，只拦 contextMenu，
-  /// 其余按键（方向/OK/BACK）原样穿透给 dpad 引擎。更多菜单 bottom sheet
-  /// 打开后焦点在其路由子树内（非本页子孙），菜单键不会重复触发。
+  /// tv: 播放页按键拦截层（仅 TV 构建）：返回键两层语义 + 遥控菜单键 → 更多菜单。
+  ///
+  /// 1. [TvPlayerBackInterceptor]：焦点**不在**播放控制 chrome 区（即停在 tab
+  ///    内容区 / 遥控 TabBar / 封面区）时，返回键只把焦点交回**播放键**并消费掉
+  ///    这次返回；焦点已在控制 chrome 区时才放行给 `_handleTvBack` 退出播放页
+  ///    （用户 2026-10-18 / 2026-10-20 真机口径：先退焦点、再按才退页）。
+  ///    chrome 区的标记见 [_tvWrapChromeScope]，页签条故意不包。
+  /// 2. [TvMenuKeyShortcuts] → 更多菜单（与顶栏「更多」按钮同源 [_showMoreMenu]）：
+  ///    CallbackShortcuts 的 Focus 不可聚焦、不参与遍历，只拦 contextMenu；菜单
+  ///    bottom sheet 打开后焦点在其路由子树内（非本页子孙），菜单键不会重复触发。
+  ///
+  /// 其余按键（方向 / OK）原样穿透给 dpad 引擎。
   Widget _tvMenuKeyScope(BuildContext context, Widget child) {
     if (!kTvBuild) return child;
-    return TvMenuKeyShortcuts(
-      onMenu: () => _showMoreMenu(context),
-      child: child,
+    return TvPlayerBackInterceptor(
+      child: TvMenuKeyShortcuts(
+        onMenu: () => _showMoreMenu(context),
+        child: child,
+      ),
     );
   }
 
@@ -1764,6 +1995,8 @@ class _FullPlayerState extends State<FullPlayer>
     if (_previousArtworkUrl == null && currentSong?.artworkUri != null) {
       _previousArtworkUrl = currentSong!.artworkUri;
     }
+    // 首帧锚定队列下标：没有它，恢复播放后第一次切歌会被当成「方向未知」。
+    _lastPagerIndex ??= playerProvider.currentIndex;
 
     if (currentSong == null) {
       return Scaffold(
@@ -1804,6 +2037,15 @@ class _FullPlayerState extends State<FullPlayer>
             _exitZenMode();
             return;
           }
+          // 播放列表编辑模式优先：返回键先退出编辑，而不是收起播放页
+          // （与歌单页多选同口径）。面板不在当前 tab 时 currentState 为 null，
+          // 其编辑状态也随之销毁，直接放行。
+          if (_exitPlaylistEditModeIfActive()) return;
+          // tv: 焦点不在控制 chrome 区时，返回键**先把焦点交还播放键**并消费本次
+          // 返回（用户 2026-10-20 口径）。这里是真机上的实际收口点：dpad 的
+          // `onBack` 与页内 `TvPlayerBackInterceptor` 都不一定被走到（后者只在
+          // 焦点节点是它的后代时才收得到按键），而 `PopScope` 覆盖全部返回路径。
+          if (kTvBuild && tvPlayerTryFocusPlay()) return;
           _collapseByButton();
         },
         child: Scaffold(
@@ -1852,6 +2094,9 @@ class _FullPlayerState extends State<FullPlayer>
                   lyricDoubleTap,
                 ),
               ),
+              // tv: 键位提示条——焦点落在带遥控语义的控件上时，于画面下沿提示按键。
+              // TvHintBar 自身是 Align(bottomCenter)+SafeArea，只需放在 Stack 最后一位。
+              if (kTvBuild) const TvHintBar(),
             ],
           ),
         ),
@@ -1889,6 +2134,7 @@ class _FullPlayerState extends State<FullPlayer>
                 // 播放列表面板（index 0，最左侧，与 AM 一致）
                 // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
                 PlayerPlaylistView(
+                  key: _playlistKey,
                   scrollAnchor: _playlistScroll,
                   useAmColors: false,
                   // 左滑跟手：面板逐帧上报进度，driver 写进 TabController
@@ -1951,7 +2197,7 @@ class _FullPlayerState extends State<FullPlayer>
                                   _adjustedLyricPosition(position, currentSong),
                               doubleTapToJump: lyricDoubleTap,
                               onSeek: (duration) {
-                                playerProvider.seek(duration);
+                                _seekToLyric(duration);
                               },
                             ),
                           ),
@@ -2013,31 +2259,57 @@ class _FullPlayerState extends State<FullPlayer>
         currentSong.isOnline &&
         !_zenMode;
 
-    return SafeArea(
-      bottom: false,
-      child: Column(
-        children: [
-          // 顶部栏放在最外层，占据整行：返回按钮真正在屏幕最左上角
-          ZenFade(
-            animation: _zenAnimation,
-            child: _buildTopBar(playerProvider, wide: true),
-          ),
+    // 挖孔对称补偿：SafeArea 默认左吃左、右吃右，挖孔只在一侧时左右起点不齐。
+    // 这里取左右安全区较大者统一加在两侧（异常值在 cutoutSymmetricInset 内钳制），
+    // 再把 MediaQuery 的左右 padding 摘掉，内层 SafeArea 只保留纵向语义。
+    // Windows / 无挖孔设备 inset=0，行为与原来一致。
+    // 「自定义宽屏边距」开启且用户选择「忽略挖孔避让」时 inset=0：内容完全
+    // 贴边（可延伸到挖孔/刘海区域），挖孔遮挡由用户自担。
+    final mq = MediaQuery.of(context);
+    final cutoutInset =
+        (kWidePaneMarginOverride.value != null && kWidePaneIgnoreCutoutEnabled.value)
+            ? 0.0
+            : PlayerWidePane.cutoutSymmetricInset(mq);
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: cutoutInset),
+      child: MediaQuery.removePadding(
+        context: context,
+        removeLeft: true,
+        removeRight: true,
+        child: SafeArea(
+          bottom: false,
+          left: false,
+          right: false,
+          child: Column(
+            children: [
+              // 顶部栏放在最外层，占据整行：返回按钮真正在屏幕最左上角
+              ZenFade(
+                animation: _zenAnimation,
+                child: _buildTopBar(playerProvider, wide: true),
+              ),
           Expanded(
             child: LayoutBuilder(
-              // 常驻控制带按**右栏局部**宽高分档：4/6 分栏 → 右栏宽 = 内容区 6/10，
+              // 常驻控制带按**右栏局部**宽高分档：右栏宽 = 内容区 × (1 − 左栏占比)，
+              // 占比来自「横屏左右对称分栏」开关（1:1 → 右栏 1/2；关闭 → 4:6），
               // 高即内容区高（顶栏在它上方，不参与分档）。判定不读
               // platformDispatcher 物理快照 —— 转屏动画途中那是旧值，会让 tab 结构
               // 与孩子数量对不上（计划 §2.3 / R4）。
               builder: (context, content) {
+                final symmetric = _symmetricPane;
+                final leftFraction = PlayerWidePane.leftPaneFraction(symmetric);
                 final tier = resolvePlayerDockTier(
-                  paneWidth: content.maxWidth * 6 / 10,
+                  paneWidth: content.maxWidth * (1 - leftFraction),
                   paneHeight: content.maxHeight,
                   dockMode: widget.dockMode,
                 );
                 // 左栏的比例内衬、以及「尺与播放键装不装得进左栏」都在这一处判定：
                 // 左栏和右栏底部那条 chrome 必须读到**同一个结论**，否则进度尺要么
                 // 挂两遍、要么一处都没有。
-                final gutter = PlayerWidePane.gutter(content.maxWidth * 4 / 10);
+                final gutter = PlayerWidePane.gutter(
+                  content.maxWidth * leftFraction,
+                  // 「自定义宽屏边距」覆盖值：非 null 时完全取代比例算法
+                  override: kWidePaneMarginOverride.value,
+                );
                 final bandInLeftPane =
                     !_detachedControls &&
                     !widget.dockMode &&
@@ -2045,340 +2317,327 @@ class _FullPlayerState extends State<FullPlayer>
                       innerHeight: content.maxHeight - gutter * 2,
                     );
                 return Row(
-                  children: [
-                    // ── 左侧：封面 + 歌曲信息 ──
-                    Expanded(
-                      flex: 4,
-                      child: Builder(
-                        builder: (context) {
-                          // 封面 / 曲名 / 进度尺 / 播放键共用**同一个内容盒**：左右内衬只按
-                          // 栏宽取一次比例，四件都贴这条边线（改造前各吃各的：栏内衬写死 16、
-                          // 曲名按封面边长、播放键按自然宽、尺还额外叠一层控制带的 16，
-                          // 实测 800×360 上 147 / 120 / 164 三种宽度并存，边缘对不齐）。
-                          // 纵向居中令上下留白相等。
-                          return Padding(
-                            padding: EdgeInsets.symmetric(
-                              horizontal: gutter,
-                              vertical: gutter,
-                            ),
-                            child: AnimatedBuilder(
-                              // Zen 淡出途中逐帧重算封面边长（见下方 chrome 的折算）。
-                              // 这条动画是**一次性状态转场**，不是常驻循环（AGENTS §10.1
-                              // 的合法例外）：跑完就停，不挂常驻 Ticker。
-                              animation: _zenAnimation,
-                              builder: (context, _) => LayoutBuilder(
-                                builder: (context, constraints) {
-                                  // 封面正方形边长：宽、高两个方向取小的那个。chrome 取
-                                  // 「实际排在曲名下方那几件」的实测预留，预留准了封面边长
-                                  // 才等于曲名盒的宽度，四件才共用一条左右边线。
-                                  //
-                                  // **chrome 要按 Zen 进度折算**：曲名 / 进度尺 / 播放键在
-                                  // Zen 下被 `ZenFade` 的 SizeTransition 折成 0 高，空间确实
-                                  // 让出来了；预留若不跟着归零，`coverSize` 就照旧扣掉整条
-                                  // chrome，让出来的 190dp 一分都不补给封面 —— 表现为「进 Zen
-                                  // 封面不再变大、横屏手机上明显比旧版小」。读的是**同一个**
-                                  // _zenAnimation，所以折叠与长大在同一帧序列里，不会出现
-                                  // 「预留先归零、Flexible 把封面压成扁方块」的中间态。
-                                  // 注意 `bandFits` 不吃这个折算：它决定尺挂在哪一栏，
-                                  // 跟着 Zen 翻脸会在淡出途中整块重排。
-                                  final chrome =
-                                      (bandInLeftPane
-                                          ? PlayerWidePane.bandChrome()
-                                          : _detachedControls
-                                          ? PlayerWidePane.titleChrome()
-                                          : PlayerWidePane.clusterChrome()) *
-                                      (1 - _zenAnimation.value);
-                                  final size = PlayerWidePane.coverSize(
-                                    innerWidth: constraints.maxWidth,
-                                    innerHeight: constraints.maxHeight,
-                                    chrome: chrome,
-                                  );
-                                  return Align(
-                                    alignment: Alignment.center,
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.center,
-                                      children: [
-                                        // 封面：横屏 + 写真背景开启时隐藏（避免与背景写真重复）
-                                        if (!hideArtworkForPhotoBg)
-                                          Flexible(
-                                            // 封面定正方形且**按 size 收宽**：与下面的曲名盒同宽，
-                                            // 左栏四件（封面/曲名/尺/播放键）才共用同一条左右边线。
-                                            // chrome 预留按实测算，故这里不会被压成非方形。
-                                            child: SizedBox.square(
-                                              dimension: size,
-                                              // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
-                                              // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
-                                              child: GestureDetector(
-                                                behavior:
-                                                    HitTestBehavior.opaque,
-                                                // 横屏封面仅注册竖向拖拽时，静止点击会被唯一的
-                                                // VerticalDragGestureRecognizer 通过 arena sweep 认领，
-                                                // 走进 _onTopBarDrag* 的微拖拽收起路径（曾表现为「点击封面闪回」）。
-                                                // 加一个 no-op onTap，让静止点击被 TapGestureRecognizer 赢下手势竞技场
-                                                // （与竖屏封面一致）；拖动仍由竖向拖拽识别器接管。
-                                                onTap: _onWideArtworkTap,
-                                                onVerticalDragStart:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragStart,
-                                                onVerticalDragUpdate:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragUpdate,
-                                                onVerticalDragEnd:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragEnd,
-                                                onVerticalDragCancel:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragCancel,
-                                                child: _wrapArtworkZenPress(
-                                                  // PlayerCoverSlot 必须在 AnimatedScale
-                                                  // **外层**：槽位里的探针用
-                                                  // 「实测屏幕矩形 / 自身布局尺寸」反推
-                                                  // pageToScreen（页面本地 → 屏幕）。
-                                                  // 一旦被关在 AnimatedScale 内层，暂停时的
-                                                  // 0.85 会被算进这个比值，它就不再是页面→
-                                                  // 屏幕的缩放比，settledRect 的位移抵消随之
-                                                  // 失真（暂停态下拉收起会闪一帧）。
-                                                  // AnimatedScale 只改绘制不改布局，
-                                                  // 两者对调不改变任何布局尺寸与视觉。
-                                                  child: PlayerCoverSlot(
-                                                    songId: currentSong.id,
-                                                    artworkUri:
-                                                        currentSong.artworkUri,
-                                                    fallbackFilePath:
-                                                        currentSong.localPath,
-                                                    iconSize: 48,
-                                                    placeholderColor: colorScheme
-                                                        .surfaceContainerHighest,
-                                                    shadowColor:
-                                                        colorScheme.shadow,
-                                                    eligible: () =>
-                                                        _coverMorphEligible,
-                                                    // 暂停态的稳定态缩放 / 锚点：形变层终点
-                                                    // 要落在**真实封面可见的位置**上，否则
-                                                    // 暂停时从 MiniPlayer 上滑，飞行终点是满
-                                                    // 尺寸，松手后 AnimatedScale 再从 1.0 缩到
-                                                    // 0.85，会多出一段看得见的收缩动画。
-                                                    // 必须与下面 AnimatedScale 的表达式一致。
-                                                    settledScale: _isDiscCover
+              children: [
+                // ── 左侧：封面 + 歌曲信息 ──
+                Expanded(
+                  flex: symmetric ? 5 : 4,
+                  child: Builder(
+                    builder: (context) {
+                      // 封面 / 曲名 / 进度尺 / 播放键共用**同一个内容盒**：左右内衬只按
+                      // 栏宽取一次比例，四件都贴这条边线（改造前各吃各的：栏内衬写死 16、
+                      // 曲名按封面边长、播放键按自然宽、尺还额外叠一层控制带的 16，
+                      // 实测 800×360 上 147 / 120 / 164 三种宽度并存，边缘对不齐）。
+                      // 纵向居中令上下留白相等。
+                      return Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: gutter,
+                          vertical: gutter,
+                        ),
+                        child: AnimatedBuilder(
+                          // Zen 淡出途中逐帧重算封面边长（见下方 chrome 的折算）。
+                          // 这条动画是**一次性状态转场**，不是常驻循环（AGENTS §10.1
+                          // 的合法例外）：跑完就停，不挂常驻 Ticker。
+                          animation: _zenAnimation,
+                          builder: (context, _) => LayoutBuilder(
+                          builder: (context, constraints) {
+                            // 封面正方形边长：宽、高两个方向取小的那个。chrome 取
+                            // 「实际排在曲名下方那几件」的实测预留，预留准了封面边长
+                            // 才等于曲名盒的宽度，四件才共用一条左右边线。
+                            //
+                            // **chrome 要按 Zen 进度折算**：曲名 / 进度尺 / 播放键在
+                            // Zen 下被 `ZenFade` 的 SizeTransition 折成 0 高，空间确实
+                            // 让出来了；预留若不跟着归零，`coverSize` 就照旧扣掉整条
+                            // chrome，让出来的 190dp 一分都不补给封面 —— 表现为「进 Zen
+                            // 封面不再变大、横屏手机上明显比旧版小」。读的是**同一个**
+                            // _zenAnimation，所以折叠与长大在同一帧序列里，不会出现
+                            // 「预留先归零、Flexible 把封面压成扁方块」的中间态。
+                            // 注意 `bandFits` 不吃这个折算：它决定尺挂在哪一栏，
+                            // 跟着 Zen 翻脸会在淡出途中整块重排。
+                            final chrome = (bandInLeftPane
+                                ? PlayerWidePane.bandChrome()
+                                : _detachedControls
+                                ? PlayerWidePane.titleChrome()
+                                : PlayerWidePane.clusterChrome()) *
+                                (1 - _zenAnimation.value);
+                            final size = PlayerWidePane.coverSize(
+                              innerWidth: constraints.maxWidth,
+                              innerHeight: constraints.maxHeight,
+                              chrome: chrome,
+                            );
+                            return Align(
+                              alignment: Alignment.center,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  // 封面：横屏 + 写真背景开启时隐藏（避免与背景写真重复）
+                                  if (!hideArtworkForPhotoBg)
+                                    Flexible(
+                                      // 封面定正方形且**按 size 收宽**：与下面的曲名盒同宽，
+                                      // 左栏四件（封面/曲名/尺/播放键）才共用同一条左右边线。
+                                      // chrome 预留按实测算，故这里不会被压成非方形。
+                                      child: SizedBox.square(
+                                        dimension: size,
+                                        // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
+                                        // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
+                                        child: GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          // 横屏封面仅注册竖向拖拽时，静止点击会被唯一的
+                                          // VerticalDragGestureRecognizer 通过 arena sweep 认领，
+                                          // 走进 _onTopBarDrag* 的微拖拽收起路径（曾表现为「点击封面闪回」）。
+                                          // 加一个 no-op onTap，让静止点击被 TapGestureRecognizer 赢下手势竞技场
+                                          // （与竖屏封面一致）；拖动仍由竖向拖拽识别器接管。
+                                          onTap: _onWideArtworkTap,
+                                          onVerticalDragStart: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragStart,
+                                          onVerticalDragUpdate: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragUpdate,
+                                          onVerticalDragEnd: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragEnd,
+                                          onVerticalDragCancel: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragCancel,
+                                          child: _wrapArtworkZenPress(
+                                            // PlayerCoverSlot 必须在 AnimatedScale
+                                            // **外层**：槽位里的探针用
+                                            // 「实测屏幕矩形 / 自身布局尺寸」反推
+                                            // pageToScreen（页面本地 → 屏幕）。
+                                            // 一旦被关在 AnimatedScale 内层，暂停时的
+                                            // 0.85 会被算进这个比值，它就不再是页面→
+                                            // 屏幕的缩放比，settledRect 的位移抵消随之
+                                            // 失真（暂停态下拉收起会闪一帧）。
+                                            // AnimatedScale 只改绘制不改布局，
+                                            // 两者对调不改变任何布局尺寸与视觉。
+                                            child: PlayerCoverSlot(
+                                              songId: currentSong.id,
+                                              artworkUri: currentSong.artworkUri,
+                                              fallbackFilePath:
+                                                  currentSong.localPath,
+                                              iconSize: 48,
+                                              placeholderColor: colorScheme
+                                                  .surfaceContainerHighest,
+                                              shadowColor: colorScheme.shadow,
+                                              eligible: () => _coverMorphEligible,
+                                              // 暂停态的稳定态缩放 / 锚点：形变层终点
+                                              // 要落在**真实封面可见的位置**上，否则
+                                              // 暂停时从 MiniPlayer 上滑，飞行终点是满
+                                              // 尺寸，松手后 AnimatedScale 再从 1.0 缩到
+                                              // 0.85，会多出一段看得见的收缩动画。
+                                              // 必须与下面 AnimatedScale 的表达式一致。
+                                              settledScale: _isDiscCover
+                                                  ? 1.0
+                                                  : (playerProvider.isPlaying
+                                                      ? 1.0
+                                                      : 0.85),
+                                              settledAnchor: Alignment.center,
+                                              settledInsetRatio: _coverMorphSettledInset,
+                                              child: AnimatedScale(
+                                                // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
+                                                scale: _isDiscCover
+                                                    ? 1.0
+                                                    : (playerProvider.isPlaying
                                                         ? 1.0
-                                                        : (playerProvider
-                                                                  .isPlaying
-                                                              ? 1.0
-                                                              : 0.85),
-                                                    settledAnchor:
-                                                        Alignment.center,
-                                                    child: AnimatedScale(
-                                                      // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
-                                                      scale: _isDiscCover
-                                                          ? 1.0
-                                                          : (playerProvider
-                                                                    .isPlaying
-                                                                ? 1.0
-                                                                : 0.85),
-                                                      // 缩放锚点=中心：宽屏标题本就居中于封面下方，
-                                                      // 暂停内缩也必须绕同一个视觉中心收，否则缩到
-                                                      // 0.85 的封面会向左下偏移，四边留白立刻不等。
-                                                      // （曾用 bottomLeft：那是标题左对齐年代为了
-                                                      //  让标题左缘贴封面可见左缘，如今该前提不成立。）
-                                                      alignment:
-                                                          Alignment.center,
-                                                      duration: const Duration(
-                                                        milliseconds: 500,
-                                                      ),
-                                                      curve: Curves.easeOutBack,
-                                                      child:
-                                                          _buildCrossfadeArtworkWrapper(
-                                                            currentSong,
-                                                            colorScheme,
-                                                            iconSize: 48,
-                                                            isPlaying:
-                                                                playerProvider
-                                                                    .isPlaying,
-                                                          ),
-                                                    ),
-                                                  ),
+                                                        : 0.85),
+                                                // 缩放锚点=中心：宽屏标题本就居中于封面下方，
+                                                // 暂停内缩也必须绕同一个视觉中心收，否则缩到
+                                                // 0.85 的封面会向左下偏移，四边留白立刻不等。
+                                                // （曾用 bottomLeft：那是标题左对齐年代为了
+                                                //  让标题左缘贴封面可见左缘，如今该前提不成立。）
+                                                alignment: Alignment.center,
+                                                duration: const Duration(
+                                                  milliseconds: 500,
                                                 ),
-                                              ),
-                                            ),
-                                          ),
-                                        // 封面下方这段 chrome（曲名 + 常驻档的尺与播放键）连同它的
-                                        // 16 / 12 / 12 三条行距一起折成 0：行距若留在 ZenFade 外层，
-                                        // Zen 收起后封面下面仍占着 40px，整列居中就等于把封面
-                                        // 往上顶 —— 上下留白不等（实测 16/16/146/174）。
-                                        ZenFade(
-                                          animation: _zenAnimation,
-                                          child: Column(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              const SizedBox(
-                                                height: PlayerWidePane.titleGap,
-                                              ),
-                                              // 歌名 / 艺人·专辑：横屏一律**居中**于封面下方，
-                                              // 宽度取封面布局盒 size（写真背景隐封面时退回整栏宽），
-                                              // 与封面同轴；常驻档再往下就是控制带，整列一起居中。
-                                              // Zen 与传输簇同源淡出：曲名/艺人·专辑也是 chrome，
-                                              // 留在屏幕上会与「只剩封面与歌词」的 Zen 语义冲突。
-                                              SizedBox(
-                                                width: hideArtworkForPhotoBg
-                                                    ? null
-                                                    : size,
-                                                child: _buildTitleBlockMorph(
-                                                  playerProvider,
+                                                curve: Curves.easeOutBack,
+                                                child: _buildCoverPagerOrStatic(
                                                   currentSong,
                                                   colorScheme,
-                                                  alignment:
-                                                      CrossAxisAlignment.center,
-                                                  dense: true,
+                                                  side: size,
+                                                  iconSize: 48,
+                                                  isPlaying:
+                                                      playerProvider.isPlaying,
                                                 ),
                                               ),
-                                              // 常驻档（未开「横屏控制面板独立页」）：进度尺与播放键
-                                              // 都落在曲名正下方（尺在上、簇在下），横贯左栏内容宽 ——
-                                              // dock 传 paddingHorizontal = 0，它自带的那层 16 与左栏
-                                              // 比例内衬叠加会让尺比封面/曲名窄一截，边线又对不齐。
-                                              // 栏高不够（640×300 这类小横屏）时 bandInLeftPane 为假，
-                                              // 尺退回右栏底部那条 chrome，免得封面被压成扁方块。
-                                              if (!_detachedControls) ...[
-                                                if (bandInLeftPane) ...[
-                                                  const SizedBox(
-                                                    height:
-                                                        PlayerWidePane.rowGap,
-                                                  ),
-                                                  _buildControlDock(
-                                                    tier,
-                                                    playerProvider,
-                                                    colorScheme,
-                                                    leftPane: true,
-                                                  ),
-                                                ],
-                                                const SizedBox(
-                                                  height: PlayerWidePane.rowGap,
-                                                ),
-                                                _buildTransportCluster(
-                                                  playerProvider,
-                                                  colorScheme,
-                                                ),
-                                              ],
-                                            ],
+                                            ),
                                           ),
                                         ),
+                                      )
+                                    ),
+                                  // 封面下方这段 chrome（曲名 + 常驻档的尺与播放键）连同它的
+                                  // 16 / 12 / 12 三条行距一起折成 0：行距若留在 ZenFade 外层，
+                                  // Zen 收起后封面下面仍占着 40px，整列居中就等于把封面
+                                  // 往上顶 —— 上下留白不等（实测 16/16/146/174）。
+                                  ZenFade(
+                                    animation: _zenAnimation,
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const SizedBox(
+                                          height: PlayerWidePane.titleGap,
+                                        ),
+                                        // 歌名 / 艺人·专辑：横屏一律**居中**于封面下方，
+                                        // 宽度取封面布局盒 size（写真背景隐封面时退回整栏宽），
+                                        // 与封面同轴；常驻档再往下就是控制带，整列一起居中。
+                                        // Zen 与传输簇同源淡出：曲名/艺人·专辑也是 chrome，
+                                        // 留在屏幕上会与「只剩封面与歌词」的 Zen 语义冲突。
+                                        SizedBox(
+                                          width: hideArtworkForPhotoBg
+                                              ? null
+                                              : size,
+                                          child: _buildTitleBlockMorph(
+                                            playerProvider,
+                                            currentSong,
+                                            colorScheme,
+                                            alignment: CrossAxisAlignment.center,
+                                            dense: true,
+                                          ),
+                                        ),
+                                        // 常驻档（未开「横屏控制面板独立页」）：进度尺与播放键
+                                        // 都落在曲名正下方（尺在上、簇在下），横贯左栏内容宽 ——
+                                        // dock 传 paddingHorizontal = 0，它自带的那层 16 与左栏
+                                        // 比例内衬叠加会让尺比封面/曲名窄一截，边线又对不齐。
+                                        // 栏高不够（640×300 这类小横屏）时 bandInLeftPane 为假，
+                                        // 尺退回右栏底部那条 chrome，免得封面被压成扁方块。
+                                        if (!_detachedControls) ...[
+                                          if (bandInLeftPane) ...[
+                                            const SizedBox(
+                                              height: PlayerWidePane.rowGap,
+                                            ),
+                                            _buildControlDock(
+                                              tier,
+                                              playerProvider,
+                                              colorScheme,
+                                              leftPane: true,
+                                            ),
+                                          ],
+                                          const SizedBox(
+                                            height: PlayerWidePane.rowGap,
+                                          ),
+                                          _buildTransportCluster(
+                                            playerProvider,
+                                            colorScheme,
+                                          ),
+                                        ],
                                       ],
                                     ),
-                                  );
-                                },
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                    // ── 右侧：Tab + 内容 + 控制 ──
-                    Expanded(
-                      flex: 6,
-                      child: Column(
-                        children: [
-                          // 内容区（播放列表 / 封面信息 / 歌词 / 评论 / 控制?）
-                          // Pad模式下无封面Tab；手机横屏保留封面Tab
-                          Expanded(
-                            child: ValueListenableBuilder<bool>(
-                              valueListenable: _controlsPageGestureLock,
-                              builder: (context, locked, _) => PlayerTabPager(
-                                key: _pagerKey,
-                                tabController: _tabController,
-                                // 控制页内按下期间锁横滑：进度条/音量条的水平拖动
-                                // 优先于切页（R1 手势锁，见 _controlsPageGestureLock）
-                                physics: locked
-                                    ? const NeverScrollableScrollPhysics()
-                                    : null,
-                                children: [
-                                  // 播放列表面板（index 0，最左侧，与 AM 一致）
-                                  // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
-                                  PlayerPlaylistView(
-                                    scrollAnchor: _playlistScroll,
-                                    useAmColors: false,
-                                    // 左滑跟手：面板逐帧上报进度，driver 写进 TabController
-                                    onSwipeStart: _playlistSwipe.start,
-                                    onSwipeProgress: _playlistSwipe.update,
-                                    onSwipeRelease: (velocity, width) =>
-                                        _playlistSwipe.settle(
-                                          velocityPxPerSec: velocity,
-                                          panelWidth: width,
-                                        ),
                                   ),
-                                  // 控制 tab：进度/传输/音量搬进独立页签（宽屏 +
-                                  // 「横屏控制面板独立页」开启时存在，与 _buildTabStrip
-                                  // 的 hasControls 分支同源，都只读 _tabLayout）。
-                                  // 排在歌词之前：播放列表 / 控制 / 歌词 / 评论，
-                                  // 从歌单左滑一下即达，不必越过歌词与评论。
-                                  if (_tabLayout.hasControls)
-                                    _buildLandscapeControlPage(
-                                      playerProvider,
-                                      colorScheme,
-                                    ),
-                                  _wrapMd3LyricsWithAuxToggle(
-                                    _isLoadingLyrics
-                                        ? Center(
-                                            child: M3ELoadingIndicator(
-                                              color: colorScheme.primary,
-                                            ),
-                                          )
-                                        // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
-                                        : RepaintBoundary(
-                                            child: LyricsView(
-                                              lyrics: _lyrics,
-                                              parsedLyrics: _lyricMetadata,
-                                              position: Duration.zero,
-                                              positionListenable: playerProvider
-                                                  .positionNotifier,
-                                              adaptPosition: (position) =>
-                                                  _adjustedLyricPosition(
-                                                    position,
-                                                    currentSong,
-                                                  ),
-                                              doubleTapToJump: lyricDoubleTap,
-                                              onSeek: (duration) {
-                                                playerProvider.seek(duration);
-                                              },
-                                            ),
-                                          ),
-                                  ),
-                                  // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
-                                  if (_tabLayout.hasComments)
-                                    CommentsView(
-                                      songHash: currentSong.id,
-                                      albumAudioId: currentSong.albumAudioId,
-                                      // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
-                                      showComposer: false,
-                                      onReplyComment: _openComposeSheet,
-                                    ),
                                 ],
                               ),
-                            ),
+                            );
+                          },
+                        ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                // ── 右侧：Tab + 内容 + 控制 ──
+                Expanded(
+                  flex: symmetric ? 5 : 6,
+                  child: Column(
+                    children: [
+                      // 内容区（播放列表 / 封面信息 / 歌词 / 评论 / 控制?）
+                      // Pad模式下无封面Tab；手机横屏保留封面Tab
+                      Expanded(
+                        child: ValueListenableBuilder<bool>(
+                          valueListenable: _controlsPageGestureLock,
+                          builder: (context, locked, _) => PlayerTabPager(
+                            key: _pagerKey,
+                            tabController: _tabController,
+                            // 控制页内按下期间锁横滑：进度条/音量条的水平拖动
+                            // 优先于切页（R1 手势锁，见 _controlsPageGestureLock）
+                            physics: locked
+                                ? const NeverScrollableScrollPhysics()
+                                : null,
+                            children: [
+                              // 播放列表面板（index 0，最左侧，与 AM 一致）
+                              // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
+                              PlayerPlaylistView(
+                                key: _playlistKey,
+                                scrollAnchor: _playlistScroll,
+                                useAmColors: false,
+                                // 左滑跟手：面板逐帧上报进度，driver 写进 TabController
+                                onSwipeStart: _playlistSwipe.start,
+                                onSwipeProgress: _playlistSwipe.update,
+                                onSwipeRelease: (velocity, width) =>
+                                    _playlistSwipe.settle(
+                                  velocityPxPerSec: velocity,
+                                  panelWidth: width,
+                                ),
+                              ),
+                              // 控制 tab：进度/传输/音量搬进独立页签（宽屏 +
+                              // 「横屏控制面板独立页」开启时存在，与 _buildTabStrip
+                              // 的 hasControls 分支同源，都只读 _tabLayout）。
+                              // 排在歌词之前：播放列表 / 控制 / 歌词 / 评论，
+                              // 从歌单左滑一下即达，不必越过歌词与评论。
+                              if (_tabLayout.hasControls)
+                                _buildLandscapeControlPage(
+                                  playerProvider,
+                                  colorScheme,
+                                ),
+                              _wrapMd3LyricsWithAuxToggle(
+                                _isLoadingLyrics
+                                    ? Center(
+                                        child: M3ELoadingIndicator(
+                                          color: colorScheme.primary,
+                                        ),
+                                      )
+                                    // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
+                                    : RepaintBoundary(
+                                        child: LyricsView(
+                                          lyrics: _lyrics,
+                                          parsedLyrics: _lyricMetadata,
+                                          position: Duration.zero,
+                                          positionListenable:
+                                              playerProvider.positionNotifier,
+                                          adaptPosition: (position) =>
+                                              _adjustedLyricPosition(
+                                                position,
+                                                currentSong,
+                                              ),
+                                          doubleTapToJump: lyricDoubleTap,
+                                          onSeek: (duration) {
+                                            _seekToLyric(duration);
+                                          },
+                                        ),
+                                      ),
+                              ),
+                              // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
+                              if (_tabLayout.hasComments)
+                                CommentsView(
+                                  songHash: currentSong.id,
+                                  albumAudioId: currentSong.albumAudioId,
+                                  // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                  showComposer: false,
+                                  onReplyComment: _openComposeSheet,
+                                ),
+                            ],
                           ),
-                          // 导航条从原控制面板中提出常驻：控制面板搬进「控制」页后，
-                          // 它必须留在外面，否则进入控制页后无法点击离开（只能滑动）。
-                          // 常驻档（开关关闭）在导航条下面追加控制带。
-                          _buildChromeBottom(
-                            tier: tier,
-                            playerProvider: playerProvider,
-                            showBand: !_detachedControls && !bandInLeftPane,
-                            colorScheme: colorScheme,
-                            bottomPadding: bottomPadding,
-                          ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ],
-                );
+                      // 导航条从原控制面板中提出常驻：控制面板搬进「控制」页后，
+                      // 它必须留在外面，否则进入控制页后无法点击离开（只能滑动）。
+                      // 常驻档（开关关闭）在导航条下面追加控制带。
+                      _buildChromeBottom(
+                        tier: tier,
+                        playerProvider: playerProvider,
+                        showBand: !_detachedControls && !bandInLeftPane,
+                        colorScheme: colorScheme,
+                        bottomPadding: bottomPadding,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
               },
             ),
           ),
         ],
+          ),
+        ),
       ),
     );
   }
@@ -2404,28 +2663,54 @@ class _FullPlayerState extends State<FullPlayer>
         currentSong.isOnline &&
         !_zenMode;
 
-    return SafeArea(
-      bottom: false,
-      child: Column(
-        children: [
-          // 顶部栏放在最外层，占据整行：返回按钮真正在屏幕最左上角
-          ZenFade(
-            animation: _zenAnimation,
-            child: _buildTopBar(playerProvider, wide: true),
-          ),
+    // 挖孔对称补偿：SafeArea 默认左吃左、右吃右，挖孔只在一侧时左右起点不齐。
+    // 这里取左右安全区较大者统一加在两侧（异常值在 cutoutSymmetricInset 内钳制），
+    // 再把 MediaQuery 的左右 padding 摘掉，内层 SafeArea 只保留纵向语义。
+    // Windows / 无挖孔设备 inset=0，行为与原来一致。
+    // 「自定义宽屏边距」开启且用户选择「忽略挖孔避让」时 inset=0：内容完全
+    // 贴边（可延伸到挖孔/刘海区域），挖孔遮挡由用户自担。
+    final mq = MediaQuery.of(context);
+    final cutoutInset =
+        (kWidePaneMarginOverride.value != null && kWidePaneIgnoreCutoutEnabled.value)
+            ? 0.0
+            : PlayerWidePane.cutoutSymmetricInset(mq);
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: cutoutInset),
+      child: MediaQuery.removePadding(
+        context: context,
+        removeLeft: true,
+        removeRight: true,
+        child: SafeArea(
+          bottom: false,
+          left: false,
+          right: false,
+          child: Column(
+            children: [
+              // 顶部栏放在最外层，占据整行：返回按钮真正在屏幕最左上角
+              ZenFade(
+                animation: _zenAnimation,
+                child: _buildTopBar(playerProvider, wide: true),
+              ),
           Expanded(
             child: LayoutBuilder(
               // 与 _buildLandscapeLayout 同款档位换算（计划 §2.3 / R4）。
+              // 分栏占比同样读「横屏左右对称分栏」开关：1:1 或 4:6。
               builder: (context, content) {
+                final symmetric = _symmetricPane;
+                final leftFraction = PlayerWidePane.leftPaneFraction(symmetric);
                 final tier = resolvePlayerDockTier(
-                  paneWidth: content.maxWidth * 6 / 10,
+                  paneWidth: content.maxWidth * (1 - leftFraction),
                   paneHeight: content.maxHeight,
                   dockMode: widget.dockMode,
                 );
                 // 左栏的比例内衬、以及「尺与播放键装不装得进左栏」都在这一处判定：
                 // 左栏和右栏底部那条 chrome 必须读到**同一个结论**，否则进度尺要么
                 // 挂两遍、要么一处都没有。
-                final gutter = PlayerWidePane.gutter(content.maxWidth * 4 / 10);
+                final gutter = PlayerWidePane.gutter(
+                  content.maxWidth * leftFraction,
+                  // 「自定义宽屏边距」覆盖值：非 null 时完全取代比例算法
+                  override: kWidePaneMarginOverride.value,
+                );
                 final bandInLeftPane =
                     !_detachedControls &&
                     !widget.dockMode &&
@@ -2433,314 +2718,301 @@ class _FullPlayerState extends State<FullPlayer>
                       innerHeight: content.maxHeight - gutter * 2,
                     );
                 return Row(
-                  children: [
-                    Expanded(
-                      flex: 4,
-                      child: Builder(
-                        builder: (context) {
-                          // 封面 + 曲名 +（常驻档的尺与播放键）共用同一个内容盒，
-                          // **水平居中**于左栏：内衬按栏宽取比例，四件贴同一条左右边线
-                          // （口径与 _buildLandscapeLayout 完全一致）。
-                          return Padding(
-                            padding: EdgeInsets.symmetric(
-                              horizontal: gutter,
-                              vertical: gutter,
-                            ),
-                            child: AnimatedBuilder(
-                              // 与 _buildLandscapeLayout 同一条口径：chrome 按 Zen 进度折算，
-                              // 让 ZenFade 折出来的高度真的补给封面（理由见那处的长注释）。
-                              animation: _zenAnimation,
-                              builder: (context, _) => LayoutBuilder(
-                                builder: (context, constraints) {
-                                  // 正方形边长 = min(栏内宽, 栏内高 − chrome 实测预留)。
-                                  // 不再封顶 380：封了顶封面就比横贯栏宽的进度尺窄一截，
-                                  // 实测 1280×800 上会退回「封面 380 / 尺 464」的对不齐。
-                                  final chrome =
-                                      (bandInLeftPane
-                                          ? PlayerWidePane.bandChrome()
-                                          : _detachedControls
-                                          ? PlayerWidePane.titleChrome()
-                                          : PlayerWidePane.clusterChrome()) *
-                                      (1 - _zenAnimation.value);
-                                  final maxSize = PlayerWidePane.coverSize(
-                                    innerWidth: constraints.maxWidth,
-                                    innerHeight: constraints.maxHeight,
-                                    chrome: chrome,
-                                  );
-                                  return Align(
-                                    alignment: Alignment.center,
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.center,
-                                      children: [
-                                        // 封面：横屏 + 写真背景开启时隐藏（避免与背景写真重复）
-                                        if (!hideArtworkForPhotoBg)
-                                          Flexible(
-                                            // 与 _buildLandscapeLayout 同口径：封面按 maxSize 定方
-                                            // 正方形，与曲名/尺/播放键共用一条左右边线。
-                                            child: SizedBox.square(
-                                              dimension: maxSize,
-                                              // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
-                                              // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
-                                              child: GestureDetector(
-                                                behavior:
-                                                    HitTestBehavior.opaque,
-                                                // 见上：no-op onTap 让静止点击被 Tap 识别器赢下竞技场，
-                                                // 避免唯一竖向拖拽识别器把点击误判为微拖拽收起（「点击封面闪回」）。
-                                                onTap: () {
-                                                  _consumeZenPressTap();
-                                                },
-                                                onVerticalDragStart:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragStart,
-                                                onVerticalDragUpdate:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragUpdate,
-                                                onVerticalDragEnd:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragEnd,
-                                                onVerticalDragCancel:
-                                                    widget.dockMode
-                                                    ? null
-                                                    : _onTopBarDragCancel,
-                                                child: _wrapArtworkZenPress(
-                                                  // PlayerCoverSlot 必须在 AnimatedScale
-                                                  // **外层**：槽位里的探针用
-                                                  // 「实测屏幕矩形 / 自身布局尺寸」反推
-                                                  // pageToScreen（页面本地 → 屏幕）。
-                                                  // 一旦被关在 AnimatedScale 内层，暂停时的
-                                                  // 0.85 会被算进这个比值，它就不再是页面→
-                                                  // 屏幕的缩放比，settledRect 的位移抵消随之
-                                                  // 失真（暂停态下拉收起会闪一帧）。
-                                                  // AnimatedScale 只改绘制不改布局，
-                                                  // 两者对调不改变任何布局尺寸与视觉。
-                                                  child: PlayerCoverSlot(
-                                                    songId: currentSong.id,
-                                                    artworkUri:
-                                                        currentSong.artworkUri,
-                                                    fallbackFilePath:
-                                                        currentSong.localPath,
-                                                    iconSize: 48,
-                                                    placeholderColor: colorScheme
-                                                        .surfaceContainerHighest,
-                                                    shadowColor:
-                                                        colorScheme.shadow,
-                                                    eligible: () =>
-                                                        _coverMorphEligible,
-                                                    // 暂停态的稳定态缩放 / 锚点：与下面
-                                                    // AnimatedScale 一致，理由见左栏 A 处注释。
-                                                    settledScale: _isDiscCover
+              children: [
+                Expanded(
+                  flex: symmetric ? 5 : 4,
+                  child: Builder(
+                    builder: (context) {
+                      // 封面 + 曲名 +（常驻档的尺与播放键）共用同一个内容盒，
+                      // **水平居中**于左栏：内衬按栏宽取比例，四件贴同一条左右边线
+                      // （口径与 _buildLandscapeLayout 完全一致）。
+                      return Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: gutter,
+                          vertical: gutter,
+                        ),
+                        child: AnimatedBuilder(
+                          // 与 _buildLandscapeLayout 同一条口径：chrome 按 Zen 进度折算，
+                          // 让 ZenFade 折出来的高度真的补给封面（理由见那处的长注释）。
+                          animation: _zenAnimation,
+                          builder: (context, _) => LayoutBuilder(
+                          builder: (context, constraints) {
+                            // 正方形边长 = min(栏内宽, 栏内高 − chrome 实测预留)。
+                            // 不再封顶 380：封了顶封面就比横贯栏宽的进度尺窄一截，
+                            // 实测 1280×800 上会退回「封面 380 / 尺 464」的对不齐。
+                            final chrome = (bandInLeftPane
+                                ? PlayerWidePane.bandChrome()
+                                : _detachedControls
+                                ? PlayerWidePane.titleChrome()
+                                : PlayerWidePane.clusterChrome()) *
+                                (1 - _zenAnimation.value);
+                            final maxSize = PlayerWidePane.coverSize(
+                              innerWidth: constraints.maxWidth,
+                              innerHeight: constraints.maxHeight,
+                              chrome: chrome,
+                            );
+                            return Align(
+                              alignment: Alignment.center,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  // 封面：横屏 + 写真背景开启时隐藏（避免与背景写真重复）
+                                  if (!hideArtworkForPhotoBg)
+                                    Flexible(
+                                      // 与 _buildLandscapeLayout 同口径：封面按 maxSize 定方
+                                      // 正方形，与曲名/尺/播放键共用一条左右边线。
+                                      child: SizedBox.square(
+                                        dimension: maxSize,
+                                        // 封面支持向下拖拽原路返回关闭播放器（横屏/pad 与竖屏一致），
+                                        // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
+                                        child: GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          // 见上：no-op onTap 让静止点击被 Tap 识别器赢下竞技场，
+                                          // 避免唯一竖向拖拽识别器把点击误判为微拖拽收起（「点击封面闪回」）。
+                                          onTap: () {
+                                            _consumeZenPressTap();
+                                          },
+                                          onVerticalDragStart: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragStart,
+                                          onVerticalDragUpdate: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragUpdate,
+                                          onVerticalDragEnd: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragEnd,
+                                          onVerticalDragCancel: widget.dockMode
+                                              ? null
+                                              : _onTopBarDragCancel,
+                                          child: _wrapArtworkZenPress(
+                                            // PlayerCoverSlot 必须在 AnimatedScale
+                                            // **外层**：槽位里的探针用
+                                            // 「实测屏幕矩形 / 自身布局尺寸」反推
+                                            // pageToScreen（页面本地 → 屏幕）。
+                                            // 一旦被关在 AnimatedScale 内层，暂停时的
+                                            // 0.85 会被算进这个比值，它就不再是页面→
+                                            // 屏幕的缩放比，settledRect 的位移抵消随之
+                                            // 失真（暂停态下拉收起会闪一帧）。
+                                            // AnimatedScale 只改绘制不改布局，
+                                            // 两者对调不改变任何布局尺寸与视觉。
+                                            child: PlayerCoverSlot(
+                                              songId: currentSong.id,
+                                              artworkUri: currentSong.artworkUri,
+                                              fallbackFilePath:
+                                                  currentSong.localPath,
+                                              iconSize: 48,
+                                              placeholderColor: colorScheme
+                                                  .surfaceContainerHighest,
+                                              shadowColor: colorScheme.shadow,
+                                              eligible: () => _coverMorphEligible,
+                                              // 暂停态的稳定态缩放 / 锚点：与下面
+                                              // AnimatedScale 一致，理由见左栏 A 处注释。
+                                              settledScale: _isDiscCover
+                                                  ? 1.0
+                                                  : (playerProvider.isPlaying
+                                                      ? 1.0
+                                                      : 0.85),
+                                              settledAnchor: Alignment.center,
+                                              settledInsetRatio: _coverMorphSettledInset,
+                                              child: AnimatedScale(
+                                                // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
+                                                scale: _isDiscCover
+                                                    ? 1.0
+                                                    : (playerProvider.isPlaying
                                                         ? 1.0
-                                                        : (playerProvider
-                                                                  .isPlaying
-                                                              ? 1.0
-                                                              : 0.85),
-                                                    settledAnchor:
-                                                        Alignment.center,
-                                                    child: AnimatedScale(
-                                                      // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
-                                                      scale: _isDiscCover
-                                                          ? 1.0
-                                                          : (playerProvider
-                                                                    .isPlaying
-                                                                ? 1.0
-                                                                : 0.85),
-                                                      // 锚点=中心：与 _buildLandscapeLayout 同口径，
-                                                      // 暂停内缩绕封面视觉中心收，四边留白才相等。
-                                                      alignment:
-                                                          Alignment.center,
-                                                      duration: const Duration(
-                                                        milliseconds: 500,
-                                                      ),
-                                                      curve: Curves.easeOutBack,
-                                                      child:
-                                                          _buildCrossfadeArtworkWrapper(
-                                                            currentSong,
-                                                            colorScheme,
-                                                            iconSize: 48,
-                                                            isPlaying:
-                                                                playerProvider
-                                                                    .isPlaying,
-                                                          ),
-                                                    ),
-                                                  ),
+                                                        : 0.85),
+                                                // 锚点=中心：与 _buildLandscapeLayout 同口径，
+                                                // 暂停内缩绕封面视觉中心收，四边留白才相等。
+                                                alignment: Alignment.center,
+                                                duration: const Duration(
+                                                  milliseconds: 500,
                                                 ),
-                                              ),
-                                            ),
-                                          ),
-                                        // 与 _buildLandscapeLayout 同一套收口：行距留在 ZenFade
-                                        // 外层会在 Zen 下残留 40px，把封面顶离纵向中心。
-                                        ZenFade(
-                                          animation: _zenAnimation,
-                                          child: Column(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              const SizedBox(
-                                                height: PlayerWidePane.titleGap,
-                                              ),
-                                              // 歌名 / 艺人·专辑：横屏一律**居中**于封面下方，
-                                              // 宽度取封面布局盒 maxSize（写真背景隐封面时退回整栏宽），
-                                              // 与封面同轴；常驻档再往下就是控制带，整列一起居中。
-                                              // Zen 与传输簇同源淡出：曲名/艺人·专辑也是 chrome，
-                                              // 留在屏幕上会与「只剩封面与歌词」的 Zen 语义冲突。
-                                              SizedBox(
-                                                width: hideArtworkForPhotoBg
-                                                    ? null
-                                                    : maxSize,
-                                                child: _buildTitleBlockMorph(
-                                                  playerProvider,
+                                                curve: Curves.easeOutBack,
+                                                child: _buildCoverPagerOrStatic(
                                                   currentSong,
                                                   colorScheme,
-                                                  alignment:
-                                                      CrossAxisAlignment.center,
-                                                  dense: true,
+                                                  side: maxSize,
+                                                  iconSize: 48,
+                                                  isPlaying: playerProvider
+                                                      .isPlaying,
                                                 ),
                                               ),
-                                              // 常驻档（未开「横屏控制面板独立页」）：进度尺与播放键
-                                              // 都落在曲名正下方（尺在上、簇在下），横贯左栏内容宽 ——
-                                              // dock 传 paddingHorizontal = 0，它自带的那层 16 与左栏
-                                              // 比例内衬叠加会让尺比封面/曲名窄一截，边线又对不齐。
-                                              // 栏高不够（640×300 这类小横屏）时 bandInLeftPane 为假，
-                                              // 尺退回右栏底部那条 chrome，免得封面被压成扁方块。
-                                              if (!_detachedControls) ...[
-                                                if (bandInLeftPane) ...[
-                                                  const SizedBox(
-                                                    height:
-                                                        PlayerWidePane.rowGap,
-                                                  ),
-                                                  _buildControlDock(
-                                                    tier,
-                                                    playerProvider,
-                                                    colorScheme,
-                                                    leftPane: true,
-                                                  ),
-                                                ],
-                                                const SizedBox(
-                                                  height: PlayerWidePane.rowGap,
-                                                ),
-                                                _buildTransportCluster(
-                                                  playerProvider,
-                                                  colorScheme,
-                                                ),
-                                              ],
-                                            ],
+                                            ),
                                           ),
                                         ),
+                                      ),
+                                    ),
+                                  // 与 _buildLandscapeLayout 同一套收口：行距留在 ZenFade
+                                  // 外层会在 Zen 下残留 40px，把封面顶离纵向中心。
+                                  ZenFade(
+                                    animation: _zenAnimation,
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const SizedBox(
+                                          height: PlayerWidePane.titleGap,
+                                        ),
+                                        // 歌名 / 艺人·专辑：横屏一律**居中**于封面下方，
+                                        // 宽度取封面布局盒 maxSize（写真背景隐封面时退回整栏宽），
+                                        // 与封面同轴；常驻档再往下就是控制带，整列一起居中。
+                                        // Zen 与传输簇同源淡出：曲名/艺人·专辑也是 chrome，
+                                        // 留在屏幕上会与「只剩封面与歌词」的 Zen 语义冲突。
+                                        SizedBox(
+                                          width: hideArtworkForPhotoBg
+                                              ? null
+                                              : maxSize,
+                                          child: _buildTitleBlockMorph(
+                                            playerProvider,
+                                            currentSong,
+                                            colorScheme,
+                                            alignment: CrossAxisAlignment.center,
+                                            dense: true,
+                                          ),
+                                        ),
+                                        // 常驻档（未开「横屏控制面板独立页」）：进度尺与播放键
+                                        // 都落在曲名正下方（尺在上、簇在下），横贯左栏内容宽 ——
+                                        // dock 传 paddingHorizontal = 0，它自带的那层 16 与左栏
+                                        // 比例内衬叠加会让尺比封面/曲名窄一截，边线又对不齐。
+                                        // 栏高不够（640×300 这类小横屏）时 bandInLeftPane 为假，
+                                        // 尺退回右栏底部那条 chrome，免得封面被压成扁方块。
+                                        if (!_detachedControls) ...[
+                                          if (bandInLeftPane) ...[
+                                            const SizedBox(
+                                              height: PlayerWidePane.rowGap,
+                                            ),
+                                            _buildControlDock(
+                                              tier,
+                                              playerProvider,
+                                              colorScheme,
+                                              leftPane: true,
+                                            ),
+                                          ],
+                                          const SizedBox(
+                                            height: PlayerWidePane.rowGap,
+                                          ),
+                                          _buildTransportCluster(
+                                            playerProvider,
+                                            colorScheme,
+                                          ),
+                                        ],
                                       ],
                                     ),
-                                  );
-                                },
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                    Expanded(
-                      flex: 6,
-                      child: Column(
-                        children: [
-                          // 与 _buildLandscapeLayout 同构：平板/折叠展开也把控制面板
-                          // 搬进「控制」页，导航条常驻底部。
-                          Expanded(
-                            child: ValueListenableBuilder<bool>(
-                              valueListenable: _controlsPageGestureLock,
-                              builder: (context, locked, _) => PlayerTabPager(
-                                key: _pagerKey,
-                                tabController: _tabController,
-                                // 控制页内按下期间锁横滑：进度条/音量条的水平拖动
-                                // 优先于切页（R1 手势锁，见 _controlsPageGestureLock）
-                                physics: locked
-                                    ? const NeverScrollableScrollPhysics()
-                                    : null,
-                                children: [
-                                  // 播放列表面板（index 0，最左侧，与 AM 一致）
-                                  // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
-                                  PlayerPlaylistView(
-                                    scrollAnchor: _playlistScroll,
-                                    useAmColors: false,
-                                    // 左滑跟手：面板逐帧上报进度，driver 写进 TabController
-                                    onSwipeStart: _playlistSwipe.start,
-                                    onSwipeProgress: _playlistSwipe.update,
-                                    onSwipeRelease: (velocity, width) =>
-                                        _playlistSwipe.settle(
-                                          velocityPxPerSec: velocity,
-                                          panelWidth: width,
-                                        ),
                                   ),
-                                  // 控制 tab：进度/传输/音量搬进独立页签（宽屏 +
-                                  // 「横屏控制面板独立页」开启时存在，与 _buildTabStrip
-                                  // 的 hasControls 分支同源，都只读 _tabLayout）。
-                                  // 排在歌词之前：播放列表 / 控制 / 歌词 / 评论，
-                                  // 从歌单左滑一下即达，不必越过歌词与评论。
-                                  if (_tabLayout.hasControls)
-                                    _buildLandscapeControlPage(
-                                      playerProvider,
-                                      colorScheme,
-                                    ),
-                                  _wrapMd3LyricsWithAuxToggle(
-                                    _isLoadingLyrics
-                                        ? Center(
-                                            child: M3ELoadingIndicator(
-                                              color: colorScheme.primary,
-                                            ),
-                                          )
-                                        // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
-                                        : RepaintBoundary(
-                                            child: LyricsView(
-                                              lyrics: _lyrics,
-                                              parsedLyrics: _lyricMetadata,
-                                              position: Duration.zero,
-                                              positionListenable: playerProvider
-                                                  .positionNotifier,
-                                              adaptPosition: (position) =>
-                                                  _adjustedLyricPosition(
-                                                    position,
-                                                    currentSong,
-                                                  ),
-                                              doubleTapToJump: lyricDoubleTap,
-                                              onSeek: (duration) {
-                                                playerProvider.seek(duration);
-                                              },
-                                            ),
-                                          ),
-                                  ),
-                                  // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
-                                  if (_tabLayout.hasComments)
-                                    CommentsView(
-                                      songHash: currentSong.id,
-                                      albumAudioId: currentSong.albumAudioId,
-                                      // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
-                                      showComposer: false,
-                                      onReplyComment: _openComposeSheet,
-                                    ),
                                 ],
                               ),
-                            ),
+                            );
+                          },
+                        ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                Expanded(
+                  flex: symmetric ? 5 : 6,
+                  child: Column(
+                    children: [
+                      // 与 _buildLandscapeLayout 同构：平板/折叠展开也把控制面板
+                      // 搬进「控制」页，导航条常驻底部。
+                      Expanded(
+                        child: ValueListenableBuilder<bool>(
+                          valueListenable: _controlsPageGestureLock,
+                          builder: (context, locked, _) => PlayerTabPager(
+                            key: _pagerKey,
+                            tabController: _tabController,
+                            // 控制页内按下期间锁横滑：进度条/音量条的水平拖动
+                            // 优先于切页（R1 手势锁，见 _controlsPageGestureLock）
+                            physics: locked
+                                ? const NeverScrollableScrollPhysics()
+                                : null,
+                            children: [
+                              // 播放列表面板（index 0，最左侧，与 AM 一致）
+                              // 左滑切页：列表卡片吃掉了水平拖拽，靠面板内的指针判定回调补齐
+                              PlayerPlaylistView(
+                                key: _playlistKey,
+                                scrollAnchor: _playlistScroll,
+                                useAmColors: false,
+                                // 左滑跟手：面板逐帧上报进度，driver 写进 TabController
+                                onSwipeStart: _playlistSwipe.start,
+                                onSwipeProgress: _playlistSwipe.update,
+                                onSwipeRelease: (velocity, width) =>
+                                    _playlistSwipe.settle(
+                                  velocityPxPerSec: velocity,
+                                  panelWidth: width,
+                                ),
+                              ),
+                              // 控制 tab：进度/传输/音量搬进独立页签（宽屏 +
+                              // 「横屏控制面板独立页」开启时存在，与 _buildTabStrip
+                              // 的 hasControls 分支同源，都只读 _tabLayout）。
+                              // 排在歌词之前：播放列表 / 控制 / 歌词 / 评论，
+                              // 从歌单左滑一下即达，不必越过歌词与评论。
+                              if (_tabLayout.hasControls)
+                                _buildLandscapeControlPage(
+                                  playerProvider,
+                                  colorScheme,
+                                ),
+                              _wrapMd3LyricsWithAuxToggle(
+                                _isLoadingLyrics
+                                    ? Center(
+                                        child: M3ELoadingIndicator(
+                                          color: colorScheme.primary,
+                                        ),
+                                      )
+                                    // P0: 歌词时间只订阅 positionNotifier（高频 200ms）
+                                    : RepaintBoundary(
+                                        child: LyricsView(
+                                          lyrics: _lyrics,
+                                          parsedLyrics: _lyricMetadata,
+                                          position: Duration.zero,
+                                          positionListenable:
+                                              playerProvider.positionNotifier,
+                                          adaptPosition: (position) =>
+                                              _adjustedLyricPosition(
+                                                position,
+                                                currentSong,
+                                              ),
+                                          doubleTapToJump: lyricDoubleTap,
+                                          onSeek: (duration) {
+                                            _seekToLyric(duration);
+                                          },
+                                        ),
+                                      ),
+                              ),
+                              // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
+                              if (_tabLayout.hasComments)
+                                CommentsView(
+                                  songHash: currentSong.id,
+                                  albumAudioId: currentSong.albumAudioId,
+                                  // 输入不在播放器里：长按评论段/点「回复」弹出仅输入框的托盘
+                                  showComposer: false,
+                                  onReplyComment: _openComposeSheet,
+                                ),
+                            ],
                           ),
-                          // 导航条从原控制面板中提出常驻：控制面板搬进「控制」页后，
-                          // 它必须留在外面，否则进入控制页后无法点击离开（只能滑动）。
-                          // 底部 padding 包含导航栏高度；常驻档在导航条下面追加控制带。
-                          _buildChromeBottom(
-                            tier: tier,
-                            playerProvider: playerProvider,
-                            showBand: !_detachedControls && !bandInLeftPane,
-                            colorScheme: colorScheme,
-                            bottomPadding: bottomPadding,
-                          ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ],
-                );
+                      // 导航条从原控制面板中提出常驻：控制面板搬进「控制」页后，
+                      // 它必须留在外面，否则进入控制页后无法点击离开（只能滑动）。
+                      // 底部 padding 包含导航栏高度；常驻档在导航条下面追加控制带。
+                      _buildChromeBottom(
+                        tier: tier,
+                        playerProvider: playerProvider,
+                        showBand: !_detachedControls && !bandInLeftPane,
+                        colorScheme: colorScheme,
+                        bottomPadding: bottomPadding,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
               },
             ),
           ),
         ],
+          ),
+        ),
       ),
     );
   }
@@ -2757,31 +3029,46 @@ class _FullPlayerState extends State<FullPlayer>
   Widget _buildTopBar(PlayerProvider playerProvider, {bool wide = false}) {
     // 「歌曲信息 / 播放速度」等原先散落在顶栏与底部胶囊的入口统一收进更多菜单，
     // 顶栏尾部从 4 个元素回到 2 个。
-    // 整个顶栏支持向下拖拽原路返回（点击按钮仍由子元素处理，竞技场自动区分）
-    final bar = GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      // 车机模式：顶栏不参与「下拉原路收起」，否则手势会被白白吃掉
-      // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
-      // 但仍是注册了手势识别器）。
-      onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
-      onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
-      onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
-      onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
-      child: LayoutBuilder(
-        // 宽屏（横屏 / Pad）的尾部胶囊贴**页面比例内衬**：顶栏与下方 Row 同宽，
-        // 所以这里按 4/10 取到的 gutter 与左栏封面/曲名/进度尺用的是同一个值。
-        // 竖屏沿用原来的 8，不受影响。
-        builder: (context, box) => Padding(
-          padding: EdgeInsets.only(
-            left: 8,
-            right: wide ? PlayerWidePane.gutter(box.maxWidth * 4 / 10) : 8,
-            top: 4,
-            bottom: 4,
-          ),
-          child: Row(
-            children: [
-              // 车机模式：面板不可收起，左侧按钮改为「退出车机模式」（二次确认）
-              if (widget.dockMode)
+    // 整个顶栏支持向下拖拽原路返回（点击按钮仍由子元素处理，竞技场自动区分）。
+    // tv: 顶栏 = 控制 chrome 区（返回键 / 音质 / 睡眠 / 一起听 / 更多）——焦点
+    // 停在这些段上按返回键应放行收起播放页，而不是被交还到播放键。
+    // **中段的页签圆点条例外**：playerTopBarTabMiddle 在宽屏恒返回 Spacer，
+    // 竖屏开启「顶栏页签圆点」时它排的是圆点形态的 PlayerTabStrip（触屏控件，
+    // TV 下不是焦点停点），故整根顶栏包进去不会误伤 tab 栏段。
+    final bar = _tvWrapChromeScope(
+      GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        // 车机模式：顶栏不参与「下拉原路收起」，否则手势会被白白吃掉
+        // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
+        // 但仍是注册了手势识别器）。
+        onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+        onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+        onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+        onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
+        child: LayoutBuilder(
+          // 宽屏（横屏 / Pad）的尾部胶囊贴**页面比例内衬**：顶栏与下方 Row 同宽，
+          // 所以按左栏占比取到的 gutter 与左栏封面/曲名/进度尺用的是同一个值
+          // （分栏 1:1 时即内容区 1/2，4:6 时即左栏 0.4 倍）。
+          // 竖屏沿用原来的 8，不受影响。
+          builder: (context, box) => Padding(
+            padding: EdgeInsets.only(
+              left: 8,
+              right: wide
+                  ? PlayerWidePane.gutter(
+                      box.maxWidth * PlayerWidePane.leftPaneFraction(
+                        _symmetricPane,
+                      ),
+                      // 「自定义宽屏边距」覆盖值：与左栏同一来源，保持对齐
+                      override: kWidePaneMarginOverride.value,
+                    )
+                  : 8,
+              top: 4,
+              bottom: 4,
+            ),
+            child: Row(
+              children: [
+                // 车机模式：面板不可收起，左侧按钮改为「退出车机模式」（二次确认）
+                if (widget.dockMode)
                 IconButton(
                   icon: const Icon(Icons.close_fullscreen),
                   tooltip: '退出车机模式',
@@ -2790,7 +3077,11 @@ class _FullPlayerState extends State<FullPlayer>
               else
                 IconButton(
                   icon: const Icon(Icons.keyboard_arrow_down),
-                  onPressed: _collapseByButton,
+                  // 编辑模式下先退出编辑，与系统返回键同口径
+                  onPressed: () {
+                    if (_exitPlaylistEditModeIfActive()) return;
+                    _collapseByButton();
+                  },
                 ),
               // 页签条位置由「顶栏页签圆点」开关决定（默认关闭 = 留在底部，见 _buildControls）；
               // 判断口径收在 playerTopBarTabMiddle 里，宽屏恒为 Spacer。
@@ -2838,9 +3129,10 @@ class _FullPlayerState extends State<FullPlayer>
                       // 宽屏/横屏不带底色，前景也就不能再用「贴在容器上」的那套色：
                       // onPrimaryContainer 压在页面背景/壁纸上会发灰，改吃 onSurface
                       // （与 ⋯ 用的 onSurfaceVariant 同一套裸 chrome 取色）。
-                      foreground: wide
-                          ? Theme.of(context).colorScheme.onSurface
-                          : style.foregroundColor,
+                      foreground:
+                          wide
+                              ? Theme.of(context).colorScheme.onSurface
+                              : style.foregroundColor,
                       // 横屏裸化：不画那层连体底色，每格与 ⋯ 一样是裸图标 + 文案。
                       showBackground: !wide,
                       dotColor: Theme.of(context).colorScheme.error,
@@ -2860,6 +3152,7 @@ class _FullPlayerState extends State<FullPlayer>
           ),
         ),
       ),
+    ),
     );
 
     return bar;
@@ -2897,10 +3190,7 @@ class _FullPlayerState extends State<FullPlayer>
   /// [faded] = **淡化**形态，用于进度条下方那一行（车机面板）：只把容器降到 55% alpha，
   /// 图标与文字保持满色。那一行的时间数字靠各自的 `AnimatedOpacity` 压暗，徽章若跟着
   /// 整块合成到封面上就会发灰发暗（看着像禁用）—— 淡是它自己变轻，不是被压暗。
-  Widget _buildQualityPill(
-    PlayerProvider playerProvider, {
-    bool faded = false,
-  }) {
+  Widget _buildQualityPill(PlayerProvider playerProvider, {bool faded = false}) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final song = playerProvider.currentSong;
@@ -2999,6 +3289,143 @@ class _FullPlayerState extends State<FullPlayer>
     return SongDanmakuHost(cover: cover);
   }
 
+  /// 队列里相对当前曲目偏移 [delta] 的邻居；不可用时返回 null（该页画空白）。
+  ///
+  /// 绕回口径与 [PlayerProvider.next] / [previous] 取下一首的算法一致：
+  /// 只有列表循环（[AppLoopMode.all]）才首尾相接，其余模式到头就是没有邻居。
+  /// 因此 `player.playlist` 里的邻居就是按钮路径真正的目标曲目。
+  Song? _pagerNeighborSong(PlayerProvider player, int delta) {
+    final list = player.playlist;
+    if (list.length < 2) return null;
+    final index = player.currentIndex + delta;
+    if (index < 0) {
+      return player.loopMode == AppLoopMode.all ? list[list.length - 1] : null;
+    }
+    if (index >= list.length) {
+      return player.loopMode == AppLoopMode.all ? list[0] : null;
+    }
+    return list[index];
+  }
+
+  /// 邻居页：只画静态封面。
+  ///
+  /// **刻意不建 `DynamicCoverView`**：动态封面会各自拉起一路 `video_player`，
+  /// 横滑过程中同时存在三路纯属浪费；邻居页也不需要频谱（那是当前曲目的装饰）。
+  Widget _buildPagerPage(
+    Song? song,
+    ColorScheme colorScheme, {
+    required double iconSize,
+  }) {
+    if (song == null) return const SizedBox.shrink();
+    return DepthCoverHost(
+      artworkUri: song.artworkUri,
+      fallbackFilePath: song.localPath,
+      fit: BoxFit.cover,
+      iconSize: iconSize,
+      backgroundColor: colorScheme.surfaceContainerHighest,
+      iconColor: colorScheme.onSurfaceVariant,
+    );
+  }
+
+  /// 当前页：沿用既有封面淡入淡出 + 动态封面层。
+  ///
+  /// 淡入淡出在这里不是冗余：方向未知的切歌（歌单点歌 / 一起听同步 / 冷启动
+  /// 恢复）不滑动，全靠它兜底，画面与改动前逐像素一致。
+  Widget _buildCurrentPagerPage(
+    dynamic currentSong,
+    ColorScheme colorScheme, {
+    required double iconSize,
+    required bool isPlaying,
+  }) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _buildCrossfadeArtwork(
+          currentSong.artworkUri,
+          colorScheme,
+          iconSize: iconSize,
+          fallbackFilePath: currentSong.localPath,
+        ),
+        if (currentSong is Song && currentSong.isOnline)
+          DynamicCoverView(song: currentSong, enabled: _dynamicCoverEnabled),
+      ],
+    );
+  }
+
+  /// 封面槽的最终内容：圆角卡片横向切换 pager。
+  ///
+  /// 频谱圆盘模式（style 0/1）**不做横滑**：封面是随音乐旋转的圆盘，环状频谱
+  /// 以圆盘中心为圆心绘制，圆盘位移会让圆心跟着漂；该模式沿用原封面淡入淡出。
+  Widget _buildCoverPagerOrStatic(
+    dynamic currentSong,
+    ColorScheme colorScheme, {
+    required double side,
+    double iconSize = 48.0,
+    required bool isPlaying,
+  }) {
+    if (_isDiscCover) {
+      return _buildCrossfadeArtworkWrapper(
+        currentSong,
+        colorScheme,
+        iconSize: iconSize,
+        isPlaying: isPlaying,
+      );
+    }
+    final player = context.read<PlayerProvider>();
+    return SongDanmakuHost(
+      cover: PlayerCoverShadow.wrap(
+        shadowColor: colorScheme.shadow,
+        child: CoverSwitchPager(
+          key: _coverPagerKey,
+          side: side,
+          radius: kCoverMorphFullRadius,
+          pages: [
+            _buildPagerPage(
+              _pagerNeighborSong(player, -1),
+              colorScheme,
+              iconSize: iconSize,
+            ),
+            _buildCurrentPagerPage(
+              currentSong,
+              colorScheme,
+              iconSize: iconSize,
+              isPlaying: isPlaying,
+            ),
+            _buildPagerPage(
+              _pagerNeighborSong(player, 1),
+              colorScheme,
+              iconSize: iconSize,
+            ),
+          ],
+          canGoPrevious: _pagerNeighborSong(player, -1) != null,
+          canGoNext: _pagerNeighborSong(player, 1) != null,
+          onCommit: _onCoverPagerCommit,
+          onDragStarted: _onCoverPagerDragStarted,
+        ),
+      ),
+    );
+  }
+
+  /// 拖动提交：真正去切歌。按钮路径与拖动路径最终都落到这里。
+  void _onCoverPagerCommit(CoverSwitchIntent intent) {
+    AppHaptics.click(HapticCategory.transport);
+    final player = context.read<PlayerProvider>();
+    switch (intent) {
+      case CoverSwitchIntent.previous:
+        player.previous();
+      case CoverSwitchIntent.next:
+        player.next();
+    }
+  }
+
+  /// 拖动开始时停掉封面淡入淡出：否则旧封面会同时被「淡出」与「滑走」，
+  /// 叠成一层半透明残影。
+  void _onCoverPagerDragStarted() {
+    if (!_artworkFadeController.isAnimating) return;
+    _artworkFadeController.stop();
+    _previousArtworkUrl = context.read<PlayerProvider>().currentSong?.artworkUri;
+  }
+
   Widget _buildCoverArtwork(
     dynamic currentSong,
     ColorScheme colorScheme, {
@@ -3017,6 +3444,9 @@ class _FullPlayerState extends State<FullPlayer>
         opacity: _spectrumStyle == 1
             ? _spectrumCurveOpacity
             : _spectrumBarOpacity,
+        // 与 MiniPlayer 交接期间把环形柱让位（交接后 350ms 淡入回来）：
+        // 飞行期本子树被槽位 Opacity(0) 隐藏，柱体会在交接帧突然显形。
+        morphProgress: playerExpansion,
       );
     }
     return PlayerCoverShadow.wrap(
@@ -3111,6 +3541,7 @@ class _FullPlayerState extends State<FullPlayer>
                                 ? 1.0
                                 : (playerProvider.isPlaying ? 1.0 : 0.85),
                             settledAnchor: Alignment.center,
+                            settledInsetRatio: _coverMorphSettledInset,
                             child: AnimatedScale(
                               // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
                               scale: _isDiscCover
@@ -3118,9 +3549,10 @@ class _FullPlayerState extends State<FullPlayer>
                                   : (playerProvider.isPlaying ? 1.0 : 0.85),
                               duration: const Duration(milliseconds: 500),
                               curve: Curves.easeOutBack,
-                              child: _buildCrossfadeArtworkWrapper(
+                              child: _buildCoverPagerOrStatic(
                                 currentSong,
                                 colorScheme,
+                                side: maxSize,
                                 iconSize: iconSize,
                                 isPlaying: playerProvider.isPlaying,
                               ),
@@ -3150,6 +3582,7 @@ class _FullPlayerState extends State<FullPlayer>
                       ? 1.0
                       : (playerProvider.isPlaying ? 1.0 : 0.85),
                   settledAnchor: Alignment.center,
+                  settledInsetRatio: _coverMorphSettledInset,
                   child: AnimatedScale(
                     // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
                     scale: _isDiscCover
@@ -3157,11 +3590,18 @@ class _FullPlayerState extends State<FullPlayer>
                         : (playerProvider.isPlaying ? 1.0 : 0.85),
                     duration: const Duration(milliseconds: 500),
                     curve: Curves.easeOutBack,
-                    child: _buildCrossfadeArtworkWrapper(
-                      currentSong,
-                      colorScheme,
-                      iconSize: iconSize,
-                      isPlaying: playerProvider.isPlaying,
+                    // 包一层 LayoutBuilder 只为拿到**真实**封面边长：外层
+                    // AspectRatio 给的是 tight(side × side) 约束，这里读到多少
+                    // 就是多少，pager 的 pitch 才不会与可视窗口错位。
+                    child: LayoutBuilder(
+                      builder: (context, constraints) =>
+                          _buildCoverPagerOrStatic(
+                            currentSong,
+                            colorScheme,
+                            side: constraints.maxWidth,
+                            iconSize: iconSize,
+                            isPlaying: playerProvider.isPlaying,
+                          ),
                     ),
                   ),
                 ),
@@ -3249,7 +3689,7 @@ class _FullPlayerState extends State<FullPlayer>
       titleStyle: spec.titleStyle,
       subtitleStyle: spec.subtitleStyle,
       align: spec.align,
-      // 文字侧只认结构条件：频谱圆盘开着时歌名照飞（封面才不飞）
+      // 文字侧只认结构条件：封面形状（含频谱圆盘）不影响歌名是否飞
       eligible: () => _morphTextEligible,
       child: _buildTitleBlock(
         playerProvider,
@@ -3285,31 +3725,50 @@ class _FullPlayerState extends State<FullPlayer>
     final textAlign = spec.align == Alignment.center
         ? TextAlign.center
         : TextAlign.left;
-    return Column(
-      crossAxisAlignment: alignment,
-      children: [
-        InkWell(
-          onTap: () => _navigateToAlbum(currentSong as Song),
-          borderRadius: BorderRadius.circular(4),
-          // 过长歌名不换行，改优雅滚动（两端停顿 + 缓动往返 + 边缘渐隐）。
-          child: GentleScrollingText(
-            spec.title,
-            style: spec.titleStyle,
-            textAlign: textAlign,
+    return TitleSwitchFade(
+      version: currentSong.id.toString(),
+      align: spec.align,
+      // 频谱圆盘模式下封面不做横滑，标题也就不需要延迟分层，
+      // 保持「同时换」与既有观感一致。
+      enabled: !_isDiscCover,
+      child: Column(
+        crossAxisAlignment: alignment,
+        children: [
+          InkWell(
+            onTap: () => _navigateToAlbum(currentSong as Song),
+            borderRadius: BorderRadius.circular(4),
+            // 过长歌名不换行，改优雅滚动（两端停顿 + 缓动往返 + 边缘渐隐）。
+            child: GentleScrollingText(
+              spec.title,
+              style: spec.titleStyle,
+              textAlign: textAlign,
+            ),
           ),
-        ),
-        const SizedBox(height: 2),
-        InkWell(
-          onTap: () => _navigateToAlbum(currentSong as Song),
-          borderRadius: BorderRadius.circular(4),
-          child: GentleScrollingText(
-            spec.subtitle,
-            style: spec.subtitleStyle,
-            textAlign: textAlign,
+          const SizedBox(height: 2),
+          InkWell(
+            onTap: () => _navigateToAlbum(currentSong as Song),
+            borderRadius: BorderRadius.circular(4),
+            child: GentleScrollingText(
+              spec.subtitle,
+              style: spec.subtitleStyle,
+              textAlign: textAlign,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
+  }
+
+  /// tv: 把「播放控制 chrome 区」标出来——返回键据此判断「焦点已在控制区」
+  /// （放行 → 收起播放页）与「焦点在右侧区域 / 页签条」（交还播放键）。
+  /// 见 `tv_player_back_focus.dart` 的 `TvPlayerChromeScope`。
+  ///
+  /// **页签条不包**：`_buildChromeBottom` / [_buildControls] 里的遥控页签条
+  /// 正是返回键要救的对象，包了它焦点停在 tab 栏段时返回键又会被放行成 pop 页面。
+  /// 非 TV 构建原样返回，触屏路径零变化。
+  Widget _tvWrapChromeScope(Widget child) {
+    if (!kTvBuild) return child;
+    return TvPlayerChromeScope(child: child);
   }
 
   /// 底部控制区 —— 三层等权重的旧结构（进度行 / 传输行 / 操作胶囊）压成两层：
@@ -3344,32 +3803,45 @@ class _FullPlayerState extends State<FullPlayer>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const PlaybackStatusFeedback(),
-          // 与上方 tab 内容拉开距离：进度条拖动时时间标签会向上浮出 16px
-          SizedBox(height: isExpanded ? 4 : 8),
-          // P0: 进度条监听 positionNotifier（高频 200ms）+ provider（duration 等低频），
-          // 不再因 positionStream 触发 _buildControls 整体重建
-          ListenableBuilder(
-            listenable: Listenable.merge([
-              playerProvider.positionNotifier,
-              playerProvider,
-              // 进度条波浪回退开关：切换即重建进度条，不需要 setState
-              kSeekBarWaveEnabled,
-            ]),
-            builder: (context, _) => _buildProgressBar(
-              playerProvider,
-              playerProvider.position,
-              duration,
-              colorScheme,
+          // tv: **只把控制块这一截**（提示条 / 进度尺 / 传输行）标为控制 chrome。
+          // 页签条必须留在作用域之外 —— 遥控 TabBar 正是返回键要救的对象
+          // （见 [_tvWrapChromeScope] 与 `full_player.dart` 的 `_buildChromeBottom`）。
+          _tvWrapChromeScope(
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const PlaybackStatusFeedback(),
+                // 与上方 tab 内容拉开距离：进度条拖动时时间标签会向上浮出 16px
+                SizedBox(height: isExpanded ? 4 : 8),
+                // P0: 进度条监听 positionNotifier（高频 200ms）+ provider（duration 等低频），
+                // 不再因 positionStream 触发 _buildControls 整体重建
+                ListenableBuilder(
+                  listenable: Listenable.merge([
+                    playerProvider.positionNotifier,
+                    playerProvider,
+                    // 进度条波浪回退开关：切换即重建进度条，不需要 setState
+                    kSeekBarWaveEnabled,
+                    // 「音频过渡中」提示：交叉淡化起止只改这一个 notifier，
+                    // 不必让整页 provider 通知跟着走（见 playback_hint_pills.dart）
+                    playerProvider.crossfadeActiveNotifier,
+                  ]),
+                  builder: (context, _) => _buildProgressBar(
+                    playerProvider,
+                    playerProvider.position,
+                    duration,
+                    colorScheme,
+                  ),
+                ),
+                // 进度条与播放控件之间留白：竖屏拉到 28，让「时间数字那一行」与按钮
+                // 不粘在一起（拖动时时间标签上移 16px，低于这个留白就会压到按钮上）。
+                SizedBox(height: baseGap),
+                _buildMainControls(
+                  playerProvider,
+                  colorScheme,
+                  isExpanded: isExpanded,
+                ),
+              ],
             ),
-          ),
-          // 进度条与播放控件之间留白：竖屏拉到 28，让「时间数字那一行」与按钮
-          // 不粘在一起（拖动时时间标签上移 16px，低于这个留白就会压到按钮上）。
-          SizedBox(height: baseGap),
-          _buildMainControls(
-            playerProvider,
-            colorScheme,
-            isExpanded: isExpanded,
           ),
           // 页签条：默认（「顶栏页签圆点」关闭）留在这里，且是**原 icon + 指示线**
           // 形态 —— 底部是一条独立带，图标比圆点认得出页。开启后它升到顶栏中央并
@@ -3393,6 +3865,11 @@ class _FullPlayerState extends State<FullPlayer>
   /// 数量与 TabController.length 不一致会直接抛断言（计划 R4）。
   bool get _detachedControls =>
       !widget.dockMode && kLandscapeDetachedControlsEnabled.value;
+
+  /// 宽屏左右分栏是否对称（1:1）。用户开关；车机模式（dockMode）固定单栏，
+  /// 与分栏无关，跟 [_detachedControls] 一样先排除。
+  bool get _symmetricPane =>
+      !widget.dockMode && kSymmetricWidePaneEnabled.value;
 
   /// 常驻档的**进度尺带**。`leftPane` 决定它挂在哪一栏，并连带两件事：
   ///
@@ -3431,7 +3908,11 @@ class _FullPlayerState extends State<FullPlayer>
   Widget _buildTransportCluster(
     PlayerProvider playerProvider,
     ColorScheme colorScheme,
-  ) => _buildMainControls(playerProvider, colorScheme, isExpanded: true);
+  ) => _buildMainControls(
+    playerProvider,
+    colorScheme,
+    isExpanded: true,
+  );
 
   /// 宽屏右栏底部 chrome：页签条，外加**装不进左栏时**的进度尺带。
   ///
@@ -3455,17 +3936,28 @@ class _FullPlayerState extends State<FullPlayer>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (showBand)
-              _buildControlDock(
-                tier,
-                playerProvider,
-                colorScheme,
-                leftPane: false,
-              )
-            else if (!_detachedControls)
-              // 尺搬去左栏了，加载/失败提示条留在右栏这一侧：它撑得起来（错误文案
-              // 两行 ≈ 50dp），而左栏 chrome 是不定高的非 flex 子项，塞进去就是溢出。
-              const PlaybackStatusFeedback(),
+            // tv: **只把尺带 / 提示条这一截**标为控制 chrome。页签条必须留在
+            // 作用域之外 —— 遥控 TabBar 正是返回键要救的对象，把它包进来焦点停
+            // 在 tab 栏段时返回键又会被放行成 pop 页面（2026-10-20 真机探针实测：
+            // 整条 Column 一起包时 tab 栏段的 `inChrome=true`，修复失效）。
+            _tvWrapChromeScope(
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (showBand)
+                    _buildControlDock(
+                      tier,
+                      playerProvider,
+                      colorScheme,
+                      leftPane: false,
+                    )
+                  else if (!_detachedControls)
+                    // 尺搬去左栏了，加载/失败提示条留在右栏这一侧：它撑得起来（错误文案
+                    // 两行 ≈ 50dp），而左栏 chrome 是不定高的非 flex 子项，塞进去就是溢出。
+                    const PlaybackStatusFeedback(),
+                ],
+              ),
+            ),
             // 宽屏右栏底部的形态与竖屏底部同源（关 = icon + 指示线，开 = 圆点），
             // 见 playerWideTabStripVariant；位置不变，横屏恒在右栏底部。
             // 订阅开关让设置页改完回到播放页即时换形态，不必重进路由。
@@ -3495,21 +3987,25 @@ class _FullPlayerState extends State<FullPlayer>
     PlayerProvider playerProvider,
     ColorScheme colorScheme,
   ) {
-    return PlayerControlDock(
-      tier: PlayerDockTier.detached,
-      skin: DockSkin.md3,
-      playerProvider: playerProvider,
-      colorScheme: colorScheme,
-      // 独立控制页不再挂音质徽章：它与其它形态同规则，统一在顶栏（见 _buildTopBar）。
-      // 独立控制页有整页高度：中间三控件用不加窄的全尺寸档
-      // （侧键 56 / 播放键 76 / 间距 12，同时把常驻档 44 的侧键命中框抬到 48 以上）
-      transport: _buildMainControls(
-        playerProvider,
-        colorScheme,
-        isExpanded: false,
-      ),
-      swipeLock: _lockSliderRowSwipe,
-    );
+      // tv: 独立「控制」页整页都是控制 chrome —— 焦点停在这里按返回键应放行
+      // （收起播放页），而不是被交还到播放键（见 [_tvWrapChromeScope]）。
+      return _tvWrapChromeScope(
+        PlayerControlDock(
+          tier: PlayerDockTier.detached,
+          skin: DockSkin.md3,
+          playerProvider: playerProvider,
+          colorScheme: colorScheme,
+          // 独立控制页不再挂音质徽章：它与其它形态同规则，统一在顶栏（见 _buildTopBar）。
+          // 独立控制页有整页高度：中间三控件用不加窄的全尺寸档
+          // （侧键 56 / 播放键 76 / 间距 12，同时把常驻档 44 的侧键命中框抬到 48 以上）
+          transport: _buildMainControls(
+            playerProvider,
+            colorScheme,
+            isExpanded: false,
+          ),
+          swipeLock: _lockSliderRowSwipe,
+        ),
+      );
   }
 
   /// 把横滑手势锁罩住一行：按住期间 pager 不可横滑，松手还原。
@@ -3556,6 +4052,9 @@ class _FullPlayerState extends State<FullPlayer>
       labelRowBadge: widget.dockMode
           ? _buildQualityPill(playerProvider, faded: true)
           : null,
+      // 时间行中央的瞬时状态提示（「缓冲中」/「音频过渡中」）：居中于两个时间
+      // 数字之间，与徽章共用中央组；无提示时传 null，时间行保持原 14dp 定高。
+      labelRowHints: playerHintPillsFor(playerProvider, amStyle: false),
       onSeekStart: () {
         _wasPlayingBeforeDrag = playerProvider.isPlaying;
         if (_wasPlayingBeforeDrag) {
@@ -3594,13 +4093,18 @@ class _FullPlayerState extends State<FullPlayer>
             ? context.watch<FavoritesProvider>().isFavorite(song.id)
             : context.watch<LocalFavoritesProvider>().isFavorite(song.id));
 
-    return Row(
-      children: [
+    // tv: 传输三键 + 播放模式 + 收藏 = 控制 chrome 的核心，整行包进作用域。
+    // 左栏常驻簇（_buildTransportCluster）与独立控制页都经这里出去，
+    // 一处接线覆盖两条路径。非 TV 构建原样返回 Row，触屏路径零变化。
+    return _tvWrapChromeScope(
+      Row(
+        children: [
         // 左端：播放模式（不循环 → 列表循环 → 单曲循环 → 随机，单键循环切换）
         Expanded(
           child: Align(
             alignment: Alignment.centerLeft,
             child: _buildEdgeAction(
+              debugLabel: 'tv/play-mode',
               icon: _playModeIcon(
                 playerProvider.shuffleEnabled,
                 playerProvider.loopMode,
@@ -3621,6 +4125,8 @@ class _FullPlayerState extends State<FullPlayer>
           sideButtonSize: isExpanded ? 44.0 : 56.0,
           playButtonSize: isExpanded ? 60.0 : 76.0,
           spacing: isExpanded ? 8.0 : 12.0,
+          // tv: 首焦点锚点落在中央播放键（只首帧一次，见 _tvAutofocusDone）。
+          autofocusPlay: kTvBuild && !_tvAutofocusDone,
           onPrevious: () {
             AppHaptics.click(HapticCategory.transport);
             playerProvider.previous();
@@ -3643,6 +4149,7 @@ class _FullPlayerState extends State<FullPlayer>
           child: Align(
             alignment: Alignment.centerRight,
             child: _buildEdgeAction(
+              debugLabel: 'tv/favorite',
               icon: isFavorited ? Icons.favorite : Icons.favorite_border,
               color: isFavorited
                   ? colorScheme.error
@@ -3670,27 +4177,43 @@ class _FullPlayerState extends State<FullPlayer>
             ),
           ),
         ),
-      ],
+        ],
+      ),
     );
   }
 
   /// 传输行两端的次要动作：48dp 圆形触达区，无容器背景。
   /// 不挂 Tooltip：长按只执行长按动作（如收藏长按开 AI 推荐），不弹按钮说明。
+  ///
+  /// tv: TV 构建换 [TvPlayerEdgeAction]（`DpadFocusable` 单停点）——裸 `InkWell`
+  /// 在 TV 上落不下焦点（见该组件类注释）。非 TV 构建原样返回 `InkWell`，
+  /// 触屏路径零变化。
   Widget _buildEdgeAction({
     required IconData icon,
     required Color color,
     VoidCallback? onTap,
     VoidCallback? onLongPress,
+    String? debugLabel,
   }) {
+    final body = SizedBox(
+      width: 48,
+      height: 48,
+      child: Center(child: Icon(icon, size: 24, color: color)),
+    );
+    if (kTvBuild) {
+      return TvPlayerEdgeAction(
+        icon: icon,
+        color: color,
+        debugLabel: debugLabel,
+        onSelect: onTap,
+        onLongSelect: onLongPress,
+      );
+    }
     return InkWell(
       onTap: onTap,
       onLongPress: onLongPress,
       customBorder: const CircleBorder(),
-      child: SizedBox(
-        width: 48,
-        height: 48,
-        child: Center(child: Icon(icon, size: 24, color: color)),
-      ),
+      child: body,
     );
   }
 
@@ -3752,9 +4275,7 @@ class _FullPlayerState extends State<FullPlayer>
         desktopLyricEnabled: DesktopLyricService.instance.enabled,
         // 长按封面段：弹出下载音质选择（本地歌曲与钩子缺失时不给回调）
         coverOnLongPress:
-            song != null &&
-                isOnline &&
-                FullPlayer.coverLongPressCallback != null
+            song != null && isOnline && FullPlayer.coverLongPressCallback != null
             ? () {
                 AppHaptics.lightImpact(HapticCategory.navigation);
                 FullPlayer.coverLongPressCallback!(context, song);
@@ -3766,24 +4287,30 @@ class _FullPlayerState extends State<FullPlayer>
     );
   }
 
-  /// tv: 遥控专属 TabBar（P-E，移植自 TV 参考实现 `_buildRemoteTabBar`，
-  /// 并按本仓 tab 结构适配）——本仓 tab 0 是播放列表，封面/评论 tab 由
-  /// [_tabLayout] 条件增删，顺序与 `PlayerTabPager.children` 严格对应。
-  /// 段本身是 InkWell：D-pad 聚焦后 OK 键激活（原生 Actions 链路），无需再包
-  /// DpadFocusable。配色与 PlayerTabStrip 同源（primary / onSurfaceVariant）。
-  /// Zen 模式下随 `_buildControls` 一并淡出。
+  /// tv: 遥控专属底部 TabBar（P-E）：左右方向键直接切页，无需 OK。
+  ///
+  /// labels 由 [_tabLayout] 的 `tabKinds` 派生（顺序唯一真值，与
+  /// TabController.length / PlayerTabPager.children 同源；TV 恒宽屏故无封面
+  /// 段，控制段随设置出现——旧实现漏了控制段，结构变化时会数量不一致）。
   Widget _buildRemoteTabBar(ColorScheme colorScheme) {
-    return TabBar(
-      controller: _tabController,
-      dividerColor: Colors.transparent,
-      labelColor: colorScheme.primary,
-      unselectedLabelColor: colorScheme.onSurfaceVariant,
-      tabs: [
-        const Tab(text: '列表'),
-        if (_tabLayout.hasCover) const Tab(text: '封面'),
-        const Tab(text: '歌词'),
-        if (_tabLayout.hasComments) const Tab(text: '评论'),
-      ],
+    return AnimatedBuilder(
+      animation: _tabController,
+      builder: (context, _) => TvPlayerTabBar(
+        labels: [
+          for (final kind in _tabLayout.tabKinds)
+            switch (kind) {
+              PlayerTabKind.playlist => '列表',
+              PlayerTabKind.cover => '封面',
+              PlayerTabKind.controls => '控制',
+              PlayerTabKind.lyrics => '歌词',
+              PlayerTabKind.comments => '评论',
+            }
+        ],
+        currentIndex: _tabController.index,
+        activeColor: colorScheme.primary,
+        inactiveColor: colorScheme.onSurfaceVariant,
+        onSelected: (index) => _tabController.animateTo(index),
+      ),
     );
   }
 
@@ -3804,7 +4331,7 @@ class _FullPlayerState extends State<FullPlayer>
       // 语义，本地歌曲在酷狗也没有弹幕池）。
       onDanmakuSent: target == null && songDanmakuUsable(song)
           ? (text) =>
-                SongDanmakuHost.deliverText(text, song.id, player.position)
+              SongDanmakuHost.deliverText(text, song.id, player.position)
           : null,
     );
   }
@@ -3853,6 +4380,15 @@ class _FullPlayerState extends State<FullPlayer>
   /// 导航条拖动结束：吸附到最近 tab
   void _onTabDragEnd() {
     _pagerKey.currentState?.settleNearest();
+  }
+
+  /// 卡片深链在车机模式下的落点：指挥本面板实例切到歌词页。统一 postFrame：
+  /// 命令可能在面板实例 initState 后、pager 未就绪的当帧到达，此时 goToPage
+  /// 是 no-op，落一帧等它就位再切。
+  void _goDockLyrics() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _goToTab(_tabLayout.lyricsIndex);
+    });
   }
 
   /// 程序化切页（封面页点击、歌词页点击等）。
@@ -3905,11 +4441,10 @@ class _FullPlayerState extends State<FullPlayer>
                                 vertical: 4,
                               ),
                               decoration: BoxDecoration(
-                                color:
-                                    (usbExclusive
-                                            ? Colors.green
-                                            : colorScheme.primary)
-                                        .withValues(alpha: 0.12),
+                                color: (usbExclusive
+                                        ? Colors.green
+                                        : colorScheme.primary)
+                                    .withValues(alpha: 0.12),
                                 borderRadius: BorderRadius.circular(999),
                               ),
                               child: Text(
@@ -3933,19 +4468,12 @@ class _FullPlayerState extends State<FullPlayer>
                                 ? RemoteSlider(
                                     value: volume,
                                     onChanged: (value) {
-                                      current.apply(
-                                        playerProvider,
-                                        value,
-                                        persist: false,
-                                      );
+                                      current.apply(playerProvider, value, persist: false);
                                       setState(() {});
                                     },
                                     // 松手才落盘（拖动中只实时下发，与触屏同口径）
-                                    onChangeEnd: (value) => current.apply(
-                                      playerProvider,
-                                      value,
-                                      persist: true,
-                                    ),
+                                    onChangeEnd: (value) =>
+                                        current.apply(playerProvider, value, persist: true),
                                   )
                                 : M3ESlider(
                                     value: volume,
@@ -3974,7 +4502,7 @@ class _FullPlayerState extends State<FullPlayer>
                                         persist: true,
                                       );
                                     },
-                                  ),
+                                ),
                             Text(
                               '$percent%',
                               style: Theme.of(context).textTheme.labelMedium,
@@ -4011,8 +4539,15 @@ class _FullPlayerState extends State<FullPlayer>
     final offset = (song != null && song.isOnline)
         ? SettingsRepository.lyricTimeOffsetMs.value
         : 0;
-    final rawMs = position.inMilliseconds;
-    return Duration(milliseconds: rawMs > offset ? rawMs - offset : 0);
+    return lyricDisplayPosition(position, offsetMs: offset);
+  }
+
+  void _seekToLyric(Duration timestamp) {
+    final player = context.read<PlayerProvider>();
+    final offset = player.currentSong?.isOnline == true
+        ? SettingsRepository.lyricTimeOffsetMs.value
+        : 0;
+    player.seek(lyricSeekPosition(timestamp, offsetMs: offset));
   }
 
   // 下载功能未移植（公开库不包含下载）：原封面长按入口已移除。
@@ -4021,10 +4556,7 @@ class _FullPlayerState extends State<FullPlayer>
     final song = context.read<PlayerProvider>().currentSong;
     if (song == null) return;
 
-    // 动态标题：显示专辑名/歌手名（截断处理）
-    final albumTitle = song.album.isEmpty ? '查看专辑' : '查看专辑：${song.album}';
-    final artistTitle = song.artist.isEmpty ? '查看歌手' : '查看歌手：${song.artist}';
-
+    // 动态标题原为 ListTile 文案（专辑名/歌手名截断），改宫格后不再需要。
     showM3EModalBottomSheet(
       context: rootContext,
       isScrollControlled: true,
@@ -4038,44 +4570,6 @@ class _FullPlayerState extends State<FullPlayer>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // 查看 MV：仅在线歌曲显示（原顶栏按钮收纳到菜单，置顶）
-                if (song.isOnline == true)
-                  ListTile(
-                    leading: const Icon(Icons.music_video_outlined),
-                    title: const Text('查看 MV'),
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      _pageNavigator(rootContext)?.push(
-                        MaterialPageRoute(
-                          builder: (_) => MvPlayerPage(song: song),
-                        ),
-                      );
-                    },
-                  ),
-                ListTile(
-                  leading: const Icon(Icons.album),
-                  title: Text(
-                    albumTitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  onTap: () {
-                    Navigator.pop(sheetContext);
-                    _navigateToAlbum(song);
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.person),
-                  title: Text(
-                    artistTitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  onTap: () {
-                    Navigator.pop(sheetContext);
-                    _navigateToArtist(song);
-                  },
-                ),
                 // 本地歌曲：匹配在线歌曲，补充封面兜底/歌词精确检索/评论区
                 if (!song.isOnline && song.localPath != null)
                   ListTile(
@@ -4086,28 +4580,28 @@ class _FullPlayerState extends State<FullPlayer>
                       showSongMatchSheet(rootContext, song);
                     },
                   ),
+                if (song.isOnline)
+                  ListTile(
+                    leading: const Icon(Icons.playlist_add),
+                    title: const Text('添加到歌单'),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      showAddToPlaylistDialog(rootContext, song);
+                    },
+                  ),
+                // 歌曲信息：采样频率/位深/声道/文件大小 + 本地歌曲在线信息入口。
+                // USB 独占区块只在 Android 手机显示（supportsUsbExclusive 已排除
+                // 桌面端与 TV 构建），其余内容在播放页没有等价展示，故恢复入口。
                 ListTile(
-                  leading: const Icon(Icons.playlist_add),
-                  title: const Text('添加到歌单'),
+                  leading: const Icon(Icons.info_outline),
+                  title: const Text('歌曲信息'),
                   onTap: () {
                     Navigator.pop(sheetContext);
-                    showAddToPlaylistDialog(rootContext, song);
+                    _pageNavigator(rootContext)?.push(
+                      MaterialPageRoute(builder: (_) => const SongInfoPage()),
+                    );
                   },
                 ),
-                // 歌曲信息：频率/位深/码率/声道 + USB 独占开关（原顶栏按钮收纳到菜单）
-                // 已移除：页内 USB 独占整块已删（桌面端不可用），剩余的格式信息
-                // 与播放页已有的封面/码率展示重复，故整个入口一并去掉。
-                //
-                // ListTile(
-                //   leading: const Icon(Icons.info_outline),
-                //   title: const Text('歌曲信息'),
-                //   onTap: () {
-                //     Navigator.pop(sheetContext);
-                //     _pageNavigator(rootContext)?.push(
-                //       MaterialPageRoute(builder: (_) => const SongInfoPage()),
-                //     );
-                //   },
-                // ),
                 // 播放速度：低频动作，不占底部常驻位置
                 ListTile(
                   leading: const Icon(Icons.speed),
@@ -4134,7 +4628,8 @@ class _FullPlayerState extends State<FullPlayer>
                   ),
                   child: PlayerVolumeBar(amStyle: false),
                 ),
-                // 均衡器 / 定时关闭 / 投屏：同一行三格宫格，上方 icon 下方文字
+                // 宫格组合容器：上行 MV/专辑/歌手/曲谱（一行四格），分割线，
+                // 下行 均衡器/音效/定时关闭/投屏。同一 MenuActionCell 样式。
                 Container(
                   margin: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -4147,81 +4642,145 @@ class _FullPlayerState extends State<FullPlayer>
                     borderRadius: BorderRadius.circular(16),
                   ),
                   padding: const EdgeInsets.symmetric(vertical: 12),
-                  child: Row(
+                  child: Column(
                     children: [
-                      // 均衡器 / 音效：依赖 EqualizerService 的 Android
-                      // AudioSession 绑定，桌面端 tryBind() 直接 return false，
-                      // 开关能开能存盘但没有任何音效被挂载（假成功），
-                      // 故桌面端整格隐藏。见 platform_capabilities。
-                      if (supportsSystemAudioEffects) ...[
-                        ListenableBuilder(
-                          listenable: EqualizerService.instance,
-                          builder: (context, _) {
-                            final eq = EqualizerService.instance;
-                            return MenuActionCell(
-                              icon: Icons.graphic_eq,
-                              label: '均衡器',
-                              active: eq.enabled,
-                              enabled: !eq.systemEffectsDisabled,
-                              onTap: () {
-                                Navigator.pop(sheetContext);
-                                _pageNavigator(rootContext)?.push(
-                                  MaterialPageRoute(
-                                    builder: (_) =>
-                                        const EqualizerSettingsPage(),
-                                  ),
-                                );
-                              },
-                            );
-                          },
-                        ),
-                        ListenableBuilder(
-                          listenable: EqualizerService.instance,
-                          builder: (context, _) {
-                            final eq = EqualizerService.instance;
-                            return MenuActionCell(
-                              icon: Icons.spatial_audio_off,
-                              label: '音效',
+                      // 上行：导航宫格。曲谱依赖 album_audio_id（/sheet/song
+                      // 查询键），缺失时隐藏。
+                      Row(
+                        children: [
+                          // 查看 MV：仅在线歌曲显示
+                          if (song.isOnline == true)
+                            MenuActionCell(
+                              icon: Icons.music_video_outlined,
+                              label: 'MV',
                               active: false,
-                              enabled: !eq.systemEffectsDisabled,
                               onTap: () {
                                 Navigator.pop(sheetContext);
                                 _pageNavigator(rootContext)?.push(
                                   MaterialPageRoute(
-                                    builder: (_) => const SoundsPage(),
+                                    builder: (_) => MvPlayerPage(song: song),
                                   ),
                                 );
                               },
-                            );
-                          },
-                        ),
-                      ],
-                      ListenableBuilder(
-                        listenable: context.read<PlayerProvider>(),
-                        builder: (context, _) {
-                          final player = context.read<PlayerProvider>();
-                          return MenuActionCell(
-                            icon: Icons.timer_outlined,
-                            label: '定时关闭',
-                            active: player.isSleepTimerActive,
+                            ),
+                          MenuActionCell(
+                            icon: Icons.album,
+                            label: '专辑',
+                            active: false,
                             onTap: () {
                               Navigator.pop(sheetContext);
-                              showSleepTimerSheet(
-                                context: rootContext,
-                                player: player,
+                              _navigateToAlbum(song);
+                            },
+                          ),
+                          MenuActionCell(
+                            icon: Icons.person,
+                            label: '歌手',
+                            active: false,
+                            onTap: () {
+                              Navigator.pop(sheetContext);
+                              _navigateToArtist(song);
+                            },
+                          ),
+                          if (song.albumAudioId != null &&
+                              song.albumAudioId!.isNotEmpty)
+                            MenuActionCell(
+                              icon: Icons.library_music_outlined,
+                              label: '曲谱',
+                              active: false,
+                              onTap: () {
+                                Navigator.pop(sheetContext);
+                                showSongSheetSheet(rootContext, song);
+                              },
+                            ),
+                        ],
+                      ),
+                      // 两行之间的分割线（与容器左右内边距对齐）
+                      Container(
+                        height: 1,
+                        margin: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        color: colorScheme.outlineVariant.withValues(
+                          alpha: 0.5,
+                        ),
+                      ),
+                      // 下行：均衡器 / 音效 / 定时关闭 / 投屏。均衡器/音效依赖
+                      // EqualizerService 的 Android AudioSession 绑定，桌面端
+                      // tryBind() 直接 return false（假成功），故桌面端整格隐藏。
+                      Row(
+                        children: [
+                          if (supportsSystemAudioEffects) ...[
+                            ListenableBuilder(
+                              listenable: EqualizerService.instance,
+                              builder: (context, _) {
+                                final eq = EqualizerService.instance;
+                                return MenuActionCell(
+                                  icon: Icons.graphic_eq,
+                                  label: '均衡器',
+                                  active: eq.enabled,
+                                  enabled: !eq.systemEffectsDisabled,
+                                  onTap: () {
+                                    Navigator.pop(sheetContext);
+                                    _pageNavigator(rootContext)?.push(
+                                      MaterialPageRoute(
+                                        builder: (_) =>
+                                            const EqualizerSettingsPage(),
+                                      ),
+                                    );
+                                  },
+                                );
+                              },
+                            ),
+                            ListenableBuilder(
+                              listenable: EqualizerService.instance,
+                              builder: (context, _) {
+                                final eq = EqualizerService.instance;
+                                return MenuActionCell(
+                                  icon: Icons.spatial_audio_off,
+                                  label: '音效',
+                                  active: false,
+                                  enabled: !eq.systemEffectsDisabled,
+                                  onTap: () {
+                                    Navigator.pop(sheetContext);
+                                    _pageNavigator(rootContext)?.push(
+                                      MaterialPageRoute(
+                                        builder: (_) => const SoundsPage(),
+                                      ),
+                                    );
+                                  },
+                                );
+                              },
+                            ),
+                          ],
+                          ListenableBuilder(
+                            listenable: context.read<PlayerProvider>(),
+                            builder: (context, _) {
+                              final player = context.read<PlayerProvider>();
+                              return MenuActionCell(
+                                icon: Icons.timer_outlined,
+                                label: '定时关闭',
+                                active: player.isSleepTimerActive,
+                                onTap: () {
+                                  Navigator.pop(sheetContext);
+                                  showSleepTimerSheet(
+                                    context: rootContext,
+                                    player: player,
+                                  );
+                                },
                               );
                             },
-                          );
-                        },
-                      ),
-                      MenuActionCell(
-                        icon: Icons.cast,
-                        label: '投屏',
-                        active: false,
-                        onTap: () {
-                          Navigator.pop(sheetContext);
-                          _showDlnaCastSheet(rootContext);
-                        },
+                          ),
+                          MenuActionCell(
+                            icon: Icons.cast,
+                            label: '投屏',
+                            active: false,
+                            onTap: () {
+                              Navigator.pop(sheetContext);
+                              _showDlnaCastSheet(rootContext);
+                            },
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -4338,8 +4897,8 @@ class _FullPlayerState extends State<FullPlayer>
                         },
                       ),
                     ),
-                  // 音乐频谱环绕：Android / iOS 均支持
-                  if (Platform.isAndroid || Platform.isIOS)
+                  // 音乐频谱环绕：Android / Windows 都支持（同一套通道协议）
+                  if (supportsMusicSpectrum)
                     SwitchListTile(
                       title: const Text('音乐频谱环绕'),
                       subtitle: Text(

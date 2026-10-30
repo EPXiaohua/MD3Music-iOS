@@ -1,16 +1,17 @@
 // AM 传输控件测试：中央播放/暂停。
 //
 // 回归点：
-// 1) 用的是新增的粗白描边资源 am_play_bold / am_pause_bold；
-// 2) 描边 3.0（比上一首/下一首的 2.0 更粗），颜色为白；
-// 3) **没有**白色实心圆底（不再是 IconButton.filled）；
-// 4) 形变时长 200ms（此前 460ms，用户反馈"太慢"）；
-// 5) 点击仍然只回调一次 onPlayPause。
+// 1) 中央用 PlayPauseMorphIcon 双轨实心形变（参考小宇宙播放页按钮）；
+// 2) 形变时长默认 280ms（参考视频实测约 350ms，取更快的手感）；
+// 3) 没有白色实心圆底（不是 IconButton.filled）；
+// 4) 点击只回调一次 onPlayPause；
+// 5) 上一曲/下一曲仍是 iconic_morph 描边重绘。
 import 'package:flutter_test/flutter_test.dart';
 import 'package:iconic_morph/iconic_morph.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'package:md3music/modules/player/am_transport_controls.dart';
+import 'package:md3music/modules/player/widgets/play_pause_morph_icon.dart';
 
 void main() {
   Widget host({required bool isPlaying, VoidCallback? onPlayPause}) {
@@ -28,27 +29,27 @@ void main() {
     );
   }
 
-  testWidgets('默认形变时长 200ms（此前 460ms 偏慢）', (tester) async {
+  testWidgets('默认形变时长 280ms', (tester) async {
     await tester.pumpWidget(host(isPlaying: false));
     await tester.pump();
 
     final controls = tester.widget<AMTransportControls>(
       find.byType(AMTransportControls),
     );
-    expect(controls.morphDuration, const Duration(milliseconds: 200));
+    expect(controls.morphDuration, const Duration(milliseconds: 280));
   });
 
-  testWidgets('中央用粗白描边的 play↔pause 形变', (tester) async {
-    await tester.pumpWidget(host(isPlaying: false));
+  testWidgets('中央用 PlayPauseMorphIcon 实心形变（白色、54、跟随 isPlaying）',
+      (tester) async {
+    await tester.pumpWidget(host(isPlaying: true));
     await tester.pump();
 
-    final morph = tester.widget<IconicShapeMorph>(
-      find.byType(IconicShapeMorph),
+    final icon = tester.widget<PlayPauseMorphIcon>(
+      find.byType(PlayPauseMorphIcon),
     );
-    expect(morph.from, 'assets/icons/am_play_bold.svg');
-    expect(morph.to, 'assets/icons/am_pause_bold.svg');
-    expect(morph.strokeWidth, 3.0);
-    expect(morph.color, Colors.white);
+    expect(icon.isPlaying, isTrue);
+    expect(icon.color, Colors.white);
+    expect(icon.size, 54);
   });
 
   testWidgets('中央按钮没有实心圆底色', (tester) async {
@@ -60,7 +61,7 @@ void main() {
     expect(
       middle.style?.backgroundColor?.resolve(<WidgetState>{}),
       isNull,
-      reason: '播放/暂停不再使用 IconButton.filled 的白色圆底',
+      reason: '播放/暂停不使用 IconButton.filled 的白色圆底',
     );
   });
 
@@ -75,13 +76,11 @@ void main() {
     expect(calls, 1);
   });
 
-  testWidgets('播放中时中央形变以暂停态为静止帧', (tester) async {
-    await tester.pumpWidget(host(isPlaying: true));
-    await tester.pump();
+  testWidgets('上一曲/下一曲仍是 IconicAnimatedIcon 描边动画', (tester) async {
+    await tester.pumpWidget(host(isPlaying: false));
+    await tester.pumpAndSettle();
 
-    final morph = tester.widget<IconicShapeMorph>(
-      find.byType(IconicShapeMorph),
-    );
-    expect(morph.autoplay, isTrue);
+    expect(find.byType(IconicAnimatedIcon), findsNWidgets(2));
+    expect(find.byType(PlayPauseMorphIcon), findsOneWidget);
   });
 }

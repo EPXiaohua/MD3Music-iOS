@@ -25,6 +25,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PersistableBundle;
+import android.os.Process;
 import android.view.Surface;
 import androidx.annotation.ChecksSdkIntAtLeast;
 import androidx.annotation.IntDef;
@@ -69,9 +70,25 @@ import java.nio.ByteBuffer;
     public Factory(@C.TrackType int trackType) {
       this(
           /* callbackThreadSupplier= */ () ->
-              new HandlerThread(createCallbackThreadLabel(trackType)),
+              newThread(createCallbackThreadLabel(trackType), trackType),
           /* queueingThreadSupplier= */ () ->
-              new HandlerThread(createQueueingThreadLabel(trackType)));
+              newThread(createQueueingThreadLabel(trackType), trackType));
+    }
+
+    /**
+     * MD3Music fork：音频轨的编解码回调/入队线程提到 {@link Process#THREAD_PRIORITY_AUDIO}。
+     *
+     * <p>默认 {@link HandlerThread} 是 {@link Process#THREAD_PRIORITY_DEFAULT}，与前台 App
+     * 的普通工作线程同档；前台高负载（大核被吃满）时这两个线程排不上队，解码供不上数据 →
+     * 渲染线程空转 → AudioTrack 欠载，听感就是「卡顿/爆音」。ExoPlayer 自己的播放线程
+     * 本来就用 AUDIO 档（见 ExoPlayerImplInternal），这里补齐编解码侧的同一档位。
+     *
+     * <p>只对音频轨生效：视频轨提优先级会与显示线程抢核，反而更容易掉帧。
+     */
+    private static HandlerThread newThread(String name, @C.TrackType int trackType) {
+      return trackType == C.TRACK_TYPE_AUDIO
+          ? new HandlerThread(name, Process.THREAD_PRIORITY_AUDIO)
+          : new HandlerThread(name);
     }
 
     @VisibleForTesting

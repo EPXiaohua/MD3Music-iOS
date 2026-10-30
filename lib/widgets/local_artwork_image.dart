@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:material_ui/material_ui.dart';
 
 import '../core/services/local_artwork_cache.dart';
+import '../core/utils/local_media_path.dart';
 import '../providers/song_match_provider.dart';
 
 /// 本地音乐封面图组件。
@@ -69,7 +70,13 @@ class _LocalArtworkImageState extends State<LocalArtworkImage> {
     final isFill = widget.size == double.infinity;
 
     // 这首歌自己的匹配记录：单曲偏好「使用在线封面」优先于内嵌封面
-    final matchInfo = matchedInfoForLocal(context, 'local_${widget.filePath}');
+    //
+    // 键必须与库内 `Song.id`（`local_<扫描期裸路径>`）同口径：filePath 可能在
+    // 播放解析后被回写成 `file://`+percent 编码形态，直接拼会查不到记录，
+    // 表现为「匹配/偏好都对，列表封面却不换在线图」。
+    final normalizedPath =
+        normalizeLocalMediaPath(widget.filePath) ?? widget.filePath;
+    final matchInfo = matchedInfoForLocal(context, 'local_$normalizedPath');
     final matchedUri = (matchInfo != null && matchInfo.isMatched)
         ? matchInfo.artworkUri
         : null;

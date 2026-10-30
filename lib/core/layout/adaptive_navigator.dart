@@ -1,3 +1,7 @@
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:material_ui/material_ui.dart';
 
 import '../build_flags.dart';
@@ -6,6 +10,7 @@ import '../../widgets/playlist_cover_flight_bus.dart';
 import '../../widgets/resizable_splitter.dart';
 import '../theme/app_dimens.dart';
 import 'page_layout.dart';
+import 'responsive_layout.dart';
 
 /// 混合导航分派与双栏 Master-Detail（横屏平板重设计计划 4.4 B）。
 ///
@@ -44,6 +49,10 @@ class DetailPaneScope extends InheritedWidget {
   static GlobalKey<NavigatorState>? maybeOf(BuildContext context) {
     return _maybeOf(context)?.detailKey;
   }
+
+  /// 主列表与详情面板均可读取的双栏状态。
+  static bool isTwoPaneOf(BuildContext context) =>
+      _maybeOf(context)?.twoPane ?? false;
 
   /// 查最近的详情面板前进历史（不建立重建依赖）。
   static ForwardHistory? historyOf(BuildContext context) {
@@ -134,11 +143,79 @@ class ForwardTag {
   final WidgetBuilder builder;
 }
 
+/// 挂在详情面板 Navigator 上，负责前进历史的回收/失效，并通知宿主刷新。
+///
+/// 语义由 [ForwardHistory] 决定：
+/// - `didPop`：弹出带 [ForwardTag] 的详情页 → 记入前进栈（供「前进」原样重建）；
+/// - `didPush`：正向导航（非重放）令既有前进栈失效（浏览器语义）。
+///
+/// **两个壳层共用**（`DesktopShell` 与 `ResponsiveShell` 的双栏 tab），各自按 tab
+/// 建实例：`IndexedStack` 保活下同一个 `NavigatorObserver` 挂到两个 Navigator 会
+/// 触发框架断言（见 `responsive_shell.dart` 的 `_TvFocusRecheckObserver` 说明）。
+///
+/// [onChanged] 可为 null：只需要历史回收、没有工具栏要刷新的宿主不必重建子树。
+class ForwardHistoryObserver extends NavigatorObserver {
+  ForwardHistoryObserver({this.history, this.onChanged});
+
+  final ForwardHistory? history;
+  final VoidCallback? onChanged;
+
+  void _schedule() {
+    final callback = onChanged;
+    if (callback == null) return;
+    // 延迟到帧末：导航期间同步 setState 会撞上 Navigator 的 build 断言。
+    WidgetsBinding.instance.addPostFrameCallback((_) => callback());
+  }
+
+  @override
+  void didPush(Route route, Route? previousRoute) {
+    if (history != null && !history!.replaying) history!.invalidate();
+    _schedule();
+  }
+
+  @override
+  void didPop(Route route, Route? previousRoute) {
+    final tag = route.settings.arguments;
+    if (history != null && tag is ForwardTag) history!.recordBack(tag.builder);
+    _schedule();
+  }
+
+  @override
+  void didRemove(Route route, Route? previousRoute) => _schedule();
+
+  @override
+  void didReplace({Route? newRoute, Route? oldRoute}) => _schedule();
+}
+
 /// 详情导航分派入口。各 B 类页面的详情入口把
 /// `Navigator.push(context, MaterialPageRoute(builder: b))` 改为
 /// `AdaptiveNav.openDetail(context, b)` 即可，无需自行判断布局。
 class AdaptiveNav {
   const AdaptiveNav._();
+
+  /// MD3Music fork v43：最近一次可见的双栏详情面板 Navigator（由
+  /// [_TwoPanePageState] initState/dispose 登记）。车机卡片深链用它把播放页
+  /// 塞进右窗格——App 层（app.dart）的 context 在壳层之上，拿不到
+  /// DetailPaneScope，只能借这条全局登记。
+  static GlobalKey<NavigatorState>? _latestDetailKey;
+
+  /// MD3Music fork v43：向最近可见的双栏详情面板 push 一个页面。
+  ///
+  /// @return true = 已进详情面板；false = 当前没有可见双栏（调用方退回根 push）。
+  static bool pushDetailGlobal(WidgetBuilder builder) {
+    final nav = _latestDetailKey?.currentState;
+    if (nav == null) return false;
+    nav.push(MaterialPageRoute<void>(builder: builder));
+    return true;
+  }
+
+  static void registerDetailKey(GlobalKey<NavigatorState> key) {
+    _latestDetailKey = key;
+  }
+
+  static void unregisterDetailKey(GlobalKey<NavigatorState> key) {
+    if (identical(_latestDetailKey, key)) _latestDetailKey = null;
+  }
 
   static Future<T?> openDetail<T>(
     BuildContext context,
@@ -202,6 +279,20 @@ class TwoPanePage extends StatefulWidget {
 
 class _TwoPanePageState extends State<TwoPanePage> {
   final GlobalKey<NavigatorState> _detailKey = GlobalKey<NavigatorState>();
+
+  @override
+  void initState() {
+    super.initState();
+    // MD3Music fork v43：把"当前可见的双栏详情面板"登记给全局深链入口——
+    // 车机卡片深链要用它把播放页塞进右窗格（AdaptiveNav.pushDetailGlobal）。
+    AdaptiveNav.registerDetailKey(_detailKey);
+  }
+
+  @override
+  void dispose() {
+    AdaptiveNav.unregisterDetailKey(_detailKey);
+    super.dispose();
+  }
 
   Future<void> _handlePop(bool didPop) async {
     if (didPop) return;
@@ -281,6 +372,32 @@ class DesktopTwoPane extends StatefulWidget {
 }
 
 class _DesktopTwoPaneState extends State<DesktopTwoPane> {
+  bool get _isWindows => defaultTargetPlatform == TargetPlatform.windows;
+  bool get _usesResponsiveLayout => widget.responsive || _isWindows;
+
+  // Windows 的分隔条仍可拖动；首次进入忽略旧版偏右的比例，左右各占可用区一半。
+  //
+  // TV 构建强制双栏（不随分辨率/DPI 自适应退化单栏）：TV 焦点体系（两层顶栏、
+  // TvNavFocusBridge、挂在详情面板 Navigator 上的 _TvFocusRecheckObserver）
+  // 全部以双栏 master-detail 为前提，单栏路径下焦点无法进入列表（真机实测：
+  // 我的收藏页焦点移不到歌单上）。宽度 ≥ [kTwoPaneForcedMinWidth] 才强制；
+  // 更窄的视口由壳层（ResponsiveShell._buildTab）绕过本组件改走中央栈
+  // 整屏详情，不会进到这里的窄分支。
+  ({double masterLeft, double masterWidth, double detailLeft,
+    double detailWidth, bool twoPane}) _geometry(
+    double width, {List<Rect> obstructions = const []}
+  ) => resolvePaneGeometry(
+    width: width,
+    masterFraction: _isWindows && width > 16
+        ? _masterFraction * (width - 16) / width
+        : _masterFraction,
+    // 双栏开关三端通用（历史名 kWindowsTwoPaneEnabled 保留）：非 Windows
+    // 由 main.dart 播种默认 true，宽屏双栏行为不回退；关掉后宽屏退单栏。
+    // TV 下开关被强制 true 且设置页置灰（见 main.dart 播种），不参与判定。
+    twoPaneEnabled: kWindowsTwoPaneEnabled.value,
+    forceTwoPane: kTvBuild && width >= kTwoPaneForcedMinWidth,
+    verticalObstructions: obstructions,
+  );
   static const double _kMinMaster = 280.0;
   static const double _kMaxMaster = 560.0;
   static const double _kDefaultFraction = 0.34;
@@ -318,7 +435,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   /// push 可能发生在 build 期间（嵌套 Navigator 首帧挂载 restoreState 也走
   /// didPush），与 [_onDetailChanged] 同理必须推迟到帧末再 setState。
   void _onTopRoutePushed(Route<dynamic> route) {
-    if (!widget.responsive) return;
+    if (!_usesResponsiveLayout) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _coverAnim?.removeStatusListener(_onCoverStatus);
@@ -339,7 +456,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   }
 
   void _onTopRoutePopped(Route<dynamic> route) {
-    if (!widget.responsive) return;
+    if (!_usesResponsiveLayout) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _coverAnim?.removeStatusListener(_onCoverStatus);
@@ -399,7 +516,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   /// 单栏态下详情铺满整宽（master 被遮住）= 用户看到的是二级页面，上报给壳层收起
   /// 底部导航栏；双栏态 master 仍在场，报 false（见 [onDetailFullscreenChanged]）。
   void _reportDetailFullscreen(bool fullscreen) {
-    if (!widget.responsive || fullscreen == _reportedDetailFullscreen) return;
+    if (!_usesResponsiveLayout || fullscreen == _reportedDetailFullscreen) return;
     _reportedDetailFullscreen = fullscreen;
     // 壳层只登记帧末回调，build 期间同步调用是安全的。
     widget.onDetailFullscreenChanged?.call(fullscreen);
@@ -408,7 +525,8 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   @override
   void initState() {
     super.initState();
-    if (!widget.responsive) _loadRatio();
+    if (_isWindows) _masterFraction = 0.5;
+    if (!_usesResponsiveLayout) _loadRatio();
   }
 
   @override
@@ -425,16 +543,14 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
 
   void _onDelta(double dx) {
     setState(() {
-      if (widget.responsive) {
+      if (_usesResponsiveLayout) {
         // 从当前显示的宽度开始拖，避免在窄面板上碰到上限后出现回拖死区。
-        final current = resolvePaneGeometry(
-          width: _lastTotalWidth,
-          masterFraction: _masterFraction,
-        ).masterWidth;
+        final current = _geometry(_lastTotalWidth).masterWidth;
         final master = (current + dx).clamp(
           AppLayout.twoPaneMasterWidth, _lastTotalWidth - 496,
         );
-        _masterFraction = master / _lastTotalWidth;
+        _masterFraction = master / (_isWindows
+            ? _lastTotalWidth - 16 : _lastTotalWidth);
         return;
       }
       final master = (_masterFraction * _lastTotalWidth + dx)
@@ -444,7 +560,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   }
 
   void _persist() {
-    if (widget.responsive) return;
+    if (_usesResponsiveLayout) return;
     // ignore: discarded_futures
     _settings.setDesktopDetailRatio(_masterFraction);
   }
@@ -456,30 +572,85 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
     return Column(children: [Expanded(child: master), footer]);
   }
 
+  /// 折叠屏 / 多屏分栏诊断日志（`[FoldLayout]`，仅 debug 构建）。
+  ///
+  /// 只在「特性集合 + 几何」签名变化时打一行，绝不逐帧刷屏。真机排查折叠屏
+  /// 布局问题（issue #138 这一类）时用它判定**这台设备到底上报了什么**：
+  /// `type`（fold / hinge / cutout）、姿势（postureFlat / postureHalfOpened）、
+  /// `bounds`，以及最终是否被当作分栏障碍。判据以日志为准，不以截图为准。
+  String? _lastFoldSignature;
+
+  void _logFoldLayout(
+    MediaQueryData mq,
+    double panelWidth,
+    double leftInset,
+    List<Rect> obstructions,
+  ) {
+    if (!kDebugMode) return;
+    final features = mq.displayFeatures;
+    String fmt(ui.DisplayFeature f) =>
+        '(${f.type.name},${f.state.name},${f.bounds})';
+    final signature =
+        '${mq.size}|$panelWidth|$leftInset|${features.map(fmt).join()}';
+    if (signature == _lastFoldSignature) return;
+    _lastFoldSignature = signature;
+    final obs = obstructions
+        .map((r) => '(l=${r.left.toStringAsFixed(1)},'
+            'w=${r.width.toStringAsFixed(1)})')
+        .join();
+    debugPrint(
+      '[FoldLayout] view=${mq.size.width}x${mq.size.height} '
+      'panel=${panelWidth.toStringAsFixed(1)} '
+      'leftInset=${leftInset.toStringAsFixed(1)} '
+      'features=${features.map(fmt).join()} obstructions=$obs',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    // 双栏开关三端通用：订阅 notifier，开关翻转时双栏↔单栏即时重建
+    // （详情栈不销毁，与 Windows 同一行为）。
+    return ValueListenableBuilder<bool>(
+      valueListenable: kWindowsTwoPaneEnabled,
+      builder: (context, enabled, child) => _buildLayout(context),
+    );
+  }
+
+  Widget _buildLayout(BuildContext context) {
     return LayoutBuilder(
       builder: (context, c) {
+        final isWindows = defaultTargetPlatform == TargetPlatform.windows;
+        // 壁纸模式下双栏的详情面板与分隔线都必须透明：否则右侧是一条纯
+        // surface 白板、两栏之间还多一条竖线，壁纸被硬生生切断。
+        //
+        // 原先这里只看 Windows（平台判定），Android 平板开桌面布局 + 壁纸时
+        // 仍会露白/露线。改为直接看主题信号：壁纸模式在 app.dart 的
+        // `_applyBackgroundOverrides` 里把 scaffoldBackgroundColor 置为透明，
+        // 与平台无关，正好是「需要透明双栏」的唯一真值来源。
+        final transparentBackground =
+            Theme.of(context).scaffoldBackgroundColor == Colors.transparent;
+        // 分隔线：Windows 恒透明（既有桌面观感）；其它平台仅壁纸模式下透明。
+        final transparentSplitter = isWindows || transparentBackground;
         _lastTotalWidth = c.maxWidth;
         final masterW =
             (_masterFraction * c.maxWidth).clamp(_kMinMaster, _kMaxMaster,
         );
-        if (widget.responsive) {
+        if (_usesResponsiveLayout) {
           final mq = MediaQuery.of(context);
           // 响应式内容位于 rail 右侧并已消费横向 SafeArea。displayFeatures 是
           // 窗口坐标，先扣除 rail/左安全区的占位，再按面板局部宽度求值。
           final leftInset = mq.size.width - c.maxWidth - mq.viewPadding.right;
-          final obstructions = [
-            for (final feature in mq.displayFeatures)
-              if (feature.bounds.height > feature.bounds.width &&
-                  feature.bounds.height >= mq.size.height / 2)
-                feature.bounds.shift(Offset(-leftInset, 0)),
-          ];
-          final geometry = resolvePaneGeometry(
-            width: c.maxWidth,
-            masterFraction: _masterFraction,
-            verticalObstructions: obstructions,
+          // 障碍只认**真正分隔视口**的特性（Android `isSeparating` 语义）：
+          // 折叠屏完全展开时上报的折痕（fold + postureFlat）不分隔可用空间，
+          // 曾经只按几何裸判它会通过筛选，于是两栏被一起塞到折痕一侧、另一侧
+          // 近半屏留白（issue #138）。判据与理由见 [verticalPaneObstructions]。
+          final obstructions = verticalPaneObstructions(
+            features: mq.displayFeatures,
+            viewSize: mq.size,
+            leftInset: leftInset,
           );
+          _logFoldLayout(mq, c.maxWidth, leftInset, obstructions);
+          final geometry = _geometry(c.maxWidth, obstructions: obstructions);
           final twoPane = geometry.twoPane;
           final width = geometry.masterWidth;
           // 单栏 + 有详情 = 详情整屏盖住 master，壳层据此认定二级页面。
@@ -491,6 +662,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
           // 因此表单、滚动位置、返回值 Future 及多层详情栈均保留。
           return DetailPaneScope(
             detailKey: _detailKey,
+            history: widget.history,
             twoPane: twoPane,
             child: Stack(
               children: [
@@ -517,6 +689,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
                     child: ResizableSplitter(
                       onDelta: _onDelta,
                       onDragEnd: _persist,
+                      color: transparentSplitter ? Colors.transparent : null,
                     ),
                   ),
                 Positioned(
@@ -546,9 +719,23 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
                             onGenerateRoute: (s) =>
                                 MaterialPageRoute<void>(
                               settings: s,
+                              // tv: 双栏 tab 首次挂载时，本面板 Navigator 会
+                              // didAdd 一条栈底空态路由；默认 requestFocus 会把
+                              // enclosingScope（tab 根路由 FocusScope）设为焦点，
+                              // dpad 的 restoreFocus 兜底随即把焦点拽进页面内容
+                              // —— 表现为冷启动后左右键切 navbar 到未访问 tab 时
+                              // 切换被打断。只关栈底路由：AdaptiveNav 推出的详情
+                              // 页（settings.name 不是 '/'）保留默认，仍有初始焦点。
+                              requestFocus:
+                                  !(kTvBuild &&
+                                      s.name == Navigator.defaultRouteName),
                               builder: (_) => _ResponsiveDetailBase(
                                 emptyState: widget.emptyState ??
-                                    const DetailEmptyState(),
+                                    DetailEmptyState(
+                                      color: transparentBackground
+                                          ? Colors.transparent
+                                          : null,
+                                    ),
                               ),
                             ),
                           ),
@@ -569,15 +756,26 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
           child: Row(
             children: [
               SizedBox(width: masterW, child: _withMasterFooter(widget.master)),
-              ResizableSplitter(onDelta: _onDelta, onDragEnd: _persist),
+              ResizableSplitter(
+                onDelta: _onDelta,
+                onDragEnd: _persist,
+                color: transparentSplitter ? Colors.transparent : null,
+              ),
               Expanded(
                 child: Navigator(
                   key: _detailKey,
                   observers: widget.detailObservers,
                   onGenerateRoute: (s) => MaterialPageRoute(
                     settings: s,
-                    builder: (_) =>
-                        widget.emptyState ?? const DetailEmptyState(),
+                    // tv: 同响应式分支（见上方 onGenerateRoute 的说明）——
+                    // 栈底空态路由不得在 TV 下抢顶栏焦点。
+                    requestFocus:
+                        !(kTvBuild && s.name == Navigator.defaultRouteName),
+                    builder: (_) => widget.emptyState ?? DetailEmptyState(
+                      color: transparentBackground
+                          ? Colors.transparent
+                          : null,
+                    ),
                   ),
                 ),
               ),

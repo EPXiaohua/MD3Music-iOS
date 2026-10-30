@@ -3,7 +3,8 @@ import 'dart:io';
 import 'dart:ui';
 
 import 'package:dpad/dpad.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart'
+    show kDebugMode, kProfileMode, ValueListenable;
 import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
@@ -19,20 +20,33 @@ import 'core/layout/page_layout.dart';
 import 'core/layout/page_title_alignment.dart';
 import 'core/layout/responsive_layout.dart';
 import 'core/layout/responsive_shell.dart';
+import 'core/layout/tv_shell.dart';
 import 'core/layout/ui_density.dart';
 import 'core/remote/tv_exit_confirm_dialog.dart';
 import 'core/remote/tv_focus_highlight.dart';
+import 'core/remote/tv_key_repeat.dart';
+// tv: 播放页返回键兜底（焦点丢回路由 FocusScope 时页内拦截器收不到按键）。
+import 'core/remote/tv_player_back_focus.dart';
+import 'core/services/diagnostic_logger.dart';
 import 'core/services/external_media_intent_service.dart';
 import 'core/services/fm_widget_sync.dart';
+import 'core/services/lock_screen_action_service.dart';
 import 'core/services/lyricon_provider_service.dart';
+import 'core/services/media_notification_service.dart';
 import 'core/services/music_haptics_service.dart';
+import 'core/services/vivo_mix_sync.dart';
 import 'core/services/startup_auto_play.dart';
+import 'core/services/windows_fullscreen.dart';
+import 'core/services/windows_taskbar_sync.dart';
 import 'core/theme/app_theme.dart';
 import 'core/theme/motion_constants.dart';
 import 'core/utils/artwork_color_extractor.dart';
 import 'core/utils/app_toast.dart';
 import 'core/widgets/app_background.dart';
+import 'core/widgets/desktop_input_layer.dart';
+import 'core/widgets/desktop_playback_keys.dart';
 import 'core/widgets/safe_insets_guard.dart';
+import 'core/widgets/windows_window_frame.dart';
 import 'data/models/playlist.dart';
 import 'data/models/song.dart';
 import 'data/repositories/settings_repository.dart';
@@ -41,6 +55,7 @@ import 'services/kugou_api/listen_together_models.dart';
 import 'main.dart'
     show
         appNavigatorKey,
+        finishWindowsAppExit,
         handleShortcut,
         pendingShortcutType,
         shortcutTabRequest;
@@ -63,9 +78,12 @@ import 'modules/user/favorites_page.dart';
 import 'modules/brush/brush_page.dart';
 import 'modules/listen_together/listen_together_page.dart';
 import 'modules/listen_together/widgets/guest_play_confirm_dialog.dart';
+import 'modules/update/windows_update_dialog.dart';
+import 'modules/update/windows_update_service.dart';
 
 import 'modules/player/full_player.dart';
 import 'modules/player/full_player_route.dart';
+import 'modules/player/player_zen_bridge.dart';
 import 'modules/player/mini_player.dart';
 import 'modules/player/bottom_bar_morph_overlay.dart';
 import 'modules/player/player_drag_overlay.dart';
@@ -90,12 +108,14 @@ import 'modules/audiobook/audiobook_page.dart';
 import 'modules/recognition/song_recognition_page.dart';
 import 'modules/scene/scene_page.dart';
 import 'modules/channel/channel_page.dart';
+import 'modules/sheet/sheet_square_page.dart';
 import 'providers/dlna_provider.dart';
 import 'providers/favorites_provider.dart';
 import 'providers/blacklist_provider.dart';
 import 'providers/cloud_upload_provider.dart';
 import 'providers/kugou_provider.dart';
 import 'providers/listen_stats_provider.dart';
+import 'providers/local_listen_stats_provider.dart';
 import 'providers/library_provider.dart';
 // ignore: unused_import  // 类型用于 ChangeNotifierProvider(create: ...) 的 T 推断
 import 'providers/local_favorites_provider.dart';
@@ -115,6 +135,21 @@ import 'providers/listen_together_provider.dart';
 import 'services/kugou_server.dart';
 import 'widgets/dlna_casting_overlay.dart';
 import 'core/widgets/local_server_down_banner.dart';
+
+/// 形态交棒取证日志的生效档（debug + profile）。
+///
+/// 判据与 `player_cover_morph.dart` 的 `coverMorphPerfLogEnabled` **必须同源**，
+/// 那里已记录过教训：只认 `kDebugMode` 的话 profile 包一行都不出，而真机复测
+/// 性能与残条类报障用的正是 profile 档（`debugPrint` 在 profile 会照常进 logcat，
+/// 加这道闸只是为了 release 侧把这行常量折叠掉、不留在产物里）。
+///
+/// 独立命名而非复用那个常量：它属「封面形变仪表」的开关，形态交棒是另一台仪表，
+/// 借名会让读代码的人误以为两者的开/关是同一件事。要合并请一起合并两处定义。
+const bool _barFormLogEnabled = kDebugMode || kProfileMode;
+
+/// 任务控制通道（MainActivity）：`moveToBack` 挂后台、`exitApp` 停服务后
+/// 结束任务回桌面。两处调用共用同一个通道名，避免字符串漂移。
+const MethodChannel _taskChannel = MethodChannel('com.md3music.md3music/task');
 
 /// 主页（`/`）专用的 [MaterialPageRoute] 子类。
 ///
@@ -177,6 +212,8 @@ class MyApp extends StatelessWidget {
   final bool showOnboarding;
   final bool showUserAgreement;
   final bool initialUseBackgroundImage;
+  /// 主题模式的启动播种值：null = 从未持久化，保持 ThemeProvider 初值 ThemeMode.system。
+  final ThemeMode? initialThemeMode;
 
   /// 可选扩展：额外注册的 Provider 列表（默认无，由私有构建注入，
   /// 用于注册私有功能 Provider）。
@@ -186,7 +223,8 @@ class MyApp extends StatelessWidget {
     super.key,
     this.showOnboarding = false,
     this.showUserAgreement = false,
-    this.initialUseBackgroundImage = true,
+    this.initialUseBackgroundImage = false,
+    this.initialThemeMode,
     this.extraProviders,
   });
 
@@ -197,6 +235,7 @@ class MyApp extends StatelessWidget {
         ChangeNotifierProvider(
           create: (_) => ThemeProvider(
             initialUseBackgroundImage: initialUseBackgroundImage,
+            initialThemeMode: initialThemeMode,
           ),
         ),
         ChangeNotifierProvider(create: (_) => DeviceProvider()),
@@ -205,18 +244,16 @@ class MyApp extends StatelessWidget {
           ChangeNotifierProvider(create: (_) => RemoteControlProvider()),
         ],
         ChangeNotifierProvider(create: (_) => GridColumnsProvider()),
-        ChangeNotifierProvider(
-          create: (_) {
-            final player = PlayerProvider();
-            // 播放状态 → 音乐节奏震动：「App 内/始终」两档在无播放页时也要拿到
-            // 播放/暂停沿。notifyListeners 只在播放/暂停/切歌等低频时机触发
-            // （高频位置更新走 positionNotifier），服务内部按值去重，零成本。
-            player.addListener(() {
-              MusicHapticsService.instance.setPlaybackActive(player.isPlaying);
-            });
-            return player;
-          },
-        ),
+        ChangeNotifierProvider(create: (_) {
+          final player = PlayerProvider();
+          // 播放状态 → 音乐节奏震动：「App 内/始终」两档在无播放页时也要拿到
+          // 播放/暂停沿。notifyListeners 只在播放/暂停/切歌等低频时机触发
+          // （高频位置更新走 positionNotifier），服务内部按值去重，零成本。
+          player.addListener(() {
+            MusicHapticsService.instance.setPlaybackActive(player.isPlaying);
+          });
+          return player;
+        }),
         // 本地曲库：MCP 构造时要 read 它（本地工具的真实源），故声明在 MCP 之前。
         ChangeNotifierProvider(create: (_) => LibraryProvider()),
         // AI 代理接口（MCP）：默认关闭。非惰性创建——需要在每次冷启动时读取
@@ -273,6 +310,18 @@ class MyApp extends StatelessWidget {
             return stats;
           },
         ),
+        // 本地听歌统计（本地库 play_records 聚合，不依赖登录态）：同样按
+        // 登录态/账号作用域，账号变化时清缓存，防止跨账号串状态。
+        ChangeNotifierProxyProvider<KugouProvider, LocalListenStatsProvider>(
+          create: (_) => LocalListenStatsProvider(),
+          update: (_, kugou, stats) {
+            stats!.syncLoginState(
+              loggedIn: kugou.isLoggedIn,
+              userid: kugou.userid,
+            );
+            return stats;
+          },
+        ),
         ChangeNotifierProvider(create: (_) => FavoritesProvider()),
         ChangeNotifierProvider(create: (_) => LocalFavoritesProvider()),
         // 跨页面广播「收藏的歌单」变更（详情页 → 我的收藏 tab 立即刷新）
@@ -294,9 +343,21 @@ class MyApp extends StatelessWidget {
         // 可选扩展：私有构建注入的额外 Provider（默认无）
         ...?extraProviders,
       ],
-      child: _AppView(
-        showOnboarding: showOnboarding,
-        showUserAgreement: showUserAgreement,
+      // Windows 键鼠快捷键（空格播放/暂停、F 播放页、Esc 返回、侧键前进后退）。
+      //
+      // **必须挂在 MaterialApp 之外**：框架的 `space → ActivateIntent`（激活聚焦
+      // 按钮）与文本层 `space → 交给 IME` 都在 Navigator 之内，且两者都会终止按键
+      // 冒泡 —— 只有挂在本层才能让「按钮 / 输入框」先消费，两者都不接时才轮到
+      // 播放控制。挂在页面内部（旧 DesktopShell 的做法）会抢在框架之前，
+      // 桌面布局开着时搜索框打不出空格。
+      //
+      // 同时要留在 MultiProvider **之内**：本层要 `read<PlayerProvider>`。
+      // 非 Windows 平台原样返回 child，Android / TV 的树与改动前完全一致。
+      child: DesktopInputLayer(
+        child: _AppView(
+          showOnboarding: showOnboarding,
+          showUserAgreement: showUserAgreement,
+        ),
       ),
     );
   }
@@ -326,6 +387,18 @@ class _AppViewState extends State<_AppView> {
   String? _lastBackgroundPath;
   // 桌面快捷方式配置：监听变更 → 重新注册 Android 长按图标快捷入口。
   ShortcutConfigProvider? _shortcutConfig;
+  // tv: 焦点红框的唤醒入口。播放列表「自动滚到当前曲」等程序化滚动不触发
+  // FocusManager 通知，静音后的 Ticker 不会跟随，红框会滞留旧位置。
+  final GlobalKey<TvFocusHighlightState> _tvFocusFrameKey =
+      GlobalKey<TvFocusHighlightState>();
+
+  /// Windows F11 全局处理器的卸载函数（null = 当前平台不装）。
+  ///
+  /// F11 在播放页 = 切换 Zen（并连带窗口全屏），其余页面 = 切换窗口全屏。
+  /// 挂在应用根而不是某个 Focus 上：桌面端焦点可能停在任意控件，全屏快捷键
+  /// 不该被焦点位置左右。
+  VoidCallback? _windowsF11Dispose;
+  Timer? _windowsUpdateStartupTimer;
 
   @override
   void initState() {
@@ -354,6 +427,13 @@ class _AppViewState extends State<_AppView> {
       _setupCoverColorBridge();
       _setupBackgroundColorBridge();
       _setupFmWidgetSync();
+      // Windows 任务栏进度条 + 悬停缩略图按钮：非 Windows 平台 attach 直接
+      // 返回（零通道调用），因此无需在这里再判平台。
+      WindowsTaskbarSync.instance.attach(context.read<PlayerProvider>());
+      // 锁屏歌词卡片的投屏/队列按钮：注册 widgetAction 回调，并补投冷启动
+      // 期间原生暂存的待处理动作（引擎未就绪时原生只能存 pending）。
+      // ignore: discarded_futures
+      LockScreenActionService.instance.attach();
       // 外部调用（文件管理器「用其他应用打开」）：注册原生推送回调，
       // 并主动拉取一次冷启动期间原生侧积压的待处理音频
       // ignore: discarded_futures
@@ -362,11 +442,55 @@ class _AppViewState extends State<_AppView> {
       // 自动打开识曲页展示
       // ignore: discarded_futures
       PipRecognitionController.instance.openPendingResultPageIfAny();
+      // MD3Music fork v21 车机卡片：点系统媒体卡片直达全屏歌词。冷启动残留
+      // （引擎未就绪时原生只置 pending）在本帧根导航就绪后拉取一次。
+      MediaNotificationService.onOpenCardLyric = _openFullPlayerOnLyrics;
+      unawaited(MediaNotificationService.consumePendingOpenCardLyric().then((pending) {
+        if (pending) _openFullPlayerOnLyrics();
+      }));
     });
     // 预测性返回 + 封面连贯过渡：两个开关互斥，冷启动一起载入并纠正历史同开的值
     // （裁决见 resolveCoverBackExclusivity，封面连贯过渡优先）。
     unawaited(_loadCoverAndBackSwitches());
     kPredictiveBackEnabled.addListener(_onPredictiveBackChanged);
+    // Windows：F11 全局快捷键 + 启动时校正全屏状态镜像（原生窗口可能被
+    // 上次会话/外部工具改成全屏，标题栏按钮要按真实状态显示）。
+    _windowsF11Dispose = installWindowsF11Handler(
+      toggleZen: PlayerZenBridge.instance.toggleZen,
+    );
+    if (WindowsFullscreen.supported) {
+      unawaited(WindowsFullscreen.sync());
+    }
+    if (Platform.isWindows &&
+        !widget.showOnboarding &&
+        !widget.showUserAgreement) {
+      _windowsUpdateStartupTimer = Timer(
+        const Duration(seconds: 1),
+        _checkWindowsUpdateAtStartup,
+      );
+    }
+  }
+
+  Future<void> _checkWindowsUpdateAtStartup() async {
+    try {
+      final result = await WindowsUpdateService.instance.takeInstallResult();
+      if (!mounted) return;
+      if (result != null) {
+        showToast(result, long: true);
+        // 失败结果也要继续检查尚未安装的版本，不能因此吃掉本次启动提醒。
+      }
+    } catch (error) {
+      debugPrint('[WindowsUpdate] 读取安装结果失败：$error');
+    }
+    final release = await WindowsUpdateService.instance.checkForUpdate();
+    if (!mounted || release == null) return;
+    final context = appNavigatorKey.currentContext;
+    if (context == null || !context.mounted) return;
+    await showWindowsUpdateDialog(
+      context,
+      release,
+      onExitForUpdate: finishWindowsAppExit,
+    );
   }
 
   /// 建立私人FM桌面小部件桥接：监听三个 provider 推送快照，并接上原生按钮回调。
@@ -376,7 +500,60 @@ class _AppViewState extends State<_AppView> {
       player: context.read<PlayerProvider>(),
       favorites: context.read<FavoritesProvider>(),
     );
+    // MD3Music fork v39：vivo 原子随身听的列表快照（当前队列/收藏/本地）。
+    VivoMixSync.instance.attach(
+      player: context.read<PlayerProvider>(),
+      favorites: context.read<FavoritesProvider>(),
+      library: context.read<LibraryProvider>(),
+    );
   }
+
+  /// MD3Music fork v21 车机卡片：直达全屏歌词页。预置「歌词页」为初始 tab——
+  /// 窄屏页身份的歌词下标是 2，宽屏由 _syncTabLayout 按页身份自动换算，不用管
+  /// 横竖屏差异；歌的播放状态保持不变（只是看词，不会顺手开始播放）。
+  ///
+  /// MD3Music fork v42（用户拍板）：车机点卡片＝打开播放页 + 落歌词 tab
+  /// （宽屏布局的右窗格即歌词页）。v29/v30 的"临时铺满全屏 + 面板抑制 +
+  /// 看门狗回退"一族已整体退场。
+  Future<void> _openFullPlayerOnLyrics() async {
+    // v34：首行守卫必须先于 context.read——冷启动消费路径经
+    // consumePendingOpenCardLyric().then(_openFullPlayerOnLyrics)，旧 State 的
+    // 闭包在 dispose 后仍可能在途执行（引擎复用重建窗口），无守卫会
+    // 在 deactivated ancestor 上抛非受检异常并吞掉本代次深链。
+    if (!mounted) return;
+    final carMode = context.read<CarModeProvider>();
+    await carMode.ready;
+    // v32：同时等首帧屏幕判定注入（autoScreen 档的 screenIsCar 只在首帧后有
+    // 真值，601ms 兜底防面板缺席）；窗口前送达的深链不再被分错支。
+    await Future.any<void>([
+      carMode.metricsReady,
+      Future<void>.delayed(const Duration(milliseconds: 600)),
+    ]);
+    if (!mounted) return;
+    // v43（用户拍板二次修正）：车机投屏下 App 打开的是平板双栏主壳（左发现 +
+    // 右"查看详情"占位），v42 的 openFullPlayer 打错靶子。改为：优先把播放页
+    // 推进最近可见的双栏右窗格（右窗格内 playerTabIndex=2 落歌词 tab）；无
+    // 双栏（手机竖屏）才退回 openFullPlayer。车机忽略守卫已在 full_player_route
+    // 恢复（防双实例），深链经 bypass 旁路一次。
+    debugPrint('[CardLyricLink] dart open: carMode.active=${carMode.active}');
+    final detailUsed = AdaptiveNav.pushDetailGlobal((_) => const FullPlayer());
+    if (detailUsed) {
+      debugPrint('[CardLyricLink] pushed FullPlayer into detail pane');
+      return;
+    }
+    final navContext = appNavigatorKey.currentContext;
+    if (navContext == null) {
+      // 根导航器尚未附着（冷启动）：本次直达取消，避免打开无效路由。
+      return;
+    }
+    playerTabIndex.value = 2;
+    sendDockPlayerLyricsCommand();
+    openFullPlayer(navContext, bypassCarGuardOnce: true);
+  }
+
+  // v42（用户拍板）：车机深链改为"打开播放页 + 右窗格歌词"后，
+  // v29/v30 的面板抑制/看门狗/force 一族（_suppressPanelForCardLyrics、
+  // _watchPanelReturn、_releasePanelForCardLyrics 及两个字段）整体退场。
 
   /// 根据 ShortcutConfigProvider 当前配置，整体替换桌面快捷方式列表
   /// （Android App Shortcut / iOS Quick Actions）。
@@ -486,7 +663,15 @@ class _AppViewState extends State<_AppView> {
   /// TV 返回键收口：能 pop 则 pop（返回 true 表示已消费）；
   /// 根路由返回 false 交回系统默认 —— 由 [_MainLayout] 根 [PopScope]
   /// 走既有退出流程（回首页 → 双击返回挂后台，不允许一下退出）。
+  ///
+  /// **pop 之前先询问播放页**（2026-10-20 真机补的兜底）：播放页内的
+  /// `TvPlayerBackInterceptor` 靠「焦点节点 → ancestors 向上」收按键，焦点一旦
+  /// 丢回路由自己的 FocusScope（`primaryFocus` 变成 `_ModalScopeState Focus Scope`）
+  /// 它就收不到了，返回键会直接把播放页 pop 掉 —— 用户看到的是「焦点在列表上
+  /// 按返回键，播放页直接关了」。这里先让播放页把焦点交还播放键并消费这次返回；
+  /// 它没救（不在播放页 / 焦点已在控制区）才真正 pop。
   bool _handleTvBack() {
+    if (TvPlayerBackFallback.instance.requestPlayFocus()) return true;
     final navigator = appNavigatorKey.currentState;
     if (navigator != null && navigator.canPop()) {
       navigator.pop();
@@ -508,6 +693,8 @@ class _AppViewState extends State<_AppView> {
   ///    不拦按键）。替代 dpad 的 `debugOverlay`——那个开关是整体的，一开就把
   ///    调试标签（region/尺寸）一起画出来，且 release 下自动关闭导致 release
   ///    包完全没有焦点指示。TV 没有光标，焦点框是硬需求，故自绘并在正式包保留。
+  ///    焦点切换时红框**连贯滑行 + 半径形变**（见该组件的类注释与
+  ///    `tv_focus_frame_animation.dart`）；滚动 / 路由转场期间贴合不拖影。
   ///
   /// 原先这里还有一层 overscan 安全边距（[kTvOverscanInset]，曾按 10-foot
   /// 指标给内容留 48dp），实测在无过扫描的设备（平板/手机，以及多数现代
@@ -528,24 +715,40 @@ class _AppViewState extends State<_AppView> {
           ),
           child: Stack(
             children: [
-              // dpad 遍历引擎。debugOverlay 传 false：它开启后会连同红框一起
-              // 画出调试标签（`region: … 112×112`，dpad root.dart:499+），
-              // 且该开关是整体的、无法只关标签。焦点框改由下面的
-              // [TvFocusHighlight] 自绘（同规格红框、无标签），正式包也保留
-              // —— TV 没有光标，焦点可见是硬需求。
-              Dpad.wrap(
-                theme: const DpadThemeData(
-                  // tv: 焦点视觉只保留 [TvFocusHighlight] 的描边框，不再叠加
-                  // dpad 自带的辉光阴影——两者并存会在控件外多一圈光晕，
-                  // 遮住相邻的细边框/分割线，且滚动时阴影与描边不同步。
-                  // 传空列表而非依赖默认值（默认含 scale + border 两项）。
-                  effects: <DpadEffect>[],
-                  scrollPadding: 64,
+              // tv: 滚动不产生 FocusManager 通知——播放列表切歌后的「自动滚到
+              // 当前曲」等程序化 animateTo 在红框 Ticker 静音后不会被跟随，红框
+              // 会滞留旧位置（焦点与页面元素错位）。统一接住滚动通知唤醒红框；
+              // 唤醒只在已静音时生效，不会打断正在进行的滑行（见 wake 的注释）。
+              NotificationListener<ScrollNotification>(
+                onNotification: (_) {
+                  _tvFocusFrameKey.currentState?.wake();
+                  return false;
+                },
+                // dpad 遍历引擎。debugOverlay 传 false：它开启后会连同红框一起
+                // 画出调试标签（`region: … 112×112`，dpad root.dart:499+），
+                // 且该开关是整体的、无法只关标签。焦点框改由下面的
+                // [TvFocusHighlight] 自绘（同规格红框、无标签），正式包也保留
+                // —— TV 没有光标，焦点可见是硬需求。
+                child: Dpad.wrap(
+                  theme: const DpadThemeData(
+                    // tv: 焦点视觉只保留 [TvFocusHighlight] 的描边框，不再叠加
+                    // dpad 自带的辉光阴影——两者并存会在控件外多一圈光晕，
+                    // 遮住相邻的细边框/分割线，且滚动时阴影与描边不同步。
+                    // 传空列表而非依赖默认值（默认含 scale + border 两项）。
+                    effects: <DpadEffect>[],
+                    scrollPadding: 64,
+                  ),
+                  onBack: _handleTvBack,
+                )(
+                  context,
+                  // tv: 方向键连发层（见 TvKeyRepeatLayer）：必须包在 Dpad 之内、
+                  // Navigator 之外——本层 Focus 节点是全部焦点节点的祖先，且位于
+                  // Dpad 的 Shortcuts 之下（按键先经本层，才到 dpad 遍历）。
+                  TvKeyRepeatLayer(child: child ?? const SizedBox.shrink()),
                 ),
-                onBack: _handleTvBack,
-              )(context, child),
+              ),
               // 焦点红框叠在最上层（IgnorePointer，不拦按键）。
-              const Positioned.fill(child: TvFocusHighlight()),
+              Positioned.fill(child: TvFocusHighlight(key: _tvFocusFrameKey)),
             ],
           ),
         );
@@ -619,10 +822,20 @@ class _AppViewState extends State<_AppView> {
 
   @override
   void dispose() {
+    _windowsUpdateStartupTimer?.cancel();
+    _windowsF11Dispose?.call();
+    _windowsF11Dispose = null;
+    // v32：命令回调一并摘除——旧 State 的闭包引用已销毁 context，若引擎
+    // 复用重建后首帧前的深链恰好到达，会读到失效 context；置空后这类深链
+    // 不清 pending，由重建后的 _AppView postFrame 消费兜底补开。
+    MediaNotificationService.onOpenCardLyric = null;
+    // v40：原子随身听列表同步一并解绑（去抖 Timer、provider 监听、点播回调）。
+    VivoMixSync.instance.dispose();
     _shortcutConfig?.removeListener(_applyDesktopShortcuts);
     _playerProvider?.removeListener(_onPlayerChanged);
     _backgroundThemeProvider?.removeListener(_onBackgroundChanged);
     kPredictiveBackEnabled.removeListener(_onPredictiveBackChanged);
+    WindowsTaskbarSync.instance.detach();
     super.dispose();
   }
 
@@ -647,6 +860,7 @@ class _AppViewState extends State<_AppView> {
         AppTheme.lightThemeFromSeed(
           themeProvider.effectiveSeedColor,
           fontFamily: fontFamily,
+          textColor: themeProvider.customTextColor,
           emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
           predictiveBack: predictiveBack,
@@ -658,6 +872,7 @@ class _AppViewState extends State<_AppView> {
           themeProvider.effectiveSeedColor,
           useOledBlack: themeProvider.useOledBlack,
           fontFamily: fontFamily,
+          textColor: themeProvider.customTextColor,
           emphasized: themeProvider.emphasizedTypographyEnabled,
           labelBehavior: themeProvider.navLabelBehavior,
           predictiveBack: predictiveBack,
@@ -665,6 +880,15 @@ class _AppViewState extends State<_AppView> {
         themeProvider,
       ),
       themeMode: themeProvider.themeMode,
+      // 封面取色驱动的主题切换（切歌 → 封面主色 → ThemeProvider → 这里）在
+      // 视频观感里明显慢于封面滑动：封面先滑到位、标题随后、背景色最后收敛。
+      // MaterialApp 内建 AnimatedTheme 的默认 200ms 太快，拉长到 520ms 后
+      // 三层编排的先后顺序才看得出来。
+      //
+      // **这是全局改动**：手动切深色模式、换主题色等也会走 520ms。若验收时
+      // 觉得其它入口变拖沓，把它调回 300ms 左右即可（只影响观感，不影响正确性）。
+      themeAnimationDuration: const Duration(milliseconds: 520),
+      themeAnimationCurve: Curves.easeInOut,
       // 根据主题设置系统导航栏颜色
       builder: (context, child) {
         // 全局「显示大小」：整个 App 唯一的缩放点，页面侧一律直接写 dp。
@@ -679,6 +903,12 @@ class _AppViewState extends State<_AppView> {
               child: _SystemUiUpdater(
                 child: Stack(
                   children: [
+                    if (Platform.isWindows)
+                      Positioned.fill(
+                        child: ColoredBox(
+                          color: Theme.of(context).colorScheme.surface,
+                        ),
+                      ),
                     // 全局背景层（主页/底层背景）：复用 AppBackground 组件。
                     // 二级页面由路由过渡内嵌 AppBackground，随页面位移入场。
                     Positioned.fill(child: AppBackground()),
@@ -691,38 +921,82 @@ class _AppViewState extends State<_AppView> {
                     // 仍导入 package:flutter/material.dart，其 Theme.of(context) 取不到本项目的
                     // material_ui 主题。本桥把 ThemeData / MaterialLocalizations 提供给它们。
                     // 官方定位为过渡工具，待依赖全部迁移到 material_ui 后移除。
-                    CarModePanel(
-                      // ignore: deprecated_member_use
-                      child: MaterialUiCompatibilityBridge(
-                        // TV 构建：dpad 遍历引擎（区域记忆 + 束流遍历 + 聚焦特效 +
-                        // 返回键收口 + debugOverlay 调试高亮）。正常构建不包。
-                        // tv: TV 构建再叠加 10-foot 内容作用域（overscan 安全边距
-                        // + 正文缩放下限，见 [_tvContentScope]），Dpad 引擎包在
-                        // 最内层。正常构建仍走 child! 原分支，树与改动前一致。
-                        child: kTvBuild
-                            ? _tvMediaKeyFallback(
-                                _tvContentScope(context, child),
-                              )
-                            : child!,
+                    // 本 Material 只包 **app 内容**（Navigator）。顶层悬浮层在同级的
+                    // 另一个 Material 里，理由见下面「顶层悬浮层组」。
+                    WindowsWindowFrame(
+                      child: Material(
+                        type: MaterialType.transparency,
+                        // 桌面方向键播放控制（↑↓ 应用音量 / ←→ 快进快退）。
+                        //
+                        // **必须挂在这里（`MaterialApp.builder` 之内），不能像
+                        // 空格 / F / Esc 那样挂到 `MaterialApp` 之外**：裸方向键
+                        // 已被框架 `WidgetsApp.defaultShortcuts` 绑成
+                        // `DirectionalFocusIntent`（焦点遍历），而那个 `Shortcuts`
+                        // 包着本 builder 的产物（`widgets/app.dart` 的
+                        // `Shortcuts(... child: builder(context, routing))`）。
+                        // 挂在外面永远收不到；挂在这里既比默认遍历先拿到按键，
+                        // 又仍在 Navigator 之上 —— 全部路由、弹层与车机面板都覆盖到。
+                        // 非 Windows 原样返回 child（TV / Android 树零变化）。
+                        child: DesktopPlaybackKeys(
+                          child: CarModePanel(
+                            // ignore: deprecated_member_use
+                            child: MaterialUiCompatibilityBridge(
+                              // TV 构建：dpad 遍历引擎（区域记忆 + 束流遍历 + 聚焦特效 +
+                              // 返回键收口 + debugOverlay 调试高亮）。正常构建不包。
+                              // tv: TV 构建再叠加 10-foot 内容作用域（overscan 安全边距
+                              // + 正文缩放下限，见 [_tvContentScope]），Dpad 引擎包在
+                              // 最内层。正常构建仍走 child! 原分支，树与改动前一致。
+                              child: kTvBuild
+                                  ? _tvMediaKeyFallback(
+                                      _tvContentScope(context, child),
+                                    )
+                                  : child!,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
-                    const DlnaCastingOverlay(),
-                    // 底栏形态交叉过渡浮层（一级常驻条 ↔ 二级悬浮胶囊）：挂在
-                    // Navigator 之上、`PlayerDragOverlay` **之前** —— 形变层 /
-                    // 封面层必须盖在它上面。只在飞行窗口渲染，静止时零成本。
-                    const BottomBarMorphOverlay(),
-                    // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
-                    const PlayerDragOverlay(),
-                    // 封面连贯形变层：必须排在 PlayerDragOverlay **之后**，
-                    // 否则形变中的封面会被跟手预览页盖住。
-                    const PlayerCoverMorphLayer(),
-                    // 歌单封面连贯过渡的 pane 路径飞行层（详情面板嵌套
-                    // Navigator 内的 push 没有 HeroController 观察者，框架
-                    // Hero 不飞，由该层自绘；根 Navigator 路径走框架 Hero）。
-                    const PlaylistCoverFlightLayer(),
-                    // 「下一首播放」封面跳水动画层：与形变层同处设计像素空间，
-                    // 必须排在最末（球要画在最上面，越过形变层与歌单封面飞行层）。
-                    const PlayNextFlightLayer(),
+                    // 顶层悬浮层组：**必须留在 WindowsWindowFrame 之外**。
+                    //
+                    // Frame 在 Windows 上是一条 32dp 标题栏 + `Expanded` 正文
+                    //（见 windows_window_frame.dart）。而探针（封面探针 / MiniPlayer /
+                    // 底栏）量到的矩形都在 App 级「设计像素锚点」空间（含标题栏，
+                    // 见 ui_density.dart 的 DisplayScaleReference）；浮层若挂在 Frame
+                    // 内部，就会把锚点坐标当正文局部坐标画 —— 表现为封面飞行动画
+                    // 整段低 32dp、落位时向上跳，「下一首播放」跳水球与底栏形态
+                    // 交棒同理。只把 app 内容交给 Frame，浮层与锚点同空间才逐像素对齐。
+                    //
+                    // 透明 Material：这些浮层不在任何 Scaffold 内，其内部 InkWell 的
+                    // tapDown 取不到 Material 祖先会直接抛 "Null check operator used
+                    // on a null value"（Material.of，诊断日志 2026-10-16 09:40/09:55
+                    // 实证），点按被吞掉。根级挂一层 MaterialType.transparency 修复
+                    // 这一类崩溃：最近匹配规则下，页面内已有的 Material 完全不受影响。
+                    const Positioned.fill(
+                      child: Material(
+                        type: MaterialType.transparency,
+                        child: Stack(
+                          children: [
+                            DlnaCastingOverlay(),
+                            // 底栏形态交叉过渡浮层（一级常驻条 ↔ 二级悬浮胶囊）：挂在
+                            // Navigator 之上、`PlayerDragOverlay` **之前** —— 形变层 /
+                            // 封面层必须盖在它上面。只在飞行窗口渲染，静止时零成本。
+                            BottomBarMorphOverlay(),
+                            // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
+                            PlayerDragOverlay(),
+                            // 封面连贯形变层：必须排在 PlayerDragOverlay **之后**，
+                            // 否则形变中的封面会被跟手预览页盖住。
+                            PlayerCoverMorphLayer(),
+                            // 歌单封面连贯过渡的 pane 路径飞行层（详情面板嵌套
+                            // Navigator 内的 push 没有 HeroController 观察者，框架
+                            // Hero 不飞，由该层自绘；根 Navigator 路径走框架 Hero）。
+                            PlaylistCoverFlightLayer(),
+                            // 「下一首播放」封面跳水动画层：与形变层同处设计像素空间，
+                            // 必须排在最末（球要画在最上面，越过形变层与歌单封面飞行层）。
+                            PlayNextFlightLayer(),
+                          ],
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -844,14 +1118,13 @@ class _AppViewState extends State<_AppView> {
     );
     return withTransparentSurfaces.copyWith(
       appBarTheme: withTransparentSurfaces.appBarTheme.copyWith(
-        titleTextStyle: withTransparentSurfaces.appBarTheme.titleTextStyle
-            ?.copyWith(shadows: shadows),
+        titleTextStyle:
+            withTransparentSurfaces.appBarTheme.titleTextStyle?.copyWith(
+          shadows: shadows,
+        ),
       ),
       textTheme: AppTheme.applyTextShadows(base.textTheme, shadows),
-      primaryTextTheme: AppTheme.applyTextShadows(
-        base.primaryTextTheme,
-        shadows,
-      ),
+      primaryTextTheme: AppTheme.applyTextShadows(base.primaryTextTheme, shadows),
       // 实色表面：把 Flutter 的 M3 默认值（都从 textTheme 兜底取）在这里钉死，
       // 取的是 base 里还没加阴影的那份文字层级。
       dialogTheme: base.dialogTheme.copyWith(
@@ -864,13 +1137,11 @@ class _AppViewState extends State<_AppView> {
         textStyle: base.popupMenuTheme.textStyle ?? base.textTheme.labelLarge,
       ),
       snackBarTheme: base.snackBarTheme.copyWith(
-        contentTextStyle:
-            base.snackBarTheme.contentTextStyle ??
+        contentTextStyle: base.snackBarTheme.contentTextStyle ??
             base.textTheme.bodyMedium?.copyWith(color: cs.onInverseSurface),
       ),
       tooltipTheme: base.tooltipTheme.copyWith(
-        textStyle:
-            base.tooltipTheme.textStyle ??
+        textStyle: base.tooltipTheme.textStyle ??
             base.textTheme.bodySmall?.copyWith(color: cs.onInverseSurface),
       ),
     );
@@ -973,6 +1244,10 @@ class _MainLayoutState extends State<_MainLayout>
   final GlobalKey<DesktopShellState> _desktopShellKey =
       GlobalKey<DesktopShellState>();
 
+  /// 注册给 [DesktopInputRouter] 的两个出口（dispose 时按 identical 只清自己那份）。
+  Future<bool> Function()? _desktopBackHandler;
+  bool Function()? _desktopForwardHandler;
+
   /// 上一次同步的沉浸状态，避免重复调用 SystemChrome（幂等去重）。
   bool _immersiveSynced = false;
 
@@ -985,9 +1260,10 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// 常驻 MiniPlayer 的收起动画（二级路由形态的设置页开在当前 tab 栈顶、
   /// 或封面流横屏沉浸生效时）。
-  /// 与底栏收起同时长（kBottomChromeToggleDuration）、同曲线（面板收展缓动），
-  /// 且由同一 rebuild 帧驱动（_secondaryPageOnTop 翻转处同步起止），视觉上与
-  /// 底栏一起沉底/浮出。reduce-motion 时直接落端点（与底栏口径一致）。
+  /// 与底栏同时驱动（_secondaryPageOnTop 翻转处同步起止）：同时长
+  /// （kBottomChromeToggleDuration，交棒窗口预算按它校准，不可单独放宽）+
+  /// `chromeSinkEasing` / `chromeRiseEasing`，视觉上与底栏一起沉底/浮出。
+  /// reduce-motion 时直接落端点（与底栏口径一致）。
   late final AnimationController _miniPlayerHideController;
   late final CurvedAnimation _miniPlayerHide;
 
@@ -1010,6 +1286,68 @@ class _MainLayoutState extends State<_MainLayout>
 
   /// 上一次同步给 [_barFormController] 的目标形态（true = 悬浮胶囊）。
   late bool _barFormTargetIsCapsule;
+
+  /// 壳层是否「在前台」（自身 ticker 未被静音）。
+  ///
+  /// **为什么需要这一维**：形态交棒的飞行窗口 [kBarFormFlightActive] 只能由
+  /// [_barFormController] 的 `completed/dismissed` 状态事件关闭
+  /// （[_onBarFormStatusChanged]）。而框架在 Overlay 层给**被不透明路由盖住**的
+  /// 条目整棵子树关掉 TickerMode（`overlay.dart`：`onstage` 之后的 entry 一律
+  /// `tickerEnabled: false`；`TickerProviderStateMixin` 把 ticker 置 `muted`）——
+  /// 静音只是**不回调**，`isActive` 仍为 true（`ticker.dart`），也就是说动画被
+  /// 冻在起点而不是被停止，状态事件永不产生。
+  ///
+  /// 于是：用户停在**推到根 Navigator** 的设置页（「我的」齿轮那条入口，
+  /// `user_center_page.dart`）时切「悬浮迷你播放器」→ 窗口照例开启、控制器照例
+  /// forward/reverse → 但这一侧的 ticker 是静音的 → 窗口永不关闭 → 交棒浮层
+  /// （挂在 Navigator 之上，见 `_MAppView.builder`）把切换前那根条一直画在设置页
+  /// 上面，必须返回主页（解除静音、补发状态事件）才消失。真机报障即此。
+  ///
+  /// 用 notifier 订阅而不是只在 `didChangeDependencies` 读一次：飞行**中途**被盖住
+  /// （切后台、又 push 一层）也要能立刻收窗，见 [_onTickerModeChanged]。
+  ValueListenable<TickerModeData>? _tickerModeNotifier;
+
+  /// 壳层当前是否可见（无 TickerMode 祖先时按可见处理，与框架 fallback 一致）。
+  bool get _shellVisible => _tickerModeNotifier?.value.enabled ?? true;
+
+  /// 订阅壳层可见性（`didChangeDependencies` 每次重挂，祖先换了对称解挂）。
+  void _listenShellVisibility() {
+    final next = TickerMode.getValuesNotifier(context);
+    if (identical(next, _tickerModeNotifier)) return;
+    _tickerModeNotifier?.removeListener(_onTickerModeChanged);
+    next.addListener(_onTickerModeChanged);
+    _tickerModeNotifier = next;
+  }
+
+  /// 壳层可见性翻转：被盖住的一瞬如果交棒窗口还开着（动画已在途中），立刻吸附
+  /// 收窗。留在台上只会变成「永不关闭的浮层条」；吸附本身是幂等的
+  /// （[_snapBarFormToTarget] 先 `stop()` 再关窗、落端点）。
+  ///
+  /// 时机：本回调由 `TickerMode` 的 notifier 触发，可能正落在 build / layout 阶段
+  /// （框架更新有效值是在 `didUpdateWidget` 里），而 `_MainLayout` 是浮层 Stack 的
+  /// **后代**——同步写那两个全局会当场标脏祖先。吸附体本身
+  /// （[_snapBarFormToTarget]）已按 `persistentCallbacks` 推迟到帧末，常驻条那半边
+  /// 照同一口径自己判一次。
+  void _onTickerModeChanged() {
+    if (!mounted) return;
+    if (_shellVisible) return;
+    if (kBarFormFlightActive.value) _snapBarFormToTarget();
+    // 常驻条收起同理：被盖住时动画看不见，落端点即可（回主页不会补播这段动画）。
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _syncMiniPlayerHide());
+    } else {
+      _syncMiniPlayerHide();
+    }
+  }
+
+  /// 开启交棒让位窗口（起跑同帧调）：标出源端形态（窗口内两端真身保持挂载，源端
+  /// 不 offstage、目的端 offstage，见 [barFormRealBarStandsDown]）。
+  void _openBarFormFlight(bool targetIsCapsule) {
+    // 目的形态是胶囊 ⇒ 源形态是常驻条（反之亦然）。
+    kBarFormResidentIsSource.value = targetIsCapsule;
+    kBarFormFlightActive.value = true;
+  }
 
   /// 形态交棒专用的「当前 tab 是否停在 push 出来的页面上」事实（导航时刻立即更新）。
   ///
@@ -1102,6 +1440,9 @@ class _MainLayoutState extends State<_MainLayout>
         break;
       case 'channel':
         page = const ChannelPage();
+        break;
+      case 'sheet':
+        page = const SheetSquarePage();
         break;
       case 'brush':
         page = const BrushPage();
@@ -1244,6 +1585,15 @@ class _MainLayoutState extends State<_MainLayout>
           ),
           label: tab.label,
         );
+      case 'sheet':
+        return NavigationDestination(
+          icon: _AnimatedTabIcon(
+            selected: isSelected,
+            outlinedIcon: Icons.queue_music_outlined,
+            filledIcon: Icons.queue_music,
+          ),
+          label: tab.label,
+        );
       case 'brush':
         return NavigationDestination(
           icon: _AnimatedTabIcon(
@@ -1376,6 +1726,12 @@ class _MainLayoutState extends State<_MainLayout>
           selectedIcon: const Icon(Icons.dynamic_feed),
           label: label,
         );
+      case 'sheet':
+        return NavigationRailDestination(
+          icon: const Icon(Icons.queue_music_outlined),
+          selectedIcon: const Icon(Icons.queue_music),
+          label: label,
+        );
       case 'brush':
         return NavigationRailDestination(
           icon: const Icon(Icons.swipe_outlined),
@@ -1502,6 +1858,13 @@ class _MainLayoutState extends State<_MainLayout>
           // 公开版偏好：侧栏（NavigationRail）也不显示文字，仅图标
           label: const Text(''),
         );
+      case 'sheet':
+        return NavigationDrawerDestination(
+          icon: const Icon(Icons.queue_music_outlined),
+          selectedIcon: const Icon(Icons.queue_music),
+          // 公开版偏好：侧栏（NavigationRail）也不显示文字，仅图标
+          label: const Text(''),
+        );
       case 'brush':
         return NavigationDrawerDestination(
           icon: const Icon(Icons.swipe_outlined),
@@ -1551,17 +1914,13 @@ class _MainLayoutState extends State<_MainLayout>
     _exitScale = Tween<double>(begin: 1.0, end: 0.1).animate(
       CurvedAnimation(parent: _exitController, curve: Curves.easeInOutCubic),
     );
-    _exitOpacity = Tween<double>(
-      begin: 1.0,
-      end: 0.0,
-    ).animate(CurvedAnimation(parent: _exitController, curve: Curves.easeIn));
+    _exitOpacity = Tween<double>(begin: 1.0, end: 0.0).animate(
+      CurvedAnimation(parent: _exitController, curve: Curves.easeIn),
+    );
     _exitOffset = Tween<Offset>(begin: Offset.zero, end: const Offset(0.7, 0.7))
         .animate(
-          CurvedAnimation(
-            parent: _exitController,
-            curve: Curves.easeInOutCubic,
-          ),
-        );
+      CurvedAnimation(parent: _exitController, curve: Curves.easeInOutCubic),
+    );
     // 常驻 MiniPlayer 收起：时长/曲线与 ResponsiveScaffold._chromeHide 完全一致，
     // 由 [_syncMiniPlayerHide] 在同一帧驱动到目标态。
     // 初值按目标态定端点（与 _chromeHide 按 widget.hideNavigation 定端点同一口径）：
@@ -1581,8 +1940,8 @@ class _MainLayoutState extends State<_MainLayout>
     _miniPlayerHideTarget = initialMiniPlayerHide;
     _miniPlayerHide = CurvedAnimation(
       parent: _miniPlayerHideController,
-      curve: M3ExpressiveMotion.panelCollapseEasing,
-      reverseCurve: M3ExpressiveMotion.panelExpandEasing,
+      curve: M3ExpressiveMotion.chromeSinkEasing,
+      reverseCurve: M3ExpressiveMotion.chromeRiseEasing,
     );
     kSecondaryPlayerEnabled.addListener(_syncMiniPlayerHide);
     kSuppressResidentMiniPlayer.addListener(_syncMiniPlayerHide);
@@ -1590,13 +1949,9 @@ class _MainLayoutState extends State<_MainLayout>
     // [_resolveBarFormTargetIsCapsule]）。初值按目标定端点（启动即处于胶囊形态时
     // 不必再播一段 260ms）。
     _barFormTargetIsCapsule = _resolveBarFormTargetIsCapsule();
-    _lastSyncedBarFormTabIndex = _selectedIndex;
-    // 窗口判据自起跑同帧写 true、源端标记置「常驻条端为源」：路由初始视口一定
-    // 是常驻条页（`_resolveBarFormTargetIsCapsule` 在冷启动恒 false），此后
-    // `_openBarFormFlight` 只在真切换时写。若不置位，首次动画的前半程判据仍闭着，
-    // 端点不登记/让位，浮层会对着空场画。`p` 保持 0，由动画自身推进。
     kBarFormFlightActive.value = false;
-    kBarFormResidentIsSource.value = true;
+    kBarFormResidentIsSource.value = !_barFormTargetIsCapsule;
+    _lastSyncedBarFormTabIndex = _selectedIndex;
     _barFormController = AnimationController(
       vsync: this,
       duration: kBottomChromeToggleDuration,
@@ -1665,6 +2020,10 @@ class _MainLayoutState extends State<_MainLayout>
     playerProvider.onRoomPlayModeChanged = (mode) {
       ltProvider.session?.ownerSetPlayMode(mode);
     };
+    // 定时关闭「结束后减少待机耗电」：到点（含「播完当前歌曲」收尾）复用
+    // 「退出 App」序列（stopForAppExit 停播落盘 → 停本地 Rust 服务 →
+    // Android 结束任务；Windows 走托盘退出握手真退整个进程，见 _exitApp）。
+    playerProvider.onSleepTimerExit = _exitApp;
     // 冷启动一起听会话恢复：进程被杀后服务端会话仍在进行（其他成员还能看到
     // 自己），按服务端会话重建 RoomSession，让播放器胶囊不进页也立即回到
     // 会话态。首帧后执行（等 Provider 挂载），恢复失败静默跳过。
@@ -1708,6 +2067,15 @@ class _MainLayoutState extends State<_MainLayout>
     // 载入前默认 false（常规响应式布局），载入/切换后触发整棵子树重建。
     kDesktopModeEnabled.addListener(_onDesktopModeChanged);
     unawaited(_loadDesktopModeEnabled());
+    // 桌面键鼠的「返回 / 前进」出口（Esc、Alt+←/→、鼠标侧键）：本 State 是唯一
+    // 同时握着两个壳层句柄与 tab 状态的地方，全局键位层经 DesktopInputRouter
+    // 问到这里（注册/注销成对，identical 校验避免新旧实例互相覆盖）。
+    // 存成字段而不是直接写闭包：`_desktopBackHandler` 与注销时的比较必须是
+    // 同一个函数对象（闭包每次新建，identical 不成立）。
+    _desktopBackHandler = () => _dispatchBack(allowExitAtRoot: false);
+    _desktopForwardHandler = _dispatchForward;
+    DesktopInputRouter.backHandler = _desktopBackHandler;
+    DesktopInputRouter.forwardHandler = _desktopForwardHandler;
     // 悬浮播放器总开关：启动时载入持久化值（宿主自己订阅，无需本 State 监听）。
     unawaited(_loadSecondaryPlayerEnabled());
     // 悬浮播放器的进度指示与一级页面形态：同上，宿主/本 shell 各自订阅。
@@ -1727,6 +2095,12 @@ class _MainLayoutState extends State<_MainLayout>
     unawaited(_loadCoverShadowStrength());
     // 宽屏播放页「横屏控制面板独立页」开关：启动时载入持久化值（播放页自己订阅）。
     unawaited(_loadLandscapeDetachedControls());
+    // 宽屏播放页「左右对称分栏」开关：启动时载入持久化值（播放页自己订阅）。
+    unawaited(_loadSymmetricWidePane());
+    // 宽屏播放页「自定义宽屏边距」滑条：启动时载入持久化值（播放页自己订阅）。
+    unawaited(_loadWidePaneMarginOverride());
+    // 宽屏播放页「忽略挖孔避让」开关：启动时载入持久化值（播放页自己订阅）。
+    unawaited(_loadWidePaneIgnoreCutout());
     // 顶栏「胶囊按钮收缩」开关：启动时载入持久化值（顶栏尾部组件自己订阅）。
     unawaited(_loadTopBarPillCollapse());
     // 页签圆点位置开关（默认关 = 底部页签条）：启动时载入持久化值（播放页自己订阅）。
@@ -1743,16 +2117,46 @@ class _MainLayoutState extends State<_MainLayout>
   }
 
   @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    // 转屏 / 分屏 / 改窗口尺寸：飞行中浮层的两端端点（冻结的常驻条快照与实时
+    // 解析的胶囊端点）来自**不同屏幕尺寸**的口径，继续插值必然半途错位 ——
+    // 直接吸附到目标端收窗；转屏后的静止几何由两端真身各自按新尺寸落位。
+    // 只在交棒窗口开着时出手（didChangeMetrics 本就不频繁），不新增帧源。
+    if (kBarFormFlightActive.value) {
+      if (_barFormLogEnabled) {
+        debugPrint('[BarForm] metrics changed mid-flight, snap to target');
+      }
+      _snapBarFormToTarget();
+    }
+  }
+
+  @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     // 与底栏收起同一 reduce-motion 口径：动画直接落端点，不播过渡。
     _reduceMotion = MediaQuery.disableAnimationsOf(context);
+    // 壳层可见性（被不透明路由盖住 = ticker 静音）：交棒窗口只能靠动画状态事件
+    // 关闭，静音时那些事件永不产生，见 [_tickerModeNotifier]。
+    _listenShellVisibility();
   }
 
   @override
   void dispose() {
     _exitResetTimer?.cancel();
     _exitController.dispose();
+    // 桌面返回/前进出口成对注销：只清自己那一份（identical 校验），避免热重载或
+    // 重建顺序上把新 State 注册的回调误清空。
+    if (identical(DesktopInputRouter.backHandler, _desktopBackHandler)) {
+      DesktopInputRouter.backHandler = null;
+    }
+    if (identical(DesktopInputRouter.forwardHandler, _desktopForwardHandler)) {
+      DesktopInputRouter.forwardHandler = null;
+    }
+    // 壳层可见性订阅与 _listenShellVisibility 成对解挂（框架在 dispose 期
+    // 取 InheritedWidget 会断言，这里只用手上那份 notifier，不再碰 context）。
+    _tickerModeNotifier?.removeListener(_onTickerModeChanged);
+    _tickerModeNotifier = null;
     kSecondaryPlayerEnabled.removeListener(_syncMiniPlayerHide);
     kSuppressResidentMiniPlayer.removeListener(_syncMiniPlayerHide);
     kCoverFlowImmersiveActive.removeListener(_syncMiniPlayerHide);
@@ -1765,7 +2169,9 @@ class _MainLayoutState extends State<_MainLayout>
     LyriconProviderService.instance.removeListener(_onLyriconStateChanged);
     kCoverFlowImmersive.removeListener(_onCoverFlowImmersiveChanged);
     kDesktopModeEnabled.removeListener(_onDesktopModeChanged);
-    kHideNavBarOnSecondaryPages.removeListener(_onHideNavBarOnSecondaryChanged);
+    kHideNavBarOnSecondaryPages.removeListener(
+      _onHideNavBarOnSecondaryChanged,
+    );
     shortcutTabRequest.removeListener(_handleShortcutTabRequest);
     externalMediaRequest.removeListener(_handleExternalMediaRequest);
     WidgetsBinding.instance.removeObserver(this);
@@ -1860,6 +2266,40 @@ class _MainLayoutState extends State<_MainLayout>
     }
   }
 
+  /// 启动时从持久化载入宽屏「左右对称分栏」开关，写入全局
+  /// [kSymmetricWidePaneEnabled]
+  /// （两个 full_player 的 initState 监听它，无需本 State 监听）。
+  Future<void> _loadSymmetricWidePane() async {
+    final enabled = await SettingsRepository().getSymmetricWidePane();
+    if (!mounted) return;
+    if (kSymmetricWidePaneEnabled.value != enabled) {
+      kSymmetricWidePaneEnabled.value = enabled;
+    }
+  }
+
+  /// 启动时从持久化载入宽屏「自定义宽屏边距」覆盖值（dp），写入全局
+  /// [kWidePaneMarginOverride]
+  /// （两个 full_player 的 initState 监听它，无需本 State 监听）。
+  /// null（未设置/越界）= 自动口径，不写 notifier，保持初值即可。
+  Future<void> _loadWidePaneMarginOverride() async {
+    final margin = await SettingsRepository().getWidePaneMargin();
+    if (!mounted) return;
+    if (kWidePaneMarginOverride.value != margin) {
+      kWidePaneMarginOverride.value = margin;
+    }
+  }
+
+  /// 启动时从持久化载入宽屏「忽略挖孔避让」开关，写入全局
+  /// [kWidePaneIgnoreCutoutEnabled]
+  /// （两个 full_player 的 initState 监听它，无需本 State 监听）。
+  Future<void> _loadWidePaneIgnoreCutout() async {
+    final enabled = await SettingsRepository().getWidePaneIgnoreCutout();
+    if (!mounted) return;
+    if (kWidePaneIgnoreCutoutEnabled.value != enabled) {
+      kWidePaneIgnoreCutoutEnabled.value = enabled;
+    }
+  }
+
   /// 启动时从持久化载入顶栏「胶囊按钮收缩」开关，写入全局
   /// [kTopBarPillCollapseEnabled]（顶栏尾部组件订阅它，无需本 State 监听）。
   Future<void> _loadTopBarPillCollapse() async {
@@ -1925,8 +2365,7 @@ class _MainLayoutState extends State<_MainLayout>
   Future<void> _loadSecondaryPlayerDock() async {
     final raw = await SettingsRepository().getSecondaryPlayerDockRaw();
     if (!mounted) return;
-    final side =
-        SecondaryPlayerDockSide.tryParse(raw) ??
+    final side = SecondaryPlayerDockSide.tryParse(raw) ??
         (isPadLayout(context)
             ? SecondaryPlayerDockSide.right
             : SecondaryPlayerDockSide.center);
@@ -2040,13 +2479,12 @@ class _MainLayoutState extends State<_MainLayout>
   /// 推到当前 tab 的中央栈（内层 Navigator），深度观察者上报二级态 → 底栏播放
   /// 收起动画；壳层不在（桌面布局 / 首帧前）时回退根 Navigator 直接覆盖。
   void _openTabAsPage(String tabId) {
-    final pushed = _responsiveShellKey.currentState?.pushCurrentTabRoute<void>(
-      (_) => _pageForTabAsRoute(tabId),
-    );
+    final pushed = _responsiveShellKey.currentState
+        ?.pushCurrentTabRoute<void>((_) => _pageForTabAsRoute(tabId));
     if (pushed != null) return;
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => _pageForTabAsRoute(tabId)));
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => _pageForTabAsRoute(tabId)),
+    );
   }
 
   /// tabId → 可作为二级路由打开的页面（复用主 tab 页面，去掉主 tab 专属参数）。
@@ -2098,6 +2536,9 @@ class _MainLayoutState extends State<_MainLayout>
         break;
       case 'channel':
         page = const ChannelPage();
+        break;
+      case 'sheet':
+        page = const SheetSquarePage();
         break;
       case 'brush':
         page = const BrushPage();
@@ -2169,9 +2610,7 @@ class _MainLayoutState extends State<_MainLayout>
       barrierDismissible: false,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('词幕连接失败'),
-        content: const Text(
-          '多次尝试连接词幕服务失败，请确认已开启词幕（Lyricon），检查设备上的词幕服务是否正常运行后重试。',
-        ),
+        content: const Text('多次尝试连接词幕服务失败，请确认已开启词幕（Lyricon），检查设备上的词幕服务是否正常运行后重试。'),
         actions: [
           TextButton(
             onPressed: () {
@@ -2318,10 +2757,8 @@ class _MainLayoutState extends State<_MainLayout>
   /// 中央按钮 / 广场横幅的 resumeRoomPlayback。
   void _forwardSeekToRoom(int positionMs) {
     final session = context.read<ListenTogetherProvider>().session;
-    debugPrint(
-      '[ListenTogether] 用户 seek 通告: ${positionMs}ms '
-      'session=${session == null ? "null" : (session.isOwner ? "房主" : (session.playbackDetached ? "已脱离" : "跟随中"))}',
-    );
+    debugPrint('[ListenTogether] 用户 seek 通告: ${positionMs}ms '
+        'session=${session == null ? "null" : (session.isOwner ? "房主" : (session.playbackDetached ? "已脱离" : "跟随中"))}');
     if (session == null) return;
     if (session.isOwner) {
       session.ownerSeek(positionMs);
@@ -2403,42 +2840,18 @@ class _MainLayoutState extends State<_MainLayout>
       _syncBarFormTarget();
     });
 
-    // 一级页面返回拦截：
-    // 1) PopScope 拦截系统返回手势 / 物理返回键，canPop=false → 触发 onPopInvoked
-    // 2) 封面流沉浸中：返回键先恢复 tab 栏（退出沉浸），不弹退出确认
-    // 3) 否则双击返回回到手机桌面：首次返回 Toast 提示，3 秒内再按一次
-    //    走 moveTaskToBack 挂后台（不杀进程、不停播放器、不停本地 Rust 服务器）
+    // 一级页面返回拦截：本方法承担两条入口，语义不同（见 [allowExitAtRoot]）：
+    // 1) 系统返回手势 / 物理返回键（根 PopScope）——允许走到「双击返回挂后台」；
+    // 2) 桌面键盘 Esc / 鼠标侧键后退（经 DesktopInputRouter 注册）——到根即停。
+    //
+    // 顺序（与横屏平板重设计计划 4.4 / 六一致）：
+    // 拖拽展开层 → 当前 Tab 的壳层栈 → 封面流沉浸退出 → 回首页 → 退出。
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
-        // 上滑拖拽展开中：返回键先收起覆盖层，回到 MiniPlayer
-        if (playerDragActive.value) {
-          playerDragActive.value = false;
-          playerExpansion.value = 0.0;
-          return;
-        }
-        // 桌面布局：先回退当前 Tab 的中央内容栈（详情页返回），空栈才继续。
-        if (isDesktopLayout(context) &&
-            (await _desktopShellKey.currentState?.maybePop() ?? false)) {
-          return;
-        }
-        if (!isDesktopLayout(context) &&
-            (await _responsiveShellKey.currentState?.maybePop() ?? false)) {
-          return;
-        }
-        if (!mounted) return;
-        if (immersive) {
-          kCoverFlowImmersive.value = false;
-        } else if (safeIndex != 0) {
-          // 主导航页面先返回首页，只有首页继续执行双击返回退出。
-          debugPrint('[MainNavigation] back tab=${currentTab.id} -> home');
-          setState(() => _selectedIndex = 0);
-          _exitResetTimer?.cancel();
-          _exitPressed = false;
-        } else {
-          _onBackPressedForExit();
-        }
+        // ignore: discarded_futures
+        await _dispatchBack(allowExitAtRoot: true);
       },
       child: AbsorbPointer(
         absorbing: _isExiting,
@@ -2458,7 +2871,10 @@ class _MainLayoutState extends State<_MainLayout>
               child: Transform.scale(
                 scale: _exitScale.value,
                 alignment: Alignment.topLeft,
-                child: Opacity(opacity: _exitOpacity.value, child: child),
+                child: Opacity(
+                  opacity: _exitOpacity.value,
+                  child: child,
+                ),
               ),
             );
           },
@@ -2481,6 +2897,24 @@ class _MainLayoutState extends State<_MainLayout>
                       _selectedIndex = index;
                     });
                   },
+                )
+              : kTvBuild
+              // tv: TV 版主壳层——顶部双层导航（见 tv_shell.dart）。沉浸
+              // （封面流横屏全屏）时整条顶栏让位；二级页面不再收起顶栏
+              // （MiniPlayer 在顶栏，收起会丢掉当前播放信息）。
+              ? TvMainShell(
+                  visibleTabs: visibleTabs,
+                  selectedIndex: _selectedIndex,
+                  railDestinations: railDestinations,
+                  onDestinationSelected: (index) {
+                    if (isFullPlayerOnTop) return;
+                    setState(() {
+                      _selectedIndex = index;
+                    });
+                  },
+                  shellKey: _responsiveShellKey,
+                  body: _buildBody(context, visibleTabs, immersive),
+                  hidden: immersive,
                 )
               : ResponsiveScaffold(
                   destinations: destinations,
@@ -2545,6 +2979,84 @@ class _MainLayoutState extends State<_MainLayout>
     return visibleTabs[_selectedIndex.clamp(0, visibleTabs.length - 1)].id;
   }
 
+  /// 封面流横屏沉浸是否生效（build 的 `immersive` 与返回链路共用同一判据）。
+  bool _immersiveActive(List<TabItem> visibleTabs) =>
+      _currentTabId(visibleTabs) == 'coverflow' &&
+      MediaQuery.orientationOf(context) == Orientation.landscape &&
+      kCoverFlowImmersive.value;
+
+  /// 统一「返回」链路，两个入口共用：
+  /// 1. 根 [PopScope]（系统返回手势 / 物理返回键）传 `allowExitAtRoot: true`；
+  /// 2. 桌面键鼠层（Esc / 鼠标侧键后退 / Alt+←）经 [DesktopInputRouter]
+  ///    注册进来时传 false。
+  ///
+  /// 顺序：拖拽展开层 → 根栈顶页 → 当前 Tab 的壳层栈 → 退出封面流沉浸 →
+  /// 回首页 → （仅系统返回）双击返回挂后台。
+  ///
+  /// [allowExitAtRoot] 到根页面时才起作用：键盘/侧键**不允许**继续走
+  /// [_onBackPressedForExit] —— 那条路经 `showToast`，而 Windows 的 Toast 是原生
+  /// `MessageBoxW` 模态框（见 `windows/runner/flutter_window.cpp`），用户在输入框
+  /// 或菜单里按 Esc 不该被模态框打断。返回 true = 本次返回已被消费。
+  Future<bool> _dispatchBack({required bool allowExitAtRoot}) async {
+    // 上滑拖拽展开中：返回键先收起覆盖层，回到 MiniPlayer。
+    if (playerDragActive.value) {
+      playerDragActive.value = false;
+      playerExpansion.value = 0.0;
+      return true;
+    }
+    // 后半段有 await，先把要读 context 的四项取成快照（避免跨异步间隙用 context）。
+    final NavigatorState? rootNav = appNavigatorKey.currentState;
+    final List<TabItem> visibleTabs =
+        context.read<TabConfigProvider>().visibleTabs;
+    final bool desktop = isDesktopLayout(context);
+    final bool immersive = _immersiveActive(visibleTabs);
+    // 根栈上还盖着别的页面（完整播放页、车机 dockMode 重定向到根的歌单页等）：
+    // 交给它自己的返回语义。播放页的 PopScope 已排好「退 Zen → 退出编辑 →
+    // 收起播放页」的优先级，这里不重复判断。
+    //
+    // 判据只能是 canPop：本 State 的 route 是根栈第一条，canPop=false 时说明
+    // 顶栏就是它，才继续往壳层走。系统返回键到达本方法时根栈必然 canPop=false
+    // （那条 route 的 PopScope 已把返回吃掉），所以两个入口不会互相重入。
+    if (rootNav != null && rootNav.canPop()) {
+      // ignore: discarded_futures
+      await rootNav.maybePop();
+      return true;
+    }
+    // 桌面布局：先回退当前 Tab 的中央内容栈（详情页返回），空栈才继续。
+    if (desktop) {
+      if (await _desktopShellKey.currentState?.maybePop() ?? false) return true;
+    } else if (await _responsiveShellKey.currentState?.maybePop() ?? false) {
+      return true;
+    }
+    if (!mounted) return false;
+    if (immersive) {
+      kCoverFlowImmersive.value = false;
+      return true;
+    }
+    if (_selectedIndex != 0) {
+      // 主导航页面先返回首页，只有首页继续执行双击返回退出。
+      debugPrint('[MainNavigation] back tab=${_currentTabId(visibleTabs)} -> home');
+      setState(() => _selectedIndex = 0);
+      _exitResetTimer?.cancel();
+      _exitPressed = false;
+      return true;
+    }
+    if (!allowExitAtRoot) return false;
+    _onBackPressedForExit();
+    return true;
+  }
+
+  /// 桌面「前进」（鼠标侧键前进 / Alt+→）：重建当前 Tab 最近一次后退掉的详情页。
+  ///
+  /// 前进历史挂在各壳层（`DesktopShellState` / `ResponsiveShellState`），
+  /// 本方法只做分发。返回 true = 有前进历史并已 push。
+  bool _dispatchForward() {
+    if (isDesktopLayout(context)) {
+      return _desktopShellKey.currentState?.goForward() ?? false;
+    }
+    return _responsiveShellKey.currentState?.goForward() ?? false;
+  }
+
   /// 常驻播放条的承载位置：总开关关闭时由本壳层最外层承载（所有页面共用一条，
   /// 宿主 `ownsBottomBar` 会抑制各页自补的那条）；总开关开但一级页面退回常驻条时，
   /// 改由每个 tab 根内容底部的 [PrimaryPagePersistentBar] 槽承载 —— 挂在壳层底部
@@ -2590,7 +3102,10 @@ class _MainLayoutState extends State<_MainLayout>
     // 常驻条就此沉底不回。守卫换成目标态后，mid-flight 改目标也一定会重新驱动。
     if (_miniPlayerHideTarget == hide) return;
     _miniPlayerHideTarget = hide;
-    if (_reduceMotion) {
+    // 与形态交棒同一道理（见 [_tickerModeNotifier]）：壳层被不透明路由盖住时
+    // ticker 是静音的，`forward/reverse` 只会停在起点，等回主页再补事件期间这条
+    // 一直半收半显。看不见动画时直接落端点即可（回主页本也不该重播这段动画）。
+    if (_reduceMotion || !_shellVisible) {
       _miniPlayerHideController.value = hide ? 1.0 : 0.0;
     } else if (hide) {
       _miniPlayerHideController.forward();
@@ -2648,6 +3163,9 @@ class _MainLayoutState extends State<_MainLayout>
       _syncBarFormTarget(cause: BarFormFlipCause.ambient);
       return;
     }
+    // 导航事实翻转只驱动形态交棒（下方调用）；底栏/常驻条的收展继续走推迟
+    // 上报（_onSecondaryRouteChanged）—— 转场途中底栏槽位高度必须不变
+    // （Hero 飞行盒子 + 交棒窗口的端点预算都按此校准），两者解耦是刻意的。
     _syncBarFormTarget(
       cause: BarFormFlipCause.navigation,
       transition: transition,
@@ -2684,6 +3202,11 @@ class _MainLayoutState extends State<_MainLayout>
     // 早退——它一旦被重构掉，这里会立刻退化成幻影翻转。kTvBuild 为 const，
     // 正常构建此分支被树摇剔除、零开销。
     if (kTvBuild) return;
+    // 横屏（rail 布局）口径：没有底部导航栏（胶囊端点不再让出底栏槽位），内容区
+    // 从 rail+分隔线右缘起（一级页；二级页 rail 随页收起则回到全屏宽）。
+    final bool railLayout = usesNavigationRail(
+      MediaQuery.sizeOf(context).width,
+    );
     final int tabIndex = _selectedIndex;
     final bool tabChanged = tabIndex != _lastSyncedBarFormTabIndex;
     _lastSyncedBarFormTabIndex = tabIndex;
@@ -2714,10 +3237,14 @@ class _MainLayoutState extends State<_MainLayout>
         if (target) {
           // push 方向：目的页的胶囊要等它构建（下一帧）才挂出来 —— 先起跑，
           // 帧末核对；核对不过（设置子页这类不挂播放条的页面）再吸附撤销。
-          // 胶囊端点随二级页的底栏状态定：默认收底栏（胶囊贴到屏底净空）。
-          _startBarFormFlight(
+          // 胶囊端点随二级页的底栏状态定：默认收底栏（胶囊贴到屏底净空）；
+          // 横屏 rail 布局本就没有底栏，恒视为已收。
+          _driveBarFormFlight(
             duration,
-            capsuleNavHiddenAtSettle: kHideNavBarOnSecondaryPages.value,
+            capsuleNavHiddenAtSettle:
+                railLayout || kHideNavBarOnSecondaryPages.value,
+            // 二级页的 rail 已随页收起（hideRailNavigation），胶囊区回到全屏宽。
+            capsuleBodyLeadingInset: 0.0,
           );
           _verifyPushedPageHasCapsule(navRoute);
         } else {
@@ -2727,43 +3254,134 @@ class _MainLayoutState extends State<_MainLayout>
             return;
           }
           // 胶囊在这一侧是**被弹出的二级页**（当前结算形态），其底栏状态同样
-          // 由该设置决定。
-          _startBarFormFlight(
+          // 由该设置决定；横屏 rail 布局恒视为已收、胶囊区全屏宽（同 push）。
+          _driveBarFormFlight(
             duration,
-            capsuleNavHiddenAtSettle: kHideNavBarOnSecondaryPages.value,
+            capsuleNavHiddenAtSettle:
+                railLayout || kHideNavBarOnSecondaryPages.value,
+            capsuleBodyLeadingInset: 0.0,
           );
         }
       case BarFormFlipCause.settingsToggle:
       case BarFormFlipCause.tabSwitch:
-        // 这两条线的胶囊侧都在一级页（标题居中的 tab 根页 / 一级页面也用
-        // 悬浮条）：底栏恒在场，胶囊端点要让出底栏槽位。
-        _startBarFormFlight(
+        // 这两条线的胶囊侧都在一级页：竖屏底栏恒在场，胶囊端点要让出底栏槽位；
+        // 横屏 rail 布局没有底栏（胶囊贴到屏底净空），但内容区要让出 rail+
+        // 分隔线的左缘保留宽（真身 body 从 rail 右缘起）。
+        //
+        // 走 [_driveBarFormFlight] 而不是直接起飞：**设置页切换形态开关时用户
+        // 就停在一条推到根 Navigator 的页面上，壳层整棵被静音**，动画跑不完、
+        // 交棒窗口永不关闭 → 残条浮在设置页上（真机报障，见 _tickerModeNotifier
+        // 的说明）。这条正是本案例的落点：吸附、直接落位。
+        _driveBarFormFlight(
           kBottomChromeToggleDuration,
-          capsuleNavHiddenAtSettle: false,
+          capsuleNavHiddenAtSettle: railLayout,
+          capsuleBodyLeadingInset: railLayout
+              ? navigationRailReservedWidth
+              : 0.0,
         );
       case BarFormFlipCause.ambient:
         _snapBarFormToTarget();
     }
   }
 
-  /// 本次形态翻转之后，底栏（竖屏 NavigationBar）还会不会在转场收敛时起
-  /// 260ms 收起/恢复动画 —— 交棒窗口据此顺延（竖屏底栏收起是唯一还要在
-  /// 转场之后变几何的动作；横屏侧栏是瞬时 Offstage，不需要顺延）。
-  bool _barFormNavWillToggle() =>
-      (_formSecondaryOnTop && kHideNavBarOnSecondaryPages.value) !=
-      (_secondaryPageOnTop && kHideNavBarOnSecondaryPages.value);
+  /// 本次形态翻转之后，导航栏还会不会在转场收敛时起 260ms 收起/恢复动画
+  /// —— 交棒窗口据此顺延（两端真身要等导航栏落定才到结算端点）。
+  bool _barFormNavWillToggle() {
+    // 横屏 rail 布局：侧栏已改为与竖屏底栏同一套逐帧收起动画（槽位宽度按
+    // 进度收缩，见 responsive_layout 的 _buildRailLayout），且 rail 恒随二级页
+    // 翻转收起（hideRailNavigation，不受设置开关影响）——转场收敛后 rail 仍有
+    // 260ms 在变几何，内容区宽（胶囊 trackW 的来源）逐帧变。不顺延窗口的话，
+    // 交棒发生在 rail 半滑出时：端点按"已全宽"解析、真身仍在让 rail，胶囊
+    // 位置/宽度当场跳变。与竖屏同口径顺延 + settle slack。
+    if (usesNavigationRail(MediaQuery.sizeOf(context).width)) {
+      return _formSecondaryOnTop != _secondaryPageOnTop;
+    }
+    return (_formSecondaryOnTop && kHideNavBarOnSecondaryPages.value) !=
+        (_secondaryPageOnTop && kHideNavBarOnSecondaryPages.value);
+  }
+
+  /// 交棒飞行的**唯一入口**：能播就播，播不了就吸附。
+  ///
+  /// 吸附（而不是起飞）的两种情形，共同点是「窗口开了却没人关它」：
+  ///
+  /// 1. **控制器已经停在目标端点**且不在动画中。`AnimationController.forward()`
+  ///    在 `target == value` 时走 `_animateToInternal` 的零时长分支：它会设好
+  ///    `_status`，但 [_onBarFormStatusChanged] 只在状态**与上次上报的不同**时才
+  ///    收到通知——若上次就是 completed，本次一个事件都不发，窗口永不关闭。
+  /// 2. **壳层被不透明路由盖住**（[_shellVisible] 为 false）。这一侧的 ticker
+  ///    只是**静音**：`isActive` 仍 true、`_tick` 永不回调，所以动画冻在起点、
+  ///    状态事件永不产生 → 挂在 Navigator 之上的交棒浮层把切换前那根条永久画在
+  ///    最上面，必须返回主页才消失。真机报障即此：停在**推到根 Navigator** 的
+  ///    设置页（「我的」齿轮入口，`user_center_page.dart`）切「悬浮迷你播放器」。
+  ///
+  /// **为什么这里可以放心地按可见性早退，不怕误伤正常的 pop 交棒**：两个方向的
+  /// 因果是分开的。
+  /// - `navigation` 因由只来自**每个 tab 的内层 Navigator**（`ResponsiveShell
+  ///   .onPageRouteEvent`）。内层路由在壳层子树**内部**，push/pop 都不会让壳层
+  ///    所在的那个 Overlay 条目离台 → 读数恒为 true，这道闸根本不会拦它。
+  ///    返回主页那程（pop 方向交棒）因此一字不受影响。
+  /// - 能让壳层静音的只有**根 Navigator** 上的不透明路由（设置页、登录页），
+  ///    而那些 push **不经过**内层观察者、产不出 `navigation` 因由：形态翻转只能
+  ///    是用户在设置页里自己切开关（`settingsToggle`）或帧末顺带重算
+  ///    （`ambient`，本就吸附）。
+  /// - 真在静音中途被翻的目标，动画无论如何都跑不完（见上面的静音语义），吸附是
+  ///    唯一能收窗的路径；等回主页时 `_buildBody` / 各宿主按 notifier 早已把两端
+  ///    真身摆到正确形态，视觉上与「飞完」逐值等价。
+  ///
+  /// 万一读数与事实背离（未来新增别的静音源），[_startBarFormFlight] 末尾还有
+  /// 一帧两查的看门狗兜底。
+  void _driveBarFormFlight(
+    Duration duration, {
+    required bool capsuleNavHiddenAtSettle,
+    double capsuleBodyLeadingInset = 0.0,
+  }) {
+    final double target = _barFormTargetIsCapsule ? 1.0 : 0.0;
+    final bool alreadyAtTarget =
+        !_barFormController.isAnimating && _barFormController.value == target;
+    if (!_shellVisible || alreadyAtTarget) {
+      // 取证日志（AGENTS §0.1：判定状态以日志为准）：排查残条类报障先看这行
+      // 有没有打、打的字段是什么。生效档见 [_barFormLogEnabled]。
+      if (_barFormLogEnabled) {
+        // 取证日志（AGENTS §0.1：判定状态以日志为准）：排查残条类报障先看这行
+        // 有没有打、打的字段是什么。
+        debugPrint(
+          '[BarForm] snap instead of fly '
+          'visible=$_shellVisible value=${_barFormController.value} '
+          'target=$target animating=${_barFormController.isAnimating}',
+        );
+      }
+      _snapBarFormToTarget();
+      return;
+    }
+    _startBarFormFlight(
+      duration,
+      capsuleNavHiddenAtSettle: capsuleNavHiddenAtSettle,
+      capsuleBodyLeadingInset: capsuleBodyLeadingInset,
+    );
+  }
 
   /// 起一次交棒飞行：冻结常驻条端点快照（飞行期间浮层只认它）并驱动一次性
   /// 控制器到目标端点。
   ///
+  /// **只应经 [_driveBarFormFlight] 调用**（那里裁决「能不能播」）；直接调本方法
+  /// 会绕过「动画跑不起来就别开窗」这道闸。
+  ///
   /// [capsuleNavHiddenAtSettle]：胶囊侧（二级页面）在结算态是否收起了底栏 ——
   /// 决定胶囊端点的底部净空要不要多让一个底栏槽位（见 resolveCapsuleBodyRect）。
+  ///
+  /// [capsuleBodyLeadingInset]：胶囊侧结算页面的内容区左缘保留宽（结算快照存档
+  /// —— 浮层的胶囊端点已改为逐帧跟随 rail 的实时可见保留宽
+  /// `navigationRailVisibleInset`，见 bottom_bar_morph_overlay；本快照保留在
+  /// 冻结 API 上供测试对照）。横屏一级页 = rail+分隔线
+  /// （`navigationRailReservedWidth`），竖屏 / 横屏二级页（rail 已随页收起）= 0。
   void _startBarFormFlight(
     Duration duration, {
     required bool capsuleNavHiddenAtSettle,
+    double capsuleBodyLeadingInset = 0.0,
   }) {
     BottomBarMorphRegistry.instance.freezeResidentRectForFlight(
       capsuleNavHiddenAtSettle: capsuleNavHiddenAtSettle,
+      capsuleBodyLeadingInset: capsuleBodyLeadingInset,
     );
     _barFormController.duration = duration;
     if (_barFormTargetIsCapsule) {
@@ -2771,20 +3389,25 @@ class _MainLayoutState extends State<_MainLayout>
     } else {
       _barFormController.reverse();
     }
-    // **同一帧**开窗 + 写源端（2026-10-12 会诊 W1）：判据曾只看 `0 < p < 1`，
-    // 但起跑帧 `p` 仍是端点值，目的真身要等 `p` 离开端点那一帧才让位 —— 空窗一帧，
-    // 目的真身抢闸画出（跳变）。窗口与让位都在这帧置位，`p` 端点值不影响判据。
+    // 同帧开启让位窗口（起跑入口都在事件回调 / 帧末回调，不在 build 期）：目的
+    // 真身同帧 offstage，避免在动画首 tick 之前就按结算几何抢闸画出。
     _openBarFormFlight(_barFormTargetIsCapsule);
-  }
-
-  /// 开窗：写窗口开关 + 源端标记（是否从常驻条端发起）。
-  ///
-  /// 写入顺序刻意「先目的、后窗口」：让位 builder 与浮层都读 [kBarFormFlightActive]，
-  /// 若先开窗后写源端，同一帧内会先按**上一次的源端标记**分流一次 —— 回程（胶囊→条）
-  /// 时会短暂按「条端为源」让位，胶囊端真身漏画一帧。
-  void _openBarFormFlight(bool targetIsCapsule) {
-    kBarFormResidentIsSource.value = !targetIsCapsule;
-    kBarFormFlightActive.value = true;
+    // 兜底看门狗：两帧之后窗口若还开着、动画却根本没在跑（被外部 stop、或未来
+    // 任何「开窗没驱动」的同类故障），当场吸附收窗，不留永久残条。只核对一次，
+    // 不新增 Ticker / Timer（AGENTS §10）。正常飞行这里必然看到 isAnimating=true
+    // （窗口最短也是 260ms，两帧远不到终点）。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (!kBarFormFlightActive.value) return;
+        if (_barFormController.isAnimating) return;
+        if (_barFormLogEnabled) {
+          debugPrint('[BarForm] watchdog snap (window open, nothing animating)');
+        }
+        _snapBarFormToTarget();
+      });
+    });
   }
 
   /// 直接吸附到目标端点（不走交棒窗口）：reduced-motion、冷启动播种、
@@ -2794,11 +3417,9 @@ class _MainLayoutState extends State<_MainLayout>
     BottomBarMorphRegistry.instance.clearFrozenResidentRect();
     void apply() {
       if (!mounted) return;
-      _barFormController.value = _barFormTargetIsCapsule ? 1.0 : 0.0;
-      // 吸附 = 无交棒，窗口必须关（2026-10-12 会诊 W2）：吸附发生在「目标形态真身
-      // 不在 / reduced-motion / 无导航事件的顺带重算」，此时窗口若残留为 true，
-      // 目的端真身会**永久 offstage**（没有任何回调再去关窗）。
+      // 吸附不走窗口：关窗（两端真身各归各位），再落端点。
       kBarFormFlightActive.value = false;
+      _barFormController.value = _barFormTargetIsCapsule ? 1.0 : 0.0;
     }
 
     // build / layout 阶段写全局进度会 markNeedsBuild 祖先（"setState during
@@ -2812,14 +3433,11 @@ class _MainLayoutState extends State<_MainLayout>
     }
   }
 
-  /// 交棒飞行收敛（或被吸附）时解冻常驻条端点快照，并关窗。
+  /// 交棒飞行收敛（或被吸附）时解冻常驻条端点快照。
   void _onBarFormStatusChanged(AnimationStatus status) {
     if (status == AnimationStatus.completed ||
         status == AnimationStatus.dismissed) {
-      // **先关窗、同帧再解冻端点**（顺序不可反，2026-10-12 会诊 W3）：端点登记
-      // 门控读窗口判据，若先解冻，登记会以「窗口开着」为由被拒收 —— 冻结快照
-      // 滞留旧值，下次交棒的浮层从错误端点起跑。关窗后门控即刻放行，
-      // `clearFrozenResidentRect` 触发的让位恢复在同一帧完成重登记。
+      // 收敛：关窗（两端真身各归各位）并解冻端点快照。
       kBarFormFlightActive.value = false;
       BottomBarMorphRegistry.instance.clearFrozenResidentRect();
     }
@@ -2865,6 +3483,35 @@ class _MainLayoutState extends State<_MainLayout>
     List<TabItem> visibleTabs,
     bool immersive,
   ) {
+    // tv: 迷你播放器已移入顶部第一层（tv_shell.dart），底部常驻条与悬浮
+    // 宿主整套退场；本地服务器启动失败横幅保留（诊断信息不丢）。
+    if (kTvBuild) {
+      return Column(
+        children: [
+          // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
+          // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
+          ValueListenableBuilder<bool>(
+            valueListenable: KugouApiClient.localServerAvailable,
+            builder: (context, available, _) => available
+                ? const SizedBox.shrink()
+                : LocalServerDownBanner(onRetry: KugouApiServer.start),
+          ),
+          Expanded(
+            child: ResponsiveShell(
+              key: _responsiveShellKey,
+              visibleTabs: visibleTabs,
+              selectedIndex: _selectedIndex,
+              pageBuilder: _buildPageForTab,
+              // tv: 不传 persistentBarBuilder —— 底部常驻条已随 MiniPlayer
+              // 移顶而退场（tv_shell.dart），每 tab 再挂一条会与顶栏重复，
+              // 并触发 residentRect 多点并发结算（真机 attached 断言刷屏）。
+              onSecondaryRouteChanged: _onSecondaryRouteChanged,
+              onPageRouteEvent: _onPageRouteEvent,
+            ),
+          ),
+        ],
+      );
+    }
     // 主页（一级页面）与二级页面统一由悬浮播放器承载：整段 body 包进宿主后，
     // 开关开启时底部常驻 MiniPlayer 隐藏（下方 builder），避免两套播放器并存。
     // 沉浸态（封面流全屏浏览）透传 immersive，宿主不渲染悬浮条，保持全屏无遮挡。
@@ -2952,10 +3599,13 @@ class _MainLayoutState extends State<_MainLayout>
     _exitPressed = true;
     _showDoubleBackToast();
     _exitResetTimer?.cancel();
-    _exitResetTimer = Timer(const Duration(seconds: 3), () {
-      _exitPressed = false;
-      _exitResetTimer = null;
-    });
+    _exitResetTimer = Timer(
+      const Duration(seconds: 3),
+      () {
+        _exitPressed = false;
+        _exitResetTimer = null;
+      },
+    );
   }
 
   /// 显示「再按一次返回桌面」提示（系统原生 Toast，非 SnackBar/弹窗）。
@@ -2963,17 +3613,21 @@ class _MainLayoutState extends State<_MainLayout>
     showToast('再按一次返回桌面');
   }
 
-  /// TV：弹出退出确认；确认后走既有 [_doExit]（moveTaskToBack 挂后台，
-  /// 后台播放与本地服务器保持运行）。
+  /// TV：弹出返回确认菜单（取消 / 后台播放 / 退出 App）。
   Future<void> _confirmTvExit() async {
-    final confirmed = await showTvExitConfirmDialog(context);
+    final action = await showTvExitConfirmDialog(context);
     if (!mounted) return;
-    if (confirmed) {
-      await _doExit();
+    switch (action) {
+      case TvExitAction.cancel:
+        return;
+      case TvExitAction.background:
+        return _doExit();
+      case TvExitAction.exitApp:
+        return _exitApp();
     }
   }
 
-  /// 双击返回后回到手机桌面（仅挂后台）：
+  /// 回到桌面挂后台（TV「后台播放」与手机双击返回共用）：
   /// 不杀进程、不停播放器、不停本地 Rust 服务器，重新打开瞬时恢复。
   /// 优先走原生 [method 'moveToBack']（等同按 Home），
   /// 异常时兜底 [SystemNavigator.pop]（回桌面但保留后台进程与服务器）。
@@ -2982,15 +3636,63 @@ class _MainLayoutState extends State<_MainLayout>
     _isExiting = true;
     try {
       await context.read<PlayerProvider>().flushPersistence();
-      await const MethodChannel(
-        'com.md3music.md3music/task',
-      ).invokeMethod<void>('moveToBack');
+      await _taskChannel.invokeMethod<void>('moveToBack');
     } catch (_) {
       await SystemNavigator.pop();
     } finally {
       _isExiting = false;
     }
   }
+
+  /// TV「退出 App」：停音乐 → 停本地 Rust 服务 → 结束任务回桌面。
+  ///
+  /// 与 [_doExit] 的区别：这里是**真退出**，音乐输出与本地服务都会关闭，
+  /// 不保留后台播放；重新打开为冷启动。每步独立 try/catch：任一步失败
+  /// 都继续后续步骤，保证用户按了「退出 App」就一定能回到桌面。
+  /// 平台收尾：Android/TV 走 task 通道结束任务；Windows 走托盘退出握手
+  /// （[finishWindowsAppExit]）真正结束整个进程，定时关闭「结束后减少
+  /// 待机耗电」与 TV 退出菜单共用本方法。
+  Future<void> _exitApp() async {
+    if (_isExiting || !mounted) return;
+    _isExiting = true;
+    final player = context.read<PlayerProvider>();
+    try {
+      await player.stopForAppExit();
+    } catch (error, stack) {
+      DiagnosticLogger.instance.e('退出 App：停止播放失败 $error\n$stack');
+    }
+    try {
+      await KugouApiServer.stop();
+    } catch (error, stack) {
+      DiagnosticLogger.instance.e('退出 App：停止本地服务失败 $error\n$stack');
+    }
+    if (Platform.isWindows) {
+      // Windows：task 通道只在 Android/TV 的 MainActivity 注册，invoke 必然
+      // MissingPluginException；而兜底的 SystemNavigator.pop 在 Windows 引擎里
+      // 只是重投一条 WM_CLOSE，托盘可用时原生仅隐藏窗口、进程常驻（之前定时
+      // 关闭退出后「进程没退」的根因）。改走托盘退出握手 finishExit：
+      // SetQuitOnClose(true) + Destroy → WM_DESTROY → 整个进程退出。
+      try {
+        await finishWindowsAppExit();
+      } catch (error, stack) {
+        DiagnosticLogger.instance.e(
+          '退出 App：finishExit 失败，直接结束进程 $error\n$stack',
+        );
+        // 播放落盘（stopForAppExit）与本地服务停止都已完成，硬退安全；
+        // 不能退回 SystemNavigator.pop（见上），否则窗口藏进托盘进程常驻。
+        exit(0);
+      }
+    } else {
+      try {
+        await _taskChannel.invokeMethod<void>('exitApp');
+      } catch (error, stack) {
+        DiagnosticLogger.instance.e('退出 App：结束任务失败，回退桌面 $error\n$stack');
+        await SystemNavigator.pop();
+      }
+    }
+    _isExiting = false;
+  }
+
 }
 
 /// 底部 NavigationBar 的 tab 图标（胶囊由别处画，见下）。

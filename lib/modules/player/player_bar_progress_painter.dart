@@ -275,11 +275,14 @@ BarProgressGeometry resolveBarProgressGeometry({
   double barHeight = 0.0,
   double gapSize = 0.0,
   StrokeCap strokeCap = StrokeCap.round,
+  // tv: 直线态描边宽可调（默认 2 与既有端点逐像素一致；TV 顶栏 MiniPlayer
+  // 传 4 加粗）。胶囊端 kPlayerBarProgressRimStroke 不随它变。
+  double lineStroke = kPlayerBarProgressLineStroke,
 }) {
   final double t = formT.clamp(0.0, 1.0);
   final double flatWeight = 1.0 - t;
   final double strokeWidth = lerpDouble(
-    kPlayerBarProgressLineStroke,
+    lineStroke,
     kPlayerBarProgressRimStroke,
     t,
   )!;
@@ -415,6 +418,7 @@ class PlayerBarProgressPainter extends CustomPainter {
     this.gapSize = 0.0,
     this.strokeCap = StrokeCap.round,
     this.stopIndicatorSize = 0.0,
+    this.lineStroke = kPlayerBarProgressLineStroke,
   });
 
   /// 播放进度 0..1。
@@ -450,6 +454,10 @@ class PlayerBarProgressPainter extends CustomPainter {
   /// [kPlayerBarProgressLineStopSize]；0 = 不画）。只在直线态生效。
   final double stopIndicatorSize;
 
+  /// 直线态描边宽（默认 [kPlayerBarProgressLineStroke]；tv: 顶栏 MiniPlayer
+  /// 传 4 加粗，见 mini_player.dart 的 TV 分支）。
+  final double lineStroke;
+
   @override
   void paint(Canvas canvas, Size size) {
     // 退化约束（形变极短帧 / 异常约束）下没有可画的环或线。
@@ -462,6 +470,7 @@ class PlayerBarProgressPainter extends CustomPainter {
       barHeight: barHeight,
       gapSize: gapSize,
       strokeCap: strokeCap,
+      lineStroke: lineStroke,
     );
     final path = geo.toPath();
     final metric = path.computeMetrics().first;

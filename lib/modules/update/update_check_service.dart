@@ -14,13 +14,10 @@ import 'release_version.dart';
 enum UpdateCheckOutcome {
   /// 已 toast 提醒用户
   notified,
-
   /// 已是最新（或远端版本无法比较）
   upToDate,
-
-  /// 本次跳过（开关关闭 / 同一版本已提醒 / 非移动端）
+  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非移动端）
   skipped,
-
   /// 查询失败（网络等原因，静默）
   failed,
 }
@@ -31,9 +28,7 @@ typedef UpdateNotifier = void Function(String message);
 /// 版本更新检测与提醒。
 ///
 /// 职责边界：只负责「查最新版本 → 比本地版本 → 提醒一次」，
-/// 不做下载、不做安装、不展示更新日志。只有发现新版本才 toast；
-/// 已是最新 / 网络异常一律静默。每次启动都会检查（开关开启时），
-/// 无时间节流；同一版本只提醒一次避免重复打扰。
+/// 不做下载、不做安装、不展示更新日志。
 class UpdateCheckService {
   UpdateCheckService({
     ReleaseSource? source,
@@ -51,6 +46,9 @@ class UpdateCheckService {
   /// 启动后延迟多久检查：避开冷启动首帧与首屏接口竞争。
   static const Duration startupDelay = Duration(seconds: 8);
 
+  /// 两次网络查询的最小间隔（跨启动持久化）。
+  static const Duration minCheckInterval = Duration(hours: 12);
+
   final ReleaseSource _source;
   final SettingsRepository _settings;
   final UpdateNotifier _notifier;
@@ -59,8 +57,7 @@ class UpdateCheckService {
   /// 同一次运行内的防重入。
   bool _running = false;
 
-  static void _defaultNotifier(String message) =>
-      showToast(message, long: true);
+  static void _defaultNotifier(String message) => showToast(message, long: true);
 
   static Future<String> _defaultCurrentVersion() async {
     try {
@@ -103,11 +100,17 @@ class UpdateCheckService {
       return UpdateCheckOutcome.skipped;
     }
 
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final lastCheckMs = await _settings.getUpdateLastCheckMs();
+    if (lastCheckMs > 0 && now - lastCheckMs < minCheckInterval.inMilliseconds) {
+      debugPrint('[UpdateCheck] 距上次检查不足 12 小时，跳过');
+      return UpdateCheckOutcome.skipped;
+    }
+
     final release = await _source.fetchLatest();
+    // 无论成败都记录时间戳：失败时不重试轰炸，下个窗口再试
+    await _settings.setUpdateLastCheckMs(now);
     if (release == null) return UpdateCheckOutcome.failed;
-    // 记录远端最新版本号：供设置页「更新最新版本」入口展示
-    // （已是最新也记录，入口处就能看到 GitHub 上的最新版本号）
-    await _settings.setUpdateLatestRemoteVersion(release.version);
 
     final current = await _readCurrentVersion();
     if (!isNewerRelease(release.version, current)) {
@@ -131,7 +134,6 @@ class UpdateCheckService {
 
   void _notify(ReleaseInfo release, String current) {
     final currentPart = current.isEmpty ? '' : '（当前 $current）';
-    // 用剥离过构建号的 version 拼回 v 前缀：tagName 可能含 `+47`，展示层不露构建号
-    _notifier('发现新版本 v${release.version}$currentPart，可在「设置 → 关于」中更新');
+    _notifier('发现新版本 ${release.tagName}$currentPart，可在「设置 → 关于」中更新');
   }
 }

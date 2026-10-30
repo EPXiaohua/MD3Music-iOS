@@ -224,5 +224,29 @@ void main() {
       expect(log.lastStep, closeTo(15000 / _durationMs, 1e-9));
       stepper.cancel();
     });
+
+    test('escalation：连按升级步长，静默后回落', () {
+      final steps = <double>[];
+      final stepper = TvSeekStepper(
+        onBegin: () {},
+        onStep: steps.add,
+        onCommit: () {},
+        onAbort: () {},
+        escalation: const [5, 15, 30],
+      );
+      addTearDown(stepper.dispose);
+
+      // 第 1 击：5s
+      stepper.handleDirection(TraversalDirection.right, currentMs: 0, durationMs: 300000);
+      // 第 2 击（窗口内）：15s
+      stepper.handleDirection(TraversalDirection.right, currentMs: 0, durationMs: 300000);
+      // 第 3 击起：封顶 30s
+      stepper.handleDirection(TraversalDirection.right, currentMs: 0, durationMs: 300000);
+      stepper.handleDirection(TraversalDirection.right, currentMs: 0, durationMs: 300000);
+
+      final ms = steps.map((f) => (f * 300000).round()).toList();
+      expect(ms, [5000, 20000, 50000, 80000],
+          reason: '5s → 15s → 30s → 30s（步长升级叠加在当前目标上）');
+    });
   });
 }

@@ -1,7 +1,9 @@
 import 'package:material_ui/material_ui.dart';
 
+import '../../core/build_flags.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../providers/player_provider.dart';
+import '../playback_hint_pills.dart';
 import '../playback_status_feedback.dart';
 import '../player_seek_bar.dart';
 import '../player_volume_bar.dart';
@@ -165,6 +167,9 @@ class _PlayerControlDockState extends State<PlayerControlDock> {
       // 每 ~200ms 一次重建会换算成一次 scheduleFrame —— 看不见还在产帧。
       if (widget.visible) player.positionNotifier,
       player,
+      // 「音频过渡中」提示：交叉淡化起止只改这一个 notifier
+      //（见 widgets/playback_hint_pills.dart）
+      player.crossfadeActiveNotifier,
       if (!amStyle) kSeekBarWaveEnabled,
     ];
     return ListenableBuilder(
@@ -180,6 +185,9 @@ class _PlayerControlDockState extends State<PlayerControlDock> {
         activeColor: widget.skin.seekActive(colorScheme),
         inactiveColor: widget.skin.seekInactive(colorScheme),
         labelColor: widget.skin.seekLabel(colorScheme),
+        // 时间行中央的瞬时状态提示（「缓冲中」/「音频过渡中」）：居中于两个时间
+        // 数字之间；无提示时传 null，时间行（及带的 40dp 预算）保持原样。
+        labelRowHints: playerHintPillsFor(player, amStyle: amStyle),
         climaxStart: song?.climaxStart,
         climaxEnd: song?.climaxEnd,
         height: _seekHeight(widget.tier),
@@ -300,6 +308,16 @@ class _PlayerControlDockState extends State<PlayerControlDock> {
           if (widget.transport != null) ...[
             const SizedBox(height: _bandGap),
             widget.transport!,
+          ],
+          // tv: TV 构建在常驻带里补一行音量——TV 默认布局没有「控制」页签
+          // （见 full_player.dart 的 _detachedControls，用户开关默认关闭），
+          // 音量原本只剩顶栏 ⋯ 更多菜单一条入口，遥控难调。PlayerVolumeBar
+          // 已是 TV 焦点停点（player_volume_bar.dart 的 'tv/player-volume-bar'），
+          // 直接复用，不新建控件。只在 S/M 档补：L 档（极窄横屏/大字号）带高
+          // 本就紧张，补行会挤掉歌词行数（见 _buildSingleRowBand 的注释）。
+          if (kTvBuild) ...[
+            const SizedBox(height: _bandGap),
+            PlayerVolumeBar(amStyle: widget.skin.amStyle),
           ],
         ],
       ),

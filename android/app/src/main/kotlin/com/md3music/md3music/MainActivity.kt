@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.annotation.TargetApi
+import android.hardware.display.DisplayManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +19,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.view.Display
 import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Log
@@ -91,6 +93,9 @@ class MainActivity : FlutterActivity() {
         // 频谱插件引用，Activity 销毁时释放 Visualizer
         @Volatile private var spectrumPlugin: SpectrumPlugin? = null
 
+        // MD3Music fork v21：车机卡片深链的冷启动残留（Dart 引擎未就绪时暂存）
+        @Volatile private var pendingOpenCardLyric = false
+
         // MV 画中画：Dart 端标记视频是否播放中（按 Home 自动进入画中画用）
         @Volatile private var pipVideoActive = false
         // MV 视频宽高比（宽/高），用于画中画窗口比例
@@ -109,6 +114,8 @@ class MainActivity : FlutterActivity() {
         @Volatile private var usbAudioPlugin: UsbAudioPlugin? = null
         @Volatile private var directPcmPlugin: DirectPcmPlugin? = null
         @Volatile private var musicHapticsPlugin: MusicHapticsPlugin? = null
+        // 系统音频 Offload 通道（TV 也注册，故独立于 FEATURE_TV 分支）
+        @Volatile private var audioOffloadPlugin: AudioOffloadPlugin? = null
 
         /** Activity 与 headless 服务共用自定义播放插件，避免缺 handler 和重复USB接收器。 */
         @Synchronized
@@ -120,6 +127,7 @@ class MainActivity : FlutterActivity() {
             runCatching { usbAudioPlugin?.cleanup() }
             runCatching { directPcmPlugin?.cleanup() }
             runCatching { musicHapticsPlugin?.cleanup() }
+            runCatching { audioOffloadPlugin?.cleanup() }
             customPluginsEngine = engine
 
             EqualizerPlugin().also {
@@ -129,10 +137,19 @@ class MainActivity : FlutterActivity() {
             // 蝰蛇母带通道：将母带设置与十段均衡器增益发送到 just_audio 处理链。
             ViperDspPlugin().register(engine)
             spectrumPlugin = SpectrumPlugin().also { it.register(engine) }
-            // 音乐节奏震动：预构建 VibrationEffect 缓存 + 专用线程点火
-            MusicHapticsPlugin(context).also {
-                it.register(engine)
-                musicHapticsPlugin = it
+            // 音乐节奏震动：预构建 VibrationEffect 缓存 + 专用线程点火。
+            // runCatching 兜底：能力探测涉及多档 SDK_INT 守卫（hasAmplitudeControl 是
+            // API 26 方法），任何遗漏都只能让功能降级，绝不允许把整个进程带崩——
+            // issue #130 正是无守卫写在属性初始化器里，导致 Android 7.x TV 盒子
+            // （rk3128）冷启动必崩。musicHapticsPlugin 保持 null 时各 cleanup 空跑无害，
+            // 交互震动的 noteInteraction() 是 companion 静态方法，与实例无关。
+            runCatching {
+                MusicHapticsPlugin(context).also {
+                    it.register(engine)
+                    musicHapticsPlugin = it
+                }
+            }.onFailure {
+                Log.w("MusicHaptics", "插件注册失败：$it")
             }
             // TV 版不编入 USB 独占/Direct PCM（BuildConfig.FEATURE_TV=false 跳过注册；
             // release 由 R8 剥离未引用类）。类字段保留（cleanup 空跑无害）。
@@ -147,6 +164,17 @@ class MainActivity : FlutterActivity() {
                     directPcmPlugin = it
                 }
             }
+            // 系统音频 Offload 通道：放在 FEATURE_TV 判断之外——电视盒子同样走
+            // 系统 offload，必须编入。能力探测在插件内部后台预热，注册失败仅降级
+            // 该功能（音质档位退回默认），不允许影响启动。
+            runCatching {
+                AudioOffloadPlugin(context).also {
+                    it.register(engine)
+                    audioOffloadPlugin = it
+                }
+            }.onFailure {
+                Log.w("AudioOffload", "插件注册失败：$it")
+            }
             ExternalEditorPlugin(context).register(engine)
             DiagnosticLogPlugin().register(engine)
             AutomixAnalysisPlugin().register(engine)
@@ -160,16 +188,48 @@ class MainActivity : FlutterActivity() {
             runCatching { usbAudioPlugin?.cleanup() }
             runCatching { directPcmPlugin?.cleanup() }
             runCatching { musicHapticsPlugin?.cleanup() }
+            runCatching { audioOffloadPlugin?.cleanup() }
             spectrumPlugin = null
             equalizerPlugin = null
             usbAudioPlugin = null
             directPcmPlugin = null
             musicHapticsPlugin = null
+            audioOffloadPlugin = null
             customPluginsEngine = null
         }
 
         fun setKugouApiService(service: KugouApiService?) {
             kugouApiService = service
+        }
+
+        /// 锁屏卡片「投屏/队列」等动作的待处理值：拉起 app 时若 Dart 尚未就绪，
+        /// 动作留在这里，由 Dart `takePendingWidgetAction` 冷启动兜底拉取。
+        @Volatile
+        private var pendingWidgetAction: String? = null
+
+        /// 锁屏卡片把 Flutter 侧动作转交给 App：存 pending + 以 NEW_TASK|SINGLE_TOP 拉起。
+        ///
+        /// 之所以不在锁屏内直接实现投屏/队列：两者都是 Flutter 页面，
+        /// 在锁屏 Activity 里另做一套的成本与一致性风险都不划算（见计划「用户确认的设计决策」）。
+        @JvmStatic
+        fun requestWidgetAction(context: Context, action: String) {
+            pendingWidgetAction = action
+            try {
+                val intent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    putExtra("widget_action", action)
+                }
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                Log.w("MainActivity", "requestWidgetAction failed: ${e.message}")
+            }
+        }
+
+        /// Dart 冷启动拉取并清空 pending（取走即清空，避免重复执行）。
+        fun takePendingWidgetAction(): String? {
+            val action = pendingWidgetAction
+            pendingWidgetAction = null
+            return action
         }
 
         fun sendDesktopLyricAction(action: String) {
@@ -234,8 +294,39 @@ class MainActivity : FlutterActivity() {
         // 桌面小部件冷启动拉起携带的动作（如登录卡 openLogin → 进登录页）。
         // 引擎尚未就绪时 Flutter 侧导航尚不可用，invokeMethod 静默失败即降级为打开 app。
         dispatchWidgetAction(intent?.getStringExtra("widget_action"))
+        // MD3Music fork v21 车机卡片：sessionActivity 深链（media card 点击），冷启动入口
+        maybeHandleOpenLyricIntent(intent)
         // 外部调用（文件管理器「用其他应用打开」等）：冷启动入口
         ExternalMediaBridge.onIntent(this, intent)
+    }
+
+    /**
+     * MD3Music fork v21 车机卡片深链：卡片点击走 sessionActivity（启动意图带
+     * md3_open_lyric_fullscreen 标记），判据为**设备级存在任一非默认屏**
+     * （dm.displays 有 displayId≠DEFAULT_DISPLAY，与 MSS 连车唤醒判据同源）——
+     * 不是"Activity 跑在虚拟屏"：投屏形态下 Flutter Activity 常驻手机主屏，
+     * 车机/投影画面由 RunningStackSide 虚拟屏承载，按 Activity 所在屏判会恒判
+     * 否。取舍：手机连接 PC 投屏/镜像产生第二显示时，主屏点卡片也会直达全屏
+     * 歌词（同义"正在外投"，视为合理语义）；不满足则维持手机旧行为。
+     */
+    private fun maybeHandleOpenLyricIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("md3_open_lyric_fullscreen", false) != true) return
+        val dm = getSystemService(DisplayManager::class.java) ?: return
+        val projected = dm.displays.any { it.displayId != Display.DEFAULT_DISPLAY }
+        if (!projected) return
+        pendingOpenCardLyric = true
+        dispatchOpenCardLyric()
+    }
+
+    private fun dispatchOpenCardLyric() {
+        val engine = FlutterEngineCache.getInstance().get("md3music_engine")
+            ?: return
+        try {
+            MethodChannel(engine.dartExecutor.binaryMessenger, FLOATING_CHANNEL)
+                .invokeMethod("openCardLyricView", null)
+        } catch (_: Exception) {
+            // 引擎刚创建/未跑 Dart 时转发失败：留 pending 由 Dart postFrame 主动拉取
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -244,22 +335,43 @@ class MainActivity : FlutterActivity() {
         setIntent(intent)
         // singleTop 复用实例时（app 已在前台/后台存活），小部件动作走这里
         dispatchWidgetAction(intent.getStringExtra("widget_action"))
+        // MD3Music fork v21 车机卡片：热启动入口
+        maybeHandleOpenLyricIntent(intent)
         // 外部调用（文件管理器「用其他应用打开」等）：热启动入口
         ExternalMediaBridge.onIntent(this, intent)
     }
 
-    /// 把小部件拉起 app 携带的 widget_action 转发给 Flutter。
-    /// 目前仅处理 FM 登录卡的 openLogin（现有 music widget 的 action 仍不处理）。
+    /// 把小部件/锁屏卡片拉起 app 携带的 widget_action 转发给 Flutter。
+    ///
+    /// 已知动作：
+    /// - `openLogin`：FM 登录卡 → 进登录页；
+    /// - `openCast` / `openQueue`：锁屏卡片投屏键 / 队列键 → 由 Dart `LockScreenActionService` 打开对应面板。
+    ///
+    /// 引擎尚未就绪时 invokeMethod 静默失败，动作留在 pending 里等 Dart 拉取
+    /// （与 ExternalMediaBridge 的 takePendingMedia 同一套已验证模式）。
     private fun dispatchWidgetAction(action: String?) {
-        if (action != "openLogin") return
-        val engine = FlutterEngineCache.getInstance().get("md3music_engine") ?: return
-        try {
-            MethodChannel(
-                engine.dartExecutor.binaryMessenger,
-                FLOATING_CHANNEL
-            ).invokeMethod("widgetFmOpenLogin", null)
-        } catch (_: Exception) {
-            // 引擎刚创建/未跑 Dart 时转发失败：降级为仅打开 app
+        when (action) {
+            "openLogin" -> {
+                val engine = FlutterEngineCache.getInstance().get("md3music_engine") ?: return
+                try {
+                    MethodChannel(
+                        engine.dartExecutor.binaryMessenger,
+                        FLOATING_CHANNEL
+                    ).invokeMethod("widgetFmOpenLogin", null)
+                } catch (_: Exception) {
+                    // 引擎刚创建/未跑 Dart 时转发失败：降级为仅打开 app
+                }
+            }
+            "openCast", "openQueue" -> {
+                // 先落 pending 再推送：冷启动早期通道未就绪也不会丢动作
+                pendingWidgetAction = action
+                try {
+                    cachedChannel?.invokeMethod("widgetAction", action)
+                } catch (_: Exception) {
+                    // 同上：保留 pending，由 Dart takePendingWidgetAction 冷启动兜底
+                }
+            }
+            else -> return
         }
     }
 
@@ -268,6 +380,15 @@ class MainActivity : FlutterActivity() {
         // 回到前台（如从画中画/锁屏/切后台返回）时重新应用，
         // 防止被系统降频后未恢复（偶现锁 60Hz 的场景之一）。
         applyOptimalRefreshRate()
+        // MD3Music fork v50：原子随身听点歌拉起兜底——岛端到本 App 的 MediaBrowser
+        // 连接随进程重启断链后（D==null），岛点列表项会把 App 拉到前台且丢弃本次
+        // 点击（真机 logcat 实证：Displayed LauncherModernIcon）。这里借 onResume
+        // 重发一次岛 metadata：岛 onMetadataChanged 会刷新源/控制器，用户下一次
+        // 点击即可正常下发 playFromMediaId。未初始化时为 no-op。
+        try {
+            com.ryanheise.just_audio.AudioPlayer.republishVivoIslandState()
+        } catch (_: Throwable) {
+        }
     }
 
     /// 向系统请求当前分辨率下可用的最高刷新率。
@@ -499,6 +620,12 @@ class MainActivity : FlutterActivity() {
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FLOATING_CHANNEL)
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
+                // MD3Music fork v21 车机卡片：冷启动残留深链在 Dart 侧主动拉取
+                "consumePendingOpenCardLyric" -> {
+                    val pending = pendingOpenCardLyric
+                    pendingOpenCardLyric = false
+                    result.success(pending)
+                }
                 "startFloatingLyric" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
                         val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
@@ -513,6 +640,18 @@ class MainActivity : FlutterActivity() {
                         // 挂起结果：等服务 onCreate 真正完成 addView（或权限竞态失败
                         // stopSelf）后由 completeFloatingStart 回填真实结果，不再提前
                         // 返回 success，杜绝"开关已开但悬浮窗未出现"的假开启。
+                        // MD3Music fork v28d：5s 窗口内重复调用先结算上一个挂起
+                        // Result（按当前状态）并撤旧超时——否则旧 Result 悬挂泄漏
+                        // （Dart Future 永久挂起），旧 timeout 到点还会抢用新
+                        // Result 提前按旧状态回填。
+                        pendingFloatingTimeout?.let { floatingHandler.removeCallbacks(it) }
+                        pendingFloatingTimeout = null
+                        pendingFloatingStart?.let { previous ->
+                            pendingFloatingStart = null
+                            previous.success(
+                                FloatingLyricService.isRunning && FloatingLyricService.viewAdded
+                            )
+                        }
                         pendingFloatingStart = result
                         val timeout = Runnable { completeFloatingStart(FloatingLyricService.viewAdded) }
                         pendingFloatingTimeout = timeout
@@ -522,7 +661,14 @@ class MainActivity : FlutterActivity() {
                             putExtra(FloatingLyricService.EXTRA_LYRIC, call.argument<String>("lyric") ?: "")
                             putExtra(FloatingLyricService.EXTRA_TITLE, call.argument<String>("title") ?: "")
                         }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+                        // v33：与 showNotification 调用点同构——前台被 ROM 拒时吞掉
+                        // ForegroundServiceStartNotAllowedException（悬浮窗自身
+                        // 台账已按失败路径自停，无 5s duty）。
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+                        } catch (t: Throwable) {
+                            Log.w("MainActivity", "floating update start rejected: ${t.message}")
+                        }
                     }
                 }
                 "updateLyric" -> {
@@ -573,9 +719,19 @@ class MainActivity : FlutterActivity() {
                 "hasOverlayPermission" -> {
                     result.success(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(this) else true)
                 }
+                "isFloatingLyricWindowRunning" -> {
+                    // MD3Music fork：原生窗口实况查询。引擎被系统杀死后 Dart 侧开关
+                    // 丢失（restoreFloatingFromNative 用它判断是否恢复悬浮窗推送）。
+                    result.success(FloatingLyricService.isRunning && FloatingLyricService.viewAdded)
+                }
                 "setDesktopLyricConfig" -> {
-                    val intent = Intent(this, FloatingLyricService::class.java).apply {
-                        action = FloatingLyricService.ACTION_SET_CONFIG
+                    // 窗口不在时不再把服务拉起来：设置页「锁定歌词」等配置推送
+                    // 此前会无条件 startService，把一个谁都不会往里推词的空窗口
+                    // 建出来（黑框）。配置本来会落 SharedPreferences，下次真正
+                    // 开启（enable 随后会推同一份配置）时自然生效。
+                    if (FloatingLyricService.isRunning && FloatingLyricService.viewAdded) {
+                        val intent = Intent(this, FloatingLyricService::class.java).apply {
+                            action = FloatingLyricService.ACTION_SET_CONFIG
                         call.argument<Double>(FloatingLyricService.EXTRA_FONT_SIZE)?.let {
                             putExtra(FloatingLyricService.EXTRA_FONT_SIZE, it.toFloat())
                         }
@@ -615,8 +771,9 @@ class MainActivity : FlutterActivity() {
                         call.intArg(FloatingLyricService.EXTRA_CUSTOM_UNPLAYED)?.let {
                             putExtra(FloatingLyricService.EXTRA_CUSTOM_UNPLAYED, it)
                         }
+                        }
+                        startService(intent)
                     }
-                    startService(intent)
                     result.success(true)
                 }
                 "setPlaying" -> {
@@ -689,6 +846,25 @@ class MainActivity : FlutterActivity() {
                     AudioPlaybackService.prefetchCovers(this, urls)
                     result.success(true)
                 }
+                // MD3Music fork v40：原子随身听三棵列表快照——headless 通道已有处理，
+                // 但前台主通道（本 handler）缺失会让前台推送全部 notImplemented 被 Dart
+                // 空 catch 吞掉（第六轮审查 P0）。补注册，转发 APS 的静态解析。
+                "updateVivoMixLists" -> {
+                    AudioPlaybackService.updateVivoMixLists(call.arguments)
+                    result.success(true)
+                }
+                // MD3Music fork v50：岛状态回显——同上，前台主通道补注册（第六轮
+                // 审查同款教训：headless 有而主通道缺 → 前台推送 notImplemented 被吞）。
+                "updateVivoMixState" -> {
+                    AudioPlaybackService.updateVivoMixState(call.arguments)
+                    result.success(true)
+                }
+                // MD3Music fork v63：点歌后强制岛列表重拉（高亮立即跟随）——
+                // 同 v50 教训：headless 通道有而主通道缺 → 前台推送被吞。
+                "refreshVivoMixChildren" -> {
+                    AudioPlaybackService.refreshVivoMixChildren()
+                    result.success(true)
+                }
                 // 蓝牙歌词兼容通道；原生端保持共享 MediaSession 的歌曲身份不变。
                 "updateBluetoothLyric" -> {
                     val intent = Intent(this, AudioPlaybackService::class.java).apply {
@@ -758,6 +934,15 @@ class MainActivity : FlutterActivity() {
                     LockScreenLyricActivity.applyAccentCall(call)
                     result.success(true)
                 }
+                // 锁屏卡片收藏态增量同步：只翻红心，不重推歌词
+                "updateLockScreenFavorite" -> {
+                    LockScreenLyricActivity.applyFavoriteCall(call)
+                    result.success(true)
+                }
+                // 冷启动时锁屏卡片动作（投屏/队列）可能在 Dart 就绪前触发：取走即清空
+                "takePendingWidgetAction" -> {
+                    result.success(takePendingWidgetAction())
+                }
                 else -> result.notImplemented()
             }
         }
@@ -784,10 +969,16 @@ class MainActivity : FlutterActivity() {
                         result.error("PERMISSION_DENIED", "需要悬浮窗权限", null)
                     } else {
                         val intent = Intent(this, FloatingRecognitionService::class.java)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            startForegroundService(intent)
-                        } else {
-                            startService(intent)
+                        // v33：与 :723 调用点同构——被拒不冒主线程（FRS 自身
+                        // onSave 失败/停止路径自管，无 5s duty）。
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                startForegroundService(intent)
+                            } else {
+                                startService(intent)
+                            }
+                        } catch (t: Throwable) {
+                            Log.w("MainActivity", "recognition start rejected: ${t.message}")
                         }
                         result.success(true)
                     }
@@ -905,7 +1096,7 @@ class MainActivity : FlutterActivity() {
                             val uri = Uri.parse(treeUri)
                             contentResolver.takePersistableUriPermission(
                                 uri,
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION
                             )
                             result.success(true)
                         } catch (e: Exception) {
@@ -913,6 +1104,21 @@ class MainActivity : FlutterActivity() {
                         }
                     } else {
                         result.error("INVALID_URI", "URI is null", null)
+                    }
+                }
+                "queryTreeAudioFiles" -> {
+                    val treeUri = call.argument<String>("uri")
+                    if (treeUri.isNullOrBlank()) {
+                        result.error("INVALID_URI", "目录 URI 为空", null)
+                    } else {
+                        Thread {
+                            try {
+                                val files = SafAudioScanner.queryAudioFiles(this, treeUri)
+                                runOnUiThread { result.success(files) }
+                            } catch (error: Exception) {
+                                runOnUiThread { result.error("TREE_SCAN_ERROR", error.message, null) }
+                            }
+                        }.start()
                     }
                 }
                 else -> result.notImplemented()
@@ -970,7 +1176,10 @@ class MainActivity : FlutterActivity() {
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "image/*"
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                        )
                     }
                     startActivityForResult(intent, BACKGROUND_PICKER_REQUEST_CODE)
                 }
@@ -1056,9 +1265,12 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // 注册任务控制 MethodChannel：Dart 双击返回 → 回到桌面挂后台
-        // 用 moveTaskToBack(等同按 Home)，不销毁 Activity、不杀进程，
-        // 播放器与本地 Rust 服务器都保持运行，重新打开瞬时恢复。
+        // 注册任务控制 MethodChannel：
+        // - moveToBack：TV「后台播放」/ 手机双击返回 → 回桌面挂后台。
+        //   用 moveTaskToBack(等同按 Home)，不销毁 Activity、不杀进程，
+        //   播放器与本地 Rust 服务器都保持运行，重新打开瞬时恢复。
+        // - exitApp：TV「退出 App」→ Dart 侧已停播放/移除通知并关停 Rust
+        //   服务，这里兜底停掉前台播放与媒体会话服务，再结束任务回桌面。
         val taskChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             TASK_CHANNEL
@@ -1068,6 +1280,21 @@ class MainActivity : FlutterActivity() {
                 "moveToBack" -> {
                     moveTaskToBack(true)
                     result.success(true)
+                }
+                "exitApp" -> {
+                    // AudioPlaybackService 在 Manifest 里是 stopWithTask=false，
+                    // 只 finish 会让它带着前台通知残留在后台，必须显式停。
+                    try {
+                        stopService(Intent(this, AudioPlaybackService::class.java))
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        stopService(Intent(this, MD3MusicMediaSessionService::class.java))
+                    } catch (_: Throwable) {
+                    }
+                    Log.i("MainActivity", "exitApp: playback services stopped, finishing task")
+                    result.success(true)
+                    finishAndRemoveTask()
                 }
                 else -> result.notImplemented()
             }
@@ -1269,7 +1496,7 @@ class MainActivity : FlutterActivity() {
                 try {
                     contentResolver.takePersistableUriPermission(
                         treeUri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
                 } catch (_: Exception) {}
                 folderPickerResult?.success(treeUri.toString())
@@ -1312,6 +1539,15 @@ class MainActivity : FlutterActivity() {
         } else if (requestCode == BACKGROUND_PICKER_REQUEST_CODE) {
             if (resultCode == RESULT_OK && data?.data != null) {
                 val uri = data.data!!
+                // 保留可移动存储提供方的读取授权，避免选择器返回后 USB 文档授权立即失效。
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: SecurityException) {
+                    // 部分文档提供方只授予临时权限；当前线程仍会立即复制内容。
+                }
                 // 后台线程：把 content URI 流拷贝到 filesDir/background/bg_<ts>.<ext>
                 Thread {
                     try {
@@ -1322,10 +1558,13 @@ class MainActivity : FlutterActivity() {
                             targetDir,
                             "bg_${System.currentTimeMillis()}.${guessImageExtension(uri)}"
                         )
-                        contentResolver.openInputStream(uri).use { input ->
-                            targetFile.outputStream().use { output ->
-                                input?.copyTo(output)
-                            }
+                        val input = contentResolver.openInputStream(uri)
+                            ?: throw IllegalStateException("无法读取所选图片：$uri")
+                        input.use { source ->
+                            targetFile.outputStream().use { output -> source.copyTo(output) }
+                        }
+                        if (!targetFile.exists() || targetFile.length() == 0L) {
+                            throw IllegalStateException("所选图片为空或读取失败：$uri")
                         }
                         // 拷贝成功后清理旧背景文件，避免累积
                         targetDir.listFiles()?.forEach { old ->

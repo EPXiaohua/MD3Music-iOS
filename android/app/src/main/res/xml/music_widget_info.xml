@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 音乐播放器桌面小部件元信息：4×1 格，预览图用应用图标 -->
+<!-- 音乐播放器桌面小部件元信息：4×1 格，预览图用真机截图裁剪的静态图
+     （MIUI 挑选器只读 previewImage，不用 AOSP 的 previewLayout）。 -->
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
     android:minWidth="250dp"
     android:minHeight="70dp"
@@ -11,5 +12,5 @@
     android:widgetCategory="home_screen"
     android:label="@string/music_widget_label"
     android:previewLayout="@layout/widget_music_player"
-    android:previewImage="@mipmap/ic_launcher"
+    android:previewImage="@drawable/widget_preview_music"
     android:description="@string/widget_description" />

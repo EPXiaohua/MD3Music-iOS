@@ -31,6 +31,15 @@ const double kMaxDisplayScale = 5.0;
 /// 默认档位：设备真实 dp，不做任何变换。
 const double kDefaultDisplayScale = 1.0;
 
+/// Windows 首次安装时的默认「显示大小」档位。
+const double kWindowsDefaultDisplayScale = 1.0;
+
+/// 按运行目标平台返回默认显示大小；Android 等非 Windows 平台沿用原默认值。
+double defaultDisplayScaleForPlatform(TargetPlatform platform) =>
+    platform == TargetPlatform.windows
+    ? kWindowsDefaultDisplayScale
+    : kDefaultDisplayScale;
+
 /// 系统「字体大小」的跟随上限。
 ///
 /// 只压上限、下限钉在 1.0：系统调大时 App 跟随（最多 1.3x），调小时不跟随

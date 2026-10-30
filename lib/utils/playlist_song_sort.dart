@@ -3,6 +3,24 @@ import '../data/models/song.dart';
 /// 歌单页（PlaylistPage）内歌曲的排序维度。
 enum PlaylistSongSort { time, title, artist, duration, playCount, lastPlayed }
 
+/// 按酷狗歌单条目的 sort 顺序位排列，缺失 sort 的旧缓存条目留在末尾。
+/// 相同 sort 保留接口原序，避免 List.sort 的不稳定排序改变同位歌曲。
+List<Song> sortSongsByPlaylistPosition(List<Song> songs) {
+  if (!songs.any((song) => song.playlistSort != null)) return songs;
+  final indexed = <({Song song, int index})>[
+    for (var i = 0; i < songs.length; i++) (song: songs[i], index: i),
+  ];
+  indexed.sort((a, b) {
+    final left = a.song.playlistSort;
+    final right = b.song.playlistSort;
+    if (left == null) return right == null ? a.index.compareTo(b.index) : 1;
+    if (right == null) return -1;
+    final order = left.compareTo(right);
+    return order != 0 ? order : a.index.compareTo(b.index);
+  });
+  return indexed.map((item) => item.song).toList();
+}
+
 /// 对 [list] 原地排序。
 ///
 /// - [baseOrder]：歌单未经排序的原始列表。其下标即「添加时间」代理，

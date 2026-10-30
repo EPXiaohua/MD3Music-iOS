@@ -56,7 +56,22 @@ class McpService extends ChangeNotifier {
         _appFeatures = appFeatures,
         _store = store ?? McpSettingsStore(),
         _server = server ?? McpHttpServer() {
-    unawaited(_autoStart());
+    settingsReady = _autoStart();
+    unawaited(settingsReady);
+  }
+
+  late final Future<void> settingsReady;
+
+  /// Windows 重置后关闭旧服务并读取默认配置，不能只清除磁盘值。
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await settingsReady;
+    await stop();
+    final settings = await _store.load();
+    if (_disposed) return;
+    _settings = settings;
+    notifyListeners();
+    if (settings.enabled) await start();
   }
 
   final McpPlayerControl _playerControl;

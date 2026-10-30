@@ -54,6 +54,7 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.media.AudioManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.TextUtils;
@@ -105,10 +106,19 @@ import java.util.concurrent.TimeoutException;
 
   private static final String TAG = "LegacyConversions";
 
-  // MD3Music fork: 原子随身听（vivomusicmix）能力位常量（7|8|16：播控+歌词+进度）。
-  // 字段名照抄 vivo 官方拼写；compat 普通键经 parcel 往返成为 framework 顶层键。
+  // MD3Music fork v45：原子随身听能力位（单一来源收敛）。
+  // 31（播控/信息/图/歌词/进度）+ 收藏 64 + 循环 128 + 三类列表 256|512|1024
+  // = 2015，每一位都有对应实现（v45 起循环/收藏已接通）。不再随歌词有无增删。
+  // 与 legacy MediaSessionCompat.VMM_SUPPORT_EVENT_VALUE 同值（两包私有互不可
+  // 见，改值必须同步）。
   static final String VMM_SUPPORT_EVENT_KEY = "vivomusicmix.media.metadata.support_event";
-  static final long VMM_SUPPORT_EVENT_VALUE = 31L;
+  static final long VMM_SUPPORT_EVENT_VALUE = 2015L;
+
+  private static boolean isVivoFamily() {
+    return "vivo".equalsIgnoreCase(Build.MANUFACTURER)
+        || "vivo".equalsIgnoreCase(Build.BRAND)
+        || "iqoo".equalsIgnoreCase(Build.BRAND);
+  }
 
   // Stub BrowserRoot for accepting any connection here.
   public static final BrowserRoot defaultBrowserRoot =
@@ -748,6 +758,10 @@ import java.util.concurrent.TimeoutException;
           MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, metadata.artworkUri.toString());
       builder.putString(
           MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, metadata.artworkUri.toString());
+      if (isVivoFamily()) {
+        builder.putString(
+            MediaMetadataCompat.METADATA_KEY_ART_URI, metadata.artworkUri.toString());
+      }
     }
 
     if (artworkBitmap != null) {
@@ -783,12 +797,38 @@ import java.util.concurrent.TimeoutException;
       builder.putLong(MediaConstants.EXTRAS_KEY_MEDIA_TYPE_COMPAT, metadata.mediaType);
     }
 
-    // MD3Music fork: 原子随身听（vivomusicmix）能力位无条件写入（7|8|16：播控+歌词+进度）。
+    // MD3Music fork: 仅 vivo/iQOO 写入原子随身听能力位（7|8|16：播控+歌词+进度）。
     // 能力位必须与歌词内容解耦：无歌词的曲子也要有 16 位，否则原子随身听
     // SeekBarLayout 的 Y0()/Z0() 恒为 false，进度条永远 --:--（VivoCarLyrics 实测）。
     // 该键作为 compat 普通键经 parcel 往返成为 framework MediaMetadata 顶层键，
     // 原子随身听（合作控制器路径）原样读取。
-    builder.putLong(VMM_SUPPORT_EVENT_KEY, VMM_SUPPORT_EVENT_VALUE);
+    if (isVivoFamily()) {
+      builder.putLong(VMM_SUPPORT_EVENT_KEY, VMM_SUPPORT_EVENT_VALUE);
+      // MD3Music fork v51：LOOP_MODE 顶层双写。extras 拷贝路径真机实测岛读不到
+      // （v50 诊断包：同一份 metadata 里 RATING（预定义键）岛读到了、LOOP_MODE
+      // （extras 键）恒读 0 → 岛循环按钮每次发同一档）。与 support_event 同走
+      // 顶层键（该路径已实证可达岛：能力位生效）。值取 Dart 推送的权威状态，
+      // 0=未推送不写。
+      int vmmLoop = com.ryanheise.just_audio.AudioPlayer.sVivoLoopMode;
+      if (vmmLoop >= 1) {
+        builder.putLong("vivomusicmix.media.metadata.LOOP_MODE", vmmLoop);
+      }
+      // MD3Music fork v64：framework MEDIA_ID 统一为 `title|artist`——岛高亮靠它
+      // 与列表项 mediaId 相等来判定"正在播放"。此前这里写 item 原始 mediaId
+      // （song.id），高亮身份要等 APS 封面链再改写（真机实测：按钮切歌走预取
+      // 毫秒级、列表点歌要等封面下载 3~5 秒）。转换发生在 item 变化的当下，
+      // setUrl 后即刻高亮；后续 APS 注入同口径不跳变。
+      CharSequence vmmTitle = metadata.title;
+      CharSequence vmmArtist = metadata.artist;
+      if (vmmTitle != null && vmmTitle.length() > 0
+          || vmmArtist != null && vmmArtist.length() > 0) {
+        String t = vmmTitle == null ? "" : vmmTitle.toString();
+        String a = vmmArtist == null ? "" : vmmArtist.toString();
+        if (!t.isEmpty() || !a.isEmpty()) {
+          builder.putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, t + "|" + a);
+        }
+      }
+    }
 
     if (metadata.extras != null) {
       for (@Nullable String customKey : metadata.extras.keySet()) {

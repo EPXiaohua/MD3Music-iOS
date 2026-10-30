@@ -7,6 +7,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../core/services/local_artwork_cache.dart';
+import '../core/utils/local_media_path.dart';
 import '../providers/song_match_provider.dart';
 
 /// 播放器专用封面图组件，支持所有 artworkUri 类型。
@@ -18,6 +19,8 @@ import '../providers/song_match_provider.dart';
 /// - 支持 `file://` URI
 /// - 支持 `http(s)://` 通过 [CachedNetworkImage] 加载（带磁盘缓存）
 /// - `content://` 加载失败时，尝试用 `fallbackFilePath` 读取内嵌封面
+/// - 本地音频（`local://` 与 `content://`）统一走 [normalizeLocalMediaPath] 归一
+///   后再读内嵌封面，并共用同一套「单曲偏好在线封面」解析
 class PlayerArtworkImage extends StatefulWidget {
   /// 封面 URI，支持 http(s):// / content:// / local:// / file:// / null
   final String? artworkUri;
@@ -64,6 +67,51 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
   /// 当前正在加载的文件路径，避免重复加载同一文件
   String? _loadingPath;
 
+  /// MD3Music fork v37：在线封面失败自愈重试（有界——同 URI 至多一次）。
+  /// kugou 图床偶现抖动/超时时 CachedNetworkImage 一次失败即定格占位，
+  /// 岛/锁屏走原生链没受影响，唯独 App 内一错到底。重试用换 Key 强制
+  /// 重新 resolve（failed 请求不污染缓存），二连败维持占位至切歌。
+  ///
+  /// v40（第六轮审查 P0）：守卫从 widget.artworkUri 改为 [_requestedUri]——
+  /// local:// + 在线匹配分支实际请求的是 http 匹配 URL，与 widget.artworkUri
+  /// 恒不等导致重试永不触发；另把 Future.delayed 换成可取消的 Timer。
+  static const int _maxHttpAttempts = 2;
+  static const Duration _httpRetryDelay = Duration(milliseconds: 1600);
+  String? _attemptUri;
+  int _attempt = 0;
+  bool _retryScheduled = false;
+  Timer? _retryTimer;
+  String? _requestedUri;
+
+  void _noteUriChanged() {
+    if (widget.artworkUri != _attemptUri) {
+      _attemptUri = widget.artworkUri;
+      _attempt = 0;
+      _retryScheduled = false;
+      _requestedUri = null;
+      _retryTimer?.cancel();
+      _retryTimer = null;
+    }
+  }
+
+  void _scheduleHttpRetry(String uri) {
+    if (_retryScheduled || _attempt >= _maxHttpAttempts - 1) return;
+    _retryScheduled = true;
+    _retryTimer = Timer(_httpRetryDelay, () {
+      _retryScheduled = false;
+      if (!mounted || _requestedUri != uri) return;
+      if (_attempt >= _maxHttpAttempts - 1) return;
+      setState(() => _attempt++);
+    });
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    super.dispose();
+  }
+
   @override
   void didUpdateWidget(PlayerArtworkImage oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -74,6 +122,7 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
       _embeddedLoaded = false;
       _loadingPath = null;
     }
+    _noteUriChanged();
   }
 
   /// 从文件路径读取内嵌封面
@@ -90,6 +139,79 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
         _embeddedLoaded = true;
       });
     }
+  }
+
+  /// 归一化后的字符串是否真是本地文件形态（`content://` 等仍无法用 `dart:io` 读）。
+  static bool _isReadableLocalPath(String path) =>
+      !path.startsWith('content://') &&
+      !path.startsWith('http://') &&
+      !path.startsWith('https://');
+
+  /// 本地音频封面：[内嵌封面 > 在线匹配封面 > 占位符]。
+  ///
+  /// [filePath] 必须是**归一化后的裸磁盘路径**（见 [normalizeLocalMediaPath]）——
+  /// 匹配记录的键 `'local_<扫描期路径>'` 与库内 `Song.id` 同口径，播放期回写的
+  /// `file://` 形态直接拼会查不到记录（「使用在线封面」开关对本地歌也因此失效）。
+  Widget _buildForLocalAudio(
+    BuildContext context,
+    String filePath,
+    int decodeWidth,
+    Color bg,
+    Color icon,
+    double iSize,
+  ) {
+    // 这首歌自己的匹配记录：单曲偏好「使用在线封面」+ 兜底 URL
+    // （matchedInfoForLocal 订阅匹配状态，匹配确认/偏好切换后自动重建）
+    final matchInfo = matchedInfoForLocal(context, 'local_$filePath');
+    final matchedUri = (matchInfo != null && matchInfo.isMatched)
+        ? matchInfo.artworkUri
+        : null;
+    final hasMatchedUri = matchedUri != null && matchedUri.isNotEmpty;
+    final preferOnlineCover = matchInfo != null &&
+        matchInfo.isMatched &&
+        matchInfo.preferOnlineCover &&
+        hasMatchedUri;
+    if (!_embeddedLoaded) {
+      _loadEmbedded(filePath);
+    }
+    // 偏好开启时跳过内嵌显示（内嵌仍提取，供在线失败时回落）
+    if (!preferOnlineCover && _embeddedBytes != null) {
+      return Image.memory(
+        _embeddedBytes!,
+        width: widget.isFill ? double.infinity : null,
+        height: widget.isFill ? double.infinity : null,
+        fit: widget.fit,
+        cacheWidth: decodeWidth,
+      );
+    }
+    // 内嵌封面缺失或偏好在线：用匹配到的在线封面
+    if (hasMatchedUri) {
+      _requestedUri = matchedUri;
+      return CachedNetworkImage(
+        key: ValueKey('matched:$matchedUri#${_attempt}'),
+        imageUrl: matchedUri,
+        width: widget.isFill ? double.infinity : null,
+        height: widget.isFill ? double.infinity : null,
+        fit: widget.fit,
+        memCacheWidth: decodeWidth,
+        placeholder: (_, _) => _placeholder(bg, icon, iSize),
+        errorWidget: (_, _, _) {
+          // 在线封面加载失败：核对一次（同 URI 至多一次重试），再失败回落内嵌
+          _scheduleHttpRetry(matchedUri);
+          if (_embeddedBytes != null) {
+            return Image.memory(
+              _embeddedBytes!,
+              width: widget.isFill ? double.infinity : null,
+              height: widget.isFill ? double.infinity : null,
+              fit: widget.fit,
+              cacheWidth: decodeWidth,
+            );
+          }
+          return _placeholder(bg, icon, iSize);
+        },
+      );
+    }
+    return _placeholder(bg, icon, iSize);
   }
 
   /// 解码档位（物理像素宽）。
@@ -132,6 +254,8 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
   }
 
   Widget _buildArtwork(BuildContext context, int decodeWidth) {
+    // 在线封面自愈重试：URI 变化经此统一重置（didUpdateWidget 之外兜底）
+    _noteUriChanged();
     final cs = Theme.of(context).colorScheme;
     final uri = widget.artworkUri;
     final bg = widget.backgroundColor ?? cs.surfaceContainerHighest;
@@ -155,58 +279,31 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
       return _placeholder(bg, icon, iSize);
     }
 
-    // local:// 前缀：从文件路径读取内嵌封面
-    if (uri.startsWith('local://')) {
-      final filePath = uri.substring('local://'.length);
-      // 这首歌自己的匹配记录：单曲偏好「使用在线封面」+ 兜底 URL
-      // （matchedInfoForLocal 订阅匹配状态，匹配确认/偏好切换后自动重建）
-      final matchInfo = matchedInfoForLocal(context, 'local_$filePath');
-      final matchedUri = (matchInfo != null && matchInfo.isMatched)
-          ? matchInfo.artworkUri
-          : null;
-      final hasMatchedUri = matchedUri != null && matchedUri.isNotEmpty;
-      final preferOnlineCover = matchInfo != null &&
-          matchInfo.isMatched &&
-          matchInfo.preferOnlineCover &&
-          hasMatchedUri;
-      if (!_embeddedLoaded) {
-        _loadEmbedded(filePath);
+    // 本地音频：`local://<path>`（库内标识）或 `content://`（MediaStore albumart
+    // 封面 URI，只能靠 fallbackFilePath 里的音频文件读内嵌封面）。
+    //
+    // 两条分支共用 [_buildForLocalAudio]：此前 `content://` 分支既不归一
+    // `filePath`（播放解析会把 localPath 回写成 `file://`，`File()` 读不到 →
+    // 播放页恒为占位符，而列表因用曲库对象所以正常），也不查匹配偏好
+    // （「使用在线封面」开关对这类歌完全无效）。两处行为分叉正是本 bug 的两个面。
+    if (uri.startsWith('local://') || uri.startsWith('content://')) {
+      final rawPath = uri.startsWith('local://')
+          ? uri.substring('local://'.length)
+          : widget.fallbackFilePath;
+      final filePath = normalizeLocalMediaPath(rawPath);
+      if (filePath == null || !_isReadableLocalPath(filePath)) {
+        // `content://` 且没有可用的音频文件路径（如扫描期 resolveLocalPath 就失败）：
+        // 无内嵌封面可读，也没有在线封面可退——保持占位符。
+        return _placeholder(bg, icon, iSize);
       }
-      // 偏好开启时跳过内嵌显示（内嵌仍提取，供在线失败时回落）
-      if (!preferOnlineCover && _embeddedBytes != null) {
-        return Image.memory(
-          _embeddedBytes!,
-          width: widget.isFill ? double.infinity : null,
-          height: widget.isFill ? double.infinity : null,
-          fit: widget.fit,
-          cacheWidth: decodeWidth,
-        );
-      }
-      // 内嵌封面缺失或偏好在线：用匹配到的在线封面
-      if (hasMatchedUri) {
-        return CachedNetworkImage(
-          imageUrl: matchedUri,
-          width: widget.isFill ? double.infinity : null,
-          height: widget.isFill ? double.infinity : null,
-          fit: widget.fit,
-          memCacheWidth: decodeWidth,
-          placeholder: (_, _) => _placeholder(bg, icon, iSize),
-          errorWidget: (_, _, _) {
-            // 在线封面加载失败：回落内嵌封面（有则显示）
-            if (_embeddedBytes != null) {
-              return Image.memory(
-                _embeddedBytes!,
-                width: widget.isFill ? double.infinity : null,
-                height: widget.isFill ? double.infinity : null,
-                fit: widget.fit,
-                cacheWidth: decodeWidth,
-              );
-            }
-            return _placeholder(bg, icon, iSize);
-          },
-        );
-      }
-      return _placeholder(bg, icon, iSize);
+      return _buildForLocalAudio(
+        context,
+        filePath,
+        decodeWidth,
+        bg,
+        icon,
+        iSize,
+      );
     }
 
     // file:// URI：直接读本地文件（云盘提取的内嵌封面等场景）
@@ -233,37 +330,25 @@ class _PlayerArtworkImageState extends State<PlayerArtworkImage> {
       return _placeholder(bg, icon, iSize);
     }
 
-    // content:// URI：Image.network 无法加载（非 HTTP 协议），
-    // 直接用 fallbackFilePath 走 LocalArtworkImage 懒加载内嵌封面
-    if (uri.startsWith('content://')) {
-      if (widget.fallbackFilePath != null) {
-        if (!_embeddedLoaded) {
-          _loadEmbedded(widget.fallbackFilePath!);
-        }
-        if (_embeddedBytes != null) {
-          return Image.memory(
-            _embeddedBytes!,
-            width: widget.isFill ? double.infinity : null,
-            height: widget.isFill ? double.infinity : null,
-            fit: widget.fit,
-            cacheWidth: decodeWidth,
-          );
-        }
-        return _placeholder(bg, icon, iSize);
-      }
-      return _placeholder(bg, icon, iSize);
-    }
+    // content:// URI：已在上面的「本地音频」分支与 local:// 合并处理
+    // （靠 fallbackFilePath 读内嵌封面 + 匹配偏好），此处不再单独分支。
 
     // http(s):// 在线封面：用 CachedNetworkImage（带磁盘缓存）
     if (uri.startsWith('http://') || uri.startsWith('https://')) {
+      _requestedUri = uri;
       return CachedNetworkImage(
+        // v37：自愈重试——失败换 Key 重新 resolve（网络失败不入缓存）
+        key: ValueKey('net:$uri#${_attempt}'),
         imageUrl: uri,
         width: widget.isFill ? double.infinity : null,
         height: widget.isFill ? double.infinity : null,
         fit: widget.fit,
         memCacheWidth: decodeWidth,
         placeholder: (_, _) => _placeholder(bg, icon, iSize),
-        errorWidget: (_, _, _) => _placeholder(bg, icon, iSize),
+        errorWidget: (_, _, _) {
+          _scheduleHttpRetry(uri);
+          return _placeholder(bg, icon, iSize);
+        },
       );
     }
 
@@ -444,4 +529,34 @@ Future<ui.Image?> _resolveCoverImage(ImageProvider<Object> provider) {
   );
   stream.addListener(listener);
   return completer.future;
+}
+
+/// 封面是否已就绪（同键解码缓存命中，渲染首帧即有图）。
+///
+/// 与 [PlayerArtworkImage] 渲染**同键**：宽度经 [_decodeTierFor] 量化成档位后
+/// 交给 `CachedNetworkImage(memCacheWidth: tier)`，octo_image 内部落成
+/// `ResizeImage.resizeIfNeeded(tier, null, provider)`——所以这里复用同一个工厂
+/// [coverPrewarmProviderFor] 解析，避免「探测一份、渲染另一份」的键漂移
+/// （与 [prewarmPlayerArtworkTexture] 同源的理由；`CachedNetworkImageProvider
+/// .obtainKey` 不读 configuration，空配置与渲染层的环境配置同键）。
+///
+/// 未命中时本次 resolve 即开始加载，完成时返回 true——顺带把解码结果放进缓存，
+/// 渲染层随后同键命中，不会重复取数。
+///
+/// 内嵌封面（local://、content://）外部拿不到同一份字节，无法探测，按就绪返回
+/// true（其读取走本地文件/Isolate，通常一帧内完成，由渲染层自行兜底）。
+Future<bool> isPlayerArtworkReady({
+  required String? artworkUri,
+  required double settledLogicalWidth,
+  required double devicePixelRatio,
+}) async {
+  final provider = coverPrewarmProviderFor(
+    artworkUri: artworkUri,
+    settledLogicalWidth: settledLogicalWidth,
+    devicePixelRatio: devicePixelRatio,
+  );
+  // 探测不了的类型（内嵌封面 / 不存在的 file://）：按就绪处理。
+  if (provider == null) return true;
+  final image = await _resolveCoverImage(provider);
+  return image != null;
 }

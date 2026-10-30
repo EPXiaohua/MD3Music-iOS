@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/build_flags.dart';
 import '../../core/layout/bottom_chrome_dimens.dart';
+import '../../core/platform_capabilities.dart' show isWindowsDesktop;
 import '../../core/remote/remote_slider.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/theme/motion_constants.dart';
@@ -83,7 +84,13 @@ class NowPlayingBar extends StatelessWidget {
                   // 中：传输控制 + 进度条
                   Expanded(
                     flex: 2,
-                    child: _NowPlayingControls(player: player),
+                    // 整块自建重绘边界：上一首/下一首是裸 `IconButton`，其水波画在
+                    // 按钮内层 `Material` 的 ink 层上，`markNeedsPaint` 会冒泡到最近
+                    // 的重绘边界；没有本层边界时一次点击会把整条底栏之外的内容一起
+                    // 重绘（Windows 实测「鼠标点暂停整窗卡一下」）。
+                    child: RepaintBoundary(
+                      child: _NowPlayingControls(player: player),
+                    ),
                   ),
                   // 右：收藏 + 播放模式
                   Expanded(
@@ -199,6 +206,12 @@ class _NowPlayingControls extends StatelessWidget {
             M3EFilledButton(
               tooltip: player.isPlaying ? '暂停' : '播放',
               shape: M3EButtonShape.round,
+              // Windows 桌面端回退 m3e 默认的 InkSparkle 水波：它由运行时
+              // fragment shader 绘制（material_ui 的 shaders/ink_sparkle.frag，
+              // 617ms 动画 + 每帧写 uniform），首次按下要等着色器编译/管线创建，
+              // 表现就是「点一下暂停整窗卡一下」。InkRipple 是纯 Canvas 涟漪，
+              // 桌面端观感差异可忽略；Android / TV 保持 m3e 的 sparkle 观感。
+              splashFactory: isWindowsDesktop ? InkRipple.splashFactory : null,
               decoration: const M3EButtonDecoration(
                 fixedSize: Size(40, 40),
                 padding: EdgeInsets.zero,

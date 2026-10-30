@@ -1,4 +1,5 @@
 import 'package:canvas_danmaku/canvas_danmaku.dart';
+import 'package:flutter/painting.dart';
 
 import 'danmaku_entry.dart';
 
@@ -13,10 +14,15 @@ DanmakuItemType toItemType(DanmakuMode mode) => switch (mode) {
       DanmakuMode.bottom => DanmakuItemType.bottom,
     };
 
-DanmakuContentItem<String> toContentItem(DanmakuEntry entry) =>
+DanmakuContentItem<String> toContentItem(
+  DanmakuEntry entry, {
+  Color? overrideColor,
+}) =>
     DanmakuContentItem<String>(
       entry.text,
-      color: entry.color,
+      // v54：MV 弹幕颜色覆盖（null=跟随弹幕池 entry.color）；随机取色由
+      // 调用方算好具体 Color 传入（纯函数库不持 Random）。
+      color: overrideColor ?? entry.color,
       type: toItemType(entry.mode),
       selfSend: entry.selfSend,
       extra: entry.id,

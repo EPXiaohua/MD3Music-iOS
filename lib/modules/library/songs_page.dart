@@ -120,13 +120,11 @@ class _SongsPageState extends State<SongsPage> {
     switch (_sortBy) {
       case SongSortBy.title:
         songs.sort(
-          (a, b) => compare(a.title, b.title, (x, y) => x.compareTo(y)),
-        );
+            (a, b) => compare(a.title, b.title, (x, y) => x.compareTo(y)));
         break;
       case SongSortBy.artist:
         songs.sort(
-          (a, b) => compare(a.artist, b.artist, (x, y) => x.compareTo(y)),
-        );
+            (a, b) => compare(a.artist, b.artist, (x, y) => x.compareTo(y)));
         break;
       case SongSortBy.dateAdded:
         // 添加时间排序：原列表顺序视为添加顺序，倒序时整体反转
@@ -167,8 +165,8 @@ class _SongsPageState extends State<SongsPage> {
         child: Text(
           '暂无歌曲',
           style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
         ),
       );
     }
@@ -182,8 +180,8 @@ class _SongsPageState extends State<SongsPage> {
               Text(
                 '${songs.length} 首歌曲',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
               ),
               const Spacer(),
               IconButton(
@@ -215,18 +213,18 @@ class _SongsPageState extends State<SongsPage> {
                   (value: SongSortBy.artist, label: '按歌手'),
                   (value: SongSortBy.dateAdded, label: '按添加时间'),
                 ],
-                onPicked: (value, repeated) {
+                onPicked: (value) {
                   setState(() {
-                    if (repeated) {
-                      // 再次点当前项 → 切换升/降序
-                      _sortDescending = !_sortDescending;
-                    } else {
-                      // 切到新的排序项 → 重置为正序
-                      _sortBy = value;
-                      _sortDescending = false;
-                    }
+                    // 切到新的排序项 → 重置为正序
+                    _sortBy = value;
+                    _sortDescending = false;
                   });
                   // 记忆排序选择：切到其它页面再回来仍保持本次选择
+                  _saveSortPreference();
+                },
+                ascending: !_sortDescending,
+                onDirectionChanged: (ascending) {
+                  setState(() => _sortDescending = !ascending);
                   _saveSortPreference();
                 },
               ),
@@ -236,6 +234,10 @@ class _SongsPageState extends State<SongsPage> {
         Expanded(
           child: ListView.builder(
             controller: _scrollController,
+            // SongListItem 自带 10dp 内衬，补齐到页面的 16dp；底部保留播放栏占位。
+            padding: EdgeInsets.fromLTRB(
+              6, 0, 6, 16 + MediaQuery.paddingOf(context).bottom,
+            ),
             itemCount: songs.length,
             itemBuilder: (context, index) {
               return SongListItem(

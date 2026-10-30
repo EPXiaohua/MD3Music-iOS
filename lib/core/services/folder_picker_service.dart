@@ -4,15 +4,15 @@ import 'package:flutter/services.dart';
 
 /// Android 原生文件夹选择器：通过 SAF (Storage Access Framework) 打开系统目录选择界面。
 ///
-/// 用户选择的目录 URI 会自动获得持久化权限，后续可直接读写。
+/// 用户选择的目录 URI 获得持久化读取权限；U 盘必须通过 URI 扫描，
+/// 不能把 document tree URI 猜成 /storage 路径。
 class FolderPickerService {
   static const _channel = MethodChannel('com.md3music.md3music/folder_picker');
 
-  /// 打开系统文件夹选择器，返回用户选择的目录路径。
+  /// 打开系统文件夹选择器。Windows 返回路径，Android 返回 SAF tree URI。
   ///
   /// 返回 `null` 表示用户取消选择。
-  /// 返回的是实际文件系统路径（如 `/storage/emulated/0/Music/md3Music`），
-  /// 可直接用于文件操作。
+  /// Android 返回的 content:// URI 只可经 ContentResolver 读取。
   static Future<String?> pickFolder() async {
     try {
       // 按**目标平台**判断，不用 Platform.isWindows：后者在 Windows 宿主上跑
@@ -22,10 +22,7 @@ class FolderPickerService {
         final path = await getDirectoryPath();
         return path;
       }
-      final uri = await _channel.invokeMethod<String>('pickFolder');
-      if (uri == null) return null;
-      // 将 SAF URI 转换为实际文件路径
-      return _uriToPath(uri);
+      return await _channel.invokeMethod<String>('pickFolder');
     } catch (error) {
       // 静默失败会让用户只看到"点了没反应"，这里留日志便于定位
       // （Windows 上 fluttertoast 无实现，弹窗提示走不通）。
@@ -34,26 +31,29 @@ class FolderPickerService {
     }
   }
 
-  /// 将 SAF content URI 转换为实际文件系统路径。
-  ///
-  /// URI 格式示例：
-  /// `content://com.android.externalstorage.documents/tree/primary%3AMusic%2Fmd3Music`
-  /// 转换为：`/storage/emulated/0/Music/md3Music`
-  static String? _uriToPath(String uri) {
-    try {
-      final treeIndex = uri.indexOf('/tree/');
-      if (treeIndex == -1) return null;
+  static bool isTreeUri(String path) =>
+      path.startsWith('content://') && path.contains('/tree/');
 
-      var path = Uri.decodeComponent(uri.substring(treeIndex + 6));
-      // 替换 primary: 为 /storage/emulated/0/
-      path = path.replaceFirst('primary:', '/storage/emulated/0/');
-      return path;
-    } catch (_) {
-      return null;
+  static String displayName(String path) {
+    if (isTreeUri(path)) {
+      final id = Uri.parse(path).pathSegments.last;
+      return id.substring(id.lastIndexOf('/') + 1).split(':').last;
     }
+    final parts = path.split(RegExp(r'[/\\]')).where((p) => p.isNotEmpty);
+    return parts.isEmpty ? path : parts.last;
   }
 
-  /// 对已保存的 URI 请求持久化读写权限。
+  /// 原生侧使用持久化 tree grant 遍历目录，返回可播放的 document URI。
+  static Future<List<Map<String, dynamic>>> queryTreeAudioFiles(String uri) async {
+    final rows = await _channel.invokeMethod<List<dynamic>>(
+      'queryTreeAudioFiles',
+      {'uri': uri},
+    );
+    return rows?.whereType<Map>().map((row) =>
+        row.map((key, value) => MapEntry(key.toString(), value))).toList() ?? [];
+  }
+
+  /// 对已保存的 URI 确认持久化读取权限。
   ///
   /// 在 App 冷启动时调用，确保之前选择的目录仍然可访问。
   static Future<bool> persistUriPermission(String uri) async {

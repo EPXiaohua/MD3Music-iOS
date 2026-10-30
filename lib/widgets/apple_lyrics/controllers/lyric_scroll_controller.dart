@@ -137,6 +137,9 @@ class LyricScrollController {
   /// [lineTop] 为当前行顶部 y（前面所有行高度的累加），用于自动换行场景。
   /// 默认 -1 表示用线性假设 `lineTop = lineIndex * lineHeight`。
   ///
+  /// [snap] 为 true 时跳过弹簧过渡，直接瞬移到目标位置（快速连切兜底）。
+  /// 与首次定位一样只在视口就绪且用户未拖动时生效。
+  ///
   /// **重要**：用户正在拖动歌词时（[onUserScroll] 后到 5000ms 回弹前），
   /// 不调用 `setTarget`，避免覆盖用户手动滚动位置导致瞬间回弹。
   /// 仅更新 `_currentLineIndex` 和 `_currentLineHeight`，等用户松手 5s 后
@@ -148,6 +151,7 @@ class LyricScrollController {
     int intervalMs = 0,
     double lineTop = -1,
     bool isInterludeActive = false,
+    bool snap = false,
   }) {
     _currentLineIndex = index;
     _currentLineHeight = lineHeight;
@@ -156,7 +160,11 @@ class LyricScrollController {
     // 用户滚动期间不强制 setTarget，等 5s 倒计时结束后自动回弹到最新行
     if (!_isUserScrolling && _autoReturned) {
       final double targetY = targetYForLine(index, lineHeight, lineTop: lineTop);
-      if (!_initialJumpDone && _viewportHeight > 0) {
+      if (snap && _viewportHeight > 0) {
+        // 快速连切兜底：直接切行，不产生弹簧过渡
+        _initialJumpDone = true;
+        _posYSpring.setPosition(targetY, 0);
+      } else if (!_initialJumpDone && _viewportHeight > 0) {
         // 首次定位：直接瞬移到当前行（setPosition 会把 target 同步为当前位置），
         // 避免弹簧从顶部 0 一路滚动到当前行的动画
         _initialJumpDone = true;
@@ -235,6 +243,18 @@ class LyricScrollController {
     // 等 5000ms 倒计时结束后再 setTarget 触发回弹。
     _posYSpring.setPosition(_posYSpring.position + delta, 0);
     _isUserScrolling = true;
+    _autoReturnRemainingMs = LyricLayout.autoReturnMs.toDouble();
+    _autoReturned = false;
+  }
+
+  /// 鼠标滚轮滚动（桌面端）：滚轮没有跟手过程，直接把滚动量累加进弹簧
+  /// 目标，由弹簧平滑滚过去；同样重置 5s 自动回弹倒计时。
+  ///
+  /// 不置 [_isUserScrolling]：滚轮一格没有按住拖动语义，且倒计时期间
+  /// `_autoReturned=false`，[setCurrentLine] 本就不会夺走滚动位置。
+  /// delta 为正 = 内容向下滚（看后面的行，posY 减小）。
+  void onUserWheelScroll(double delta) {
+    _posYSpring.setTarget(_posYSpring.target + delta);
     _autoReturnRemainingMs = LyricLayout.autoReturnMs.toDouble();
     _autoReturned = false;
   }

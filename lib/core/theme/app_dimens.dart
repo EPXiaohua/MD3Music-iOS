@@ -71,6 +71,13 @@ class AppRadius {
   static const double lg = 16;
   static const double xl = 28;
 
+  /// 下拉面板外层圆角（20dp）——与面板内条目保持同心圆。
+  ///
+  /// m3e_core 的 `M3EDropdownMenu.containerRadius` 默认 28，但面板内列表
+  /// `contentPadding` 为 8、首尾条目外角 `outerRadius` 为 12，同心圆条件是
+  /// 外半径 = 内半径 + 间距 = 12 + 8 = 20；28 会让外层明显比内部更圆。
+  static const double dropdownPanel = 20;
+
   /// 胶囊 / 全圆角（配合 [StadiumBorder] 或极大半径）。
   static const double full = 999;
 
@@ -141,9 +148,18 @@ class AppCapsule {
 class AppLayout {
   AppLayout._();
 
-  /// 单栏内容的最大宽度：超过它就居中留白，而不是继续拉长（如设置项、表单、
-  /// 单列列表在平板上的表现）。约等于 MD3 body pane 上限。
+  /// 手机原有单栏宽度上限；大屏以此为基准，通过 contentWidthFor 扩展。
   static const double maxContentWidth = 840;
+
+  /// 大屏内容占局部可用宽度的 85%；窄面板不缩窄，手机沿用原限宽。
+  static double contentWidthFor(double width, {
+    double compactWidth = maxContentWidth, bool adaptive = true,
+  }) {
+    if (!width.isFinite) return compactWidth;
+    if (width <= compactWidth) return width;
+    if (!adaptive) return compactWidth;
+    return (width * 0.85).clamp(compactWidth, width);
+  }
 
   /// 正文文本的舒适阅读宽度上限（歌词、长段描述），约 60–75 字符行长。
   static const double readableMaxWidth = 640;

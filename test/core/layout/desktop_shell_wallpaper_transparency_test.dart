@@ -50,13 +50,17 @@ void main() {
     );
   });
 
-  test('侧栏 Material：壁纸模式走半透明', () {
+  test('侧栏 Material：壁纸模式完全透明', () {
     final code = readEffective(shellPath);
     expect(
-      code.contains('surfaceContainerLow.withValues(alpha: 0.2)'),
+      code.contains('wallpaperOn\n          ? Colors.transparent\n          : cs.surfaceContainerLow'),
       isTrue,
-      reason: '侧栏在壁纸模式下应半透明让壁纸透出，'
-          '与 app.dart 里 navigationRailTheme 的 0.2 口径保持一致',
+      reason: '侧栏在壁纸模式下不得叠加半透明色块',
+    );
+    expect(
+      code.contains('color: wallpaperOn ? Colors.transparent : null'),
+      isTrue,
+      reason: '侧栏分隔条在壁纸模式下不应留下竖线，但仍须保留拖拽命中区',
     );
   });
 

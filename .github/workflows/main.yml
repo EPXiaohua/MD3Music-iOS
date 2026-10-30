@@ -716,9 +716,8 @@ jobs:
       - name: Package portable zip
         shell: pwsh
         run: |
-          $ver = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*','' -split '\+')[0]
-          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "md3music-windows-$ver.zip" -CompressionLevel Optimal
-          Get-Item "md3music-windows-$ver.zip" | Select-Object Name,Length
+          ./scripts/tasks/windows.ps1 -PackageOnly -NoPause -OutDir . `
+            -PackageVersion '${{ needs.build-android.outputs.version }}'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

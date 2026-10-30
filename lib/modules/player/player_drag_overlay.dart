@@ -52,16 +52,19 @@ class _DragPositionedContent extends StatelessWidget {
       valueListenable: playerExpansion,
       builder: (context, progress, _) {
         if (progress <= 0.0) return const SizedBox.shrink();
-        final origin = playerDragOriginTop;
+        // 跟手覆盖层与路由**必须用同一份起点几何**（否则交接那一帧会跳一下）：
+        // 矩形与圆角都从全局锚点读（五字段成组写，见 publishPlayerDragOrigin）。
+        final Size screen = MediaQuery.sizeOf(context);
         return Positioned.fill(
-          // 拖拽期间不拦截触摸（穿透到下层 MiniPlayer 手势）
+          // 拖拽期间不拦截触摸（穿透到下层 MiniPlayer / 悬浮胶囊手势）
           child: IgnorePointer(
-            // 淡入在 PlayerPanelFrame 内部（只作用于页面内容，底色恒不透明），
+            // 淡入在 PlayerPanelFrame 内部（只作用于页面内容，底色按自己的曲线渐显），
             // 这里不要再包 Opacity —— 会把底色一起变透明，过渡态照样透出背后。
             child: PlayerPanelFrame(
               progress: progress,
-              origin: origin,
-              miniHeight: playerMiniBarHeight(),
+              originRect: playerPanelAnchorRect(screen),
+              originRadius: playerDragOriginRadius,
+              screenRadii: MediaQuery.displayCornerRadiiOf(context),
               child: const _DragPlayerContent(),
             ),
           ),

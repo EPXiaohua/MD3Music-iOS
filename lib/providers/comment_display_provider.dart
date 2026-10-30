@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -31,8 +33,19 @@ class CommentDisplayProvider extends ChangeNotifier {
     return reply < _minCommentFontSize ? _minCommentFontSize : reply;
   }
 
+  late final Future<void> settingsReady;
+
   CommentDisplayProvider() {
-    _loadCommentFontSize();
+    settingsReady = _loadCommentFontSize();
+  }
+
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await settingsReady;
+    final prefs = await SharedPreferences.getInstance();
+    _commentFontSize = (prefs.getDouble(_keyCommentFontSize) ?? 17.0)
+        .clamp(_minCommentFontSize, _maxCommentFontSize);
+    notifyListeners();
   }
 
   Future<void> _loadCommentFontSize() async {

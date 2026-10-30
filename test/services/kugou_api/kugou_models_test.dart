@@ -1,8 +1,23 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:md3music/data/models/song.dart';
 import 'package:md3music/services/kugou_api/kugou_models.dart';
 
 /// KugouLyric.fromJson 双格式歌词（LRC + KRC）解析与 getter 降级行为测试
 void main() {
+  test('歌单歌曲解析 sort 并经 Song 缓存往返保留', () {
+    final response = KugouPlaylistSongs.fromJson({
+      'data': {
+        'info': [
+          {'hash': 'A', 'songname': '甲', 'sort': '12'},
+          {'hash': 'B', 'songname': '乙', 'sort': 0},
+        ],
+      },
+    });
+    expect(response.songs.map((song) => song.playlistSort), [12, 0]);
+    final cached = Song.fromJson(response.songs.first.toSong().toJson());
+    expect(cached.playlistSort, 12);
+    expect(response.songs.first.copyWith(albumName: '专辑').playlistSort, 12);
+  });
   group('KugouLyric.fromJson', () {
     test('同时有 decodeContent 与 decodeKrcContent 时，displayLyric 优先返回 KRC', () {
       const lrcText = '[00:01.00]Hello LRC';

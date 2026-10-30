@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:material_ui/material_ui.dart';
 import 'package:material_color_utilities/material_color_utilities.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,10 +9,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/layout/ui_density.dart';
 import '../core/services/custom_font_loader.dart';
 import '../core/theme/app_theme.dart';
+import '../core/services/windows_default_font.dart';
 import '../data/repositories/settings_repository.dart';
 
 class ThemeProvider extends ChangeNotifier {
-  static const String _key = 'theme_mode';
+  /// 主题模式的持久化键。公开只读：启动链路需在 runApp 前同步播种初值，
+  /// 见 runBootstrap 对 [initialThemeMode] 的读取。
+  static const String themeModePreferenceKey = 'theme_mode';
+  static const String _key = themeModePreferenceKey;
   static const String _dynamicKey = 'use_dynamic_color';
   static const String _coverDynamicKey = 'use_cover_dynamic_color';
   static const String _amStylePlayerKey = 'use_am_style_player';
@@ -25,6 +30,7 @@ class ThemeProvider extends ChangeNotifier {
   static const String _navLabelBehaviorKey = 'nav_label_behavior';
   static const String _fontSourceKey = 'font_source';
   static const String _customFontPathKey = 'custom_font_path';
+  static const String _customTextColorKey = 'custom_text_color';
   static const String _artistPhotoBgKey = 'use_artist_photo_background';
   static const String _artistPhotoIntervalKey = 'artist_photo_interval';
   static const String _artistPhotoOpacityKey = 'artist_photo_opacity';
@@ -53,9 +59,12 @@ class ThemeProvider extends ChangeNotifier {
   bool _useCoverSeedColor = false;
   Color? _coverSeedColor;
   bool _useAmStylePlayer = false;
+  late final Future<void> amStylePlayerReady;
+  late final Future<void> windowsSettingsReady;
   Color? _manualSeedColor;
   bool _useOledBlack = false;
-  double _displayScale = kDefaultDisplayScale;
+  double _displayScale =
+      defaultDisplayScaleForPlatform(defaultTargetPlatform);
   // 底部导航栏文字显示行为（默认始终不显示）
   NavigationDestinationLabelBehavior _navLabelBehavior =
       NavigationDestinationLabelBehavior.alwaysHide;
@@ -65,6 +74,7 @@ class ThemeProvider extends ChangeNotifier {
   String? _customFontPath;
   // 运行时加载成功后填充的 fontFamily（仅在 custom 模式且加载成功时非 null）
   String? _loadedCustomFontFamily;
+  Color? _customTextColor;
   bool _useArtistPhotoBackground = false;
   int _artistPhotoInterval = 15;
   double _artistPhotoOpacity = 0.55;
@@ -101,6 +111,7 @@ class ThemeProvider extends ChangeNotifier {
   NavigationDestinationLabelBehavior get navLabelBehavior => _navLabelBehavior;
   FontSource get fontSource => _fontSource;
   String? get customFontPath => _customFontPath;
+  Color? get customTextColor => _customTextColor;
   bool get useArtistPhotoBackground => _useArtistPhotoBackground;
   int get artistPhotoInterval => _artistPhotoInterval;
   double get artistPhotoOpacity => _artistPhotoOpacity;
@@ -169,38 +180,80 @@ class ThemeProvider extends ChangeNotifier {
   }
 
   /// 当前生效的 fontFamily（传给 AppTheme）：
-  /// - [FontSource.system]：返回 null（让 Flutter 走系统字体链）
-  /// - [FontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system 返回 null
+  /// - [FontSource.system]：Windows 优先内置思源黑体，其他平台走系统字体链
+  /// - [FontSource.bundled]：旧值等同 system（旧内置 SimHei 已移除）
   /// - [FontSource.custom]：返回 [_loadedCustomFontFamily]，
-  ///   加载失败时为 null（实际降级为 system 行为）
+  ///   加载失败时降级为对应平台默认字体
   String? get effectiveFontFamily {
     switch (_fontSource) {
       case FontSource.system:
       case FontSource.bundled:
-        return null;
+        return WindowsDefaultFont.loadedFamily;
       case FontSource.custom:
-        return _loadedCustomFontFamily;
+        return _loadedCustomFontFamily ?? WindowsDefaultFont.loadedFamily;
     }
   }
 
-  ThemeProvider({bool? initialUseBackgroundImage}) {
+  ThemeProvider({
+    bool? initialUseBackgroundImage,
+    ThemeMode? initialThemeMode,
+  }) {
     if (initialUseBackgroundImage != null) {
       _useBackgroundImage = initialUseBackgroundImage;
     }
+    // 启动链路在 runApp 前同步读取持久化值并播种：_loadThemeMode 是异步的，
+    // 若只靠它，首帧会先用初值 ThemeMode.system 渲染一帧（锁浅色 + 系统深色
+    // 时表现为开屏闪黑），随后才切到用户选择的模式。
+    if (initialThemeMode != null) {
+      _themeMode = initialThemeMode;
+    }
+    // Windows 保活页面必须等全部主题偏好加载完成，不能只等播放页样式。
+    if (Platform.isWindows) {
+      windowsSettingsReady = _loadWindowsSettings();
+      amStylePlayerReady = windowsSettingsReady;
+      return;
+    }
+    windowsSettingsReady = Future<void>.value();
     _loadThemeMode();
     _loadDynamicColor();
     _loadUseCoverSeedColor();
-    _loadAmStylePlayer();
+    amStylePlayerReady = _loadAmStylePlayer();
     _loadManualSeedColor();
     _loadOledBlack();
     _loadDisplayScale();
     _loadNavLabelBehavior();
     _loadFontSource();
+    _loadCustomTextColor();
     _loadArtistPhotoBackground();
     _loadLyricDoubleTapToJump();
     _loadBackgroundImage();
     _loadAmPlayerBlur();
     _loadEmphasizedTypography();
+  }
+
+  Future<void> _loadWindowsSettings() async {
+    await Future.wait<void>([
+      _loadThemeMode(), _loadDynamicColor(), _loadUseCoverSeedColor(),
+      _loadAmStylePlayer(), _loadManualSeedColor(), _loadOledBlack(),
+      _loadDisplayScale(), _loadNavLabelBehavior(), _loadFontSource(),
+      _loadCustomTextColor(), _loadArtistPhotoBackground(),
+      _loadLyricDoubleTapToJump(), _loadBackgroundImage(),
+      _loadAmPlayerBlur(), _loadEmphasizedTypography(),
+    ]);
+  }
+
+  /// Windows 还原偏好后刷新已挂载的主题，而不是保留旧内存值。
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await windowsSettingsReady;
+    _themeMode = ThemeMode.system;
+    _manualSeedColor = null;
+    _navLabelBehavior = NavigationDestinationLabelBehavior.alwaysHide;
+    _loadedCustomFontFamily = null;
+    _backgroundSeedColor = null;
+    _amPlayerBlur = 30.0;
+    await _loadWindowsSettings();
+    notifyListeners();
   }
 
   Future<void> _loadThemeMode() async {
@@ -326,7 +379,7 @@ class ThemeProvider extends ChangeNotifier {
   /// 切换「Apple Music 风格播放页」开关。
   /// - 开启：用 AM 风格 FullPlayer（模糊封面背景 + 弹簧动画 + KRC 逐字歌词）
   /// - 关闭：用原版 MD3 FullPlayer（标准主题色 + LRC 行级歌词）
-  /// 切换后已打开的 FullPlayer 不会立即换 widget，下次 push 时才走新分支。
+  /// 已打开的播放页通过 ThemeProvider 订阅该值，切换时同步更换样式。
   Future<void> setUseAmStylePlayer(bool enabled) async {
     if (_useAmStylePlayer == enabled) return;
     _useAmStylePlayer = enabled;
@@ -447,37 +500,27 @@ class ThemeProvider extends ChangeNotifier {
     await SettingsRepository().setEmphasizedTypographyEnabled(enabled);
   }
 
-  /// 加载「显示大小」档位，默认 [kDefaultDisplayScale]（设备真实 dp）。
+  /// 加载「显示大小」档位；各平台默认 1.00x，保留用户手动保存的档位。
   ///
   /// 顺带清掉旧键 `ui_scale`：那是已删除的逐元素缩放实现留下的，值域 0.5~5.0，
-  /// 沿用会让存了 3.0 的用户拿到 131dp 宽的视口。不做值迁移，一律从 1.00 起。
+  /// 沿用会让存了 3.0 的用户拿到 131dp 宽的视口。不迁移旧值，使用平台默认档位。
   Future<void> _loadDisplayScale() async {
     final prefs = await SharedPreferences.getInstance();
-    _displayScale = (prefs.getDouble(_displayScaleKey) ?? kDefaultDisplayScale)
+    _displayScale = (prefs.getDouble(_displayScaleKey) ??
+            defaultDisplayScaleForPlatform(defaultTargetPlatform))
         .clamp(kMinDisplayScale, kMaxDisplayScale);
     notifyListeners();
     await prefs.remove(_legacyUiScaleKey);
   }
 
-  /// 预览「显示大小」档位：只改内存并通知监听者，**不落盘**。
-  ///
-  /// 显示大小确认弹窗期间用它实时应用新档位。确认前进程被杀（滑掉后台等）时，
-  /// 还原逻辑没机会执行——若此刻新档位已在磁盘上，下次启动会直接以未确认的
-  /// 档位生效（真机复现）；只预览则磁盘仍是旧档位，重启自然回到确认前状态。
-  void previewDisplayScale(double scale) {
+  /// 设置「显示大小」档位（[kMinDisplayScale] ~ [kMaxDisplayScale]）。
+  Future<void> setDisplayScale(double scale) async {
     final clamped = scale.clamp(kMinDisplayScale, kMaxDisplayScale);
     if (_displayScale == clamped) return;
     _displayScale = clamped;
     notifyListeners();
-  }
-
-  /// 把当前（预览）档位落盘，确认弹窗点「保留」后调用。
-  ///
-  /// 不复用 [previewDisplayScale] 的幂等早退语义——预览后内存已是新值，
-  /// 这里无条件写入。
-  Future<void> persistDisplayScale() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_displayScaleKey, _displayScale);
+    await prefs.setDouble(_displayScaleKey, clamped);
   }
 
   /// 加载底部导航栏文字显示行为的持久化值，默认始终不显示。
@@ -543,6 +586,27 @@ class ThemeProvider extends ChangeNotifier {
   }
 
   // ============== 字体来源 ==============
+
+  Future<void> _loadCustomTextColor() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getInt(_customTextColorKey);
+    _customTextColor = value == null ? null : Color(value | 0xFF000000);
+    notifyListeners();
+  }
+
+  /// null 表示跟随主题；自定义颜色只覆盖界面的表面文字色。
+  Future<void> setCustomTextColor(Color? color) async {
+    final next = color == null ? null : Color(color.toARGB32() | 0xFF000000);
+    if (_customTextColor == next) return;
+    _customTextColor = next;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (next == null) {
+      await prefs.remove(_customTextColorKey);
+    } else {
+      await prefs.setInt(_customTextColorKey, next.toARGB32());
+    }
+  }
 
   /// 加载持久化的字体来源与自定义字体路径。
   /// 读完后若为 custom 模式，自动触发 FontLoader 注册（异步，不阻塞构造）。

@@ -451,7 +451,11 @@ void main() {
   });
 
   group('强调波浪 - 字尾尾巴（v8）', () {
-    test('字唱完后波浪继续推进不被截断，走完才 idle', () {
+    test('字唱完后波浪继续推进不被截断，走完才 idle', () async {
+      // 效果默认关闭；验证辉光状态机时显式开启，并在结束后恢复默认。
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => LyricPreferences.instance.reset());
+      await LyricPreferences.instance.setUseGlowEffect(true);
       // 双字强调字 '命运'（时长 2000ms）：错位启动使第二个字符波浪
       // 比字尾晚 400ms 结束，字切换后应继续推进（尾巴）直至走完。
       const line2 = LyricLine(
@@ -655,7 +659,9 @@ void main() {
       return [for (final y in ys) byY[y]!];
     }
 
-    test('绘制分组 == 计划分组（贪心残留会被这条抓住）', () {
+    test('绘制分组 == 计划分组（贪心残留会被这条抓住）', () async {
+      // 不依赖用户默认值，明确验证开启平衡换行后的分组。
+      await LyricPreferences.instance.setLineBalance(true);
       const fontSize = 15.0;
       const maxWidth = 55.0;
       final line = sevenChars();
@@ -724,6 +730,299 @@ void main() {
       );
     });
   });
+
+  /// sweep（扫光）模型接线：行绑定期建墨迹路径，paintLine 按 fillMode 分派。
+  ///
+  /// classic 分支行为不变（前端不参与绘制，sweepFrontDebug 恒 0）；
+  /// sweep 分支前端随墨迹推进进度前进，且始终落在行程域内。
+  group('sweep（扫光）模型接线', () {
+    test('classic 模式：墨迹路径已建但不消费前端', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      await LyricPreferences.instance.setFillMode(LyricFillMode.classic);
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      for (int i = 0; i < 100; i++) {
+        renderer.tick(0.016, 500);
+      }
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+
+      expect(renderer.sweepPathDebug, isNotNull);
+      expect(renderer.sweepPathDebug!.isEmpty, isFalse);
+      expect(renderer.sweepPathDebug!.totalInk, greaterThan(0));
+      expect(renderer.sweepFrontDebug, 0,
+          reason: 'classic 模式不得消费 sweep 前端（原有绘制路径一行不变）');
+    });
+
+    test('sweep 模式：前端随墨迹进度推进且落在行程域内', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      await LyricPreferences.instance.setFillMode(LyricFillMode.sweep);
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      // 第 1 个字唱到一半
+      for (int i = 0; i < 60; i++) {
+        renderer.tick(0.016, 500);
+      }
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      final double early = renderer.sweepFrontDebug;
+      expect(early, greaterThan(0));
+
+      // 推进到第 3 个字
+      for (int i = 0; i < 60; i++) {
+        renderer.tick(0.016, 2500);
+      }
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      final double later = renderer.sweepFrontDebug;
+      expect(later, greaterThan(early), reason: '前端应随进度向右推进');
+
+      final path = renderer.sweepPathDebug!;
+      expect(later, lessThanOrEqualTo(path.totalInk + 30),
+          reason: '前端最多外扩 feather/2，不得飞出墨迹行程域');
+    });
+
+    test('sweep 模式：真的走 saveLayer + 4 停渐变 drawRect（不是退化均匀色）', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      await LyricPreferences.instance.setFillMode(LyricFillMode.sweep);
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      for (int i = 0; i < 60; i++) {
+        renderer.tick(0.016, 500); // 前端落在第 1 个字内 → 该字必须有过渡带
+      }
+      final probe = _SweepProbeCanvas();
+      renderer.paintLine(probe, ui.Offset.zero, line, 24);
+
+      expect(probe.savedLayers, isNotEmpty,
+          reason: 'sweep 渐变路径必须 saveLayer（零 saveLayer 说明整行退化成均匀色）');
+      expect(probe.drawRects, isNotEmpty,
+          reason: 'sweep 渐变路径必须 drawRect 贴 4 停渐变');
+      // 过渡带内的字矩形（第 1 个字，宽 24）应被渐变覆盖
+      expect(probe.drawRects.first.width, closeTo(24, 0.5));
+    });
+
+    test('sweep + 强调字：逐字符路径也走 4 停渐变且不崩', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      await LyricPreferences.instance.setFillMode(LyricFillMode.sweep);
+      await LyricPreferences.instance.setUseGlowEffect(true);
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      const line2 = LyricLine(
+        startTime: 0,
+        duration: 4000,
+        text: '命运华',
+        words: [
+          LyricWord(startTime: 0, duration: 2000, text: '命运'),
+          LyricWord(startTime: 2000, duration: 1000, text: '华'),
+        ],
+      );
+      renderer.emphasizeEffect = EmphasizeEffect();
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, line2, 24);
+      // 推进到强调字中段（逐字符激活窗口内）
+      for (int t = 0; t <= 1000; t += 16) {
+        renderer.tick(0.016, t, isPlaying: true);
+      }
+      expect(
+        renderer.debugCharStatesRef(0).any((s) => s != EmphasizeState.idle),
+        isTrue,
+        reason: '强调字应进入逐字符激活窗口，否则本用例没覆盖逐字符 sweep 路径',
+      );
+
+      final probe = _SweepProbeCanvas();
+      renderer.paintLine(probe, ui.Offset.zero, line2, 24);
+      expect(renderer.sweepFrontDebug, greaterThan(0));
+      expect(probe.drawRects, isNotEmpty,
+          reason: '逐字符 sweep 路径也应 drawRect 贴 4 停渐变');
+    });
+  });
+
+  // ==================== 辉光颜色与剖面 ====================
+  group('辉光跟随动态颜色 + 三层剖面（方块字贴合笔画）', () {
+    test('辉光上色 = 当前文字色（不再恒白）', () {
+      final renderer = WordRenderer();
+      // 深色背景下的动态混色结果（如 30% 封面色混出来的浅蓝）
+      final filter = renderer.debugGlowTintForTest(0x33, 0x66, 0xCC, 0.8);
+      expect(
+        filter,
+        equals(
+          ColorFilter.mode(
+            const Color.fromRGBO(0x33, 0x66, 0xCC, 0.8),
+            BlendMode.srcIn,
+          ),
+        ),
+        reason: '辉光必须用当前文字色（含动态取色比例），不能用白色矩阵',
+      );
+    });
+
+    test('辉光强度仍只由 alpha 控制：同色不同 alpha 是两个 filter', () {
+      final renderer = WordRenderer();
+      expect(
+        renderer.debugGlowTintForTest(0x11, 0x22, 0x33, 0.2),
+        isNot(equals(renderer.debugGlowTintForTest(0x11, 0x22, 0x33, 0.9))),
+      );
+    });
+
+    test('辉光强度倍数只乘 alpha、不改剖面半径', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final prefs = LyricPreferences.instance;
+      addTearDown(() => prefs.reset());
+      final renderer = WordRenderer();
+      final sigmasBefore = WordRenderer.glowSigmaProfileEmForTest;
+
+      // 默认 1.0 = 历史行为（只有常规叠加层，无追加层）
+      expect(prefs.glowIntensity, equals(1.0));
+      var a = renderer.debugGlowDrawAlphaForTest(0.5);
+      expect(a.base, closeTo(0.5, 1e-9));
+      expect(a.extra, equals(0.0));
+
+      // 0.5 倍 → 亮度减半
+      await prefs.setGlowIntensity(0.5);
+      a = renderer.debugGlowDrawAlphaForTest(0.5);
+      expect(a.base, closeTo(0.25, 1e-9));
+      expect(a.extra, equals(0.0));
+
+      // 2.0 倍 → 峰值处常规层饱和 1.0，超出部分走加法叠加
+      await prefs.setGlowIntensity(2.0);
+      a = renderer.debugGlowDrawAlphaForTest(0.6);
+      expect(a.base, equals(1.0));
+      expect(a.extra, closeTo(0.2, 1e-9));
+      a = renderer.debugGlowDrawAlphaForTest(0.2);
+      expect(a.base, closeTo(0.4, 1e-9));
+      expect(a.extra, equals(0.0));
+
+      // 强度上限下最亮处 = 常规 1.0 + 加法 1.0
+      a = renderer.debugGlowDrawAlphaForTest(1.0);
+      expect(a.base, equals(1.0));
+      expect(a.extra, equals(1.0));
+
+      // 剖面半径不随强度变化（贴笔画的光形稳定）
+      expect(WordRenderer.glowSigmaProfileEmForTest, equals(sigmasBefore));
+    });
+
+    test('多层剖面由内到外递增，最内层必须紧到不糊满字怀', () {
+      final sigmas = WordRenderer.glowSigmaProfileEmForTest;
+      expect(sigmas.length, greaterThanOrEqualTo(2));
+      // 汉字字怀约 0.15em 宽。光从笔画两侧各向内扩 sigma，两侧相加必须
+      // 明显小于字怀宽度，空腔才不会被填满 → 最内层上限取 0.08em
+      // （0.08×2=0.16 已接近字怀宽度，是留了余量的上限；实测采用 0.07em，
+      // 再大就会沿笔画出现亮暗亮，见 profile 测试的字怀内侧断言）。
+      expect(sigmas.first, lessThanOrEqualTo(0.08));
+      for (int i = 1; i < sigmas.length; i++) {
+        expect(sigmas[i], greaterThan(sigmas[i - 1]));
+      }
+      // 最外层不应再回到旧实现那种 0.24em 以上的糊块
+      expect(sigmas.last, lessThanOrEqualTo(0.3));
+    });
+
+    test('权重由内到外递减（最内层最亮）', () {
+      final weights = WordRenderer.glowWeightProfileForTest;
+      expect(weights.length, greaterThanOrEqualTo(2));
+      for (int i = 1; i < weights.length; i++) {
+        expect(weights[i], lessThan(weights[i - 1]));
+      }
+      // 最内层必须占主导，否则观感退回"一层柔光糊块"
+      expect(weights.first, greaterThan(0.6));
+    });
+
+    test('精灵外扩按最外层 3σ（与绘制侧同口径，避免光晕被裁切）', () {
+      final renderer = WordRenderer();
+      final sigmas = WordRenderer.glowSigmaProfileEmForTest;
+      const fontSize = 40.0;
+      expect(
+        renderer.debugGlowSpritePadForTest(fontSize),
+        closeTo(sigmas.last * fontSize * 3, 1e-9),
+      );
+    });
+
+    testWidgets('辉光精灵可正常烘焙：尺寸按最外层 3σ 外扩', (tester) async {
+      final renderer = WordRenderer();
+      ui.Image? image;
+      await tester.runAsync(() async {
+        image = await renderer.debugRenderGlowSpriteForTest(
+          text: '日',
+          fontSize: 40,
+          rowHeight: 1.4,
+        );
+      });
+      expect(image, isNotNull, reason: '多层辉光剖面必须能烘焙成功');
+      final sigmas = WordRenderer.glowSigmaProfileEmForTest;
+      final pad = sigmas.last * 40 * 3;
+      // 精灵按超采样倍数烘焙：尺寸 = (行盒 + 上下 pad) × 倍数
+      final int ss = WordRenderer.glowSupersampleForTest;
+      expect(image!.height, closeTo((40 * 1.4 + pad * 2).ceil() * ss, 2));
+      expect(image!.width, greaterThan((pad * 2).ceil() * ss));
+      image!.dispose();
+    });
+
+    testWidgets('拖动混色比例（文字色逐帧变化）不得重烘焙辉光精灵', (tester) async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      await LyricPreferences.instance.setUseGlowEffect(true);
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      // 单字、时长 2000ms（>= 默认固定阈值 1000ms）→ 触发辉光
+      const glowLine = LyricLine(
+        startTime: 0,
+        duration: 4000,
+        text: '华',
+        words: [LyricWord(startTime: 0, duration: 2000, text: '华')],
+      );
+      final renderer = WordRenderer();
+      renderer.emphasizeEffect = EmphasizeEffect();
+      renderer.setLineState(
+        isActive: true,
+        scale: LyricLayout.activeScale,
+        activeColorValue: 0xFF3366CC,
+      );
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, glowLine, 24);
+      for (int t = 0; t <= 400; t += 16) {
+        renderer.tick(0.016, t, isPlaying: true);
+        renderer.paintLine(makeCanvas(), ui.Offset.zero, glowLine, 24);
+      }
+      // toImage 走 native 回调，多等几轮事件循环让精灵落地
+      for (int i = 0; i < 40; i++) {
+        await tester.pump(const Duration(milliseconds: 5));
+      }
+      final first = renderer.debugGlowSpriteForTest(0, 0);
+      expect(first, isNotNull, reason: '强调字应烘焙出辉光精灵');
+
+      // 模拟拖动「动态颜色混色比例」：文字色每帧都变
+      for (int i = 1; i <= 5; i++) {
+        renderer.setLineState(
+          isActive: true,
+          scale: LyricLayout.activeScale,
+          activeColorValue: 0xFF000000 | (0x11 * i << 16) | (0x22 * i << 8) | 0x33,
+        );
+        renderer.paintLine(makeCanvas(), ui.Offset.zero, glowLine, 24);
+        await tester.pump(const Duration(milliseconds: 5));
+      }
+      expect(
+        renderer.debugGlowSpriteForTest(0, 0),
+        same(first),
+        reason: '颜色由绘制期 ColorFilter 上色，改色不得触发 toImage 重烘焙（否则拖动必掉帧）',
+      );
+    });
+  });
+}
+
+/// 记录 `saveLayer` / `drawRect` 调用（其余方法 noSuchMethod 兜底）的探测画布。
+class _SweepProbeCanvas implements ui.Canvas {
+  final List<ui.Rect> savedLayers = <ui.Rect>[];
+  final List<ui.Rect> drawRects = <ui.Rect>[];
+
+  @override
+  void saveLayer(ui.Rect? bounds, ui.Paint paint) {
+    if (bounds != null) savedLayers.add(bounds);
+  }
+
+  @override
+  void drawRect(ui.Rect rect, ui.Paint paint) => drawRects.add(rect);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
 }
 
 /// 记录 [ui.Canvas.drawParagraph] 位置与画布变换的测试画布（其余方法走 noSuchMethod 兜底）。

@@ -13,6 +13,7 @@ import '../../core/build_flags.dart';
 import '../../core/layout/adaptive_content_grid.dart';
 import '../../core/layout/adaptive_navigator.dart';
 import '../../core/layout/page_title_alignment.dart';
+import '../../core/remote/tv_reorder.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
@@ -24,8 +25,10 @@ import '../../providers/player_provider.dart';
 import '../../providers/playlist_collection_notifier.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../utils/playlist_write_payload.dart';
 import '../../widgets/playlist_cover_hero.dart';
 import '../artist/artist_detail_page.dart';
+import '../playlist/playlist_edit_page.dart';
 import '../playlist/playlist_page.dart';
 import '../playlist/playlist_songs_loader.dart';
 import 'import_playlist_page.dart';
@@ -82,6 +85,9 @@ class _FavoritesPageState extends State<FavoritesPage>
   // 排序模式：0=无分组在排序，1=「我创建的歌单」，2=「我收藏的歌单」。
   // 进入后分组标题右侧按钮变为「完成」，列表项可长按拖拽调整顺序。
   int _reorderingGroup = 0;
+
+  // 拖拽产生的顺序尚未同步到云端（`/playlist/sort`）。退出排序模式时消费一次。
+  bool _listSortDirty = false;
 
   // 歌单访问排序：歌单 ID → 最后访问时间戳（毫秒）
   // 点击歌单后记录时间，列表按最近访问排序（最近访问的排最前）
@@ -165,6 +171,13 @@ class _FavoritesPageState extends State<FavoritesPage>
 
   @override
   void dispose() {
+    // 排序模式下直接离开页面（返回/切 tab）时补一次云端同步：
+    // 否则用户拖完顺序就退出，云端永远停在旧顺序，下次启动又会拉回来覆盖本地。
+    // 不 await（dispose 不能异步），失败路径已由 mounted 守卫挡住 toast。
+    if (_listSortDirty && _reorderingGroup != 0) {
+      // ignore: discarded_futures
+      _syncPlaylistOrderToCloud(_reorderingGroup);
+    }
     _networkProbeTimer?.cancel();
     _playlistCollectionNotifier?.removeListener(_onCollectionChanged);
     _playlistCollectionNotifier = null;
@@ -278,9 +291,8 @@ class _FavoritesPageState extends State<FavoritesPage>
     return null;
   }
 
-  /// 解析「我喜欢」动态封面：取该歌单「最新收藏」的专辑封面（改版计划四）
-  /// ——云端歌单接口按收藏时间正序返回，最新在最后，故从**末尾**往前取
-  /// 第一首带封面的歌——写入 SharedPreferences 供离线启动显示。
+  /// 解析「我喜欢」动态封面：取服务端 sort 顺序的第一首带封面的歌，
+  /// 写入 SharedPreferences 供离线启动显示。
   /// App 内最新红心由 FavoritesProvider 在 tile 里实时优先（最新在前）。
   /// 纯旁路刷新，失败静默，不阻塞任何收藏操作。
   Future<void> _resolveMyFavoriteCover() async {
@@ -300,12 +312,9 @@ class _FavoritesPageState extends State<FavoritesPage>
         final r = await PlaylistSongsLoader.fetch(context, p);
         songs = r.songs;
       }
-      // 取「最新收藏」的专辑封面。云端「我喜欢」歌单接口按收藏时间
-      // **正序**返回（最早在前、最新在最后），所以取最后一首带封面的歌
-      // 才是最新收藏（改版计划四：接口无可靠时间字段，以列表顺序为准，
-      // 正序取末、倒序取首）；没有则保持回退到歌单自带封面。
+      // 不按响应数组顺序猜测；加载器已按服务端 sort 排列。
       String? cover;
-      for (final s in songs.reversed) {
+      for (final s in songs) {
         final art = s.artworkUri;
         if (art != null && art.isNotEmpty) {
           cover = art;
@@ -352,9 +361,10 @@ class _FavoritesPageState extends State<FavoritesPage>
       }
       await _recordPlaylistAccess(playlist);
       if (!mounted) return;
-      // 倒序播放：歌单接口按收藏时间升序返回（最早在前、最新在后），
-      // 反转后从最新收藏开始。用户要求所有歌单封面一键播放均倒序。
-      final ordered = songs.reversed.toList();
+      // 「我喜欢」按服务端 sort 播放；其余歌单保留原有封面倒序播放行为。
+      final ordered = playlist.name == '我喜欢'
+          ? songs
+          : songs.reversed.toList();
       // 只等到队列构建完成即释放进度环，不等整条 URL 解析/播放链
       // （playOnlinePlaylist 内部自带 try/catch，失败时会链式 next()，
       //  若在此 await 整条链，进度环会长期不消失 → 一直转圈）。
@@ -425,6 +435,10 @@ class _FavoritesPageState extends State<FavoritesPage>
 
   /// 分组拖拽排序回调：更新内存顺序并立即持久化。
   /// [newIndex] 已由拖拽回调换算为移除后的插入位置，无需再修正。
+  ///
+  /// 这里**只写本地**并置脏标记：拖拽过程中每移动一格都会回调，逐次发请求会把
+  /// 服务端打满。真正的云端同步在退出排序模式（或页面销毁）时由
+  /// [_syncPlaylistOrderToCloud] 发一次。
   void _reorderGroup(int group, int oldIndex, int newIndex) {
     // getter 返回的是已排序的新列表副本，可直接原地调整
     final list = group == 1 ? _createdPlaylists : _collectedPlaylists;
@@ -437,6 +451,7 @@ class _FavoritesPageState extends State<FavoritesPage>
       } else {
         _collectedManualOrder = order;
       }
+      _listSortDirty = true;
     });
     if (group == 1) {
       _settingsRepository.setCreatedPlaylistOrder(order);
@@ -446,13 +461,61 @@ class _FavoritesPageState extends State<FavoritesPage>
   }
 
   /// 排序按钮：点击进入该分组的自由排序模式，再次点击（✓）退出。
+  ///
+  /// 退出时把该组的顺序同步到云端（`/playlist/sort`）。进入时不发请求。
   void _toggleReorderingGroup(int group) {
+    final leaving = _reorderingGroup == group;
     setState(
-      () => _reorderingGroup = _reorderingGroup == group ? 0 : group,
+      () => _reorderingGroup = leaving ? 0 : group,
     );
+    if (leaving) _syncPlaylistOrderToCloud(group);
+  }
+
+  /// 把分组的当前顺序同步到云端（`/playlist/sort`）。
+  ///
+  /// group 1（我创建的歌单）→ type 0；group 2（我收藏的歌单）→ type 1。
+  /// 两类的 sort 各自从 0 开始独立编号（上游如此约定，混编会互相覆盖）。
+  ///
+  /// 失败不撤回本地顺序：本地顺序才是用户刚操作过的意图，云端下次同步会再提交一次。
+  Future<void> _syncPlaylistOrderToCloud(int group) async {
+    if (!_listSortDirty) return;
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) return;
+
+    final playlists = group == 1 ? _createdPlaylists : _collectedPlaylists;
+    final entries = buildPlaylistSortEntries(playlists, type: group == 1 ? 0 : 1);
+    final data = buildListSortData(entries);
+    if (data.isEmpty) return;
+
+    // 消费脏标记：本次是「退出排序模式」这次机会，后续无改动不必重复提交
+    _listSortDirty = false;
+
+    final result = await api.sortPlaylists(
+      data,
+      totalVer: api.lastKnownPlaylistTotalVer,
+    );
+    if (!mounted) return;
+    final ok = result != null &&
+        (result['status'] == 1 || result['error_code'] == 0);
+    if (!ok) {
+      debugPrint('[PlaylistSort] 同步失败 data=$data result=$result');
+      showToast('排序同步失败，本地顺序已保留', long: true);
+    }
   }
 
   // ==================== 数据加载 ====================
+
+  Future<Map<String, dynamic>?>? _collectionsRequest;
+
+  Future<Map<String, dynamic>?> _fetchCollections({required bool noCache}) {
+    final pending = _collectionsRequest;
+    if (pending != null) return pending;
+    final request = KugouApiClient().getAllUserPlaylists(noCache: noCache);
+    _collectionsRequest = request;
+    return request.whenComplete(() {
+      if (identical(_collectionsRequest, request)) _collectionsRequest = null;
+    });
+  }
 
   Future<void> _loadPlaylists({
     bool forceNoCache = false,
@@ -463,20 +526,19 @@ class _FavoritesPageState extends State<FavoritesPage>
     if (!mounted) return;
     // 重置分页状态
     _playlistPage = 1;
-    _hasMorePlaylists = true;
+    _hasMorePlaylists = false;
     // 刷新时重新读取「最近点击排序」开关，使设置改动无需重启即可生效
     _sortByLatestClick = await _settingsRepository
         .getSortCollectedByLatestClick();
+    if (!mounted) return;
     if (showLoading) setState(() => _isLoadingPlaylists = true);
 
     try {
-      final api = KugouApiClient();
-      final result = await api.getUserPlaylist(
-        page: 1,
-        pagesize: _playlistPageSize,
+      final result = await _fetchCollections(
         noCache: forceNoCache,
       );
       if (!mounted) return;
+      if (_reorderingGroup != 0) return;
 
       // KugouApiClient._get 在网络/服务异常时返回 null（吞了 DioException），
       // 不抛异常。把 null 视为离线信号。
@@ -496,20 +558,20 @@ class _FavoritesPageState extends State<FavoritesPage>
         list ??= data['list'] as List<dynamic>?;
       }
 
-      if (list != null && list.isNotEmpty) {
+      if (list != null) {
         final filtered = list!
             .where((e) {
               final json = e as Map<String, dynamic>;
-              final type = json['type'] as int? ?? 0;
-              final source = json['source'] as int? ?? 0;
+              final type = int.tryParse('${json['type']}') ?? 0;
+              final source = int.tryParse('${json['source']}') ?? 0;
               if (type == 1 && source == 2) return false;
               return true;
             })
             .map((e) => KugouPlaylistBrief.fromJson(e as Map<String, dynamic>))
             .toList();
         final now = DateTime.now();
-        // 判断是否还有更多：返回条数等于请求页大小则可能还有下一页
-        _hasMorePlaylists = list!.length >= _playlistPageSize;
+        // 已按原始列表拉完所有页，不再依赖过滤后的滚动高度触发加载。
+        _hasMorePlaylists = false;
         setState(() {
           _playlists = filtered;
           _isLoadingPlaylists = false;
@@ -526,6 +588,7 @@ class _FavoritesPageState extends State<FavoritesPage>
         _isLoadingPlaylists = false;
       });
     } catch (e) {
+      debugPrint('[FavoritesSync] 歌单同步失败，保留旧缓存: $e');
       if (mounted) {
         setState(() {
           _isLoadingPlaylists = false;
@@ -599,8 +662,7 @@ class _FavoritesPageState extends State<FavoritesPage>
     if (showLoading) setState(() => _isLoadingAlbums = true);
 
     try {
-      final api = KugouApiClient();
-      final result = await api.getUserPlaylist(pagesize: 50, noCache: noCache);
+      final result = await _fetchCollections(noCache: noCache);
       if (!mounted) return;
 
       if (result == null) {
@@ -619,12 +681,12 @@ class _FavoritesPageState extends State<FavoritesPage>
         list ??= data['list'] as List<dynamic>?;
       }
 
-      if (list != null && list.isNotEmpty) {
+      if (list != null) {
         final albums = list!
             .where((e) {
               final json = e as Map<String, dynamic>;
-              final type = json['type'] as int? ?? 0;
-              final source = json['source'] as int? ?? 0;
+              final type = int.tryParse('${json['type']}') ?? 0;
+              final source = int.tryParse('${json['source']}') ?? 0;
               return type == 1 && source == 2;
             })
             .map((e) => KugouPlaylistBrief.fromJson(e as Map<String, dynamic>))
@@ -642,6 +704,7 @@ class _FavoritesPageState extends State<FavoritesPage>
       }
       setState(() => _isLoadingAlbums = false);
     } catch (e) {
+      debugPrint('[FavoritesSync] 专辑同步失败，保留旧缓存: $e');
       if (mounted) {
         setState(() {
           _isLoadingAlbums = false;
@@ -654,6 +717,7 @@ class _FavoritesPageState extends State<FavoritesPage>
   Future<void> _fetchAlbumGlobalIds(List<KugouPlaylistBrief> albums) async {
     final api = KugouApiClient();
     for (final album in albums) {
+      if (_albumOriginalIds.containsKey(album.id)) continue;
       try {
         final searchResult = await api.searchAlbums(album.name);
         if (!mounted) return;
@@ -685,7 +749,7 @@ class _FavoritesPageState extends State<FavoritesPage>
 
     try {
       final api = KugouApiClient();
-      final result = await api.getUserFollow(noCache: noCache);
+      final result = await api.getAllUserFollow(noCache: noCache);
       if (!mounted) return;
 
       if (result == null) {
@@ -708,7 +772,7 @@ class _FavoritesPageState extends State<FavoritesPage>
         list = data;
       }
 
-      if (list != null && list.isNotEmpty) {
+      if (list != null) {
         final artists = list!.map((e) => e as Map<String, dynamic>).toList();
         final now = DateTime.now();
         setState(() {
@@ -735,6 +799,31 @@ class _FavoritesPageState extends State<FavoritesPage>
 
   // ==================== 歌单操作 ====================
 
+  /// 打开「编辑歌单」页；有改动返回时刷新列表（名称/封面都会变）。
+  ///
+  /// totalVer 用**列表级**全局版本 [KugouApiClient.lastKnownPlaylistTotalVer]
+  /// （`/user/playlist` 响应的 `data.total_ver`）：v4 modify_list 的乐观锁是
+  /// 整个歌单列表的版本（kugou_sdk 实网口径，2026-10-14 本机探针验证
+  /// pre_total_ver=119 → total_ver=120），不是 brief 里逐条的 `list_ver`。
+  Future<void> _openEditPlaylist(KugouPlaylistBrief playlist) async {
+    final api = KugouApiClient();
+    if (!api.isLoggedIn) {
+      showToast('请先登录', long: true);
+      return;
+    }
+    final changed = await AdaptiveNav.openDetail<bool>(
+      context,
+      (_) => PlaylistEditPage(
+        playlist: playlist.toPlaylist(),
+        totalVer: api.lastKnownPlaylistTotalVer,
+        type: _isCreated(playlist) ? 0 : 1,
+      ),
+    );
+    if (changed == true && mounted) {
+      _loadPlaylists(forceNoCache: true, showLoading: false);
+    }
+  }
+
   /// 打开「导入外部歌单」功能页；导入成功返回后刷新歌单列表。
   Future<void> _openImportPlaylistPage() async {
     final changed = await Navigator.push<bool>(
@@ -746,39 +835,51 @@ class _FavoritesPageState extends State<FavoritesPage>
     }
   }
 
+  /// 新建歌单对话框（名称 + 是否隐私）。
+  ///
+  /// `is_pri` 只在**创建**歌单时生效（参考 `module/playlist_add.js:21-23`：只有
+  /// `type === 0` 才把 `is_pri` 写进 dataMap），故这里不做持久化记忆，
+  /// 每次新建都默认公开。
   Future<void> _showCreatePlaylistDialog() async {
-    final controller = TextEditingController();
-    final result = await showDialog<String>(
+    final api = KugouApiClient();
+    // 未登录时上游必然失败，提前拦下比发一次注定失败的请求更清楚
+    if (!api.isLoggedIn) {
+      showToast('请先登录', long: true);
+      return;
+    }
+
+    // controller 由 [_CreatePlaylistDialog] 的 State 持有：弹窗路由退出动画
+    // 期间 TextField 仍在逐帧重建，若由调用方在 showDialog 返回后立即
+    // dispose，动画帧会访问已释放的 controller 抛断言，被全局兜底顶成
+    // 「此处内容加载出错」（2026-10-15 回归测试钉住，取消/创建两条路径都中）。
+    final result = await showDialog<_CreatePlaylistResult>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('新建歌单'),
-        content: TextField(
-          controller: controller,
-          contextMenuBuilder: buildAppTextContextMenu,
-          autofocus: true,
-          decoration: const InputDecoration(
-            hintText: '输入歌单名称',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('创建'),
-          ),
-        ],
-      ),
+      builder: (ctx) => const _CreatePlaylistDialog(),
     );
 
-    if (result != null && result.isNotEmpty) {
-      final api = KugouApiClient();
-      await api.createPlaylist(result);
-      _loadPlaylists(forceNoCache: true);
+    if (result == null || result.name.isEmpty) return;
+
+    final response = await api.createPlaylist(
+      result.name,
+      isPri: result.isPrivate ? 1 : 0,
+    );
+    if (!mounted) return;
+
+    // 现状无条件刷新，把失败也当成成功。这里按 status / error_code 判定，
+    // 失败时把上游 msg 透出来（如「歌单名称已存在」）。
+    final ok = response != null &&
+        (response['status'] == 1 || response['error_code'] == 0);
+    if (!ok) {
+      final msg = response?['msg']?.toString();
+      showToast(
+        (msg != null && msg.isNotEmpty) ? msg : '创建歌单失败，请稍后重试',
+        long: true,
+      );
+      return;
     }
+
+    showToast(result.isPrivate ? '已创建隐私歌单「${result.name}」' : '已创建歌单「${result.name}」');
+    _loadPlaylists(forceNoCache: true);
   }
 
   void _enterManageMode(int tab) {
@@ -1399,6 +1500,18 @@ class _FavoritesPageState extends State<FavoritesPage>
                   Icons.drag_indicator,
                   color: colorScheme.onSurfaceVariant,
                   size: 20,
+                )
+              // 编辑入口（仅触屏）：自己创建的歌单可改名称/标签/简介/封面。
+              // 这是编辑能力唯一的 UI 入口——歌单详情页（PlaylistPage）顶栏
+              // 已按需求不再放编辑按钮。
+              // tv: 不在此处提供——TV 整行是单个 DpadFocusable 停点
+              // （excludeChildFocus），行内图标收不到焦点，故 TV 侧暂无入口。
+              else if (!kTvBuild && !_isManaging && _isCreated(playlist))
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: '编辑歌单',
+                  onPressed: () => _openEditPlaylist(playlist),
                 ),
             ],
           ),
@@ -1743,6 +1856,87 @@ class _FavoritesPageState extends State<FavoritesPage>
   }
 }
 
+/// 新建歌单对话框的返回值。
+class _CreatePlaylistResult {
+  final String name;
+  final bool isPrivate;
+  const _CreatePlaylistResult({required this.name, required this.isPrivate});
+}
+
+/// 「新建歌单」对话框内容（名称 + 是否隐私）。
+///
+/// [TextEditingController] 由本 State 持有并随元素卸载 dispose：弹窗路由的
+/// 退出动画播放期间 TextField 仍在逐帧重建，controller 必须活到动画结束。
+/// 早先由调用方在 `showDialog` 返回后立即 dispose，取消/创建两条路径都会
+/// 让动画帧访问已释放的 controller 抛断言，被全局 `_FallbackErrorWidget`
+/// 顶成「此处内容加载出错」（2026-10-15 回归测试钉住）。
+class _CreatePlaylistDialog extends StatefulWidget {
+  const _CreatePlaylistDialog();
+
+  @override
+  State<_CreatePlaylistDialog> createState() => _CreatePlaylistDialogState();
+}
+
+class _CreatePlaylistDialogState extends State<_CreatePlaylistDialog> {
+  final _controller = TextEditingController();
+  bool _isPrivate = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('新建歌单'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _controller,
+            contextMenuBuilder: buildAppTextContextMenu,
+            autofocus: true,
+            decoration: const InputDecoration(
+              hintText: '输入歌单名称',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const Gap(AppSpacing.sm),
+          // 用 CheckboxListTile 而非 Switch：三态语义（公开/隐私）在对话框里
+          // 用勾选框更贴近「附加选项」，且 m3e 无对应组件时优先核心组件。
+          CheckboxListTile(
+            value: _isPrivate,
+            onChanged: (v) => setState(() => _isPrivate = v ?? false),
+            title: const Text('设为隐私歌单'),
+            subtitle: const Text('仅自己可见，创建后不可更改'),
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            dense: true,
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+            context,
+            _CreatePlaylistResult(
+              name: _controller.text.trim(),
+              isPrivate: _isPrivate,
+            ),
+          ),
+          child: const Text('创建'),
+        ),
+      ],
+    );
+  }
+}
+
 /// 可折叠/展开的歌单分组，带有平滑过渡动画。
 ///
 /// 使用 [AnimationController] + [SizeTransition] 实现高度渐变，
@@ -1787,6 +1981,21 @@ class _GroupSectionState extends State<_GroupSection>
   late final AnimationController _controller;
   late final Animation<double> _sizeAnimation;
 
+  /// tv: 遥控拖拽排序状态机（与播放队列/Tab 管理同口径）。非 TV 不接线。
+  ///
+  /// onReorder 出口与 M3E 列表**同一个**：先把 ReorderableListView 语义换成
+  /// 页面 onReorder（_reorderGroup）的「移除后插入位」语义（既有 -1 补偿），
+  /// 保证手动顺序的写回逐字不变（见 M3E 列表调用处 2077-2085 的注释）。
+  late final TvReorderController _reorder = TvReorderController(
+    itemCount: () => widget.playlists.length,
+    onReorder: (oldIndex, newIndex) => widget.onReorder!(
+      oldIndex,
+      newIndex > oldIndex ? newIndex - 1 : newIndex,
+    ),
+    labelOf: (index) => widget.playlists[index].name,
+    onToast: (msg, {long = false}) => showToast(msg, long: long),
+  );
+
   @override
   void initState() {
     super.initState();
@@ -1815,6 +2024,7 @@ class _GroupSectionState extends State<_GroupSection>
 
   @override
   void dispose() {
+    _reorder.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -1902,16 +2112,30 @@ class _GroupSectionState extends State<_GroupSection>
                     ),
                     // 置零 M3E 卡片自身的背景/圆角/间距/内边距：行内是自带样式的自绘行；
                     // 同时用 direction: none 关掉滑动（本列表只有拖拽排序，没有删除）
-                    style: const M3EDismissibleCardStyle(
+                    style: M3EDismissibleCardStyle(
                       outerRadius: 0,
                       innerRadius: 0,
                       gap: 0,
                       padding: EdgeInsets.zero,
                       color: Colors.transparent,
+                      // tv: 同播放队列——TV 构建关掉 M3E 卡片自绘的焦点环，
+                      // 只留全局 TvFocusHighlight 一层（详见 player_playlist_view.dart）。
+                      focusRingColor: kTvBuild ? Colors.transparent : null,
                       direction: DismissDirection.none,
                     ),
-                    itemBuilder: (context, index) =>
-                        widget.onBuildTile(widget.playlists[index]),
+                    itemBuilder: (context, index) {
+                      final row = widget.onBuildTile(
+                        widget.playlists[index],
+                      );
+                      // tv: 整行单停点 + 排序方向键。排序模式禁用点击跳转
+                      // （触屏语义），故不传 onSelect（拿起态 OK 仍收口到放下）。
+                      if (!kTvBuild) return row;
+                      return TvReorderItem(
+                        index: index,
+                        controller: _reorder,
+                        child: row,
+                      );
+                    },
                   )
                 : Column(
                     children: widget.playlists.map((playlist) {

@@ -151,9 +151,11 @@ class LineRenderer {
   /// 上次 set text 时使用的字重。字重变化时需强制重建 TextSpan。
   FontWeight _lastFontWeight = FontWeight.normal;
 
-  /// 当前行专用的文字颜色（ARGB int，仅 [_isActive] 时生效）。
-  /// 动态字体颜色：由封面提取色按「70% 白 + 30% 提取色」混色得到，
-  /// null 表示不使用（回退到 LyricLayout.textColorValue）。
+  /// 行级文字颜色覆盖（ARGB int）；null 表示回退 [LyricLayout.textColorValue]。
+  ///
+  /// **不再按 [_isActive] 门控**：调用方（AppleLyricsView）决定哪些行需要
+  /// 覆盖——当前行用高亮色，开启「上方行使用已播颜色」后上方已播行也传同一个
+  /// 颜色。这样本渲染器只负责「有覆盖就用覆盖」，不重复判断行位置。
   int? _activeColorValue;
 
   /// 当前绑定的 LyricLine 引用。
@@ -211,6 +213,12 @@ class LineRenderer {
   /// 目标 alpha（用于测试断言）。
   @visibleForTesting
   double get targetAlpha => _targetAlpha;
+
+  /// 最近一次绘制实际解析出的文字颜色 ARGB（用于颜色回归断言）。
+  ///
+  /// 未绘制前为 -1；绘制后等于「覆盖色 ?? LyricLayout.textColorValue」。
+  @visibleForTesting
+  int get lastPaintedTextColorValue => _lastTextColorValue;
 
   // ============== 状态设置 ==============
 
@@ -362,10 +370,9 @@ class LineRenderer {
           maxWidth,
           balanced: balanced,
         );
-    // 解析当前行实际文字颜色：动态字体颜色（仅当前行）优先，否则回退主题默认色
-    final int textColorValue = (_isActive && _activeColorValue != null)
-        ? _activeColorValue!
-        : LyricLayout.textColorValue;
+    // 解析当前行实际文字颜色：行级覆盖色优先（当前行 / 上方已播行），
+    // 否则回退主题默认色。覆盖时机由调用方决定，见 [_activeColorValue]。
+    final int textColorValue = _activeColorValue ?? LyricLayout.textColorValue;
     final int textRed = (textColorValue >> 16) & 0xFF;
     final int textGreen = (textColorValue >> 8) & 0xFF;
     final int textBlue = textColorValue & 0xFF;

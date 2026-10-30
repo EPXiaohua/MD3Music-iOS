@@ -193,35 +193,29 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
   }
 
   /// 专辑排序：'hot'/'new' 是服务端排序（重拉第一页并持久化偏好），
-  /// 'title' 是纯客户端排序。「再次点当前项」与歌曲列表同语义——
-  /// 客户端字段翻方向；接口排序则先把客户端字段收回 original，再翻转接口顺序。
-  Future<void> _switchAlbumSort(String value, bool repeated) async {
+  /// 'title' 是纯客户端排序。再点当前项不动作；方向由排序面板的分段控件切换。
+  Future<void> _switchAlbumSort(String value) async {
     if (value == 'title') {
-      setState(() {
-        if (_albumSortBy == ArtistAlbumSortField.title) {
-          _albumSortAscending = !_albumSortAscending;
-        } else {
+      if (_albumSortBy == ArtistAlbumSortField.original) {
+        setState(() {
           _albumSortBy = ArtistAlbumSortField.title;
           _albumSortAscending = true;
-        }
-        _invalidateDisplayAlbums();
-      });
+          _invalidateDisplayAlbums();
+        });
+      }
       return;
     }
 
-    if (repeated && value == _albumSort) {
+    if (value == _albumSort) {
+      // 已在该接口排序上但当前展示的是客户端字段排序：收回 original 即可
+      if (_albumSortBy == ArtistAlbumSortField.original) return;
       setState(() {
-        if (_albumSortBy == ArtistAlbumSortField.original) {
-          _albumSortAscending = !_albumSortAscending;
-        } else {
-          _albumSortBy = ArtistAlbumSortField.original;
-          _albumSortAscending = false;
-        }
+        _albumSortBy = ArtistAlbumSortField.original;
+        _albumSortAscending = false;
         _invalidateDisplayAlbums();
       });
       return;
     }
-    if (value == _albumSort) return;
 
     _albumSort = value;
     _albumSortBy = ArtistAlbumSortField.original;
@@ -239,21 +233,8 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
   static const _tabLabels = ['歌曲', '专辑', 'MV'];
 
   void _switchArtistSongSort(String newSort) {
-    if (_artistSongSort == newSort && !_isLoading) {
-      if (_sortBy == ArtistSongSortField.original) {
-        setState(() {
-          _sortAscending = !_sortAscending;
-          _invalidateDisplaySongs();
-        });
-      } else {
-        setState(() {
-          _sortBy = ArtistSongSortField.original;
-          _sortAscending = false;
-          _invalidateDisplaySongs();
-        });
-      }
-      return;
-    }
+    // 再点当前接口排序项：不动作（方向改由排序面板的分段控件切换）
+    if (_artistSongSort == newSort) return;
     setState(() {
       _artistSongSort = newSort;
       _sortBy = ArtistSongSortField.original;
@@ -1225,6 +1206,10 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
           if (_tab == _ArtistTab.songs && _songs.isNotEmpty)
             M3ESortButton<String>(
               tooltip: '排序',
+              // 图标随升/降序切换（与歌单页一致）
+              icon: _sortAscending
+                  ? Icons.arrow_upward_rounded
+                  : Icons.arrow_downward_rounded,
               current: _currentSortOption,
               options: const [
                 (value: 'hot', label: '按热度排行'),
@@ -1232,9 +1217,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                 (value: 'title', label: '按歌曲名称'),
                 (value: 'duration', label: '按时长'),
               ],
-              // 不用 repeated 改分支：'hot'/'new' 的「再次点当前项」
-              // 由 _switchArtistSongSort 内部自行判定并翻转方向
-              onPicked: (value, repeated) {
+              onPicked: (value) {
                 if (value == 'hot' || value == 'new') {
                   _switchArtistSongSort(value);
                 } else {
@@ -1242,15 +1225,20 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                       ? ArtistSongSortField.title
                       : ArtistSongSortField.duration;
                   setState(() {
-                    if (_sortBy == sortBy) {
-                      _sortAscending = !_sortAscending;
-                    } else {
-                      _sortBy = sortBy;
-                      _sortAscending = true;
-                    }
+                    // 换字段回到正序；同字段仅刷新（方向由分段控件切换）
+                    _sortAscending =
+                        _sortBy == sortBy ? _sortAscending : true;
+                    _sortBy = sortBy;
                     _invalidateDisplaySongs();
                   });
                 }
+              },
+              ascending: _sortAscending,
+              onDirectionChanged: (ascending) {
+                setState(() {
+                  _sortAscending = ascending;
+                  _invalidateDisplaySongs();
+                });
               },
             ),
           // 专辑排序：hot/new 走服务端重拉，title 纯客户端。
@@ -1260,13 +1248,24 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
               (_albums.isNotEmpty || _albumsLoading))
             M3ESortButton<String>(
               tooltip: '专辑排序',
+              // 图标随升/降序切换（与歌单页一致）
+              icon: _albumSortAscending
+                  ? Icons.arrow_upward_rounded
+                  : Icons.arrow_downward_rounded,
               current: _currentAlbumSortOption,
               options: const [
                 (value: 'hot', label: '按热度排行'),
                 (value: 'new', label: '按发布时间'),
                 (value: 'title', label: '按专辑名称'),
               ],
-              onPicked: _switchAlbumSort,
+              onPicked: (value) => _switchAlbumSort(value),
+              ascending: _albumSortAscending,
+              onDirectionChanged: (ascending) {
+                setState(() {
+                  _albumSortAscending = ascending;
+                  _invalidateDisplayAlbums();
+                });
+              },
             ),
           // MV 分类：与排序钮同一个顶栏下拉控件（M3ESortButton 本身就是
           // 图标 + M3E 下拉面板），不再在网格上方占一行。
@@ -1282,7 +1281,7 @@ class _ArtistDetailPageState extends State<ArtistDetailPage> {
                   (value: _mvTags[i], label: _mvTagLabels[i]),
               ],
               // 再点当前分类时 _onMvTagChanged 内部按同值早退，天然不动作
-              onPicked: (value, repeated) =>
+              onPicked: (value) =>
                   _onMvTagChanged(_mvTags.indexOf(value)),
             ),
         ],

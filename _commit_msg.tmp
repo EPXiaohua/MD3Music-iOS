@@ -1,0 +1,17 @@
+同步上游 6.2.0 并修复 iOS 切歌无声/残留问题
+
+- 全量同步上游 6.2.0（版本号对齐 6.2.0+53）：13 个目录镜像覆盖、
+  根文件更新，pubspec 合并上游新增依赖（just_audio_windows、ort_dart、
+  image、m3_expressive、shaders/flowing_background 等），CHANGELOG 增补。
+- just_audio fork 同步上游 Android 改动（audio offload、自适应缓冲、
+  解码能力探测），darwin 侧保留并整理 iOS 自维护补丁：focus 事件转发、
+  load 无条件暂停、play() 激活音频会话、EQ/itemCreated 钩子。
+- iOS 回填自维护能力：平台能力开关、均衡器伪会话、蓝牙歌词经
+  NowPlayingService、桌面歌词 PiP、锁屏 NowPlaying 元数据/命令、
+  桌面小组件命令处理、挂起恢复重建播放器、API 服务器解限等。
+- 修复 iOS 概率性无声：音频会话此前沿用 Android 的停用策略，iOS 上
+  AVAudioSession 从未激活，起播依赖隐式激活在冷启动/中断恢复后概率
+  失败；现 configure 后立即激活并保持。
+- 修复切歌时上一首残留续响：所有切歌入口（上一首/下一首/队列点播/
+  点歌播放/在线点歌）在切歌意图确立后立即暂停旧播放器，不再等
+  链接解析与新源装载完成后才停声。

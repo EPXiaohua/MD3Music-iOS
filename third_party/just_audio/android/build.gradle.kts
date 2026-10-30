@@ -85,6 +85,13 @@ dependencies {
     implementation("androidx.media3:media3-datasource:$exoplayerVersion")
     implementation("androidx.media3:media3-decoder:$exoplayerVersion")
     implementation("androidx.media3:media3-extractor:$exoplayerVersion")
+    // MD3Music fork: flac 扩展已本地化（src/main/java/androidx/media3/decoder/flac/** + jniLibs
+    // 的 libflacJNI.so，源码取自 media3 1.4.1 libraries/decoder_flac + libflac 1.4.3，ndk-build 构建，
+    // 构建工程在 tmp/media3-src/libraries/decoder_flac/src/main/jni/，.so 预编译后提交），
+    // 用于修复 c2.android.flac.decoder 输入缓冲 64KB 上限导致的大块帧 FLAC 丢帧/停喂（P0-5）。
+    // 2026-09-14：libflac 1.3.2 → 1.4.3 —— 1.3.2 无法解码 32bps FLAC（整文件零帧输出、静默 EOS），
+    // 1.4.x 用 64bit 累加器支持 32bit 流（证据链见 docs/…-32bit-float-24bit-dac-analysis.md §17）。
+    // 注意：media3 官方不在 maven 发布 decoder 扩展（含 native 代码），故必须本地源码+自编 so。
     // 本地 exoplayer 源码所需的注解依赖（原 maven media3-exoplayer 自带传递依赖）
     compileOnly("com.google.errorprone:error_prone_annotations:2.28.0")
     compileOnly("org.checkerframework:checker-qual:3.43.0")

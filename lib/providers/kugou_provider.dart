@@ -160,6 +160,8 @@ class KugouProvider extends ChangeNotifier {
   final Set<String> _homeDiscoverSeen = <String>{};
   bool _homeDiscoverProgressLoaded = false;
   bool _homeDiscoverLoadingMore = false;
+  bool _homeDiscoverLastLoadFailed = false;
+  Future<List<KugouSongDetail>>? _homeDiscoverLoadMoreFuture;
   static const HomeDiscoverProgressStore _homeDiscoverStore =
       HomeDiscoverProgressStore();
 
@@ -222,7 +224,6 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? _ipHomeData;
   Map<String, dynamic>? _ipZoneData;
   Map<String, dynamic>? _fmData;
-  Map<String, dynamic>? _sheetData;
   Map<String, dynamic>? _everydayHistory;
   List<KugouAlbumBrief> _topAlbums = [];
   KugouUserVipDetail? _vipInfo;
@@ -240,7 +241,6 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? _fmRecommendData;
   List<KugouFmInfo> _fmClassList = [];
   List<KugouThemeInfo> _themePlaylistData = [];
-  List<KugouSheetInfo> _sheetExploreList = [];
   List<KugouYouthChannel> _youthChannels = [];
   List<KugouLongAudioAlbum> _longAudioAlbums = [];
   List<KugouLongAudioAlbum> _longAudioVipAlbums = [];
@@ -407,7 +407,6 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? get ipHomeData => _ipHomeData;
   Map<String, dynamic>? get ipZoneData => _ipZoneData;
   Map<String, dynamic>? get fmData => _fmData;
-  Map<String, dynamic>? get sheetData => _sheetData;
   Map<String, dynamic>? get everydayHistory => _everydayHistory;
   List<KugouAlbumBrief> get topAlbums => _topAlbums;
   List<KugouSongDetail> get newSongs => _newSongs;
@@ -426,7 +425,6 @@ class KugouProvider extends ChangeNotifier {
   Map<String, dynamic>? get fmRecommendData => _fmRecommendData;
   List<KugouFmInfo> get fmClassList => _fmClassList;
   List<KugouThemeInfo> get themePlaylistData => _themePlaylistData;
-  List<KugouSheetInfo> get sheetExploreList => _sheetExploreList;
   List<KugouYouthChannel> get youthChannels => _youthChannels;
   List<KugouLongAudioAlbum> get longAudioAlbums => _longAudioAlbums;
   List<KugouLongAudioAlbum> get longAudioVipAlbums => _longAudioVipAlbums;
@@ -458,6 +456,7 @@ class KugouProvider extends ChangeNotifier {
 
   List<KugouSongDetail> get homeDiscoverSongs => _homeDiscoverSongs;
   bool get homeDiscoverLoadingMore => _homeDiscoverLoadingMore;
+  bool get homeDiscoverLastLoadFailed => _homeDiscoverLastLoadFailed;
   List<Song> get homeDiscoverSongsAsSongs =>
       _homeDiscoverSongs.map((e) => e.toSong()).toList();
 
@@ -531,7 +530,10 @@ class KugouProvider extends ChangeNotifier {
   /// [forceRefresh] 只绕过 5 分钟 TTL，**不重置游标与 seen**：重置等于让用户
   /// 反复看见刚刷过的那几首，"刷"就没有意义了。要换一批就继续往下拉。
   Future<void> getHomeDiscover({bool forceRefresh = false}) async {
-    if (!forceRefresh && _isDataFresh('homeDiscover')) return;
+    if (!forceRefresh && _isDataFresh('homeDiscover')) {
+      await _topUpHomeDiscoverPreview();
+      return;
+    }
     _beginLoading();
     _error = null;
     try {
@@ -549,10 +551,22 @@ class KugouProvider extends ChangeNotifier {
       if (result.isEmpty) return;
       _ingestHomeDiscoverSongs(result);
       _dataTimestamps['homeDiscover'] = DateTime.now();
+      await _topUpHomeDiscoverPreview();
     } catch (e) {
       _error = e.toString();
     }
     _endLoading();
+  }
+
+  /// 上游偶尔不足 pagesize，或去重后首批少于四首时，用下一批补齐预览。
+  /// 复用分页补货器，保证 today_play_num、seen 和重复批次跳过规则一致。
+  Future<void> _topUpHomeDiscoverPreview() async {
+    final missing = homeDiscoverFirstPageSize - _homeDiscoverSongs.length;
+    if (missing <= 0 || _homeDiscoverSongs.isEmpty) return;
+    await fetchMoreHomeDiscover(
+      minCount: missing,
+      maxAttempts: homeDiscoverMaxAttempts,
+    );
   }
 
   /// 追加一批刷歌推荐，返回**真正新并进 [_homeDiscoverSongs] 的那些**。
@@ -570,9 +584,30 @@ class KugouProvider extends ChangeNotifier {
   Future<List<KugouSongDetail>> fetchMoreHomeDiscover({
     int minCount = homeDiscoverBatchSize,
     int maxAttempts = homeDiscoverMaxAttempts,
+  }) {
+    final inFlight = _homeDiscoverLoadMoreFuture;
+    if (inFlight != null) return inFlight;
+    late final Future<List<KugouSongDetail>> request;
+    request = _fetchMoreHomeDiscover(
+      minCount: minCount,
+      maxAttempts: maxAttempts,
+    ).whenComplete(() {
+      if (identical(_homeDiscoverLoadMoreFuture, request)) {
+        _homeDiscoverLoadMoreFuture = null;
+      }
+    });
+    _homeDiscoverLoadMoreFuture = request;
+    return request;
+  }
+
+  Future<List<KugouSongDetail>> _fetchMoreHomeDiscover({
+    required int minCount,
+    required int maxAttempts,
   }) async {
-    if (_homeDiscoverLoadingMore) return const [];
     _homeDiscoverLoadingMore = true;
+    final previousFailure = _homeDiscoverLastLoadFailed;
+    _homeDiscoverLastLoadFailed = false;
+    var requestFailed = false;
     // 声明在 try 之外：finally 里要靠它决定要不要通知订阅者。
     final fresh = <KugouSongDetail>[];
     try {
@@ -591,7 +626,11 @@ class KugouProvider extends ChangeNotifier {
           todayPlayNum: _homeDiscoverCursor,
           noCache: true,
         );
-        if (result == null || result.isEmpty) continue;
+        if (result == null) {
+          requestFailed = true;
+          continue;
+        }
+        if (result.isEmpty) continue;
         final added = _ingestHomeDiscoverSongs(result);
         if (added > 0) {
           fresh.addAll(
@@ -601,13 +640,20 @@ class KugouProvider extends ChangeNotifier {
         }
       }
       return fresh;
+    } catch (_) {
+      requestFailed = true;
+      return fresh;
     } finally {
       _homeDiscoverLoadingMore = false;
+      _homeDiscoverLastLoadFailed = fresh.isEmpty && requestFailed;
       // 必须自己通知：本方法不走 [_beginLoading]/[_endLoading] 计数器（它是滑动
       // 与补货的增量路径，不该把整页的 loading 指示器点亮），所以不能指望那对
       // 边沿通知顺带把新批次推给 UI。不通知的话详情页会一直停在 _hasMore 翻转
       // 之后的旧列表上——数据到了、画面没动。
-      if (fresh.isNotEmpty) notifyListeners();
+      if (fresh.isNotEmpty ||
+          previousFailure != _homeDiscoverLastLoadFailed) {
+        notifyListeners();
+      }
     }
   }
 
@@ -1483,6 +1529,229 @@ class KugouProvider extends ChangeNotifier {
     }
   }
 
+  // ==================== 微信 / QQ 扫码登录 ====================
+
+  /// 生成微信扫码登录会话（uuid + 二维码图片）。
+  /// 失败时写 [error] 并返回 null。
+  Future<KugouWxQrSession?> createWxLoginQr() async {
+    try {
+      final res = await _apiClient.createLoginWx();
+      final session = KugouWxQrSession.fromJson(res);
+      if (session == null || !session.hasImage) {
+        _error = '生成微信二维码失败';
+        notifyListeners();
+        return null;
+      }
+      return session;
+    } catch (e) {
+      _error = '生成微信二维码失败';
+      notifyListeners();
+      print('[LOGIN] createWxLoginQr error: $e');
+      return null;
+    }
+  }
+
+  /// 轮询微信扫码状态。
+  ///
+  /// 上游 `wx_errcode`：408 等待 / 404 已扫码 / 403 拒绝 / 402 过期 /
+  /// 405 成功（带 `wx_code`，内部直接换酷狗 token 后返回 [WxScanKind.success]）。
+  Future<WxScanResult> checkWxLogin(String uuid) async {
+    if (uuid.isEmpty) {
+      return const WxScanResult(WxScanKind.error, message: '微信登录会话缺失');
+    }
+    Map<String, dynamic>? res;
+    try {
+      res = await _apiClient.checkLoginWx(uuid);
+    } catch (e) {
+      return const WxScanResult(WxScanKind.error, message: '微信登录状态检查失败，请重试');
+    }
+    if (res == null) {
+      return const WxScanResult(WxScanKind.error, message: '微信登录状态检查失败，请重试');
+    }
+    final code = _parseScanCode(res['wx_errcode'] ?? res['status']);
+    switch (code) {
+      case 405:
+        final wxCode = res['wx_code']?.toString();
+        if (wxCode == null || wxCode.isEmpty) {
+          return const WxScanResult(WxScanKind.error, message: '微信授权信息缺失，请重试');
+        }
+        return _exchangeOpenplat(wxCode);
+      case 404:
+        return const WxScanResult(WxScanKind.scanned, message: '已扫描，请在手机上确认');
+      case 403:
+        return const WxScanResult(WxScanKind.rejected, message: '已拒绝登录');
+      case 402:
+        return const WxScanResult(WxScanKind.expired, message: '二维码已过期，请刷新重试');
+      case 408:
+        return const WxScanResult(WxScanKind.waiting, message: '等待扫描...');
+      default:
+        // 上游偶发返回空对象/未知码，按「继续等待」处理，避免误判为失败。
+        return const WxScanResult(WxScanKind.waiting, message: '等待扫描...');
+    }
+  }
+
+  /// 生成 QQ 扫码登录会话（二维码 JPEG + 6 个会话字段）。
+  Future<KugouQqQrSession?> createQqLoginQr() async {
+    try {
+      final res = await _apiClient.createLoginQqQr();
+      final session = KugouQqQrSession.fromJson(res);
+      if (session == null) {
+        _error = _qqCreateErrorText(res);
+        notifyListeners();
+        return null;
+      }
+      return session;
+    } catch (e) {
+      _error = '生成 QQ 二维码失败';
+      notifyListeners();
+      print('[LOGIN] createQqLoginQr error: $e');
+      return null;
+    }
+  }
+
+  /// 轮询 QQ 扫码状态。
+  ///
+  /// 上游 `status`：`wait` / `scanned` / `expired` / `blocked`（风控拦截）/
+  /// `error`；登录成功时 Rust 直接返回 `/login/openplat` 的
+  /// `{status:1, data:{token,userid,vip_token}}`，这里转换为
+  /// [QqScanKind.success]。
+  Future<QqScanResult> checkQqLogin(KugouQqQrSession session) async {
+    Map<String, dynamic>? res;
+    try {
+      res = await _apiClient.checkLoginQqQr(session.toQuery());
+    } catch (e) {
+      return const QqScanResult(QqScanKind.error, message: 'QQ 登录状态检查失败，请重试');
+    }
+    if (res == null) {
+      return const QqScanResult(QqScanKind.error, message: 'QQ 登录状态检查失败，请重试');
+    }
+    // 登录成功：Rust 透传 openplat 的响应（status 为数字 1 + data.token）
+    if (res['status'] == 1) {
+      final data = res['data'] as Map?;
+      final token = data?['token']?.toString();
+      final userid = data?['userid']?.toString();
+      if (token != null && token.isNotEmpty && userid != null && userid.isNotEmpty) {
+        return QqScanResult(
+          QqScanKind.success,
+          token: token,
+          userid: userid,
+          vipToken: data?['vip_token']?.toString(),
+        );
+      }
+      return QqScanResult(
+        QqScanKind.error,
+        message: res['error_msg']?.toString() ?? res['msg']?.toString() ?? 'QQ 登录失败',
+      );
+    }
+    final status = res['status']?.toString() ?? '';
+    final msg = res['msg']?.toString();
+    switch (status) {
+      case 'wait':
+        return QqScanResult(QqScanKind.waiting, message: msg ?? '等待 QQ 扫码...');
+      case 'scanned':
+        return QqScanResult(
+          QqScanKind.scanned,
+          message: msg ?? '已扫码，请在 QQ 中确认',
+        );
+      case 'expired':
+        return QqScanResult(
+          QqScanKind.expired,
+          message: msg ?? '二维码已失效，请重新生成',
+        );
+      case 'blocked':
+        return QqScanResult(
+          QqScanKind.blocked,
+          message: msg ?? 'QQ 扫码接口暂时不可用，请改用微信或酷狗扫码',
+        );
+      default:
+        return QqScanResult(
+          QqScanKind.error,
+          message: msg ?? 'QQ 扫码状态异常，请重新加载',
+        );
+    }
+  }
+
+  /// 第三方（微信 / QQ）扫码成功后的统一收尾：落凭证 → 清账号级缓存 → 拉资料。
+  Future<bool> completeThirdPartyLogin({
+    required String token,
+    required String userid,
+    String? vipToken,
+  }) async {
+    if (token.isEmpty || userid.isEmpty) {
+      _error = '登录响应缺少凭证，请重试';
+      notifyListeners();
+      return false;
+    }
+    try {
+      await _clearAvatarCacheIfUserChanged(userid);
+      await _apiClient.setLoginCookies(token, userid, vipToken: vipToken);
+    } catch (e) {
+      _error = '登录凭证保存失败，请重试';
+      notifyListeners();
+      return false;
+    }
+    _isLoggedIn = true;
+    // 与手机登录一致：新账号前先清空当前用户内存缓存，否则资料接口失败时
+    // 用户中心顶部会残留上一个账号的昵称/头像。
+    _userInfo = null;
+    _vipInfo = null;
+    _gradeInfo = null;
+    _vipMonthRecord = null;
+    _userPreference = null;
+    _qrKey = null;
+    _qrData = null;
+    notifyListeners();
+    await _fetchUserInfo();
+    print('✅ [Account] 第三方扫码登录成功: $userid');
+    notifyListeners();
+    return true;
+  }
+
+  /// `openplat`（微信 code → 酷狗 token）包装，供 [checkWxLogin] 的 405 分支复用。
+  Future<WxScanResult> _exchangeOpenplat(String code) async {
+    Map<String, dynamic>? loginRes;
+    try {
+      loginRes = await _apiClient.loginByOpenplat(code);
+    } catch (e) {
+      return const WxScanResult(WxScanKind.error, message: '微信登录失败，请重试');
+    }
+    if (loginRes == null) {
+      return const WxScanResult(WxScanKind.error, message: '微信登录失败，请重试');
+    }
+    final data = loginRes['data'] as Map?;
+    final token = data?['token']?.toString();
+    final userid = data?['userid']?.toString();
+    if (loginRes['status'] == 1 && token != null && userid != null) {
+      return WxScanResult(
+        WxScanKind.success,
+        token: token,
+        userid: userid,
+        vipToken: data?['vip_token']?.toString(),
+      );
+    }
+    return WxScanResult(
+      WxScanKind.error,
+      message:
+          loginRes['error_msg']?.toString() ??
+          loginRes['msg']?.toString() ??
+          '微信登录失败，请重试',
+    );
+  }
+
+  /// 上游把错误码时而给数字时而给字符串，统一转 int（解析不了 → -1）。
+  int _parseScanCode(dynamic v) {
+    if (v is int) return v;
+    if (v is double) return v.toInt();
+    if (v == null) return -1;
+    return int.tryParse(v.toString()) ?? -1;
+  }
+
+  String _qqCreateErrorText(Map<String, dynamic>? res) {
+    final msg = res?['msg'];
+    if (msg is String && msg.isNotEmpty) return '生成 QQ 二维码失败：$msg';
+    return '生成 QQ 二维码失败';
+  }
+
   // 发送手机验证码
   Future<bool> sendLoginCaptcha(String mobile) async {
     if (mobile.length != 11) {
@@ -1578,22 +1847,16 @@ class KugouProvider extends ChangeNotifier {
     if (token == null || userid == null) return;
 
     _pendingLoginAccounts = [];
-    // 登录新用户前，清除旧用户的头像缓存
-    await _clearAvatarCacheIfUserChanged(userid);
-    await _apiClient.setLoginCookies(token, userid, vipToken: vipToken);
-    _isLoggedIn = true;
-    // 关键：登录新账号前清空当前用户内存缓存（与 switchAccount 一致）。
-    // 否则 getUserDetail 失败时 _userInfo 残留旧账号，用户中心顶部显示旧昵称。
-    _userInfo = null;
-    _vipInfo = null;
-    _gradeInfo = null;
-    _vipMonthRecord = null;
-    _userPreference = null;
-    _qrKey = null;
-    _qrData = null;
-    await _fetchUserInfo();
-    print('✅ [Account] 登录新账号: $userid, userInfo=${_userInfo?.nickname}');
-    notifyListeners();
+    // 凭证落盘、清账号级缓存、拉资料的收尾与第三方扫码登录完全一致，
+    // 统一走 completeThirdPartyLogin，避免两条路径慢慢漂移。
+    final ok = await completeThirdPartyLogin(
+      token: token,
+      userid: userid,
+      vipToken: vipToken,
+    );
+    if (ok) {
+      print('✅ [Account] 登录新账号: $userid, userInfo=${_userInfo?.nickname}');
+    }
   }
 
   /// 解析多账号响应中的账号列表（兼容 info_list / user_list 等字段名）。
@@ -2577,22 +2840,6 @@ class KugouProvider extends ChangeNotifier {
         final list = data['list'] ?? data['info'] ?? [];
         _fmClassList = (list as List)
             .map((e) => KugouFmInfo.fromJson(e as Map<String, dynamic>))
-            .toList();
-        notifyListeners();
-      }
-    } catch (_) {}
-  }
-
-  // ==================== Sheet (曲谱) ====================
-
-  Future<void> getSheetExplore({int page = 1}) async {
-    try {
-      final r = await _apiClient.getSheetExplore(page: page);
-      if (r != null) {
-        final data = r['data'] as Map<String, dynamic>? ?? r;
-        final list = data['list'] ?? data['info'] ?? [];
-        _sheetExploreList = (list as List)
-            .map((e) => KugouSheetInfo.fromJson(e as Map<String, dynamic>))
             .toList();
         notifyListeners();
       }

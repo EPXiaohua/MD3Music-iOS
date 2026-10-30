@@ -185,6 +185,60 @@ void main() {
       expect(playerMiniBarHeight(), closeTo(80, 0.001));
     });
 
+    test('五字段成组写：胶囊的窄矩形/圆角不会泄漏给下一次常驻条登记', () {
+      // 悬浮胶囊上拉：登记可见本体 + 32 圆角
+      publishPlayerDragOrigin(
+        top: 793,
+        bottom: 857,
+        left: 16,
+        width: 368,
+        radius: 32,
+      );
+      expect(playerDragOriginLeft, 16);
+      expect(playerDragOriginWidth, 368);
+      expect(playerDragOriginRadius, 32);
+
+      // 下一次是常驻条（只传两参）：横向范围与圆角必须**复位**成通栏/方角，
+      // 否则常驻条的面板起点会带上胶囊留下的窄矩形（凭空变窄变圆）。
+      publishPlayerDragOrigin(top: 700, bottom: 780);
+      expect(playerDragOriginLeft, 0.0);
+      expect(playerDragOriginWidth, 0.0);
+      expect(playerDragOriginRadius, 0.0);
+    });
+
+    test('playerPanelAnchorRect：width≤0 视为通栏；有登记则按登记钳进屏内', () {
+      const Size screen = Size(400, 869);
+      publishPlayerDragOrigin(top: 700, bottom: 780);
+      expect(
+        playerPanelAnchorRect(screen),
+        const Rect.fromLTWH(0, 700, 400, 80),
+      );
+
+      publishPlayerDragOrigin(
+        top: 793,
+        bottom: 857,
+        left: 16,
+        width: 368,
+        radius: 32,
+      );
+      expect(
+        playerPanelAnchorRect(screen),
+        const Rect.fromLTWH(16, 793, 368, 64),
+      );
+
+      // 越界（旧视口快照）：左缘钳进 [0, 屏宽 − 宽]，不会把窗口推出屏外
+      publishPlayerDragOrigin(
+        top: 793,
+        bottom: 857,
+        left: 500,
+        width: 368,
+        radius: 32,
+      );
+      final clamped = playerPanelAnchorRect(screen);
+      expect(clamped.right, lessThanOrEqualTo(screen.width + 1e-9));
+      expect(clamped.left, greaterThanOrEqualTo(0));
+    });
+
     test('kPlayerFallbackMiniBarHeight 与 core 兜底条高同源', () {
       expect(kPlayerFallbackMiniBarHeight, PlayerPanelSignal.fallbackBarHeight);
     });

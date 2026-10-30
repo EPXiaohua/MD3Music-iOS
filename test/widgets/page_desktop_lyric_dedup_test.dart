@@ -30,6 +30,12 @@ import '../test_helpers/fake_secure_storage.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  // 预热单例：DesktopLyricService 构造时会起一个 5s 的悬浮窗巡检周期 Timer。
+  // 若首次实例化发生在 testWidgets 的 FakeAsync 区内，该 Timer 会挂在假时钟上，
+  // 测试收尾报「A Timer is still pending even after the widget tree was disposed」。
+  // 在 fake async 之外先建好单例，Timer 就落在真实事件循环里，收尾不再报错。
+  DesktopLyricService.instance;
+
   testWidgets('全屏页与桌面歌词同键并发时只查询并下载一次', (tester) async {
     final originalPhysicalSize = tester.view.physicalSize;
     final originalDevicePixelRatio = tester.view.devicePixelRatio;
@@ -202,6 +208,12 @@ void main() {
       );
       expect(adapter.searchRequestCount, 1);
       expect(adapter.lyricRequestCount, 2);
+      // 锁屏卡片红心态由整包 payload 携带：该用例从未收藏该曲，故恒为 false。
+      expect(
+        lockScreenPayloads.every((payload) => payload['isFavorited'] == false),
+        isTrue,
+        reason: '锁屏歌词整包必须携带 isFavorited（未收藏时 false）',
+      );
     } finally {
       await desktopLyrics.setLockScreenLyricEnabled(false);
       await tester.pumpWidget(const SizedBox.shrink());

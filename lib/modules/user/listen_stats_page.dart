@@ -16,13 +16,15 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
 import '../artist/artist_detail_page.dart';
 import '../player/secondary_mini_player.dart';
+import 'local_listen_stats_view.dart';
 
 /// 听歌统计页（可视化）。
 ///
-/// EchoMusic「统计」Tab 同款布局：4 张总览卡 → 最近 7 天柱状图 → 时段偏好 →
-/// 常听歌手 TOP6 → 高频歌曲 TOP6 → 最常回访专辑。**数据全部来自云端**
-/// （/user/listen 排行 + /user/history 最近历史 + /user/grade/info 等级），
-/// 本地计数不参与统计（听歌记录已统一云端，一条计算路径）。
+/// 顶部数据源切换（云端/本地）：
+/// - 云端：EchoMusic「统计」Tab 同款布局，数据全部来自云端
+///   （/user/listen 排行 + /user/history 最近历史 + /user/grade/info 等级）；
+/// - 本地：[LocalListenStatsView]，数据来自本地库 play_records 聚合
+///   （不依赖登录态，本地歌与未知艺人/专辑同样计入）。
 class ListenStatsPage extends StatefulWidget {
   const ListenStatsPage({super.key});
 
@@ -31,6 +33,10 @@ class ListenStatsPage extends StatefulWidget {
 }
 
 class _ListenStatsPageState extends State<ListenStatsPage> {
+  /// 当前数据源。默认云端：保持既有入口语义（未登录时云端 Tab 显示
+  /// 登录引导；本地 Tab 无登录门槛，用户切过去即可看）。
+  _StatsSource _source = _StatsSource.cloud;
+
   @override
   void initState() {
     super.initState();
@@ -68,9 +74,47 @@ class _ListenStatsPageState extends State<ListenStatsPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('听歌统计')),
       body: ContentWidth(
-        child: SecondaryMiniPlayerHost(
-          child: _buildBody(),
+        child: Column(
+          children: [
+            _buildSourceSwitch(),
+            Expanded(
+              child: SecondaryMiniPlayerHost(
+                child: _source == _StatsSource.cloud
+                    ? _buildBody()
+                    : const LocalListenStatsView(),
+              ),
+            ),
+          ],
         ),
+      ),
+    );
+  }
+
+  /// 数据源切换（云端账号聚合 / 本地播放记录聚合）。
+  Widget _buildSourceSwitch() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.lg,
+        AppSpacing.sm,
+        AppSpacing.lg,
+        0,
+      ),
+      child: SegmentedButton<_StatsSource>(
+        segments: const [
+          ButtonSegment(
+            value: _StatsSource.cloud,
+            label: Text('云端'),
+            icon: Icon(Icons.cloud_outlined),
+          ),
+          ButtonSegment(
+            value: _StatsSource.local,
+            label: Text('本地'),
+            icon: Icon(Icons.smartphone_outlined),
+          ),
+        ],
+        selected: {_source},
+        onSelectionChanged: (selection) =>
+            setState(() => _source = selection.first),
       ),
     );
   }
@@ -857,3 +901,6 @@ class _ListenStatsPageState extends State<ListenStatsPage> {
 }
 
 enum _CardTone { primary, secondary, tertiary, surface }
+
+/// 听歌统计页数据源。
+enum _StatsSource { cloud, local }

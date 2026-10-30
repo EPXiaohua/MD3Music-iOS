@@ -72,6 +72,12 @@ class TvNavFocusBridge {
   /// 当前是否有已登记的导航项节点（诊断用）。
   bool get hasNodes => _nodes.isNotEmpty;
 
+  /// 第 [index] 个导航项的焦点节点（未登记返回 null）。
+  ///
+  /// 用途：切 tab / 首帧的焦点归还（见 `ResponsiveShell` 的
+  /// `_scheduleNavFocusRetention`）需要直接拿到导航项节点再决定是否 requestFocus。
+  FocusNode? nodeFor(int index) => _nodes[index];
+
   /// 当前已登记的导航项索引（诊断用）。
   Iterable<int> get registeredIndices => _nodes.keys;
 }

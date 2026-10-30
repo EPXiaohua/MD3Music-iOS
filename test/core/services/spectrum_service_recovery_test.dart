@@ -115,7 +115,36 @@ void main() {
     expect(service.isSimulated, isTrue);
   });
 
-  test('熄屏期间不反复重连，亮屏立即重绑并恢复真实数据', () async {
+  test('熄屏期间停掉原生采集，亮屏立即重绑并恢复真实数据', () async {
+    await service.start(42);
+    service.setPlaying(true);
+    await fft(List.filled(40, 0.4));
+    service.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await Future<void>.delayed(const Duration(milliseconds: 2100));
+    // 退后台停掉原生采集：引擎不产帧、没有消费者，渲染线程上那套逐样本解码
+    // 与跨线程投递是纯开销（前台高负载时正是欠载推手）。
+    expect(calls, ['start', 'stop']);
+    service.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await Future<void>.delayed(Duration.zero);
+    expect(calls, ['start', 'stop', 'start']);
+    await fft(List.filled(40, 0.6));
+    expect(service.isRunning, isTrue);
+    expect(service.isSimulated, isFalse);
+  });
+
+  test('退后台停采集后 owner 仍保留，重新 start 不重复登记', () async {
+    await service.start(42);
+    service.setPlaying(true);
+    await fft(List.filled(40, 0.4));
+    service.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await Future<void>.delayed(Duration.zero);
+    expect(calls, ['start', 'stop']);
+    // 退后台只是暂停原生采集，会话本身没结束
+    expect(service.isRunning, isTrue);
+  });
+
+  test('「始终震动」场景退后台不停采集，回前台也不重复重绑', () async {
+    service.setBackgroundCaptureRequired(true);
     await service.start(42);
     service.setPlaying(true);
     await fft(List.filled(40, 0.4));
@@ -125,8 +154,15 @@ void main() {
     service.didChangeAppLifecycleState(AppLifecycleState.resumed);
     await Future<void>.delayed(Duration.zero);
     expect(calls, ['start', 'start']);
-    await fft(List.filled(40, 0.6));
-    expect(service.isRunning, isTrue);
-    expect(service.isSimulated, isFalse);
+  });
+
+  test('inactive 可见失焦期间仍监测断流并恢复频谱采集', () async {
+    await service.start(42);
+    service.setPlaying(true);
+    await fft(List.filled(40, 0.4));
+    service.didChangeAppLifecycleState(AppLifecycleState.inactive);
+    await Future<void>.delayed(const Duration(milliseconds: 2100));
+    expect(service.isSimulated, isTrue);
+    expect(calls.where((call) => call == 'start'), hasLength(2));
   });
 }

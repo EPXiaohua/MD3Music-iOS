@@ -28,7 +28,12 @@ class LockScreenLyricReceiver : BroadcastReceiver() {
         }
         android.util.Log.i("LockScreenLyric", "$action: lockScreenLyricEnabled=$enabled")
         if (enabled) {
-            LockScreenLyricActivity.start(context)
+            // 亮屏路径要求「确实在锁屏」才拉起：否则点亮屏幕（App 在前台播放）时
+            // 这层可触控全屏窗口会盖住 App。熄屏路径不校验（见 start 的注释）。
+            LockScreenLyricActivity.start(
+                context,
+                requireLocked = action == Intent.ACTION_SCREEN_ON,
+            )
         }
     }
 }

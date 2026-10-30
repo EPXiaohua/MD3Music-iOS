@@ -51,6 +51,134 @@ const Duration kPlayerExpandDuration = Duration(milliseconds: 400);
 /// 收起（退出）时长：展开的 65%（退出比进入快）。
 const Duration kPlayerCollapseDuration = Duration(milliseconds: 260);
 
+/// 上拉未达阈值时的**回弹**时长。
+///
+/// 旧实现在松手那一刻直接把 `playerExpansion` 归零：面板/覆盖层下一帧就消失，
+/// 用户看到的是「拉到一半，啪一下没了」。改成 220ms 的一次性回弹（与悬浮条
+/// 圆盘吸附同一档时长）后，手势与结果之间才有因果感。
+///
+/// 只用于「用户直接操纵被拒绝」这一种收尾：系统打断（PointerCancel）仍瞬时归零，
+/// 因为那时用户没有期待任何动画。
+const Duration kPlayerDragCancelDuration = Duration(milliseconds: 220);
+
+/// 拖拽松手后「把跟手覆盖层交接给路由」的共享实现（常驻条 / 悬浮胶囊共用）。
+///
+/// 交接要点（避免松手闪烁）：
+/// 1. 先 `push` 路由并**停在当前进度**（不立即动画）—— push 会重建覆盖层之上的
+///    一帧，此时路由尚未与 controller 同步，若直接 `settleToFull()` 会从 0 起播、
+///    出现「松手瞬间弹回迷你条再展开」；
+/// 2. 等**两个** post-frame：第 1 帧路由完成首建（此时它的 `buildTransitions`
+///    已按 `controller.value` 画出与覆盖层同形的面板），第 2 帧覆盖层让位、
+///    路由接管显示；
+/// 3. 让位与续播必须在同一帧完成：先隐藏覆盖层再 forward，两者形状在那一帧
+///    逐像素相同，交接不可见；
+/// 4. 等待期间路由可能已被移除（用户按返回 / 页面被销毁）—— 用 [route.isActive]
+///    兜住，否则会对已 dispose 的 controller 调 `forward()` 抛状态错误。
+///
+/// [onOverlayRelease] 由调用方决定怎么隐藏自己的跟手覆盖层（常驻条与悬浮条
+/// 各自持有一个 `playerDragActive` / 回弹控制器）。
+void handOffDragToRoute({
+  required NavigatorState navigator,
+  required DraggablePlayerRoute<void> route,
+  required double progress,
+  required VoidCallback onOverlayRelease,
+}) {
+  navigator.push(route);
+  route.controller.stop();
+  route.controller.value = progress.clamp(0.0, 1.0); // 路由从当前手指位置开始显示
+  var frames = 0;
+  void tick() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!route.isActive) {
+        // 路由在等待期就被移除了：至少把覆盖层收掉，别留一块幽灵面板。
+        onOverlayRelease();
+        return;
+      }
+      frames++;
+      if (frames >= 2) {
+        onOverlayRelease();
+        route.settleToFull();
+      } else {
+        tick();
+      }
+    });
+  }
+
+  tick();
+}
+
+/// 「上拉未达阈值 → 回弹归零」的一次性动画驱动（常驻条 / 悬浮胶囊共用）。
+///
+/// **为什么抽成类而不是各处手搓 `AnimationController`**：两个入口的收尾语义必须
+/// 完全一致（时长、曲线、把 `playerExpansion` 逐帧写回、结束时置回
+/// `playerDragActive=false`），否则「从常驻条拉」和「从胶囊拉」会是两种手感。
+///
+/// 生命周期：调用方持有（`initState` 建、`dispose` 释放）；[settleBack] 可重复
+/// 调用（会先 `stop()` 再从新起点重播），[stop] 用于用户重新接管手势。
+///
+/// 系统「移除动画」下直接落端点（不播补间）——与其余转场同一套降级口径。
+class DragReleaseAnimator {
+  DragReleaseAnimator(TickerProvider vsync)
+    : _controller = AnimationController(
+        vsync: vsync,
+        duration: kPlayerDragCancelDuration,
+      );
+
+  final AnimationController _controller;
+  Animation<double>? _animation;
+  VoidCallback? _onDone;
+
+  /// 是否正在回弹（调用方据此决定要不要把新手指事件当作「接管」）。
+  bool get isRunning => _controller.isAnimating;
+
+  /// 把 [playerExpansion] 从当前值动画回 0，结束后回调 [onDone]。
+  void settleBack({
+    required bool reduceMotion,
+    VoidCallback? onDone,
+  }) {
+    final double start = playerExpansion.value;
+    _onDone = onDone;
+    _controller.stop();
+    if (start <= 0.0) {
+      playerExpansion.value = 0.0;
+      _finish();
+      return;
+    }
+    if (reduceMotion) {
+      playerExpansion.value = 0.0;
+      _finish();
+      return;
+    }
+    _animation = Tween<double>(begin: start, end: 0.0).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: M3ExpressiveMotion.panelCollapseEasing,
+      ),
+    )..addListener(() {
+        playerExpansion.value = _animation!.value;
+      });
+    _controller.forward(from: 0.0).whenCompleteOrCancel(_finish);
+  }
+
+  void _finish() {
+    playerExpansion.value = 0.0;
+    final done = _onDone;
+    _onDone = null;
+    done?.call();
+  }
+
+  /// 中止回弹（用户重新按住 / 页面销毁）。不触发 `onDone`。
+  void stop() {
+    _onDone = null;
+    _controller.stop();
+  }
+
+  void dispose() {
+    _onDone = null;
+    _controller.dispose();
+  }
+}
+
 /// 播放页容器相对"归位"位置的本帧位移（**页面本地坐标**，dy 向下为正）。
 ///
 /// 两条进入路径的公式不同，集中到一处，避免"路由过渡里算一遍、拖拽覆盖层里
@@ -126,12 +254,66 @@ double get playerDragOriginBottom => PlayerPanelSignal.anchorBottom;
 set playerDragOriginBottom(double value) =>
     PlayerPanelSignal.anchorBottom = value;
 
+/// 迷你条**左缘** X（设计像素）。`<= 0` / 未登记 = 通栏（常驻条口径）。
+double get playerDragOriginLeft => PlayerPanelSignal.anchorLeft;
+set playerDragOriginLeft(double value) => PlayerPanelSignal.anchorLeft = value;
+
+/// 迷你条**宽度**（设计像素）。`<= 0` / 未登记 = 通栏（回退整屏宽）。
+double get playerDragOriginWidth => PlayerPanelSignal.anchorWidth;
+set playerDragOriginWidth(double value) => PlayerPanelSignal.anchorWidth = value;
+
+/// 迷你条**外轮廓圆角**（dp）：胶囊 / 圆盘 32，常驻条 0。
+double get playerDragOriginRadius => PlayerPanelSignal.anchorRadius;
+set playerDragOriginRadius(double value) => PlayerPanelSignal.anchorRadius = value;
+
 /// 锚点未登记（`origin == 0`，理论上不可达的退化路径）时兜底的条高（dp）。
 const double kPlayerFallbackMiniBarHeight = PlayerPanelSignal.fallbackBarHeight;
 
-/// 登记迷你条锚点（顶端 + 底端，成对写）。
-void publishPlayerDragOrigin({required double top, required double bottom}) =>
-    PlayerPanelSignal.publishAnchor(top: top, bottom: bottom);
+/// 登记迷你条锚点（顶端 + 底端 + 横向范围 + 外轮廓圆角，**成组写**）。
+///
+/// [left]/[width]/[radius] 默认值即常驻条口径（通栏、方角），所以常驻条那几处
+/// 两参调用点无需改动；但每次都会**全量写入**，胶囊登记的窄矩形/32 圆角不会
+/// 泄漏给下一次常驻条拖拽。
+void publishPlayerDragOrigin({
+  required double top,
+  required double bottom,
+  double left = 0.0,
+  double width = 0.0,
+  double radius = 0.0,
+}) => PlayerPanelSignal.publishAnchor(
+  top: top,
+  bottom: bottom,
+  left: left,
+  width: width,
+  radius: radius,
+);
+
+/// 已登记锚点对应的**屏幕矩形**（设计像素）。
+///
+/// [screenSize] 用于把「未登记横向范围」补成通栏，并把矩形钳进屏内。
+/// 高度为 0 时回落到经验条高（[kPlayerFallbackMiniBarHeight]），保证消费端永远
+/// 拿得到一个有面积的矩形。
+Rect playerPanelAnchorRect(Size screenSize) {
+  final double w = screenSize.width.isFinite && screenSize.width > 0
+      ? screenSize.width
+      : 0.0;
+  final double h = screenSize.height.isFinite && screenSize.height > 0
+      ? screenSize.height
+      : 0.0;
+  final double top = playerDragOriginTop > 0
+      ? playerDragOriginTop.clamp(0.0, h)
+      : math.max(0.0, h - kPlayerFallbackMiniBarHeight);
+  final double bottom = (playerDragOriginBottom - playerDragOriginTop) > 0
+      ? playerDragOriginBottom.clamp(top, h)
+      : math.min(h, top + kPlayerFallbackMiniBarHeight);
+  final double width = playerDragOriginWidth > 0
+      ? playerDragOriginWidth.clamp(0.0, w)
+      : w;
+  final double left = playerDragOriginWidth > 0
+      ? playerDragOriginLeft.clamp(0.0, math.max(0.0, w - width))
+      : 0.0;
+  return Rect.fromLTWH(left, top, width, bottom - top);
+}
 
 /// 迷你条高度（设计像素）= 底端 − 顶端；锚点未登记时回落到经验值。
 double playerMiniBarHeight() {
@@ -151,11 +333,56 @@ double playerMiniBarHeight() {
 /// 让覆盖层从这个信号取初始下标，两个问题一起消掉。
 final ValueNotifier<int> playerTabIndex = ValueNotifier<int>(1);
 
+/// 播放页在场的**歌词指挥口**，卡片深链专用（v31 起以集合承载全部在场实例）。
+///
+/// v43（用户拍板二次修正）：车机点媒体卡片改走「AdaptiveNav.pushDetailGlobal
+/// 把播放页塞进双栏右窗格」，不再依赖本指挥口直达；守卫恢复但深链经
+/// bypassCarGuardOnce 旁路。指挥口保留用于"播放页已开着时原地切歌词"。
+///
+/// v31：单指针改**注册集合**。覆盖层这类"后注册"的实例若在覆盖后注销，
+/// 单指针会以 identical 判属把整根清空，而它先注册的"存活"路由/面板实例
+/// 的命令从此静默 no-op（深链又对存量路由不 push——症状借拖拽路径复活）。
+/// 集合模式实例死亡只摘自己的注册，存活者继续响应；发送对全部在场实例
+/// 广播，各自幂等切页（UI 更新，不创建新实例）。
+///
+/// 抽象成 `void Function()`（而不是下标）：播放页窄屏结构的实际顺序是
+/// [playlist, cover, lyrics, …]（下标 2 恰为歌词），但顺序随宽窄屏与
+/// tab 开关动态调整——歌词页下标由在场实例按实时 `_tabLayout` 解析
+/// （`lyricsIndex`，见 player_tab_layout），调用方只表达"切歌词"语义，
+/// 不写死任何下标。
+///
+/// 没有在场实例（无路由、无面板）时发送是 **no-op**——不会凭空拉起任何
+/// 页面，等下一次卡片点击再试。
+typedef void PlayerLyricsCommandHandler();
+
+final Set<PlayerLyricsCommandHandler> _lyricsCommandHandlers =
+    <PlayerLyricsCommandHandler>{};
+
+void registerPlayerLyricsCommand(PlayerLyricsCommandHandler handler) =>
+    _lyricsCommandHandlers.add(handler);
+
+void unregisterPlayerLyricsCommand(PlayerLyricsCommandHandler handler) =>
+    _lyricsCommandHandlers.remove(handler);
+
+void sendDockPlayerLyricsCommand() {
+  for (final handler
+      in List<PlayerLyricsCommandHandler>.of(_lyricsCommandHandlers)) {
+    // v32：单实例异常不阻断后续实例（现状都是 postFrame+pager 空守卫，
+    // 实害低，这里固化"注册者不得打进命令语义"的兜底）。
+    try {
+      handler();
+    } catch (_) {}
+  }
+}
+
 /// 兼容旧引用：返回 true 表示当前 FullPlayer 在栈顶。
 /// 新代码应直接监听 [playerExpansion]。
 bool get isFullPlayerOnTop => playerExpansion.value > 0.5;
 
 /// 打开 FullPlayer（**统一防重复入栈**，新代码一律走这里）。
+///
+/// v43：恢复车机忽略守卫（防双实例双动画，v21 实测帧率翻倍+发热），深链经
+/// `bypassCarGuardOnce` 旁路一次；v42 的废弃 force 参数已删除（全仓无调用点）。
 ///
 /// 此前各调用点各自判重且口径不一：多数用 `activePlayerRoute?.isCurrent == true`
 /// ——播放页已在栈中但**非栈顶**时（用户从播放页又打开了歌单/其他页面）
@@ -171,12 +398,16 @@ bool get isFullPlayerOnTop => playerExpansion.value > 0.5;
 /// [scene] 是调用方（入口控件）在点击那一刻采集的形态快照，随路由透传 ——
 /// 悬浮胶囊这类"自己不写全局锚点"的入口必须带上它，否则展开起点只能落到
 /// 全局锚点或合成兜底上（见 [PlayerMorphScene] 与 [DraggablePlayerRoute.panelAnchorFor]）。
-void openFullPlayer(BuildContext context, {PlayerMorphScene? scene}) {
-  // 车机模式：播放器已常驻在面板里，任何「打开全屏播放页」的入口都忽略。
-  // 否则会在面板之外再 push 一个播放页 —— 两个实例各自驱动歌词/进度等动画，
-  // 整页帧率翻倍。
-  // active 含自动检测：命中车机屏同样忽略。
-  if (context.read<CarModeProvider>().active) return;
+void openFullPlayer(
+  BuildContext context, {
+  PlayerMorphScene? scene,
+  bool bypassCarGuardOnce = false,
+}) {
+  // MD3Music fork v43：恢复 v21 守卫（车机面板常驻播放器 + 全屏页 = 双实例
+  // 双动画，v21 实测帧率翻倍+发热），深链经 bypassCarGuardOnce 旁路一次——
+  // 深链优先走 AdaptiveNav.pushDetailGlobal 进双栏右窗格，旁路只是无双栏
+  // 场景（手机竖屏车机模式）的兜底。
+  if (context.read<CarModeProvider>().active && !bypassCarGuardOnce) return;
 
   // rootNavigator: true —— 桌面布局下内容区是嵌套 Navigator，若走最近的
   // Navigator 会把完整播放页 push 进中央内容区（只盖住内容区、盖不住侧栏与
@@ -215,9 +446,12 @@ DraggablePlayerRoute<void> fullPlayerRoute(
   double? screenHeight,
   double? dragOriginBottom,
 }) {
-  final useAm = context.read<ThemeProvider>().useAmStylePlayer;
   return DraggablePlayerRoute<void>(
-    builder: (_) => useAm ? const AmStyleFullPlayer() : const FullPlayer(),
+    builder: (_) => Consumer<ThemeProvider>(
+      builder: (context, theme, _) => theme.useAmStylePlayer
+          ? const AmStyleFullPlayer()
+          : const FullPlayer(),
+    ),
     scene: scene,
     dragOriginTop: dragOriginTop,
     screenHeight: screenHeight,
@@ -278,7 +512,7 @@ class PlayerSystemUiScope extends StatelessWidget {
 /// 设计要点：
 /// - [opaque] = false：路由背景透明，下层 MiniPlayer 可见，实现交叉淡入淡出
 /// - 拖拽模式（[dragOriginTop] 非空）：顶端与 MiniPlayer 对齐、1:1 跟手上移、
-///   透明度在前 20% 屏高内 0→1；松手后 [settleToFull]（panelExpandEasing，
+///   透明度在前 20% 屏高内 0→1；松手后 [settleToFull]（panelSettleEasing，
 ///   时长按剩余行程等比缩放）完整展开或 [dismiss] 收起
 /// - [controller] 暴露给外部手势：拖动期间 `controller.stop()` + `controller.value = x`，
 ///   释放时调用 [settleToFull] / [dismiss]
@@ -353,6 +587,57 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
     );
   }
 
+  /// 本次转场的**起点外轮廓**（矩形 + 圆角），设计像素。
+  ///
+  /// 这是「悬浮条外轮廓 → 覆盖全屏」形变的几何入口：[PlayerPanelFrame] 用它算
+  /// 窗口矩形与四角圆角，`p=0` 时与源形态可见本体逐值相等。
+  ///
+  /// **纵向一律委托 [panelAnchorFor]**，本函数只补「横向范围 + 圆角」。必须同源
+  /// 的原因：底栏下沉量（`bottom_chrome_sink.dart`）与页面位移都按那条纵向映射
+  /// 推导，这里若自己再推一遍 top/height，两处会在转屏 / 小窗 resize 途中分叉，
+  /// 面板下沿与底栏之间露出空带。
+  ///
+  /// 横向与圆角的来源与纵向**同优先级**：
+  /// - 有 [scene]：快照矩形（可见本体，含左右内缩）+ `scene.panelRadius`；
+  /// - 否则：全局锚点的 `anchorLeft/Width/Radius`（胶囊上拉会写；常驻条不写 →
+  ///   通栏 + 方角，与引入这两个字段之前逐像素一致）；
+  /// - 未登记（width ≤ 0）：按整屏宽铺，等价旧行为。
+  ({Rect rect, double radius}) panelGeometryFor(Size screenSize) {
+    final double w = screenSize.width.isFinite && screenSize.width > 0
+        ? screenSize.width
+        : 0.0;
+    final double h = screenSize.height.isFinite && screenSize.height > 0
+        ? screenSize.height
+        : 0.0;
+    // 纵向唯一来源：panelAnchorFor（scene / 拖拽参数 / 全局锚点 / 合成兜底），
+    // 钳进当前屏后取回。
+    final anchor = panelAnchorFor(h);
+    final double top = anchor.top.clamp(0.0, h);
+    final double bottom = (top + anchor.height).clamp(top, h);
+
+    final s = scene;
+    if (s != null && s.panelRect.height > 0) {
+      final r = s.panelRect;
+      // 快照的横向可能来自**旧视口**（转屏途中）：钳进当前屏。
+      final double left = r.left.isFinite ? r.left.clamp(0.0, w) : 0.0;
+      final double right = r.right.isFinite ? r.right.clamp(left, w) : w;
+      return (
+        rect: Rect.fromLTRB(left, top, right, bottom),
+        radius: s.panelRadius,
+      );
+    }
+    final double width = playerDragOriginWidth > 0
+        ? playerDragOriginWidth.clamp(0.0, w)
+        : w;
+    final double left = playerDragOriginWidth > 0
+        ? playerDragOriginLeft.clamp(0.0, math.max(0.0, w - width))
+        : 0.0;
+    return (
+      rect: Rect.fromLTWH(left, top, width, bottom - top),
+      radius: playerDragOriginRadius,
+    );
+  }
+
   /// 是否为拖拽模式（MiniPlayer 上滑展开）。
   bool get isDragMode => dragOriginTop != null && screenHeight != null;
 
@@ -405,7 +690,7 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   /// 收起别名：与 [dismiss] 相同，供 MiniPlayer 拖拽松手未达阈值时调用。
   void collapse() => dismiss();
 
-  /// 松手后完整展开：从当前进度续播 panelExpandEasing 前向动画
+  /// 松手后完整展开：从当前进度续播 panelSettleEasing 前向动画
   /// （时长按剩余行程等比缩放，见 AnimationController.forward）。
   void settleToFull() {
     if (_isDismissing) return;
@@ -499,9 +784,20 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   /// 两个方向都是**落位**：展开落全屏、收起落回迷你条（p=0 时封面/文字由
   /// 形变层交接回两端真实组件），所以末端速度必须趋零——旧组合（进入
   /// expressive 前置冲刺 + 离场 emphasized-accelerate 末端 4 倍均速突进）
-  /// 在叠加封面/文字形变后两端都呈现掉帧感。panelExpand（迟起、中段快、
-  /// 软着陆）与 panelCollapse（轻推、全程平滑、软着陆，起步斜率 ~0.67
-  /// 贴合下拉初速）把位移铺满全程。
+  /// 在叠加封面/文字形变后两端都呈现掉帧感。
+  ///
+  /// **展开按「起点是不是手指」分两条曲线**（只此一条分叉，别继续加）：
+  /// - 起点 = 0（点击进入：`didPush` 起播，[_animStartValue] 保持字段初值 0）
+  ///   → [M3ExpressiveMotion.panelExpandEasing]，对称 S 型（起步慢、中段最快、
+  ///   末端慢着陆）。这是用户能看清整段位移的唯一入口，慢起步才读得出「非线性」；
+  /// - 起点 > 0（拖拽松手续展 [settleToFull] / 顶栏下拉后弹回全屏）
+  ///   → [M3ExpressiveMotion.panelSettleEasing]，形状与旧版展开曲线**逐值相同**。
+  ///   原因：这一段前面是 1:1 跟手，画面此刻的速度是**手指的速度**；换成慢起步
+  ///   等于「手指一停画面先刹一停」，观感是顿挫而不是优雅。位移已完成的行程
+  ///   不重走（归一化保证），只把剩余行程送到底。
+  ///
+  /// 收起侧不分叉：拖拽收起与系统返回都从全屏附近起，[panelCollapseEasing]
+  /// 的轻推起步（斜率 ~0.67）本就贴合下拉初速。
   ///
   /// tap 模式与拖拽松手共用本函数；跟手阶段（controller 未在动画中）直接
   /// 透传 raw，1:1 线性不受影响。
@@ -510,9 +806,11 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
     if (_animDirection > 0) {
       // 展开：raw 从 start → 1
       if (start >= 1.0) return raw;
+      final curve = start == 0.0
+          ? M3ExpressiveMotion.panelExpandEasing
+          : M3ExpressiveMotion.panelSettleEasing;
       final t = ((raw - start) / (1.0 - start)).clamp(0.0, 1.0);
-      return start +
-          (1.0 - start) * M3ExpressiveMotion.panelExpandEasing.transform(t);
+      return start + (1.0 - start) * curve.transform(t);
     }
     // 收起：raw 从 start → 0
     if (start <= 0.0) return raw;
@@ -547,25 +845,28 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
 
         // —— 双向展开面板（**全部进出路径**：上滑展开 / 松手续展 / 顶栏下拉收起 /
         //   点击进入 / 按钮收起 / 系统返回）——
-        // 位置与透明度各自独立映射：
-        // 位置：播放页仍是**整屏尺寸**，只按 dy = origin*(1-pos) 整体下移，
-        //   再由 PlayerPanelFrame 裁剪到 [origin*(1-pos), +面板高] 的窗口里 ——
-        //   pos=0 时窗口恰好等于迷你条矩形（导航栏完整可见），pos=1 铺满全屏；
-        //   origin = 拖拽模式的 MiniPlayer 顶端；顶栏拖拽（含点击进入的播放页）
-        //   用 topBarDragTotal，实现点击进入也能原路返回
-        // 透明度：前 20% 屏高线性 0→1，之后保持 1
+        // 位置、外轮廓圆角与透明度各自独立映射：
+        // 位置：播放页仍是**整屏尺寸**，只按 dy = 轮廓上沿整体下移，再由
+        //   PlayerPanelFrame 裁剪到 [轮廓上沿, +轮廓高] 的窗口里 ——
+        //   pos=0 时窗口恰好等于源形态（悬浮胶囊 / 圆盘 / 常驻条）的**可见本体**
+        //   矩形，pos=1 铺满全屏；
+        // 圆角：源形态外轮廓（胶囊/圆盘 32、常驻条 0）→ 设备上报的屏幕 r 角，
+        //   这是「悬浮条外轮廓完美过渡到覆盖全屏」那条形变的主轴；
+        // 透明度：页面内容前 20% 屏高线性 0→1，面板底色前 4% 行程 0→1。
         //
         // 为什么裁剪而不是压扁播放页：压扁会让它逐帧重新布局（歌词/封面/控件
         // 全部 reflow），且封面形变层那套「减去 pageOffset 换算归位矩形」的
         // 前提（页面只做平移）也不再成立。见 player_panel_frame.dart 的说明。
         //
         // **点击进入也走这里**（原先是「淡入 + 15% 抽屉上滑」）：用户要求非拖拽
-        // 进出与拖拽观感一致。锚点未知时由 [panelAnchorFor] 合成一条贴底的起点，
-        // 起点 opacity=0 所以估不准不可见。
-        final height = screenHeight ?? MediaQuery.sizeOf(context).height;
-        if (height > 0) {
-          final anchor = panelAnchorFor(height);
-          final origin = topBarDragTotal ?? anchor.top;
+        // 进出与拖拽观感一致。锚点未知时由 [panelGeometryFor] 合成一个胶囊本体
+        // 起点，起点 opacity=0 所以估不准不可见。
+        final size = Size(
+          MediaQuery.sizeOf(context).width,
+          screenHeight ?? MediaQuery.sizeOf(context).height,
+        );
+        if (size.height > 0 && size.width > 0) {
+          final geometry = panelGeometryFor(size);
           final pos = animating
               ? (reduceMotion ? snappedTarget : _easedPosition(raw))
               : raw;
@@ -576,25 +877,33 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
               playerExpansion.value = pos;
             });
           }
+          // 顶栏下拉：整页沿「展开路径」原路下滑，窗口上沿同时跟着走。
+          // 语义 = **把整个起点矩形平移到手指位置**（而不是只改上沿）：条高、
+          // 横向范围与圆角都保持源形态口径，`p=0` 时窗口仍是「迷你条大小」，
+          // 与旧式 `top = dragTop*(1-p)` + `miniHeight` 的推导逐值等价。
+          final double? dragTotal = topBarDragTotal;
+          final Rect originRect = dragTotal == null
+              ? geometry.rect
+              : geometry.rect.shift(Offset(0, dragTotal - geometry.rect.top));
           // 注意：**不要**在这里再包一层 Opacity。面板的不透明性由 PlayerPanelFrame
           // 内部的底色层保证，淡入只作用于页面内容（见该文件的结构说明）；
           // 把 Opacity 提到外面会把底色一起乘上透明度，过渡态照样透出背后内容。
           //
-          // `pageOffset`（形变登记簿）由 PlayerPanelFrame 内部的
-          // playerPanelPageOffset 写入，与本文件 playerPageOffset 同式（有单测）。
+          // `pageOffset`（形变登记簿）由 PlayerPanelFrame 内部按轮廓上沿写入。
           return PlayerPanelFrame(
             progress: pos,
-            origin: origin,
-            // 条高只影响下沿起点；窗口顶边由 [origin] 决定。
-            miniHeight: anchor.height,
+            originRect: originRect,
+            originRadius: geometry.radius,
+            screenRadii: MediaQuery.displayCornerRadiiOf(context),
             child: child,
           );
         }
 
-        // —— 退化兜底：屏高为 0（理论不可达的视口）——
+        // —— 退化兜底：视口为 0（理论不可达）——
         // 此时面板几何除零，直接走「淡入 + 15% 抽屉上滑」，不做裁剪。
         // 位移、淡入淡出与 playerExpansion（形变层 / 迷你条 / 封面槽位）共用同一条
         // 进度：拆成两条长跑曲线会让飞行中的封面与它自己的槽位脱节。
+        final height = size.height;
         final progress = animating
             ? (reduceMotion ? snappedTarget : _easedPosition(raw))
             : raw;

@@ -4,25 +4,34 @@ class ReleaseInfo {
     required this.tagName,
     required this.version,
     required this.htmlUrl,
+    this.body = '',
+    this.windowsZipUrl,
+    this.windowsZipSize,
+    this.windowsZipDigest,
   });
 
-  /// 由 GitHub tag 构造：剥离 `v` 前缀与 `+<build>` 构建号写入 [version] 供展示。
-  ///
-  /// 本仓库 tag 形如 `v5.8.1+47`（CI 用 --build-name/--build-number 打），
-  /// 而本地 pubspec `version` 不含构建号（PackageInfo.version = `5.8.1`）。
-  /// 展示与「已提醒去重」都应基于三段版本号，否则 toast / 设置页会露出
-  /// `+47`，且与本地版本字面不等。`tagName` 保留原样（跳转链接仍指向完整 tag）。
+  /// 由 GitHub tag 构造：剥离 `v` 前缀写入 [version] 供展示与比较。
   factory ReleaseInfo.fromTag({
     required String tagName,
     required String htmlUrl,
+    String body = '',
+    String? windowsZipUrl,
+    int? windowsZipSize,
+    String? windowsZipDigest,
   }) {
     final tag = tagName.trim();
-    var bare = (tag.startsWith('v') || tag.startsWith('V'))
+    final bare = (tag.startsWith('v') || tag.startsWith('V'))
         ? tag.substring(1)
         : tag;
-    // 截断构建号（+47）与预发布后缀（-beta）：与 parseReleaseVersion 同口径
-    bare = bare.split('+').first.split('-').first;
-    return ReleaseInfo(tagName: tag, version: bare, htmlUrl: htmlUrl);
+    return ReleaseInfo(
+      tagName: tag,
+      version: bare,
+      htmlUrl: htmlUrl,
+      body: body,
+      windowsZipUrl: windowsZipUrl,
+      windowsZipSize: windowsZipSize,
+      windowsZipDigest: windowsZipDigest,
+    );
   }
 
   /// 原始 tag，形如 `v5.6.5`。
@@ -33,6 +42,18 @@ class ReleaseInfo {
 
   /// Release 页面地址（供跳转下载）。
   final String htmlUrl;
+
+  /// Release 说明；Windows 更新提示中展示。
+  final String body;
+
+  /// 当前 Release 的 Windows 便携版 ZIP 下载地址。
+  final String? windowsZipUrl;
+
+  /// Windows ZIP 字节数。
+  final int? windowsZipSize;
+
+  /// GitHub 提供的资产摘要（通常为 `sha256:<hex>`）。
+  final String? windowsZipDigest;
 }
 
 /// Release 数据来源抽象：让 [UpdateCheckService] 可在测试中注入假实现，不联网。

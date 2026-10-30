@@ -253,3 +253,80 @@ class MvDetail {
       return playCount.toString();
   }
 }
+
+/// MV 的单个片源：来自 `/kmr/audio/mv` 响应里 `h264`/`h265`/`mkv` 编码映射。
+///
+/// 每个编码映射按清晰度（fhd/hd/qhd/sd/ld）提供 `${quality}_hash` 与
+/// `${quality}_filesize`，本模型据此汇总成一个可请求 `/video/url` 的片源。
+class MvSource {
+  /// 视频 hash，用于 `/video/url` 获取播放地址。
+  final String hash;
+
+  /// 清晰度标签，如 "1080P" / "720P"。
+  final String label;
+
+  /// 编码族标签："H.264" / "H.265" / "MKV"。
+  final String codec;
+
+  /// 文件大小（字节），供「取较小片源」排序；可为空。
+  final int? size;
+
+  const MvSource({
+    required this.hash,
+    required this.label,
+    required this.codec,
+    this.size,
+  });
+}
+
+/// 曲库 MV 候选：含 MV 音频兜底筛选所需的标记字段。
+///
+/// 字段口径对齐 EchoMusic `pickCatalogMv`：只有「官方发布、非 UGC、非平台短视频、
+/// 非其他版本、有片源、时长 > 0」的记录才可用于兜底。
+class MvCandidate {
+  /// MV 的 video_id。
+  final String videoId;
+
+  /// 顶层 hash（部分响应直接返回，可作为片源 hash 的补充）。
+  final String? hash;
+
+  /// MV 时长（秒）；0 视为不可用。
+  final int durationSeconds;
+
+  /// 上游是否推荐该版本（`is_recommend == 1`）。
+  final bool recommend;
+
+  /// 上游 `is_publish`；未发布（!=1）不可用。
+  final int? isPublish;
+
+  /// 上游 `is_ugc`；UGC 版本（==1）不可用，字段缺失（null）也视为不可用。
+  final int? isUgc;
+
+  /// 上游 `is_short`；平台短视频（!=0）不可用，字段缺失（null）也视为不可用。
+  final int? isShort;
+
+  /// 上游 `is_other`；其他版本（==1）不可用，字段缺失（null）也视为不可用。
+  final int? isOther;
+
+  /// 记录内 `__status`；为 null 表示未返回（放行），==1 放行。
+  final int? status;
+
+  /// 该 MV 的全部片源。
+  final List<MvSource> sources;
+
+  const MvCandidate({
+    required this.videoId,
+    this.hash,
+    this.durationSeconds = 0,
+    this.recommend = false,
+    this.isPublish,
+    this.isUgc,
+    this.isShort,
+    this.isOther,
+    this.status,
+    this.sources = const [],
+  });
+
+  bool get hasSources => sources.isNotEmpty;
+}
+

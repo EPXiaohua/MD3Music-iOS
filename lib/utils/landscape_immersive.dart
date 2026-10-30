@@ -38,6 +38,32 @@ bool kLandscapeImmersiveEnabled = true;
 final ValueNotifier<bool> kLandscapeDetachedControlsEnabled =
     ValueNotifier<bool>(false);
 
+/// 横屏/宽屏左右分栏是否对称（1:1）。初值必须与 SettingsRepository 默认值一致
+/// （见 `getSymmetricWidePane`），否则启动载入前会短暂按另一套分栏渲染。
+/// 由 app.dart 启动引导恢复、设置页开关即时同步；两个 full_player 的
+/// initState 监听它并在变化时 setState 重算分栏（左栏 1:1 还是 4:6）。
+final ValueNotifier<bool> kSymmetricWidePaneEnabled =
+    ValueNotifier<bool>(true);
+
+/// 宽屏（横屏/平板）左栏内衬的手动覆盖值（dp）。null = 自动（按屏宽比例，
+/// 见 `PlayerWidePane.gutter`），非 null 时完全取代比例算法（0 = 无边距）。
+/// 初值必须与 `SettingsRepository.getWidePaneMargin` 的默认值（null）一致，
+/// 否则启动载入前会短暂按另一套内衬渲染。
+/// 由 app.dart 启动引导恢复、设置页滑条即时同步；两个 full_player 的
+/// initState 监听它并在变化时 setState 重算内衬。
+final ValueNotifier<double?> kWidePaneMarginOverride =
+    ValueNotifier<double?>(null);
+
+/// 宽屏布局是否忽略挖孔（刘海）对称补偿。仅在 kWidePaneMarginOverride 非 null
+/// （自定义宽屏边距开启）时生效：开启后宽屏布局不做挖孔对称补偿（inset=0），
+/// 内容可延伸到挖孔/刘海区域真贴边，遮挡由用户自担。
+/// 初值必须与 `SettingsRepository.getWidePaneIgnoreCutout` 的默认值（false）
+/// 保持一致，否则启动载入前会短暂按另一套补偿渲染。
+/// 由 app.dart 启动引导恢复、设置页开关即时同步；两个 full_player 的
+/// initState 监听它并在变化时 setState 重算补偿。
+final ValueNotifier<bool> kWidePaneIgnoreCutoutEnabled =
+    ValueNotifier<bool>(false);
+
 /// 全屏播放器竖屏下的系统栏样式。
 ///
 /// **重要**：[AmStyleFullPlayer._buildFullLayout] 中 AnnotatedRegion 的 value

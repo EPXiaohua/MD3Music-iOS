@@ -13,6 +13,7 @@ import '../modules/library/song_match_sheet.dart';
 import '../modules/player/comments_view.dart';
 import '../modules/player/song_accompany_sheet.dart';
 import '../modules/player/song_ranking_sheet.dart';
+import '../modules/sheet/song_sheet_sheet.dart';
 import '../modules/player/full_player_route.dart' show activePlayerRoute;
 import '../modules/player/mv_player_page.dart';
 import '../modules/player/player_cover_morph.dart' show PlayerCoverMorphBus;
@@ -54,7 +55,7 @@ class SongListItem extends StatelessWidget {
   /// 可选扩展：歌曲更多菜单的额外条目（默认关闭，由私有构建注入）。
   /// 返回的 Widget 追加在菜单底部（「下一首播放」之前）。
   static List<Widget> Function(BuildContext context, Song song)?
-  extraMenuTilesBuilder;
+      extraMenuTilesBuilder;
 
   final Song song;
   final VoidCallback? onTap;
@@ -102,8 +103,7 @@ class SongListItem extends StatelessWidget {
   SongMenuInfoFetcher? _menuInfoFetcher(BuildContext context) {
     try {
       final apiClient = context.read<KugouProvider>().apiClient;
-      return (hash, albumId) =>
-          apiClient.getPrivilegeLite(hash, albumId: albumId);
+      return (hash, albumId) => apiClient.getPrivilegeLite(hash, albumId: albumId);
     } on ProviderNotFoundException {
       return null;
     }
@@ -137,8 +137,8 @@ class SongListItem extends StatelessWidget {
                 final favorited = forceFavorited
                     ? true
                     : (song.isOnline
-                          ? favorites.isFavorite(song.id)
-                          : localFavorites.isFavorite(song.id));
+                        ? favorites.isFavorite(song.id)
+                        : localFavorites.isFavorite(song.id));
                 final cs = Theme.of(ctx2).colorScheme;
                 return ListTile(
                   leading: Icon(
@@ -159,9 +159,7 @@ class SongListItem extends StatelessWidget {
                 title: const Text('编辑歌曲信息'),
                 onTap: () async {
                   Navigator.pop(ctx);
-                  final r = await LyricoEditor.launchLyricoEdit(
-                    song.localPath!,
-                  );
+                  final r = await LyricoEditor.launchLyricoEdit(song.localPath!);
                   if (!r.installed) {
                     showToast('未安装 Lyrico，请先安装后再编辑', long: true);
                   } else if (!r.launched) {
@@ -185,7 +183,9 @@ class SongListItem extends StatelessWidget {
                 title: const Text('查看 MV'),
                 onTap: () {
                   Navigator.pop(ctx);
-                  Navigator.of(context, rootNavigator: true).push(
+                  Navigator.of(
+                    context,
+                    rootNavigator: true).push(
                     MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
                   );
                 },
@@ -199,7 +199,7 @@ class SongListItem extends StatelessWidget {
                 builder: (ctx2, blacklist, _) {
                   final present =
                       blacklist.statusFor('song', song.id.toLowerCase()) ==
-                      BlacklistStatus.present;
+                          BlacklistStatus.present;
                   return ListTile(
                     leading: Icon(
                       present
@@ -220,15 +220,16 @@ class SongListItem extends StatelessWidget {
               ),
             // 可选扩展：私有构建注入的额外菜单条目（默认无）
             ...?SongListItem.extraMenuTilesBuilder?.call(ctx, song),
-            ListTile(
-              // 与紧邻的「下一首播放」(playlist_add) 区分图标，避免同图标相邻
-              leading: const Icon(Icons.add_to_queue_outlined),
-              title: const Text('添加到歌单'),
-              onTap: () {
-                Navigator.pop(ctx);
-                showAddToPlaylistDialog(context, song);
-              },
-            ),
+            if (song.isOnline)
+              ListTile(
+                // 与紧邻的「下一首播放」(playlist_add) 区分图标，避免同图标相邻
+                leading: const Icon(Icons.add_to_queue_outlined),
+                title: const Text('添加到歌单'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showAddToPlaylistDialog(context, song);
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.playlist_add),
               title: const Text('下一首播放'),
@@ -268,6 +269,16 @@ class SongListItem extends StatelessWidget {
                   showSongAccompanySheet(context, song);
                 },
               ),
+            // 曲谱同样依赖 album_audio_id（/sheet/song 查询键）
+            if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.library_music_outlined),
+                title: const Text('看曲谱'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showSongSheetSheet(context, song);
+                },
+              ),
           ],
         ),
       ),
@@ -303,10 +314,8 @@ class SongListItem extends StatelessWidget {
   Future<void> _unmarkSongBlacklist(BuildContext context) async {
     final blacklist = context.read<BlacklistProvider>();
     final hash = song.id.toLowerCase();
-    final matches = blacklist
-        .entries('song')
-        .where((e) => e.key == hash)
-        .toList();
+    final matches =
+        blacklist.entries('song').where((e) => e.key == hash).toList();
     if (matches.isEmpty) {
       showToast('未找到黑名单记录，请在黑名单管理中操作');
       return;
@@ -328,8 +337,7 @@ class SongListItem extends StatelessWidget {
   ) async {
     itemCtx.read<PlayerProvider>().insertAfterCurrent([song]);
     final miniRect = PlayerCoverMorphBus.instance.miniRect;
-    final canFly =
-        !MediaQuery.disableAnimationsOf(itemCtx) &&
+    final canFly = !MediaQuery.disableAnimationsOf(itemCtx) &&
         activePlayerRoute == null &&
         itemCtx.read<PlayerProvider>().currentSong != null &&
         miniRect != null &&
@@ -585,7 +593,9 @@ class SongListItem extends StatelessWidget {
             _iconAction(
               colorScheme,
               Icons.music_video_outlined,
-              () => Navigator.of(context, rootNavigator: true).push(
+              () => Navigator.of(
+                context,
+                rootNavigator: true).push(
                 MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
               ),
               label: '查看 MV',

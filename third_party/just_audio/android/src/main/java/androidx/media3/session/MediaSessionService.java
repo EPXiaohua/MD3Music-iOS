@@ -263,10 +263,17 @@ public abstract class MediaSessionService extends Service {
     checkNotNull(session, "session must not be null");
     checkArgument(!session.isReleased(), "session is already released");
     @Nullable MediaSession old;
+    // MD3Music fork v40：provider 的读取与写入都持 lock（第六轮审查：原写在
+    // synchronized 块外，构成 @GuardedBy 字段的数据竞争）。addSession 允许任意
+    // 线程调用，锁内快照后再挂到 impl，锁序保持 service.lock → impl.lock 单向。
+    final MediaSessionImpl sessionImpl = session.getImpl();
     synchronized (lock) {
       old = sessions.get(session.getId());
       checkArgument(old == null || old == session, "Session ID should be unique");
       sessions.put(session.getId(), session);
+      // 新会话接入时把 browse 子节点提供者套上去（vivo 原子随身听列表树）。
+      // legacy browser stub 懒创建，挂到 impl 上——impl 建 stub 时会套用。
+      sessionImpl.setLegacyBrowseChildrenProvider(browseChildrenProvider);
     }
     if (old == null) {
       // Session has returned for the first time. Register callbacks.
@@ -278,6 +285,79 @@ public abstract class MediaSessionService extends Service {
             notificationManager.addSession(session);
             session.setListener(new MediaSessionListener());
           });
+    }
+  }
+
+  /**
+   * MD3Music fork v40：legacy browse 子节点提供者（vivo 原子随身听列表树）。
+   *
+   * <p>接口声明在本类（public）里：{@link MediaSessionServiceLegacyStub} 是包内可见，
+   * App 侧无法引用它的嵌套类型。
+   */
+  public interface BrowseChildrenProvider {
+    @Nullable
+    List<androidx.media3.session.legacy.MediaBrowserCompat.MediaItem> onLoadChildren(
+        @Nullable String parentId, @Nullable Bundle options);
+  }
+
+  /**
+   * MD3Music fork v40：playFromMediaId 消费钩子（vivo 原子随身听列表项点播）。
+   *
+   * <p>App 注入后，legacy 控制器的 playFromMediaId 先经钩子；返回 true 表示已消费
+   * （默认实现会把只有 mediaId、没有 URI 的 item 塞进 ExoPlayer，播不出且污染
+   * media3 时间线）。
+   */
+  public interface PlayFromMediaIdHook {
+    boolean onPlayFromMediaId(@Nullable String mediaId);
+  }
+
+  /** MD3Music fork v40：全局钩子（单会话宿主应用，恒单实例）。 */
+  @Nullable
+  public static volatile PlayFromMediaIdHook playFromMediaIdHook;
+
+  /** MD3Music fork v39：browse 子节点提供者（App 侧注入）。 */
+  @GuardedBy("lock")
+  @Nullable
+  private BrowseChildrenProvider browseChildrenProvider;
+
+  /**
+   * MD3Music fork v39：设置 legacy browse 子节点提供者。
+   *
+   * <p>会话创建前调用最佳；会话已存在时会立即补挂（见 {@link #addSession}）。
+   */
+  public void setLegacyBrowseChildrenProvider(@Nullable BrowseChildrenProvider provider) {
+    synchronized (lock) {
+      browseChildrenProvider = provider;
+      for (MediaSession session : sessions.values()) {
+        MediaSessionImpl sessionImpl = session.getImpl();
+        if (sessionImpl != null) {
+          sessionImpl.setLegacyBrowseChildrenProvider(provider);
+        }
+      }
+    }
+  }
+
+  /**
+   * MD3Music fork v48：通知 legacy 浏览订阅方指定父节点的 children 已变化。
+   *
+   * <p>vivo 原子随身听订阅三棵列表树（vivomusicmix_current/favorite/local_list）后，
+   * 内容更新若不 {@code notifyChildrenChanged}，岛端会一直显示订阅时刻的旧列表
+   * （melodist 参考实现每次列表变化都通知）。内部投递到主线程执行；未订阅时为
+   * no-op，任意调用方安全。
+   */
+  public void notifyLegacyChildrenChanged(String parentId) {
+    synchronized (lock) {
+      for (MediaSession session : sessions.values()) {
+        MediaSessionImpl sessionImpl = session.getImpl();
+        if (sessionImpl != null) {
+          @Nullable MediaSessionServiceLegacyStub stub = sessionImpl.getLegacyBrowserService();
+          if (stub != null) {
+            postOrRun(
+                mainHandler,
+                () -> stub.notifyChildrenChanged(parentId));
+          }
+        }
+      }
     }
   }
 

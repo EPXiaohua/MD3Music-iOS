@@ -73,6 +73,10 @@ class KugouEndpoints {
   static const String playlistDel = '/playlist/del';
   static const String playlistTracksAdd = '/playlist/tracks/add';
   static const String playlistTracksDel = '/playlist/tracks/del';
+  static const String playlistSort = '/playlist/sort';
+  static const String playlistPic = '/playlist/pic';
+  static const String playlistPicUpload = '/playlist/pic/upload';
+  static const String playlistUpdate = '/playlist/update';
 
   // Sheet
   static const String sheetCollection = '/sheet/collection';
@@ -161,6 +165,12 @@ class KugouEndpoints {
   static const String loginQrCheck = '/login/qr/check';
   static const String loginWxCreate = '/login/wx/create';
   static const String loginWxCheck = '/login/wx/check';
+
+  /// QQ 扫码登录（Rust `login.rs::handle_qq_qr_create`）。
+  /// 返回根级 `{qrcode, qrsig, ptqrtoken, pt_login_sig, pt_openlogin_data,
+  /// xlogin_url, cookie}`，check 时原样回传这 6 个会话字段。
+  static const String loginQqQrCreate = '/login/qq/qr/create';
+  static const String loginQqQrCheck = '/login/qq/qr/check';
   static const String loginToken = '/login/token';
   static const String loginDevice = '/login/device';
   static const String loginDeviceKick = '/login/device/kick';

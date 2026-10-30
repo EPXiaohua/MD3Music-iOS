@@ -58,8 +58,9 @@ JustAudioPlatform get _pluginPlatform {
 class AudioPlayer {
   /// MD3Music fork: 辅播放器（crossfade 用）的 id 前缀。
   ///
-  /// Android 侧 `AudioPlayer.java` 在构造时按此前缀判定"辅播放器"，
-  /// 跳过 MediaSession 创建（避免系统看到重复媒体会话）。
+  /// Android 侧所有播放器（含辅播放器）都会创建 Media3 会话，会话归属由
+  /// `AudioPlayer.play()` 收敛：只有真正开始播放的播放器，其会话才被归入
+  /// host（其余会话被释放），系统任意时刻只暴露一个活跃媒体会话。
   /// id 只用于 MethodChannel 名与平台消息的 `id` 字段，加前缀是安全的。
   static const String androidAuxIdPrefix = 'md3aux-';
 
@@ -258,10 +259,13 @@ class AudioPlayer {
   ///
   /// MD3Music fork: set [androidAuxPlayer] to `true` for the secondary player
   /// used during crossfade. Such a player gets an id prefixed with
-  /// [androidAuxIdPrefix], which makes the Android side skip creating a
-  /// `MediaSession` for it (otherwise the system would see two active media
-  /// sessions for the app). Combine it with `androidApplyAudioAttributes:
-  /// false` so the aux player never requests audio focus of its own.
+  /// [androidAuxIdPrefix] for diagnostics only; the Android side creates a
+  /// `MediaSession` for every player, and converges session ownership in
+  /// `AudioPlayer.play()`: only the player that actually starts playing has
+  /// its session hosted, all other sessions are released from the host, so
+  /// the system always exposes a single active media session. Combine it with
+  /// `androidApplyAudioAttributes: false` so the aux player never requests
+  /// audio focus of its own.
   AudioPlayer({
     String? userAgent,
     bool handleInterruptions = true,
@@ -1299,10 +1303,11 @@ class AudioPlayer {
 
   /// 读取当前曲目的「源格式」（歌曲原始位深/采样率/码率/声道，取自 TrackGroup）。
   /// 与解码输出格式不同：源格式保留歌曲原始位深（如 FLAC 24bit → bitsPerSample=24），
-  /// 而解码输出可能被降为 16bit。仅 Android 平台有效，失败返回 null。
+  /// 而解码输出可能被降为 16bit。Windows 从当前 MediaPlaybackItem 读取，失败返回 null。
   Future<Map<String, dynamic>?> getSourceFormat() async {
     if (_disposed) return null;
-    if (!_isAndroid()) return null;
+    if (!_isAndroid() && (kIsWeb || !Platform.isWindows)) return null;
+    if (_id == null) return null;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
       final result = await channel.invokeMethod('getSourceFormat');
@@ -1392,8 +1397,7 @@ class AudioPlayer {
   bool? _pendingForceKeepPlaying;
 
   /// 读取本曲累计传输字节与播放位置（歌曲信息页实时码率用）。仅 Android 有效。
-  Future<Map<String, dynamic>?> getTransferStats() async {
-    if (_disposed) return null;
+  Future<Map<String, dynamic>?> getTransferStats() async {    if (_disposed) return null;
     if (!_isAndroid()) return null;
     try {
       final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');

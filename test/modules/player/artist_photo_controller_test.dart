@@ -155,6 +155,41 @@ void main() {
     expect(fetches, 2);
   });
 
+  test('setInterval：按新间隔重起轮播，不重拉图、不通知', () async {
+    final c = ArtistPhotoController(
+      service: _service({
+        'h-interval': ['https://p/a.jpg', 'https://p/b.jpg'],
+      }),
+    );
+    addTearDown(c.dispose);
+    // 先按 60 秒起：1.2 秒内不翻页
+    await c.setHash('h-interval', intervalSeconds: 60);
+    expect(c.currentUrl.value, 'https://p/a.jpg');
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    expect(c.currentUrl.value, 'https://p/a.jpg');
+
+    // 播放中改设置页「轮播间隔」→ 重起定时器后 1.2 秒内应已翻页
+    var n = 0;
+    c.addListener(() => n++);
+    c.setInterval(1);
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    expect(c.currentUrl.value, 'https://p/b.jpg');
+    expect(n, 0);
+  });
+
+  test('setInterval：无图 / 单图时无事可做（不抛、不翻页）', () async {
+    final c = ArtistPhotoController(
+      service: _service({
+        'h-interval-one': ['https://p/only.jpg'],
+      }),
+    );
+    addTearDown(c.dispose);
+    await c.setHash('h-interval-one', intervalSeconds: 60);
+    c.setInterval(1);
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    expect(c.currentUrl.value, 'https://p/only.jpg');
+  });
+
   test('seedFromCache：首帧空态同步填充，不通知、不改 hash', () async {
     final service = _service({
       'seed-h': ['https://p/a.jpg', 'https://p/b.jpg'],

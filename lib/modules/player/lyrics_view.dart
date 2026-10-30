@@ -1,10 +1,16 @@
 import 'dart:async';
 
+import 'package:dpad/dpad.dart';
 import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:provider/provider.dart';
 
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/md3_lyric_preferences.dart';
+import '../../providers/theme_provider.dart';
+import '../../core/build_flags.dart';
+import '../../core/remote/tv_hint_bar.dart';
+import '../../core/remote/tv_lyrics_focus.dart';
 import '../../core/utils/lyric_wrap_plan.dart';
 
 class LyricsView extends StatefulWidget {
@@ -72,6 +78,18 @@ class LyricsViewState extends State<LyricsView> {
 
   // ListView 顶部 padding
   static const double _topPadding = 100.0;
+
+  // tv: 歌词页遥控焦点状态机与逐行 FocusNode 登记表。
+  //
+  // 只在 `kTvBuild` 分支创建/登记：触屏构建既不创建状态机，也不把行包成
+  // 遥控停点，路径逐像素不变（AGENTS §12 惯例：可测状态机不带编译期旗标，
+  // 由调用方门控）。状态机本身在 `tv_lyrics_focus.dart`，`flutter test` 可钉。
+  TvLyricsFocus? _tvFocus;
+  final Map<int, FocusNode> _tvLineNodes = <int, FocusNode>{};
+
+  /// tv: 歌词页的遥控键位提示文案（也用于「只有文案仍属于本页时才清除」——
+  /// 焦点移到进度条/传输行等自带提示的控件时不覆盖它们的文案）。
+  static const String _tvLyricsHint = '上下键选歌词行 · OK 跳到该行';
 
   // 当前 MD3 歌词偏好快照（行高 = fontSize * lineSpacing）
   Md3LyricPreferences get _prefs => Md3LyricPreferences.instance;
@@ -176,6 +194,9 @@ class LyricsViewState extends State<LyricsView> {
     widget.positionListenable?.removeListener(_onExternalPos);
     _prefs.removeListener(_onPrefsChanged);
     _cancelResumeTimer();
+    // tv: 状态机只持有 4s 恢复跟随的 Timer，页面销毁时必须取消
+    // （AGENTS §10.4 第 7 条）；逐行 FocusNode 由各行 State 自行释放。
+    _tvFocus?.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -421,7 +442,11 @@ class LyricsViewState extends State<LyricsView> {
 
     if (mounted) {
       setState(() {});
-      if (scrollNeeded && !_userTouching && newIndex >= 0) {
+      // tv: 遥控期间互斥——用户刚移行就被「按播放进度回滚」拉回去会看不清自己
+      // 在哪一行，故判据取「未进入遥控（_tvFocus == null）或状态机仍在跟随」。
+      // following == false 期间只更新高亮，不回滚视图。
+      final bool followPlayback = _tvFocus == null || _tvFocus!.following;
+      if (scrollNeeded && !_userTouching && followPlayback && newIndex >= 0) {
         _forceScroll = false;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) _scrollToLine(newIndex, jump: !_initialJumpDone);
@@ -606,10 +631,88 @@ class LyricsViewState extends State<LyricsView> {
     }
   }
 
+  /// tv: 惰性创建遥控焦点状态机。
+  ///
+  /// OK 提交出口是 [widget.onSeek]——与触屏 [_onLineTap] **同一条** seek 出口
+  /// （行时间戳在该页就是 `_parsedLyrics[i].timestamp`，字段名照旧），
+  /// 不新增第二套 seek 路径。
+  TvLyricsFocus _ensureTvFocus() {
+    return _tvFocus ??= TvLyricsFocus(
+      lineCount: () => _parsedLyrics.length,
+      onSeek: (ms) => widget.onSeek(Duration(milliseconds: ms)),
+    );
+  }
+
+  /// tv: 行上/下键 → 状态机移行，再对目标行 `requestFocus`；左右放行（返回
+  /// false）让焦点出得去（AGENTS §12.4 规则：只吃本控件真正消费的方向键）。
+  bool _tvHandleDirection(TraversalDirection direction) {
+    final TvLyricsFocus? focus = _tvFocus;
+    if (focus == null || !focus.move(direction)) return false;
+    final int? target = focus.focusedIndex;
+    if (target == null) return true;
+    final FocusNode? node = _tvLineNodes[target];
+    if (node != null && node.canRequestFocus) {
+      node.requestFocus();
+    } else {
+      // 目标行还没进 ListView 的构建窗口（视口外）：先把列表滚到那一行，等它
+      // 建出来后再落焦。少了这一步，长按上下键越过已构建范围就再也移不动
+      // （节点不在 `_tvLineNodes` 里，requestFocus 无处可发）。
+      _scrollToLine(target, jump: true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _tvLineNodes[target]?.requestFocus();
+      });
+    }
+    if (mounted) setState(() {});
+    return true;
+  }
+
+  /// tv: OK → 焦点行跳到它的时间戳（状态机的 [TvLyricsFocus.commit]）。
+  void _tvCommitFocusedLine() {
+    _ensureTvFocus().commit(
+      timeMsOfLine: (i) => _parsedLyrics[i].timestamp.inMilliseconds,
+    );
+  }
+
+  /// tv: 行获得焦点 → 焦点行落到该行（即屏幕上看得见的那一行，红框与高亮
+  /// 始终一致），并暂停按播放进度回滚；失焦 → 下一帧再判定是「行间移动」还是
+  /// 「真的离开了歌词区」，后者清空状态机与提示。
+  void _tvLineFocusChanged(int index, bool focused) {
+    final TvLyricsFocus focus = _ensureTvFocus();
+    if (focused) {
+      focus.enter(currentIndex: index);
+      TvHintBarScope.show(_tvLyricsHint);
+      if (mounted) setState(() {});
+      return;
+    }
+    // 失焦回调可能先于目标行的获焦回调触发，此刻判「是否已离开歌词区」会误判；
+    // 延到下一帧按 primaryFocus 判定。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final FocusNode? primary = FocusManager.instance.primaryFocus;
+      if (primary != null && _tvLineNodes.containsValue(primary)) return;
+      _tvFocus?.exit();
+      // 只在本页文案还在时清除：焦点落到了自带提示的控件（进度条等）时不覆盖。
+      if (TvHintBarScope.current.value == _tvLyricsHint) {
+        TvHintBarScope.clear();
+      }
+      setState(() {});
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final prefs = _prefs;
+    final lyricTextColor = prefs.customTextColor;
+    final themeProvider = context.read<ThemeProvider?>();
+    // 全局界面文字颜色不得改变未单独设色的歌词；还原主题原本的副文字色。
+    final defaultInactiveColor = themeProvider?.customTextColor == null
+        ? colorScheme.onSurfaceVariant
+        : ColorScheme.fromSeed(
+            seedColor: themeProvider!.effectiveSeedColor,
+            brightness: Theme.of(context).brightness,
+          ).onSurfaceVariant;
     final fontSize = prefs.fontSize;
     // 非当前行仍是歌词内容，下限取 12（与 LyricLayout 的可读下限一致）
     final otherFontSize = (fontSize - 3).clamp(12.0, fontSize);
@@ -655,12 +758,18 @@ class LyricsViewState extends State<LyricsView> {
               ),
               itemCount: _parsedLyrics.length,
               itemBuilder: (context, index) {
-                final isCurrent = index == _currentLineIndex;
+                // tv: 焦点行沿用本页既有的「当前行 / 非当前行」配色体系
+                // （见下方 AnimatedDefaultTextStyle 的 isCurrent 分支），
+                // 不新增第二套视觉。
+                final int? tvFocusedIndex =
+                    kTvBuild ? _tvFocus?.focusedIndex : null;
+                final isCurrent =
+                    index == _currentLineIndex || index == tvFocusedIndex;
                 final line = _parsedLyrics[index];
                 final auxiliaryText = _selectedAuxiliaryText(line);
                 final auxiliaryFontSize = _auxiliaryFontSize(fontSize);
 
-                return GestureDetector(
+                final Widget row = GestureDetector(
                   onTap: widget.doubleTapToJump
                       ? null
                       : () => _onLineTap(index),
@@ -683,9 +792,13 @@ class LyricsViewState extends State<LyricsView> {
                                 ? prefs.fontWeight
                                 : prefs.otherFontWeight,
                             fontFamily: fontFamily,
-                            color: isCurrent
-                                ? colorScheme.primary
-                                : colorScheme.onSurfaceVariant,
+                            color: lyricTextColor == null
+                                ? (isCurrent
+                                    ? colorScheme.primary
+                                    : defaultInactiveColor)
+                                : (isCurrent
+                                    ? lyricTextColor
+                                    : lyricTextColor.withValues(alpha: 0.7)),
                             // 与 _ensureLayout 的测量保持一致（换行内部行距）
                             height: _wrapLineHeight,
                           ),
@@ -713,12 +826,12 @@ class LyricsViewState extends State<LyricsView> {
                                 height: _auxiliaryLineHeight,
                                 fontWeight: prefs.otherFontWeight,
                                 fontFamily: fontFamily,
-                                color: isCurrent
-                                    ? colorScheme.primary.withValues(
-                                        alpha: 0.7,
-                                      )
-                                    : colorScheme.onSurfaceVariant.withValues(
-                                        alpha: 0.7,
+                                color: lyricTextColor == null
+                                    ? (isCurrent
+                                        ? colorScheme.primary.withValues(alpha: 0.7)
+                                        : defaultInactiveColor.withValues(alpha: 0.7))
+                                    : lyricTextColor.withValues(
+                                        alpha: isCurrent ? 0.7 : 0.5,
                                       ),
                               ),
                             ),
@@ -726,6 +839,16 @@ class LyricsViewState extends State<LyricsView> {
                       ],
                     ),
                   ),
+                );
+
+                // tv: 每行一个遥控停点（上/下移行、OK 跳到该行时间戳）。
+                // 非 TV 构建原样返回上面那棵树，触屏路径逐像素不变。
+                if (!kTvBuild) return row;
+                return _TvLyricLineRow(
+                  key: ValueKey<int>(index),
+                  index: index,
+                  host: this,
+                  child: row,
                 );
               },
             ),
@@ -753,4 +876,67 @@ class _LyricLine {
     this.translation,
     this.roma,
   });
+}
+
+/// tv: 歌词行的遥控包装——每行一个停点，FocusNode 与行的挂载生命周期同生共死。
+///
+/// ## 为什么节点必须随行销毁并从登记表移除
+///
+/// `ListView.builder` 会把滚出构建窗口的行整棵销毁。若把节点留在
+/// [_LyricsViewState._tvLineNodes] 里，之后 `requestFocus` 会点到已 `dispose`
+/// 的节点（debug 下直接断言崩），也会让 `_tvLineFocusChanged` 的
+/// 「焦点是否仍在歌词区」判定（`_tvLineNodes.containsValue`）被幽灵节点骗过。
+/// 因此 [dispose] 必须**同时**移除登记项并释放节点。
+///
+/// ## 与触屏路径的关系
+///
+/// 只有调用方在 `kTvBuild` 分支才会构造本组件（见 itemBuilder 里的门控），
+/// 非 TV 构建 `ListView` 的行仍是原 `GestureDetector`，逐像素不变。
+/// `DpadFocusable` 的 `excludeChildFocus` 保持默认 true：内层
+/// `GestureDetector` 不产生第二个停点（AGENTS §12.4 规则 3）。
+class _TvLyricLineRow extends StatefulWidget {
+  const _TvLyricLineRow({
+    super.key,
+    required this.index,
+    required this.host,
+    required this.child,
+  });
+
+  final int index;
+  final LyricsViewState host;
+  final Widget child;
+
+  @override
+  State<_TvLyricLineRow> createState() => _TvLyricLineRowState();
+}
+
+class _TvLyricLineRowState extends State<_TvLyricLineRow> {
+  late final FocusNode _node;
+
+  @override
+  void initState() {
+    super.initState();
+    _node = FocusNode(debugLabel: 'tv/lyric-line-${widget.index}');
+    widget.host._tvLineNodes[widget.index] = _node;
+  }
+
+  @override
+  void dispose() {
+    // 顺序要紧：先摘登记表，再释放节点（释放后访问会断言）。
+    widget.host._tvLineNodes.remove(widget.index);
+    _node.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DpadFocusable(
+      focusNode: _node,
+      onFocusChange: (focused) =>
+          widget.host._tvLineFocusChanged(widget.index, focused),
+      onSelect: widget.host._tvCommitFocusedLine,
+      onDirection: widget.host._tvHandleDirection,
+      child: widget.child,
+    );
+  }
 }

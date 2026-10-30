@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import '../platform_capabilities.dart';
 import 'diagnostic_logger.dart';
 
 /// 「频谱总开关」的**同步可读**进程级镜像（默认关）。
@@ -26,7 +26,10 @@ int kSpectrumStyle = 0;
 
 /// 频谱**圆盘**（style 0/1：圆形旋转封面 + 环形频谱柱）当前是否生效。
 ///
-/// 圆盘下封面形变必须关闭（形变层画不出圆形裁切 + 旋转），但**文字形变照旧**。
+/// 圆盘下封面**仍可做 mini→full 的连贯形变**（可见圆 = 槽位盒内缩
+/// `SpectrumArtwork.barReserveRatio`、唱片角取共享相位）。本镜像只负责「终点
+/// 形状是什么」，且必须**同步可读**：跟手覆盖层里的播放页是当场新建的，首帧就
+/// 在 0<p<1，它自己的异步偏好还没读到。
 bool get kSpectrumDiscCoverActive => kSpectrumEnabled && kSpectrumStyle < 2;
 
 /// 频谱**视觉对齐延迟**（毫秒，默认 580）。
@@ -37,27 +40,43 @@ bool get kSpectrumDiscCoverActive => kSpectrumEnabled && kSpectrumStyle < 2;
 /// 让柱体起落与听到的拍点同相。设置页拖动滑杆下一帧（≈50ms）实时生效；0 关闭。
 int kSpectrumVisualOffsetMs = 580;
 
-/// 频谱可视化服务：单例，桥接 Kotlin [SpectrumPlugin] 的 FFT 数据流。
+/// 频谱可视化服务：单例，桥接原生 FFT 数据流。
 ///
-/// **双模式设计**（兼容 HyperOS 等禁用 Visualizer 的 ROM）：
-/// - **真实模式**：通过 MethodChannel 接收原生 Visualizer 的 FFT 回调
-/// - **模拟模式**：Visualizer 不可用时，用 sin 波动 + 随机化生成装饰性频谱数据
+/// **双平台原生采集**（同一套通道协议，`com.md3music.md3music/spectrum`）：
+/// - Android：Kotlin [SpectrumPlugin] 从 PCM 截取或 `Visualizer` 取 FFT；
+/// - Windows：runner 的 `SpectrumCapture` 用 WASAPI 环回采集输出音频后自己算
+///   FFT（进程环回优先，老系统回落系统混音），帧形状与 Android 逐字段一致。
 ///
-/// 播放期间超过 1.5 秒未收到 FFT 回调时降级，并低频重试原生采集。
+/// **三级降级**（兼容采集不可用的环境）：
+/// - **真实模式**：通过 MethodChannel 接收原生 FFT 回调；
+/// - **模拟模式**：原生采集不可用时，用 sin 波动 + 随机化生成装饰性频谱数据；
+/// - 播放期间超过 1.5 秒未收到 FFT 回调时降级，并低频重试原生采集。
 /// 收到真实 FFT 回调后自动切换回真实模式。
 ///
 /// 模拟模式视觉上跟随播放节奏（播放时跳动、暂停时静止），但不反映真实音频频谱。
 class SpectrumService with WidgetsBindingObserver {
-  SpectrumService._() : _isAndroid = Platform.isAndroid;
+  SpectrumService._()
+    : _isAndroid = isAndroidPlatform,
+      _isWindows = isWindowsDesktop,
+      _isIos = isIOSPlatform;
   @visibleForTesting
-  SpectrumService.forTesting({required bool isAndroid})
-    : _isAndroid = isAndroid;
+  SpectrumService.forTesting({required bool isAndroid, bool isWindows = false})
+    : _isAndroid = isAndroid,
+      _isWindows = isWindows,
+      _isIos = false;
   final bool _isAndroid;
+  final bool _isWindows;
+
+  // iOS 原生频谱走同一条 MethodChannel（EQ tap 的 spectrumFeed，由
+  // AudioEqualizer 提供），必须与 Android 一样进真实采集路径；仅在
+  // 「断流自动降级模拟」上比 Android 更保守（见 _watchData：iOS 不降级，
+  // 频谱保持静止）。
+  final bool _isIos;
+
+  /// 是否存在原生采集通路（Android PCM/Visualizer、iOS EQ tap 或
+  /// Windows WASAPI 环回）。
+  bool get _hasNativeCapture => _isAndroid || _isWindows || _isIos;
   static final SpectrumService instance = SpectrumService._();
-  // iOS 原生频谱走同一条 MethodChannel（MTAudioProcessingTap），必须与 Android
-  // 一样进真实采集路径；仅在「断流自动降级模拟」上比 Android 更保守（见
-  // _watchData：iOS 不降级，频谱保持静止）。
-  bool get _isIos => Platform.isIOS;
 
   static const String _channelName = 'com.md3music.md3music/spectrum';
 
@@ -106,6 +125,26 @@ class SpectrumService with WidgetsBindingObserver {
   bool _running = false;
   bool get isRunning => _running;
 
+  /// 原生采集当前是否真的在工作：服务在跑且未被「退后台」暂停。
+  ///
+  /// 「硬件解码播放」（audio offload）用它判断频谱是否正在消费 PCM 采样：
+  /// offload 的样本不经过应用进程，采不到 PCM，两者天然互斥。
+  bool get isNativeCaptureActive => _running && !_nativeSuspended;
+
+  /// 采集工作状态变化回调（同步调用，供硬解让路判定立即重算）。
+  ///
+  /// 刻意做成同步 + 吞异常：它挂在生命周期回调与 start/stop 的关键路径上，
+  /// 回调抛错绝不能影响采集本身（或导致原生停不下来）。
+  void Function()? onCaptureStateChanged;
+
+  void _notifyCaptureStateChanged() {
+    final callback = onCaptureStateChanged;
+    if (callback == null) return;
+    try {
+      callback();
+    } catch (_) {}
+  }
+
   /// 是否正在使用模拟模式（Visualizer 不可用时的降级方案）
   bool _simulated = false;
   bool get isSimulated => _simulated;
@@ -125,10 +164,77 @@ class SpectrumService with WidgetsBindingObserver {
   DateTime? _lastRecoveryAt;
   int _sessionId = 0;
 
+  /// 看门狗 500ms 拍计数：攒满 10 拍打一条诊断行（约 5s）。
+  int _watchBeats = 0;
+
   /// 原生端是否允许挂 Visualizer 兜底（透传给 Kotlin，重绑时沿用）。
   bool _visualizerFallback = true;
   bool _recovering = false;
   bool _foreground = true;
+
+  /// 退后台时是否仍需原生采集（见 [setBackgroundCaptureRequired]）。
+  bool _backgroundCaptureRequired = false;
+
+  /// 原生采集是否因退后台而暂停（[_running] 与 owner 集合保持不动）。
+  bool _nativeSuspended = false;
+
+  /// 告知「退后台时是否还有消费者需要采集」。
+  ///
+  /// **为什么要停**：退后台后引擎不产帧，频谱 UI 没有消费者，但原生侧仍在
+  /// ExoPlayer 渲染线程上逐样本解码 PCM + 投 FFT + 每 ~23ms 往主线程发一次
+  /// MethodChannel 帧。前台高负载时这些活正是 AudioTrack 欠载的推手之一，
+  /// 停掉是纯收益。
+  ///
+  /// **为什么不能无条件停**：音乐震动的生效范围可选「始终」（熄屏后台播放也
+  /// 跟着震），那种场景后台仍要 PCM 特征帧驱动马达 —— 由
+  /// [MusicHapticsService] 按 scope 置位，停掉会让震动整个失效。
+  void setBackgroundCaptureRequired(bool value) {
+    if (_backgroundCaptureRequired == value) return;
+    _backgroundCaptureRequired = value;
+    // 已经在后台：立刻按新需求调整，不必等下一次生命周期回调
+    if (!_foreground && _running) {
+      if (value) {
+        _resumeNativeCapture();
+      } else {
+        _suspendNativeCapture();
+      }
+    }
+  }
+
+  /// 停原生采集与看门狗，但保留 [_running] 与 owner 登记（回前台按需恢复）。
+  void _suspendNativeCapture() {
+    if (_nativeSuspended) return;
+    _nativeSuspended = true;
+    _notifyCaptureStateChanged();
+    _fallbackTimer?.cancel();
+    _fallbackTimer = null;
+    _stopSimulated();
+    _cancelPendingFrames();
+    DiagnosticLogger.instance.info('[Spectrum] 退后台，暂停原生采集');
+    if (!_hasNativeCapture) return;
+    // 不 await：生命周期回调是同步的，停失败最多是白跑一段采集，不影响播放
+    unawaited(_stopNative());
+  }
+
+  Future<void> _stopNative() async {
+    try {
+      await _channel.invokeMethod<bool>('stop');
+    } catch (_) {}
+  }
+
+  /// 回前台恢复采集：重启看门狗，并按播放状态重绑原生采集。
+  void _resumeNativeCapture() {
+    if (!_nativeSuspended) return;
+    _nativeSuspended = false;
+    _notifyCaptureStateChanged();
+    if (!_running) return;
+    _lastFftAt = DateTime.now();
+    _lastFeatureAt = null;
+    _watchData();
+    DiagnosticLogger.instance.info('[Spectrum] 回前台，恢复原生采集');
+    if (_hasNativeCapture && _isPlaying) unawaited(_recoverNative());
+  }
+
   double _simulateTime = 0;
   final math.Random _rng = math.Random();
   // 每根柱的相位偏移，让模拟频谱更自然（按最大 bandCount 生成，运行时取模索引）
@@ -171,18 +277,30 @@ class SpectrumService with WidgetsBindingObserver {
       // sessionId 无关，不打断；已降级到模拟模式说明旧绑定没在工作，
       // 必须带新参数立即重绑，否则 _recoverNative 会永远拿旧 session 重试。
       final sessionId = audioSessionId ?? 0;
-      if (_sessionId != sessionId ||
-          _visualizerFallback != visualizerFallback) {
+      if (_sessionId != sessionId || _visualizerFallback != visualizerFallback) {
         _sessionId = sessionId;
         _visualizerFallback = visualizerFallback;
-        if (_isAndroid && _simulated) unawaited(_recoverNative());
+        if (_hasNativeCapture && _simulated) unawaited(_recoverNative());
       }
       return true;
     }
     _running = true;
+    // 服务进入运行态：通知硬解让路判定重算（同步，不阻塞启动）。
+    _notifyCaptureStateChanged();
+    // md3 fork：start 只由「正在播放」路径调起（播放页 _tryStartSpectrum 有
+    // isPlaying 守卫，音乐震动 acquire 后会按真实状态回写）。上一段遗留的暂停
+    // 门控若不在此复位，重启后要等下一次 provider notify 才有人纠正——期间
+    // 频谱以「假暂停」冻住（车机投屏切页后「复活→又冻」的叠加因素）。
+    _isPlaying = true;
+    _gateZero = false;
     WidgetsBinding.instance.addObserver(this);
     final lifecycle = WidgetsBinding.instance.lifecycleState;
-    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    // md3 fork 口径：inactive（可见无焦点——车机投屏/浮窗/通知栏下拉）引擎
+    // 照常出帧，算前台，与 MusicHapticsService 一致。
+    _foreground =
+        lifecycle == null ||
+        lifecycle == AppLifecycleState.resumed ||
+        lifecycle == AppLifecycleState.inactive;
     _sessionId = audioSessionId ?? 0;
     _visualizerFallback = visualizerFallback;
     _lastRecoveryAt = DateTime.now();
@@ -193,8 +311,7 @@ class SpectrumService with WidgetsBindingObserver {
     DiagnosticLogger.instance.info(
       '[Spectrum] start generation=$generation session=${audioSessionId ?? 0}',
     );
-    if (!_isAndroid && !_isIos) {
-      // 其他平台（桌面）直接用模拟模式
+    if (!_hasNativeCapture) {
       _startSimulated();
       return true;
     }
@@ -226,7 +343,16 @@ class SpectrumService with WidgetsBindingObserver {
       _owners.remove(owner ?? _defaultOwner);
       return false;
     }
+    // 起播这 4s 窗口里可能已经退后台：此时 _suspendNativeCapture 早于原生 start 落地，
+    // 原生侧会在后台白跑采集。这里补一次停，避免「停在前、起在后」漏网。
+    if (_nativeSuspended) {
+      unawaited(_stopNative());
+      return true;
+    }
     if (!nativeOk) _startSimulated();
+    // Windows 端把采集模式（process / device）记进诊断：现场排障时一眼区分
+    // 「只采本应用」与「系统混音兜底」，也是 Win10 回落路径的唯一可观测证据。
+    if (_isWindows && nativeOk) unawaited(_logNativeStats());
     return true;
   }
 
@@ -234,9 +360,23 @@ class SpectrumService with WidgetsBindingObserver {
   void _watchData() {
     _fallbackTimer?.cancel();
     _fallbackTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      if (!_running || !_isPlaying || !_foreground) return;
+      if (!_running) return;
+      // md3 fork 诊断行：每 5s 一条看门狗状态，冻结窗口内可直接定位哪道门
+      // 卡住（fg / playing / gateZero / simulated / 数据陈旧时长）。
+      if (++_watchBeats >= 10) {
+        _watchBeats = 0;
+        final last = _lastFftAt;
+        final staleMs = last == null
+            ? -1
+            : DateTime.now().difference(last).inMilliseconds;
+        DiagnosticLogger.instance.info(
+          '[Spectrum] watch: fg=$_foreground playing=$_isPlaying '
+          'gate=$_gateZero sim=$_simulated stale=${staleMs}ms',
+        );
+      }
+      if (!_isPlaying || !_foreground) return;
       if (_simulated) {
-        if (_isAndroid &&
+        if (_hasNativeCapture &&
             !_recovering &&
             DateTime.now().difference(_lastRecoveryAt!) >=
                 const Duration(seconds: 5)) {
@@ -252,11 +392,12 @@ class SpectrumService with WidgetsBindingObserver {
         // "设备不支持"的场景。播放失败/缓冲/暂停期间没有 PCM 流经 tap，
         // FFT 自然不到达——此时频谱保持静止即可；旧逻辑在 1.5s 无数据时
         // 误降级模拟并弹"设备不支持"，网络差导致播放失败时必然触发。
-        if (_isAndroid) {
-          DiagnosticLogger.instance.warning(
-            '[Spectrum] FFT stream stalled, use simulated fallback',
-          );
-          _startSimulated();
+        if (_isIos) return;
+        DiagnosticLogger.instance.warning(
+          '[Spectrum] FFT stream stalled, use simulated fallback',
+        );
+        _startSimulated();
+        if (_hasNativeCapture) {
           unawaited(_logNativeStats());
           unawaited(_recoverNative());
         }
@@ -266,12 +407,24 @@ class SpectrumService with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _foreground = state == AppLifecycleState.resumed;
-    if (!_foreground || !_running) return;
+    // md3 fork 口径：inactive 算前台（可见无焦点时引擎照常出帧），只有真正
+    // 退后台/熄屏才收回前台——否则车机投屏场景看门狗永远睡着，断流无人恢复。
+    _foreground =
+        state == AppLifecycleState.resumed ||
+        state == AppLifecycleState.inactive;
+    if (!_running) return;
+    if (!_foreground) {
+      // 退后台：无消费者就停原生采集（省掉渲染线程上的逐样本解码 + FFT + 跨线程投递）。
+      // 「始终震动」场景由 setBackgroundCaptureRequired 挡住。
+      if (!_backgroundCaptureRequired) _suspendNativeCapture();
+      return;
+    }
+    // 回前台：先恢复看门狗与原生采集（若退后台时被停掉）。
+    _resumeNativeCapture();
     // 熄屏期间系统可能回收采集资源，亮屏后主动重绑，不能依赖页面的 started 标记。
     _lastFftAt = DateTime.now();
     DiagnosticLogger.instance.info('[Spectrum] app resumed, restore capture');
-    if (_isAndroid && _isPlaying) unawaited(_recoverNative());
+    if (_hasNativeCapture && _isPlaying) unawaited(_recoverNative());
   }
 
   /// 断流后重新注册原生采集；恢复期间保留模拟显示，真实帧到达后自动切回。
@@ -374,6 +527,10 @@ class SpectrumService with WidgetsBindingObserver {
     _owners.remove(owner ?? _defaultOwner);
     if (_owners.isNotEmpty || !_running) return;
     _running = false;
+    _notifyCaptureStateChanged();
+    // 会话结束：后台暂停标记一并复位，否则下一次 start 会带着「已暂停」的旧状态
+    // 起跑（原生已重新采集，退后台却因标记为 true 而跳过停止 → 白跑采集）。
+    _nativeSuspended = false;
     WidgetsBinding.instance.removeObserver(this);
     _recovering = false;
     ++_generation;
@@ -383,7 +540,7 @@ class SpectrumService with WidgetsBindingObserver {
     _stopSimulated();
     _cancelPendingFrames();
     _lastFeatureAt = null;
-    if (_isAndroid || _isIos) {
+    if (_hasNativeCapture) {
       try {
         await _channel.invokeMethod<bool>('stop');
       } catch (_) {}
@@ -451,7 +608,11 @@ class SpectrumService with WidgetsBindingObserver {
     // Timer（视觉偏移默认 580ms ≈ 常驻约 25 个定时器）。震动自持采集
     // （频谱显示关闭 / App 内 / 始终档）时视觉流通常无人监听，这是主要省电点。
     if (!_controller.hasListener) return;
-    final offsetMs = kSpectrumVisualOffsetMs;
+    // 视觉偏移补偿「采集点早于听感」的链路延迟：Android PCM 在写进输出缓冲
+    // 那一刻被截取，iOS EQ tap 同样在输出前截 PCM——都比「听到的」早一整个
+    // 缓冲深度。Windows 是**环回采集实际输出**，帧本来就与听到的同相（仅差
+    // 采集周期的十几毫秒），再套 580ms 只会让柱体明显滞后。
+    final offsetMs = (_isAndroid || _isIos) ? kSpectrumVisualOffsetMs : 0;
     if (offsetMs <= 0) {
       if (!_controller.isClosed) _controller.add(bands);
       return;
@@ -498,6 +659,7 @@ class SpectrumService with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _running = false;
+    _notifyCaptureStateChanged();
     ++_generation;
     _owners.clear();
     _simulateTimer?.cancel();

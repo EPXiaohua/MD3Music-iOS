@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/data/models/song.dart';
@@ -22,6 +23,13 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    // 游标文件落盘在单元测试里隔离掉：默认走「偏好项单键」回退路径，
+    // 避免 Windows 上 path_provider 真写到用户目录、跨用例串状态。
+    PlayerStateRepository.debugCursorFileOverride = () async => null;
+  });
+
+  tearDown(() {
+    PlayerStateRepository.debugCursorFileOverride = null;
   });
 
   test('saveState + restoreState 完整回读', () async {
@@ -91,6 +99,47 @@ void main() {
     expect(prefs.getString('player_current_song'), isNull);
     expect(prefs.getStringList('player_playlist'), isNull);
     expect(prefs.getInt('player_position'), isNull);
+  });
+
+  test('游标写入独立小文件：不再写偏好项，恢复优先读文件，清理会删文件', () async {
+    final Directory dir = await Directory.systemTemp.createTemp('cursor_store');
+    addTearDown(() async {
+      PlayerStateRepository.debugCursorFileOverride = () async => null;
+      if (await dir.exists()) await dir.delete(recursive: true);
+    });
+    PlayerStateRepository.debugCursorFileOverride =
+        () async => File('${dir.path}/playback_cursor.json');
+
+    final repo = PlayerStateRepository();
+    final songs = [_song('a'), _song('b')];
+    await repo.saveState(
+      currentSong: songs[1],
+      playlist: songs,
+      currentIndex: 1,
+      position: const Duration(seconds: 30),
+      loopMode: 'one',
+      shuffleEnabled: true,
+    );
+
+    final prefs = await SharedPreferences.getInstance();
+    // 关键回归：走小文件时不得再触碰偏好项（那会触发整表重写的 ~40ms 主线程开销）。
+    expect(prefs.getString('player_cursor'), isNull);
+    expect(prefs.getString('player_current_song'), isNull);
+    final File file = File('${dir.path}/playback_cursor.json');
+    expect(await file.exists(), isTrue);
+
+    final state = await repo.restoreState();
+    expect(state, isNotNull);
+    expect(state!.currentSong.id, 'b');
+    expect(state.playlist.map((song) => song.id), ['a', 'b']);
+    expect(state.currentIndex, 1);
+    expect(state.position, const Duration(seconds: 30));
+    expect(state.loopMode, 'one');
+    expect(state.shuffleEnabled, isTrue);
+
+    await repo.clearState();
+    expect(await file.exists(), isFalse);
+    expect(await repo.restoreState(), isNull);
   });
 
   test('未保存过任何状态时 restoreState 返回 null', () async {
@@ -230,7 +279,7 @@ void main() {
     final release = Completer<void>();
     final repo = PlayerStateRepository(
       beforeWrite: (step) async {
-        if (step == 'cursor.position' && !entered.isCompleted) {
+        if (step == 'cursor.write' && !entered.isCompleted) {
           entered.complete();
           await release.future;
         }
@@ -250,23 +299,17 @@ void main() {
     expect(await repo.restoreState(), isNull);
   });
 
-  test('flush等待调用时已排队的持久化写入完成', () async {
-    final firstEntered = Completer<void>();
-    final firstRelease = Completer<void>();
-    final laterEntered = Completer<void>();
-    final laterRelease = Completer<void>();
+  test('flush 等待调用时已排队的持久化写入完成，且不包含其后新写入', () async {
+    final gate = Completer<void>();
+    final entered = Completer<void>();
     final repo = PlayerStateRepository(
       beforeWrite: (step) async {
-        if (step != 'cursor.position') return;
-        if (!firstEntered.isCompleted) {
-          firstEntered.complete();
-          await firstRelease.future;
-        } else if (!laterEntered.isCompleted) {
-          laterEntered.complete();
-          await laterRelease.future;
-        }
+        if (step != 'cursor.write' || entered.isCompleted) return;
+        entered.complete();
+        await gate.future;
       },
     );
+
     final firstWrite = repo.saveCursor(
       currentSong: _song('flush-target'),
       currentIndex: 0,
@@ -274,12 +317,14 @@ void main() {
       loopMode: 'off',
       shuffleEnabled: false,
     );
-    await firstEntered.future;
+    await entered.future;
 
     var flushed = false;
     final flush = repo.flush().then((_) => flushed = true);
     await Future<void>.value();
     expect(flushed, isFalse);
+
+    // 排在 flush 之后提交的写入不属于本次屏障。
     final laterWrite = repo.saveCursor(
       currentSong: _song('later-write'),
       currentIndex: 0,
@@ -288,11 +333,10 @@ void main() {
       shuffleEnabled: false,
     );
 
-    firstRelease.complete();
+    gate.complete();
     await flush;
-    await laterEntered.future;
     expect(flushed, isTrue);
-    laterRelease.complete();
+
     await Future.wait([firstWrite, laterWrite]);
     expect((await repo.restoreState())?.currentSong.id, 'later-write');
   });
@@ -300,7 +344,7 @@ void main() {
   test('一个字段写失败会回传错误，但不阻塞后续清理屏障', () async {
     final repo = PlayerStateRepository(
       beforeWrite: (step) async {
-        if (step == 'cursor.position') {
+        if (step == 'cursor.write') {
           throw StateError('injected write failure');
         }
       },
@@ -317,14 +361,8 @@ void main() {
     expect(await repo.restoreState(), isNull);
   });
 
-  for (final failedStep in [
-    'state.current_song',
-    'state.playlist',
-    'state.index',
-    'state.position',
-    'state.loop_mode',
-    'state.shuffle',
-  ]) {
+  // 完整快照现由「游标小文件 + 队列偏好项」两段组成（旧版逐键 6 段已废弃）。
+  for (final failedStep in ['state.cursor_store', 'state.playlist']) {
     test('完整快照写入在$failedStep失败后仍能降级恢复一致游标', () async {
       final originalSong = _song('original');
       await PlayerStateRepository().saveState(
@@ -361,11 +399,9 @@ void main() {
       final state = await repo.restoreState();
       expect(injected, isTrue);
       expect(state, isNotNull);
-      expect(
-        state!.currentSong.id,
-        failedStep == 'state.current_song' ? 'original' : 'updated-current',
-      );
-      expect(state.playlist[state.currentIndex].id, state.currentSong.id);
+      // 无论失败落在游标还是队列，恢复结果必须自洽：
+      // 当前歌一定在队列里、索引指向它、进度落在曲目时长内。
+      expect(state!.playlist[state.currentIndex].id, state.currentSong.id);
       expect(state.position.inMilliseconds, greaterThanOrEqualTo(0));
       expect(state.position, lessThanOrEqualTo(state.currentSong.duration));
     });

@@ -36,6 +36,7 @@ struct RunningServer {
     generation: u64,
     port: u16,
     stop: Arc<AtomicBool>,
+    server: Arc<Server>,
     listener_thread: JoinHandle<()>,
 }
 
@@ -238,11 +239,13 @@ pub fn start(port: u16, data_dir: String) -> Option<u16> {
         }
     };
 
+    let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
+    let loop_server = Arc::clone(&server);
     let listener_thread = match std::thread::Builder::new()
         .name("kugou-http-listener".into())
-        .spawn(move || run_loop(server, data_dir, loop_stop))
+        .spawn(move || run_loop(loop_server, data_dir, loop_stop))
     {
         Ok(handle) => handle,
         Err(error) => {
@@ -255,6 +258,7 @@ pub fn start(port: u16, data_dir: String) -> Option<u16> {
         generation: state.generation,
         port: chosen,
         stop,
+        server,
         listener_thread,
     });
     Some(chosen)
@@ -273,10 +277,12 @@ pub fn stop() {
     if let Some(active) = state.active.take() {
         let RunningServer {
             stop,
+            server,
             listener_thread,
             ..
         } = active;
         stop.store(true, Ordering::SeqCst);
+        server.unblock();
         if let Err(error) = listener_thread.join() {
             eprintln!("[server] listener thread panicked during stop: {error:?}");
         }
@@ -306,10 +312,10 @@ pub fn active_request_count() -> usize {
     ACTIVE_REQUESTS.load(Ordering::Acquire)
 }
 
-fn run_loop(server: Server, data_dir: String, stop: Arc<AtomicBool>) {
+fn run_loop(server: Arc<Server>, data_dir: String, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
-        match server.recv_timeout(Duration::from_millis(50)) {
-            Ok(Some(request)) => {
+        match server.recv() {
+            Ok(request) => {
                 if stop.load(Ordering::SeqCst) {
                     let _ = request.respond(Response::empty(503));
                     break;
@@ -347,8 +353,10 @@ fn run_loop(server: Server, data_dir: String, stop: Arc<AtomicBool>) {
                     eprintln!("[server] spawn handler thread failed: {}", e);
                 }
             }
-            Ok(None) => {}
             Err(_) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -510,7 +518,14 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let cache_key = format!("{}{}", hostname, url);
     let bypass = headers.get("x-apicache-bypass").is_some()
-        || headers.get("x-apicache-force-fetch").is_some();
+        || headers.get("x-apicache-force-fetch").is_some()
+        // 登录轮询端点：响应就是「此刻的扫码状态」，缓存 120s 会让前端每轮都
+        // 拿到同一个旧状态（实测酷狗/微信/QQ 三条链路都有此问题）。客户端虽然
+        // 也会带 x-apicache-bypass，但这里做服务端兜底，避免任何调用方漏带。
+        || matches!(
+            path.as_str(),
+            "/login/qr/check" | "/login/wx/check" | "/login/qq/qr/check"
+        );
 
     if !bypass {
         if let Some(entry) = CACHE.get_or_init(crate::cache::Cache::new).get(&cache_key) {

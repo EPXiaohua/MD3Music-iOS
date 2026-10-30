@@ -43,6 +43,12 @@ class AudioService {
 
   double get speed => _player.speed;
 
+  /// Web 端没有 Android 的音量均衡（响度归一）链路，恒为关闭。
+  ///
+  /// 与 `audio_service_io.dart` 的同名 getter 对齐，保持条件导入两端 API 一致
+  /// （「硬件解码播放」让路判定会读它，而 Web 端该功能整体不可用）。
+  bool get volumeNormalizationEnabled => false;
+
   /// Web 端无 Android 音频会话 ID。
   int? get androidAudioSessionId => null;
 
@@ -96,12 +102,14 @@ class AudioService {
     double? loudnessLufs,
     double? loudnessPeakDb,
     Duration? initialPosition,
+    dynamic tag,
   }) async {
     final blobUrl = await _fetchAudioBlob(url);
     // 与 io 端同口径：定位交给平台层，避免「加载后 seek」的竞态
     await _player.setUrl(
       blobUrl,
       initialPosition: initialPosition ?? Duration.zero,
+      tag: tag,
     );
   }
 

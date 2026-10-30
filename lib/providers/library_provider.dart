@@ -1,4 +1,5 @@
 import 'dart:async' show unawaited;
+import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -21,7 +22,10 @@ void _log(String msg) {
 }
 
 class LibraryProvider extends ChangeNotifier {
-  final LocalMusicRepository _repository = LocalMusicRepository();
+  LibraryProvider({LocalMusicRepository? repository})
+      : _repository = repository ?? LocalMusicRepository();
+
+  final LocalMusicRepository _repository;
 
   List<Song> _songs = [];
   List<Song> _indexedSongs = [];
@@ -36,6 +40,7 @@ class LibraryProvider extends ChangeNotifier {
   bool _isScanning = false;
   String? _error;
   String _searchQuery = '';
+  int _settingsLoadGeneration = 0;
 
   /// 未过滤的原始歌曲列表（供详情页按分类获取歌曲使用）。
   List<Song> get allSongs => _songs;
@@ -132,11 +137,28 @@ class LibraryProvider extends ChangeNotifier {
 
   /// 加载已保存的扫描文件夹和排除文件夹列表。
   Future<void> loadScanFolders() async {
-    _scanFolders = await _repository.getSavedFolders();
-    _excludedFolders = await _repository.getExcludedFolders();
-    _filterShortAudio = await _repository.getFilterShortAudio();
+    final generation = _settingsLoadGeneration;
+    final folders = await _repository.getSavedFolders();
+    final excluded = await _repository.getExcludedFolders();
+    final filterShortAudio = await _repository.getFilterShortAudio();
+    if (Platform.isWindows && generation != _settingsLoadGeneration) return;
+    _scanFolders = folders;
+    _excludedFolders = excluded;
+    _filterShortAudio = filterShortAudio;
     _rebuildCategories();
     notifyListeners();
+  }
+
+  /// Windows 重置扫描目录和短音频筛选时使旧读取失效。
+  void prepareWindowsSettingsReset() {
+    if (Platform.isWindows) ++_settingsLoadGeneration;
+  }
+
+  /// 刷新扫描目录和短音频筛选，不丢失已扫描歌曲缓存。
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    ++_settingsLoadGeneration;
+    await loadScanFolders();
   }
 
   /// 加载上次持久化的歌曲列表（用于 App 重启后立即显示）。
@@ -144,11 +166,16 @@ class LibraryProvider extends ChangeNotifier {
   /// 不会自动触发扫描；只有在用户没有缓存且有扫描文件夹时才提示。
   /// 同时加载已保存的扫描目录，保持状态一致。
   Future<void> loadSavedSongs() async {
+    final generation = _settingsLoadGeneration;
     final cached = await _repository.getSavedSongs();
+    final folders = await _repository.getSavedFolders();
+    final excluded = await _repository.getExcludedFolders();
+    final filterShortAudio = await _repository.getFilterShortAudio();
+    if (Platform.isWindows && generation != _settingsLoadGeneration) return;
     _indexedSongs = cached;
-    _scanFolders = await _repository.getSavedFolders();
-    _excludedFolders = await _repository.getExcludedFolders();
-    _filterShortAudio = await _repository.getFilterShortAudio();
+    _scanFolders = folders;
+    _excludedFolders = excluded;
+    _filterShortAudio = filterShortAudio;
     _rebuildCategories();
     notifyListeners();
     _log('[LibraryProvider] 已恢复 ${cached.length} 首缓存歌曲');
@@ -156,6 +183,7 @@ class LibraryProvider extends ChangeNotifier {
 
   /// 扫描本地音乐（使用默认目录 + 用户选择的目录，排除用户指定的文件夹）。
   Future<void> loadLocalMusic() async {
+    if (_isScanning) return;
     if (kIsWeb) {
       _songs = [];
       _albums = [];
@@ -169,22 +197,22 @@ class LibraryProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // 请求存储权限（iOS：应用 Documents 沙箱内无需权限，授权目录由
-      // 安全作用域书签授予访问权，同样不触发系统权限弹窗）
-      if (!isIOSPlatform) {
-        final hasPermission = await requestStoragePermission();
-        if (!hasPermission) {
-          _error = '需要存储权限才能扫描本地音乐';
-          _isScanning = false;
-          notifyListeners();
-          return;
-        }
-      }
-
-      // 加载用户保存的扫描文件夹和排除文件夹
+      // SAF 用户授权目录不依赖全盘媒体权限；即使用户拒绝媒体权限仍可扫描 U 盘。
       _scanFolders = await _repository.getSavedFolders();
       _excludedFolders = await _repository.getExcludedFolders();
       _filterShortAudio = await _repository.getFilterShortAudio();
+
+      // 请求存储权限（iOS：应用 Documents 沙箱内无需权限，授权目录由
+      // 安全作用域书签授予访问权，同样不触发系统权限弹窗）
+      if (!isIOSPlatform) {
+        // 请求系统媒体库权限
+        final hasPermission = await requestStoragePermission();
+        if (!hasPermission &&
+            !_scanFolders.any(FolderPickerService.isTreeUri)) {
+          _error = '需要存储权限才能扫描本地音乐';
+          return;
+        }
+      }
 
       // iOS 扫描源 = 应用 Documents（文件 App 可见，用户可直接投递音频）
       // + 已授权文件夹（安全作用域书签，原位扫描原位播放，不拷贝）。
@@ -192,6 +220,8 @@ class LibraryProvider extends ChangeNotifier {
       final scanDirs = isIOSPlatform
           ? [await _documentsDirectory(), ...await _resolveAuthorizedFolders()]
           : _scanFolders;
+
+      // 扫描（传入排除文件夹）
       final songs = await _repository.scanSongs(
         customFolders: scanDirs,
         excludedFolders: _excludedFolders,
@@ -213,12 +243,15 @@ class LibraryProvider extends ChangeNotifier {
       await _repository.saveSongs(_indexedSongs);
 
       // 触发本地歌曲的在线信息自动匹配（引擎内部有开关与去重，重复调用安全）
-      unawaited(SongMatchProvider.instance?.onLibraryUpdated(_indexedSongs));
-
-      _isScanning = false;
-      notifyListeners();
-    } catch (e) {
+      unawaited(SongMatchProvider.instance?.onLibraryUpdated(_indexedSongs)
+          .catchError((Object error) {
+        debugPrint('[LibraryScan] 在线匹配失败: $error');
+      }));
+      debugPrint('[LibraryScan] 完成，歌曲数=${_indexedSongs.length}');
+    } catch (e, stack) {
       _error = e.toString();
+      debugPrint('[LibraryScan] 扫描失败: $e\n$stack');
+    } finally {
       _isScanning = false;
       notifyListeners();
     }
@@ -309,19 +342,19 @@ class LibraryProvider extends ChangeNotifier {
   /// 排除只做路径过滤匹配：iOS 仅取路径（不建授权书签、不激活访问权），
   /// 安卓走 SAF。
   Future<bool> addExcludedFolder() async {
-    if (isIOSPlatform) {
-      final path = await _pickIosFolderPath();
-      if (path == null) return false;
-      await _repository.addExcludedFolder(path);
-      _excludedFolders = await _repository.getExcludedFolders();
-      notifyListeners();
-      return true;
-    }
-    final path = await FolderPickerService.pickFolder();
+    final path = isIOSPlatform
+        ? await _pickIosFolderPath()
+        : await FolderPickerService.pickFolder();
     if (path == null) return false;
 
     await _repository.addExcludedFolder(path);
     _excludedFolders = await _repository.getExcludedFolders();
+    _indexedSongs = _repository.filterSongs(
+      _indexedSongs,
+      excludedFolders: _excludedFolders,
+    );
+    await _repository.saveSongs(_indexedSongs);
+    _rebuildCategories();
     notifyListeners();
     return true;
   }
@@ -348,7 +381,10 @@ class LibraryProvider extends ChangeNotifier {
   List<Song> getSongsInFolder(String folderPath) {
     return _songs.where((s) {
       if (s.localPath == null) return false;
-      final songDir = s.localPath!.substring(0, s.localPath!.lastIndexOf('/'));
+      // 与 buildFolders 一致：Windows 路径先统一分隔符，避免详情构建越界。
+      final localPath = s.localPath!.replaceAll('\\', '/');
+      final songDir = s.folderPath ??
+          localPath.substring(0, localPath.lastIndexOf('/'));
       return songDir == folderPath;
     }).toList();
   }

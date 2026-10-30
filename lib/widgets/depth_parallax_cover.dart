@@ -10,12 +10,19 @@ class DepthParallaxCover extends StatefulWidget {
   const DepthParallaxCover({
     super.key,
     required this.layerPaths,
+    this.backgroundPath, // 修补底板（可选；null = 不画，行为与旧版一致）
     this.tiltStream, // 仅测试注入；生产走 accelerometerEventStream
     this.strength = 9.0, // 最大平移像素（背景层，前景按 _factors 递减）
     this.onTiltError,
   });
 
   final List<String> layerPaths;
+
+  /// 全尺寸修补底板（主体已被填补）：垫在三层之下的最底层。
+  ///
+  /// 只有 Windows 的 Dart FFI 后端会产出（`bg_fill.png`）；Android 的 Kotlin
+  /// `generate` 不产，故为空 —— 为空时渲染与旧版完全一致。
+  final String? backgroundPath;
   final Stream<(double, double)>? tiltStream;
   final double strength;
 
@@ -84,6 +91,30 @@ class _DepthParallaxCoverState extends State<DepthParallaxCover> {
       child: Stack(
         fit: StackFit.expand,
         children: [
+          // **修补底板**（全尺寸、主体已被填补），必须垫在 3 层之下：
+          // 三条深度带铺满 0..1、合成后 = 原图完整，而修补结果只进 layer0 的
+          // 「背景带」（主体 ≈0.9 不在该带里）→ 不画这张底板，前景移开时露出的
+          // 就是原图里那份主体（错位重影），用户看到的正是「修补没生效」。
+          // 变换与 layer0 **完全一致**（_factors[0]/_scales[0]）：底板就是"抠掉
+          // 主体后的同一张背景"，同速同尺度才不会在带的接缝处错位。
+          if (widget.backgroundPath != null)
+            Transform(
+              transform: Matrix4.identity()
+                ..translateByDouble(
+                  _tx * widget.strength * _factors[0],
+                  _ty * widget.strength * _factors[0],
+                  0,
+                  1,
+                )
+                ..scaleByDouble(_scales[0], _scales[0], 1, 1),
+              alignment: Alignment.center,
+              child: Image.file(
+                File(widget.backgroundPath!),
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                filterQuality: FilterQuality.medium,
+              ),
+            ),
           // Stack 首个子项在最底层：必须按 背景(0)→中景(1)→前景(2) 的顺序画，
           // 让前景压在背景之上（此前倒序画导致背景层盖在最上面，层级反了）。
           for (var i = 0; i < widget.layerPaths.length; i++)

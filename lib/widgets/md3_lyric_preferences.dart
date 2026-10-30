@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/services/windows_default_font.dart';
 import 'apple_lyrics/layout/lyric_layout.dart';
 
 /// MD3 风格播放页歌词字体来源枚举。
@@ -75,6 +76,7 @@ class Md3LyricPreferences extends ChangeNotifier {
   static const String _keyFontWeight = 'md3_lyric_font_weight';
   static const String _keyFontSource = 'md3_lyric_font_source';
   static const String _keyCustomFontPath = 'md3_lyric_custom_font_path';
+  static const String _keyCustomTextColor = 'md3_lyric_custom_text_color';
   static const String _keyShowAuxiliary = 'md3_lyric_show_auxiliary';
   static const String _keyDisplayMode = 'md3_lyric_display_mode';
   static const String _keyLineBalance = 'md3_lyric_line_balance';
@@ -86,10 +88,11 @@ class Md3LyricPreferences extends ChangeNotifier {
   int _fontWeight = defaultFontWeight;
   Md3LyricFontSource _fontSource = Md3LyricFontSource.system;
   bool _showAuxiliary = true;
-  // 平衡行换行（默认开启）：长歌词行按 DP 均衡断点插入硬换行，见 LyricWrapPlanner
-  bool _lineBalance = true;
+  // 平衡行换行默认关闭：保持歌词的原始自动换行行为。
+  bool _lineBalance = false;
   Md3LyricDisplayMode _displayMode = Md3LyricDisplayMode.translation;
   String? _customFontPath;
+  Color? _customTextColor;
   // 运行时加载成功后填充的 family（仅 custom 模式且加载成功时非 null）
   String? _loadedCustomFontFamily;
   bool _loaded = false;
@@ -113,23 +116,33 @@ class Md3LyricPreferences extends ChangeNotifier {
   Md3LyricFontSource get fontSource => _fontSource;
   bool get showAuxiliary => _showAuxiliary;
 
-  /// 平衡行换行是否开启（默认开启）；关闭时退回 Text 的自动换行。
+  /// 平衡行换行是否开启（默认关闭）；关闭时退回 Text 的自动换行。
   bool get lineBalance => _lineBalance;
   Md3LyricDisplayMode get displayMode => _displayMode;
   String? get customFontPath => _customFontPath;
+  Color? get customTextColor => _customTextColor;
+
+  /// 自定义字体（[Md3LyricFontSource.custom]）是否加载成功。
+  ///
+  /// 面板提示「已应用自定义字体 / 字体加载失败」必须用它：
+  /// [effectiveFontFamily] 在 Windows 的 system 档也非 null（内置思源黑体），
+  /// 用它判断会把「回落到默认字体」误报成「自定义字体已生效」。
+  bool get customFontLoaded => _loadedCustomFontFamily != null;
 
   /// 当前生效的 fontFamily（传给 TextPainter 的 TextStyle）：
-  /// - [Md3LyricFontSource.system]：返回 null（让 Flutter 走系统字体链）
-  /// - [Md3LyricFontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system 返回 null
+  /// - [Md3LyricFontSource.system]：Windows 返回内置思源黑体（与全局 UI 同族，
+  ///   否则「还原所有设置」后歌词会掉到引擎兜底字形）；其他平台返回 null，
+  ///   让 Flutter 走系统字体链
+  /// - [Md3LyricFontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system
   /// - [Md3LyricFontSource.custom]：返回 [_loadedCustomFontFamily]，
-  ///   加载失败时为 null（实际降级为 system 行为）
+  ///   加载失败时降级为对应平台默认字体（Windows = 内置思源黑体）
   String? get effectiveFontFamily {
     switch (_fontSource) {
       case Md3LyricFontSource.system:
       case Md3LyricFontSource.bundled:
-        return null;
+        return WindowsDefaultFont.loadedFamily;
       case Md3LyricFontSource.custom:
-        return _loadedCustomFontFamily;
+        return _loadedCustomFontFamily ?? WindowsDefaultFont.loadedFamily;
     }
   }
 
@@ -149,9 +162,11 @@ class Md3LyricPreferences extends ChangeNotifier {
             .clamp(minFontWeight, maxFontWeight);
     _fontSource = _fontSourceFromName(prefs.getString(_keyFontSource));
     _showAuxiliary = prefs.getBool(_keyShowAuxiliary) ?? true;
-    _lineBalance = prefs.getBool(_keyLineBalance) ?? true;
+    _lineBalance = prefs.getBool(_keyLineBalance) ?? false;
     _displayMode = _displayModeFromName(prefs.getString(_keyDisplayMode));
     _customFontPath = prefs.getString(_keyCustomFontPath);
+    final colorValue = prefs.getInt(_keyCustomTextColor);
+    _customTextColor = colorValue == null ? null : Color(colorValue);
     _loaded = true;
     notifyListeners();
     // 若已配置自定义字体，立即尝试加载
@@ -241,6 +256,18 @@ class Md3LyricPreferences extends ChangeNotifier {
     }
   }
 
+  Future<void> setCustomTextColor(Color? color) async {
+    if (_customTextColor?.toARGB32() == color?.toARGB32()) return;
+    _customTextColor = color;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (color == null) {
+      await prefs.remove(_keyCustomTextColor);
+    } else {
+      await prefs.setInt(_keyCustomTextColor, color.toARGB32());
+    }
+  }
+
   /// 重置为默认值（不影响 Apple Music 风格的设置）。
   Future<void> reset() async {
     _fontSize = defaultUserFontSize;
@@ -248,9 +275,10 @@ class Md3LyricPreferences extends ChangeNotifier {
     _fontWeight = defaultFontWeight;
     _fontSource = Md3LyricFontSource.system;
     _showAuxiliary = true;
-    _lineBalance = true;
+    _lineBalance = false;
     _displayMode = Md3LyricDisplayMode.translation;
     _customFontPath = null;
+    _customTextColor = null;
     _loadedCustomFontFamily = null;
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
@@ -262,6 +290,7 @@ class Md3LyricPreferences extends ChangeNotifier {
     await prefs.remove(_keyLineBalance);
     await prefs.remove(_keyDisplayMode);
     await prefs.remove(_keyCustomFontPath);
+    await prefs.remove(_keyCustomTextColor);
   }
 
   /// 内部：尝试用 FontLoader 加载 [_customFontPath] 指向的字体文件。

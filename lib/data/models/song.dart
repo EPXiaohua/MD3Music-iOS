@@ -51,13 +51,19 @@ class Song {
   final Duration duration;
   final String? url;
   final String? localPath;
+  /// SAF 扫描时的授权目录 URI；普通文件由 localPath 推导所属目录。
+  final String? folderPath;
   final String? artworkUri;
+  /// SAF 本地音频的内嵌/同目录歌词（Dart File 无法直接读取 content://）。
+  final String? localLyrics;
   final bool isOnline;
   final String? albumId;
   final String? artistId;
   final String? quality;
   final String? albumAudioId;
   final int? fileId;
+  /// 云端歌单顺序位；缓存后仍需保留，不能用响应数组下标代替。
+  final int? playlistSort;
   /// 是否为酷狗云盘歌曲（用户上传到云盘）。
   /// 播放/投屏时 URL 解析优先走 /user/cloud/url，而非通用 /song/url。
   final bool isCloud;
@@ -97,13 +103,16 @@ class Song {
     required this.duration,
     this.url,
     this.localPath,
+    this.folderPath,
     this.artworkUri,
+    this.localLyrics,
     this.isOnline = false,
     this.albumId,
     this.artistId,
     this.quality,
     this.albumAudioId,
     this.fileId,
+    this.playlistSort,
     this.isCloud = false,
     this.climaxStart,
     this.climaxEnd,
@@ -142,13 +151,16 @@ class Song {
       duration: Duration(milliseconds: (json['duration'] as num).toInt()),
       url: json['url'] as String?,
       localPath: json['localPath'] as String?,
+      folderPath: json['folderPath'] as String?,
       artworkUri: json['artworkUri'] as String?,
+      localLyrics: json['localLyrics'] as String?,
       isOnline: (json['isOnline'] as bool?) ?? false,
       albumId: json['albumId'] as String?,
       artistId: json['artistId'] as String?,
       quality: json['quality'] as String?,
       albumAudioId: json['albumAudioId'] as String?,
       fileId: json['fileId'] as int?,
+      playlistSort: (json['playlistSort'] as num?)?.toInt(),
       isCloud: (json['isCloud'] as bool?) ?? false,
       climaxStart: (json['climaxStart'] as num?)?.toDouble(),
       climaxEnd: (json['climaxEnd'] as num?)?.toDouble(),
@@ -171,13 +183,16 @@ class Song {
       'duration': duration.inMilliseconds,
       'url': url,
       'localPath': localPath,
+      'folderPath': folderPath,
       'artworkUri': artworkUri,
+      'localLyrics': localLyrics,
       'isOnline': isOnline,
       'albumId': albumId,
       'artistId': artistId,
       'quality': quality,
       'albumAudioId': albumAudioId,
       'fileId': fileId,
+      'playlistSort': playlistSort,
       'isCloud': isCloud,
       'climaxStart': climaxStart,
       'climaxEnd': climaxEnd,
@@ -199,13 +214,16 @@ class Song {
     Duration? duration,
     String? url,
     String? localPath,
+    String? folderPath,
     String? artworkUri,
+    String? localLyrics,
     bool? isOnline,
     String? albumId,
     String? artistId,
     String? quality,
     String? albumAudioId,
     int? fileId,
+    int? playlistSort,
     bool? isCloud,
     double? climaxStart,
     double? climaxEnd,
@@ -226,13 +244,16 @@ class Song {
       duration: duration ?? this.duration,
       url: clearUrl ? null : url ?? this.url,
       localPath: localPath ?? this.localPath,
+      folderPath: folderPath ?? this.folderPath,
       artworkUri: artworkUri ?? this.artworkUri,
+      localLyrics: localLyrics ?? this.localLyrics,
       isOnline: isOnline ?? this.isOnline,
       albumId: albumId ?? this.albumId,
       artistId: artistId ?? this.artistId,
       quality: quality ?? this.quality,
       albumAudioId: albumAudioId ?? this.albumAudioId,
       fileId: fileId ?? this.fileId,
+      playlistSort: playlistSort ?? this.playlistSort,
       isCloud: isCloud ?? this.isCloud,
       climaxStart: climaxStart ?? this.climaxStart,
       climaxEnd: climaxEnd ?? this.climaxEnd,

@@ -54,6 +54,16 @@ END
 // remains consistent on all systems.
 IDI_APP_ICON            ICON                    "resources\\app_icon.ico"
 
+// 任务栏缩略图工具栏（悬停任务栏图标时出现）的 4 枚按钮图标，两套主题字形。
+IDI_TASKBAR_PREV        ICON                    "resources\\taskbar_prev.ico"
+IDI_TASKBAR_PLAY        ICON                    "resources\\taskbar_play.ico"
+IDI_TASKBAR_PAUSE       ICON                    "resources\\taskbar_pause.ico"
+IDI_TASKBAR_NEXT        ICON                    "resources\\taskbar_next.ico"
+IDI_TASKBAR_PREV_LIGHT  ICON                    "resources\\taskbar_prev_light.ico"
+IDI_TASKBAR_PLAY_LIGHT  ICON                    "resources\\taskbar_play_light.ico"
+IDI_TASKBAR_PAUSE_LIGHT ICON                    "resources\\taskbar_pause_light.ico"
+IDI_TASKBAR_NEXT_LIGHT  ICON                    "resources\\taskbar_next_light.ico"
+
 
 /////////////////////////////////////////////////////////////////////////////
 //

@@ -111,6 +111,16 @@ void main() {
     expect(lines.first.roma, 'Today I watch the snow drift by');
     expect(lines.last.text, '怀着冷却了的心窝漂远方');
   });
+
+  test('快速切换歌曲时不并发启动内嵌歌词解析 isolate', () async {
+    final first = _write('first.mp3', 'not a real mp3');
+    final next = _write('next.mp3', 'not a real mp3');
+    final firstRead = LocalLyricLoader.loadForAudioAsync(first.path);
+    final nextRead = LocalLyricLoader.loadForAudioAsync(next.path);
+
+    expect(await nextRead, isNull);
+    expect(await firstRead, isNull);
+  });
 }
 
 /// 构造含 LYRICS 标签的最小 FLAC 二进制（fLaC + STREAMINFO + VORBIS_COMMENT）。

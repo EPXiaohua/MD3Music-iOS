@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../core/build_flags.dart';
+import '../core/theme/app_dimens.dart';
 
 /// TV 可用的下拉选择器：触屏构建渲染 [M3EDropdownMenu]（行为零变化），
 /// TV 构建渲染同外观的可聚焦字段 + 底部弹层可聚焦行。
@@ -54,6 +55,8 @@ class TvDropdownMenu<T> extends StatelessWidget {
         items: items,
         singleSelect: singleSelect,
         showChipAnimation: showChipAnimation,
+        // 外层 20 = 条目外角 12 + 列表内边距 8，同心圆（默认 28 过大）
+        containerRadius: AppRadius.dropdownPanel,
         fieldStyle: fieldStyle,
         onSelectionChanged: onSelectionChanged,
       );

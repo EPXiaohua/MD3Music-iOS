@@ -1,6 +1,7 @@
 import 'package:flutter/rendering.dart' show OverflowBoxFit;
 import 'package:material_ui/material_ui.dart';
 
+import '../../core/services/spectrum_disc_spin.dart';
 import '../../widgets/player_artwork_image.dart';
 import 'full_player_route.dart';
 import 'player_cover_morph.dart';
@@ -53,6 +54,10 @@ class PlayerCoverMorphLayer extends StatelessWidget {
     // 由路由照常写入，减弱动画下它只会更快地落到 0 / 1 端点。
     bus.reducedMotion = MediaQuery.disableAnimationsOf(context);
     final expansion = playerExpansion.value;
+    // 上一帧进度先记账，端点早退与下面的起飞判据都要用（见 [
+    // PlayerCoverMorphBus.lastExpansion]）。
+    final double prevExpansion = bus.lastExpansion;
+    bus.lastExpansion = expansion;
     // 两端不画：p=0 归 MiniPlayer 自己的封面，p=1 归播放页自己的封面。
     // 由形变层交接正是为了避免"整页淡出 + 重新淡入"造成的闪断。
     if (expansion <= 0.0 || expansion >= 1.0) {
@@ -61,6 +66,8 @@ class PlayerCoverMorphLayer extends StatelessWidget {
       // 「不合格」会泄漏到下一程 —— 表现为「第一次可以，收起后再拉就不行」。
       bus.latchedCoverEligible = null;
       bus.latchedTextEligible = null;
+      // 端点帧：放行下一次飞行的重测（见 [PlayerCoverMorphBus.remeasureMiniSources]）。
+      bus.miniRemeasuredThisFlight = false;
       // 转场收口：打一行计数器摘要（随后清零），并把线程归因那一行留在尾窗后打印。
       // 判据关闭时整段不取仪表单例（`instance` 是静态字段，取了就把仪表建起来）。
       if (coverMorphPerfLogEnabled) {
@@ -71,6 +78,27 @@ class PlayerCoverMorphLayer extends StatelessWidget {
     }
     // 过了端点早退即视为「本帧形变层真的在为转场产出内容」——端点帧不计数。
     coverMorphDebugCountLayerBuild();
+    // **只有「从收起端起飞」那一程的首帧**重测迷你端（治「切到悬浮形态后封面
+    // 形变起点偏左」：真机日志实锤起点被钉死在 L=-78.5，之后再无修正）。
+    //
+    // 判据取**上一帧**进度而不是本帧：`prevExpansion <= 0` 说明这次是从「条还在
+    // 原位」起飞 —— 此刻壳层没有被 [_UpFadeMainRoute] 平移（它只在
+    // `playerExpansion > 0.5` 时上移 15% + 淡出），布局也已落定，量到的就是结算
+    // 位置。点按与上拉拖拽两条路径都从 0 起飞，所以**都**重测（真机日志里
+    // `drag=true` 的那程同样带着偏左的旧值，拖拽路径并不新鲜：胶囊封面一交接
+    // 就被 `Opacity(0)` 让位，`RenderOpacity` 在 alpha=0 时整棵子树不 paint，
+    // 探针在飞行期间根本不跑）。
+    //
+    // 反过来，**收起那一程不能重测**：起飞瞬间壳层正被上移+淡出，真实条量到的
+    // 是飞行中的位置，而重测是绕过 paint 直接读变换矩阵的 —— 会把新的一次偏移
+    // 写进登记簿，比原 bug 更糟。
+    //
+    // `revision` 在 lib 侧无人监听（见 player_cover_morph.dart），所以这里在
+    // build 阶段写入不会触发同步重建。
+    if (!bus.miniRemeasuredThisFlight) {
+      bus.miniRemeasuredThisFlight = true;
+      if (prevExpansion <= 0.0) bus.remeasureMiniSources();
+    }
     // 同时给线程归因探针记一帧（UI build / Raster 时长由 FrameTiming 提供）。
     // 段身份也在这里落：`playerDragActive` 为真 = 拖拽起飞，否则点按起飞。
     if (coverMorphPerfLogEnabled) {
@@ -119,7 +147,9 @@ class PlayerCoverMorphLayer extends StatelessWidget {
   /// **不做整体缩放**：迷你条与播放页的「文字/封面尺寸比」根本不同
   /// （14px/44px ≈ 0.32 vs 24px/300px ≈ 0.08），同一个缩放系数不可能同时对上
   /// 两端，硬缩放还会把放大那一侧糊掉。改为：
-  /// - **矩形**用 [coverMorphTargetRect] 插值（与封面同一套位置曲线，两者同拍）；
+  /// - **矩形**用 [coverMorphTargetRect] 插值（线性 + 弓高）；封面一侧走平抛轨迹
+  ///   （[coverMorphFlightRect]，见其说明），两者**刻意不同拍**：封面的尺寸与纵向
+  ///   都按 `t²` 加速，而文字块要保持可读的稳定移动，不做缩放也不加速；
   /// - **样式**用 [coverMorphLerpTextStyle] 插值字号/字重/字距/行高（进度按
   ///   [kCoverMorphTextSteps] 档走，见其说明），文字始终按真实字号绘制；
   /// - **内容**只在中段做交叉淡入（迷你条是 `歌名/歌手`，播放页是
@@ -144,8 +174,11 @@ class PlayerCoverMorphLayer extends StatelessWidget {
     );
     // 内容交叉淡入放在中段：两端各自纯净，中段错开时也看不出重影
     final cf = ((t - 0.35) / 0.30).clamp(0.0, 1.0);
-    // 水平对齐也插值：迷你条「块内左对齐」→ 播放页竖屏「块内居中」/ 横屏左对齐。
-    final align = Alignment.lerp(Alignment.centerLeft, bus.fullTitleAlign, t)!;
+    // 水平对齐也插值：**起点取源形态自己上报的行对齐**（常驻条贴左
+    // centerLeft、胶囊逐行居中 center），终点播放页竖屏「块内居中」/ 横屏左对齐。
+    // 起点若硬编码 centerLeft，胶囊（真身逐行居中）一交棒给飞行层，文字就会
+    // 整体跳到块左缘 —— 真机反馈「上拉时文字位置突变到左边」的根源。
+    final align = Alignment.lerp(bus.miniTextAlign, bus.fullTitleAlign, t)!;
     // 只给 left/top/width，**不给高度**。
     // 用 `Positioned.fromRect` 会把插值出来的矩形高度当作**紧约束**，而内容高度
     // 是按字号插值独立变化的：飞行途中「内容高于盒子」时 RenderFlex 直接报
@@ -318,11 +351,40 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
   Object? _signature;
   Widget? _artwork;
 
+  /// 从**源形态角**到**终点角**的连续差（弧度，可跨圈，未取模）。
+  ///
+  /// 每段飞行首帧初始化：形变层在 `p ∈ {0,1}` 端点返回 `SizedBox.shrink()`，
+  /// 本 State 随之销毁，所以下一次起飞必然重新算 —— 不需要额外复位。
+  ///
+  /// **为什么不是逐帧 `wrapPi(终值−起值)`**：圆盘相位是 `[0,2π)` 的值，转完一圈
+  /// 就回绕；而逐帧取最短路径又会在「差值恰好跨过 π」那一帧把整张封面拧 180°
+  /// （`start + delta × t` 里 delta 从 +π 翻到 −π，非端点帧差了 `2π × t`）。
+  /// 这里对差值做**连续跟踪**（`delta += wrapPi(raw − delta)`），delta 平滑演化，
+  /// 两端仍然精确：t=0 逐值等于源形态当前角，t=1 与真身同相（差整数圈）。
+  double? _spinDelta;
+
   @override
   void dispose() {
     _artwork = null;
     _signature = null;
     super.dispose();
+  }
+
+  /// 本帧「源角 → 终点角」的连续差。
+  ///
+  /// [disc] = 终点是否是频谱圆盘（[PlayerCoverMorphBus.settledInsetRatio] > 0）：
+  /// - 圆盘：终点角 = 共享唱片相位（[SpectrumDiscSpin.instance.angle]），会回绕，
+  ///   故每帧把新算的裸差并入 [_spinDelta]；
+  /// - 方图：终点角恒 0（真身封面不旋转），`delta = −start` 等价于改动前的
+  ///   `start × (1 − t)`，行为逐值不变。
+  double _spinDeltaFor({required double start, required bool disc}) {
+    if (!disc) {
+      return _spinDelta ??= -start;
+    }
+    final double raw = SpectrumDiscSpin.instance.angle.value - start;
+    final double? prev = _spinDelta;
+    if (prev == null) return _spinDelta = coverMorphWrapPi(raw);
+    return _spinDelta = prev + coverMorphWrapPi(raw - prev);
   }
 
   /// 封面本体：签名未变就复用同一实例，变了才现造。
@@ -364,19 +426,39 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
   /// （[PlayerCoverShadow.decoration]，side 取同一视觉边长、圆角取同一插值
   /// 局部圆角），只有 intensity 乘形变进度——迷你端无阴影（t=0 不画），
   /// 全屏端淡入到与真实封面等强，两端交接处左右两份阴影等价，无感换手。
+  ///
+  /// **圆盘端不画阴影**：频谱圆盘真身（`SpectrumArtwork`）的圆形封面没有
+  /// `PlayerCoverShadow.wrap`，飞行期若画一层，交接帧会凭空多出/消失一圈投影。
   Widget _shadowedArtwork(
     PlayerCoverMorphBus bus,
     double t,
     double scale,
     Rect settled,
   ) {
+    // 起点圆角取 mini 侧上报的**真实**圆角（常驻条 6 / 胶囊 29 / 圆盘 28）：
+    // 一律用 6 的话，胶囊/圆盘点开那一帧封面会从正圆突变成近方角。
+    //
+    // 进度传**平抛的加速项**而不是 t：圆角是盒子自身的属性，必须与边长同拍
+    // （边长也按 t² 走，见 coverMorphFlightRect），否则前半程那个还没怎么放大的
+    // 小方块会显得过圆。
+    //
+    // **终点圆角随目标形状**：方图 16（`kCoverMorphFullRadius`）；圆盘取终点矩形
+    // 边长的一半 —— t=1 恰好是正圆，与真身 `ClipOval` 的可见圆逐像素重合。
+    final double radius = coverMorphLocalRadius(
+      coverMorphAcceleratedProgress(t),
+      scale,
+      startRadius: bus.miniCoverCornerRadius,
+      endRadius: bus.settledInsetRatio > 0
+          ? settled.width / 2
+          : kCoverMorphFullRadius,
+    );
     final artwork = ClipRRect(
       // 局部半径 = 屏幕圆角 / scale，保证两端与真实封面严格对齐
-      borderRadius: BorderRadius.circular(coverMorphLocalRadius(t, scale)),
+      borderRadius: BorderRadius.circular(radius),
       child: _artworkFor(bus),
     );
     final shadowColor = bus.shadowColor;
-    if (shadowColor == null) return artwork;
+    if (shadowColor == null || bus.settledInsetRatio > 0) return artwork;
     return DecoratedBox(
       // side 用视觉盒边长（暂停态 0.85 已计入）：settledScale=1 时与真实阴影
       // 的取径完全一致；暂停交接下模糊/扩散的上下限钳制会差出零点几到几个
@@ -384,7 +466,7 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
       decoration: PlayerCoverShadow.decoration(
         shadowColor: shadowColor,
         side: settled.width,
-        radius: coverMorphLocalRadius(t, scale),
+        radius: radius,
         intensity: kCoverShadowIntensity.value * t,
       ),
       child: artwork,
@@ -409,15 +491,29 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
     final mini = bus.miniRect!;
     // 终点用**真实屏幕矩形**（暂停态 0.85 已计入），否则松手那帧真实封面会
     // 从满尺寸动画缩到 0.85 —— 就是「松手后还有个缩放动画」的来源。
-    final settled = coverSettledVisualRect(
+    final box = coverSettledVisualRect(
       layout: settledLayout,
       scale: bus.settledArtworkScale,
       anchor: bus.settledArtworkAnchor,
     );
-    final target = coverMorphTargetRect(mini: mini, settled: settled, t: t);
-    // 两端都是正方形（MiniPlayer 固定 44×44，播放页是 AspectRatio(1)），
-    // 故用单标量缩放。
-    final scale = target.width / settled.width;
+    // **可见封面**矩形：方图路径恒等于槽位盒；频谱圆盘要按上报比例内缩
+    //
+    // 由槽位上报而不是形变层猜（见 PlayerCoverMorphBus.settledInsetRatio）：
+    // 真身 `SpectrumArtwork` 把可见圆画在槽位盒**居中**、四周各留 12% 给环形
+    // 频谱柱，所以终点矩形 = 盒矩形 deflate(边长 × 0.12)，终点圆角 = 边长/2。
+    // 不内缩的话封面会飞成"比真身大一圈的方块"，落位帧再缩成圆 —— 正是改动前
+    // 圆盘模式干脆不飞的原因。
+    final double insetRatio = bus.settledInsetRatio.isFinite
+        ? bus.settledInsetRatio.clamp(0.0, 0.45)
+        : 0.0;
+    final Rect settled = (insetRatio > 0 && box.shortestSide > 0)
+        ? box.deflate(box.shortestSide * insetRatio)
+        : box;
+    final target = coverMorphFlightRect(mini: mini, settled: settled, t: t);
+    // 两端都是正方形（MiniPlayer 固定 44×44，播放页是 AspectRatio(1)，圆盘内缩
+    // 后仍是正方形），故用单标量缩放。除零守卫：端点矩形尚未量到时会让 scale
+    // 变成 NaN / Infinity，整个 Transform 失效（封面凭空消失）。
+    final scale = settled.width <= 0 ? 1.0 : target.width / settled.width;
 
     // 把 settled 尺寸的方盒子整体搬到 target 的中心、缩放 scale、绕自身中心
     // 转 tilt；等价于 m = T(target.center)·Rz·S·T(-size/2)，局部 (0,0)（方块
@@ -426,9 +522,22 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
     // translate(x,y) / scale(s) 标记为 deprecated。
     // 末位 tw / sw 必须给 1.0（老 API 的默认值就是 1.0）：给 0 会把矩阵第 4 行
     // 清零、退化成非仿射，求逆随之奇异，localToGlobal 直接返回 NaN / Infinity。
+    //
+    // **唱片角**：源形态可能是正在自转的悬浮圆盘（`_discAngle`），终点可能是
+    // 共享相位的频谱圆盘。改用 `coverMorphFlightAngle`（起点角 + 连续差 × 进度）：
+    // - 方图端（终点角恒 0）退化成改动前的 `start × (1 − t)`，逐值不变；
+    // - 圆盘端 t=1 与真身同相（差整数圈），交接帧不再"跳一格"。
+    final double startAngle = bus.miniCoverRotation;
+    final bool discTarget = insetRatio > 0;
+    final double spinDelta = _spinDeltaFor(start: startAngle, disc: discTarget);
+    final double baseAngle = coverMorphFlightAngle(
+      start: startAngle,
+      delta: spinDelta,
+      t: t,
+    );
     final matrix = Matrix4.identity()
       ..translateByDouble(target.center.dx, target.center.dy, 0, 1)
-      ..rotateZ(coverMorphTilt(t))
+      ..rotateZ(baseAngle + coverMorphTilt(t))
       ..scaleByDouble(scale, scale, scale, 1)
       ..translateByDouble(-settled.width / 2, -settled.height / 2, 0, 1);
 
@@ -484,8 +593,9 @@ class _MorphCoverFlightState extends State<_MorphCoverFlight> {
 /// 一个都不能漏（漏一个就是「转场中途切歌仍飞着上一首封面」这类缺陷）。
 ///
 /// **不含** `settledRect` / `miniRect` / `settledArtworkScale` /
-/// `settledArtworkAnchor` / `shadowColor`：这些都在每帧现算的外层被读到
-/// （`SizedBox` 的边长、`Transform` 的矩阵、`DecoratedBox` 的阴影），不经过
+/// `settledArtworkAnchor` / `settledInsetRatio` / `miniCoverRotation` /
+/// `shadowColor`：这些都在每帧现算的外层被读到（`SizedBox` 的边长、`Transform`
+/// 的矩阵、`DecoratedBox` 的阴影、以及本 State 自己跟踪的唱片角差），不经过
 /// memo，因此不存在陈旧问题。
 ///
 /// 解码档位同样不进签名：`PlayerArtworkImage` 用 `LayoutBuilder` 在**布局阶段**
@@ -598,6 +708,7 @@ class MiniPlayerTextSlot extends StatelessWidget {
     required this.titleStyle,
     required this.subtitleStyle,
     required this.child,
+    this.lineAlign = Alignment.centerLeft,
   });
 
   final String title;
@@ -606,18 +717,26 @@ class MiniPlayerTextSlot extends StatelessWidget {
   final TextStyle? subtitleStyle;
   final Widget child;
 
+  /// 本块的行对齐（飞行起点）。常驻条贴左 = 缺省；胶囊传 center（见
+  /// [PlayerCoverMorphBus.miniTextAlign]）。
+  final Alignment lineAlign;
+
   @override
   Widget build(BuildContext context) {
     final bus = PlayerCoverMorphBus.instance;
     return ValueListenableBuilder<double>(
       valueListenable: playerExpansion,
       builder: (context, expansion, content) => CoverGeometryProbe(
+        // 本槽位**按定义**就是迷你端（类名即 MiniPlayerTextSlot），所以无条件
+        // 登记重测入口：它同样被 `Opacity(0)` 让位包住，转场期间不 paint。
+        isMiniSource: true,
         onRect: (rect, _) => bus.publishMiniText(
           rect: rect,
           title: title,
           subtitle: subtitle,
           titleStyle: titleStyle,
           subtitleStyle: subtitleStyle,
+          lineAlign: lineAlign,
         ),
         child: Opacity(
           opacity: expansion > 0.0 && bus.textWillDraw ? 0.0 : 1.0,
@@ -648,6 +767,7 @@ class PlayerCoverSlot extends StatelessWidget {
     required this.eligible,
     required this.settledScale,
     required this.settledAnchor,
+    this.settledInsetRatio = 0.0,
     required this.child,
   });
 
@@ -662,8 +782,9 @@ class PlayerCoverSlot extends StatelessWidget {
   /// 进度淡入淡出，不传则形变层不画阴影（旧行为）。
   final Color? shadowColor;
 
-  /// 本次转场是否允许**封面**形变接管。频谱圆盘 / 写真 / 3D 深度封面 / 动态封面 /
-  /// 车机常驻面板一律传 false——形变层画的是一张平面方图，盖在这些形态上会穿帮。
+  /// 本次转场是否允许**封面**形变接管。写真封面 / 车机常驻面板一律传 false——
+  /// 那两种形态没有可与形变层交接的方形封面（频谱圆盘**不在此列**：它的形状由
+  /// [settledInsetRatio] + 终点圆角完整描述，可以交接）。
   ///
   /// **判据必须同步可读**（见 `PlayerCoverMorphBus.resolveCoverEligible`）：
   /// 跟手覆盖层里的播放页是当场新建的，首帧就在 0<p<1，它自己的异步偏好还没读到。
@@ -682,6 +803,14 @@ class PlayerCoverSlot extends StatelessWidget {
 
   /// 与 [settledScale] 对应的 `AnimatedScale.alignment`。
   final Alignment settledAnchor;
+
+  /// 终点**可见封面**相对本槽位盒的单侧内缩比例（口径见
+  /// [PlayerCoverMorphBus.settledInsetRatio]）。
+  ///
+  /// 方图恒 0；频谱圆盘传 `SpectrumArtwork.barReserveRatio`（0.12）—— 真身把
+  /// 可见圆居中画在盒里、四周留出环形频谱柱的空间，形变层据此把终点收到那个圆上。
+  /// 只有槽位知道「自己包着什么形状」，所以必须由这里上报。
+  final double settledInsetRatio;
 
   /// 真实封面子树。
   final Widget child;
@@ -714,6 +843,7 @@ class PlayerCoverSlot extends StatelessWidget {
               eligible: eligible,
               settledArtworkScale: settledScale,
               settledArtworkAnchor: settledAnchor,
+              settledInsetRatio: settledInsetRatio,
             );
           },
           child: Opacity(

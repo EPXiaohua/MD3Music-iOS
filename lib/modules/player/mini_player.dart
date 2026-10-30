@@ -9,9 +9,9 @@ import '../../core/build_flags.dart';
 import '../../core/layout/bottom_chrome_dimens.dart';
 import '../../core/layout/bottom_chrome_scope.dart';
 import '../../core/layout/display_space.dart';
+import '../../core/layout/responsive_layout.dart';
 import '../../core/layout/tv_player_bar_focus_bridge.dart';
 import '../../core/layout/ui_density.dart';
-import '../../core/services/desktop_lyric_service.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../core/utils/app_haptics.dart';
@@ -173,6 +173,8 @@ class _MiniPlayerState extends State<MiniPlayer>
   // MiniPlayer「从无到有」入场动画控制器（底部弹出 + 背景色遮罩 morph 到本体）
   late final AnimationController _entranceController;
   late final CurvedAnimation _entranceAnim;
+  // 上拉未达阈值时的回弹驱动（与悬浮胶囊共用，见 DragReleaseAnimator）。
+  late final DragReleaseAnimator _dragRelease;
   // 记录本实例是否已处于「有歌」状态：只在 null→有歌 的转变时播放一次入场动画，
   // 页面切换重建（进来即有歌）不触发
   late bool _hadSong;
@@ -191,10 +193,6 @@ class _MiniPlayerState extends State<MiniPlayer>
   // 字段一比即可区分，无需任何「切歌进行中」标志（也就无需动切歌状态机）。
   String? _coverSongId;
 
-  // 桌面歌词状态监听：iOS 从 PiP 小窗点按/手势关闭时无任何点击事件流经本页，
-  // 必须靠 DesktopLyricService 的通知重建，歌词按钮高亮才能复位
-  late final VoidCallback _onDesktopLyricChanged;
-
   // 拖动触发阈值
   static const double _velocityThreshold = 400.0; // px/s
   static const double _distanceRatio = 0.25; // 屏宽比例
@@ -210,11 +208,6 @@ class _MiniPlayerState extends State<MiniPlayer>
   @override
   void initState() {
     super.initState();
-    // 桌面歌词状态变化时刷新 UI（同步歌词按钮 icon，含 PiP 内关闭的回传）
-    _onDesktopLyricChanged = () {
-      if (mounted) setState(() {});
-    };
-    DesktopLyricService.instance.addListener(_onDesktopLyricChanged);
     final swipeNode = _tvSwipeFocusNode;
     if (swipeNode != null) {
       TvPlayerBarFocusBridge.instance.register(swipeNode);
@@ -231,6 +224,8 @@ class _MiniPlayerState extends State<MiniPlayer>
       parent: _entranceController,
       curve: M3ExpressiveMotion.expressiveEasing,
     );
+    // 上拉未达阈值时的回弹（与悬浮胶囊共用同一个驱动）。
+    _dragRelease = DragReleaseAnimator(this);
     // 进来即有歌（如页面切换重建）→ 直接满显示、不弹；进来无歌 → 归零待触发
     _hadSong = context.read<PlayerProvider>().currentSong != null;
     _entranceController.value = _hadSong ? 1.0 : 0.0;
@@ -248,7 +243,6 @@ class _MiniPlayerState extends State<MiniPlayer>
 
   @override
   void dispose() {
-    DesktopLyricService.instance.removeListener(_onDesktopLyricChanged);
     final swipeNode = _tvSwipeFocusNode;
     if (swipeNode != null) {
       TvPlayerBarFocusBridge.instance.unregister(swipeNode);
@@ -256,6 +250,7 @@ class _MiniPlayerState extends State<MiniPlayer>
     }
     _snapController.dispose();
     _entranceController.dispose();
+    _dragRelease.dispose();
     super.dispose();
   }
 
@@ -429,6 +424,9 @@ class _MiniPlayerState extends State<MiniPlayer>
   void _onRawDown(PointerDownEvent e) {
     if (_activePointer != null) return; // 已在跟踪其他手指
     _activePointer = e.pointer;
+    // 用户重新按住 = 接管上一次回弹（回弹动画若不停，会继续逐帧覆写
+    // playerExpansion，与新手势的跟手值打架）。
+    _dragRelease.stop();
     // 原始指针事件是**窗口坐标**，而 `_miniTopY` / 路由位移是设计像素：
     // 不换算会让跟手进度偏 s²（1.1 档快 21%）。统一按设计像素累计。
     final down = toDisplaySpace(context, e.position);
@@ -504,19 +502,27 @@ class _MiniPlayerState extends State<MiniPlayer>
     if (expand) {
       _expandPlayerFromDrag();
     } else {
-      // 未达阈值：收起覆盖层，回到 MiniPlayer
-      playerDragActive.value = false;
-      playerExpansion.value = 0.0;
+      // 未达阈值：面板**动画回弹**到迷你条（旧实现单帧硬归零，观感是
+      // 「拉到一半啪一下没了」）。与悬浮胶囊共用同一个回弹驱动。
+      _dragRelease.settleBack(
+        reduceMotion: MediaQuery.disableAnimationsOf(context),
+        onDone: () {
+          if (!mounted) return;
+          playerDragActive.value = false;
+        },
+      );
     }
   }
 
   void _onRawCancel(PointerCancelEvent e) {
     if (e.pointer != _activePointer) return;
     _activePointer = null;
-    // 手势被系统打断：收起覆盖层（同样保持守卫到下一次 down）
+    // 手势被系统打断：收起覆盖层（同样保持守卫到下一次 down）。
+    // 系统打断时用户没有期待动画，瞬时归零。
     if (_dragActivated) {
       // 同 _onRawUp：上滑接管后归零水平偏移，防止错位残留
       if (_dragOffset != 0.0) setState(() => _dragOffset = 0.0);
+      _dragRelease.stop();
       playerDragActive.value = false;
       playerExpansion.value = 0.0;
     }
@@ -552,24 +558,18 @@ class _MiniPlayerState extends State<MiniPlayer>
       screenHeight: MediaQuery.sizeOf(context).height,
       dragOriginBottom: _miniBottomY,
     );
-    Navigator.of(context).push(route);
-    route.controller.stop();
-    route.controller.value = progress; // 路由从当前手指位置开始显示
-    // 等待路由渲染（2 帧）后：隐藏覆盖层并启动展开动画
-    var frames = 0;
-    void tick() {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        frames++;
-        if (frames >= 2) {
-          playerDragActive.value = false;
-          route.settleToFull();
-        } else {
-          tick();
-        }
-      });
-    }
-
-    tick();
+    // 交接实现收口到 full_player_route.dart（与悬浮胶囊共用）：
+    // push → 停在当前进度 → 两帧后覆盖层让位 + 路由续播。
+    // 常驻条不写横向范围/圆角（默认值 = 通栏 + 方角），所以这里不用传。
+    handOffDragToRoute(
+      navigator: Navigator.of(context),
+      route: route,
+      progress: progress,
+      onOverlayRelease: () {
+        if (!mounted) return;
+        playerDragActive.value = false;
+      },
+    );
   }
 
   @override
@@ -798,7 +798,7 @@ class _MiniPlayerState extends State<MiniPlayer>
                       child: Opacity(
                         opacity: (1.0 - t).clamp(0.0, 1.0),
                         child: ColoredBox(
-                          color: colorScheme.surfaceContainerHigh,
+                          color: background,
                         ),
                       ),
                     ),
@@ -853,7 +853,10 @@ class _MiniPlayerState extends State<MiniPlayer>
       if (inBottomBarFormFlight()) return;
       if (_residentRoute?.isCurrent != true || !_tickerModeEnabled) return;
       final box = context.findRenderObject() as RenderBox?;
-      if (box == null || !box.hasSize) return;
+      // attached：post-frame 回调执行前本条可能已被卸载（tab 切换/转场），
+      // 挂着的 box 引用拿去做 localToGlobal 会触发
+      // 「RenderObject.getTransformTo: attached」断言（2026-10-16 TV 真机刷屏）。
+      if (box == null || !box.attached || !box.hasSize) return;
       final origin = box.localToGlobal(Offset.zero, ancestor: _scaleAnchor);
       BottomBarMorphRegistry.instance.residentRect = origin & box.size;
     });
@@ -902,12 +905,11 @@ class _MiniPlayerState extends State<MiniPlayer>
     final miniSubtitleStyle = textTheme.bodySmall?.copyWith(
       color: colorScheme.onSurfaceVariant,
     );
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // 进度只对变化敏感：用 ValueListenableBuilder 只订阅 position 通道，
-        // 封面/标题/按钮等静态内容不再随 200ms 进度刷新重建。
-        ValueListenableBuilder<Duration>(
+    // tv: 进度条加粗 2→4dp 并移到内容行下方（非 TV 保持顶置 2dp 原样）。
+    final double progressStroke = kTvBuild ? 4.0 : kPlayerBarProgressLineStroke;
+    // 进度只对变化敏感：用 ValueListenableBuilder 只订阅 position 通道，
+    // 封面/标题/按钮等静态内容不再随 200ms 进度刷新重建。
+    Widget buildProgressLine() => ValueListenableBuilder<Duration>(
           valueListenable: playerProvider.positionNotifier,
           builder: (context, position, _) {
             final duration = playerProvider.duration ?? Duration.zero;
@@ -916,7 +918,7 @@ class _MiniPlayerState extends State<MiniPlayer>
                 : 0.0;
             // 常驻条走同一 painter 的 formT=0 端点（顶置直线），与悬浮胶囊的
             // 内缘包边共用一套几何，交叉过渡期间只变形、不换画法。
-            // 盒子高取直线描边宽（2dp）→ 中心线落在盒中线、描边带正好贴顶铺满。
+            // 盒子高取直线描边宽 → 中心线落在盒中线、描边带正好铺满。
             // formT=0 逐项复刻旧的 M3ELinearProgressIndicator(value:, minHeight: 2,
             // backgroundColor: surfaceContainerHighest, color: primary)：轨道色取
             // **surfaceContainerHighest**（不是胶囊那套 onSurfaceVariant@0.16），
@@ -924,7 +926,7 @@ class _MiniPlayerState extends State<MiniPlayer>
             // （后者在描边宽 2 时与轨道的圆端帽重合，只把轨道最右 2dp 画成进度色）。
             return SizedBox(
               width: double.infinity,
-              height: kPlayerBarProgressLineStroke,
+              height: progressStroke,
               child: CustomPaint(
                 key: const ValueKey('mini-player-progress'),
                 painter: PlayerBarProgressPainter(
@@ -936,11 +938,18 @@ class _MiniPlayerState extends State<MiniPlayer>
                   gapSize: kPlayerBarProgressLineGap,
                   strokeCap: StrokeCap.round,
                   stopIndicatorSize: kPlayerBarProgressLineStopSize,
+                  lineStroke: progressStroke,
                 ),
               ),
             );
           },
-        ),
+        );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // tv: 进度条移到 miniplayer 下方 —— 内容行在前、进度在后；非 TV 顺序
+        // 与改动前逐像素一致（进度顶置）。
+        if (!kTvBuild) buildProgressLine(),
         const PlaybackStatusFeedback(),
         // 左右内边距在「自身即屏幕最底部」时按圆角反解值加宽（本机 R=58 /
         // 底部 20dp → 15dp），有导航栏时为 4dp。
@@ -1016,6 +1025,9 @@ class _MiniPlayerState extends State<MiniPlayer>
                               // 里面会有「新旧两份并存」的问题（见下方回调），
                               // 那是可解的瞬时问题；外面是不可解的常态错误。
                               CoverGeometryProbe(
+                                // 迷你端探针：注册「不经 paint 重测」的入口（见
+                                // [CoverGeometryProbe.isMiniSource] 的成因说明）。
+                                isMiniSource: true,
                                 onRect: (rect, _) {
                                   // 切歌过渡期 AnimatedSwitcher 里新旧两份封面同时
                                   // 存在、两份都带探针，而「后画的赢」——正在滑出的
@@ -1036,7 +1048,7 @@ class _MiniPlayerState extends State<MiniPlayer>
                                   // 一旦形变层真的在画，就说明它已经画在了
                                   // 本封面此刻的位置上（p≈0 时两者重合），
                                   // 淡出只会拖成一个看得见的残影。
-                                  // 若形变层没接管（例如频谱圆盘 / 车机面板），
+                                  // 若形变层没接管（例如车机面板 / 减弱动画），
                                   // 本封面保持显示，行为与改动前一致。
                                   // 必须自己订阅：外层 _buildContent 只构建一次
                                   // （被 build 里的 ValueListenableBuilder 当
@@ -1096,8 +1108,11 @@ class _MiniPlayerState extends State<MiniPlayer>
                 // —— 固定区：右侧按钮不参与滑动 ——
                 // 桌面歌词按钮 + 播放控制：与交叉过渡浮层共用（内容只留一个实现）。
                 // 常驻条侧两者都满显（opacity/widthFactor = 1），逐像素与改动前一致。
-                const PlayerBarLyricButton(opacity: 1.0, widthFactor: 1.0),
-                PlayerBarTransport(player: playerProvider),
+                // tv: 顶栏迷你条只保留播放/暂停——下一首与桌面歌词按钮按需求移除
+                // （完整播放页 / 通知栏 / 遥控媒体键均有等价入口）。
+                if (!kTvBuild)
+                  const PlayerBarLyricButton(opacity: 1.0, widthFactor: 1.0),
+                PlayerBarTransport(player: playerProvider, showNext: !kTvBuild),
               ],
             ),
             builder: (context, child) => Padding(
@@ -1115,6 +1130,8 @@ class _MiniPlayerState extends State<MiniPlayer>
             ),
           ),
         ),
+        // tv: 进度条移到 miniplayer 下方（内容行之后），加粗 4dp。
+        if (kTvBuild) buildProgressLine(),
       ],
     );
   }

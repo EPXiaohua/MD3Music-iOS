@@ -6,6 +6,57 @@ import 'package:md3music/modules/player/player_tab_layout.dart';
 ///   * 封面 tab 只在窄屏存在、控制 tab 只在宽屏存在，两者同为下标 1 但不冲突；
 ///   * 歌词、评论恒在控制 tab 之后。
 void main() {
+  group('宽分栏页签判定', () {
+    test('嵌入播放器的宽面板仍按宽屏处理', () {
+      expect(
+        isWidePlayerTabLayout(
+          dockMode: true,
+          deviceIsPad: false,
+          width: 800,
+        ),
+        isTrue,
+      );
+      final layout = resolvePlayerTabLayout(
+        isWideLayout: isWidePlayerTabLayout(
+          dockMode: true,
+          deviceIsPad: false,
+          width: 800,
+        ),
+        isLocalSong: false,
+        closeLocalMusicComments: true,
+        showControlsPage: false,
+      );
+      expect(layout.hasCover, isFalse);
+      expect(layout.tabKinds, const [
+        PlayerTabKind.playlist,
+        PlayerTabKind.lyrics,
+        PlayerTabKind.comments,
+      ]);
+    });
+
+    test('设备标记为平板但车机面板窄时仍保留封面页签', () {
+      expect(
+        isWidePlayerTabLayout(
+          dockMode: true,
+          deviceIsPad: true,
+          width: 500,
+        ),
+        isFalse,
+      );
+    });
+
+    test('普通播放器仍尊重平板设备类型', () {
+      expect(
+        isWidePlayerTabLayout(
+          dockMode: false,
+          deviceIsPad: true,
+          width: 500,
+        ),
+        isTrue,
+      );
+    });
+  });
+
   group('resolvePlayerTabLayout 结构推导', () {
     test('窄屏在线歌曲：含封面与评论 tab，共 4 个，歌词下标 2', () {
       final layout = resolvePlayerTabLayout(

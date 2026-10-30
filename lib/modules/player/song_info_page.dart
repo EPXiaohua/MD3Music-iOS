@@ -5,6 +5,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
+import '../../core/platform_capabilities.dart';
 import '../../core/services/usb_audio_service.dart';
 import '../../core/utils/audio_format_utils.dart';
 import '../../core/utils/audio_scanner.dart' show audioExtensions;
@@ -13,22 +14,25 @@ import '../../data/models/song.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/song_match_provider.dart';
 import '../../widgets/player_artwork_image.dart';
+import '../../widgets/usb_exclusive_section.dart';
 import '../album/album_detail_page.dart';
 import '../artist/artist_detail_page.dart';
 import '../library/song_match_sheet.dart';
+import '../sheet/song_sheet_sheet.dart';
 import 'comments_view.dart';
 import 'song_accompany_sheet.dart';
 import 'song_ranking_sheet.dart';
 
 /// 歌曲信息页：展示当前播放歌曲的音频格式（采样频率/位深/码率/声道）与
-/// USB 独占设备状态（仅在USB 独占开启时才有内容）。
+/// USB 独占输出开关（与设置页共用同一 [UsbExclusiveSection]，信息保持一致）。
 ///
-/// 频率/位深/码率/声道取自 ExoPlayer 实际解码输出格式（原生 UsbAudioSinkController
-/// 在 configure() 时捕获，无论是否开启独占都会更新）。
+/// Android 使用 ExoPlayer 源格式/解码遥测；Windows 使用当前播放项的音轨属性。
+/// FLAC/WAV 文件头可补充原始位深，不把系统混音器格式当作歌曲属性。
 ///
-/// 注：原页尾的「USB 独占」开关整块已移除（依赖 Android USB Host + native cpp，
-/// 桌面端不可用）。若日后要恢复，需同时恢复 `UsbExclusiveSection` 的 import，
-/// 并沿用 `supportsUsbExclusive` 门控（见 lib/core/platform_capabilities.dart）。
+/// 平台可见性：USB 独占相关内容（页尾开关区块 + 解码输出/USB 输出两行遥测）只在
+/// [supportsUsbExclusive] 为真时渲染 —— 即仅 Android 手机；桌面端与 TV 构建没有
+/// USB Host 原生插件（TV 的 `FEATURE_TV` 不注册 UsbAudioPlugin），整块隐藏，
+/// 避免出现点不动、也永远没有数据的死 UI。
 class SongInfoPage extends StatefulWidget {
   const SongInfoPage({super.key});
 
@@ -45,27 +49,35 @@ class _SongInfoPageState extends State<SongInfoPage> {
   /// 从音频文件头解析的原始位深（FLAC/WAV），null=未知。
   int? _headerBitDepth;
 
-  /// 从音频文件头解析的源格式（iOS 无 ExoPlayer TrackGroup 时的兜底数据源）。
-  Map<String, int?>? _headerInfo;
-
   /// 文件大小（字节），null=暂无数据。获取成功后不再重复请求（文件大小恒定）。
   int? _fileSizeBytes;
   bool _fileSizeResolved = false;
   Timer? _fileSizeTimer;
   String? _sourceSongId;
+  int _sourceFormatRequest = 0;
+  bool _sourceFormatLoading = false;
 
   @override
   void initState() {
     super.initState();
-    _status = UsbAudioService.instance.lastStatus;
-    UsbAudioService.instance.statusStream.listen((s) {
-      if (mounted) setState(() => _status = s);
-    });
-    // 兜底 c：页面可见时主动查一次（覆盖原生事件未推送的边界场景）
-    UsbAudioService.instance.refresh();
+    // USB 遥测只在支持 USB 独占的平台上有数据源（桌面端/TV 无原生插件通道，
+    // 调用只会抛 MissingPluginException 被吞掉），故整体按能力门控。
+    if (supportsUsbExclusive) {
+      _status = UsbAudioService.instance.lastStatus;
+      UsbAudioService.instance.statusStream.listen((s) {
+        if (mounted) setState(() => _status = s);
+      });
+      // 兜底 c：页面可见时主动查一次（覆盖原生事件未推送的边界场景）
+      UsbAudioService.instance.refresh();
+    }
     // 每秒刷新一次文件大小
     _fileSizeTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _refreshFileSize();
+      // Windows 装载尚未完成时没有音轨信息，页面保持打开也需在就绪后补取。
+      if (isWindowsDesktop && !_sourceFormatLoading &&
+          _sourceFormat?['hasData'] != true) {
+        _refreshSourceFormat();
+      }
     });
   }
 
@@ -78,9 +90,11 @@ class _SongInfoPageState extends State<SongInfoPage> {
   /// 每秒刷新文件大小。文件大小恒定，获取成功后即停（_fileSizeResolved）。
   Future<void> _refreshFileSize() async {
     if (_fileSizeResolved) return;
+    final songId = _sourceSongId;
     try {
       final size = await _resolveFileSize();
-      if (mounted && size != null && size != _fileSizeBytes) {
+      if (mounted && songId == _sourceSongId &&
+          size != null && size != _fileSizeBytes) {
         setState(() {
           _fileSizeBytes = size;
           _fileSizeResolved = true;
@@ -104,7 +118,8 @@ class _SongInfoPageState extends State<SongInfoPage> {
     if (local != null && local.isNotEmpty) {
       if (local.startsWith('file://')) {
         path = Uri.parse(local).toFilePath();
-      } else if (local.startsWith('/')) {
+      } else if (local.startsWith('/') || (isWindowsDesktop &&
+          (RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(local) || local.startsWith(r'\\')))) {
         path = local;
       }
     }
@@ -118,17 +133,13 @@ class _SongInfoPageState extends State<SongInfoPage> {
       if (await f.exists()) return await f.length();
     }
     // 3) 网络歌曲：HEAD 请求拿 Content-Length（文件真实大小）
-    if (url != null &&
-        (url.startsWith('http://') || url.startsWith('https://'))) {
+    if (url != null && (url.startsWith('http://') || url.startsWith('https://'))) {
       try {
         final resp = await http
             .head(Uri.parse(url))
             .timeout(const Duration(seconds: 4));
         final len = int.tryParse(resp.headers['content-length'] ?? '');
-        if (resp.statusCode >= 200 &&
-            resp.statusCode < 300 &&
-            len != null &&
-            len > 0) {
+        if (resp.statusCode >= 200 && resp.statusCode < 300 && len != null && len > 0) {
           return len;
         }
       } catch (_) {}
@@ -143,29 +154,24 @@ class _SongInfoPageState extends State<SongInfoPage> {
     return null;
   }
 
-  /// 从 ExoPlayer TrackGroup 读取源格式 + 解析音频文件头（位深与完整源格式）。
+  /// Android 读取 TrackGroup，Windows 读取当前播放项；文件头补充原始位深。
   Future<void> _refreshSourceFormat() async {
     final player = context.read<PlayerProvider>().audioService?.player;
     final song = context.read<PlayerProvider>().currentSong;
+    if (song == null) return;
+    final request = ++_sourceFormatRequest;
+    _sourceFormatLoading = true;
     Map<String, dynamic>? fmt;
     if (player != null) {
-      try {
-        fmt = await player.getSourceFormat();
-      } catch (_) {
-        // 源格式仅用于展示，失败静默（iOS 端 just_audio 无此实现，必然失败）
-      }
+      fmt = await player.getSourceFormat();
     }
-    final headerBits = await _parseHeaderBitDepth(song?.url, song?.localPath);
-    // 平台无关兜底：iOS 无 TrackGroup/原生 USB 状态，采样率/声道/码率从文件头解析
-    final headerInfo = await AudioFormatUtils.parseAudioSourceInfo(
-      song?.url,
-      song?.localPath,
-    );
-    if (mounted) {
+    final headerBits = await _parseHeaderBitDepth(song.url, song.localPath);
+    if (mounted && request == _sourceFormatRequest &&
+        song.id == context.read<PlayerProvider>().currentSong?.id) {
       setState(() {
         _sourceFormat = fmt;
         _headerBitDepth = headerBits;
-        _headerInfo = headerInfo;
+        _sourceFormatLoading = false;
       });
     }
   }
@@ -185,7 +191,13 @@ class _SongInfoPageState extends State<SongInfoPage> {
     // 切歌后异步拉取源格式（以歌曲 id 去重，避免重复请求）
     if (song?.id != _sourceSongId) {
       _sourceSongId = song?.id;
-      _fileSizeBytes = null; // 换歌重置
+      if (isWindowsDesktop) {
+        ++_sourceFormatRequest;
+        _sourceFormat = null;
+        _headerBitDepth = null;
+        _sourceFormatLoading = false;
+      }
+      _fileSizeBytes = null;  // 换歌重置
       _fileSizeResolved = false;
       _refreshSourceFormat();
     }
@@ -204,18 +216,17 @@ class _SongInfoPageState extends State<SongInfoPage> {
           const SizedBox(height: 8),
           _buildSectionHeader('音频格式'),
           _buildFormatCard(colorScheme),
-          // USB 独占整块已从歌曲信息页移除（原本用 if (supportsUsbExclusive) 门控，
-          // 但该区块含 USB 独占输出 / TPDF 抖动降位 / 输出采样率 / 输出位深，
-          // 桌面端全部不可用，留着只是噪音）。
-          // 保留注释便于日后需要时恢复；恢复时需同时保留 settings_page 的同款门控。
-          //
-          // if (supportsUsbExclusive) ...[
-          //   const SizedBox(height: 8),
-          //   _buildSectionHeader('USB 独占'),
-          //   UsbExclusiveSection(
-          //     onAutoPause: () => context.read<PlayerProvider>().pause(),
-          //   ),
-          // ],
+          // USB 独占：依赖 Android USB Host + native cpp（UAC1 DAC 直写 usbdevfs）。
+          // supportsUsbExclusive 已排除桌面端与 TV 构建（TV 不注册原生插件），
+          // 因此这里只剩 Android 手机可见；与设置页「USB 独占」共用同一组件，
+          // 两处信息与开关必然一致（见 docs/agents/troubleshooting.md §4.11）。
+          if (supportsUsbExclusive) ...[
+            const SizedBox(height: 8),
+            _buildSectionHeader('USB 独占'),
+            UsbExclusiveSection(
+              onAutoPause: () => context.read<PlayerProvider>().pause(),
+            ),
+          ],
           const SizedBox(height: 32),
         ],
       ),
@@ -228,8 +239,8 @@ class _SongInfoPageState extends State<SongInfoPage> {
       child: Text(
         title,
         style: Theme.of(context).textTheme.titleSmall?.copyWith(
-          color: Theme.of(context).colorScheme.primary,
-        ),
+              color: Theme.of(context).colorScheme.primary,
+            ),
       ),
     );
   }
@@ -333,6 +344,12 @@ class _SongInfoPageState extends State<SongInfoPage> {
                     if (isMatched)
                       TextButton(
                         onPressed: () =>
+                            showSongSheetSheet(context, matchedSong),
+                        child: const Text('看曲谱'),
+                      ),
+                    if (isMatched)
+                      TextButton(
+                        onPressed: () =>
                             showSongCommentsSheet(context, song),
                         child: const Text('看评论'),
                       ),
@@ -362,10 +379,7 @@ class _SongInfoPageState extends State<SongInfoPage> {
   }
 
   Widget _buildSongHeader(
-    Song? song,
-    ColorScheme colorScheme,
-    TextTheme textTheme,
-  ) {
+      Song? song, ColorScheme colorScheme, TextTheme textTheme) {
     // 去掉文件名后缀：仅当标题以音频扩展名结尾才剥离，避免误伤合法带点的标题
     final title = _stripAudioExtension(song?.title ?? '未在播放');
     final artist = song?.artist ?? '—';
@@ -392,21 +406,16 @@ class _SongInfoPageState extends State<SongInfoPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  title,
-                  style: textTheme.titleMedium,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                Text(title,
+                    style: textTheme.titleMedium,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
                 const SizedBox(height: 2),
-                Text(
-                  artist,
-                  style: textTheme.bodySmall?.copyWith(
-                    color: colorScheme.onSurfaceVariant,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                Text(artist,
+                    style: textTheme.bodySmall
+                        ?.copyWith(color: colorScheme.onSurfaceVariant),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
@@ -417,42 +426,31 @@ class _SongInfoPageState extends State<SongInfoPage> {
 
   Widget _buildFormatCard(ColorScheme colorScheme) {
     final textTheme = Theme.of(context).textTheme;
-    final song = context.read<PlayerProvider>().currentSong;
     final src = _sourceFormat;
     final hasSrc = src != null && (src['hasData'] == true);
-    // 文件头解析（iOS 无 TrackGroup 时的唯一源格式来源）
-    final hdr = _headerInfo;
-    final hdrRate = hdr?['sampleRate'] ?? 0;
-    final hdrCh = hdr?['channels'] ?? 0;
-    final hdrBits = hdr?['bits'] ?? 0;
-    final hdrBitrate = hdr?['bitrate'] ?? 0;
 
     // 源格式（歌曲原始属性，来自 ExoPlayer TrackGroup）
     final srcRate = hasSrc ? ((src['sampleRate'] as num?)?.toInt() ?? 0) : 0;
     final srcCh = hasSrc ? ((src['channelCount'] as num?)?.toInt() ?? 0) : 0;
     final srcPcmEnc = hasSrc ? ((src['pcmEncoding'] as num?)?.toInt() ?? 0) : 0;
     // 位深权威来源：音频文件头解析（FLAC/WAV 原始位深）
-    final srcBits = _headerBitDepth ?? hdrBits;
+    final srcBits = _headerBitDepth ?? (isWindowsDesktop && hasSrc
+        ? ((src['bitsPerSample'] as num?)?.toInt() ?? 0) : 0);
 
     // 回退：解码输出格式（未拿到源格式时）
     final decRate = (_status['lastSampleRate'] as num?)?.toInt() ?? 0;
     final decCh = (_status['lastChannelCount'] as num?)?.toInt() ?? 0;
     final decEnc = (_status['lastEncoding'] as num?)?.toInt() ?? 2;
 
-    final hasData = hasSrc || decRate > 0 || hdrRate > 0 || hdrCh > 0;
-    final rate = srcRate > 0 ? srcRate : (hdrRate > 0 ? hdrRate : decRate);
-    final ch = srcCh > 0 ? srcCh : (hdrCh > 0 ? hdrCh : decCh);
+    final hasData = hasSrc || decRate > 0;
+    final rate = srcRate > 0 ? srcRate : decRate;
+    final ch = srcCh > 0 ? srcCh : decCh;
 
     // 位深优先级：源 bitsPerSample > 源 pcmEncoding > 解码输出
     final bits = srcBits > 0
         ? srcBits
-        : (srcPcmEnc > 0 ? _encodingBits(srcPcmEnc) : _encodingBits(decEnc));
-
-    // 编码名：扩展名推断（TrackGroup codec 不可用时恒可得）
-    final codec = AudioFormatUtils.codecLabelFromPath(
-      song?.url,
-      song?.localPath,
-    );
+        : (isWindowsDesktop ? 0
+            : (srcPcmEnc > 0 ? _encodingBits(srcPcmEnc) : _encodingBits(decEnc)));
 
     // USB 实际输出位深（独占开启时有效）
     final dacBits = (_status['dacBitDepth'] as num?)?.toInt() ?? 0;
@@ -470,22 +468,23 @@ class _SongInfoPageState extends State<SongInfoPage> {
       ),
       child: Column(
         children: [
-          if (codec != null) _buildFormatRow('编码', codec),
           _buildFormatRow('采样频率', hasData ? _formatRate(rate) : '—'),
-          _buildFormatRow('位深', hasData ? '$bits-bit' : '—'),
-          if (hdrBitrate > 0) _buildFormatRow('码率', '$hdrBitrate kbps'),
-          if (!exclusiveEnabled)
+          _buildFormatRow('位深', hasData && bits > 0 ? '$bits-bit' : '—'),
+          // USB 遥测行（解码输出 / USB 输出）：数据源是原生 UsbAudioSinkController
+          // 经 UsbAudioPlugin 上报，桌面端与 TV 构建没有该通道，永远只会显示「—」，
+          // 故按能力隐藏（仅 Android 手机显示）。
+          if (supportsUsbExclusive && !exclusiveEnabled)
             _buildFormatRow(
               '解码输出',
               hasData
                   ? (decRate > 0
-                        ? '${_formatRate(decRate)} · ${_encodingBits(decEnc)}-bit'
-                        : '${_encodingBits(decEnc)}-bit')
+                      ? '${_formatRate(decRate)} · ${_encodingBits(decEnc)}-bit'
+                      : '${_encodingBits(decEnc)}-bit')
                   : '—',
             ),
-          if (dacBits > 0) _buildFormatRow('USB 输出', '$dacBits-bit(USB输出)'),
-          if (fileSize != null)
-            _buildFormatRow('文件大小', _formatFileSize(fileSize)),
+          if (supportsUsbExclusive && dacBits > 0)
+            _buildFormatRow('USB 输出', '$dacBits-bit(USB输出)'),
+          if (fileSize != null) _buildFormatRow('文件大小', _formatFileSize(fileSize)),
           _buildFormatRow('声道', hasData ? _formatChannels(ch) : '—'),
           if (!hasData)
             Padding(
@@ -494,9 +493,8 @@ class _SongInfoPageState extends State<SongInfoPage> {
                 alignment: Alignment.centerLeft,
                 child: Text(
                   '播放歌曲后自动显示音频格式',
-                  style: textTheme.bodySmall?.copyWith(
-                    color: colorScheme.onSurfaceVariant,
-                  ),
+                  style: textTheme.bodySmall
+                      ?.copyWith(color: colorScheme.onSurfaceVariant),
                 ),
               ),
             ),
@@ -512,19 +510,13 @@ class _SongInfoPageState extends State<SongInfoPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       child: Row(
         children: [
-          Text(
-            label,
-            style: textTheme.bodyMedium?.copyWith(
-              color: colorScheme.onSurfaceVariant,
-            ),
-          ),
+          Text(label,
+              style: textTheme.bodyMedium
+                  ?.copyWith(color: colorScheme.onSurfaceVariant)),
           const Spacer(),
-          Text(
-            value,
-            style: textTheme.bodyMedium?.copyWith(
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
+          Text(value,
+              style: textTheme.bodyMedium
+                  ?.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
         ],
       ),
     );

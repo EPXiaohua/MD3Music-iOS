@@ -16,6 +16,11 @@ class LocalLyricLoader {
   /// 支持的本地歌词文件扩展名（按优先级排列）。
   static const List<String> lyricExtensions = ['.lrc', '.ttml', '.txt'];
 
+  /// compute 超时不会取消后台 isolate；限制同时解析的本地音乐歌词任务，
+  /// 防止快速切歌时多个大 ID3/FLAC 标签解析任务堆积。
+  static String? _activeAsyncReadPath;
+  static Future<String?>? _activeAsyncRead;
+
   /// 仅从音频头部读取元数据的最大字节数。
   ///
   /// FLAC 的 VORBIS_COMMENT、MP3 的 ID3v2、MP4 的 ©lyr 均位于文件起始区域，
@@ -47,9 +52,31 @@ class LocalLyricLoader {
         ? Uri.parse(filePath).toFilePath()
         : filePath;
     if (path.isEmpty) return null;
+
+    final active = _activeAsyncRead;
+    if (active != null) {
+      // 同一首歌复用解析任务；快速切到其他歌曲时不再额外启动 isolate。
+      if (_activeAsyncReadPath != path) return null;
+      try {
+        return await active.timeout(const Duration(seconds: 5));
+      } catch (_) {
+        return null;
+      }
+    }
+
+    final read = Future<String?>.sync(() => compute(_loadForAudioInIsolate, path));
+    _activeAsyncReadPath = path;
+    _activeAsyncRead = read;
+    void clearRead() {
+      if (identical(_activeAsyncRead, read)) {
+        _activeAsyncReadPath = null;
+        _activeAsyncRead = null;
+      }
+    }
+    // 超时只结束调用方等待，底层 compute 仍运行；完成前不能释放并发闸门。
+    read.then<void>((_) => clearRead(), onError: (_, _) => clearRead());
     try {
-      return await compute(_loadForAudioInIsolate, path)
-          .timeout(const Duration(seconds: 5));
+      return await read.timeout(const Duration(seconds: 5));
     } catch (_) {
       return null;
     }

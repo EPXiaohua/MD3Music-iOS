@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui' show lerpDouble;
 
 import 'package:flutter/scheduler.dart' show SchedulerBinding;
@@ -50,6 +51,14 @@ const double kMorphResidentTextLeft =
 const double kMorphResidentRowRight = 4.0;
 
 const double kMorphCapsuleSideInset = 16.0;
+/// 圆盘端（collapse=1）的条宽 = [BottomChromeDimens.discDiameter]（64），由
+/// `resolveCapsuleBodyRect` 按收缩进度插值，不再单列常量。
+/// 圆盘端**可见封面**边长 = 56（`secondary_mini_player.dart` 收起态 `coverVisible`
+/// 的终点，`lerp(58, 56, _morph)`）。
+const double kMorphDiscCoverSize = 56.0;
+/// 圆盘端可见封面在 64 盒内的左上偏移 = (64 − 56) / 2 = 4。
+const double kMorphDiscCoverInset =
+    (BottomChromeDimens.discDiameter - kMorphDiscCoverSize) / 2;
 /// 胶囊端**可见封面**边长 = `secondary_mini_player.dart` 的 `_kCoverDecode`（58）。
 ///
 /// 展开态胶囊的封面就按 58 画：封面容器恒 64×64、封面圆在容器内居中，四周留
@@ -101,15 +110,54 @@ class BottomBarMorphRegistry {
   /// 中途漂移（会诊 D4 的「矩形冻结」正是现状如此，端点必须一次性冻结）。
   Rect? frozenResidentRect;
 
+  /// 交棒目的端（胶囊侧）结算页面的内容区左缘保留宽（设计像素）。
+  ///
+  /// **结算快照存档**：驱动方在 [freezeResidentRectForFlight] 时写入（横屏二级页
+  /// rail 已收 → 0，一级页 → rail 保留宽，竖屏恒 0）。**浮层已不再消费它** ——
+  /// rail 的滑出发生在窗口后段（转场收敛后才起 260ms 动画），冻结常量会让前置
+  /// 完成的可见形变把胶囊提前推到全宽、盖在仍在场的 rail 上（真机横屏跳变）；
+  /// 浮层改为逐帧读 rail 的实时可见保留宽（[navigationRailVisibleInset]，由
+  /// `_buildRailLayout` 同帧回填），rail 静止在场时两者同值。保留字段供冻结
+  /// API 兼容与测试对照。
+  double capsuleBodyLeadingInset = 0.0;
+
   /// 交棒目的端（胶囊侧）在**结算态**底栏是否已收起（飞行期间浮层据此算胶囊
   /// 端点的底部净空，见 [resolveCapsuleBodyRect] 的 `navVisibleAtSettle`）。
   ///
   /// 由驱动方在 [freezeResidentRectForFlight] 时写入：
   /// - 胶囊侧是 push/pop 的**二级页面**（导航交棒）：底栏收不收由
-  ///   `kHideNavBarOnSecondaryPages` 决定（默认收，胶囊贴到屏底净空）；
-  /// - 胶囊侧是一级页（切 tab / 设置切换交棒）：底栏恒在场，胶囊要抬高一个
-  ///   底栏槽位（`navBarHeight + safeBottom`），否则交棒会瞬时下沉一整段槽位。
+  ///   `kHideNavBarOnSecondaryPages` 决定（默认收，胶囊贴到屏底净空）；横屏
+  ///   rail 布局本就没有底部导航栏，恒视为已收；
+  /// - 胶囊侧是一级页（切 tab / 设置切换交棒）：竖屏底栏恒在场，胶囊要抬高一个
+  ///   底栏槽位（`navBarHeight + safeBottom`），否则交棒会瞬时下沉一整段槽位；
+  ///   横屏 rail 布局无底栏，同样视为已收。
   bool capsuleNavHiddenAtSettle = false;
+
+  // —— 胶囊侧收缩态（圆盘）的事实登记（活字段，与 [residentRect] 同模式）——
+  //
+  // 悬浮条在二级页可被滚动收缩成 64×64 圆盘（`secondary_mini_player.dart` 的
+  // `_morph`），停靠位可左/中/右、封面旋转中、文字行已淡出。交棒端点若仍按
+  // 全宽展开胶囊解析（[resolveCapsuleBodyRect] 的旧行为），从圆盘态起飞的首帧
+  // 会以全宽胶囊硬盖圆盘——观感即硬切。这三项由胶囊真身逐帧登记、飞行开启时
+  // 冻结（见 [frozenCapsuleCollapseT] 组）。
+
+  /// 胶囊当前收缩进度：0 = 展开胶囊，1 = 圆盘（`_morph.value` 的 clamp 值）。
+  double capsuleCollapseT = 0.0;
+
+  /// 圆盘停靠位（仅 collapse>0 有意义；展开胶囊恒全宽居中）。
+  SecondaryPlayerDockSide capsuleDockSide = SecondaryPlayerDockSide.center;
+
+  /// 圆盘封面当前旋转角（弧度，`_discAngle`；展开态恒 0 附近的累积值不消费）。
+  double capsuleDiscAngle = 0.0;
+
+  /// 交棒飞行开始那一刻的收缩态快照（与 [frozenResidentRect] 同理：飞行期间
+  /// 端点必须一次性冻结，逐帧读活值会让插值端点中途漂移）。
+  ///
+  /// **只对「胶囊是源端」的飞行（pop 方向）有意义**；push 方向的目的端胶囊是
+  /// 新页面挂出的展开态，消费方按 collapse=0 处理（见 `_buildBar`）。
+  double? frozenCapsuleCollapseT;
+  SecondaryPlayerDockSide? frozenCapsuleDockSide;
+  double frozenCapsuleDiscAngle = 0.0;
 
   /// 本次交棒飞行的序号（每次 [freezeResidentRectForFlight] 自增）。
   ///
@@ -119,16 +167,26 @@ class BottomBarMorphRegistry {
   /// 贴在旧端点不动，交棒瞬间跳变，见 `_MorphBarLayerState._syncFlightClock`）。
   int flightSerial = 0;
 
-  /// 为一次交棒飞行冻结常驻条端点（取当前结算值）并记录胶囊侧底栏状态。
-  void freezeResidentRectForFlight({required bool capsuleNavHiddenAtSettle}) {
+  /// 为一次交棒飞行冻结常驻条端点（取当前结算值）并记录胶囊侧结算事实。
+  void freezeResidentRectForFlight({
+    required bool capsuleNavHiddenAtSettle,
+    double capsuleBodyLeadingInset = 0.0,
+  }) {
     frozenResidentRect = residentRect;
     this.capsuleNavHiddenAtSettle = capsuleNavHiddenAtSettle;
+    this.capsuleBodyLeadingInset = capsuleBodyLeadingInset;
+    frozenCapsuleCollapseT = capsuleCollapseT;
+    frozenCapsuleDockSide = capsuleDockSide;
+    frozenCapsuleDiscAngle = capsuleDiscAngle;
     flightSerial++;
   }
 
   /// 交棒飞行结束（含被撤销）/无飞行时解冻。
   void clearFrozenResidentRect() {
     frozenResidentRect = null;
+    frozenCapsuleCollapseT = null;
+    frozenCapsuleDockSide = null;
+    frozenCapsuleDiscAngle = 0.0;
   }
 
   /// 当前挂在树上的胶囊所属的页面路由（`SecondaryMiniPlayer` 挂载期登记）。
@@ -176,6 +234,22 @@ double resolveNavBarHeightForLabelBehavior(
 ///   （`navBarHeight + safeBottom`，槽位高口径见 ResponsiveScaffold），胶囊
 ///   随之抬高，否则会被底栏盖住一截。
 ///
+/// **横屏 rail 布局口径**（[leadingReserve] > 0）：真身胶囊挂在 scaffold 的 body
+/// 内，横屏时 body 从 rail + 分隔线右缘起（responsive_layout 的 `_buildRailLayout`），
+/// 端点解析必须以同一内容区为基准 —— center 停靠取**内容区**中心、left 停靠贴
+/// 内容区左缘，否则交棒横移差整段 rail 宽。内容区左缘由调用方逐帧给出（rail
+/// 滑出/滑入动画期间逐帧变化，交棒浮层读 [navigationRailVisibleInset] 跟随；
+/// 竖屏 / rail 已收起 = 0）。
+///
+/// **Pad 限宽**（[maxTrackWidth] > 0）：`SecondaryMiniPlayer` 在 Pad（最短边
+/// ≥600dp）布局下把轨道限宽到该值（`BottomChromeDimens.discTrackMaxWidth`）并按
+/// [dockSide] 停靠整条轨道；端点解析按同一式收缩，形变全程不出轨道。
+///
+/// **收缩态（圆盘）**：[collapse] = 1 时宽收缩到 64，在**轨道内**按 [dockSide]
+/// 停靠收拢（左 16 / 居中 / 右 16，与真身 `Align` + `_dockBase` 的停靠几何逐值
+/// 一致）；高度与圆角恒 64/32（胶囊与圆盘同高）。collapse=0 + center +
+/// leadingReserve=0 + 不限宽 与旧口径逐字节相等。
+///
 /// **为什么必须解析而不是取登记值**：登记的是宿主外框（left=0、全屏宽），比
 /// 可见本体宽 32 / 横偏 16；且转场中的登记带着路由平移量（会诊 D2/D4：
 /// 实测交棒左缘 −81.9px / 右缘 −114px，换成解析几何后降到 2.1px）。
@@ -184,14 +258,47 @@ Rect resolveCapsuleBodyRect({
   required double safeBottom,
   double navBarHeight = 0.0,
   bool navVisibleAtSettle = false,
+  double collapse = 0.0,
+  SecondaryPlayerDockSide dockSide = SecondaryPlayerDockSide.center,
+  double leadingReserve = 0.0,
+  double maxTrackWidth = 0.0,
 }) {
-  final double width = (screenSize.width - kMorphCapsuleSideInset * 2).clamp(
-    0.0,
-    screenSize.width,
-  );
+  final double collapsed = collapse.clamp(0.0, 1.0);
+  // 胶囊真身所在的内容区：横屏 rail 布局时从 rail+分隔线右缘起，竖屏即全屏。
+  final double areaLeft = leadingReserve.clamp(0.0, screenSize.width);
+  final double areaWidth =
+      (screenSize.width - areaLeft).clamp(0.0, screenSize.width);
+  // 轨道宽 = 内容区减去两侧 16 内缩；Pad 布局再限宽（与真身
+  // `trackW = min(constraints.maxWidth, discTrackMaxWidth)` 同式，
+  // maxTrackWidth <= 0 = 不限宽）。
+  double trackW = (areaWidth - kMorphCapsuleSideInset * 2).clamp(0.0, areaWidth);
+  if (maxTrackWidth > 0) trackW = math.min(trackW, maxTrackWidth);
+  final double width = lerpDouble(
+    trackW,
+    BottomChromeDimens.discDiameter,
+    collapsed,
+  )!;
+  // 轨道盒按停靠位落在内容区内（真身 `Align` bottomLeft/Center/Right 的几何），
+  // 收缩态在轨道内继续向停靠侧收拢（真身 `_dockBase` 的几何：展开态胶囊占满
+  // 轨道，三个停靠位的左缘相同）。
+  final double trackLeft;
+  switch (dockSide) {
+    case SecondaryPlayerDockSide.left:
+      trackLeft = areaLeft + kMorphCapsuleSideInset;
+    case SecondaryPlayerDockSide.right:
+      trackLeft = areaLeft + areaWidth - kMorphCapsuleSideInset - trackW;
+    case SecondaryPlayerDockSide.center:
+      trackLeft = areaLeft + (areaWidth - trackW) / 2;
+  }
+  final double maxDx = (trackW - width).clamp(0.0, trackW);
+  final double dockDx = switch (dockSide) {
+    SecondaryPlayerDockSide.left => 0.0,
+    SecondaryPlayerDockSide.center => maxDx / 2,
+    SecondaryPlayerDockSide.right => maxDx,
+  };
   final double bottomReserve = safeBottom + (navVisibleAtSettle ? navBarHeight : 0.0);
   return Rect.fromLTWH(
-    kMorphCapsuleSideInset,
+    (trackLeft + dockDx).clamp(0.0, screenSize.width),
     (screenSize.height - bottomReserve - 12.0 - BottomChromeDimens.discDiameter)
         .clamp(0.0, screenSize.height),
     width,
@@ -327,6 +434,8 @@ class MorphBarLayout {
     required this.progressHeight,
     required this.lyricOpacity,
     required this.lyricWidthFactor,
+    required this.rowOpacity,
+    required this.coverRotation,
   });
 
   /// 形态进度（0 = 常驻条，1 = 悬浮胶囊）。
@@ -356,6 +465,14 @@ class MorphBarLayout {
   /// 「桌面歌词」按钮（常驻条有、胶囊无）：不透明度与宽度收缩系数。
   final double lyricOpacity;
   final double lyricWidthFactor;
+
+  /// 内容行（文字 + 按钮）整体不透明度：常驻端 1；胶囊端 = 1 − 收缩进度
+  /// （圆盘态文字行已淡出，形变时随展开连续浮现）。
+  final double rowOpacity;
+
+  /// 封面旋转角（弧度，绕封面中心）：圆盘端 = 冻结的 `_discAngle`，常驻端 0
+  /// —— 从旋转中的圆盘起飞时首帧与其逐角度对齐，向常驻条端旋正归零。
+  final double coverRotation;
 }
 
 /// 解算交叉过渡几何（纯函数、无副作用）。
@@ -364,12 +481,17 @@ class MorphBarLayout {
 /// 故 `p == 0` 逐值等于常驻条端点、`p == 1` 逐值等于胶囊端点（见测试）。中间线性插值。
 MorphBarLayout resolveMorphBarLayout({
   required double p,
-  required double screenWidth,
   required Rect residentRect,
   required Rect capsuleRect,
+  double capsuleCollapse = 0.0,
+  double capsuleDiscAngle = 0.0,
 }) {
   final double t = p.isFinite ? p.clamp(0.0, 1.0) : 0.0;
   double l(double a, double b) => lerpDouble(a, b, t)!;
+  // 胶囊端的「端点内插值」：收缩进度 c 先与形态进度 t 分离 —— 端点几何
+  // （[capsuleRect]）已按 c 折算过，这里只处理**端点内部**随 c 变化的量
+  // （封面尺寸/内缩/行透明度）。
+  final double c = capsuleCollapse.clamp(0.0, 1.0);
 
   final double barLeft = l(residentRect.left, capsuleRect.left);
   final double barTop = l(residentRect.top, capsuleRect.top);
@@ -386,25 +508,37 @@ MorphBarLayout resolveMorphBarLayout({
   final double barRadius = l(0.0, BottomChromeDimens.discDiameter / 2);
 
   // 封面盒（条内局部）：两端都锚在**可见封面**的真实左上角 —— 常驻条 left = 4
-  // （内容行内缩 4）、胶囊 left = 3（64 盒里 58 封面居中）。
+  // （内容行内缩 4）、胶囊 left = 3（64 盒里 58 封面居中）；圆盘端封面 56 在
+  // 64 盒里内缩 4（`kMorphDiscCoverSize` / [kMorphDiscCoverInset]）。
   //
   // **不能**用 `capsuleRect.left - barLeft`（= 0）当胶囊端：那是胶囊**宿主**左缘，
   // 封面容器虽然左缘钉死在 0，但可见封面在容器里还内缩 3dp —— 会诊 D2 实测
   // 末帧 56@left0 vs 真身 58@left3，交棒瞬间封面横跳 3px。
-  final double coverLeft = l(kMorphResidentSideInset, kMorphCapsuleCoverInset);
-  final double coverSize = l(kMorphResidentCoverSize, kMorphCapsuleCoverSize);
+  final double capsuleCoverSize = lerpDouble(
+    kMorphCapsuleCoverSize,
+    kMorphDiscCoverSize,
+    c,
+  )!;
+  final double capsuleCoverInset = lerpDouble(
+    kMorphCapsuleCoverInset,
+    kMorphDiscCoverInset,
+    c,
+  )!;
+  final double coverLeft = l(kMorphResidentSideInset, capsuleCoverInset);
+  final double coverSize = l(kMorphResidentCoverSize, capsuleCoverSize);
   final double coverRadius = l(
     kMorphResidentCoverRadius,
-    kMorphCapsuleCoverRadius,
+    // 随收缩插值的封面半径（圆盘端 56/2=28）：用常量 29 会让圆盘端差 1dp。
+    capsuleCoverSize / 2,
   );
 
-  // 内容行：左起笔由"封面 + 间隙"决定，右端各留自身内边距。
-  final double rowLeft = l(
-    kMorphResidentTextLeft - barLeft,
-    kMorphCapsuleTextLeft,
-  );
+  // 内容行：左起笔由"封面 + 间隙"决定，右端各留自身内边距。行盒坐标恒**相对
+  // 条体盒**（渲染时 Positioned 在条盒内），常驻端取自身常量、不得再减
+  // `residentRect.left` —— 横屏 rail 布局下常驻条盒左缘 = rail 保留宽（非 0），
+  // 旧式 `常量 − barLeft` 会把行盒推出条盒左缘（实测 −41px）。
+  final double rowLeft = l(kMorphResidentTextLeft, kMorphCapsuleTextLeft);
   final double rowRight = l(
-    screenWidth - kMorphResidentRowRight - barLeft,
+    residentRect.width - kMorphResidentRowRight,
     barWidth - kMorphCapsuleRowRight,
   );
 
@@ -418,7 +552,7 @@ MorphBarLayout resolveMorphBarLayout({
     coverLeft: coverLeft,
     // 常驻条 4（进度 2 + 内边距 2）→ 胶囊 3（(64 − 58) / 2），逐值锚在两端
     // 真身可见封面的顶端（旧写法恒 4，胶囊端差 1px）。
-    coverTop: l(kMorphResidentCoverTop, kMorphCapsuleCoverInset),
+    coverTop: l(kMorphResidentCoverTop, capsuleCoverInset),
     coverSize: coverSize,
     coverRadius: coverRadius,
     rowLeft: rowLeft,
@@ -431,6 +565,11 @@ MorphBarLayout resolveMorphBarLayout({
     progressHeight: l(kPlayerBarProgressLineStroke, barHeight),
     lyricOpacity: 1.0 - t,
     lyricWidthFactor: 1.0 - t,
+    // 圆盘态文字行已淡出（真身 `textOpacity = 1 − t/0.6` 在 t=1 时为 0）：
+    // 端点取 1 − c，形变中随 t 连续浮现。胶囊端歌词按钮本就随 t 淡出，不叠乘。
+    rowOpacity: lerpDouble(1.0, 1.0 - c, t)!,
+    // 起飞帧与旋转中的圆盘逐角度对齐（端点 = 冻结角 × t），向常驻端归零。
+    coverRotation: capsuleDiscAngle * t,
   );
 }
 
@@ -453,6 +592,7 @@ class PlayerBarText extends StatelessWidget {
     this.crossAxisAlignment = CrossAxisAlignment.start,
     this.textAlign,
     this.lineAlignment,
+    this.miniLineAlign = Alignment.centerLeft,
   });
 
   final Song song;
@@ -484,6 +624,11 @@ class PlayerBarText extends StatelessWidget {
   /// `secondary_mini_player.dart` 的 `_expandedRow`），行级插值的 `t == 1` 端点
   /// 与它逐值等价；`t == 0`（两行都贴左缘）与常驻条真身逐值等价。
   final Alignment? lineAlignment;
+
+  /// 本块作为**飞行起点**时上报给形变层的行对齐（见
+  /// [PlayerCoverMorphBus.miniTextAlign]）。缺省贴左 = 常驻条口径；胶囊真身逐行
+  /// 居中，须传 [Alignment.center]，否则飞行层从贴左起飞、交棒瞬间文字跳左。
+  final Alignment miniLineAlign;
 
   @override
   Widget build(BuildContext context) {
@@ -537,43 +682,55 @@ class PlayerBarText extends StatelessWidget {
       subtitle: song.artist,
       titleStyle: titleStyle,
       subtitleStyle: subtitleStyle,
+      lineAlign: miniLineAlign,
       child: column,
     );
   }
 }
 
 /// 底栏播放控制（播放/暂停 + 下一首），三方共用。
+///
+/// [showNext] 为 false 时只渲染播放/暂停——TV 顶栏迷你条的下一首入口移出
+/// （完整播放页与通知栏均有等价入口，需求口径）。默认 true，既有调用点
+/// （常驻条 / 交叉过渡浮层）逐像素不变。
 class PlayerBarTransport extends StatelessWidget {
-  const PlayerBarTransport({super.key, required this.player});
+  const PlayerBarTransport({super.key, required this.player, this.showNext = true});
 
   final PlayerProvider player;
+  final bool showNext;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          icon: Icon(player.isPlaying ? Icons.pause : Icons.play_arrow),
-          onPressed: () {
-            AppHaptics.click(HapticCategory.transport);
-            if (player.isPlaying) {
-              player.pause();
-            } else {
-              player.resume();
-            }
-          },
-        ),
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          icon: const Icon(Icons.skip_next),
-          onPressed: () {
-            AppHaptics.click(HapticCategory.transport);
-            player.next();
-          },
-        ),
-      ],
+    // 自建重绘边界（修「Windows 鼠标点暂停整窗卡一下」）：裸 `IconButton` 的
+    // 水波画在按钮内层 `Material` 的 ink 层，`markNeedsPaint` 会冒泡到最近边界；
+    // 迷你条/浮层外层没有边界时，一次点击会把整条底栏之外的内容一起重绘。
+    return RepaintBoundary(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            icon: Icon(player.isPlaying ? Icons.pause : Icons.play_arrow),
+            onPressed: () {
+              AppHaptics.click(HapticCategory.transport);
+              if (player.isPlaying) {
+                player.pause();
+              } else {
+                player.resume();
+              }
+            },
+          ),
+          if (showNext)
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.skip_next),
+              onPressed: () {
+                AppHaptics.click(HapticCategory.transport);
+                player.next();
+              },
+            ),
+        ],
+      ),
     );
   }
 }
@@ -582,7 +739,7 @@ class PlayerBarTransport extends StatelessWidget {
 ///
 /// [opacity]/[widthFactor] 供交叉过渡浮层把它**淡出并收掉宽度**（胶囊端没有这个
 /// 按钮）。常驻条侧两个参数保持 1.0，逐像素与改动前一致。
-class PlayerBarLyricButton extends StatefulWidget {
+class PlayerBarLyricButton extends StatelessWidget {
   const PlayerBarLyricButton({
     super.key,
     required this.opacity,
@@ -593,34 +750,7 @@ class PlayerBarLyricButton extends StatefulWidget {
   final double widthFactor;
 
   @override
-  State<PlayerBarLyricButton> createState() => _PlayerBarLyricButtonState();
-}
-
-/// 按钮自行监听 [DesktopLyricService] 通知：高亮严格跟随激活态（PiP 开窗
-/// 动画完成的原生回调 / 从 PiP 小窗点关闭还原）。不能依赖宿主重建——底栏
-/// 浮层挂在 app.dart 的独立 Stack，mini_player 等宿主的监听 setState 刷
-/// 不到这里，会造成"高亮滞后一拍/小窗关闭后不复位"。
-class _PlayerBarLyricButtonState extends State<PlayerBarLyricButton> {
-  @override
-  void initState() {
-    super.initState();
-    DesktopLyricService.instance.addListener(_onServiceChanged);
-  }
-
-  @override
-  void dispose() {
-    DesktopLyricService.instance.removeListener(_onServiceChanged);
-    super.dispose();
-  }
-
-  void _onServiceChanged() {
-    if (mounted) setState(() {});
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final opacity = widget.opacity;
-    final widthFactor = widget.widthFactor;
     if (widthFactor <= 0.001 || opacity <= 0.001) {
       return const SizedBox.shrink();
     }
@@ -745,6 +875,7 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
   /// 初值 -1：挂载首帧必定起算一次。
   int _flightSerial = -1;
 
+
   /// 可见形变进度的**唯一驱动通道**（O2）。
   ///
   /// 本层每帧仍被窗口进度（[kBottomBarFormProgress]）重建，但重建只做两件事：
@@ -754,6 +885,21 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
   /// 对 t == 0 / 1 有精确短路），故窗口后段每一帧都不再触发子树重建 —— 这正是被
   /// 砍掉的"静止尾巴"（≈28 帧/次）。
   final ValueNotifier<double> _visibleNotifier = ValueNotifier<double>(0.0);
+
+  /// 胶囊端点左缘保留宽的**第二驱动通道**（横屏 rail 滑出跟随）。
+  ///
+  /// 横屏 rail 布局下胶囊端点的 leadingReserve 不再是冻结常量，而是逐帧跟随
+  /// rail 槽位的实时保留宽（[navigationRailVisibleInset]，见 `_buildBar`）——
+  /// 该值在窗口**后段**（rail 转场收敛后才起 260ms 滑出）仍在变化，而那时
+  /// [kBottomBarFormProgress] 对应的可见形变早已饱和在端点、[_visibleNotifier]
+  /// 不再 notify。若子树只听 visible，浮层会冻在「inset 尚未收缩」的画面里，
+  /// rail 滑完后真身接管瞬间左缘跳回全宽（跳变）。因此把每帧的 live inset 也写
+  /// 进这个 notifier：`==` 判等，**只有 rail 真在动才触发子树重建**；竖屏 / rail
+  /// 静止时恒同值，O2 的「静止尾巴零重建」原样保留。初值 NaN：首帧必通知一次
+  /// （首帧本就构建子树，等价空操作）。
+  final ValueNotifier<double> _leadingInsetNotifier = ValueNotifier<double>(
+    double.nan,
+  );
 
   /// 条层子树的缓存实例（只在首帧 `??=` 构造一次，此后每帧返回**同一实例**）。
   ///
@@ -771,6 +917,7 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
   @override
   void dispose() {
     _visibleNotifier.dispose();
+    _leadingInsetNotifier.dispose();
     super.dispose();
   }
 
@@ -813,13 +960,30 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
     // （`BuildOwner.buildScope` 处理期间新增的脏元素会被重新排序并继续处理），
     // 故形变不会滞后一帧。
     _visibleNotifier.value = visible;
+    // 横屏 rail 跟随（第二通道）：写本帧的 live 左缘保留宽，rail 真在动才
+    // notify（见字段注释）。写在 build 期、目标是本层后代，与上面
+    // `_visibleNotifier` 同一帧内被处理（框架允许祖先 build 期标脏后代）。
+    _leadingInsetNotifier.value = _currentLeadingInset(context);
     // 返回缓存的子树实例（首帧 `??=` 构造）：恒等实例让 `updateChild` 短路，
-    // 这就是"窗口后段不再重建子树"的落点；形变推进改由上面那行 notifier 承担。
-    return _subtree ??= ValueListenableBuilder<double>(
-      valueListenable: _visibleNotifier,
-      builder: _buildBar,
+    // 这就是"窗口后段不再重建子树"的落点；形变推进由 visible notifier 承担，
+    // rail 滑出期的端点位移由 inset notifier 承担 —— 两条通道任一变化才重建。
+    return _subtree ??= ListenableBuilder(
+      listenable: Listenable.merge([_visibleNotifier, _leadingInsetNotifier]),
+      builder: (context, _) => _buildBar(context, _visibleNotifier.value, null),
     );
   }
+
+  /// 本帧胶囊端点应采用的**内容区左缘保留宽**。
+  ///
+  /// 横屏（rail 布局）= rail 槽位+分隔线的实时可见保留宽（[navigationRailVisibleInset]，
+  /// 由 rail 的逐帧 builder 回填，滑出/滑入全程跟随）；竖屏恒 0。旧口径读驱动方
+  /// 在导航时刻冻结的结算快照（[BottomBarMorphRegistry.capsuleBodyLeadingInset]），
+  /// 但 rail 的滑出发生在窗口**后段**（转场收敛后才起 260ms 动画），冻结常量会让
+  /// 前置完成的可见形变把胶囊提前推到全宽、盖在仍在场的 rail 上（真机横屏跳变）。
+  double _currentLeadingInset(BuildContext context) =>
+      usesNavigationRail(MediaQuery.sizeOf(context).width)
+      ? navigationRailVisibleInset
+      : 0.0;
 
   /// 条层子树：只在 [visible] 真变化、或所依赖的 Provider / Theme / MediaQuery
   /// 变化时重建（O2 之前是窗口内**每帧**）。
@@ -853,6 +1017,26 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
       theme.navigationBarTheme.labelBehavior,
     );
     final bool navVisibleAtSettle = !registry.capsuleNavHiddenAtSettle;
+    // 收缩态端点只对「胶囊是源端」的飞行（pop 方向）有意义：push 方向的目的端
+    // 胶囊是新页面挂出的展开态，恒 collapse=0。活字段兜底仅防冻结漏写（驱动方
+    // 忘调 freeze 的异常路径），正常流程冻结值在飞行开启那一刻已就位。
+    final bool capsuleIsSource = !kBarFormResidentIsSource.value;
+    final double collapse = capsuleIsSource
+        ? (registry.frozenCapsuleCollapseT ?? registry.capsuleCollapseT)
+        : 0.0;
+    // 目的端胶囊（push 方向）与源端共用同一条全局停靠位（kSecondaryPlayerDock，
+    // Pad 布局默认右下）：Pad 轨道限宽后三个停靠位的落点不再重合，不能再恒取
+    // center；手机布局轨道 = 全宽，三停靠位几何相同，取值变化无观感影响。
+    final SecondaryPlayerDockSide dockSide = capsuleIsSource
+        ? (registry.frozenCapsuleDockSide ?? registry.capsuleDockSide)
+        : registry.capsuleDockSide;
+    final double discAngle = capsuleIsSource
+        ? registry.frozenCapsuleDiscAngle
+        : 0.0;
+    // 横屏（rail 布局）口径：常驻条真身挂在 body 内、内容区从 rail+分隔线右缘
+    // 起，且没有底部导航栏 —— 兜底矩形据此右移、不再预留底栏槽位（登记值本身
+    // 是实测矩形，天然正确；只有兜底路径需要按屏幕口径现算）。
+    final bool railLayout = usesNavigationRail(screenWidth);
     final residentRect =
         registry.frozenResidentRect ??
         registry.residentRect ??
@@ -860,23 +1044,38 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
           screenWidth,
           screenHeight,
           safeBottom: safeBottom,
-          navBarHeight: navBarHeight,
+          navBarHeight: railLayout ? 0.0 : navBarHeight,
+          // 兜底路径同样用实时可见保留宽（rail 半滑出时兜底矩形不悬空）。
+          leadingReserve: railLayout ? navigationRailVisibleInset : 0.0,
         );
     // 胶囊端点：解析计算（不测量），口径与真身可见本体一致（见 resolveCapsuleBodyRect）。
+    // 内容区左缘保留宽 = rail 槽位的**实时可见**保留宽（横屏 push 交棒时 rail 等
+    // 转场收敛才起 260ms 滑出，端点逐帧跟随才不会在 rail 在场时把胶囊推到全宽；
+    // 竖屏 / rail 已收 = 0）。旧的冻结结算快照（capsuleBodyLeadingInset）正是
+    // 「点击瞬间即全宽」跳变的根源，已由逐帧跟随取代；rail 静止在场时本值恒等于
+    // 旧快照（一级页交棒），行为不变。Pad 布局轨道限宽到 discTrackMaxWidth
+    // （与真身 trackW 同式）。
     final capsuleRect = resolveCapsuleBodyRect(
       screenSize: screenSize,
       safeBottom: safeBottom,
       navBarHeight: navBarHeight,
       navVisibleAtSettle: navVisibleAtSettle,
+      collapse: collapse,
+      dockSide: dockSide,
+      leadingReserve: _currentLeadingInset(context),
+      maxTrackWidth: isPadLayout(context)
+          ? BottomChromeDimens.discTrackMaxWidth
+          : 0.0,
     );
 
     final layout = resolveMorphBarLayout(
       // 几何一律吃**可见**形变进度（前置完成映射后的值），不是窗口进度：
       // 形变在窗口开头 260ms 内走完、之后停在端点（K1）。
       p: visible,
-      screenWidth: screenWidth,
       residentRect: residentRect,
       capsuleRect: capsuleRect,
+      capsuleCollapse: collapse,
+      capsuleDiscAngle: discAngle,
     );
     // 文字样式内联（与 `playerBarTextStyles` 逐值同源），复用上面已取好的
     // theme 两个 aspect，省掉每帧两次额外的 InheritedWidget 查找。
@@ -956,10 +1155,12 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
                         ),
                       ),
                     ),
-                    // 封面：44/圆角 6 → 58/正圆。盒（left/top/size/radius）由
-                    // `resolveMorphBarLayout` 逐帧插值，且两端逐值锚在真身可见封面上；
-                    // 位图解码尺寸恒为胶囊档 58（见 `_MorphCoverArtwork`），
-                    // 由 FittedBox 承担缩放，避免逐帧换解码尺寸。
+                    // 封面：44/圆角 6 → 58/正圆（圆盘端 56）。盒（left/top/size/
+                    // radius）由 `resolveMorphBarLayout` 逐帧插值，且两端逐值锚在
+                    // 真身可见封面上；位图解码尺寸恒为胶囊档 58（见
+                    // `_MorphCoverArtwork`），由 FittedBox 承担缩放，避免逐帧换
+                    // 解码尺寸。圆盘起飞时按冻结角旋转、向常驻端归零（Transform
+                    // 在 Clip 内侧，旋转中也不会溢出封面盒裁切）。
                     Positioned(
                       left: layout.coverLeft,
                       top: layout.coverTop,
@@ -967,23 +1168,29 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
                       height: layout.coverSize,
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(layout.coverRadius),
-                        child: FittedBox(
-                          fit: BoxFit.fill,
-                          child: SizedBox(
-                            width: kMorphCapsuleCoverSize,
-                            height: kMorphCapsuleCoverSize,
-                            child: _MorphCoverArtwork(song: song),
+                        child: Transform.rotate(
+                          angle: layout.coverRotation,
+                          child: FittedBox(
+                            fit: BoxFit.fill,
+                            child: SizedBox(
+                              width: kMorphCapsuleCoverSize,
+                              height: kMorphCapsuleCoverSize,
+                              child: _MorphCoverArtwork(song: song),
+                            ),
                           ),
                         ),
                       ),
                     ),
                     // 内容行：文字块 + 桌面歌词按钮（渐隐收缩）+ 播放控制。
+                    // 圆盘端整行已隐（rowOpacity = 1 − collapse），随形变连续浮现。
                     Positioned(
                       left: layout.rowLeft,
                       right: layout.barWidth - layout.rowRight,
                       top: layout.rowTop,
                       bottom: layout.rowBottom,
-                      child: Row(
+                      child: Opacity(
+                        opacity: layout.rowOpacity.clamp(0.0, 1.0),
+                        child: Row(
                         children: [
                           Expanded(
                             child: PlayerBarText(
@@ -1011,6 +1218,7 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
                           ),
                           _transportFor(player),
                         ],
+                        ),
                       ),
                     ),
                   ],
@@ -1042,21 +1250,25 @@ class _MorphBarLayerState extends State<_MorphBarLayer> {
   }
 }
 
-/// 常驻条矩形缺失时的兜底：贴内容底端、全宽、内容高 50。
+/// 常驻条矩形缺失时的兜底：贴内容底端、内容区全宽、内容高 50。
 ///
 /// 底端净空 = safeBottom + 底栏槽位高（有底栏时常驻条压在底栏上方）。旧版兜底
 /// 底端落在屏底、漏了整段净空 —— 真机手机会差一个安全区（会诊 D4：24dp）。
+/// 横屏 rail 布局由调用方传 [leadingReserve]（rail+分隔线保留宽）与
+/// navBarHeight=0：常驻条在 body 内从 rail 右缘起、屏底没有底栏。
 Rect _fallbackResidentRect(
   double width,
   double height, {
   double safeBottom = 0.0,
   double navBarHeight = 0.0,
+  double leadingReserve = 0.0,
 }) {
   final double bottom = (height - safeBottom - navBarHeight).clamp(0.0, height);
+  final double left = leadingReserve.clamp(0.0, width);
   return Rect.fromLTWH(
-    0,
+    left,
     (bottom - kMorphResidentBarHeight).clamp(0.0, height),
-    width,
+    (width - left).clamp(0.0, width),
     kMorphResidentBarHeight,
   );
 }

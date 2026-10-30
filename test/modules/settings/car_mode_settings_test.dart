@@ -6,11 +6,18 @@ import 'package:md3music/modules/player/car_mode_layout.dart';
 import 'package:md3music/providers/car_mode_provider.dart';
 
 void main() {
-  test('未设置过时的默认值：关闭 / 30% / 左侧', () async {
+  test('未设置过时的默认值：关闭 / 30% / 右侧', () async {
     SharedPreferences.setMockInitialValues({});
     final repo = SettingsRepository();
     expect(await repo.getCarModeEnabled(), isFalse);
     expect(await repo.getCarModePanelRatio(), kCarModePanelDefaultRatio);
+    expect(await repo.getCarModePanelSide(), CarModePanelSide.right);
+  });
+
+  test('已有的左侧选择继续保留', () async {
+    SharedPreferences.setMockInitialValues({});
+    final repo = SettingsRepository();
+    await repo.setCarModePanelSide(CarModePanelSide.left);
     expect(await repo.getCarModePanelSide(), CarModePanelSide.left);
   });
 
@@ -106,6 +113,17 @@ void main() {
     try {
       expect(carMode.enabled, isFalse);
       expect(carMode.panelVisible, isFalse);
+    } finally {
+      carMode.dispose();
+      await tester.pump(const Duration(seconds: 5));
+    }
+  });
+
+  testWidgets('provider 首帧默认右侧', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final carMode = CarModeProvider();
+    try {
+      expect(carMode.panelSide, CarModePanelSide.right);
     } finally {
       carMode.dispose();
       await tester.pump(const Duration(seconds: 5));

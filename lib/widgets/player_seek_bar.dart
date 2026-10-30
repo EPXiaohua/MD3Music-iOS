@@ -8,8 +8,10 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../core/build_flags.dart';
+import '../core/remote/tv_hint_bar.dart';
 import '../core/remote/tv_seek_stepper.dart';
 import '../core/services/player_frame_driver.dart';
+import '../core/theme/app_dimens.dart';
 /// 播放页进度条「波浪起伏」总开关（回退开关）。
 ///
 /// 默认开启（= 2026-10-01 新增的 MD3 波浪样式）；关闭后进度条退回该改动之前的
@@ -55,6 +57,12 @@ class PlayerSeekBar extends StatefulWidget {
   /// 默认条高（含底部 14dp 的时间数字行）。提成公开常量，别再各处写 38。
   static const double defaultHeight = 38;
 
+  /// 时间数字那一行的高度。
+  ///
+  /// 也是时间行中央提示胶囊的定高（见 [labelRowHints]）：胶囊与这一行等高，
+  /// 提示出现/消失才不改变进度条总高，页面底部 chrome 不会上下抖。
+  static const double labelRowHeight = 14;
+
   const PlayerSeekBar({
     super.key,
     required this.position,
@@ -74,6 +82,7 @@ class PlayerSeekBar extends StatefulWidget {
     this.tickMarks = false,
     this.showRemaining = false,
     this.labelRowBadge,
+    this.labelRowHints,
     this.onDoubleTapSkip,
     this.onDisabledTap,
     this.onSeekStart,
@@ -144,6 +153,19 @@ class PlayerSeekBar extends StatefulWidget {
   /// —— 插槽里的按钮必须点得到。为空时与改动前逐像素一致。
   final Widget? labelRowBadge;
 
+  /// 与两侧时间数字同一行的中央状态提示（「缓冲中」/「音频过渡中」胶囊组），
+  /// 与 [labelRowBadge] 共同组成中央组、整体居中于两个时间数字之间。
+  ///
+  /// **只在有提示时传非 null**：为空时时间行维持 14dp 定高 + `IgnorePointer`
+  /// （提示不改变进度条总高）；非空时若仍无 [labelRowBadge]，同样维持 14dp
+  /// 定高（胶囊与这一行等高，见 [labelRowHeight]），一旦有 [labelRowBadge]
+  /// 就按徽章的自然高度排。
+  ///
+  /// 内容必须是非交互的（纯文案）：这一路没有素材会被点到，拖动/点按照旧交给
+  /// 整条进度条的手势。组内若比可用宽度还宽，会整体等比缩小（同徽章的处理），
+  /// 不会撑破车机窄面板或大字号。
+  final Widget? labelRowHints;
+
   /// 双击左/右半区时请求平移播放头，回调参数为**秒数增量**（-15 / +15）；
   /// TalkBack 的滑条增减动作走同一出口。
   ///
@@ -176,7 +198,7 @@ class PlayerSeekBar extends StatefulWidget {
 class _PlayerSeekBarState extends State<PlayerSeekBar>
     with TickerProviderStateMixin, WidgetsBindingObserver {
   /// 时间行高度（[PlayerSeekBar.height] 减去它就是轨道区高度）
-  static const double _labelHeight = 14;
+  static const double _labelHeight = PlayerSeekBar.labelRowHeight;
 
   /// 自驱动帧间隔：2fps（超过这个间隔才重绘进度条与两侧时间，
   /// 由 120Hz 屏幕节流到低频，只在校对/拖动时才高频）。
@@ -272,6 +294,8 @@ class _PlayerSeekBarState extends State<PlayerSeekBar>
     onAbort: () {
       if (_dragging) _releasePress();
     },
+    // tv: 连按升级步长（5→15→30s），精调与粗调兼得。
+    escalation: const [5, 15, 30],
   );
 
   @override
@@ -793,7 +817,12 @@ class _PlayerSeekBarState extends State<PlayerSeekBar>
         ),
         onFocusChange: (focused) {
           // 失焦（上下键移出/路由切换）立即落定，不留「看不见还在膨胀」的待落点
-          if (!focused) _tvStepper?.flush();
+          if (focused) {
+            TvHintBarScope.show('左右键 5/15/30 秒调整 · OK 立即跳转');
+          } else {
+            _tvStepper?.flush();
+            TvHintBarScope.clear();
+          }
         },
         child: bar,
       );
@@ -805,45 +834,55 @@ class _PlayerSeekBarState extends State<PlayerSeekBar>
   double get _trackAreaHeight =>
       (widget.height - _labelHeight).clamp(0.0, double.infinity);
 
-  /// 时间行：左「已播」右「总时长/剩余」，中间是 [PlayerSeekBar.labelRowBadge]。
+  /// 时间行：左「已播」右「总时长/剩余」，中间是 [PlayerSeekBar.labelRowBadge]
+  /// 与 [PlayerSeekBar.labelRowHints] 组成的中央组。
   ///
-  /// 压暗只作用在**两个时间数字**上，各自包一层 `AnimatedOpacity`；徽章不跟着叠
-  /// —— `Opacity` 是整块合成，把 `primaryContainer` 半透明后压在深色封面上会变灰
-  /// 变暗，看着像被禁用，那是「暗化」不是「淡化」。徽章要淡由它自己的配色决定
+  /// 压暗只作用在**两个时间数字**上，各自包一层 `AnimatedOpacity`；徽章与提示胶囊
+  /// 不跟着叠 —— `Opacity` 是整块合成，把 `primaryContainer` 半透明后压在深色封面上
+  /// 会变灰变暗，看着像被禁用，那是「暗化」不是「淡化」。徽章要淡由它自己的配色决定
   /// （宿主传 `faded` 形态），本控件不替它压暗。
   ///
-  /// 没有插槽时保持原来的 14px 定高 + `IgnorePointer`（时间只是标注，不吃点击）；
-  /// 有插槽时让它按自身高度排，且去掉 `IgnorePointer`，否则徽章点不动。
-  /// 徽章套 `Expanded` + `FittedBox`：2 倍字下它按可用宽度缩着放，
-  /// 而不是把时间行顶出横向溢出（实测不处理会溢 47px）。
+  /// 中央组套 `Expanded` + `FittedBox`：占住两侧时间数字之间的整份宽度并在其中居中
+  /// （「居中于这两个数字」，而不是居中于整条进度条），2 倍字/窄面板下按可用宽度
+  /// 缩着放，而不是把时间行顶出横向溢出（实测不处理会溢 47px）。
+  ///
+  /// 行高纪律：没有徽章时保持原来的 14px 定高 + `IgnorePointer`（时间只是标注，
+  /// 不吃点击；提示胶囊与这一行等高，传了也不改变行高）；有徽章时按徽章自身高度排，
+  /// 且去掉 `IgnorePointer`，否则徽章点不动。
   Widget _buildLabelRow(
     Duration elapsed,
     String rightLabel,
     TextStyle? labelStyle,
   ) {
     final badge = widget.labelRowBadge;
+    final hints = widget.labelRowHints;
     Widget dim(Widget child) => AnimatedOpacity(
       opacity: _dragging ? 1 : 0.5,
       duration: const Duration(milliseconds: 150),
       child: child,
     );
+    final centerItems = <Widget>[?hints, ?badge];
     final row = Row(
       children: [
         dim(Text(_format(elapsed), style: labelStyle)),
-        const Spacer(),
-        if (badge != null) ...[
-          // 用 Expanded 而不是 Flexible：Flexible 是 loose，徽章比它那一份窄时
-          // 后面的元素会整体左移，徽章就不再居中（实测偏 57px）。Expanded 占住
-          // 整份宽度，`FittedBox` 在框内居中，两侧留白才真的对称。
+        if (centerItems.isEmpty)
+          const Spacer()
+        else
           Expanded(
             child: FittedBox(
               fit: BoxFit.scaleDown,
               alignment: Alignment.center,
-              child: badge,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = 0; i < centerItems.length; i++) ...[
+                    if (i > 0) const SizedBox(width: AppSpacing.xs),
+                    centerItems[i],
+                  ],
+                ],
+              ),
             ),
           ),
-          const Spacer(),
-        ],
         dim(Text(rightLabel, style: labelStyle)),
       ],
     );

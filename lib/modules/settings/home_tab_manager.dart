@@ -2,7 +2,10 @@ import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/build_flags.dart';
+import '../../core/remote/tv_reorder.dart';
 import '../../core/utils/app_haptics.dart';
+import '../../core/utils/app_toast.dart';
 import '../../providers/tab_config_provider.dart';
 
 /// 统一的主页 Tab 图标映射。
@@ -37,6 +40,8 @@ IconData homeTabIcon(String tabId) {
       return Icons.landscape;
     case 'channel':
       return Icons.dynamic_feed;
+    case 'sheet':
+      return Icons.queue_music;
     case 'brush':
       return Icons.swipe;
     case 'listen_together':
@@ -56,7 +61,7 @@ IconData homeTabIcon(String tabId) {
 /// 均直接读写 [TabConfigProvider.allTabs]（下标与列表 1:1，无过滤、无下标换算）。
 /// 因两者都 `watch` 同一个 Provider，任一入口修改后另一入口立即刷新；
 /// 拖拽排序、显示开关、「必显示」规则与重置行为完全一致。
-class HomeTabManagerList extends StatelessWidget {
+class HomeTabManagerList extends StatefulWidget {
   /// 面板标题（设置页 / LaunchPad 各自的措辞）。
   final String title;
 
@@ -71,6 +76,28 @@ class HomeTabManagerList extends StatelessWidget {
   });
 
   @override
+  State<HomeTabManagerList> createState() => _HomeTabManagerListState();
+}
+
+class _HomeTabManagerListState extends State<HomeTabManagerList> {
+  /// tv: 遥控拖拽排序状态机（同播放队列口径）。非 TV 构建不接线。
+  late final TvReorderController _reorder = TvReorderController(
+    itemCount: () =>
+        context.read<TabConfigProvider>().allTabs.length,
+    onReorder: (oldIndex, newIndex) =>
+        context.read<TabConfigProvider>().reorderTabs(oldIndex, newIndex),
+    labelOf: (index) =>
+        context.read<TabConfigProvider>().allTabs[index].label,
+    onToast: (msg, {long = false}) => showToast(msg, long: long),
+  );
+
+  @override
+  void dispose() {
+    _reorder.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
@@ -79,8 +106,8 @@ class HomeTabManagerList extends StatelessWidget {
     final hiddenTabs = tabConfig.hiddenTabs;
 
     final list = M3EReorderableDismissibleList(
-      shrinkWrap: embedded,
-      physics: embedded ? const NeverScrollableScrollPhysics() : null,
+      shrinkWrap: widget.embedded,
+      physics: widget.embedded ? const NeverScrollableScrollPhysics() : null,
       listPadding: const EdgeInsets.symmetric(horizontal: 8),
       itemCount: allTabs.length,
       // key 由 M3E 内部套用（KeyedSubtree），保证重排后行状态稳定
@@ -91,19 +118,22 @@ class HomeTabManagerList extends StatelessWidget {
           tabConfig.reorderTabs(oldIndex, newIndex),
       // 置零 M3E 卡片自身的背景/圆角/间距/内边距：行内是自带样式的 ListTile
       // 同时用 direction: none 关掉滑动（本列表只有显示/隐藏，没有删除）
-      style: const M3EDismissibleCardStyle(
+      style: M3EDismissibleCardStyle(
         outerRadius: 0,
         innerRadius: 0,
         gap: 0,
         padding: EdgeInsets.zero,
         color: Colors.transparent,
+        // tv: 同播放队列——TV 构建关掉 M3E 卡片自绘的焦点环，只留全局
+        // TvFocusHighlight 一层（详见 player_playlist_view.dart 的说明）。
+        focusRingColor: kTvBuild ? Colors.transparent : null,
         direction: DismissDirection.none,
       ),
       itemBuilder: (context, index) {
         final tab = allTabs[index];
         final isHidden = hiddenTabs.contains(tab.id);
         // search: -
-        return ListTile(
+        final row = ListTile(
           leading: Icon(
             homeTabIcon(tab.id),
             color: isHidden ? cs.onSurfaceVariant : cs.primary,
@@ -136,6 +166,20 @@ class HomeTabManagerList extends StatelessWidget {
             ],
           ),
         );
+        // tv: 整行单停点 + 排序方向键。OK = 切换显示开关（与触屏点 Switch 同效）；
+        // 不可移除的行 onSelect 传 null（DpadFocusable 允许 onSelect 为空）。
+        if (!kTvBuild) return row;
+        return TvReorderItem(
+          index: index,
+          controller: _reorder,
+          onSelect: tab.isRemovable
+              ? () {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  tabConfig.toggleTabVisibility(tab.id);
+                }
+              : null,
+          child: row,
+        );
       },
     );
 
@@ -147,7 +191,7 @@ class HomeTabManagerList extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
           child: Row(
             children: [
-              Expanded(child: Text(title, style: tt.titleMedium)),
+              Expanded(child: Text(widget.title, style: tt.titleMedium)),
               TextButton(
                 onPressed: () => tabConfig.resetToDefault(),
                 child: const Text('重置'),
@@ -166,7 +210,7 @@ class HomeTabManagerList extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        embedded ? list : Expanded(child: list),
+        widget.embedded ? list : Expanded(child: list),
       ],
     );
   }

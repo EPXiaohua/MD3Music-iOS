@@ -16,4 +16,23 @@ void main() {
 
     expect(await SettingsRepository().getSecondaryPlayerEnabled(), isTrue);
   });
+
+  test('悬浮播放器透明度默认不透明并可持久化', () async {
+    SharedPreferences.setMockInitialValues({});
+    final repository = SettingsRepository();
+
+    expect(await repository.getSecondaryPlayerOpacity(), 1.0);
+    await repository.setSecondaryPlayerOpacity(0.45);
+    expect(await repository.getSecondaryPlayerOpacity(), 0.45);
+  });
+
+  test('悬浮播放器透明度限制在可读范围内', () async {
+    SharedPreferences.setMockInitialValues({});
+    final repository = SettingsRepository();
+
+    await repository.setSecondaryPlayerOpacity(0.0);
+    expect(await repository.getSecondaryPlayerOpacity(), 0.2);
+    await repository.setSecondaryPlayerOpacity(2.0);
+    expect(await repository.getSecondaryPlayerOpacity(), 1.0);
+  });
 }

@@ -100,6 +100,20 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Vec<u8> {
 }
 
 /// AES-CBC decrypt with PKCS7 unpadding (CryptoJS default).
+///
+/// ⚠️ **不可对长度非 block size 整数倍的输入调用**：下方
+/// `GenericArray::clone_from_slice(blk)` 遇到 `data.chunks(bs)` 的短末块会 panic，
+/// 而 release profile 是 `panic = "abort"`（见 `Cargo.toml`）→ **整个 App 直接崩**。
+/// 调用方喂进来的密文可能来自上游的**未加密**响应（网关错误页 / 纯 JSON /
+/// HTML），那种情况下长度几乎不可能恰好是 16 的倍数。
+///
+/// 回归：profile 包冷启动 `SIGABRT` + `Slice must be the same length as the array`
+/// （`crypto.rs::playlist_aes_decrypt` → 本函数）。故此处**前置挡掉**并返回空 Vec，
+/// 由调用方按「解密失败」处理。空 Vec 与 `base64_decode` 的
+/// `unwrap_or_default()`（非法 base64 → 空）口径一致。
+///
+/// 注意：**不能用 `catch_unwind` 兜**——`panic = "abort"` 下它拦不住进程 abort，
+/// 唯一正确的解法就是在 panic 发生前把输入挡掉。
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockSizeUser, KeyInit};
     use aes::cipher::typenum::Unsigned;
@@ -107,6 +121,15 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         ($ty:ty) => {{
             let bs = <$ty as BlockSizeUser>::BlockSize::USIZE;
             let cipher = <$ty>::new_from_slice(key).expect("aes key");
+            // 前置守卫：密文长度必须是 block size 的整数倍。上游偶发返回**未加密**
+            // 响应（网关错误页 / 纯 JSON / HTML），调用方按密文喂进来时长度不齐，
+            // 下方 GenericArray::clone_from_slice(blk) 会 panic，而 release 是
+            // panic="abort" → 整个 App 崩（profile 包冷启动实测 SIGABRT）。
+            // 空 Vec 与 base64_decode 的 unwrap_or_default 同口径，调用方按
+            // 「解密失败」处理即可。不能改用 catch_unwind：abort 下拦不住。
+            if data.is_empty() || data.len() % bs != 0 {
+                return Vec::new();
+            }
             let mut prev: Vec<u8> = iv.to_vec();
             let mut out = Vec::with_capacity(data.len());
             for blk in data.chunks(bs) {
@@ -355,12 +378,25 @@ pub fn playlist_aes_encrypt(data: &str) -> (String, String) {
 }
 
 /// playlistAesDecrypt({key, str}) => parsed JSON or plaintext string.
+///
+/// 上游**未加密**（或返回的是网关错误页/HTML）时，`aes_cbc_decrypt` 因长度不齐
+/// 返回空 Vec。此时明确回 `Value::Null` 而非空串：调用方（playlist.rs 的
+/// `cloud_roundtrip`、user.rs 等）据此走「解密失败」分支，把失败原因带出去，
+/// 而不是把空串当成一条业务响应返回给 UI。
 pub fn playlist_aes_decrypt(key: &str, str_: &str) -> serde_json::Value {
     let md = md5_hex(key.as_bytes());
     let enc_key = md[..16].to_string();
     let iv = md[16..32].to_string();
     let ct = base64_decode(str_);
+    // 非法 base64 → 空；长度非 16 倍数 → aes_cbc_decrypt 同样回空（其前置守卫）。
+    // 两种情况都说明「这段响应不是密文」，统一回 Null 让调用方走失败分支。
+    if ct.is_empty() {
+        return serde_json::Value::Null;
+    }
     let pt = aes_cbc_decrypt(enc_key.as_bytes(), iv.as_bytes(), &ct);
+    if pt.is_empty() {
+        return serde_json::Value::Null;
+    }
     let text = String::from_utf8_lossy(&pt).into_owned();
     serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
 }

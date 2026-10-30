@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../core/services/player_frame_driver.dart';
 
 import '../core/services/spectrum_band_envelope.dart';
+import '../core/services/spectrum_disc_spin.dart';
 import '../core/services/spectrum_service.dart';
 import 'player_artwork_image.dart';
 
@@ -17,12 +19,18 @@ import 'player_artwork_image.dart';
 /// 2. 圆形封面层：[ClipOval] 裁圆 + 1.5px 主题色细环，[Transform.rotate] 旋转
 ///
 /// 旋转逻辑：
-/// - `isPlaying=true` → 60fps Timer 步进控制器值，**顺时针**（约 8s/圈）
-/// - `isPlaying=false` → 停止，**保持当前角度静止**（不 reset，恢复播放时续转）
+/// - `isPlaying=true` → 顺时针（约 8s/圈），角度取自**进程级共享**相位
+///   [SpectrumDiscSpin]（不是本组件私有）；播放中挂共享节拍、暂停即冻结在当前角度，
+///   恢复播放续转；
+/// - **为什么必须共享**：MiniPlayer → FullPlayer 的封面形变要在落位帧与真身圆盘
+///   逐角度重合，而真身飞行期间被槽位 `Opacity(0)` 隐藏（不 paint，无法逐帧上报
+///   角度）；且跟手展开时拖拽覆盖层里还有第二个播放页实例，私有相位必然对不上。
+///   详见 [SpectrumDiscSpin] 的类注释。
 ///
 /// 帧率说明：不使用 `AnimationController.repeat()`——repeat 会让控制器 Ticker
 /// 每帧 scheduleFrame，120Hz 屏上即便画面未变也保持 120fps 帧管线（与歌词省电
-/// 模式相同的坑）。改用 16ms Timer 直接步进控制器值，帧生产被限制到 60fps。
+/// 模式相同的坑）。共享相位由 [PlayerFrameDriver] 的 60fps 节拍步进，多个圆盘
+/// 实例（含形变重叠实例）共用同一个定时器。
 ///
 /// 性能：环形频谱柱用 [ValueNotifier] + `super(repaint:)` 驱动重绘，
 /// 旋转用 [AnimatedBuilder] 局部重建，避免每帧 setState。
@@ -65,8 +73,22 @@ class SpectrumArtwork extends StatefulWidget {
   /// 柱状图与曲线共用，由调用方按样式分开记忆后传入。
   final double opacity;
 
-  /// 旋转一圈耗时（默认 8s，慢速防眩晕）
-  final Duration rotationDuration;
+  /// 封面形变进度（0..1，通常就是 `playerExpansion`）：非 null 时，**飞行途中**
+  /// 环形频谱柱目标不透明度归 0，端点恢复按 [isPlaying] 显示。
+  ///
+  /// **要治的是什么**：圆盘模式下封面现在是共享元素（MiniPlayer 的封面一路飞成
+  /// 这张圆盘），飞行期间本组件的整棵子树被播放页槽位 `Opacity(0)` 让位隐藏，
+  /// 交接帧（p→1）整棵子树突然显形——环形柱会"啪"地一下出现在圆盘外围。让它
+  /// 在飞行中先淡出、交接后随 [AnimatedOpacity] 的 350ms 淡入回来，观感才是
+  /// 「封面飞上去、频谱再长出来」。
+  ///
+  /// **为什么传进度而不是布尔**：形变层在 build 阶段写任何 notifier 都会触发
+  /// 「setState() or markNeedsBuild() called during build」断言（它每帧都在重建，
+  /// 树里其它消费者可能已经构建完毕）；`playerExpansion` 由路由/拖拽在**回调期**
+  /// 写入，监听它是安全的。
+  ///
+  /// null = 不参与形变（列表行内、独立使用等），行为与改动前完全一致。
+  final ValueListenable<double>? morphProgress;
 
   const SpectrumArtwork({
     super.key,
@@ -78,7 +100,7 @@ class SpectrumArtwork extends StatefulWidget {
     this.bandCount = 40,
     this.style = 0,
     this.opacity = 1.0,
-    this.rotationDuration = const Duration(seconds: 8),
+    this.morphProgress,
   });
 
   @override
@@ -86,12 +108,9 @@ class SpectrumArtwork extends StatefulWidget {
 }
 
 class _SpectrumArtworkState extends State<SpectrumArtwork>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  late final AnimationController _rotationController;
-  late final Animation<double> _rotationAnimation;
-
-  /// 封面旋转是否已挂在共享 60fps 帧驱动上（见 [PlayerFrameDriver]）。
-  bool _rotationDriverBound = false;
+    with WidgetsBindingObserver {
+  /// 封面旋转是否已挂到共享相位（见 [SpectrumDiscSpin]）。
+  bool _rotationBound = false;
 
   /// 频谱包络是否已挂在共享 60fps 帧驱动上。
   bool _bandDriverBound = false;
@@ -119,16 +138,6 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _rotationController = AnimationController(
-      duration: widget.rotationDuration,
-      vsync: this,
-    );
-    // 注意：Tween begin=0 end=2π（顺时针）；AnimatedBuilder 旋转角度从 0 递增
-    _rotationAnimation = Tween<double>(
-      begin: 0.0,
-      end: 2 * math.pi,
-    ).animate(_rotationController);
-
     _envelope = SpectrumBandEnvelope(bandCount: widget.bandCount);
     _bandsNotifier = ValueNotifier<List<double>>(
       List<double>.filled(widget.bandCount, 0.0),
@@ -149,9 +158,6 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
       _bandsNotifier.value = List<double>.filled(widget.bandCount, 0.0);
       _syncFrameDriverBindings();
     }
-    if (oldWidget.rotationDuration != widget.rotationDuration) {
-      _rotationController.duration = widget.rotationDuration;
-    }
   }
 
   /// 帧生产是否被挂起：`TickerMode` 关闭（被不透明路由覆盖）或 App 退到后台。
@@ -162,23 +168,23 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
 
   /// 同步两个 60fps 订阅：封面旋转（仅播放时）与频谱包络（播放中**或**未收敛）。
   ///
-  /// 用 Timer 直接步进控制器值而非 `repeat()`：控制器 Ticker 不会被启动，
-  /// 帧生产由共享节拍限制到 60fps（repeat 会让 120Hz 屏保持 120fps）。
+  /// 旋转不再由本组件自己步进：角度来自进程级共享相位 [SpectrumDiscSpin]，这里
+  /// 只负责"播放中且可见时登记为消费者"。这样即使同一屏存在多个圆盘实例
+  ///（跟手展开时的拖拽覆盖层 + 路由播放页），相位也是同一个，形变层落位帧与
+  /// 真身逐角度重合；帧生产也仍只有一个 `Timer`。
   ///
   /// 两者挂同一个 [PlayerFrameDriver]，因此**不增加任何帧生产**。
   void _syncFrameDriverBindings() {
-    // ── 封面旋转 ──
-    if (widget.isPlaying && !_framesSuspended) {
-      if (!_rotationDriverBound) {
-        // 与歌词共用同一个 60fps 节拍：两个独立 16ms Timer 相位错开会让
-        // 120Hz 屏整页跑到 ~120fps（实测），合并后整页回到 60fps，
-        // 而封面旋转本身的更新率不变（仍 60fps）。
-        PlayerFrameDriver.instance.addListener(_onRotationTick);
-        _rotationDriverBound = true;
+    // ── 封面旋转（共享相位）──
+    final bool wantSpin = widget.isPlaying && !_framesSuspended;
+    if (wantSpin != _rotationBound) {
+      _rotationBound = wantSpin;
+      if (wantSpin) {
+        SpectrumDiscSpin.instance.attach(this);
+      } else {
+        // 暂停/不可见即摘掉：相位在无消费者时冻结，恢复播放续转（不归零）。
+        SpectrumDiscSpin.instance.detach(this);
       }
-    } else if (_rotationDriverBound) {
-      PlayerFrameDriver.instance.removeListener(_onRotationTick);
-      _rotationDriverBound = false;
     }
 
     // ── 频谱包络 ──
@@ -210,17 +216,21 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final bool muted = !TickerMode.valuesOf(context).enabled;
-    if (muted == _tickerModeMuted) return;
-    _tickerModeMuted = muted;
+    // 不做「状态未变即早退」：子树 deactivate→重新插入（GlobalKey 重挂、部分
+    // 路由动画期间）后没有任何重绑回调，这里每次都走一遍 _syncFrameDriverBindings
+    //（幂等，已绑定则原样返回），避免复用场景帧驱动永久丢失。
+    _tickerModeMuted = !TickerMode.valuesOf(context).enabled;
     _syncFrameDriverBindings();
   }
 
   /// 后台/熄屏时引擎不合成帧，两个订阅一并停掉（§10.4.3）。
+  ///
+  /// md3 fork 口径：inactive（车机投屏、通知栏下拉等「可见无焦点」）下引擎
+  /// 照常合成帧，不算挂起——停掉会让投屏场景频谱/封面冻结；与
+  /// MusicHapticsService 的前端口径一致。
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final bool suspended = state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached;
     if (suspended == _appSuspended) return;
@@ -230,9 +240,11 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
 
   /// 幂等退订两个共享节拍订阅（[deactivate] / [dispose] 共用）。
   void _unbindAll() {
-    if (_rotationDriverBound) {
-      PlayerFrameDriver.instance.removeListener(_onRotationTick);
-      _rotationDriverBound = false;
+    if (_rotationBound) {
+      // 摘掉共享相位的消费者登记：漏了会让相位（以及它挂的 60fps 节拍）
+      // 在组件销毁后永久空转 —— 本仓最典型的漏电点。
+      SpectrumDiscSpin.instance.detach(this);
+      _rotationBound = false;
     }
     if (_bandDriverBound) {
       PlayerFrameDriver.instance.removeListener(_onBandTick);
@@ -247,14 +259,6 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
   void deactivate() {
     _unbindAll();
     super.deactivate();
-  }
-
-  /// 以 16ms 步进推进旋转角度（控制器值 0→1 循环，映射到 0→2π）。
-  void _onRotationTick() {
-    if (!mounted) return;
-    // 每 16ms 推进的圈数比例：16ms / 转一圈时长
-    final step = 16.0 / widget.rotationDuration.inMilliseconds;
-    _rotationController.value = (_rotationController.value + step) % 1.0;
   }
 
   /// 以真实帧间隔推进频谱包络，并驱动 CustomPainter 重绘。
@@ -293,9 +297,39 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
     WidgetsBinding.instance.removeObserver(this);
     _unbindAll(); // 幂等解绑（deactivate 已解绑过则直接 return）
     _subscription?.cancel();
-    _rotationController.dispose();
     _bandsNotifier.dispose();
     super.dispose();
+  }
+
+  /// 环形频谱柱在**形变进度** [morph] 下的目标不透明度。
+  ///
+  /// 飞行途中（`0 < morph < 1`）归 0：此时整个圆盘被播放页槽位让位隐藏，柱体
+  /// 在交接帧突然显形会很扎眼；端点（0 / 1）恢复按 [SpectrumArtwork.isPlaying]。
+  double _ringOpacityAt(double morph) =>
+      widget.isPlaying && !(morph > 0.0 && morph < 1.0) ? 1.0 : 0.0;
+
+  /// 统一的柱体淡入淡出外壳（两条路径都只包**一层** `AnimatedOpacity`）。
+  Widget _ringFade(Widget child, double opacity) => AnimatedOpacity(
+        opacity: opacity,
+        duration: const Duration(milliseconds: 350),
+        curve: Curves.easeOut,
+        child: child,
+      );
+
+  /// 环形频谱层：把柱体包进「形变让位」闸门。
+  ///
+  /// `morphProgress` 为空时与改动前逐值一致（只按播放态淡入淡出）。非空时用
+  /// [ValueListenableBuilder] 逐帧重算目标不透明度，但柱体子树走 `child:` 原样
+  /// 透传（不重建 `CustomPaint`、不重配 painter），每帧只多一个 `AnimatedOpacity`。
+  Widget _gatedRing(Widget ring) {
+    final gate = widget.morphProgress;
+    if (gate == null) return _ringFade(ring, widget.isPlaying ? 1.0 : 0.0);
+    return ValueListenableBuilder<double>(
+      valueListenable: gate,
+      child: ring,
+      builder: (context, morph, child) =>
+          _ringFade(child!, _ringOpacityAt(morph)),
+    );
   }
 
   @override
@@ -325,12 +359,9 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
               // ── 1. 环形频谱层（柱状或曲线）：AnimatedOpacity 过渡，播放时淡入、暂停淡出 ──
               Positioned.fill(
                 child: IgnorePointer(
-                  child: AnimatedOpacity(
-                    opacity: widget.isPlaying ? 1.0 : 0.0,
-                    duration: const Duration(milliseconds: 350),
-                    curve: Curves.easeOut,
-                    // 频谱每帧重绘：独立 layer，避免脏区扩散到播放页其余部分
-                    child: RepaintBoundary(
+                  // 频谱每帧重绘：独立 layer，避免脏区扩散到播放页其余部分
+                  child: _gatedRing(
+                    RepaintBoundary(
                       child: CustomPaint(
                         painter: widget.style == 1
                             ? _SpectrumCurvePainter(
@@ -365,10 +396,12 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
                 // 旋转每帧重绘：与频谱层分开隔离，两者频率与内容都不同
                 child: RepaintBoundary(
                   child: AnimatedBuilder(
-                    animation: _rotationAnimation,
+                    // 角度来自进程级共享相位（见 SpectrumDiscSpin）：形变层落位
+                    // 帧要与真身逐角度重合，私有相位做不到（真身飞行期不 paint）。
+                    animation: SpectrumDiscSpin.instance.angle,
                     builder: (context, child) {
                       return Transform.rotate(
-                        angle: _rotationAnimation.value,
+                        angle: SpectrumDiscSpin.instance.angle.value,
                         alignment: Alignment.center,
                         child: child,
                       );

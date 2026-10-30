@@ -5,8 +5,10 @@ import 'package:provider/provider.dart';
 
 import '../../core/build_flags.dart';
 import '../../core/platform_capabilities.dart';
+import '../../core/services/folder_picker_service.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/layout/page_title_alignment.dart';
+import '../../core/layout/page_layout.dart';
 import '../../core/layout/tv_fab_focus_bridge.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
@@ -31,18 +33,16 @@ class _LibraryPageState extends State<LibraryPage>
   late TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
   late FocusNode _searchFocusNode;
+  bool _searchInputEnabled = false;
 
-  /// tv: 扫描入口 FAB 的焦点节点。显式持有一份，好让内容区下边缘能把焦点
-  /// 移交过来——FAB 贴在右下角，几何上既不在末行下方、水平投影也不重叠，
-  /// dpad 的两条候选判定都不成立（详见 [TvFabFocusBridge] 头注释）。
+  /// tv: 竖屏 FAB 与横屏工具栏共用扫描入口焦点节点，旋转后仍可移交焦点。
   final FocusNode _tvFabNode = FocusNode(debugLabel: 'library_scan_fab');
 
   /// tv: 扫描弹层首项（扫描音乐）的焦点节点。显式持有一份，弹层打开后由
   /// [_tvEnsureSheetFocus] 主动请求焦点——`autofocus` 在 m3e 弹层这种延迟挂载
   /// 的路由里不可靠（2026-10-05 真机实测：焦点落到末行开关上）。
-  final FocusNode _tvScanMenuFirstNode = FocusNode(
-    debugLabel: 'scan_menu_rescan',
-  );
+  final FocusNode _tvScanMenuFirstNode =
+      FocusNode(debugLabel: 'scan_menu_rescan');
 
   /// [_tvEnsureSheetFocus] 的自锁标记，保证只请求一次焦点。
   bool _tvScanMenuFocusRequested = false;
@@ -60,9 +60,22 @@ class _LibraryPageState extends State<LibraryPage>
     if (kTvBuild) TvFabFocusBridge.instance.register(_tvFabNode);
     // 监听 FullPlayer 展开状态：展开时取消搜索框焦点，防止返回时自动弹输入法
     playerExpansion.addListener(_onPlayerExpansionChanged);
+    // 页面加载后立即取消搜索框焦点，防止输入法自动弹出。
+    //
+    // 必须**跨两帧**：搜索框挂在 `AppBar.bottom`，而该 bottom 只在
+    // `hasMusic || isScanning` 为真时才构建。冷启动/切 tab 的第一帧
+    // `LibraryProvider` 还是空的（缓存恢复是异步的，见
+    // [LibraryProvider.loadSavedSongs]），此时 TextField 尚未挂上，
+    // `_searchFocusNode` 也没有 context，`unfocus()` 是空操作。
+    // 第二帧缓存已回填、TextField 刚挂载，框架的焦点链路会按 scope 的
+    // `focusedChild` 历史把焦点落回搜索框（真机表现为「点本地音乐自动弹
+    // 出搜索框和输入法」），所以第二帧必须再补一次 unfocus。
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // 页面加载后立即取消搜索框焦点，防止输入法自动弹出
-      _searchFocusNode.unfocus();
+      _resetEntrySearchFocus();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _dismissSearchFocus();
+      });
       final provider = context.read<LibraryProvider>();
       // 1. 先恢复上次扫描结果（缓存），让用户立即看到歌曲列表
       provider.loadSavedSongs();
@@ -74,13 +87,24 @@ class _LibraryPageState extends State<LibraryPage>
   /// FullPlayer 展开时取消搜索框焦点，避免返回后输入法自动弹出
   void _onPlayerExpansionChanged() {
     if (playerExpansion.value > 0.5) {
-      _searchFocusNode.unfocus();
+      _resetEntrySearchFocus();
     }
+  }
+
+  void _resetEntrySearchFocus() {
+    if (kTvBuild) {
+      _searchFocusNode.unfocus();
+      return;
+    }
+    _dismissSearchFocus();
   }
 
   /// 功能操作不应保留输入焦点；在新路由记忆旧焦点前同步清除。
   void _dismissSearchFocus() {
     _searchFocusNode.unfocus();
+    if (!kTvBuild && _searchInputEnabled) {
+      setState(() => _searchInputEnabled = false);
+    }
     FocusManager.instance.primaryFocus?.unfocus();
     FocusManager.instance.applyFocusChangesIfNeeded();
   }
@@ -98,115 +122,222 @@ class _LibraryPageState extends State<LibraryPage>
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => SafeArea(
+    top: false,
+    bottom: false,
+    child: LayoutBuilder(builder: _buildPage),
+  );
+
+  Widget _buildPage(BuildContext context, BoxConstraints constraints) {
     final libraryProvider = context.watch<LibraryProvider>();
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final hasMusic = libraryProvider.hasMusic;
     final isScanning = libraryProvider.isScanning;
+    // 横屏只压缩有足够局部宽度的页面；分栏中的窄面板仍保留上下排列。
+    final isLandscape =
+        MediaQuery.orientationOf(context) == Orientation.landscape;
+    final compactHeader = constraints.maxWidth >= 600 && isLandscape;
+    final sideGutter = (constraints.maxWidth - ContentWidth.resolveWidth(
+        context, constraints.maxWidth)) / 2;
 
     return Scaffold(
       appBar: AppBar(
         centerTitle: centerPageTitle(context, tabId: 'library'),
+        titleSpacing: sideGutter + AppSpacing.lg,
         title: Text(
           '本地音乐',
           style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
         ),
+        actions: isLandscape
+            ? [
+                Padding(
+                  padding: EdgeInsets.only(right: sideGutter + AppSpacing.lg),
+                  child: _buildScanToolbarAction(colorScheme),
+                ),
+              ]
+            : null,
         bottom: hasMusic || isScanning
             ? PreferredSize(
-                preferredSize: const Size.fromHeight(108),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // 搜索栏
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: AppSpacing.lg,
-                        vertical: AppSpacing.xs,
-                      ),
-                      child: TextField(
-                        controller: _searchController,
-                        focusNode: _searchFocusNode,
-                        contextMenuBuilder: buildAppTextContextMenu,
-                        // 手机触摸默认不会取消输入焦点，显式覆盖以保护所有非输入操作。
-                        onTapOutside: (_) => _dismissSearchFocus(),
-                        onTap: () {
-                          // 点击搜索框时请求焦点并弹出键盘
-                          _searchFocusNode.requestFocus();
-                        },
-                        decoration: InputDecoration(
-                          hintText: '搜索本地音乐',
-                          prefixIcon: const Icon(Icons.search, size: 20),
-                          suffixIcon: _searchController.text.isNotEmpty
-                              ? IconButton(
-                                  icon: const Icon(Icons.clear, size: 20),
-                                  onPressed: () {
-                                    _searchController.clear();
-                                    libraryProvider.clearSearch();
-                                  },
-                                )
-                              : null,
-                          isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: AppSpacing.md,
-                            vertical: AppSpacing.sm,
-                          ),
-                          border: OutlineInputBorder(
-                            borderRadius: AppRadius.xlAll,
-                            borderSide: BorderSide.none,
-                          ),
-                          filled: true,
-                          fillColor: colorScheme.surfaceContainerHigh,
-                        ),
-                        onChanged: (value) {
-                          libraryProvider.setSearchQuery(value);
-                          setState(() {});
-                        },
-                      ),
+                preferredSize: Size.fromHeight(compactHeader ? 64 : 116),
+                child: ContentWidth(
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      AppSpacing.lg,
+                      compactHeader ? AppSpacing.sm : AppSpacing.md,
+                      AppSpacing.lg,
+                      compactHeader ? AppSpacing.sm : 0,
                     ),
-                    // TabBar
-                    TabBar(
-                      controller: _tabController,
-                      tabs: [
-                        const Tab(text: '曲目'),
-                        const Tab(text: '专辑'),
-                        const Tab(text: '艺术家'),
-                        const Tab(text: '文件夹'),
-                        const Tab(text: '收藏'),
-                      ],
-                      // 5 个 Tab 内容较窄，关闭滚动并居中分布到整行，
-                      // 缩窄每个 Tab 内部 padding 让全部标题都能完整显示。
-                      isScrollable: false,
-                      tabAlignment: TabAlignment.center,
-                      padding: EdgeInsets.zero,
-                      labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                      labelStyle: textTheme.titleSmall,
-                      unselectedLabelStyle: textTheme.titleSmall,
-                      dividerColor: Colors.transparent,
-                    ),
-                  ],
+                    child: compactHeader
+                        ? Row(
+                            children: [
+                              Expanded(
+                                flex: 2,
+                                child: _buildSearchField(
+                                  libraryProvider,
+                                  colorScheme,
+                                ),
+                              ),
+                              const Gap(AppSpacing.lg),
+                              Expanded(
+                                flex: 3,
+                                child: _buildCategoryTabs(textTheme),
+                              ),
+                            ],
+                          )
+                        : Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _buildSearchField(libraryProvider, colorScheme),
+                              const Gap(AppSpacing.sm),
+                              _buildCategoryTabs(
+                                textTheme,
+                                centered: !isLandscape,
+                              ),
+                            ],
+                          ),
+                  ),
                 ),
               )
             : null,
       ),
-      body: isScanning && !hasMusic
-          ? _buildScanningState(colorScheme)
-          : !hasMusic
-          ? _buildEmptyState(colorScheme)
-          : TabBarView(
-              controller: _tabController,
-              physics: const TabSnapPhysics(),
-              children: [
-                SongsPage(songs: libraryProvider.songs),
-                AlbumsPage(albums: libraryProvider.albums),
-                ArtistsPage(artists: libraryProvider.artists),
-                FoldersPage(folders: libraryProvider.folders),
-                const _LocalFavoritesTab(),
-              ],
+      body: ContentWidth(
+        key: const ValueKey('library_content'),
+        child: Column(
+          children: [
+            if (isScanning && hasMusic) ...[
+              const M3ELinearWavyProgressIndicator(),
+              const Padding(
+                padding: EdgeInsets.all(AppSpacing.sm),
+                child: Text('正在扫描本地音乐...'),
+              ),
+            ],
+            if (libraryProvider.error != null)
+              Padding(
+                padding: const EdgeInsets.all(AppSpacing.sm),
+                child: Text('扫描失败：${libraryProvider.error}',
+                    style: TextStyle(color: colorScheme.error)),
+              ),
+            Expanded(child: isScanning && !hasMusic
+            ? _buildScanningState(colorScheme)
+            : !hasMusic
+            ? _buildEmptyState(colorScheme)
+            : TabBarView(
+                controller: _tabController,
+                physics: const TabSnapPhysics(),
+                children: [
+                  SongsPage(songs: libraryProvider.songs),
+                  AlbumsPage(albums: libraryProvider.albums),
+                  ArtistsPage(artists: libraryProvider.artists),
+                  FoldersPage(folders: libraryProvider.folders),
+                  const _LocalFavoritesTab(),
+                ],
+              )),
+          ],
+        ),
+      ),
+      floatingActionButton: isLandscape
+          ? null
+          : Padding(
+              padding: EdgeInsets.only(right: sideGutter),
+              child: _buildScanFAB(context, colorScheme),
             ),
-      floatingActionButton: _buildScanFAB(context, colorScheme),
     );
   }
+
+  void _activateSearchFocus() {
+    if (kTvBuild) {
+      _searchFocusNode.requestFocus();
+      return;
+    }
+    if (_searchInputEnabled) return;
+    setState(() => _searchInputEnabled = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _searchInputEnabled) _searchFocusNode.requestFocus();
+    });
+  }
+
+  Widget _buildSearchField(LibraryProvider library, ColorScheme cs) {
+    final field = SizedBox(
+    height: 48,
+    child: TextField(
+      controller: _searchController,
+      focusNode: _searchFocusNode,
+      contextMenuBuilder: buildAppTextContextMenu,
+      onTapOutside: (_) => _dismissSearchFocus(),
+      onTap: _activateSearchFocus,
+      decoration: InputDecoration(
+        hintText: '搜索本地音乐',
+        prefixIcon: const Icon(Icons.search, size: 20),
+        suffixIcon: _searchController.text.isNotEmpty
+            ? IconButton(
+                icon: const Icon(Icons.clear, size: 20),
+                onPressed: () {
+                  _searchController.clear();
+                  library.clearSearch();
+                },
+              )
+            : null,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.md,
+          vertical: AppSpacing.sm,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: AppRadius.xlAll,
+          borderSide: BorderSide.none,
+        ),
+        filled: true,
+        fillColor: cs.surfaceContainerLow,
+      ),
+      onChanged: (value) {
+        library.setSearchQuery(value);
+        setState(() {});
+      },
+    ),
+    );
+    return kTvBuild
+        ? field
+        : Focus(descendantsAreFocusable: _searchInputEnabled, child: field);
+  }
+
+  Widget _buildCategoryTabs(TextTheme textTheme, {bool centered = false}) => TabBar(
+    controller: _tabController,
+    tabs: const [
+      Tab(text: '曲目'),
+      Tab(text: '专辑'),
+      Tab(text: '艺术家'),
+      Tab(text: '文件夹'),
+      Tab(text: '收藏'),
+    ],
+    isScrollable: true,
+    tabAlignment: centered ? TabAlignment.center : TabAlignment.start,
+    labelStyle: textTheme.titleSmall,
+    unselectedLabelStyle: textTheme.titleSmall,
+    dividerColor: Colors.transparent,
+  );
+
+  /// 横屏把扫描入口固定在右上角，不遮挡歌曲行；与竖屏 FAB 共用菜单和焦点保护。
+  Widget _buildScanToolbarAction(ColorScheme colorScheme) => _tvSheetRow(
+    () => _showScanMenu(context),
+    ExcludeFocus(
+      child: M3EFilledButton.tonal(
+        key: const ValueKey('library_scan_toolbar'),
+        tooltip: '扫描本地音乐',
+        onPressed: () => _showScanMenu(context),
+        decoration: M3EButtonDecoration(
+          fixedSize: const Size(48, 48),
+          padding: EdgeInsets.zero,
+          borderRadius: AppRadius.lg,
+          backgroundColor: WidgetStatePropertyAll(colorScheme.primaryContainer),
+          foregroundColor: WidgetStatePropertyAll(colorScheme.onPrimaryContainer),
+        ),
+        child: const Icon(Icons.add),
+      ),
+    ),
+    debugLabel: 'library_scan_toolbar',
+    focusNode: _tvFabNode,
+  );
 
   Widget _buildScanFAB(BuildContext context, ColorScheme colorScheme) {
     // 替换为 M3E 规范的 FAB：M3EFab 默认中等尺寸的容器 56 / 图标 24 /
@@ -327,6 +458,7 @@ class _LibraryPageState extends State<LibraryPage>
     final provider = context.read<LibraryProvider>();
     showM3EModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (ctx) {
         return Consumer<LibraryProvider>(
           builder: (ctx, library, _) {
@@ -346,8 +478,6 @@ class _LibraryPageState extends State<LibraryPage>
               _showScanFolderManagement(context);
             }
 
-            // iOS 与安卓同一套菜单：文件夹管理 UI 完全一致，仅底层不同
-            // （iOS = 文件夹授权 + 安全作用域书签；安卓 = SAF）。
             void manageExcluded() {
               Navigator.pop(ctx);
               _showExcludedFolderManagement(context);
@@ -365,75 +495,77 @@ class _LibraryPageState extends State<LibraryPage>
                     hasRun: () => _tvScanMenuFocusRequested,
                     markRun: () => _tvScanMenuFocusRequested = true,
                   );
-                  return Column(
+                  return SingleChildScrollView(
+                    child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Padding(
-                        padding: const EdgeInsets.all(AppSpacing.lg),
-                        child: Text(
-                          '扫描本地音乐',
-                          style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
+                  Padding(
+                    padding: const EdgeInsets.all(AppSpacing.lg),
+                    child: Text(
+                      '扫描本地音乐',
+                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
                       ),
-                      // tv: 首项持有显式焦点节点，由 [_tvEnsureSheetFocus] 在弹层
-                      // 挂载后主动请求（`autofocus` 在 m3e 弹层里不可靠）
-                      _tvSheetRow(
-                        rescan,
-                        debugLabel: 'scan_menu_rescan',
-                        ListTile(
-                          leading: const Icon(Icons.refresh),
-                          title: const Text('扫描音乐'),
-                          subtitle: const Text('扫描默认目录和已添加的文件夹'),
-                          onTap: rescan,
-                        ),
-                        focusNode: _tvScanMenuFirstNode,
-                      ),
-                      // 打开扫描文件夹管理面板（列出已添加项 + 移除）。
-                      // 此前直接调文件夹选择器，加完就看不到有哪些、也没法移除，
-                      // 用户以为没持久化（实际已存盘，见 LocalMusicRepository.saveFolders）。
-                      // iOS 同一入口：管理面板里的添加走文件夹授权选择器。
-                      _tvSheetRow(
-                        manageScanFolders,
-                        debugLabel: 'scan_menu_add_folder',
-                        ListTile(
-                          leading: const Icon(Icons.create_new_folder_outlined),
-                          title: const Text('添加扫描文件夹'),
-                          subtitle: Text(
-                            '选择额外的文件夹进行扫描'
-                            '${provider.scanFolders.isEmpty ? '' : '（已添加 ${provider.scanFolders.length} 个）'}',
-                          ),
-                          onTap: manageScanFolders,
-                        ),
-                      ),
-                      _tvSheetRow(
-                        manageExcluded,
-                        debugLabel: 'scan_menu_excluded',
-                        ListTile(
-                          leading: const Icon(Icons.folder_off_outlined),
-                          title: const Text('排除文件夹'),
-                          subtitle: Text(
-                            '已排除 ${provider.excludedFolders.length} 个文件夹',
-                          ),
-                          onTap: manageExcluded,
-                        ),
-                      ),
-                      // tv: 开关行同样要单停点；OK 键翻转取值
-                      _tvSheetRow(
-                        () => library.setFilterShortAudio(
-                          !library.filterShortAudio,
-                        ),
-                        debugLabel: 'scan_menu_filter_short',
-                        SwitchListTile(
-                          title: const Text('过滤不超过 60 秒的音频'),
-                          subtitle: const Text('默认关闭，开启后本地音乐列表只显示时长大于 60 秒的音频'),
-                          value: library.filterShortAudio,
-                          onChanged: library.setFilterShortAudio,
-                        ),
-                      ),
-                      const Gap(AppSpacing.sm),
+                    ),
+                  ),
+                  // tv: 首项持有显式焦点节点，由 [_tvEnsureSheetFocus] 在弹层
+                  // 挂载后主动请求（`autofocus` 在 m3e 弹层里不可靠）
+                  _tvSheetRow(
+                    rescan,
+                    debugLabel: 'scan_menu_rescan',
+                    ListTile(
+                      leading: const Icon(Icons.refresh),
+                      title: const Text('扫描音乐'),
+                      subtitle: const Text('扫描默认目录和已添加的文件夹'),
+                      onTap: rescan,
+                    ),
+                    focusNode: _tvScanMenuFirstNode,
+                  ),
+                  // 打开扫描文件夹管理面板（列出已添加项 + 移除）。
+                  // 此前直接调文件夹选择器，加完就看不到有哪些、也没法移除，
+                  // 用户以为没持久化（实际已存盘，见 LocalMusicRepository.saveFolders）。
+                  // iOS 同一入口：管理面板里的添加走文件夹授权选择器。
+                  _tvSheetRow(
+                    manageScanFolders,
+                    debugLabel: 'scan_menu_add_folder',
+                    ListTile(
+                      leading: const Icon(Icons.create_new_folder_outlined),
+                      title: const Text('添加扫描文件夹'),
+                      subtitle: Text(
+                          '选择额外的文件夹进行扫描'
+                          '${provider.scanFolders.isEmpty ? '' : '（已添加 ${provider.scanFolders.length} 个）'}'),
+                      onTap: manageScanFolders,
+                    ),
+                  ),
+                  // iOS 与安卓同一套菜单：文件夹管理 UI 完全一致，仅底层不同
+                  // （iOS = 文件夹授权 + 安全作用域书签；安卓 = SAF）。
+                  _tvSheetRow(
+                    manageExcluded,
+                    debugLabel: 'scan_menu_excluded',
+                    ListTile(
+                      leading: const Icon(Icons.folder_off_outlined),
+                      title: const Text('排除文件夹'),
+                      subtitle: Text(
+                          '已排除 ${provider.excludedFolders.length} 个文件夹'),
+                      onTap: manageExcluded,
+                    ),
+                  ),
+                  // tv: 开关行同样要单停点；OK 键翻转取值
+                  _tvSheetRow(
+                    () => library
+                        .setFilterShortAudio(!library.filterShortAudio),
+                    debugLabel: 'scan_menu_filter_short',
+                    SwitchListTile(
+                      title: const Text('过滤不超过 60 秒的音频'),
+                      subtitle: const Text(
+                          '默认关闭，开启后本地音乐列表只显示时长大于 60 秒的音频'),
+                      value: library.filterShortAudio,
+                      onChanged: library.setFilterShortAudio,
+                    ),
+                  ),
+                  const Gap(AppSpacing.sm),
                     ],
+                    ),
                   );
                 },
               ),
@@ -449,6 +581,9 @@ class _LibraryPageState extends State<LibraryPage>
   /// Windows 上路径是 `C:\Users\...\Music`，只按 `/` 切分拿到的会是整条路径
   /// （弹窗里显示成一长串）。这里同时兼容两种分隔符。
   static String _folderDisplayName(String path) {
+    if (FolderPickerService.isTreeUri(path)) {
+      return FolderPickerService.displayName(path);
+    }
     final parts = path
         .split(RegExp(r'[/\\]'))
         .where((p) => p.isNotEmpty)

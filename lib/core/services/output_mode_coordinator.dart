@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/repositories/settings_repository.dart';
 import '../build_flags.dart';
+import 'audio_offload_service.dart';
 import 'audio_service.dart';
 import 'device_capabilities.dart';
 import 'direct_pcm_service.dart';
@@ -150,6 +151,9 @@ class OutputModeCoordinator extends ChangeNotifier {
     if (kTvBuild) return;
     if (value == _enabled) return;
     if (value) {
+      // 打开前先让路硬解：两种 bit-perfect 路径都要独占 AudioSink 出口，硬解
+      // （offload）还开着会让 sink 配置互相覆盖，必须先挂起硬解。
+      await AudioOffloadService.instance.forceSuspend('USB 独占输出');
       // 判定用**目标状态** `_viaSystem`，不能用 isUsbdevfsActive ——
       // 此处 `_enabled` 尚未置位，读它会得到 false 而跳过直写开启。
       if (!_viaSystem) {
@@ -160,6 +164,8 @@ class OutputModeCoordinator extends ChangeNotifier {
           await _disableBoth();
           await _applyDspBypass();
           await _applyUnityVolume();
+          // 退出独占失败后设备仍不可用，硬解可重新按条件判定（不强制恢复）。
+          await AudioOffloadService.instance.refresh();
           notifyListeners();
           return;
         }
@@ -168,6 +174,8 @@ class OutputModeCoordinator extends ChangeNotifier {
     } else {
       _enabled = false;
       await _disableBoth();
+      // 退出独占后硬解条件可能恢复：刷新一次决策（播放中会挂起到下一首换源）。
+      await AudioOffloadService.instance.refresh();
     }
     await _pushToNative();
     await _applyDspBypass();
@@ -195,6 +203,9 @@ class OutputModeCoordinator extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    // 真正切换方案前先让路硬解：Direct PCM / usbdevfs 直写都要独占 AudioSink
+    // 出口（总开关关闭时只记录选择，不产生副作用，故放在这之后）。
+    await AudioOffloadService.instance.forceSuspend('系统 Direct PCM');
     if (value) {
       await _leaveUsbdevfs();
     } else {
@@ -214,6 +225,8 @@ class OutputModeCoordinator extends ChangeNotifier {
             'USB 直写不可用（$failure），仍使用系统 Direct PCM';
         await _applyDspBypass();
         await _applyUnityVolume();
+        // 回退分支收尾同样重判一次硬解：Direct PCM 仍生效时硬解会继续保持挂起。
+        await AudioOffloadService.instance.refresh();
         notifyListeners();
         return;
       }
@@ -221,6 +234,8 @@ class OutputModeCoordinator extends ChangeNotifier {
     await _pushToNative();
     await _applyDspBypass();
     await _applyUnityVolume();
+    // 方案切换完成后重判硬解（命中冲突条件则让路，恢复条件则挂起到下一首）。
+    await AudioOffloadService.instance.refresh();
     notifyListeners();
   }
 

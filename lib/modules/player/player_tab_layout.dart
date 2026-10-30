@@ -18,6 +18,13 @@
 /// tab 结构的语义描述：[hasCover] / [hasComments] / [hasControls] 为 false 时对应 tab 不存在。
 typedef PlayerTabLayout = ({bool hasCover, bool hasComments, bool hasControls});
 
+/// 播放页页签结构跟随播放器实际可用宽度；嵌入/车机模式也可能处于宽分栏。
+bool isWidePlayerTabLayout({
+  required bool dockMode,
+  required bool deviceIsPad,
+  required double width,
+}) => width >= 600 || (!dockMode && deviceIsPad);
+
 /// 页签的身份。结构变化（转屏 / 切歌 / 开关控制页）时按**身份**而不是按裸下标
 /// 决定落到哪一页，见 [PlayerTabLayoutX.indexAfterChangeFrom]。
 enum PlayerTabKind { playlist, cover, controls, lyrics, comments }

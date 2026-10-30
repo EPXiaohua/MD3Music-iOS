@@ -10,6 +10,8 @@
 library;
 
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
@@ -370,8 +372,7 @@ void main() {
 
     testWidgets('逐字歌词（KRC/字级 LRC，含本地/云盘 LRC 逐字）播放中保持 Ticker', (tester) async {
       // 本用例验证"eco 关闭时"的 P0-A 行为：逐字动画需 Ticker 满帧推进。
-      // 省电模式现已默认开启（eco 开启时逐字动画改由 60fps Timer 推进、Ticker 停止），
-      // 因此这里显式关闭，保持断言 Ticker 仍在运行的原始意图。
+      // 省电模式默认关闭；这里显式关闭，保持断言 Ticker 仍在运行的原始意图。
       SharedPreferences.setMockInitialValues({});
       await LyricPreferences.instance.setEcoMode(false);
       addTearDown(() => LyricPreferences.instance.reset());
@@ -940,6 +941,172 @@ void main() {
 
       expect(state.auxSubHeightForTest(0), greaterThan(singleRow),
           reason: '罗马音模式：过长 roma 必须按换行行数重新预留');
+    });
+  });
+
+  group('AppleLyricsView sweep（扫光）字内渐变', () {
+    testWidgets('sweep 模式下 sweepFrontDebug 非负且随进度推进', (tester) async {
+      // 偏好置 sweep（现为默认，classic 分支断言见其它用例，互不影响）
+      SharedPreferences.setMockInitialValues({'lyric_fill_mode': 'sweep'});
+      await LyricPreferences.instance.setFillMode(LyricFillMode.sweep);
+      addTearDown(() => LyricPreferences.instance.reset());
+      expect(LyricPreferences.instance.fillMode, LyricFillMode.sweep);
+
+      tester.view.physicalSize = const Size(400, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final lines = <LyricLine>[
+        LyricLine(
+          startTime: 0,
+          duration: 4000,
+          text: '扫光测试',
+          words: const [
+            LyricWord(startTime: 0, duration: 1000, text: '扫'),
+            LyricWord(startTime: 1000, duration: 1000, text: '光'),
+            LyricWord(startTime: 2000, duration: 1000, text: '测'),
+            LyricWord(startTime: 3000, duration: 1000, text: '试'),
+          ],
+        ),
+        // 第二行只为让 `hasTimestamps`（any startTime > 0）成立——
+        // 全行 startTime=0 时 AppleLyricsView 视作纯文本、不启用 WordRenderer。
+        const LyricLine(startTime: 4000, duration: 2000, text: '第二行'),
+      ];
+
+      Widget build(int timeMs) => MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 400,
+                height: 600,
+                child: AppleLyricsView(
+                  lines: lines,
+                  currentTimeMs: timeMs,
+                  isPlaying: true,
+                ),
+              ),
+            ),
+          );
+
+      await tester.pumpWidget(build(500));
+      // 多泵几帧：Ticker 首帧 dt=0 不推进，且渲染器在 _onTick 的渲染循环里创建
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+      final double early = state.sweepFrontForTest(0) as double;
+      expect(early.isNaN, isFalse, reason: '当前行应已绘制并记录 sweep 前端');
+      expect(early, greaterThanOrEqualTo(0));
+
+      // 推进到第 3 个字（权威时间跳变 > 500ms 会吸附，相位随之前进）
+      await tester.pumpWidget(build(2500));
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+
+      final double later = state.sweepFrontForTest(0) as double;
+      expect(later, greaterThanOrEqualTo(0));
+      expect(later, greaterThan(early), reason: '扫光前端应随播放进度向右推进');
+    });
+  });
+
+  group('AppleLyricsView 鼠标滚轮滚动（Windows 桌面）', () {
+    // 滚轮事件不走拖拽手势竞技场，需模拟鼠标设备派发 PointerScrollEvent
+    Future<void> sendWheel(WidgetTester tester, double dy) async {
+      final pointer = TestPointer(1, PointerDeviceKind.mouse)
+        ..hover(tester.getCenter(find.byType(AppleLyricsView)));
+      // sendEventToBinding 是 guarded API，必须 await
+      await tester.sendEventToBinding(pointer.scroll(Offset(0, dy)));
+    }
+
+    testWidgets('滚轮向下：posY 减小（看后面的行），5s 后自动回弹', (tester) async {
+      tester.view.physicalSize = const Size(400, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final lines = <LyricLine>[
+        for (int i = 0; i < 10; i++)
+          LyricLine(startTime: i * 2000, duration: 2000, text: '第 $i 行'),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AppleLyricsView(lines: lines, currentTimeMs: 500),
+          ),
+        ),
+      );
+      // 泵若干帧让首次定位瞬移完成（弹簧就位）
+      for (int i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+      final controller = state.scrollControllerForTest as dynamic;
+      final double posBefore = controller.posY as double;
+
+      // 滚轮向下 100（scrollDelta.dy=100）→ posY 减小
+      await sendWheel(tester, 100);
+      expect(controller.isWaitingForAutoReturn, isTrue,
+          reason: '滚轮后应进入 5s 自动回弹倒计时');
+      // 推进 500ms：弹簧向目标滚过去（500ms 内不能已回弹）
+      for (int i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect((controller.posY as double), lessThan(posBefore),
+          reason: '滚轮向下应看到更靠后的行（posY 变小）');
+
+      // 推过 5s 倒计时 + 回弹弹簧收敛：posY 回到滚轮前位置
+      for (int i = 0; i < 60; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect((controller.posY as double), closeTo(posBefore, 2),
+          reason: '5s 无操作后应自动回弹到当前行');
+    });
+
+    testWidgets('按住 Shift 滚轮：歌词不滚（让位给外层 PageView 横向切页）',
+        (tester) async {
+      tester.view.physicalSize = const Size(400, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final lines = <LyricLine>[
+        for (int i = 0; i < 10; i++)
+          LyricLine(startTime: i * 2000, duration: 2000, text: '第 $i 行'),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: AppleLyricsView(lines: lines, currentTimeMs: 500),
+          ),
+        ),
+      );
+      for (int i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+      final controller = state.scrollControllerForTest as dynamic;
+      final double posBefore = controller.posY as double;
+
+      // 按住左 Shift 派发滚轮：歌词视图必须忽略（不进入回弹倒计时）
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await sendWheel(tester, 100);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      expect(controller.isWaitingForAutoReturn, isFalse,
+          reason: 'Shift+滚轮应让位给外层横向切页，歌词不进入滚动状态');
+      for (int i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect((controller.posY as double), closeTo(posBefore, 2),
+          reason: 'Shift+滚轮后歌词位置不应变化');
+
+      // 松开 Shift 后普通滚轮恢复正常
+      await sendWheel(tester, 100);
+      expect(controller.isWaitingForAutoReturn, isTrue,
+          reason: '松开 Shift 后滚轮应恢复歌词滚动');
     });
   });
 }

@@ -16,6 +16,14 @@ class Playlist {
   /// 收藏别人歌单时，listCreateListid 是原作者的 listid（无权拉取），
   /// 而本字段是用户自己订阅后分配的 listid（可正常拉取歌曲）。
   final String? subscribedListId;
+  /// 歌单总版本号（`/user/playlist` 的 `total_ver`）：写接口的乐观锁，缺省 0。
+  final int totalVer;
+  /// 是否隐私歌单（`/user/playlist` 的 `is_pri`）。
+  /// 编辑保存时随 v4 modify_list 回传，避免擅自把隐私歌单改成公开。
+  final bool isPri;
+  /// 歌单在「我的歌单」列表里的排序位（`/user/playlist` 的 `sort`）。
+  /// 编辑保存时原样回传，避免 sort=0 把歌单挪到列表顶部。
+  final int sort;
 
   const Playlist({
     required this.id,
@@ -30,6 +38,9 @@ class Playlist {
     this.listCreateListid,
     this.listCreateGid,
     this.subscribedListId,
+    this.totalVer = 0,
+    this.isPri = false,
+    this.sort = 0,
   });
 
   factory Playlist.fromJson(Map<String, dynamic> json) {
@@ -60,6 +71,9 @@ class Playlist {
       'isLocal': isLocal,
       'listCreateGid': listCreateGid,
       'subscribedListId': subscribedListId,
+      'totalVer': totalVer,
+      'isPri': isPri,
+      'sort': sort,
     };
   }
 
@@ -76,6 +90,9 @@ class Playlist {
     String? listCreateListid,
     String? listCreateGid,
     String? subscribedListId,
+    int? totalVer,
+    bool? isPri,
+    int? sort,
   }) {
     return Playlist(
       id: id ?? this.id,
@@ -90,6 +107,9 @@ class Playlist {
       listCreateListid: listCreateListid ?? this.listCreateListid,
       listCreateGid: listCreateGid ?? this.listCreateGid,
       subscribedListId: subscribedListId ?? this.subscribedListId,
+      totalVer: totalVer ?? this.totalVer,
+      isPri: isPri ?? this.isPri,
+      sort: sort ?? this.sort,
     );
   }
 

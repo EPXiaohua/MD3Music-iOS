@@ -1,15 +1,18 @@
+import 'dart:async';
+
 import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../../providers/tab_config_provider.dart';
 import '../build_flags.dart';
+import '../platform_capabilities.dart';
 import '../remote/tv_edge_nested_handoff.dart';
 import '../remote/tv_focus_debug.dart';
+import '../remote/tv_top_chrome_scope.dart';
 import 'adaptive_navigator.dart';
 import 'page_layout.dart';
 import 'tv_fab_focus_bridge.dart';
 import 'tv_nav_focus_bridge.dart';
-import 'tv_player_bar_focus_bridge.dart';
 
 /// 手机与平板共用的懒建 Tab 栈。播放页始终通过根 Navigator 覆盖整个壳层。
 class ResponsiveShell extends StatefulWidget {
@@ -117,6 +120,49 @@ class ResponsiveShellState extends State<ResponsiveShell> {
   /// tv: 焦点校正去抖标记（短时间内的多次校正请求合并成一次）。
   bool _focusHandoffDebounce = false;
 
+  /// 桌面端各双栏 tab 的详情「前进」历史（按 tabId 保存）。
+  ///
+  /// **只有 Windows 键鼠场景才建条目**（判据 [DesktopInputLayer.supported]）：
+  /// 「前进」的消费方仅鼠标侧键与 Alt+→，Android / TV 没有任何入口，建了等于
+  /// 白白多留一份已 pop 页面的 builder 闭包。map 里有条目即视为启用 ——
+  /// [_buildTab] 据此决定挂不挂 `ForwardHistoryObserver`，不再重复判平台。
+  final Map<String, ForwardHistory> _forwardHistories = {};
+
+  /// 取（必要时创建）该双栏 tab 的前进历史；非 Windows 桌面返回 null = 不启用。
+  ForwardHistory? _forwardHistoryFor(String tabId) {
+    // 判据与键位层同源（`DesktopInputLayer` 用 isWindowsDesktop）：「前进」的
+    // 消费方只有鼠标侧键和 Alt+→，Android / TV 没有任何入口，建条目只是白白
+    // 多留一份已 pop 页面的 builder 闭包。
+    if (!isWindowsDesktop) return null;
+    return _forwardHistories.putIfAbsent(tabId, ForwardHistory.new);
+  }
+
+  /// 侧键「前进」/ Alt+→：重建当前双栏 tab 最近一次「后退」掉的详情页。
+  ///
+  /// 与 [DesktopShellState.goForward] 同语义（重放期间抑制观察者清栈）。
+  /// 返回 true = 有前进历史并已 push。
+  bool goForward() {
+    if (widget.visibleTabs.isEmpty) return false;
+    final index =
+        widget.selectedIndex.clamp(0, widget.visibleTabs.length - 1);
+    final tabId = widget.visibleTabs[index].id;
+    final hist = _forwardHistories[tabId];
+    final detail = _detailKeys[tabId]?.currentState;
+    if (hist == null || detail == null) return false;
+    final builder = hist.takeNext();
+    if (builder == null) return false;
+    hist.replaying = true;
+    detail.push(
+      MaterialPageRoute(
+        builder: builder,
+        settings: RouteSettings(arguments: ForwardTag(builder)),
+      ),
+    );
+    // didPush 在 push 调用栈内同步触发；帧末复位 replaying 兜底多级前进。
+    WidgetsBinding.instance.addPostFrameCallback((_) => hist.replaying = false);
+    return true;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -140,6 +186,10 @@ class ResponsiveShellState extends State<ResponsiveShell> {
       controller.dispose();
     }
     _tabHeroControllers.clear();
+    for (final history in _forwardHistories.values) {
+      history.dispose();
+    }
+    _forwardHistories.clear();
     super.dispose();
   }
 
@@ -151,8 +201,34 @@ class ResponsiveShellState extends State<ResponsiveShell> {
     final focus = FocusManager.instance.primaryFocus;
     // 只处理"逃逸到本 tab 内空范围节点"这一确定信号。
     if (focus is! FocusScopeNode) return;
-    if (!_isInTab(focus, activeId) && !_isInDetailOf(focus, activeId)) return;
-    _ensureFocusNotStuck();
+    if (_isInTab(focus, activeId) || _isInDetailOf(focus, activeId)) {
+      _ensureFocusNotStuck();
+      return;
+    }
+    _restoreNavFocusFromRouteScope(focus, index);
+  }
+
+  /// tv: 路由级 FocusScope 抢走焦点时交还顶栏。
+  ///
+  /// 实测（SM-T870，2026-10-21）：切到异步加载的「本地音乐」后约 70ms，
+  /// 主页根路由（`_UpFadeMainRoute`）的 `_ModalScopeState` FocusScope 会成为
+  /// `primaryFocus`——该路由 `requestFocus` 已是 false，说明这条聚焦来自框架的
+  /// 回退而非路由的 requestFocus 路径（Flutter 会把焦点落到当前 route scope）。
+  /// 后果：焦点停在 scope 上没有任何红框，左右键从 scope 遍历会跑到顶栏第一层，
+  /// navbar 切换被打断。
+  ///
+  /// 判据收紧到「该 scope 是当前顶栏导航项的祖先」：主页/窗口 scope 满足，
+  /// 弹层、二级页、播放页的 route scope 不包含导航项，不会被误抢。
+  void _restoreNavFocusFromRouteScope(FocusScopeNode scope, int index) {
+    final FocusNode? target = TvNavFocusBridge.instance.nodeFor(index);
+    if (target == null || !target.canRequestFocus) return;
+    if (!target.ancestors.contains(scope)) return;
+    scheduleMicrotask(() {
+      if (!mounted || !target.canRequestFocus) return;
+      // 期间焦点已被别处拿走（用户按键 / 弹层主动落位）→ 不再纠正。
+      if (!identical(FocusManager.instance.primaryFocus, scope)) return;
+      target.requestFocus();
+    });
   }
 
   /// [node] 是否位于 [tabId] 的详情面板栈内。
@@ -181,6 +257,70 @@ class ResponsiveShellState extends State<ResponsiveShell> {
         oldWidget.visibleTabs != widget.visibleTabs) {
       _scheduleDepthReport();
     }
+    if (oldWidget.selectedIndex != widget.selectedIndex && kTvBuild) {
+      // 只在「切换前焦点确实在顶栏导航项上」时归还：页面内切 tab（LaunchPad
+      // 等）焦点本来就在内容里，不该被拉回顶栏。
+      final FocusNode? navFocus = FocusManager.instance.primaryFocus;
+      if (navFocus != null && TvNavFocusBridge.instance.isNavNode(navFocus)) {
+        _scheduleNavFocusRetention(navFocus);
+      }
+    }
+  }
+
+  /// tv: 首帧 / 切 tab 后把顶栏焦点交还一次。
+  ///
+  /// 每个 tab 的内容挂在**内层 Navigator** 上，而 Flutter 的 Navigator 自身
+  /// 固定带 `Focus(autofocus: true)`（`navigator.dart` 的 build）。tab 首次
+  /// 挂载时它的外层 route scope 还没有聚焦子节点，这条 autofocus 会立刻把焦点
+  /// 抢到 Navigator 标记节点（双栏 tab 的详情面板 Navigator 嵌在 tab 根路由
+  /// scope 内，同样会抢）—— 表现为冷启动首帧焦点不在顶栏、左右键切 navbar 到
+  /// 未访问 tab 时焦点离开顶栏、切换被打断。路由级 `requestFocus: false`
+  /// （见 `_buildTab`）挡不住这条 Navigator 内部的 autofocus，故显式归还。
+  ///
+  /// [target] 是顶栏导航项的焦点节点；帧末再跳一拍微任务，确保看到的是
+  /// Navigator autofocus 落位之后的最终焦点。归还前排除用户主动去的地方：
+  /// 别的导航项 / 顶栏 / 弹层对话框（不在当前 tab 内）。
+  void _scheduleNavFocusRetention(FocusNode target) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      scheduleMicrotask(() {
+        if (!mounted) return;
+        _applyNavFocusRetention(target);
+      });
+    });
+  }
+
+  /// 首帧版本：注册发生在导航栏的 ListView **布局阶段**（Sliver 子项懒建），
+  /// 首帧 build 时桥里还没有节点，故在帧末（布局完成）再按索引取节点。
+  void _scheduleNavFocusRetentionForIndex(int index) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      scheduleMicrotask(() {
+        if (!mounted) return;
+        final FocusNode? target = TvNavFocusBridge.instance.nodeFor(index);
+        if (target == null) return;
+        _applyNavFocusRetention(target);
+      });
+    });
+  }
+
+  void _applyNavFocusRetention(FocusNode target) {
+    if (!target.canRequestFocus) return;
+    final FocusNode? primary = FocusManager.instance.primaryFocus;
+    if (identical(primary, target)) return;
+    if (primary != null) {
+      // 用户已移到别的导航项或顶栏控件：尊重用户动作。
+      if (TvNavFocusBridge.instance.isNavNode(primary) ||
+          TvTopChromeScope.contains(primary)) {
+        return;
+      }
+      // 焦点在弹层 / 对话框等当前 tab 之外的区域：用户正与之交互，不抢。
+      if (widget.visibleTabs.isEmpty) return;
+      final index = widget.selectedIndex.clamp(
+        0,
+        widget.visibleTabs.length - 1,
+      );
+      if (!_isInActiveTab(primary, widget.visibleTabs[index].id)) return;
+    }
+    target.requestFocus();
   }
 
   void _onRouteDepthChanged(String tabId) {
@@ -239,6 +379,35 @@ class ResponsiveShellState extends State<ResponsiveShell> {
       _focusHandoffDebounce = false;
       if (mounted) _runFocusHandoffCheck();
     });
+  }
+
+  /// tv: 把焦点交还给当前 tab 的内容区——第二层 tab 栏的下边缘事件调用
+  /// （见 `tv_shell.dart`：从 navbar 按下方向键进入页面）。
+  ///
+  /// 优先回该 tab 上次聚焦的项（DpadRegion.lastFocused，restore 语义），
+  /// 退化到中央栈里第一个可聚焦项。**不设 kTvBuild 门控**：非 TV 构建下
+  /// `_tvTabRegionKeys` 为空，走退化分支同样成立，普通 flutter test 可覆盖。
+  bool focusActiveTabContent() {
+    if (widget.visibleTabs.isEmpty) return false;
+    final index = widget.selectedIndex.clamp(
+      0,
+      widget.visibleTabs.length - 1,
+    );
+    final activeId = widget.visibleTabs[index].id;
+    final remembered = _tvTabRegionKeys[activeId]?.currentState?.lastFocused;
+    if (remembered != null &&
+        remembered is! FocusScopeNode &&
+        remembered.canRequestFocus) {
+      remembered.requestFocus();
+      return true;
+    }
+    final candidates = _focusablesIn(
+      _navKeys[activeId]?.currentState?.focusNode,
+      limit: 8,
+    );
+    if (candidates.isEmpty) return false;
+    _tryFocusInOrder(candidates, 0);
+    return true;
   }
 
   /// 执行一次「焦点是否可用」检查，不可用则移交回当前 tab。
@@ -357,6 +526,9 @@ class ResponsiveShellState extends State<ResponsiveShell> {
   bool _isFocusUsable(FocusNode? node, String activeId) {
     if (node == null) return false;
     if (TvNavFocusBridge.instance.isNavNode(node)) return true;
+    // tv: 焦点在持久顶栏（第一层：头像/MiniPlayer/搜索）上同样合法——顶栏在
+    // tab scope 之外，不加这条会把用户从顶栏拽回内容区。
+    if (TvTopChromeScope.contains(node)) return true;
     final inTab = _isInActiveTab(node, activeId);
     if (node is FocusScopeNode) {
       // 弹层/对话框：子树内已有可聚焦落点就说明用户正与之交互，放行。
@@ -508,6 +680,11 @@ class ResponsiveShellState extends State<ResponsiveShell> {
     if (!isFirstBuild && newlyActivated) {
       _ensureFocusNotStuck();
     }
+    // tv: 冷启动首帧同样会把焦点交给内层 Navigator 的 autofocus（详见
+    // [_scheduleNavFocusRetention]）；首屏落点应回到顶栏当前 tab 项。
+    if (isFirstBuild && kTvBuild) {
+      _scheduleNavFocusRetentionForIndex(index);
+    }
     return IndexedStack(
       index: index,
       children: [
@@ -566,6 +743,48 @@ class ResponsiveShellState extends State<ResponsiveShell> {
     return result;
   }
 
+  /// tv: TV 构建下双栏 tab 的宽视口（≥ [kTwoPaneForcedMinWidth]）分支。
+  ///
+  /// 与非 TV 的 DesktopTwoPane 组装差异只有两处：
+  /// 1. 详情面板额外挂 [_TvFocusRecheckObserver]——详情面板的 Navigator 与
+  ///    中央栈平级，中央观察者看不见它的 push/pop；不单独挂一个就无法在
+  ///    「点进歌单详情 → 返回」后校正焦点（2026-10-04 实测症状）。该观察者
+  ///    只触发焦点校正，不参与 _depths 的二级判定（中央栈专用语义）。
+  ///    TV 无键鼠前进历史消费方，history 不挂。
+  /// 2. 外包一层主题底色——详情面板被 ContentWidth 按 twoPaneDetailMaxWidth
+  ///    居中限宽，master/detail 分隔带与详情两侧留白都不铺底色，桌面壳层有
+  ///    自家背板而 TV 顶栏壳层没有，露出的就是纯黑（真机截图的「黑边」，
+  ///    (detailWidth-720)/2 ≈ 82dp 两条竖带）。
+  /// 窄视口分支见 [_buildTab] 内的 LayoutBuilder（绕过双栏走中央栈整屏）。
+  Widget _buildTvTwoPane(
+    BuildContext context,
+    String id,
+    Widget page,
+    Widget? persistentBar,
+  ) {
+    final detailObservers = <NavigatorObserver>[
+      _tvFocusRecheckObservers.putIfAbsent(
+        id,
+        () => _TvFocusRecheckObserver(_ensureFocusNotStuck),
+      ),
+    ];
+    return ColoredBox(
+      color: Theme.of(context).colorScheme.surface,
+      child: DesktopTwoPane(
+        responsive: true,
+        detailKey: _detailKeys.putIfAbsent(
+          id,
+          () => GlobalKey<NavigatorState>(),
+        ),
+        detailObservers: detailObservers,
+        masterFooter: persistentBar,
+        onDetailFullscreenChanged: (exclusive) =>
+            _onDetailExclusive(id, exclusive),
+        master: page,
+      ),
+    );
+  }
+
   Widget _buildTab(String id) {
     final navigator = Navigator(
       key: _navKeys.putIfAbsent(id, () => GlobalKey<NavigatorState>()),
@@ -580,28 +799,65 @@ class ResponsiveShellState extends State<ResponsiveShell> {
       ],
       onGenerateRoute: (settings) => MaterialPageRoute<void>(
         settings: settings,
+        // tv: tab 的**根路由**不得抢焦点。
+        //
+        // 每个 tab 的内容按 [_visited] 惰性建树：首次访问该 tab 时才 push 它
+        // 内层 Navigator 的根路由。Flutter 的 `Route.didPush` 在 `requestFocus`
+        // 为 true（默认）时 `enclosingScope.requestFocus()`，dpad 的
+        // `restoreFocus` 兜底随即把焦点落到该 scope 的首个候选 —— 也就是页面内
+        // 首个 `DpadFocusable`。真机表现：冷启动后焦点停在顶栏，左右键切到未访问
+        // 过的 tab 时焦点被首次加载的页面拽进内容区，必须按上键回顶栏才能继续切
+        // （2026-10-18 实测，test/core/layout/tv_tab_switch_focus_test.dart 复现）。
+        //
+        // 只对根路由关：tab 内**被 push 出来的二级页**（歌单详情等）仍要按默认
+        // 拿到初始焦点，进入页面时落点才正常。TV 进内容区的入口是顶栏按下方向键
+        // （[focusActiveTabContent]），不依赖根路由的这次抢焦点。
+        requestFocus: !(kTvBuild && settings.name == Navigator.defaultRouteName),
         builder: (_) {
           final page = widget.pageBuilder(id);
+          // tv: 双栏 Master-Detail 保留（聚焦即选中的 tab 语义照常生效）。
+          // 此前 TV 一度跳过它——但「黑边/内容加载出错」的真因是
+          // ime_collapse 的 build 期元素树污染（已修），双栏无罪。
+          // TV 的 persistentBarBuilder 不传（app.dart），masterFooter 自然为
+          // null，不会出现每 tab 一条 MiniPlayer 与顶栏重复。
           final persistentBar = widget.persistentBarBuilder?.call(id);
           if (kTwoPaneTabs.contains(id)) {
+            // tv: 窄视口（< [kTwoPaneForcedMinWidth]，低密度/高 dpr 电视可能
+            // 出现，如 1920/dpr2.5≈768）绕过双栏脚手架，与 A 类 tab 同构：
+            // 无 DetailPaneScope → AdaptiveNav.openDetail 自动落中央栈整屏
+            // 详情（手机同路径），焦点由 _TabRouteDepthObserver →
+            // _ensureFocusNotStuck 既有链路校正。同 TwoPanePage 的 TV 先例
+            // （kTvBuild 原样返回 child）。不包 ContentWidth（favorites 等
+            // 不在 kConstrainedTabs）。宽视口仍走下方双栏（≥812 由
+            // DesktopTwoPane 的 forceTwoPane 恒双栏，不存在"单栏
+            // DesktopTwoPane"中间态）。跨越阈值的 wm size/旋转会重建本 tab
+            // 子树（滚动位置丢失）——TV 分辨率运行时变化罕见，可接受。
+            if (kTvBuild) {
+              return LayoutBuilder(
+                builder: (context, constraints) =>
+                    constraints.maxWidth < kTwoPaneForcedMinWidth
+                    ? page
+                    : _buildTvTwoPane(
+                        context, id, page, persistentBar,
+                      ),
+              );
+            }
+            // 桌面端（Windows 键鼠）给详情面板挂上前进历史观察者：侧键「前进」
+            // 与 Alt+→ 要能重建刚「后退」掉的详情页（与 DesktopShell 同一条
+            // ForwardHistory 机制）。TV / Android 不挂——记录了没有消费方，
+            // 反而把已 pop 页面的 builder 闭包多留一段时间。
+            final history = _forwardHistoryFor(id);
+            final detailObservers = <NavigatorObserver>[
+              if (history != null) ForwardHistoryObserver(history: history),
+            ];
             return DesktopTwoPane(
               responsive: true,
               detailKey: _detailKeys.putIfAbsent(
                 id,
                 () => GlobalKey<NavigatorState>(),
               ),
-              // tv: 详情面板的 Navigator 与中央栈平级，中央观察者看不见它的
-              // push/pop；不单独挂一个就无法在「点进歌单详情 → 返回」后校正
-              // 焦点（2026-10-04 实测症状）。该观察者只负责触发焦点校正，
-              // 不参与 _depths 的二级判定（那是中央栈专用语义）。
-              detailObservers: kTvBuild
-                  ? [
-                      _tvFocusRecheckObservers.putIfAbsent(
-                        id,
-                        () => _TvFocusRecheckObserver(_ensureFocusNotStuck),
-                      ),
-                    ]
-                  : const <NavigatorObserver>[],
+              history: history,
+              detailObservers: detailObservers,
               masterFooter: persistentBar,
               onDetailFullscreenChanged: (exclusive) =>
                   _onDetailExclusive(id, exclusive),
@@ -685,23 +941,23 @@ class ResponsiveShellState extends State<ResponsiveShell> {
               focusNestedRegionBeyond(primary, direction)) {
             return;
           }
-          if (direction == TraversalDirection.left) {
-            // 左边缘 = 往导航栏方向。移交当前 tab 对应的导航项（记忆上次焦点位
-            // 由导航栏自己的 DpadRegion + memoryKey 负责）。
+          if (direction == TraversalDirection.up) {
+            // 上边缘 = 顶部第二层 tab 栏（导航栏已从左侧移到顶部）。短按焦点
+            // 上移一层；持续按住由连发层继续推动，经 tab 栏自己的上边缘落到
+            // 第一层 MiniPlayer（见 tv_shell.dart 的 onEdge 链路）。
             TvNavFocusBridge.instance.focusNavItem(tabIndex < 0 ? 0 : tabIndex);
             return;
           }
           if (direction == TraversalDirection.down) {
-            // 下边缘的两个落点，按优先级：
-            // 1. 当前页的右下角 FAB —— 它在 scope 内但几何不合格（水平不重叠
-            //    且底边更高），dpad 的候选判定直接把它排除，只能桥接
-            //    （见 [TvFabFocusBridge]）；
-            // 2. 底部常驻播放条 —— 在 tab Navigator scope 之外，同样够不着。
-            // 页内常驻条（PrimaryPagePersistentBar）在本 scope 内，dpad 会
-            // 自然落到它上面，不会走到这里。
+            // 下边缘只剩 FAB：MiniPlayer 已移到顶部第一层（tv_shell.dart），
+            // 不再从底部移交。页内常驻条（PrimaryPagePersistentBar）在本 scope
+            // 内，dpad 会自然落到它上面，不会走到这里。
             if (TvFabFocusBridge.instance.focusFab()) return;
-            TvPlayerBarFocusBridge.instance.focusPlayerBar();
+            return;
           }
+          // 左/右边缘不再移交导航栏（导航栏已移到顶部）。左键在可排序列表里
+          // 另有「拿起排序」语义（tv_reorder.dart），由行内 DpadFocusable 先行
+          // 消费，到不了这里。
         },
         child: tabStack,
       );

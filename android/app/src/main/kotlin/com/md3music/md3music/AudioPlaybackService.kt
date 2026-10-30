@@ -25,6 +25,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -93,6 +94,8 @@ class AudioPlaybackService : Service() {
         // 桌面小组件按钮动作（由 MusicWidgetProvider 转发）
         const val ACTION_WIDGET_PLAY_PAUSE = "com.md3music.md3music.ACTION_WIDGET_PLAY_PAUSE"
         const val ACTION_WIDGET_NEXT = "com.md3music.md3music.ACTION_WIDGET_NEXT"
+        // 概念版 4×1 小组件的播放模式键（由 ConceptWidgetProvider 转发）
+        const val ACTION_WIDGET_CYCLE_PLAY_MODE = "com.md3music.md3music.ACTION_WIDGET_CYCLE_PLAY_MODE"
         // 私人FM桌面小组件按钮动作（由 PersonalFmWidgetProvider 转发）
         const val ACTION_WIDGET_FM_PLAY_PAUSE = "com.md3music.md3music.ACTION_FM_WIDGET_PLAY_PAUSE"
         const val ACTION_WIDGET_FM_TOGGLE_FAVORITE = "com.md3music.md3music.ACTION_FM_WIDGET_TOGGLE_FAVORITE"
@@ -106,6 +109,14 @@ class AudioPlaybackService : Service() {
         // 线控耳机媒体键（由 MediaButtonReceiver 转发，唤醒播放）
         const val ACTION_MEDIA_BUTTON = "com.md3music.md3music.ACTION_MEDIA_BUTTON"
         const val EXTRA_MEDIA_COMMAND = "mediaCommand"
+        /** MD3Music fork v21：唤醒来源标记——"car"=车机绑定触发（放开媒体会话创建） */
+        const val EXTRA_WAKE_ORIGIN = "wakeOrigin"
+        // MD3Music fork v40：原子随身听列表项点播（MSS 的 playFromMediaId 钩子转发进来）
+        const val ACTION_VIVO_MIX_PLAY = "com.md3music.md3music.ACTION_VIVO_MIX_PLAY"
+        const val EXTRA_VIVO_MIX_MEDIA_ID = "vivoMixMediaId"
+        // MD3Music fork v45：原子随身听循环模式切换（MSS PLAY_MODE intent 转发进来）
+        const val ACTION_VIVO_MIX_PLAY_MODE = "com.md3music.md3music.ACTION_VIVO_MIX_PLAY_MODE"
+        const val EXTRA_VIVO_MIX_PLAY_MODE = "vivoMixPlayMode"
 
         private const val TAG = "AudioPlaybackService"
 
@@ -144,6 +155,72 @@ class AudioPlaybackService : Service() {
         /// 当前是否正在播放（供 LockScreenLyricReceiver 判断锁屏时是否拉起歌词界面）。
         @Volatile
         var isNowPlaying = false
+
+        /// MD3Music fork v40：解析 Dart 推来的原子随身听三棵列表快照——静态实现，
+        /// 前台主引擎通道（MainActivity）与 headless 引擎通道（本服务）共用一处。
+        /// 列表项 media id 口径 `<来源>:<songId>`（songId 为 Dart 侧 Song.id 稳定键；
+        /// 下标进 id 会随队列插删整体漂移，v39 口径已废弃）。
+        @JvmStatic
+        fun updateVivoMixLists(args: Any?) {
+            val map = args as? Map<*, *> ?: return
+            fun parse(key: String, source: String): List<VivoMixLibrary.Item> {
+                val raw = map[key] as? List<*> ?: return emptyList()
+                val out = ArrayList<VivoMixLibrary.Item>(raw.size)
+                raw.forEachIndexed { index, element ->
+                    val m = element as? Map<*, *> ?: return@forEachIndexed
+                    val title = m["title"]?.toString().orEmpty()
+                    val artist = m["artist"]?.toString().orEmpty()
+                    val album = m["album"]?.toString()
+                    val artwork = m["artworkUri"]?.toString()
+                    val duration = (m["durationMs"] as? Number)?.toLong() ?: 0L
+                    val songId = m["id"]?.toString().orEmpty().ifEmpty { "$title|$artist" }
+                    out.add(
+                        VivoMixLibrary.Item(
+                            source = source,
+                            songId = songId,
+                            title = title,
+                            artist = artist,
+                            album = album,
+                            artworkUri = artwork,
+                            durationMs = duration,
+                        )
+                    )
+                }
+                return out
+            }
+            val current = parse("current", VivoMixLibrary.SOURCE_CURRENT)
+            val favorites = parse("favorites", VivoMixLibrary.SOURCE_FAVORITE)
+            val local = parse("local", VivoMixLibrary.SOURCE_LOCAL)
+            VivoMixLibrary.replace(current, favorites, local)
+        }
+
+        /// MD3Music fork v50：解析 Dart 推来的岛状态回显（循环模式 1/2/3 + 当前曲
+        /// 红心），转交 AudioPlayer 写入会话 metadata 并重发。isFav 缺省 = 未知
+        /// （尚无当前曲），原生侧跳过 RATING 不覆盖。
+        @JvmStatic
+        fun updateVivoMixState(args: Any?) {
+            val map = args as? Map<*, *> ?: return
+            val loopMode = (map["loopMode"] as? Number)?.toInt() ?: 0
+            val isFav = map["isFav"] as? Boolean
+            com.ryanheise.just_audio.AudioPlayer.updateVivoIslandState(loopMode, isFav)
+        }
+
+        /// MD3Music fork v63：点歌后强制岛列表重拉一次（高亮立即跟随）。不推数据，
+        /// 只复用 childrenChangedNotifier 的三棵树通知；notifier 内部投主线程。
+        @JvmStatic
+        fun refreshVivoMixChildren() {
+            val notify = VivoMixLibrary.childrenChangedNotifier ?: return
+            for (parent in listOf(
+                VivoMixLibrary.PARENT_CURRENT,
+                VivoMixLibrary.PARENT_FAVORITE,
+                VivoMixLibrary.PARENT_LOCAL
+            )) {
+                try {
+                    notify(parent)
+                } catch (_: Exception) {
+                }
+            }
+        }
         /// MD3Music fork（方案A·封面兜底）：前台服务启动被拒（mAllowStartForeground=false，
         /// 如后台切歌/跨fade 收敛瞬间）时由 MainActivity 直接调用注入封面，
         /// 不依赖 AudioPlaybackService 启动。处理 http(s) 在线封面，命中内存缓存免下载。
@@ -427,6 +504,20 @@ class AudioPlaybackService : Service() {
             return staticFlutterEngine != null
         }
 
+        /// 把 UI 侧（锁屏歌词卡片等）的播放控制转发给服务自身。
+        ///
+        /// 复用 onStartCommand 的既有白名单分支与 action→Flutter 映射，
+        /// 不新增 ACTION 常量、不改服务状态机；startService 被系统限制时静默降级
+        /// （此时 UI 已不可见，无需额外兜底）。
+        @JvmStatic
+        fun dispatchUiAction(context: Context, action: String) {
+            try {
+                context.startService(
+                    Intent(context, AudioPlaybackService::class.java).apply { this.action = action }
+                )
+            } catch (_: Exception) {}
+        }
+
         fun acquireWakeLock(context: Context) {
             if (wakeLock == null || !wakeLock!!.isHeld) {
                 val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -491,6 +582,61 @@ class AudioPlaybackService : Service() {
         // 缓存最近一次 isPlaying，供 setPosition 组装 Auto PlaybackState
         @Volatile
         private var lyriconIsPlaying = false
+
+        // ===== 词幕推送可靠性（修复「首次播放推不出歌词」）=====
+        // 是否已与词幕中心服务建立连接（onConnected/onReconnected 置位，断开/超时清位）。
+        // 未连接时 player.setSong 送不到中心服务，必须缓存待补推。
+        @Volatile
+        private var lyriconConnected = false
+
+        // 「当前曲」参数（不管有没有送达都留一份）。起播时用它重新发布一次，
+        // 相当于模块式词幕插件「随时可被拉取的当前状态」。
+        @Volatile
+        private var lyriconCurrentSong: Map<String, Any?>? = null
+
+        @Volatile
+        private var lyriconCurrentStartPositionMs = 0L
+
+        // 「本次没送达」的歌曲参数，等连接就绪后补推。
+        @Volatile
+        private var lyriconPendingSong: Map<String, Any?>? = null
+
+        @Volatile
+        private var lyriconPendingStartPositionMs = 0L
+
+        // 上一刻是否在播放，用于识别「起播边沿」
+        @Volatile
+        private var lyriconPlaybackStarted = false
+
+        // 重发时用的一次性 id 序号，用于绕开词幕桥接的「按歌曲 id 去重」
+        @Volatile
+        private var lyriconVariantSeq = 0
+
+        // 重发守卫：同一首歌在该窗口内只重发一次。
+        // 起播瞬间有多个入口会触发重发（播放状态边沿 + Dart 的命令），窗口取值
+        // 覆盖 Dart 侧「未送达 → 1.2s × 3 次」的重试跨度，避免反复重发。
+        private const val LYRICON_REPUBLISH_GUARD_MS = 4000L
+
+        @Volatile
+        private var lyriconLastRepublishId: String? = null
+
+        @Volatile
+        private var lyriconLastRepublishAtMs = 0L
+
+        /** 生成一次性 id 后缀（进程内递增，保证不重复）。 */
+        private fun nextLyriconVariantSuffix(): String {
+            lyriconVariantSeq = (lyriconVariantSeq + 1) % 1000000
+            return "#rp$lyriconVariantSeq"
+        }
+
+        /** 把耗时/SDK 调用切到主线程执行（ConnectionListener 回调可能来自后台线程）。 */
+        private fun runLyriconOnMain(block: () -> Unit) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                block()
+            } else {
+                lyriconRetryHandler.post(block)
+            }
+        }
 
         fun setLyriconChannel(channel: MethodChannel?) {
             lyriconChannel = channel
@@ -563,7 +709,7 @@ class AudioPlaybackService : Service() {
         fun getLyriconProvider(): LyriconProvider? = lyriconProvider
 
         /** 由 MainActivity 的 lyricon channel handler 调用，把 Dart 端 Map 转成 SDK 的 Song */
-        fun buildLyriconSong(arg: Map<String, Any?>): Song {
+        fun buildLyriconSong(arg: Map<String, Any?>, idSuffix: String? = null): Song {
             @Suppress("UNCHECKED_CAST")
             val lyricsRaw = arg["lyrics"] as? List<Map<String, Any?>> ?: emptyList()
             val lyrics = lyricsRaw.map { line ->
@@ -585,7 +731,10 @@ class AudioPlaybackService : Service() {
                 )
             }
             val song = Song(
-                id = arg["id"] as? String ?: "",
+                // idSuffix 非空时给 id 加一次性后缀：词幕桥接按歌曲 id 去重，
+                // 换 id 能让「同一首歌的重发」被当成新曲接收，因此不必先 setSong(null)
+                // 清空状态栏（清空会让状态栏短暂回到默认内容，表现为闪烁）。
+                id = (arg["id"] as? String ?: "") + (idSuffix ?: ""),
                 name = arg["name"] as? String ?: "",
                 artist = arg["artist"] as? String ?: "",
                 duration = (arg["duration"] as? Number)?.toLong() ?: 0L,
@@ -625,6 +774,64 @@ class AudioPlaybackService : Service() {
         }
 
         /**
+         * 起播边沿：把「当前曲」重新发布给词幕。
+         *
+         * 为什么需要：冷启动会恢复上次的播放队列，App 随即把「当前曲」推给词幕，
+         * 但那一刻歌曲还是暂停态、词幕侧也未必有播放会话 —— 这次 setSong 会被
+         * 词幕桥接忽略（真机实测：SDK 返回 true，桥接侧一条日志都没有）；而用户
+         * 随后点播的往往正是这首歌本身，Dart 侧按元数据签名去重不会再推 → 状态栏
+         * 始终没有歌词，只有切到下一首才恢复。
+         *
+         * 为什么换 id：桥接对「同一首歌（同 id）」是去重的，直接重发同 id 仍会被
+         * 静默丢弃。给重发的 Song 换一个一次性 id（`#rp<n>`）即可让桥接把它当作
+         * 新曲接收 —— 相比「先 setSong(null) 清空再设」，状态栏全程不动，不会闪。
+         */
+        private fun republishLyriconCurrentSong() {
+            val payload = lyriconCurrentSong ?: return
+            if (!lyriconConnected) return
+            val provider = getLyriconProvider() ?: return
+            val songId = payload["id"] as? String
+            if (songId != null) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (songId == lyriconLastRepublishId &&
+                    now - lyriconLastRepublishAtMs < LYRICON_REPUBLISH_GUARD_MS
+                ) {
+                    return
+                }
+                lyriconLastRepublishId = songId
+                lyriconLastRepublishAtMs = now
+            }
+            try {
+                provider.player.setSong(buildLyriconSong(payload, nextLyriconVariantSuffix()))
+                provider.player.setPlaybackState(
+                    buildLyriconPlaybackState(lyriconCurrentStartPositionMs, true)
+                )
+                android.util.Log.d("LyriconDebug", "republished lyricon song on playback start")
+            } catch (e: Exception) {
+                android.util.Log.w("LyriconDebug", "republish lyricon song failed: ${e.message}")
+            }
+        }
+
+        /** 连接就绪后，把此前没送出去的歌曲补推一次（幂等）。 */
+        private fun flushPendingLyriconSong() {
+            val payload = lyriconPendingSong ?: return
+            if (!lyriconConnected) return
+            val provider = getLyriconProvider() ?: return
+            val startPos = lyriconPendingStartPositionMs
+            // 先清缓存再推送：即使推送抛异常也不会反复重放
+            lyriconPendingSong = null
+            try {
+                provider.player.setSong(buildLyriconSong(payload))
+                provider.player.setPlaybackState(
+                    buildLyriconPlaybackState(startPos, lyriconIsPlaying)
+                )
+                android.util.Log.d("LyriconDebug", "pending lyricon song flushed after connect")
+            } catch (e: Exception) {
+                android.util.Log.w("LyriconDebug", "pending lyricon song flush failed: ${e.message}")
+            }
+        }
+
+        /**
          * 注册 Lyricon Provider MethodChannel（Dart ↔ 原生双向）。
          * 由 MainActivity（正常启动）与 setupHeadlessChannels（进程被杀唤醒）
          * 共用，避免 headless 场景下 Dart 的 setSong/setEnabled 等调用因缺少
@@ -649,6 +856,11 @@ class AudioPlaybackService : Service() {
                                 resetLyriconRetryState()
                                 provider?.register()
                             } else {
+                                // 禁用：连接状态与缓存一并作废，避免下次启用时沿用旧歌
+                                lyriconConnected = false
+                                lyriconCurrentSong = null
+                                lyriconPendingSong = null
+                                lyriconPlaybackStarted = false
                                 provider?.unregister()
                             }
                             result.success(true)
@@ -659,6 +871,9 @@ class AudioPlaybackService : Service() {
                     "setSong" -> {
                         val arg = call.argument<Map<String, Any?>>("song")
                         if (arg == null) {
+                            // 显式清空：连缓存一起丢弃，避免后续连接补推已失效的歌
+                            lyriconCurrentSong = null
+                            lyriconPendingSong = null
                             try {
                                 // SDK 的 setSong 不接受 null，传一个空 Song 表示清空
                                 provider?.player?.setSong(Song())
@@ -667,20 +882,54 @@ class AudioPlaybackService : Service() {
                                 result.success(false)
                             }
                         } else {
-                            try {
-                                val song = buildLyriconSong(arg)
-                                provider?.player?.setSong(song)
-                                // 切歌后立即喂一个 Auto PlaybackState 基点（新歌 position 0 + 当前播放态）。
-                                // 若只 setSong 不推 PlaybackState，中心服务无法确定播放进度与状态，
-                                // 歌词会不渲染、回退显示"作者-歌名"。
-                                val startPos = (arg["startPositionMs"] as? Number)
-                                    ?.toLong() ?: 0L
-                                provider?.player?.setPlaybackState(
-                                    buildLyriconPlaybackState(startPos, lyriconIsPlaying)
-                                )
-                                result.success(true)
-                            } catch (e: Exception) {
-                                result.error("BUILD_SONG_FAILED", e.message, null)
+                            val startPos = (arg["startPositionMs"] as? Number)
+                                ?.toLong() ?: 0L
+                            // 「上一首」的 id 必须在覆盖缓存之前取，否则下面判断
+                            // 「是否同一首歌重复推送」会读到刚写进去的本首 id，条件恒为真。
+                            val previousId = lyriconCurrentSong?.get("id") as? String
+                            // 无论是否送达都留一份「当前曲」，起播边沿用它重新发布
+                            lyriconCurrentSong = arg
+                            lyriconCurrentStartPositionMs = startPos
+                            if (provider == null) {
+                                // provider 尚未创建（冷启动首次播放的竞态窗口）。
+                                // 原实现在这里只是 `provider?.player?.setSong(...)` 静默 no-op，
+                                // 却照样回 success(true)：Dart 便以为已推成功而不再重推，
+                                // 首曲就这样丢掉了。这里缓存参数、如实回 false，等连接后补推。
+                                lyriconPendingSong = arg
+                                lyriconPendingStartPositionMs = startPos
+                                android.util.Log.w("LyriconDebug",
+                                    "setSong deferred: lyricon provider not ready")
+                                result.success(false)
+                            } else {
+                                try {
+                                    val incomingId = arg["id"] as? String
+                                    // 同一首歌重复推送（起播补推/重试/元数据回写）时，桥接
+                                    // 会按 id 去重丢弃；换一次性 id 绕过它（不清空 → 不闪）。
+                                    val repeated = incomingId != null && incomingId == previousId
+                                    val song = buildLyriconSong(
+                                        arg,
+                                        if (repeated) nextLyriconVariantSuffix() else null
+                                    )
+                                    // SDK 返回「是否真的发给了词幕」：连接尚未就绪时它只把
+                                    // 歌曲塞进内部缓存并静默返回 false，词幕侧什么都收不到。
+                                    // 如实回传，Dart 才能把这记成未确认。
+                                    val delivered = provider.player.setSong(song)
+                                    // 切歌后立即喂一个 Auto PlaybackState 基点（新歌 position 0 + 当前播放态）。
+                                    // 若只 setSong 不推 PlaybackState，中心服务无法确定播放进度与状态，
+                                    // 歌词会不渲染、回退显示"作者-歌名"。
+                                    provider.player.setPlaybackState(
+                                        buildLyriconPlaybackState(startPos, lyriconIsPlaying)
+                                    )
+                                    if (delivered) {
+                                        lyriconPendingSong = null
+                                    } else {
+                                        lyriconPendingSong = arg
+                                        lyriconPendingStartPositionMs = startPos
+                                    }
+                                    result.success(delivered)
+                                } catch (e: Exception) {
+                                    result.error("BUILD_SONG_FAILED", e.message, null)
+                                }
                             }
                         }
                     }
@@ -840,6 +1089,9 @@ class AudioPlaybackService : Service() {
 
     // 蓝牙歌词兼容状态。保留通道与设置，但共享 MediaSession 始终使用真实歌曲身份。
     private var bluetoothLyricEnabled = false
+
+    /** MD3Music fork v21：本次派发是否来自车机绑定唤醒（唤醒时放开媒体会话创建） */
+    private var wakeFromCarBind = false
     private var currentBtLyricText = ""
     @Volatile
     private var originalMediaId = ""
@@ -953,19 +1205,26 @@ class AudioPlaybackService : Service() {
                     service.addConnectionListener(object : ConnectionListener {
                         override fun onConnected(provider: LyriconProvider) {
                             resetLyriconRetryState()
+                            lyriconConnected = true
                             invokeLyriconChannelOnMain("onConnectionStateChanged", "connected")
+                            // 连接就绪：补推此前没送出去的歌曲（冷启动首次播放的竞态窗口）
+                            runLyriconOnMain { flushPendingLyriconSong() }
                         }
                         override fun onReconnected(provider: LyriconProvider) {
                             resetLyriconRetryState()
+                            lyriconConnected = true
                             invokeLyriconChannelOnMain("onConnectionStateChanged", "reconnected")
+                            runLyriconOnMain { flushPendingLyriconSong() }
                         }
                         override fun onDisconnected(provider: LyriconProvider) {
                             // 用户主动禁用（unregister）也会触发本回调，此时 lyriconEnabled 为 false，
                             // retryLyriconConnect 内部会直接返回；仅对「仍启用但断联」的场景重试。
+                            lyriconConnected = false
                             invokeLyriconChannelOnMain("onConnectionStateChanged", "disconnected")
                             retryLyriconConnect("disconnected")
                         }
                         override fun onConnectTimeout(provider: LyriconProvider) {
+                            lyriconConnected = false
                             invokeLyriconChannelOnMain("onConnectionStateChanged", "timeout")
                             retryLyriconConnect("timeout")
                         }
@@ -990,10 +1249,11 @@ class AudioPlaybackService : Service() {
         // 恢复蓝牙歌词开关：避免冷启动后开关丢失（Flutter 端也会再推一次，幂等）
         restoreBluetoothLyricState()
         // 方案B阶段1：绑定媒体3会话承载服务（实例化 host，供 fork 会话渲染 now playing 通知）。
-        // 用带 SERVICE_INTERFACE action 的 Intent 绑定，确保 onBind 返回非空 binder 使连接成功。
+        // v32/v33：绑定走专用内部 action（onBind 首分支代为解析标准 media3
+        // SERVICE_INTERFACE，binder 等价；不进连车唤醒判定）。
         try {
             val m3Intent = Intent(this, MD3MusicMediaSessionService::class.java)
-                .setAction("androidx.media3.session.MediaSessionService")
+                .setAction(MD3MusicMediaSessionService.ACTION_INTERNAL_MEDIA_HOST_BIND)
             bindService(m3Intent, media3ServiceConnection, Context.BIND_AUTO_CREATE)
             media3ServiceBound = true
         } catch (_: Exception) {}
@@ -1003,17 +1263,22 @@ class AudioPlaybackService : Service() {
         try {
             AudioPlayer.setCustomActionListener(object : AudioPlayer.CustomActionListener {
                 override fun onToggleDesktopLyric() { handleAction(ACTION_TOGGLE_DESKTOP_LYRIC) }
-                override fun onToggleFavorite() { handleAction(ACTION_TOGGLE_FAVORITE) }
-                // MediaNotificationService 的切歌命令需要带 commandId 确认；复用媒体键队列
-                // 派发，避免直接 invokeMethod 时因缺少 commandId 被 Dart 端拒绝。
+                override fun onToggleFavorite() {
+                    handleAction(ACTION_TOGGLE_FAVORITE)
+                }
+                // MD3Music fork v45：原子随身听循环模式切换（岛 PLAY_MODE 命令）。
+                override fun onPlayMode(mode: Int) {
+                    dispatchVivoMixPlayMode(mode)
+                }
                 override fun onPrevious() { handleMediaButtonCommand("previous") }
                 override fun onNext() { handleMediaButtonCommand("next") }
+                // MediaNotificationService 的切歌命令需要带 commandId 确认；复用媒体键队列
+                // 派发，避免直接 invokeMethod 时因缺少 commandId 被 Dart 端拒绝。
                 override fun onPause() {
                     Log.i(TAG, "Media3 user pause intent forwarded to Flutter")
                     handleAction(ACTION_PAUSE)
                 }
             })
-            Log.i(TAG, "Media3 command listener registered")
         } catch (_: Throwable) {}
     }
 
@@ -1072,6 +1337,11 @@ class AudioPlaybackService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 stopForeground(STOP_FOREGROUND_REMOVE)
+                // MD3Music fork v34：前台登记已撤销，必须复位标志——同实例后续
+                // 的 fg start（线控唤醒链）依赖 ensureForeground 重新登记，
+                // flag 残留 true 会把 v32 的 5s 死线防护短路失效（服务被
+                // stopForeground 后不再 startForeground，5 秒内必崩）。
+                foregroundStarted = false
                 releaseWakeLock()
                 isNowPlaying = false
                 // 停止播放/退出 App 后锁屏歌词不应残留
@@ -1082,17 +1352,34 @@ class AudioPlaybackService : Service() {
             ACTION_PREV, ACTION_PLAY_PAUSE, ACTION_PAUSE, ACTION_NEXT,
             ACTION_TOGGLE_DESKTOP_LYRIC, ACTION_TOGGLE_FAVORITE,
             ACTION_WIDGET_PLAY_PAUSE, ACTION_WIDGET_NEXT,
+            ACTION_WIDGET_CYCLE_PLAY_MODE,
             ACTION_WIDGET_FM_PLAY_PAUSE, ACTION_WIDGET_FM_TOGGLE_FAVORITE,
             ACTION_WIDGET_FM_SELECT_STATION, ACTION_WIDGET_FM_OPEN_TRACK,
             ACTION_WIDGET_FM_OPEN_PLAYER -> {
                 handleAction(intent)
                 return START_STICKY
             }
+            // MD3Music fork v40：原子随身听列表项点播——MSS 的 playFromMediaId 钩子
+            // 转发进来，从引擎通道送 'vivoMixPlay' 给 Dart（岛点歌 = 改选曲目，不是
+            // 线控重放，不能走 ACTION_MEDIA_BUTTON 链）。
+            ACTION_VIVO_MIX_PLAY -> {
+                dispatchVivoMixPlay(intent?.getStringExtra(EXTRA_VIVO_MIX_MEDIA_ID))
+                return START_NOT_STICKY
+            }
+            // MD3Music fork v45：原子随身听循环模式切换（MSS PLAY_MODE intent 转发）。
+            ACTION_VIVO_MIX_PLAY_MODE -> {
+                dispatchVivoMixPlayMode(
+                    intent?.getIntExtra(EXTRA_VIVO_MIX_PLAY_MODE, 1) ?: 1)
+                return START_NOT_STICKY
+            }
             ACTION_MEDIA_BUTTON -> {
                 // 线控耳机唤醒播放：先保证前台服务状态（startForegroundService 必须尽快
                 // 调用 startForeground，否则 Android 12+ 会抛 ForegroundServiceDidNotStartInTimeException）
                 ensureForeground()
                 val command = intent?.getStringExtra(EXTRA_MEDIA_COMMAND) ?: "play"
+                // MD3Music fork v21：记录唤醒来源——"car"=车机绑定触发，headless 引擎
+                // 里要放开媒体会话创建（否则恢复了播放车机卡片也是空的）。
+                wakeFromCarBind = intent?.getStringExtra(EXTRA_WAKE_ORIGIN) == "car"
                 handleMediaButtonCommand(command)
                 return START_STICKY
             }
@@ -1148,6 +1435,11 @@ class AudioPlaybackService : Service() {
             releaseWakeLock()
         }
 
+        // MD3Music fork v32：default 分支也履行 5s 死线——电量/权限驱动的
+        // startForegroundService 拉起后若 startForeground 被拒，ensureForeground
+        // 的 catch 会自停（规避 RemoteServiceException）；服务已在前台时它短路。
+        ensureForeground()
+
         showNotification(
             mediaId,
             title,
@@ -1200,6 +1492,11 @@ class AudioPlaybackService : Service() {
                 "generation=$incomingGeneration"
         )
         refreshMetadata()
+        // MD3Music fork（实锤修复）：startVivoAtomicTimer 此前无任何调用点——25s
+        // lrc_change 重发兜底从未生效（死代码）。原子随身听在首次发送之后才连上时
+        // 拿不到歌词，且熄屏/暂停（30s 心跳停跑）期间完全没有重发。歌词就绪时启动
+        // 定时器（每首歌随 lyricInfo 推送重置；无歌词时 pushVivoAtomicExtras 安全跳过）。
+        if (lastIsPlaying && currentLyricInfo.isNotEmpty()) startVivoAtomicTimer()
     }
 
     /** MediaSession / 广播接收器的既有入口：只有 action、无参数。 */
@@ -1218,6 +1515,7 @@ class AudioPlaybackService : Service() {
                 ACTION_NEXT, ACTION_WIDGET_NEXT -> "next"
                 ACTION_TOGGLE_DESKTOP_LYRIC -> "toggleDesktopLyric"
                 ACTION_TOGGLE_FAVORITE -> "toggleFavorite"
+                ACTION_WIDGET_CYCLE_PLAY_MODE -> "cyclePlayMode"
                 // 私人FM小部件动作（PersonalFmWidgetProvider 转发）
                 ACTION_WIDGET_FM_PLAY_PAUSE -> "widgetFmPlayPause"
                 ACTION_WIDGET_FM_TOGGLE_FAVORITE -> "widgetFmToggleFavorite"
@@ -1236,25 +1534,36 @@ class AudioPlaybackService : Service() {
             }
             MethodChannel(engine.dartExecutor.binaryMessenger, "com.md3music.md3music/floating_lyric")
                 .invokeMethod(method, args)
-        } else {
-            sendFlutterCommand(action)
         }
     }
 
-    private fun sendFlutterCommand(action: String) {
-        val method = when (action) {
-            ACTION_PREV -> "previous"
-            ACTION_PAUSE -> "pause"
-            ACTION_PLAY_PAUSE -> "togglePlayPause"
-            ACTION_NEXT -> "next"
-            ACTION_TOGGLE_DESKTOP_LYRIC -> "toggleDesktopLyric"
-            ACTION_TOGGLE_FAVORITE -> "toggleFavorite"
-            else -> return
+    /// MD3Music fork v40：原子随身听列表项点播——把岛点的 media id 送回 Dart，
+    /// 由 Dart 按 `<来源>:<songId>` 从对应列表里找 Song 再播（稳定寻址，不受
+    /// 队列位移影响）。action 与 playFromMediaId 钩子的链路见
+    /// MD3MusicMediaSessionService 的注释。
+    private fun dispatchVivoMixPlay(mediaId: String?) {
+        if (mediaId.isNullOrEmpty()) return
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null) {
+            return
         }
-        val intent = Intent("com.md3music.md3music.FLUTTER_COMMAND").apply {
-            putExtra("method", method)
+        MethodChannel(engine.dartExecutor.binaryMessenger, "com.md3music.md3music/floating_lyric")
+            .invokeMethod("vivoMixPlay", mapOf("mediaId" to mediaId))
+    }
+
+    /// MD3Music fork v45：原子随身听循环模式切换——转发 Dart
+    /// （mode 1=列表 / 2=单曲 / 3=随机；Dart 侧 setLoopMode/setShuffle）。
+    private fun dispatchVivoMixPlayMode(mode: Int) {
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null) {
+            return
         }
-        sendBroadcast(intent)
+        runOnMainThread {
+            MethodChannel(
+                engine.dartExecutor.binaryMessenger,
+                "com.md3music.md3music/floating_lyric",
+            ).invokeMethod("vivoMixPlayMode", mapOf("mode" to mode))
+        }
     }
 
     /// 解决方案B阶段5：前台服务保活通知。
@@ -1296,10 +1605,12 @@ class AudioPlaybackService : Service() {
     }
 
     /// 前台服务占位通知：唤醒场景下服务可能刚被 startForegroundService 拉起，
-    /// 需要尽快进入前台。真实内容随后由 Dart 端 updateNotification 覆盖。
+    /// 需要尽快进入前台。媒体3会话通知接管内容渲染（MD3MusicMediaSessionService
+    /// 的 provider 链），本占位只负责在 5s 死线内完成 startForeground 登记并
+    /// 在被系统拒绝时自停（startForegroundDetached 的 catch 崩溃防护依赖
+    /// foregroundStarted 只在成功后置位）。
     private fun ensureForeground() {
         if (foregroundStarted) return
-        foregroundStarted = true
         try {
             val builder = NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launcher_monochrome)
@@ -1362,6 +1673,15 @@ class AudioPlaybackService : Service() {
             try {
                 val engine = obtainFlutterEngine()
                 if (engine != null) {
+                    // MD3Music fork v28d：复用路径补会话口径——headless 时代若曾按
+                    // 「非车唤醒」把会话创建禁掉，之后车机 bind 复用旧引擎派发 play
+                    // 会因会话未启用而拿不到卡片；只在车机唤醒来源放开（只升不降，
+                    // 非 car 派发保持既有口径不动）。
+                    if (wakeFromCarBind) {
+                        try {
+                            com.ryanheise.just_audio.AudioPlayer.setMediaSessionEnabled(true)
+                        } catch (_: Throwable) {}
+                    }
                     dispatchToDartWithRetry(engine)
                 } else {
                     createHeadlessEngineAndDispatch()
@@ -1438,7 +1758,9 @@ class AudioPlaybackService : Service() {
     private fun createHeadlessEngineAndDispatch() {
         // MD3Music fork（方向1）：headless 引擎帧的播放器不创建媒体3会话，
         // 使系统仅暴露前台 UI 播放器的会话，杜绝「媒体卡片暂停 vs app 内播放」不同步。
-        try { AudioPlayer.setMediaSessionEnabled(false) } catch (_: Throwable) {}
+        // MD3Music fork v21（连车拉起）：车机绑定唤醒的派发例外——演示恢复态没有
+        // 会话车机卡片就是空的，此时放开会话创建（引擎复用机制保证无双引擎冲突）。
+        try { AudioPlayer.setMediaSessionEnabled(wakeFromCarBind) } catch (_: Throwable) {}
         val engineLatch = CountDownLatch(1)
         val creationRequest = CancellableMainThreadTask()
         val createdEngine = arrayOfNulls<FlutterEngine>(1)
@@ -1645,6 +1967,22 @@ class AudioPlaybackService : Service() {
                         )
                         result.success(true)
                     }
+                    "updateVivoMixLists" -> {
+                        // MD3Music fork v39：原子随身听三棵列表树的快照（Dart 推来）。
+                        updateVivoMixLists(call.arguments)
+                        result.success(true)
+                    }
+                    "updateVivoMixState" -> {
+                        // MD3Music fork v50：岛状态回显（循环模式 + 当前曲红心）→
+                        // metadata 重发（岛只在 metadata 变化时读这两个值）。
+                        updateVivoMixState(call.arguments)
+                        result.success(true)
+                    }
+                    "refreshVivoMixChildren" -> {
+                        // MD3Music fork v63：点歌后强制岛列表重拉（高亮立即跟随）。
+                        refreshVivoMixChildren()
+                        result.success(true)
+                    }
                     "updateLyricInfo" -> {
                         applyLyricInfoUpdate(
                             call.argument<String>("lyricInfo") ?: "",
@@ -1656,6 +1994,8 @@ class AudioPlaybackService : Service() {
                     }
                     "hideNotification" -> {
                         stopForeground(STOP_FOREGROUND_REMOVE)
+                        // MD3Music fork v34：同 ACTION_STOP，前台登记撤销后复位标志。
+                        foregroundStarted = false
                         releaseWakeLock()
                         isNowPlaying = false
                         LockScreenLyricActivity.dismiss()
@@ -1696,6 +2036,126 @@ class AudioPlaybackService : Service() {
                     }
                     "updateLockScreenAccent" -> {
                         LockScreenLyricActivity.applyAccentCall(call)
+                        result.success(true)
+                    }
+                    // 锁屏卡片收藏态增量同步：只翻红心，不重推歌词
+                    "updateLockScreenFavorite" -> {
+                        LockScreenLyricActivity.applyFavoriteCall(call)
+                        result.success(true)
+                    }
+                    // MD3Music fork（悬浮窗桌面歌词恢复链，2026-10-16）：
+                    // vivo 等机型会只杀 Dart 引擎、进程和原生悬浮窗（服务 + overlay）存活，
+                    // 此后桌面歌词的推送（updateLyric/updateProgress/setPlaying/
+                    // setDesktopLyricConfig）在 headless 引擎上落到 notImplemented 被静默
+                    // 丢弃——表现为「黑框还在、歌词没了」。这里补齐这些方法的处理：
+                    // 服务在跑时直接同进程调用（FloatingLyricService.instance 的直达入口，
+                    // 与 MainActivity 的 Intent 路径行为一致，且不受后台 startService
+                    // 限制）；窗口不在则安全空操作。
+                    "isFloatingLyricWindowRunning" -> {
+                        result.success(FloatingLyricService.isRunning && FloatingLyricService.viewAdded)
+                    }
+                    "hasOverlayPermission" -> {
+                        result.success(
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(this) else true
+                        )
+                    }
+                    "startFloatingLyric" -> {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                            // 无头引擎没有 Activity 可跳授权页，如实报错让 Dart 端提示；
+                            // 用户回到前台 App 内再开指尖正常流程。
+                            result.error("PERMISSION_DENIED", "需要悬浮窗权限", null)
+                        } else {
+                            if (FloatingLyricService.isRunning && FloatingLyricService.viewAdded) {
+                                result.success(true)
+                            } else {
+                                try {
+                                    startService(
+                                        Intent(this, FloatingLyricService::class.java).apply {
+                                            action = FloatingLyricService.ACTION_UPDATE_LYRIC
+                                            putExtra(FloatingLyricService.EXTRA_LYRIC, call.argument<String>("lyric") ?: "")
+                                            putExtra(FloatingLyricService.EXTRA_TITLE, call.argument<String>("title") ?: "")
+                                        }
+                                    )
+                                    result.success(true)
+                                } catch (e: Exception) {
+                                    result.error("SERVICE_START_FAILED", e.message, null)
+                                }
+                            }
+                        }
+                    }
+                    "stopFloatingLyric" -> {
+                        try {
+                            startService(
+                                Intent(this, FloatingLyricService::class.java).apply {
+                                    action = FloatingLyricService.ACTION_STOP
+                                }
+                            )
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SERVICE_START_FAILED", e.message, null)
+                        }
+                    }
+                    "updateLyric" -> {
+                        val svc = FloatingLyricService.instance
+                        if (svc == null) {
+                            result.success(true)
+                        } else {
+                            val wordsRaw = call.argument<List<Object>>("words")
+                            val wordsJson = if (wordsRaw != null) {
+                                try {
+                                    org.json.JSONArray(wordsRaw).toString()
+                                } catch (e: Exception) {
+                                    "[]"
+                                }
+                            } else {
+                                "[]"
+                            }
+                            svc.handleUpdateLyric(
+                                call.argument<String>("lyric") ?: "",
+                                call.argument<String>("nextLyric") ?: "",
+                                call.argument<String>("placeholder") ?: "",
+                                wordsJson,
+                                call.argument<Number>("positionMs")?.toLong() ?: 0L
+                            )
+                            result.success(true)
+                        }
+                    }
+                    "updateTitle" -> {
+                        // MainActivity 侧同样为空实现（FloatingLyricService 仅记录标题，窗口不再用）。
+                        result.success(true)
+                    }
+                    "updateProgress" -> {
+                        FloatingLyricService.instance?.handleUpdateProgress(
+                            call.argument<Number>("position")?.toLong() ?: 0L,
+                            call.argument<Number>("duration")?.toLong() ?: 0L
+                        )
+                        result.success(true)
+                    }
+                    "setPlaying" -> {
+                        FloatingLyricService.instance?.handleSetPlaying(
+                            call.argument<Boolean>("isPlaying") ?: false
+                        )
+                        result.success(true)
+                    }
+                    "setDesktopLyricConfig" -> {
+                        FloatingLyricService.instance?.handleSetConfig(
+                            call.argument<Double>(FloatingLyricService.EXTRA_FONT_SIZE)?.toFloat(),
+                            call.argument<Double>(FloatingLyricService.EXTRA_DISPLAY_SCALE)?.toFloat(),
+                            call.argument<Boolean>(FloatingLyricService.EXTRA_DOUBLE_LINE),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_OPACITY) as? Number)?.toInt(),
+                            call.argument<Boolean>(FloatingLyricService.EXTRA_LOCKED),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_GRADIENT_START) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_GRADIENT_END) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_UNPLAYED_COLOR) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_COLOR_MODE) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_PRESET_INDEX) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_CUSTOM_GRAD_START) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_CUSTOM_GRAD_END) as? Number)?.toInt(),
+                            (call.argument<Any?>(FloatingLyricService.EXTRA_CUSTOM_UNPLAYED) as? Number)?.toInt()
+                        )
+                        result.success(true)
+                    }
+                    "seekTo" -> {
                         result.success(true)
                     }
                     else -> result.notImplemented()
@@ -2054,13 +2514,18 @@ class AudioPlaybackService : Service() {
         originalArtist = artist
         lastArtUrl = artUrl
         lastIsPlaying = isPlaying
+        if (isPlaying && currentLyricInfo.isNotEmpty()) {
+            startVivoAtomicTimer()
+        } else {
+            stopVivoAtomicTimer()
+        }
         // 同步「正在播放」状态，供锁屏歌词广播（ACTION_SCREEN_OFF）判断
         isNowPlaying = isPlaying
         lastDesktopLyricEnabled = desktopLyricEnabled
         lastIsFavorited = isFavorited
         lastDuration = duration
-        // 通知会在下方所有分支中调用 startForeground，标记已进入前台
-        foregroundStarted = true
+        // startForeground 的登记在下方 startForegroundDetached 里完成（成功才置
+        // foregroundStarted），被系统拒绝时 catch 的自停防护保持可达（v32）。
         // 方案B阶段4：随通知更新把桌面歌词/收藏状态推到媒体3会话（渲染成通知栏按钮）。
         pushMedia3CustomActions(
             desktopLyricEnabled,
@@ -2101,6 +2566,18 @@ class AudioPlaybackService : Service() {
         // MainPanelItemViewHolder 会先 setCover(null) 并在 flip 动画中吞掉后续补帧，
         // 导致封面永远停在无封面。改为封面加载成功后再一次性 setMetadata(带 bitmap)，
         // 使 SystemUI 首次拿到 metadata 即带封面；仅封面失败/无源时才发无封面兜底。
+        // v62 再调整（岛高亮滞后真机实证）：上面 P0 让 title|artist 身份（岛高亮/
+        // 锁屏/控制中心切歌显示）滞后到封面网络加载完成（数秒）。现在切歌时**立即
+        // 先发一次 title|artist 的轻量 metadata**（不带 bitmap），封面加载完成后再
+        // 二次 updateActiveSessionMetadata 补全 bitmap——两发合并，仍满足 P0 的
+        // "首帧即封面"口径（第一发只到 title/artist，封面位空）。若 SystemUI 出现
+        // "控制中心封面闪空后不再补全"的老病，回滚本段即可。
+        if (!isMetadataRequestCurrent(requestMediaId, requestGeneration)) {
+            // 已是旧请求：连轻量首帧都不必发。
+        } else {
+            AudioPlayer.updateActiveSessionTitleArtist(
+                requestMediaId, requestGeneration, displayTitle, displayArtist)
+        }
         if (!effectiveArtUrl.isNullOrEmpty()) {
             Log.d(TAG, "触发后台封面加载 effectiveArtUrl=$effectiveArtUrl fallback=$fallbackFilePath")
             Thread {
@@ -2136,8 +2613,11 @@ class AudioPlaybackService : Service() {
                         MusicWidgetProvider.cachedArtwork = resizeBitmap(displayBitmap, 200)
                         // 2×2 封面小部件：全幅背景需要更高分辨率，单独缓存 400px
                         CoverPlayerWidgetProvider.cachedArtwork = resizeBitmap(displayBitmap, 400)
+                        // 概念版 4×1 小部件：圆形封面 32dp + 卡片渐变底取色，同样用 400px
+                        ConceptWidgetProvider.cachedArtwork = resizeBitmap(displayBitmap, 400)
                         MusicWidgetProvider.notifyArtworkChanged(this@AudioPlaybackService)
                         CoverPlayerWidgetProvider.notifyArtworkChanged(this@AudioPlaybackService)
+                        ConceptWidgetProvider.notifyArtworkChanged(this@AudioPlaybackService)
 
                         // 封面同步注入 just_audio 的媒体3 会话（该会话无封面，播放中会被 SystemUI
                         // 提为控制中心顶层）。用官方 replaceMediaItem 同 uri 替换当前 MediaItem，
@@ -2180,9 +2660,16 @@ class AudioPlaybackService : Service() {
         // 不能调 Boolean 重载 / setPosition / seekTo，否则会切回 Manually 并 seek 到
         // 旧位置（lastPosition=0），导致歌词每隔一次同步就闪回开头。
         try {
+            val wasPlaying = lyriconPlaybackStarted
+            lyriconPlaybackStarted = isPlaying
             lyriconProvider?.player?.setPlaybackState(
                 buildLyriconPlaybackState(position, isPlaying)
             )
+            // 起播边沿：把当前曲重新发布一次。
+            // 此前那次推送可能因「暂停态 / 连接未就绪」被词幕忽略，而 Dart 侧按元数据
+            // 签名去重不会再推 —— 这就是「首次播放没有歌词，切下一首才正常」的成因。
+            // 详见 republishLyriconCurrentSong() 的注释。
+            if (isPlaying && !wasPlaying) republishLyriconCurrentSong()
         } catch (_: Exception) {}
     }
 
@@ -2332,6 +2819,10 @@ class AudioPlaybackService : Service() {
         }, 25_000L)
     }
 
+    private fun stopVivoAtomicTimer() {
+        vivoAtomicHandler.removeCallbacksAndMessages(null)
+    }
+
     /// 原子随身听歌词：通过 legacy MediaSessionCompat 静态通道向活跃 session 重发
     /// lrc_change extras（framework extras，25s 定时兜底：覆盖"原子在首次发送后才连上"）。
     /// meidia_id 必须与 hook 补进 metadata 的身份完全一致（title|artist），
@@ -2393,6 +2884,11 @@ class AudioPlaybackService : Service() {
             lyriconProvider?.destroy()
         } catch (_: Exception) {}
         lyriconProvider = null
+        // 连接状态与缓存一并作废，避免 Service 重建后沿用旧歌
+        lyriconConnected = false
+        lyriconCurrentSong = null
+        lyriconPendingSong = null
+        lyriconPlaybackStarted = false
         // 取消排期中的词幕重连任务，防止服务销毁后回调仍触发
         setLyriconEnabledState(false)
         // P0: 取消排期中的 setMetadata 合并刷新，防止服务销毁后仍回调

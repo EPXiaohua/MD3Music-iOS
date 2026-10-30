@@ -82,6 +82,9 @@ pub type ModuleFn = fn(&Value, &Ctx) -> Result<ModuleResponse, ModuleResponse>;
 pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/login/wx/create", login::handle_wx_create));
     routes.push(("/login/wx/check", login::handle_wx_check));
+    // QQ 扫码登录：同样必须在 /login 之前注册（前缀匹配，/login 会吞掉子路径）。
+    routes.push(("/login/qq/qr/create", login::handle_qq_qr_create));
+    routes.push(("/login/qq/qr/check", login::handle_qq_qr_check));
     routes.push(("/login/qr/create", login::handle_qr_create));
     routes.push(("/login/qr/check", login::handle_qr_check));
     routes.push(("/login/qr/key", login::handle_qr_key));
@@ -104,7 +107,14 @@ pub fn register(routes: &mut Vec<(&'static str, ModuleFn)>) {
     routes.push(("/playlist/track/all", playlist::handle_track_all));
     routes.push(("/playlist/tracks/add", playlist::handle_tracks_add));
     routes.push(("/playlist/tracks/del", playlist::handle_tracks_del));
+    routes.push(("/playlist/tracks/sort", playlist::handle_tracks_sort));
     routes.push(("/playlist/tags", playlist::handle_tags));
+    routes.push(("/playlist/sort", playlist::handle_sort));
+    // 前缀匹配语义下 /playlist/pic/upload 必须先于 /playlist/pic 注册，
+    // 否则上传请求会被 /playlist/pic 抢先命中（同 /user/update/avatar 的处理）。
+    routes.push(("/playlist/pic/upload", playlist::handle_pic_upload));
+    routes.push(("/playlist/pic", playlist::handle_pic));
+    routes.push(("/playlist/update", playlist::handle_update));
     routes.push(("/playlist/similar", playlist::handle_similar));
     routes.push(("/playlist/effect", playlist::handle_effect));
     routes.push(("/playlist/detail", playlist::handle_detail));

@@ -1,11 +1,11 @@
+import 'dart:io' show Platform;
+
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../data/repositories/settings_repository.dart';
 import '../../modules/player/now_playing_bar.dart';
 import '../../modules/search/search_page.dart';
-import '../../providers/player_provider.dart';
 import '../../providers/tab_config_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../widgets/resizable_splitter.dart';
@@ -60,6 +60,7 @@ class DesktopShell extends StatefulWidget {
   @override
   State<DesktopShell> createState() => DesktopShellState();
 }
+
 class DesktopShellState extends State<DesktopShell> {
   static const double _kMinSidebar = 200.0;
   static const double _kMaxSidebar = 380.0;
@@ -78,6 +79,21 @@ class DesktopShellState extends State<DesktopShell> {
   /// 每个 Tab 的中央内容 Navigator（按 tabId 保存，跨 Tab 重排也稳定）。
   final Map<String, GlobalKey<NavigatorState>> _navKeys = {};
 
+  /// 每个 Tab 内容栈自己的框架 Hero 控制器（与 [_navKeys] 一一对应）。
+  ///
+  /// **为什么必须逐个 Tab 单独挂**（与 `responsive_shell.dart` 的 `_buildTab`
+  /// 同一理由）：MaterialApp 的 HeroController 只订阅根 Navigator，且 Navigator
+  /// 会用 `HeroControllerScope.none` 包住自己的路由子树，拦住下级 Navigator 再
+  /// 取用同一个控制器（Flutter `navigator.dart` 的 `_updateHeroController` 与
+  /// `_overlay`）。桌面外壳的 Tab 内容栈正是这种下级嵌套 Navigator —— 没有本
+  /// 控制器时，「搜索页点专辑 / 单栏几何下 push 详情」的框架 Hero 永远不飞
+  /// （Windows 桌面布局实测：手机壳层有动画、桌面壳层没有）。
+  ///
+  /// 双栏 Tab 的详情面板 Navigator 会被 Tab 栈这一层继续挡住、同样拿不到控制器：
+  /// 它本来就走 `PlaylistCoverFlightBus` 的自绘路径，互不干涉，也不会「一个封面
+  /// 飞两次」。控制器与 Navigator 同生命周期，在 [dispose] 里统一释放。
+  final Map<String, HeroController> _tabHeroControllers = {};
+
   /// 双栏 Tab 的右侧详情面板 Navigator（按 tabId 保存），供返回键驱动。
   final Map<String, GlobalKey<NavigatorState>> _detailKeys = {};
 
@@ -88,18 +104,55 @@ class DesktopShellState extends State<DesktopShell> {
   final Set<String> _visited = {};
 
   double _sidebarWidth = _kDefaultSidebar;
+  int _sidebarWidthLoadVersion = 0;
 
   @override
   void initState() {
     super.initState();
     _markVisited();
+    if (Platform.isWindows) {
+      SettingsRepository.windowsSettingsResetRevision.addListener(
+        _onWindowsSettingsReset,
+      );
+    }
     _loadSidebarWidth();
   }
 
-  Future<void> _loadSidebarWidth() async {
+  @override
+  void dispose() {
+    if (Platform.isWindows) {
+      SettingsRepository.windowsSettingsResetRevision.removeListener(
+        _onWindowsSettingsReset,
+      );
+    }
+    // 每个 Tab 内容栈的框架 Hero 控制器与本 State 同生命周期（见 [_tabHeroControllers]）。
+    for (final controller in _tabHeroControllers.values) {
+      controller.dispose();
+    }
+    _tabHeroControllers.clear();
+    for (final h in _forwardHistories.values) {
+      h.dispose();
+    }
+    super.dispose();
+  }
+
+  void _onWindowsSettingsReset() {
+    _loadSidebarWidth(resetToDefaultWhenMissing: true);
+  }
+
+  Future<void> _loadSidebarWidth({
+    bool resetToDefaultWhenMissing = false,
+  }) async {
+    final loadVersion = ++_sidebarWidthLoadVersion;
     final w = await _settings.getDesktopSidebarWidth();
-    if (!mounted || w == null) return;
-    setState(() => _sidebarWidth = w.clamp(_kMinSidebar, _kMaxSidebar));
+    if (!mounted || loadVersion != _sidebarWidthLoadVersion) return;
+    if (w == null && !resetToDefaultWhenMissing) return;
+    setState(
+      () => _sidebarWidth = (w ?? _kDefaultSidebar).clamp(
+        _kMinSidebar,
+        _kMaxSidebar,
+      ),
+    );
   }
 
   void _markVisited() {
@@ -144,14 +197,6 @@ class DesktopShellState extends State<DesktopShell> {
   ForwardHistory _forwardHistory(String tabId) =>
       _forwardHistories.putIfAbsent(tabId, () => ForwardHistory());
 
-  @override
-  void dispose() {
-    for (final h in _forwardHistories.values) {
-      h.dispose();
-    }
-    super.dispose();
-  }
-
   String? _currentTabId() {
     final idx = widget.selectedIndex;
     if (idx < 0 || idx >= widget.visibleTabs.length) return null;
@@ -186,14 +231,19 @@ class DesktopShellState extends State<DesktopShell> {
 
   /// 工具栏「前进」：把最近一次「后退」弹出的详情页原样重建（重放期间抑制
   /// 观察者清栈），使浏览器式前进/后退闭环。
-  void _goForward() {
+  ///
+  /// 公开给 `app.dart` 的 `_MainLayout` 注册进
+  /// [DesktopInputRouter.forwardHandler]（鼠标侧键「前进」/ Alt+→）。
+  ///
+  /// 返回 true = 前进历史里有待重建的详情页并已 push。
+  bool goForward() {
     final tabId = _currentTabId();
-    if (tabId == null || !_kTwoPaneTabs.contains(tabId)) return;
+    if (tabId == null || !_kTwoPaneTabs.contains(tabId)) return false;
     final hist = _forwardHistories[tabId];
     final detail = _detailKeys[tabId]?.currentState;
-    if (hist == null || detail == null) return;
+    if (hist == null || detail == null) return false;
     final builder = hist.takeNext();
-    if (builder == null) return;
+    if (builder == null) return false;
     hist.replaying = true;
     detail.push(
       MaterialPageRoute(
@@ -203,6 +253,7 @@ class DesktopShellState extends State<DesktopShell> {
     );
     // didPush 在 push 调用栈内同步触发；帧末复位 replaying 兜底多级前进。
     WidgetsBinding.instance.addPostFrameCallback((_) => hist.replaying = false);
+    return true;
   }
 
   NavigatorState? _activeNav() {
@@ -234,74 +285,48 @@ class DesktopShellState extends State<DesktopShell> {
     final wallpaperOn = context.watch<ThemeProvider>().useBackgroundImage;
     return Material(
       color: wallpaperOn ? Colors.transparent : cs.surface,
-      // 键鼠增强（计划 4.8，作为增强）：接外接键盘时的快捷键。文本框聚焦时
-      // 字符键由 EditableText 消费、不冒泡到此，故搜索框输入不受影响。
-      child: CallbackShortcuts(
-        bindings: {
-          const SingleActivator(LogicalKeyboardKey.escape): maybePop,
-          const SingleActivator(LogicalKeyboardKey.arrowLeft, alt: true):
-              maybePop,
-          const SingleActivator(LogicalKeyboardKey.space): () =>
-              _togglePlay(context),
-          const SingleActivator(LogicalKeyboardKey.mediaPlayPause): () =>
-              _togglePlay(context),
-          const SingleActivator(LogicalKeyboardKey.arrowRight, control: true):
-              () => _skip(context, next: true),
-          const SingleActivator(LogicalKeyboardKey.arrowLeft, control: true):
-              () => _skip(context, next: false),
-          const SingleActivator(LogicalKeyboardKey.mediaTrackNext): () =>
-              _skip(context, next: true),
-          const SingleActivator(LogicalKeyboardKey.mediaTrackPrevious): () =>
-              _skip(context, next: false),
-        },
-        child: SafeArea(
-          // 横屏左右安全区：侧栏 / 内容 / 底部播放栏避开异形屏/圆角屏的左右
-          // cutout。上下不占用，交给内部工具栏与页面自身处理。
-          top: false,
-          bottom: false,
-          child: Column(
-            children: [
-              if (widget.header != null) widget.header!,
-              Expanded(
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: _sidebarWidth,
-                      child: _DesktopSidebar(
-                        railDestinations: widget.railDestinations,
-                        selectedIndex: widget.selectedIndex,
-                        onDestinationSelected: widget.onDestinationSelected,
-                      ),
+      // 键鼠快捷键**不在此层**：收口到 `core/widgets/desktop_input_layer.dart`
+      // （挂在 MaterialApp 之外）。原先这里挂一层 CallbackShortcuts 时，本层比
+      // 框架的 `DefaultTextEditingShortcuts` 更靠近焦点，空格会被「播放/暂停」
+      // 抢先消费，桌面布局开着时搜索框里打不出空格；挂在最外层才能让文本框与
+      // 聚焦按钮先消费，两者都不接时才轮到播放控制。
+      child: SafeArea(
+        // 横屏左右安全区：侧栏 / 内容 / 底部播放栏避开异形屏/圆角屏的左右
+        // cutout。上下不占用，交给内部工具栏与页面自身处理。
+        top: false,
+        bottom: false,
+        child: Column(
+          children: [
+            if (widget.header != null) widget.header!,
+            Expanded(
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: _sidebarWidth,
+                    child: _DesktopSidebar(
+                      railDestinations: widget.railDestinations,
+                      selectedIndex: widget.selectedIndex,
+                      onDestinationSelected: widget.onDestinationSelected,
                     ),
-                    ResizableSplitter(
-                      onDelta: _onSidebarDelta,
-                      onDragEnd: _persistSidebarWidth,
-                    ),
-                    Expanded(child: _buildContentRegion(context)),
-                  ],
-                ),
+                  ),
+                  ResizableSplitter(
+                    onDelta: _onSidebarDelta,
+                    onDragEnd: _persistSidebarWidth,
+                    // 壁纸模式下分隔线也透明，避免侧栏与内容区之间出现色带。
+                    color: wallpaperOn ? Colors.transparent : null,
+                  ),
+                  // `_buildContentRegion` 自己返回 Expanded：这里不要再包一层，
+                  // 否则两个 ParentDataWidget 会同时写同一个 RenderObject，
+                  // debug 下直接报「Competing ParentDataWidgets」。
+                  _buildContentRegion(context),
+                ],
               ),
-              const NowPlayingBar(),
-            ],
-          ),
+            ),
+            const NowPlayingBar(),
+          ],
         ),
       ),
     );
-  }
-
-  /// 空格 / 媒体键：切换播放/暂停（无正在播放歌曲时忽略）。
-  void _togglePlay(BuildContext context) {
-    final p = context.read<PlayerProvider>();
-    if (p.currentSong == null) return;
-    // ignore: discarded_futures
-    p.isPlaying ? p.pause() : p.resume();
-  }
-
-  /// Ctrl+←/→ 或媒体上/下曲键：切歌。
-  void _skip(BuildContext context, {required bool next}) {
-    final p = context.read<PlayerProvider>();
-    // ignore: discarded_futures
-    next ? p.next() : p.previous();
   }
 
   Widget _buildContentRegion(BuildContext context) {
@@ -336,27 +361,36 @@ class DesktopShellState extends State<DesktopShell> {
   }
 
   Widget _buildTabNavigator(String tabId) {
-    return Navigator(
-      key: _navKey(tabId),
-      observers: [_ToolbarSyncObserver(_onNavChanged)],
-      onGenerateRoute: (settings) => MaterialPageRoute(
-        settings: settings,
-        builder: (_) => _kTwoPaneTabs.contains(tabId)
-            // B 类：主列表装进双栏，详情落右侧面板（计划 4.4 B）。详情面板栈
-            // 由外壳注入的 key 驱动返回键，ToolbarSync 观察者刷新可用态并记录
-            // 前进历史（供工具栏「前进」）。
-            ? DesktopTwoPane(
-                master: widget.pageBuilder(tabId),
-                detailKey: _detailKey(tabId),
-                history: _forwardHistory(tabId),
-                detailObservers: [
-                  _ToolbarSyncObserver(
-                    _onNavChanged,
-                    history: _forwardHistory(tabId),
-                  ),
-                ],
-              )
-            : widget.pageBuilder(tabId),
+    // 每个 Tab 内容栈自带框架 Hero 控制器（理由见 [_tabHeroControllers]）。
+    // 控制器只服务这一个 Navigator：一个 HeroController 不能被多个 Navigator
+    // 共用（`navigator.dart` 的 assert），故按 tabId 各建一个并长期复用。
+    return HeroControllerScope(
+      controller: _tabHeroControllers.putIfAbsent(
+        tabId,
+        () => MaterialApp.createMaterialHeroController(),
+      ),
+      child: Navigator(
+        key: _navKey(tabId),
+        observers: [ForwardHistoryObserver(onChanged: _onNavChanged)],
+        onGenerateRoute: (settings) => MaterialPageRoute(
+          settings: settings,
+          builder: (_) => _kTwoPaneTabs.contains(tabId)
+              // B 类：主列表装进双栏，详情落右侧面板（计划 4.4 B）。详情面板栈
+              // 由外壳注入的 key 驱动返回键，前进历史观察者刷新可用态并记录
+              // 前进历史（供侧键「前进」）。
+              ? DesktopTwoPane(
+                  master: widget.pageBuilder(tabId),
+                  detailKey: _detailKey(tabId),
+                  history: _forwardHistory(tabId),
+                  detailObservers: [
+                    ForwardHistoryObserver(
+                      onChanged: _onNavChanged,
+                      history: _forwardHistory(tabId),
+                    ),
+                  ],
+                )
+              : widget.pageBuilder(tabId),
+        ),
       ),
     );
   }
@@ -372,9 +406,7 @@ class DesktopShellState extends State<DesktopShell> {
     final q = query.trim();
     if (q.isEmpty) return;
     _activeNav()?.push(
-      MaterialPageRoute(
-        builder: (_) => SearchPage(initialQuery: q),
-      ),
+      MaterialPageRoute(builder: (_) => SearchPage(initialQuery: q)),
     );
   }
 }
@@ -395,11 +427,11 @@ class _DesktopSidebar extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
-    // 壁纸模式下半透明，让底层 AppBackground 壁纸透出（与外壳同一处理）。
+    // 壁纸模式下不叠加侧栏底色，避免壁纸在侧栏形成明显的色块边界。
     final wallpaperOn = context.watch<ThemeProvider>().useBackgroundImage;
     return Material(
       color: wallpaperOn
-          ? cs.surfaceContainerLow.withValues(alpha: 0.2)
+          ? Colors.transparent
           : cs.surfaceContainerLow,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -421,21 +453,27 @@ class _DesktopSidebar extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              itemCount: railDestinations.length,
-              itemBuilder: (context, i) {
-                final selected = i == selectedIndex;
-                final dest = railDestinations[i];
-                return _SidebarItem(
-                  icon: selected
-                      ? dest.selectedIcon
-                      : dest.icon,
-                  label: dest.label,
-                  selected: selected,
-                  onTap: () => onDestinationSelected(i),
-                );
-              },
+            // 导航项整组在侧栏内**垂直居中**：侧栏顶部是 App 名称、底部紧接
+            // 迷你播放器（NowPlayingBar 在外层整宽条），若列表贴顶，下方会留下
+            // 一大段空白、整列明显偏上。Center + shrinkWrap 让这组条目居中于
+            // 「标题之下、播放条之上」的可用高度；条目多到放不下时 ListView
+            // 仍会正常滚动（shrinkWrap 被 max 高度钳制）。
+            child: Center(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                itemCount: railDestinations.length,
+                itemBuilder: (context, i) {
+                  final selected = i == selectedIndex;
+                  final dest = railDestinations[i];
+                  return _SidebarItem(
+                    icon: selected ? dest.selectedIcon : dest.icon,
+                    label: dest.label,
+                    selected: selected,
+                    onTap: () => onDestinationSelected(i),
+                  );
+                },
+              ),
             ),
           ),
         ],
@@ -482,8 +520,7 @@ class _SidebarItem extends StatelessWidget {
                   child: DefaultTextStyle.merge(
                     style: TextStyle(
                       color: selected ? cs.onSecondaryContainer : cs.onSurface,
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -601,10 +638,9 @@ class _SearchFieldState extends State<_SearchField> {
                   contentPadding: const EdgeInsets.symmetric(vertical: 10),
                   border: InputBorder.none,
                   hintText: '搜索音乐、歌手、歌单',
-                  hintStyle: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: cs.onSurfaceVariant),
+                  hintStyle: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
                 ),
               ),
             ),
@@ -614,36 +650,3 @@ class _SearchFieldState extends State<_SearchField> {
     );
   }
 }
-
-/// 监听嵌套 Navigator 栈变化，通知外壳刷新工具栏返回键可用态；若注入了
-/// [history]（仅双栏详情面板），还负责回收/失效前进历史。
-class _ToolbarSyncObserver extends NavigatorObserver {
-  _ToolbarSyncObserver(this.onChanged, {this.history});
-  final VoidCallback onChanged;
-  final ForwardHistory? history;
-
-  void _schedule() =>
-      WidgetsBinding.instance.addPostFrameCallback((_) => onChanged());
-
-  @override
-  void didPush(Route route, Route? previousRoute) {
-    // 正向导航（非前进重放）令既有前进栈失效，符合浏览器语义。
-    if (history != null && !history!.replaying) history!.invalidate();
-    _schedule();
-  }
-
-  @override
-  void didPop(Route route, Route? previousRoute) {
-    // 「后退」弹出带标签的详情页 → 记入前进栈，供工具栏「前进」重建。
-    final tag = route.settings.arguments;
-    if (history != null && tag is ForwardTag) history!.recordBack(tag.builder);
-    _schedule();
-  }
-
-  @override
-  void didRemove(Route route, Route? previousRoute) => _schedule();
-
-  @override
-  void didReplace({Route? newRoute, Route? oldRoute}) => _schedule();
-}
-

@@ -20,6 +20,7 @@ import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../../core/build_flags.dart';
+import '../../core/remote/tv_player_back_focus.dart';
 
 /// 播放器内容区。
 class PlayerTabPager extends StatefulWidget {
@@ -237,7 +238,7 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
 
   @override
   Widget build(BuildContext context) {
-    return PageView(
+    final pageView = PageView(
       controller: _pageController,
       physics: widget.physics,
       // tv: 每个 tab 页包一个带 memoryKey 的 DpadRegion（铁律 3）：PageView
@@ -253,5 +254,10 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
             ]
           : widget.children,
     );
+    // tv: 标出「tab 内容区」作用域——播放页返回键靠它区分「焦点在内容里」
+    // 与「焦点已在控制区」，前者先退回播放键、后者才退出播放页
+    // （见 `tv_player_back_focus.dart`）。非 TV 构建原样返回，零变化。
+    if (!kTvBuild) return pageView;
+    return TvPlayerTabContentScope(child: pageView);
   }
 }

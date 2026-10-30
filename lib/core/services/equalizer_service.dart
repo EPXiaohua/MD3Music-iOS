@@ -182,6 +182,7 @@ class EqualizerService extends ChangeNotifier {
     }
 
     if (!Platform.isAndroid) return false;
+    if (_systemEffectsDisabled) return false;
 
     final pending = AudioService()
         .androidAudioSessionIds

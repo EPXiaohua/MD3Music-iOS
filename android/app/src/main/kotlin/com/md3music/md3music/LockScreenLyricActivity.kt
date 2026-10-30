@@ -9,7 +9,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -17,14 +16,19 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.Choreographer
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
 import android.view.WindowManager
+import android.widget.ImageView
 import io.flutter.plugin.common.MethodCall
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.hypot
 
 /// 锁屏歌词逐字单元。
 class LockLyricWord(val text: String, val startMs: Long, val durMs: Long)
@@ -44,6 +48,7 @@ class LockLyricLine(
 /// - `updateLockScreenLyricData`：整首歌词 + 样式一次推送 → `applyDataCall`
 /// - `updateLockScreenProgress`：500ms 节流轻量进度 → `applyProgressCall`
 /// - `updateLockScreenAccent`：封面主色异步提取完成 → `applyAccentCall`
+/// - `updateLockScreenFavorite`：收藏翻转的增量同步 → `applyFavoriteCall`
 data class LockScreenLyricData(
     val lines: List<LockLyricLine> = emptyList(),
     val placeholder: String = "",
@@ -63,10 +68,17 @@ data class LockScreenLyricData(
     val displayMode: Int = 0,
     val useDynamicColor: Boolean = true,
     val accentColor: Int = 0,
+    /// 当前歌曲是否已收藏（底部卡片红心态；Dart 侧收藏翻转后增量推送）。
+    val isFavorited: Boolean = false,
 )
 
-/// 锁屏歌词 Activity：全屏覆盖在锁屏上方，渲染 AM 对齐的全屏滚动歌词列表。
-class LockScreenLyricActivity : Activity() {
+/// 锁屏歌词 Activity：全屏覆盖在锁屏上方，渲染居中逐字歌词 + 底部玻璃卡片。
+///
+/// 窗口自 2026-10 升级起可触控（不再 `FLAG_NOT_TOUCHABLE`）：卡片按钮真实可点，
+/// 上滑/双击/系统返回手势 → `requestDismissKeyguard` + `finish()` 解锁。
+/// 渲染分层：背景模糊封面由 [ImageView] 承载（仅切歌/尺寸变化时替换），
+/// 歌词与卡片在透明覆盖层 [LockScreenLyricView] 上绘制。
+class LockScreenLyricActivity : Activity(), LockScreenLyricView.Listener {
 
     companion object {
         private const val ACTION_USER_PRESENT = Intent.ACTION_USER_PRESENT
@@ -106,6 +118,8 @@ class LockScreenLyricActivity : Activity() {
                 displayMode = (args["displayMode"] as? Number)?.toInt() ?: 0,
                 useDynamicColor = args["useDynamicColor"] as? Boolean ?: true,
                 accentColor = data.accentColor, // 保留上次强调色，避免整包推送清空动态取色
+                // 收藏态允许整包覆盖；Dart 旧版本不带该字段时沿用当前值
+                isFavorited = args["isFavorited"] as? Boolean ?: data.isFavorited,
             )
             runningActivity?.postDataUpdate()
         }
@@ -151,18 +165,49 @@ class LockScreenLyricActivity : Activity() {
             runningActivity?.postDataUpdate()
         }
 
-        fun start(context: Context) {
+        /// 收藏态增量推送：只翻红心，不重推歌词与样式（避免整包重排）。
+        fun applyFavoriteCall(call: MethodCall) {
+            val args = call.arguments as? Map<*, *> ?: emptyMap<Any?, Any?>()
+            val d = data
+            data = d.copy(isFavorited = args["isFavorited"] as? Boolean ?: d.isFavorited)
+            runningActivity?.postFavoriteUpdate()
+        }
+
+        /// 拉起锁屏歌词层。
+        ///
+        /// [requireLocked] 传 true 时要求「当前确实在锁屏」才拉起（亮屏路径使用）：
+        /// 屏幕亮起但设备已解锁（例如 App 正在前台播放、用户只是点亮屏幕）时，
+        /// 这层可触控的全屏窗口会盖住 App，属于必须避免的误触场景。
+        /// 熄屏路径不校验——熄屏后系统必定进入 keyguard，且个别 ROM 在熄屏瞬间
+        /// 上报的 keyguard 状态有延迟。
+        fun start(context: Context, requireLocked: Boolean = false) {
             android.util.Log.i("LockScreenLyric", "start() called, running=${runningActivity != null}")
             if (runningActivity != null) return
+            if (requireLocked && !isKeyguardLocked(context)) {
+                android.util.Log.i("LockScreenLyric", "start() skipped: keyguard not locked")
+                return
+            }
             try {
                 val intent = Intent(context, LockScreenLyricActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    .putExtra(EXTRA_REQUIRE_LOCKED, requireLocked)
                 context.startActivity(intent)
                 android.util.Log.i("LockScreenLyric", "startActivity ok")
             } catch (e: Exception) {
                 android.util.Log.e("LockScreenLyric", "startActivity failed: $e")
             }
+        }
+
+        /// 亮屏路径的二次校验标记：拉起瞬间与 onCreate 之间可能正好被解锁。
+        private const val EXTRA_REQUIRE_LOCKED = "require_locked"
+
+        /// 当前是否处于锁屏（无 keyguard 的机型恒为 false → 永不拉起，符合语义）。
+        private fun isKeyguardLocked(context: Context): Boolean = try {
+            val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+            km?.isKeyguardLocked == true
+        } catch (_: Exception) {
+            false
         }
 
         fun dismiss() {
@@ -176,7 +221,22 @@ class LockScreenLyricActivity : Activity() {
     }
 
     private lateinit var lyricView: LockScreenLyricView
+    private lateinit var backgroundView: ImageView
     private var userPresentReceiver: BroadcastReceiver? = null
+
+    /// API 33+ 返回手势回调（低版本走 onBackPressed）。类型用 Any 避免低版本类加载。
+    private var backCallback: Any? = null
+
+    /// 解锁只执行一次：requestDismissKeyguard 与 finish 可能被多路（手势/返回键/按钮）触发。
+    private var unlocking = false
+
+    // ===== 背景模糊图加载状态（保留既有 pending 重投语义）=====
+    private var loadingBackground = false
+    private var lastArtUrl: String? = null
+    private var lastFallbackPath: String? = null
+    private var pendingArt: String? = null
+    private var pendingFallback: String? = null
+    private var backgroundBitmap: Bitmap? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -191,24 +251,17 @@ class LockScreenLyricActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setTurnScreenOn(false)
         }
-        window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
-
-        window.decorView.systemUiVisibility = (
-            View.SYSTEM_UI_FLAG_LOW_PROFILE
-                or View.SYSTEM_UI_FLAG_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-            )
+        // 注意：这里不再加 FLAG_NOT_TOUCHABLE——卡片按钮与解锁手势都依赖真实触摸事件。
+        applyImmersiveFlags()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             window.statusBarColor = 0x00000000
             window.navigationBarColor = 0x00000000
         }
 
-        lyricView = LockScreenLyricView(this)
-        setContentView(lyricView)
+        setContentView(R.layout.lock_screen_lyric_root)
+        backgroundView = findViewById(R.id.lock_bg)
+        lyricView = findViewById(R.id.lock_lyric)
+        lyricView.listener = this
         runningActivity = this
 
         userPresentReceiver = object : BroadcastReceiver() {
@@ -223,13 +276,40 @@ class LockScreenLyricActivity : Activity() {
             registerReceiver(userPresentReceiver, IntentFilter(ACTION_USER_PRESENT))
         } catch (_: Exception) {}
 
+        registerBackCallback()
         lyricView.applyLatestData()
+        lyricView.startUnlockHint()
+    }
+
+    /// 沉浸式全屏：隐藏状态栏/导航栏，锁屏上不留系统条。
+    private fun applyImmersiveFlags() {
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_LOW_PROFILE
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            )
     }
 
     override fun onStart() {
         super.onStart()
         android.util.Log.i("LockScreenLyric", "onStart")
         lyricView.applyLatestData()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 亮屏路径的二次校验：拉起瞬间在锁屏、真正显示时已被解锁（指纹/面部）时，
+        // 立即退出，避免可触控全屏层盖住 App。熄屏路径不带该标记，不做校验。
+        if (intent?.getBooleanExtra(EXTRA_REQUIRE_LOCKED, false) == true &&
+            !isKeyguardLocked(this)
+        ) {
+            android.util.Log.i("LockScreenLyric", "onResume: keyguard already dismissed, finish")
+            finish()
+        }
     }
 
     override fun onStop() {
@@ -240,13 +320,111 @@ class LockScreenLyricActivity : Activity() {
 
     override fun onDestroy() {
         runningActivity = null
+        unregisterBackCallback()
         userPresentReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
         userPresentReceiver = null
+        backgroundBitmap?.let { if (!it.isRecycled) it.recycle() }
+        backgroundBitmap = null
         try { lyricView.release() } catch (_: Exception) {}
         super.onDestroy()
     }
+
+    // ===== 返回键解锁 =====
+
+    /// API 33+ 用 OnBackInvokedDispatcher（manifest 已开 enableOnBackInvokedCallback）。
+    private fun registerBackCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        try {
+            val callback = android.window.OnBackInvokedCallback { unlock() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                callback
+            )
+            backCallback = callback
+        } catch (_: Throwable) {
+            // 个别 ROM 不支持：保留 onBackPressed 兜底
+        }
+    }
+
+    private fun unregisterBackCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val cb = backCallback as? android.window.OnBackInvokedCallback ?: return
+        try { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(cb) } catch (_: Throwable) {}
+        backCallback = null
+    }
+
+    // 返回手势：API 33+ 已走 OnBackInvokedDispatcher；低版本只能覆写已废弃的 onBackPressed
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        unlock()
+    }
+
+    /// 解锁：有密码机型露出系统 bouncer，无密码机型直达桌面；随后结束自身。
+    ///
+    /// 顺序有讲究：有密码时先让 bouncer 浮上来再收掉覆盖层（延迟 finish），
+    /// 否则 finish 可能打断正在启动的解锁流程，用户看到的是「闪一下又回到锁屏」。
+    private fun unlock() {
+        if (unlocking) return
+        unlocking = true
+        var secure = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+                secure = km?.isKeyguardSecure == true
+                km?.requestDismissKeyguard(this, null)
+            } catch (_: Exception) {
+                // 非锁屏状态调用会抛异常：忽略，直接 finish 即可
+            }
+        }
+        // 无论解锁是否成功都必须结束自身：最坏退化回「系统锁屏照常显示」，
+        // 绝不把可触控的全屏覆盖层留在锁屏上（那会挡住系统解锁手势）。
+        val delay = if (secure) 250L else 0L
+        val decor = window?.decorView
+        if (decor != null && delay > 0L) {
+            decor.postDelayed({ try { finish() } catch (_: Exception) {} }, delay)
+        } else {
+            try { finish() } catch (_: Exception) {}
+        }
+    }
+
+    // ===== 卡片动作派发 =====
+
+    override fun onCardAction(button: CardButton) {
+        when (button) {
+            CardButton.favorite -> {
+                // 乐观翻转：Dart 收藏接口返回后会用 updateLockScreenFavorite 推权威值纠正
+                lyricView.flipFavoriteLocally()
+                AudioPlaybackService.dispatchUiAction(this, AudioPlaybackService.ACTION_TOGGLE_FAVORITE)
+            }
+            CardButton.previous -> AudioPlaybackService.dispatchUiAction(this, AudioPlaybackService.ACTION_PREV)
+            CardButton.playPause -> AudioPlaybackService.dispatchUiAction(this, AudioPlaybackService.ACTION_PLAY_PAUSE)
+            CardButton.next -> AudioPlaybackService.dispatchUiAction(this, AudioPlaybackService.ACTION_NEXT)
+            CardButton.cast -> requestAppAction("openCast")
+            CardButton.queue -> requestAppAction("openQueue")
+        }
+    }
+
+    /// 投屏/队列都是 Flutter 页面：拉起 App 并把动作交给 Dart，同时解锁退出锁屏层。
+    private fun requestAppAction(action: String) {
+        MainActivity.requestWidgetAction(this, action)
+        // 直接 finish 会让 App 停在系统锁屏之后（MainActivity 不是 showWhenLocked），
+        // 故走 unlock()：先 requestDismissKeyguard 再 finish，用户能真正看到目标面板。
+        unlock()
+    }
+
+    /// View 侧上滑/双击手势的解锁请求。
+    override fun onUnlockRequested() {
+        unlock()
+    }
+
+    /// 封面变化：换背景模糊图与卡片圆角缩略图（同一套加载/挂起重投逻辑）。
+    override fun onArtworkChanged(artUrl: String?, fallbackFilePath: String?) {
+        updateBackground(artUrl, fallbackFilePath)
+    }
+
+    // ===== 数据回投 =====
 
     private fun postDataUpdate() {
         if (::lyricView.isInitialized) {
@@ -259,27 +437,199 @@ class LockScreenLyricActivity : Activity() {
             runOnUiThread { lyricView.applyProgressOnly() }
         }
     }
+
+    private fun postFavoriteUpdate() {
+        if (::lyricView.isInitialized) {
+            runOnUiThread { lyricView.applyFavoriteOnly() }
+        }
+    }
+
+    // ===== 背景模糊图（下沉到 ImageView，只在切歌/尺寸变化时替换）=====
+
+    private fun updateBackground(artUrl: String?, fallbackFilePath: String?) {
+        if (artUrl == lastArtUrl && fallbackFilePath == lastFallbackPath) return
+        lastArtUrl = artUrl
+        lastFallbackPath = fallbackFilePath
+        loadBackgroundBitmap(artUrl, fallbackFilePath)
+    }
+
+    /// 后台线程解码 + 模糊，主线程替换 ImageView 位图并投递封面缩略图。
+    ///
+    /// 保留既有「加载中再来的请求挂 pending、完成后重投」语义：
+    /// 切歌很快时不会因为线程占用而丢掉最后一次封面。
+    private fun loadBackgroundBitmap(artUrl: String?, fallbackFilePath: String?) {
+        if (loadingBackground) {
+            pendingArt = artUrl
+            pendingFallback = fallbackFilePath
+            return
+        }
+        loadingBackground = true
+        Thread {
+            var blurred: Bitmap? = null
+            var thumb: Bitmap? = null
+            try {
+                val src = loadArtBitmap(artUrl, fallbackFilePath)
+                if (src != null) {
+                    // 先烤卡片缩略图（144px 起，按密度取整），再回收原图
+                    val thumbSize = maxOf(
+                        LockScreenCardRenderer.COVER_THUMB_PX,
+                        (LockScreenCardLogic.coverDp * resources.displayMetrics.density).toInt()
+                    ).coerceAtMost(384)
+                    thumb = try {
+                        LockScreenCardRenderer.bakeCoverThumbnail(
+                            src, thumbSize, 12f * resources.displayMetrics.density
+                        )
+                    } catch (_: Exception) {
+                        null
+                    }
+                    blurred = blurArtBitmap(src)
+                    if (blurred == null) src.recycle()
+                }
+            } catch (_: Exception) {
+                blurred = null
+            }
+            val finalBlur = blurred
+            val finalThumb = thumb
+            runOnUiThread {
+                loadingBackground = false
+                if (!isFinishing && !isDestroyed) {
+                    if (finalBlur != null) {
+                        val old = backgroundBitmap
+                        backgroundBitmap = finalBlur
+                        backgroundView.setImageBitmap(finalBlur)
+                        if (old != null && old !== finalBlur && !old.isRecycled) old.recycle()
+                    }
+                    lyricView.setCoverThumbnail(finalThumb)
+                } else {
+                    finalBlur?.recycle()
+                    finalThumb?.recycle()
+                }
+                repostPending()
+            }
+        }.start()
+    }
+
+    /// 降采样到 200px 长边后 RenderScript 模糊；失败退回重度降采样（视觉近似）。
+    private fun blurArtBitmap(src: Bitmap): Bitmap? {
+        val scale = 200f / maxOf(src.width, src.height).toFloat()
+        val smallW = (src.width * scale).toInt().coerceAtLeast(1)
+        val smallH = (src.height * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(src, smallW, smallH, true)
+        if (scaled !== src) src.recycle()
+        return try {
+            val rs = android.renderscript.RenderScript.create(applicationContext)
+            val input = android.renderscript.Allocation.createFromBitmap(rs, scaled)
+            val output = android.renderscript.Allocation.createTyped(rs, input.type)
+            val blur = android.renderscript.ScriptIntrinsicBlur.create(rs, android.renderscript.Element.U8_4(rs))
+            blur.setRadius(25f)
+            blur.setInput(input)
+            blur.forEach(output)
+            output.copyTo(scaled)
+            rs.destroy()
+            scaled
+        } catch (_: Exception) {
+            val fallbackRatio = 48f / scaled.width.toFloat()
+            val fbW = 48
+            val fbH = (scaled.height.toFloat() * fallbackRatio).toInt().coerceAtLeast(1)
+            val fb = Bitmap.createScaledBitmap(scaled, fbW, fbH, true)
+            if (fb !== scaled) scaled.recycle()
+            fb
+        }
+    }
+
+    private fun repostPending() {
+        val pArt = pendingArt
+        val pFall = pendingFallback
+        pendingArt = null
+        pendingFallback = null
+        if (pArt != null || pFall != null) {
+            loadBackgroundBitmap(pArt, pFall)
+        }
+    }
+
+    private fun loadArtBitmap(artUrl: String?, fallbackFilePath: String?): Bitmap? {
+        if (artUrl != null && (artUrl.startsWith("http://") || artUrl.startsWith("https://"))) {
+            try {
+                val conn = URL(artUrl).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000; conn.readTimeout = 10000
+                conn.instanceFollowRedirects = true
+                return try { BitmapFactory.decodeStream(conn.inputStream) } finally { conn.disconnect() }
+            } catch (_: Exception) { null }
+        }
+        if (artUrl != null && artUrl.startsWith("content://")) {
+            try {
+                return contentResolver.openInputStream(Uri.parse(artUrl))
+                    ?.use { BitmapFactory.decodeStream(it) }
+            } catch (_: Exception) {}
+        }
+        val filePath = when {
+            artUrl != null && artUrl.startsWith("local://") -> artUrl.substring("local://".length)
+            artUrl != null && artUrl.startsWith("file://") -> Uri.parse(artUrl).path ?: artUrl.substring("file://".length)
+            artUrl != null -> artUrl
+            fallbackFilePath != null -> fallbackFilePath
+            else -> return null
+        }
+        val lower = filePath.lowercase()
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")) {
+            return try { BitmapFactory.decodeFile(filePath) } catch (_: Exception) { null }
+        }
+        try {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(filePath)
+                val art = retriever.embeddedPicture
+                return if (art != null) BitmapFactory.decodeByteArray(art, 0, art.size) else null
+            } finally { try { retriever.release() } catch (_: Exception) {} }
+        } catch (_: Exception) { return null }
+    }
 }
 
-/// 单行歌词渲染前测量结果（换行拆分 + 块高，文本/样式变化时重建一次）。
+/// 单行歌词渲染前测量结果（换行拆分 + 块高 + 逐行 baseline + 副行拆分）。
+///
+/// 与 AM 播放页同口径的两处关键缓存：
+/// - `rowBaselines`：每个视觉行的 baseline（相对行块顶）。旧实现绘制时用
+///   `行顶 - ascent`，把行盒里的 leading 全压在字形下方；这里改为半行距模型
+///   （见 [LockScreenLyricMetrics.baselineInBox]），字形在行盒内居中。
+/// - `auxBaselines`：副行每个视觉行的 baseline。同样走半行距，且副行预留高度
+///   按实际行数增长（`rows × 1.5em + 0.3em`）。
+///
+/// 两者都在布局重建时算好，绘制期只做 `topY + baselines[i]`，零每帧算术/分配。
+/// 副行拆分（`splitByChar`）也随布局缓存，不再每帧重算。
 private class RenderedLine(
     val rowTexts: List<String>,   // 主文本换行后的视觉行文本
     val rowStarts: IntArray,      // 逐字行：每视觉行的起始 word 索引；纯文本行为空
     val hasWords: Boolean,
     val height: Float,            // 块高（含换行与副行空间）
+    val subRows: List<String>,    // 副行（翻译/罗马音）按可视宽拆分结果
+    val rowBaselines: FloatArray, // 每个视觉行的 baseline（相对块顶）
+    val auxBaselines: FloatArray, // 副行每个视觉行的 baseline（相对块顶）
 )
 
 /// 锁屏歌词 Canvas 滚动渲染视图（AM Apple Music 风格对齐）。
 ///
 /// 布局规范对齐 `lyric_layout.dart`：
-/// - 当前行在歌词可视带内居中（见 topInset / leaveHeadRoom），避开顶部歌曲名与底部进度条
-/// - 换行行高 = 主行高 × 0.8；副行字号 = max(主字 × 0.7, 12)，透明 0.5
+/// - 当前行在歌词可视带内居中（见 topInset / bottomInset，底部为玻璃卡片让位）
+/// - 行盒半行距：换行视觉行盒 = 主行盒 × 0.8，行盒内 leading 上下各半（字形居中）；
+///   副行字号 = max(主字 × 0.7, 可读下限)，副行行盒 = 1.5em，与主行间隙 0.3em，
+///   副行预留高度随视觉行数增长 —— 口径与几何全部见 [LockScreenLyricMetrics]
 /// - 非当前行暗态 alpha 0.2，当前行亮 0.92；动态取色为「85% 白 + 15% 主色」
 /// - 位置由 Choreographer 帧循环用系统时钟自增推进，向低频真实位置做慢速指数校正
 ///   （避免每次 Dart 500ms 推送引起速度抖动 / 卡顿）
-class LockScreenLyricView(context: Context) : View(context) {
+/// - 帧循环「60fps 封顶 + 静止即停表」：见 [LockScreenFrameGate] 与 doFrame 的停表条件
+class LockScreenLyricView @JvmOverloads constructor(
+    context: Context,
+    attrs: android.util.AttributeSet? = null,
+) : View(context, attrs) {
 
-    private val wrapFactor = 0.8f
+    /// 卡片按钮与解锁手势的回调（由 Activity 实现）。
+    interface Listener {
+        fun onCardAction(button: CardButton)
+        /// 上滑/双击解锁请求。
+        fun onUnlockRequested()
+        /// 封面地址变化：由 Activity 换背景模糊图与卡片缩略图（只在切歌时触发）。
+        fun onArtworkChanged(artUrl: String?, fallbackFilePath: String?)
+    }
+
     private val transOpacity = 0.5f
     private val darkAlpha = 0.20f
     private val brightAlpha = 0.92f
@@ -289,48 +639,44 @@ class LockScreenLyricView(context: Context) : View(context) {
     private val scrollRate = 30.0
     private val seekJumpMs = 800L
 
-    private var headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xB3FFFFFF.toInt()
-        textAlign = Paint.Align.CENTER
-    }
-    private var dimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    /// 「上滑解锁」提示展示时长与淡出动画时长。
+    private val hintVisibleMs = 2000L
+    private val hintFadeMs = 400L
+    private val hintText = "上滑或双击解锁"
+
+    var listener: Listener? = null
+
+    private val dimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x4DFFFFFF.toInt()
         textAlign = Paint.Align.LEFT
     }
-    private var brightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val brightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFFFFFFF.toInt()
         textAlign = Paint.Align.LEFT
     }
-    private var transPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val transPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x80FFFFFF.toInt()
         textAlign = Paint.Align.LEFT
     }
-    private var placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x66FFFFFF.toInt()
         textAlign = Paint.Align.CENTER
     }
-    private val progressBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x33FFFFFF.toInt() }
-    private val progressFgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFFFFF.toInt() }
-    private val bgDrawPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x73FFFFFF.toInt()
+        textAlign = Paint.Align.CENTER
+    }
 
-    private var backgroundBitmap: Bitmap? = null
-    private var loadingBackground = false
-    private var lastArtUrl: String? = null
-    private var lastFallbackPath: String? = null
-    private var pendingArt: String? = null
-    private var pendingFallback: String? = null
-    private var renderedBg: Bitmap? = null
-    private var renderedBgW = 0
-    private var renderedBgH = 0
-    private var renderedBgSource: Bitmap? = null
+    private val cardRenderer = LockScreenCardRenderer(this)
 
     private var curLines: List<LockLyricLine> = emptyList()
     private var placeholder = ""
-    private var headerTitle = ""
-    private var headerArtist = ""
+    private var title = ""
+    private var artist = ""
     private var authoritativePosMs = 0L
     private var durationMs = 0L
     private var isPlayingFlag = false
+    private var isFavorited = false
 
     private var curSize = 15f
     private var curWeight = 500
@@ -359,30 +705,54 @@ class LockScreenLyricView(context: Context) : View(context) {
     private var lastAuthorityMs = 0L
     private var wasPlayingFlag = false
 
+    /// 动画收敛标记：false 表示上一帧仍在运动，帧循环必须继续。
+    private var scrollSettled = true
+    private var alphaSettled = true
+
+    /// 「上滑解锁」提示状态（亮屏后 2s 内 alpha 1→0，收敛即停表）。
+    private var hintAnimating = false
+    private var hintAlpha = 0f
+    private var hintStartMs = 0L
+
+    // ===== 卡片几何缓存（尺寸/档位/高度不变时复用，触摸与绘制共用同一份）=====
+    private var cachedGeo: CardGeometry? = null
+    private var cachedRects: Map<CardButton, CardGeometry> = emptyMap()
+    private var cachedMode: CardMode = CardMode.full
+    private var cachedGeoW = -1
+    private var cachedGeoH = -1
+    private var cachedHeightDp = -1f
+
+    // ===== 触摸状态 =====
+    private var downX = 0f
+    private var downY = 0f
+    private var pressedButton: CardButton? = null
+    private var velocityTracker: VelocityTracker? = null
+    private var lastTapUpMs = 0L
+
+    private val frameGate = LockScreenFrameGate(16L)
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             val now = SystemClock.uptimeMillis()
-            val dtMs = if (lastFrameMs > 0) (now - lastFrameMs).toDouble() else 16.0
-            lastFrameMs = now
-            val dtSec = dtMs / 1000.0
-            if (isPlayingFlag) {
-                // 时钟自增推进：即使 Dart 短暂未推进度也连续行走，避免高亮卡死
-                smoothPosMs += dtMs
-                // 向低频真实位置（authoritative + 流失时间）做慢速指数校正，吸收漂移且不外抖
-                val target = (
-                    authoritativePosMs + (now - lastAuthorityMs)
-                    ).toDouble().coerceAtMost(durationMs.toDouble())
-                val diff = target - smoothPosMs
-                val k = 1.0 - exp(-corrRate * dtSec)
-                smoothPosMs += diff * k
-                if (abs(diff) < 0.5) smoothPosMs = target
-                advanceScroll(dtSec)
-                advanceLineAlpha(dtSec)
+            // 停表条件：播放中 / 提示动画中 / 滚动未收敛 / 透明度未收敛，任一成立才继续
+            val busy = isPlayingFlag || hintAnimating || !scrollSettled || !alphaSettled
+            if (!busy) {
+                frameRunning = false
+                lastFrameMs = 0L
+                return
+            }
+            // 120Hz 屏 vsync 约 8.3ms：闸门把实际重绘封顶在 60fps，
+            // 位置推进用「上次真正绘制」的真实 dt，速度不失真。
+            if (frameGate.shouldDraw(now)) {
+                val dtMs = if (lastFrameMs > 0L) (now - lastFrameMs).toLong() else 16L
+                lastFrameMs = now
+                val dtSec = dtMs.coerceIn(1L, 100L) / 1000.0
+                if (isPlayingFlag) advancePosition(dtSec, now)
+                scrollSettled = advanceScroll(dtSec)
+                alphaSettled = advanceLineAlpha(dtSec)
+                if (hintAnimating) advanceHint(now)
                 invalidate()
             }
-            // 只要 attached 就无条件维持帧循环；isPlayingFlag 决定是否推进/重绘。
-            // 锁屏可见时帧循环持续存活，isPlaying 一旦为真立即恢复滚动，
-            // 彻底消除「首次锁屏/切歌竞态导致 Choreographer 空档而卡死」。
             if (isAttachedToWindow) {
                 Choreographer.getInstance().postFrameCallback(this)
             } else {
@@ -394,9 +764,9 @@ class LockScreenLyricView(context: Context) : View(context) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        // 只要视图可见就保持帧循环运行；isPlayingFlag 决定是否推进/重绘。
-        // 这保证首次锁屏/切歌与整包推送竞态导致 isPlaying 那一刻为 false 时，
-        // 帧循环仍活着，isPlaying 一转 true 立即恢复滚动，而非卡死等待重启时机。
+        // 只要视图可见就（重新）启动帧循环；isPlaying 由 doFrame 判读。
+        // 这保留「首次锁屏/切歌与整包推送竞态导致 isPlaying 那一刻为 false」的修复语义：
+        // 数据/进度/可见性任一变化都会重启循环，isPlaying 转 true 时立即可推进。
         startFrameLoop()
     }
 
@@ -416,18 +786,21 @@ class LockScreenLyricView(context: Context) : View(context) {
 
     fun release() {
         stopFrameLoop()
-        renderedBg?.let { if (!it.isRecycled) it.recycle() }
-        renderedBg = null
+        cardRenderer.release()
+        velocityTracker?.recycle()
+        velocityTracker = null
     }
 
     fun onScreenHidden() {
         stopFrameLoop()
     }
 
+    /// 启动帧循环：重启时重置闸门，保证第一帧立即绘制。
     private fun startFrameLoop() {
         if (frameRunning) return
         frameRunning = true
         lastFrameMs = 0L
+        frameGate.reset()
         Choreographer.getInstance().postFrameCallback(frameCallback)
     }
 
@@ -436,16 +809,31 @@ class LockScreenLyricView(context: Context) : View(context) {
         Choreographer.getInstance().removeFrameCallback(frameCallback)
     }
 
-    /// 整包数据应用：重建样式与布局缓存、去皮封面、按需吸附位置。
+    /// 请求重绘并确保帧循环活着（按钮态/收藏翻转/暂停刷新等一次性变化走这里）。
+    fun requestRedraw() {
+        startFrameLoop()
+        invalidate()
+    }
+
+    /// 亮屏后展示「上滑或双击解锁」提示，2s 内淡出。
+    fun startUnlockHint() {
+        hintStartMs = SystemClock.uptimeMillis()
+        hintAlpha = 1f
+        hintAnimating = true
+        requestRedraw()
+    }
+
+    /// 整包数据应用：重建样式与布局缓存、换背景/缩略图、按需吸附位置。
     fun applyLatestData() {
         val d = LockScreenLyricActivity.currentData()
         curLines = d.lines
         placeholder = d.placeholder
-        headerTitle = d.title
-        headerArtist = d.artist
+        title = d.title
+        artist = d.artist
         authoritativePosMs = d.currentPositionMs
         durationMs = d.durationMs
         isPlayingFlag = d.isPlaying
+        isFavorited = d.isFavorited
         curSize = d.fontSize
         curWeight = d.fontWeight
         curLineMult = d.lineHeightMultiplier
@@ -463,22 +851,17 @@ class LockScreenLyricView(context: Context) : View(context) {
         }
         lastAuthorityMs = SystemClock.uptimeMillis()
         wasPlayingFlag = isPlayingFlag
-        lastFrameMs = SystemClock.uptimeMillis()
-        // 只续不灭：帧循环的生命由可见性（onAttached/onWindowVisibility/onStop）统一管控，
-        // 避免此处按 isPlaying 停表造成竞态卡死；isPlaying 由 doFrame 内部判读。
-        if (isPlayingFlag) startFrameLoop()
-
-        if (d.artUrl != lastArtUrl || d.fallbackFilePath != lastFallbackPath) {
-            lastArtUrl = d.artUrl
-            lastFallbackPath = d.fallbackFilePath
-            loadBackgroundBitmap(d.artUrl, d.fallbackFilePath)
-        }
-        invalidate()
+        lastFrameMs = 0L
+        // 数据变化必须重启帧循环（保留「任何推送都重启」的竞态修复语义）；
+        // 是否继续由 doFrame 的停表条件决定，静止时会在下一帧自行停下。
+        requestRedraw()
+        // 封面只在切歌/换歌时变：Activity 侧对同一地址去重，不会重复解码
+        listener?.onArtworkChanged(d.artUrl, d.fallbackFilePath)
     }
 
-    /// 轻量进度应用：只改位置/播放态，不动布局。播放中由帧循环驱动重绘，
-    /// 不额外 invalidate，避免与帧循环形成双重无效重绘导致卡顿。
-    /// 不在此停表：帧循环生命由可见性统一管控，isPlaying 翻转由 doFrame 即时读取。
+    /// 轻量进度应用：只改位置/播放态，不动布局。
+    /// 播放中由帧循环驱动重绘，不额外 invalidate（避免双重无效重绘）；
+    /// 暂停时静态位置需要刷新一帧（帧循环会按停表条件自行收敛停下）。
     fun applyProgressOnly() {
         val d = LockScreenLyricActivity.currentData()
         authoritativePosMs = d.currentPositionMs
@@ -489,12 +872,29 @@ class LockScreenLyricView(context: Context) : View(context) {
         }
         lastAuthorityMs = SystemClock.uptimeMillis()
         wasPlayingFlag = isPlayingFlag
-        lastFrameMs = SystemClock.uptimeMillis()
+        lastFrameMs = 0L
         if (isPlayingFlag) {
             startFrameLoop()
         } else {
-            invalidate() // 暂停：静态位置需刷新一帧（帧循环仍在，isPlaying 翻转即恢复滚动）
+            requestRedraw()
         }
+    }
+
+    /// 收藏态增量更新：只翻红心并重绘一帧。
+    fun applyFavoriteOnly() {
+        isFavorited = LockScreenLyricActivity.currentData().isFavorited
+        requestRedraw()
+    }
+
+    /// 点击收藏后本地先翻转，等 Dart 的权威值回来纠正（网络失败时也不会毫无反馈）。
+    fun flipFavoriteLocally() {
+        isFavorited = !isFavorited
+        requestRedraw()
+    }
+
+    fun setCoverThumbnail(bitmap: Bitmap?) {
+        cardRenderer.setCoverThumbnail(bitmap)
+        requestRedraw()
     }
 
     private fun resetLayoutCache() {
@@ -508,43 +908,44 @@ class LockScreenLyricView(context: Context) : View(context) {
         curWordWidths = FloatArray(0)
         curWordStarts = FloatArray(0)
         lastMaskLineIdx = -1
+        // 布局重建后透明度/滚动都要重新收敛，否则暂停态下重排会停在暗态
+        scrollSettled = false
+        alphaSettled = false
+        invalidateCardGeometry()
     }
 
     private fun rebuildTypeface() {
         val weight = curWeight.coerceIn(300, 900)
         val baseTypeface = resolveTypeface(weight)
         val curPx = dp(curSize).coerceIn(dp(12f), dp(60f))
-        val transPx = (dp(maxOf(curSize * 0.7f, 12f))).coerceAtLeast(dp(10f))
-        val headerSize = dp(13f)
+        // 副行字号与 AM 同口径：max(主字 × 0.7, 可读下限)，下限按字重取 12/13
+        val transPx = LockScreenLyricMetrics.auxFontSize(curPx, weight)
+            .coerceAtLeast(dp(10f))
 
-        headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xB3FFFFFF.toInt()
-            textSize = headerSize
-            textAlign = Paint.Align.CENTER
-        }
-        dimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        dimPaint.apply {
             color = 0x4DFFFFFF.toInt()
             textSize = curPx
             textAlign = Paint.Align.LEFT
             typeface = baseTypeface
         }
-        brightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        brightPaint.apply {
             color = 0xFFFFFFFF.toInt()
             textSize = curPx
             textAlign = Paint.Align.LEFT
             typeface = baseTypeface
         }
-        transPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        transPaint.apply {
             color = 0x80FFFFFF.toInt()
             textSize = transPx
             textAlign = Paint.Align.LEFT
             typeface = baseTypeface
         }
-        placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        placeholderPaint.apply {
             color = 0x66FFFFFF.toInt()
             textSize = dp(15f)
             textAlign = Paint.Align.CENTER
         }
+        hintPaint.textSize = dp(11f)
     }
 
     private fun resolveTypeface(weight: Int): Typeface {
@@ -559,136 +960,6 @@ class LockScreenLyricView(context: Context) : View(context) {
         } else {
             Typeface.create(Typeface.DEFAULT, if (weight >= 700) Typeface.BOLD else Typeface.NORMAL)
         }
-    }
-
-    private fun ensureRenderedBg() {
-        val bmp = backgroundBitmap ?: return
-        val vw = width
-        val vh = height
-        if (vw <= 0 || vh <= 0) return
-        val layer = renderedBg
-        if (layer != null && renderedBgW == vw && renderedBgH == vh && renderedBgSource === bmp) return
-        val newLayer = Bitmap.createBitmap(vw, vh, Bitmap.Config.ARGB_8888)
-        val c = Canvas(newLayer)
-        if (bmp.width > 0 && bmp.height > 0) {
-            val scale = maxOf(vw / bmp.width.toFloat(), vh / bmp.height.toFloat())
-            val dstW = bmp.width * scale
-            val dstH = bmp.height * scale
-            val dx = (vw - dstW) / 2f
-            val dy = (vh - dstH) / 2f
-            c.drawBitmap(bmp, null, RectF(dx, dy, dx + dstW, dy + dstH), bgDrawPaint)
-        }
-        c.drawColor(0x66000000.toInt())
-        if (layer != null && layer !== newLayer) layer.recycle()
-        renderedBg = newLayer
-        renderedBgW = vw
-        renderedBgH = vh
-        renderedBgSource = bmp
-    }
-
-    private fun loadBackgroundBitmap(artUrl: String?, fallbackFilePath: String?) {
-        if (loadingBackground) {
-            pendingArt = artUrl
-            pendingFallback = fallbackFilePath
-            return
-        }
-        loadingBackground = true
-        Thread {
-            try {
-                val src = loadArtBitmap(artUrl, fallbackFilePath)
-                if (src != null) {
-                    val scale = 200f / maxOf(src.width, src.height).toFloat()
-                    val smallW = (src.width * scale).toInt().coerceAtLeast(1)
-                    val smallH = (src.height * scale).toInt().coerceAtLeast(1)
-                    val scaled = Bitmap.createScaledBitmap(src, smallW, smallH, true)
-                    if (scaled !== src) src.recycle()
-                    val blurred = try {
-                        val rs = android.renderscript.RenderScript.create(context)
-                        val input = android.renderscript.Allocation.createFromBitmap(rs, scaled)
-                        val output = android.renderscript.Allocation.createTyped(rs, input.type)
-                        val blur = android.renderscript.ScriptIntrinsicBlur.create(rs, android.renderscript.Element.U8_4(rs))
-                        blur.setRadius(25f)
-                        blur.setInput(input)
-                        blur.forEach(output)
-                        output.copyTo(scaled)
-                        rs.destroy()
-                        scaled
-                    } catch (_: Exception) {
-                        val fallbackRatio = 48f / scaled.width.toFloat()
-                        val fbW = 48
-                        val fbH = (scaled.height.toFloat() * fallbackRatio).toInt().coerceAtLeast(1)
-                        val fb = Bitmap.createScaledBitmap(scaled, fbW, fbH, true)
-                        if (fb !== scaled) scaled.recycle()
-                        fb
-                    }
-                    post {
-                        backgroundBitmap = blurred
-                        renderedBg = null
-                        loadingBackground = false
-                        repostPending()
-                        invalidate()
-                    }
-                } else {
-                    post {
-                        loadingBackground = false
-                        repostPending()
-                        invalidate()
-                    }
-                }
-            } catch (_: Exception) {
-                post {
-                    loadingBackground = false
-                    repostPending()
-                    invalidate()
-                }
-            }
-        }.start()
-    }
-
-    private fun repostPending() {
-        val pArt = pendingArt
-        val pFall = pendingFallback
-        pendingArt = null
-        pendingFallback = null
-        if (pArt != null || pFall != null) {
-            loadBackgroundBitmap(pArt, pFall)
-        }
-    }
-
-    private fun loadArtBitmap(artUrl: String?, fallbackFilePath: String?): Bitmap? {
-        if (artUrl != null && (artUrl.startsWith("http://") || artUrl.startsWith("https://"))) {
-            try {
-                val conn = URL(artUrl).openConnection() as HttpURLConnection
-                conn.connectTimeout = 5000; conn.readTimeout = 10000
-                conn.instanceFollowRedirects = true
-                return try { BitmapFactory.decodeStream(conn.inputStream) } finally { conn.disconnect() }
-            } catch (_: Exception) { null }
-        }
-        if (artUrl != null && artUrl.startsWith("content://")) {
-            try {
-                return context.contentResolver.openInputStream(Uri.parse(artUrl))
-                    ?.use { BitmapFactory.decodeStream(it) }
-            } catch (_: Exception) {}
-        }
-        val filePath = when {
-            artUrl != null && artUrl.startsWith("local://") -> artUrl.substring("local://".length)
-            artUrl != null && artUrl.startsWith("file://") -> Uri.parse(artUrl).path ?: artUrl.substring("file://".length)
-            artUrl != null -> artUrl
-            fallbackFilePath != null -> fallbackFilePath
-            else -> return null
-        }
-        val lower = filePath.lowercase()
-        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")) {
-            return try { BitmapFactory.decodeFile(filePath) } catch (_: Exception) { null }
-        }
-        try {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(filePath)
-                val art = retriever.embeddedPicture
-                return if (art != null) BitmapFactory.decodeByteArray(art, 0, art.size) else null
-            } finally { try { retriever.release() } catch (_: Exception) {} }
-        } catch (_: Exception) { return null }
     }
 
     // ================= 布局构建 =================
@@ -750,10 +1021,7 @@ class LockScreenLyricView(context: Context) : View(context) {
         return res
     }
 
-    private fun subTextHeight(): Float =
-        transPaint.textSize + transPaint.textSize * 0.3f
-
-    /// 构建每行块高 + 换行拆分 + 前缀和。数据/样式/视口宽度变化时重建。
+    /// 构建每行块高 + 换行拆分 + 逐行 baseline + 前缀和。数据/样式/视口宽度变化时重建。
     private fun buildLayoutCache() {
         val ls = curLines
         val vw = width
@@ -771,7 +1039,14 @@ class LockScreenLyricView(context: Context) : View(context) {
         if (ls.isEmpty() || vw <= 0 || vh <= 0) return
         val maxW = vw - dp(curSize) * 2f
         val mainH = curPx * curLineMult
-        val transH = if (curShowTrans) subTextHeight() else 0f
+        // 行盒半行距需要字体度量：主行与副行各取一次（绘制期不再读 fontMetrics）
+        val mainFm = dimPaint.fontMetrics
+        val mainAscAbs = -mainFm.ascent
+        val mainDescent = mainFm.descent
+        val auxFm = transPaint.fontMetrics
+        val auxAscAbs = -auxFm.ascent
+        val auxDescent = auxFm.descent
+        val auxFontPx = transPaint.textSize
 
         val list = ArrayList<RenderedLine>(ls.size)
         var cursor = 0f
@@ -785,32 +1060,77 @@ class LockScreenLyricView(context: Context) : View(context) {
             }
             val rows = rowTexts.size.coerceAtLeast(1)
             val hasSub = curShowTrans && line.sub.isNotEmpty()
-            val h = mainH + (rows - 1) * mainH * wrapFactor + (if (hasSub) transH else 0f)
+            // 副行拆分随布局缓存，绘制期不再每帧 splitByChar
+            val subRows = if (hasSub) splitByChar(line.sub, maxW) else emptyList()
+            val auxRows = subRows.size
+            // 视觉行 baseline：半行距（行盒内 leading 上下各半），与 AM 的行盒模型同式
+            val rowBaselines = FloatArray(rows)
+            for (ri in 0 until rows) {
+                rowBaselines[ri] = LockScreenLyricMetrics.mainRowBaseline(
+                    mainH, ri, mainAscAbs, mainDescent,
+                )
+            }
+            val auxBaselines = FloatArray(auxRows)
+            for (aj in 0 until auxRows) {
+                auxBaselines[aj] = LockScreenLyricMetrics.auxRowBaseline(
+                    mainH, rows, auxFontPx, aj, auxAscAbs, auxDescent,
+                )
+            }
+            // 块高与 AM 同式：主文本(含换行) + 副行预留(随副行行数增长)
+            val h = LockScreenLyricMetrics.lineBlockHeight(mainH, rows, auxFontPx, auxRows)
             lineTop[li] = cursor
             cursor += h
-            list.add(RenderedLine(rowTexts, rowStarts, hasW, h))
+            list.add(RenderedLine(rowTexts, rowStarts, hasW, h, subRows, rowBaselines, auxBaselines))
         }
         rendered = list
         for (i in lineAlpha.indices) lineAlpha[i] = darkAlpha
         // 首次/重建后直接吸附到当前行，避免打开时从歌词顶部滚动到当前行的突兀动画
         smoothScrollY = scrollTargetFor(currentLineIndex())
+        scrollSettled = true
+        alphaSettled = false
         invalidate()
     }
 
     override fun onSizeChanged(w: Int, hIn: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, hIn, oldw, oldh)
-        renderedBg = null
+        cardRenderer.clearIconCache()
+        invalidateCardGeometry()
         resetLayoutCache()
-        invalidate()
+        requestRedraw()
     }
 
-    // ================= 帧推进 =================
+    // ================= 保留区 / 卡片几何 =================
 
-    /// 顶部保留区：歌曲名 / 元信息在此之下，歌词不进入这里。
-    private fun topInset(): Float = maxOf(dp(76f), dp(14f) + headerPaint.textSize * 2.2f)
+    private fun density(): Float = resources.displayMetrics.density
 
-    /// 底部保留区：进度条此前保留空间，歌词不进入这里。
-    private fun bottomInset(): Float = dp(96f)
+    /// 状态栏高度（沉浸式下通常为 0，用于顶部保留区兜底）。
+    private fun statusBarInset(): Float {
+        val insets = rootWindowInsets ?: return 0f
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            insets.getInsets(android.view.WindowInsets.Type.statusBars()).top.toFloat()
+        } else {
+            @Suppress("DEPRECATION")
+            insets.systemWindowInsetTop.toFloat()
+        }
+    }
+
+    /// 顶部保留区：不再有「歌名 · 歌手」header，只留安全距离。
+    private fun topInset(): Float = maxOf(dp(72f), statusBarInset() + dp(16f))
+
+    /// 卡片是否展示：有歌曲信息或有歌词时展示。
+    private fun showCard(): Boolean = title.isNotEmpty() || curLines.isNotEmpty()
+
+    private fun cardMode(): CardMode =
+        if (width > height) CardMode.compact else LockScreenCardLogic.resolveCardMode(height / density())
+
+    private fun cardHeightDp(mode: CardMode): Float =
+        LockScreenCardLogic.cardHeightDp(mode, cardRenderer.densityScale, showProgress = durationMs > 0L)
+
+    /// 底部保留区：卡片高 + 32dp 外边距 + 16dp 间距；卡片隐藏时只留 40dp。
+    private fun bottomInset(): Float {
+        if (!showCard()) return dp(40f)
+        return cardHeightDp(cardMode()) * density() + dp(LockScreenCardLogic.bottomMarginDp) + dp(16f)
+    }
 
     /// 歌词可视带高度（顶/底保留区之间的可用高度）。
     private fun availH(): Float = (height - topInset() - bottomInset()).coerceAtLeast(0f)
@@ -828,26 +1148,104 @@ class LockScreenLyricView(context: Context) : View(context) {
         return (center - availH() * 0.5f).coerceIn(0f, maxScrollY())
     }
 
-    private fun advanceScroll(dtSec: Double) {
+    private fun invalidateCardGeometry() {
+        cachedGeo = null
+        cachedRects = emptyMap()
+        cachedGeoW = -1
+        cachedGeoH = -1
+        cachedHeightDp = -1f
+    }
+
+    /// 卡片几何（绘制与触摸共用）：尺寸/档位/高度不变时复用缓存。
+    private fun ensureCardGeometry(): Pair<CardGeometry, Map<CardButton, CardGeometry>>? {
+        val w = width
+        val h = height
+        if (w <= 0 || h <= 0) return null
+        val mode = cardMode()
+        val heightDp = cardHeightDp(mode)
+        val geo = cachedGeo
+        if (geo != null && cachedGeoW == w && cachedGeoH == h &&
+            cachedHeightDp == heightDp && cachedMode == mode
+        ) {
+            return Pair(geo, cachedRects)
+        }
+        val newGeo = LockScreenCardLogic.cardGeometry(w.toFloat(), h.toFloat(), density(), heightDp)
+        // 字体缩放要传进热区计算：行 1 长高时行 2 整体下移，否则点不中按钮
+        val rects = LockScreenCardLogic.buttonRects(newGeo, density(), mode, cardRenderer.densityScale)
+        cachedGeo = newGeo
+        cachedRects = rects
+        cachedGeoW = w
+        cachedGeoH = h
+        cachedHeightDp = heightDp
+        cachedMode = mode
+        return Pair(newGeo, rects)
+    }
+
+    // ================= 帧推进 =================
+
+    /// 播放位置推进：时钟自增 + 向低频真实位置慢速指数校正。
+    private fun advancePosition(dtSec: Double, now: Long) {
+        smoothPosMs += dtSec * 1000.0
+        val elapsed = (now - lastAuthorityMs).toDouble()
+        val rawTarget = authoritativePosMs + elapsed
+        // 时长未知（0）时不夹取，避免把位置拖回 0
+        val target = if (durationMs > 0L) rawTarget.coerceAtMost(durationMs.toDouble()) else rawTarget
+        val diff = target - smoothPosMs
+        val k = 1.0 - exp(-corrRate * dtSec)
+        smoothPosMs += diff * k
+        if (abs(diff) < 0.5) smoothPosMs = target
+        if (smoothPosMs < 0.0) smoothPosMs = 0.0
+    }
+
+    /// 滚动推进；返回是否已收敛（收敛后帧循环可以停表）。
+    private fun advanceScroll(dtSec: Double): Boolean {
         val idx = currentLineIndex()
-        if (idx < 0 || rendered.isEmpty()) return
+        if (idx < 0 || rendered.isEmpty()) return true
         val target = scrollTargetFor(idx)
         val k = 1.0 - exp(-scrollRate * dtSec)
         smoothScrollY += ((target - smoothScrollY) * k).toFloat()
-        if (abs(target - smoothScrollY) < 0.5f) smoothScrollY = target
+        if (abs(target - smoothScrollY) < 0.5f) {
+            smoothScrollY = target
+            return true
+        }
+        return false
     }
 
-    private fun advanceLineAlpha(dtSec: Double) {
+    /// 行透明度推进；返回是否已全部收敛。
+    private fun advanceLineAlpha(dtSec: Double): Boolean {
         val idx = currentLineIndex()
         val n = lineAlpha.size
-        if (n == 0) return
+        if (n == 0) return true
         val kDark = 1.0 - exp(-4.0 * dtSec)
         val kBright = 1.0 - exp(-24.0 * dtSec)
+        var settled = true
         for (i in 0 until n) {
             val target = if (i == idx) brightAlpha else darkAlpha
             val k = if (i == idx) kBright.toFloat() else kDark.toFloat()
             val next = lineAlpha[i] + (target - lineAlpha[i]) * k
-            lineAlpha[i] = if (abs(next - target) < 0.001f) target else next
+            if (abs(next - target) < 0.001f) {
+                lineAlpha[i] = target
+            } else {
+                lineAlpha[i] = next
+                settled = false
+            }
+        }
+        return settled
+    }
+
+    /// 提示淡出：亮屏后 2s 内 alpha 1→0（之后 400ms 淡出）。
+    private fun advanceHint(now: Long) {
+        val elapsed = now - hintStartMs
+        val fadeStart = hintVisibleMs
+        hintAlpha = if (elapsed <= fadeStart) {
+            1f
+        } else {
+            val t = ((elapsed - fadeStart).toFloat() / hintFadeMs).coerceIn(0f, 1f)
+            1f - t
+        }
+        if (hintAlpha <= 0f) {
+            hintAlpha = 0f
+            hintAnimating = false
         }
     }
 
@@ -899,19 +1297,7 @@ class LockScreenLyricView(context: Context) : View(context) {
         val h = height.toFloat()
         if (w <= 0 || h <= 0) return
 
-        if (backgroundBitmap == null) {
-            canvas.drawColor(0xFF000000.toInt())
-        } else {
-            ensureRenderedBg()
-            renderedBg?.let { canvas.drawBitmap(it, 0f, 0f, null) }
-                ?: canvas.drawColor(0xFF000000.toInt())
-        }
-
-        val header = if (headerArtist.isNotEmpty()) "$headerTitle · $headerArtist" else headerTitle
-        if (header.isNotEmpty()) {
-            val baseline = dp(56f) - (headerPaint.ascent() + headerPaint.descent()) / 2f
-            canvas.drawText(header, w / 2f, baseline, headerPaint)
-        }
+        // 背景（模糊封面）由 Activity 的 ImageView 承载，本层保持透明，不再每帧全屏 blit
 
         if (curLines.isEmpty()) {
             if (placeholder.isNotEmpty()) {
@@ -922,7 +1308,8 @@ class LockScreenLyricView(context: Context) : View(context) {
                     placeholderPaint
                 )
             }
-            drawProgress(canvas, w, h)
+            drawCardIfNeeded(canvas)
+            drawUnlockHint(canvas, h)
             return
         }
 
@@ -936,7 +1323,7 @@ class LockScreenLyricView(context: Context) : View(context) {
         val tInset = topInset()
         val bInset = bottomInset()
 
-        // 将歌词绘制严格限制在可视带内，绝不越界顶/底保留区
+        // 将歌词绘制严格限制在可视带内，绝不越界顶/底保留区（卡片区域）
         canvas.save()
         canvas.clipRect(0f, tInset - 1f, w, h - bInset + 1f)
 
@@ -955,7 +1342,31 @@ class LockScreenLyricView(context: Context) : View(context) {
 
         canvas.restore()
 
-        drawProgress(canvas, w, h)
+        drawCardIfNeeded(canvas)
+        drawUnlockHint(canvas, h)
+    }
+
+    private fun drawCardIfNeeded(canvas: Canvas) {
+        if (!showCard()) return
+        val geoPair = ensureCardGeometry() ?: return
+        val state = LockCardState(
+            title = title,
+            artist = artist,
+            positionMs = smoothPosMs.toLong(),
+            durationMs = durationMs,
+            isPlaying = isPlayingFlag,
+            isFavorited = isFavorited,
+            accentColor = curAccent,
+        )
+        cardRenderer.draw(canvas, geoPair.first, cachedMode, state, geoPair.second, pressedButton)
+    }
+
+    private fun drawUnlockHint(canvas: Canvas, h: Float) {
+        if (!hintAnimating && hintAlpha <= 0f) return
+        hintPaint.alpha = (hintAlpha * 0.45f * 255f).toInt().coerceIn(0, 255)
+        val geo = ensureCardGeometry()?.first
+        val baseline = (geo?.top ?: (h - dp(120f))) - dp(16f)
+        canvas.drawText(hintText, width / 2f, baseline, hintPaint)
     }
 
     private fun needRebuildLayout(): Boolean {
@@ -988,14 +1399,6 @@ class LockScreenLyricView(context: Context) : View(context) {
 
     private fun overscan(): Float = dp(300f)
 
-    private fun rowOffset(mainH: Float, ri: Int): Float =
-        if (ri == 0) 0f else mainH + (ri - 1) * mainH * wrapFactor
-
-    private fun mainLineHeightPx(): Float {
-        val curPx = dp(curSize).coerceIn(dp(12f), dp(60f))
-        return curPx * curLineMult
-    }
-
     private fun drawLine(
         canvas: Canvas, idx: Int, curIdx: Int, rl: RenderedLine,
         topY: Float, baseX: Float, maskX: Float,
@@ -1007,14 +1410,12 @@ class LockScreenLyricView(context: Context) : View(context) {
             drawCurWordLine(canvas, line, rl, topY, baseX, maskX)
         } else {
             val alpha = if (isCur) brightAlpha else lineAlphaAt(idx)
-            val fm = dimPaint.fontMetrics
             dimPaint.alpha = (alpha * 255).toInt().coerceIn(0, 255)
-            val mainH = mainLineHeightPx()
+            // baseline 已按「行盒半行距」在布局期算好，绘制期零算术
             for (ri in rl.rowTexts.indices) {
-                val rowY = topY + rowOffset(mainH, ri) - fm.ascent
-                canvas.drawText(rl.rowTexts[ri], baseX, rowY, dimPaint)
+                canvas.drawText(rl.rowTexts[ri], baseX, topY + rl.rowBaselines[ri], dimPaint)
             }
-            drawSubIfNeeded(canvas, line, rl, topY, baseX)
+            drawSubIfNeeded(canvas, rl, topY, baseX)
         }
     }
 
@@ -1025,7 +1426,6 @@ class LockScreenLyricView(context: Context) : View(context) {
     private fun drawCurWordLine(
         canvas: Canvas, line: LockLyricLine, rl: RenderedLine, topY: Float, baseX: Float, maskXIn: Float,
     ) {
-        val mainH = mainLineHeightPx()
         val brightColor = if (curUseDynamic) mixWhiteAccent(curAccent, dimMixRatio) else 0xFFFFFFFF.toInt()
         brightPaint.color = brightColor
 
@@ -1034,10 +1434,9 @@ class LockScreenLyricView(context: Context) : View(context) {
         if (n == 0) {
             dimPaint.alpha = (darkAlpha * 255).toInt()
             for (ri in rl.rowTexts.indices) {
-                val rowY = topY + rowOffset(mainH, ri) - dimPaint.fontMetrics.ascent
-                canvas.drawText(rl.rowTexts[ri], baseX, rowY, dimPaint)
+                canvas.drawText(rl.rowTexts[ri], baseX, topY + rl.rowBaselines[ri], dimPaint)
             }
-            drawSubIfNeeded(canvas, line, rl, topY, baseX)
+            drawSubIfNeeded(canvas, rl, topY, baseX)
             return
         }
 
@@ -1051,7 +1450,7 @@ class LockScreenLyricView(context: Context) : View(context) {
         for (ri in 0 until rowCount) {
             val s = starts[ri]
             val e = if (ri + 1 < starts.size) starts[ri + 1] else n
-            val rowY = topY + rowOffset(mainH, ri) - dimPaint.fontMetrics.ascent
+            val rowY = topY + rl.rowBaselines[ri]
             for (i in s until e) {
                 canvas.drawText(words[i].text, baseX + (curWordStarts[i] - curWordStarts[s]), rowY, dimPaint)
             }
@@ -1066,7 +1465,7 @@ class LockScreenLyricView(context: Context) : View(context) {
                 val rowWidth = (curWordStarts[e - 1] - rowRel) + curWordWidths[e - 1]
                 val sung = (maskX - rowRel).coerceIn(0f, rowWidth)
                 if (sung <= 0f) continue
-                val rowY = topY + rowOffset(mainH, ri) - brightPaint.fontMetrics.ascent
+                val rowY = topY + rl.rowBaselines[ri]
                 canvas.save()
                 canvas.clipRect(baseX, topY, baseX + sung, topY + rl.height)
                 for (i in s until e) {
@@ -1075,23 +1474,19 @@ class LockScreenLyricView(context: Context) : View(context) {
                 canvas.restore()
             }
         }
-        drawSubIfNeeded(canvas, line, rl, topY, baseX)
+        drawSubIfNeeded(canvas, rl, topY, baseX)
     }
 
     /// 当前行副行（翻译/罗马音）绘制在主文本视觉行之后、块内底部。
-    private fun drawSubIfNeeded(canvas: Canvas, line: LockLyricLine, rl: RenderedLine, topY: Float, baseX: Float) {
-        if (!curShowTrans || line.sub.isEmpty()) return
-        val mainH = mainLineHeightPx()
-        val rows = rl.rowTexts.size.coerceAtLeast(1)
-        val mainBottom = topY + mainH + (rows - 1) * mainH * wrapFactor
-        val sidePad = dp(curSize) * 1.0f
-        val maxW = (width - sidePad * 2f).coerceAtLeast(0f)
-        val subRows = splitByChar(line.sub, maxW)
+    ///
+    /// 位置口径与 AM 一致：`mainH(rows) + 0.3em` 起，每个副行视觉行占 `1.5em` 行盒、
+    /// 盒内半行距居中。baseline 已在布局期算好（[RenderedLine.auxBaselines]），
+    /// 这里只做绘制；副行换行时每行位置同样来自该表，不会互相挤压。
+    private fun drawSubIfNeeded(canvas: Canvas, rl: RenderedLine, topY: Float, baseX: Float) {
+        if (!curShowTrans || rl.subRows.isEmpty()) return
         transPaint.alpha = (transOpacity * 255).toInt()
-        var y = mainBottom + transPaint.textSize * 0.3f - (transPaint.ascent() + transPaint.descent()) / 2f
-        for (s in subRows) {
-            canvas.drawText(s, baseX, y, transPaint)
-            y += transPaint.textSize * 1.5f
+        for (ri in rl.subRows.indices) {
+            canvas.drawText(rl.subRows[ri], baseX, topY + rl.auxBaselines[ri], transPaint)
         }
     }
 
@@ -1102,19 +1497,84 @@ class LockScreenLyricView(context: Context) : View(context) {
         return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
     }
 
-    private fun drawProgress(canvas: Canvas, w: Float, h: Float) {
-        if (durationMs <= 0) return
-        val barW = w * 0.72f
-        val barH = dp(3f)
-        val cx = (w - barW) / 2f
-        val cy = h - dp(70f)
-        val ratio = (smoothPosMs / durationMs).toFloat().coerceIn(0f, 1f)
-        val rect = RectF(cx, cy, cx + barW, cy + barH)
-        canvas.drawRoundRect(rect, barH / 2f, barH / 2f, progressBgPaint)
-        if (ratio > 0f) {
-            val fg = RectF(cx, cy, cx + barW * ratio, cy + barH)
-            canvas.drawRoundRect(fg, barH / 2f, barH / 2f, progressFgPaint)
+    // ================= 触摸 =================
+
+    private fun hitButton(x: Float, y: Float): CardButton? {
+        val rects = ensureCardGeometry()?.second ?: return null
+        return LockScreenCardLogic.hitTest(x, y, rects)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+                velocityTracker?.recycle()
+                velocityTracker = VelocityTracker.obtain().also { it.addMovement(event) }
+                pressedButton = hitButton(event.x, event.y)
+                if (pressedButton != null) requestRedraw()
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                velocityTracker?.addMovement(event)
+                // 向上拖动超过 24dp：视为解锁手势，取消按钮按压态
+                if (pressedButton != null && downY - event.y > dp(24f)) {
+                    pressedButton = null
+                    requestRedraw()
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                velocityTracker?.addMovement(event)
+                velocityTracker?.computeCurrentVelocity(1000)
+                val vy = velocityTracker?.yVelocity ?: 0f
+                velocityTracker?.recycle()
+                velocityTracker = null
+
+                val dy = event.y - downY
+                val moved = hypot(event.x - downX, dy)
+                val hit = hitButton(event.x, event.y)
+                val pressed = pressedButton
+                pressedButton = null
+
+                // 1) 上滑解锁（位移或速度任一达标）
+                if (LockScreenCardLogic.shouldUnlockSwipe(dy, vy, density())) {
+                    requestRedraw()
+                    listener?.onUnlockRequested()
+                    return true
+                }
+                // 2) 双击解锁：仅限卡片外的歌词区（卡片内双击多半是想连点按钮）
+                val inCard = ensureCardGeometry()?.first?.contains(event.x, event.y) == true
+                if (hit == null && !inCard && moved < dp(12f)) {
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastTapUpMs in 1 until 300L) {
+                        lastTapUpMs = 0L
+                        listener?.onUnlockRequested()
+                        return true
+                    }
+                    lastTapUpMs = now
+                } else {
+                    lastTapUpMs = 0L
+                }
+                // 3) 按钮点击：同一起止按钮 + 位移 < 12dp
+                if (pressed != null && pressed == hit && moved < dp(12f)) {
+                    performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                    listener?.onCardAction(pressed)
+                }
+                requestRedraw()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                velocityTracker?.recycle()
+                velocityTracker = null
+                if (pressedButton != null) {
+                    pressedButton = null
+                    requestRedraw()
+                }
+                return true
+            }
         }
+        return true
     }
 
     private fun dp(v: Float): Float = v * resources.displayMetrics.density

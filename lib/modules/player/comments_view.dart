@@ -1461,7 +1461,9 @@ class _CommentsViewState extends State<CommentsView> {
           children: [
             TextSpan(
               text: content,
-              style: TextStyle(
+              // 必须从主题派生 fontFamily：裸 TextStyle 会让 RichText 走引擎
+              // 默认字体，绕过全局字体设置（与 playlist_comments_view 同口径）。
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                 color: primaryTextColor,
                 height: 1.4,
                 fontSize: fontSize,
@@ -1490,7 +1492,8 @@ class _CommentsViewState extends State<CommentsView> {
         children: [
           TextSpan(
             text: '${content.substring(0, 120)}...',
-            style: TextStyle(
+            // 同 _buildContent 另一分支：从主题派生 fontFamily，跟随全局字体。
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: primaryTextColor,
               height: 1.4,
               fontSize: fontSize,

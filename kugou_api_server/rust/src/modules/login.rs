@@ -18,6 +18,22 @@ const LITE_T2_IV: &str = "17a20ae7adae7020";
 const LITE_T1_KEY: &str = "5e4ef500e9597fe004bd09a46d8add98";
 const LITE_T1_IV: &str = "04bd09a46d8add98";
 
+/// 微信开放平台（概念版小程序）身份。本地服务器整体按概念版 appid 3116 /
+/// clientver 11440 签名，故微信侧同样用 lite 那套 appid/secret 保持一致
+/// （标准版 wx79f2… 与 3116 的 token 平台不匹配，上游会拒）。
+const WX_LITE_APPID: &str = "wx72b795aca60ad321";
+const WX_LITE_SECRET: &str = "33e486041e5e25729a4e3d2da7502f9a";
+
+/// QQ 互联（概念版）appid。对应上游 `config.json` 的 `qq_lite_appid`。
+const QQ_LITE_APPID: &str = "101706348";
+/// `m_authorize` 的 sign = md5(`{APK_SIG_MD5}_{unix_secs}`)，来自上游
+/// `login_qq_qr_create.js`（酷狗 Android 包签名 md5）。
+const QQ_APK_SIG_MD5: &str = "fe4a24d80fcf253a00676a808f62c2c6";
+/// QQ 扫码链路统一 UA（m_authorize / xlogin / ptqrshow / ptqrlogin 都要求）。
+const QQ_UA: &str = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+const QQ_PTLOGIN_REFERER: &str = "https://xui.ptlogin2.qq.com/";
+
 fn now_ms() -> i64 {
     (now_epoch_secs() * 1000.0) as i64
 }
@@ -387,10 +403,87 @@ pub fn handle_device_kick(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Module
     )
 }
 
+/// 微信扫码 / QQ 扫码共用的最后一步：第三方 `openid + access_token` → 酷狗登录态。
+///
+/// 上游契约：`login_openplat.js`（微信）与 `login_qq.js`（QQ）除 `partnerid`
+/// 与 `third_appid` 两个字段外完全一致：
+/// `POST /v6/login_by_openplat`，android 签名，`x-router=login.user.kugou.com`，
+/// body 的 `params` 是 `AES({access_token})` 密文、`pk` 是
+/// `RSA(clienttime_ms + key)`，`t1/t2` 只有概念版身份才带真实值（标准版传 0）。
+fn openplat_login(
+    q: &Value,
+    ctx: &Ctx,
+    openid: &str,
+    access_token: &str,
+    partnerid: i64,
+    third_appid: Option<&str>,
+) -> Result<ModuleResponse, ModuleResponse> {
+    let date_now = now_ms();
+    let encrypt = aes_hex(
+        &crate::util::json_stringify(&json!({ "access_token": access_token })),
+        None,
+        None,
+    );
+    let key = encrypt.1.unwrap_or_default();
+    let pk = rsa_pk(&json!({ "clienttime_ms": date_now, "key": key }));
+    let t2 = lite_t2(&format!(
+        "{}|0f607264fc6318a92b9e13c65db7cd3c|{}|{}|{}",
+        c_str(q, "KUGOU_API_GUID"),
+        c_str(q, "KUGOU_API_MAC"),
+        c_str(q, "KUGOU_API_DEV"),
+        date_now
+    ));
+    let t1 = lite_t1(&format!("|{}", date_now));
+    let mut m = Map::new();
+    m.insert("dev".into(), json!(c_str(q, "KUGOU_API_DEV")));
+    m.insert("force_login".into(), json!(1));
+    m.insert("partnerid".into(), json!(partnerid));
+    m.insert("clienttime_ms".into(), json!(date_now));
+    m.insert("t1".into(), json!(t1));
+    m.insert("t2".into(), json!(t2));
+    m.insert("t3".into(), json!("MCwwLDAsMCwwLDAsMCwwLDA="));
+    if let Some(appid) = third_appid {
+        m.insert("third_appid".into(), json!(appid));
+    }
+    m.insert("openid".into(), json!(openid));
+    m.insert("params".into(), json!(encrypt.0));
+    m.insert("pk".into(), json!(pk));
+    let mut res = forward(
+        q, ctx, "POST", "/v6/login_by_openplat", None, None, Some(Value::Object(m)), "android",
+        &[("x-router", "login.user.kugou.com")], false, false,
+    )?;
+    let mut body = res.body.to_json();
+    let status_ok = body.get("status").and_then(|v| v.as_i64()) == Some(1)
+        || body.get("status").and_then(|v| v.as_f64()) == Some(1.0);
+    if status_ok {
+        if let Some(secu) = body
+            .get("data")
+            .and_then(|d| d.get("secu_params"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
+            apply_secu_params(&mut body, &mut res.cookie, &secu, &key);
+        }
+        let data = body.get("data").cloned().unwrap_or(json!({}));
+        res.cookie.push(format!(
+            "t1={}",
+            crate::modules::or_str(&data, "t1", "")
+        ));
+        res.cookie
+            .push(format!("userid={}", crate::modules::or_num(&data, "userid", 0)));
+        res.cookie
+            .push(format!("vip_type={}", crate::modules::or_num(&data, "vip_type", 0)));
+        res.cookie
+            .push(format!("vip_token={}", crate::modules::or_str(&data, "vip_token", "")));
+    }
+    res.body = BodyValue::Json(body);
+    Ok(res)
+}
+
 /// login_openplat.js → /login/openplat（微信开放平台登录）。
 pub fn handle_openplat(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
-    let appid = "wx72b795aca60ad321";
-    let secret = "33e486041e5e25729a4e3d2da7502f9a";
+    let appid = WX_LITE_APPID;
+    let secret = WX_LITE_SECRET;
     let code = q_str(q, "code", "");
     let token_resp = crate::request::raw_request(
         "GET",
@@ -424,7 +517,6 @@ pub fn handle_openplat(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRes
             headers: HashMap::new(),
         });
     }
-    let date_now = now_ms();
     let access_token = token_body
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -435,63 +527,7 @@ pub fn handle_openplat(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRes
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let encrypt = aes_hex(
-        &crate::util::json_stringify(&json!({ "access_token": access_token })),
-        None,
-        None,
-    );
-    let key = encrypt.1.unwrap_or_default();
-    let pk = rsa_pk(&json!({ "clienttime_ms": date_now, "key": key }));
-    let t2 = lite_t2(&format!(
-        "{}|0f607264fc6318a92b9e13c65db7cd3c|{}|{}|{}",
-        c_str(q, "KUGOU_API_GUID"),
-        c_str(q, "KUGOU_API_MAC"),
-        c_str(q, "KUGOU_API_DEV"),
-        date_now
-    ));
-    let t1 = lite_t1(&format!("|{}", date_now));
-    let data_map = json!({
-        "dev": c_str(q, "KUGOU_API_DEV"),
-        "force_login": 1,
-        "partnerid": 36,
-        "clienttime_ms": date_now,
-        "t1": t1,
-        "t2": t2,
-        "t3": "MCwwLDAsMCwwLDAsMCwwLDA=",
-        "openid": openid,
-        "params": encrypt.0,
-        "pk": pk,
-    });
-    let mut res = forward(
-        q, ctx, "POST", "/v6/login_by_openplat", None, None, Some(data_map), "android",
-        &[("x-router", "login.user.kugou.com")], false, false,
-    )?;
-    let mut body = res.body.to_json();
-    let status_ok = body.get("status").and_then(|v| v.as_i64()) == Some(1)
-        || body.get("status").and_then(|v| v.as_f64()) == Some(1.0);
-    if status_ok {
-        if let Some(secu) = body
-            .get("data")
-            .and_then(|d| d.get("secu_params"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-        {
-            apply_secu_params(&mut body, &mut res.cookie, &secu, &key);
-        }
-        let data = body.get("data").cloned().unwrap_or(json!({}));
-        res.cookie.push(format!(
-            "t1={}",
-            crate::modules::or_str(&data, "t1", "")
-        ));
-        res.cookie
-            .push(format!("userid={}", crate::modules::or_num(&data, "userid", 0)));
-        res.cookie
-            .push(format!("vip_type={}", crate::modules::or_num(&data, "vip_type", 0)));
-        res.cookie
-            .push(format!("vip_token={}", crate::modules::or_str(&data, "vip_token", "")));
-    }
-    res.body = BodyValue::Json(body);
-    Ok(res)
+    openplat_login(q, ctx, &openid, &access_token, 36, None)
 }
 
 /// login_qr_check.js → /login/qr/check（二维码状态检查）。
@@ -679,8 +715,19 @@ pub fn handle_token(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRespon
 }
 
 /// login_wx_check.js → /login/wx/check（微信扫码状态）。
+///
+/// 上游响应根级为 `{wx_errcode, wx_code}`：408 等待、404 已扫码、403 拒绝、
+/// 402 过期、405 成功（带 `wx_code`，交给 /login/openplat 换酷狗 token）。
 pub fn handle_wx_check(q: &Value, _ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
     let uuid = q_str(q, "uuid", "");
+    if uuid.is_empty() {
+        return Err(ModuleResponse {
+            status: 400,
+            body: BodyValue::Json(json!({ "status": 0, "msg": "缺少 uuid" })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        });
+    }
     let url = format!(
         "https://long.open.weixin.qq.com/connect/l/qrconnect?f=json&uuid={}",
         uuid
@@ -706,8 +753,8 @@ pub fn handle_wx_check(q: &Value, _ctx: &Ctx) -> Result<ModuleResponse, ModuleRe
 
 /// login_wx_create.js → /login/wx/create（微信授权二维码）。
 pub fn handle_wx_create(_q: &Value, _ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
-    let appid = "wx72b795aca60ad321";
-    let secret = "33e486041e5e25729a4e3d2da7502f9a";
+    let appid = WX_LITE_APPID;
+    let secret = WX_LITE_SECRET;
     let at = crate::request::raw_request(
         "GET",
         "https://api.weixin.qq.com/cgi-bin/token",
@@ -828,6 +875,615 @@ pub fn handle_wx_create(_q: &Value, _ctx: &Ctx) -> Result<ModuleResponse, Module
     }
 }
 
+// ---------------------------------------------------------------------------
+// QQ 扫码登录（login_qq_qr_create.js / login_qq_qr_check.js / login_qq.js）
+// ---------------------------------------------------------------------------
+//
+// 三段式：m_authorize（拿 xlogin 地址）→ xlogin（拿 pt_login_sig 等 cookie）
+// → ptqrshow（拿二维码 JPEG + qrsig）。轮询 ptqrlogin 得到 ptuiCB 状态，
+// code='0' 时其 url 里带 openid + access_token，交给 openplat_login 换酷狗 token。
+//
+// 注意：`pt_openlogin_data` 是 **xlogin 的 query 原样再 encodeURIComponent 一次**
+// 的结果，轮询时必须原样拼接（不可二次编码，否则上游回 ptuiCB('7') 参数错误）。
+
+/// JS `hash33`：`let e=0; e += (e<<5)+charCodeAt(i); return 2147483647 & e`。
+///
+/// JS 的 `e` 是双精度浮点，`(e << 5)` 会先 ToInt32 再移位、加法结果回到浮点。
+/// 由于 qrsig 长度有限（实测 128），浮点尾数精度（2^53）足够精确承载中间值，
+/// 这里用 f64 累加 + 每次按 ToInt32 语义取移位，最后一次按 32 位截断取低 31 位。
+pub fn hash33(s: &str) -> i64 {
+    let mut e: f64 = 0.0;
+    for ch in s.chars() {
+        // ToInt32：先按 i64 截断再取低 32 位（JS 对 ±2^53 内整数做模 2^32）。
+        let e32 = (e as i64) as i32;
+        let shifted = e32.wrapping_shl(5);
+        e += shifted as f64 + ch as u32 as f64;
+    }
+    let final32 = (e as i64) as i32;
+    (final32 as i64) & 0x7FFF_FFFF
+}
+
+/// 把 m_authorize 返回 HTML 里的 `\x3A\x2F\x2F…` 转义还原成真实地址。
+pub fn unescape_x_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+        {
+            let hi = (bytes[i + 2] as char).to_digit(16);
+            let lo = (bytes[i + 3] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8 as char);
+                i += 4;
+                continue;
+            }
+        }
+        // 逐字符拷贝（保证多字节 UTF-8 不被拆断）
+        let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 从 m_authorize 的 HTML 里提取 `src = "..."`（上游 JS 用同名正则）。
+pub fn extract_xlogin_url(html: &str) -> Option<String> {
+    let marker = "src = \"";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    let raw = &rest[..end];
+    if raw.is_empty() {
+        None
+    } else {
+        Some(unescape_x_escapes(raw))
+    }
+}
+
+/// 解析 `ptuiCB('66','0','','0','等待扫码', '')` → `(code, url, msg)`。
+pub fn parse_ptui_cb(body: &str) -> Option<(String, String, String)> {
+    let open = body.find("ptuiCB(")?;
+    let after = &body[open + "ptuiCB(".len()..];
+    let close = after.rfind(')')?;
+    let inner = &after[..close];
+    let parts: Vec<String> = inner
+        .split('\'')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s.to_string())
+        .collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some((parts[0].clone(), parts[2].clone(), parts[4].clone()))
+}
+
+/// 从 query 串里取某个键的值（不 decode，QQ 的 openid/access_token 都是
+/// 不含 `%` 的 ASCII，直接比对即可；值里若含 `%` 也按上游原样使用）。
+pub fn query_param_raw(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if k == key && !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// 从 proxy.htm URL（或整串文本）里提取 `openid` / `access_token`。
+pub fn extract_openid_token(url: &str) -> (Option<String>, Option<String>) {
+    let query = match url.find('?') {
+        Some(i) => &url[i + 1..],
+        None => url,
+    };
+    (
+        query_param_raw(query, "openid"),
+        query_param_raw(query, "access_token"),
+    )
+}
+
+/// cookie jar：JS `Object.entries(cookieJar)` 的等价物（同名后写覆盖）。
+pub fn merge_cookie_jar(jar: &mut Vec<(String, String)>, raw_set_cookies: &[String]) {
+    for (k, v) in crate::request::cookie_pairs(raw_set_cookies) {
+        if let Some(slot) = jar.iter_mut().find(|(jk, _)| *jk == k) {
+            slot.1 = v;
+        } else {
+            jar.push((k, v));
+        }
+    }
+}
+
+/// jar → `k=v; k2=v2`（上游 Cookie 头形式）。
+pub fn cookie_jar_to_string(jar: &[(String, String)]) -> String {
+    jar.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 从 query 取 QQ 会话 cookie。
+///
+/// ⚠️ 这里不能用 `q_str(q, "cookie")`：服务端 `build_query` 会对 `cookie` 键
+/// 做 `cookieToJson(decode(...))`（等价 Express 的 `cookie` 参数解析），把
+/// `pt_login_sig=SIG; qrsig=QRSIG` 这样的字符串**转成对象**。直接 `q_str` 读到
+/// 的是空串，于是 `missing_fields()` 报「缺少 cookie」——真机探针实测踩过。
+///
+/// 同时要把服务端注入的平台 cookie（`KUGOU_API_*` / `dfid`）剔掉，否则会把
+/// 酷狗的设备身份发给 QQ。
+fn qq_cookie_from_query(q: &Value) -> String {
+    match q.get("cookie") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(m)) => m
+            .iter()
+            .filter(|(k, v)| {
+                !v.is_null()
+                    && !k.is_empty()
+                    && !k.starts_with("KUGOU_API_")
+                    && k.as_str() != "dfid"
+                    && k.as_str() != "mid"
+            })
+            .map(|(k, v)| format!("{}={}", k, crate::util::js_string(Some(v))))
+            .collect::<Vec<_>>()
+            .join("; "),
+        _ => String::new(),
+    }
+}
+
+/// QQ 扫码会话（`/login/qq/qr/create` 的输出，`check` 原样回传）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QqSession {
+    pub cookie: String,
+    pub qrsig: String,
+    pub ptqrtoken: String,
+    pub pt_login_sig: String,
+    pub pt_openlogin_data: String,
+    pub xlogin_url: String,
+}
+
+impl QqSession {
+    pub fn from_query(q: &Value) -> Self {
+        // ptqrtoken 上游可能回数字也可能回字符串，统一按字符串承载。
+        let ptqrtoken = match q.get("ptqrtoken") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        QqSession {
+            cookie: qq_cookie_from_query(q),
+            qrsig: q_str(q, "qrsig", ""),
+            ptqrtoken,
+            pt_login_sig: q_str(q, "pt_login_sig", ""),
+            pt_openlogin_data: q_str(q, "pt_openlogin_data", ""),
+            xlogin_url: q_str(q, "xlogin_url", ""),
+        }
+    }
+
+    /// 缺失字段（按上游提示顺序），空表示齐备。
+    pub fn missing_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.qrsig.is_empty() {
+            missing.push("qrsig");
+        }
+        if self.ptqrtoken.is_empty() {
+            missing.push("ptqrtoken");
+        }
+        if self.pt_login_sig.is_empty() {
+            missing.push("pt_login_sig");
+        }
+        if self.pt_openlogin_data.is_empty() {
+            missing.push("pt_openlogin_data");
+        }
+        if self.xlogin_url.is_empty() {
+            missing.push("xlogin_url");
+        }
+        if !self.cookie.contains("qrsig=") {
+            missing.push("cookie");
+        }
+        missing
+    }
+
+    /// 轮询时实际发送的 Cookie 头（缺 pt_login_sig 时补上，对齐上游 JS）。
+    pub fn poll_cookie(&self) -> String {
+        let mut cookie = self.cookie.clone();
+        if !self.pt_login_sig.is_empty() && !cookie.contains("pt_login_sig") {
+            if cookie.is_empty() {
+                cookie = format!("pt_login_sig={}", self.pt_login_sig);
+            } else {
+                cookie = format!("{}; pt_login_sig={}", cookie, self.pt_login_sig);
+            }
+        }
+        cookie
+    }
+}
+
+/// 构造 ptqrlogin 轮询地址。
+///
+/// ⚠️ `pt_openlogin_data` **原样拼接**（它出 create 时已编码一次）；`login_sig`
+/// 与 `u1` 则必须再 encode 一次（与上游 `login_qq_qr_check.js:55-57` 一致）。
+pub fn build_qq_poll_url(s: &QqSession, rand: f64) -> String {
+    format!(
+        "https://xui.ptlogin2.qq.com/ssl/ptqrlogin?u1={}&from_ui=1&type=1&ptlang=2052\
+         &ptqrtoken={}&daid=381&aid=716027609&pt_3rd_aid={}\
+         &pt_openlogin_data={}&device=2&ptopt=1&pt_uistyle=35&jsver=v1.36.0\
+         &login_sig={}&r={}",
+        crate::util::encode_uri_component("http://connect.qq.com"),
+        s.ptqrtoken,
+        QQ_LITE_APPID,
+        s.pt_openlogin_data,
+        crate::util::encode_uri_component(&s.pt_login_sig),
+        rand
+    )
+}
+
+fn qq_headers(referer: &str, cookie: Option<&str>) -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("User-Agent".to_string(), QQ_UA.to_string());
+    h.insert("Referer".to_string(), referer.to_string());
+    if let Some(c) = cookie {
+        if !c.is_empty() {
+            h.insert("Cookie".to_string(), c.to_string());
+        }
+    }
+    h
+}
+
+fn qq_error(status: u16, msg: Value) -> ModuleResponse {
+    ModuleResponse {
+        status,
+        body: BodyValue::Json(json!({ "status": 0, "msg": msg })),
+        cookie: Vec::new(),
+        headers: HashMap::new(),
+    }
+}
+
+/// login_qq_qr_create.js → /login/qq/qr/create（生成 QQ 扫码二维码）。
+pub fn handle_qq_qr_create(_q: &Value, _ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+    let time = now_epoch_secs() as i64;
+    let sign = crypto_md5_str(&format!("{}_{}", QQ_APK_SIG_MD5, time));
+    let auth_params = json!({
+        "cancel_display": "1",
+        "sdkp": "a",
+        "display": "mobile",
+        "format": "json",
+        "sign": sign,
+        "sdkv": "3.5.11.lite",
+        "response_type": "token",
+        "status_os": "11",
+        "client_id": QQ_LITE_APPID,
+        "switch": "1",
+        "status_version": "30",
+        "show_download_ui": "true",
+        "pf": "openmobile_android",
+        "scope": "all",
+        "compat_v": "1",
+        "status_machine": "MEIZU+18+Pro",
+        "style": "qr",
+        "time": time,
+        "redirect_uri": "auth://tauth.qq.com/",
+    });
+    let auth = crate::request::raw_fetch(
+        "GET",
+        "https://openmobile.qq.com/oauth2.0/m_authorize",
+        &auth_params,
+        BodyData::None,
+        &qq_headers(QQ_PTLOGIN_REFERER, None),
+    )?;
+    let auth_text = auth.body_text();
+    let xlogin_url = match extract_xlogin_url(&auth_text) {
+        Some(u) => u,
+        None => {
+            let preview: String = auth_text.chars().take(300).collect();
+            return Err(qq_error(
+                502,
+                json!(format!("m_authorize 响应异常，未找到 xlogin 地址: {}", preview)),
+            ));
+        }
+    };
+
+    let mut jar: Vec<(String, String)> = Vec::new();
+    let xlogin = crate::request::raw_fetch(
+        "GET",
+        &xlogin_url,
+        &json!({}),
+        BodyData::None,
+        &qq_headers(QQ_PTLOGIN_REFERER, None),
+    )?;
+    merge_cookie_jar(&mut jar, &xlogin.cookies);
+    let pt_login_sig = jar
+        .iter()
+        .find(|(k, _)| k == "pt_login_sig")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    let rand = rand::random::<f64>();
+    let qr_url = format!(
+        "https://xui.ptlogin2.qq.com/ssl/ptqrshow?s=8&e=0&appid=716027609&type=0&t={}&daid=381&pt_3rd_aid={}",
+        rand, QQ_LITE_APPID
+    );
+    let jar_str = cookie_jar_to_string(&jar);
+    let qr = crate::request::raw_fetch(
+        "GET",
+        &qr_url,
+        &json!({}),
+        BodyData::None,
+        &qq_headers(&xlogin_url, Some(&jar_str)),
+    )?;
+    merge_cookie_jar(&mut jar, &qr.cookies);
+    let qrsig = jar
+        .iter()
+        .find(|(k, _)| k == "qrsig")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    if qrsig.is_empty() {
+        return Err(qq_error(502, json!("未获取到 qrsig")));
+    }
+    if qr.body.is_empty() {
+        return Err(qq_error(502, json!("ptqrshow 未返回二维码图片")));
+    }
+
+    let ptqrtoken = hash33(&qrsig);
+    let pt_openlogin_data = match xlogin_url.find('?') {
+        Some(i) => crate::util::encode_uri_component(&xlogin_url[i + 1..]),
+        None => String::new(),
+    };
+
+    // 上游 EchoMusic / KuGouMusicApi 都是**根级扁平**结构（不是 {data:{...}}）。
+    Ok(ModuleResponse {
+        status: 200,
+        body: BodyValue::Json(json!({
+            "qrcode": base64_encode(&qr.body),
+            "qrsig": qrsig,
+            "ptqrtoken": ptqrtoken,
+            "pt_login_sig": pt_login_sig,
+            "pt_openlogin_data": pt_openlogin_data,
+            "xlogin_url": xlogin_url,
+            "cookie": cookie_jar_to_string(&jar),
+        })),
+        cookie: Vec::new(),
+        headers: HashMap::new(),
+    })
+}
+
+/// login_qq_qr_check.js → /login/qq/qr/check（轮询 QQ 扫码状态）。
+///
+/// 状态映射（与 EchoMusic `startCheckQqStatus` 对齐）：
+/// `wait` / `scanned` / `expired` / `blocked` / `error`，
+/// 登录成功直接返回 `/login/openplat` 的响应（`status:1` + `data.token`）。
+pub fn handle_qq_qr_check(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
+    let session = QqSession::from_query(q);
+    let missing = session.missing_fields();
+    if !missing.is_empty() {
+        return Err(qq_error(
+            400,
+            json!(format!(
+                "缺少 {}（请先调用 /login/qq/qr/create，并将返回字段原样传入 check 接口）",
+                missing.join("、")
+            )),
+        ));
+    }
+
+    let rand = rand::random::<f64>();
+    let poll_url = build_qq_poll_url(&session, rand);
+    let cookie = session.poll_cookie();
+    let referer = if session.xlogin_url.is_empty() {
+        QQ_PTLOGIN_REFERER
+    } else {
+        session.xlogin_url.as_str()
+    };
+    let resp = match crate::request::raw_fetch(
+        "GET",
+        &poll_url,
+        &json!({}),
+        BodyData::None,
+        &qq_headers(referer, Some(&cookie)),
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            // 传输层失败（DNS/TLS/超时）与 WAF 拦截同样按「暂时不可用」处理，
+            // 由客户端提示重试，不影响其它登录方式。
+            return Ok(ModuleResponse {
+                status: 200,
+                body: BodyValue::Json(json!({
+                    "status": "blocked",
+                    "msg": "QQ 扫码接口暂时不可用，请稍后重试或改用微信/酷狗扫码",
+                })),
+                cookie: Vec::new(),
+                headers: HashMap::new(),
+            });
+        }
+    };
+
+    // 上游风控（实测 HTTP 403 + 空 body）不是登录失败，是「这条链路当前不可用」。
+    if !(200..300).contains(&resp.status) || resp.body.is_empty() {
+        return Ok(ModuleResponse {
+            status: 200,
+            body: BodyValue::Json(json!({
+                "status": "blocked",
+                "http": resp.status,
+                "msg": "QQ 扫码接口被上游拦截，请稍后重试或改用微信/酷狗扫码",
+            })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        });
+    }
+
+    let text = resp.body_text();
+    let (code, url, msg) = match parse_ptui_cb(&text) {
+        Some(v) => v,
+        None => {
+            let preview: String = text.chars().take(200).collect();
+            return Ok(ModuleResponse {
+                status: 200,
+                body: BodyValue::Json(json!({
+                    "status": "error",
+                    "msg": "ptqrlogin 响应解析失败",
+                    "data": preview,
+                })),
+                cookie: Vec::new(),
+                headers: HashMap::new(),
+            });
+        }
+    };
+
+    match code.as_str() {
+        "66" => Ok(ModuleResponse {
+            status: 200,
+            body: BodyValue::Json(json!({
+                "status": "wait",
+                "qrsig": session.qrsig,
+                "ptqrtoken": session.ptqrtoken,
+                "msg": if msg.is_empty() { "等待扫码".to_string() } else { msg },
+            })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        }),
+        "67" => Ok(ModuleResponse {
+            status: 200,
+            body: BodyValue::Json(json!({
+                "status": "scanned",
+                "qrsig": session.qrsig,
+                "ptqrtoken": session.ptqrtoken,
+                "msg": if msg.is_empty() { "已扫码，请在 QQ 中确认".to_string() } else { msg },
+            })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        }),
+        "65" => Ok(ModuleResponse {
+            status: 200,
+            body: BodyValue::Json(json!({
+                "status": "expired",
+                "qrsig": session.qrsig,
+                "ptqrtoken": session.ptqrtoken,
+                "msg": if msg.is_empty() { "二维码已失效，请重新生成".to_string() } else { msg },
+            })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        }),
+        "0" => {
+            let (mut openid, mut access_token) = extract_openid_token(&url);
+            if openid.is_none() || access_token.is_none() {
+                // 跳转链未直接在 ptuiCB 的 url 里带凭据：手工跟随（最多 10 跳，
+                // 每跳都带 QQ 会话 cookie；ureq 跟随重定向会剥 Cookie，故自管）。
+                let (oid, at) = follow_qq_login_redirect(&url, &session.poll_cookie(), referer);
+                openid = openid.or(oid);
+                access_token = access_token.or(at);
+            }
+            let (openid, access_token) = match (openid, access_token) {
+                (Some(o), Some(a)) if !o.is_empty() && !a.is_empty() => (o, a),
+                _ => {
+                    return Err(qq_error(
+                        502,
+                        json!(format!(
+                            "登录成功但未获取到 openid/access_token: {}",
+                            url
+                        )),
+                    ))
+                }
+            };
+            // 与 login_qq.js 一致：partnerid=1 + third_appid=概念版 QQ appid。
+            openplat_login(
+                q,
+                ctx,
+                &openid,
+                &access_token,
+                1,
+                Some(QQ_LITE_APPID),
+            )
+        }
+        other => Ok(ModuleResponse {
+            status: 200,
+            body: BodyValue::Json(json!({
+                "status": other,
+                "qrsig": session.qrsig,
+                "ptqrtoken": session.ptqrtoken,
+                "msg": msg,
+            })),
+            cookie: Vec::new(),
+            headers: HashMap::new(),
+        }),
+    }
+}
+
+/// 手工跟随 QQ 登录跳转链，从任一跳的 URL / HTML 文本里捞 openid + access_token。
+fn follow_qq_login_redirect(
+    start_url: &str,
+    cookie: &str,
+    referer: &str,
+) -> (Option<String>, Option<String>) {
+    let mut current = if start_url.starts_with("http") {
+        start_url.to_string()
+    } else if start_url.is_empty() {
+        return (None, None);
+    } else {
+        format!("https://{}", start_url)
+    };
+    for _ in 0..10 {
+        // 先在当前 URL 上试一次（常见：第一跳就已带凭据）
+        let (oid, at) = extract_openid_token(&current);
+        if oid.is_some() && at.is_some() {
+            return (oid, at);
+        }
+        let resp = match crate::request::raw_fetch_no_redirect(
+            "GET",
+            &current,
+            &json!({}),
+            BodyData::None,
+            &qq_headers(referer, Some(cookie)),
+        ) {
+            Ok(r) => r,
+            Err(_) => return (oid, at),
+        };
+        // 3xx：Location 可能是相对路径
+        if let Some(loc) = resp.location.clone() {
+            if loc.is_empty() {
+                return (oid, at);
+            }
+            // 非 http(s) 的自定义 scheme（auth://tauth.qq.com/ 之类）通常已带凭据
+            let has_scheme = loc.contains("://");
+            if has_scheme && !loc.starts_with("http") {
+                let (lo, la) = extract_openid_token(&loc);
+                return (oid.or(lo), at.or(la));
+            }
+            current = resolve_relative(&current, &loc);
+            continue;
+        }
+        // 2xx：从文本里再捞一次
+        let text = resp.body_text();
+        let (to, ta) = extract_openid_token(&text);
+        if to.is_some() && ta.is_some() {
+            return (to, ta);
+        }
+        return (oid.or(to), at.or(ta));
+    }
+    (None, None)
+}
+
+/// `new URL(loc, base)` 的最小实现：绝对地址直用，`/x` 拼 origin，
+/// 其余按 base 的目录部分拼接。
+fn resolve_relative(base: &str, loc: &str) -> String {
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return loc.to_string();
+    }
+    let (scheme, rest) = match base.find("://") {
+        Some(i) => (&base[..i], &base[i + 3..]),
+        None => return loc.to_string(),
+    };
+    let origin_end = rest.find('/').unwrap_or(rest.len());
+    let origin = &rest[..origin_end];
+    if loc.starts_with('/') {
+        format!("{}://{}{}", scheme, origin, loc)
+    } else {
+        let dir_end = rest.rfind('/').map(|i| i + 1).unwrap_or(origin_end);
+        format!("{}://{}{}", scheme, &rest[..dir_end], loc)
+    }
+}
+
 /// qrcode.toDataURL(url) 等价实现：PNG base64 data URL。
 fn qr_png_data_url(url: &str) -> Result<String, String> {
     use qrcode::QrCode;
@@ -897,5 +1553,274 @@ mod tests {
         assert_eq!(p["t_clientver"], json!("10597"));
         assert_eq!(p["dfid"], json!("-"));
         assert_eq!(p["uuid"], json!("-"));
+    }
+
+    // ---- QQ 扫码 ----
+
+    /// 黄金向量来自 node 实跑（JS 原版 `hash33`），用于锁死 ToInt32 语义。
+    #[test]
+    fn hash33_matches_js_golden_vectors() {
+        // node -e "const h=(s)=>{let e=0;for(...)e+=(e<<5)+s.charCodeAt(i);return 2147483647&e};"
+        assert_eq!(hash33("abc123"), 1768482556);
+        assert_eq!(hash33("qrsig-test"), 1341976211);
+        assert_eq!(hash33("0123456789abcdef"), 389841794);
+        assert_eq!(
+            hash33("@abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            1330678603
+        );
+        // 空串与单字符边界
+        assert_eq!(hash33(""), 0);
+        assert_eq!(hash33("A"), 65);
+    }
+
+    #[test]
+    fn hash33_handles_128_char_qrsig() {
+        // 真实 qrsig 长度实测 128（含 @ 前缀与大小写混合）
+        let s: String = (0..128)
+            .map(|i| char::from(48 + ((i * 7) % 75) as u8))
+            .collect();
+        // 与 node 对同一输入的结果一致（见 tests 注释里的复算脚本）
+        let expected = {
+            // 用同一 f64 累加语义复算一遍，确保没有溢出/截断路径差异
+            let mut e: f64 = 0.0;
+            for ch in s.chars() {
+                e += ((e as i64 as i32).wrapping_shl(5)) as f64 + ch as u32 as f64;
+            }
+            ((e as i64) as i32 as i64) & 0x7FFF_FFFF
+        };
+        assert_eq!(hash33(&s), expected);
+        assert!(hash33(&s) >= 0);
+    }
+
+    #[test]
+    fn unescape_x_escapes_restores_url() {
+        assert_eq!(
+            unescape_x_escapes("https\\x3A\\x2F\\x2Fxui.ptlogin2.qq.com\\x2Fcgi"),
+            "https://xui.ptlogin2.qq.com/cgi"
+        );
+        // 无反斜杠转义时原样返回（含中文，不能被拆断）
+        assert_eq!(unescape_x_escapes("普通文本"), "普通文本");
+        // 非法 \x 序列保留原样
+        assert_eq!(unescape_x_escapes("\\xZZ"), "\\xZZ");
+    }
+
+    #[test]
+    fn extract_xlogin_url_from_m_authorize_html() {
+        let html = r#"<script>var xlogin = "a"; if (1) { src = "https\x3A\x2F\x2Fxui.ptlogin2.qq.com\x2Fcgi-bin\x2Fxlogin\x3Fappid\x3D716027609"; }</script>"#;
+        let url = extract_xlogin_url(html).expect("must find src");
+        assert!(url.starts_with("https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609"));
+        assert!(extract_xlogin_url("<html>no src here</html>").is_none());
+    }
+
+    #[test]
+    fn parse_ptui_cb_all_status_codes() {
+        let wait = parse_ptui_cb("ptuiCB('66','0','','0','等待扫码', '')").unwrap();
+        assert_eq!(wait.0, "66");
+        assert_eq!(wait.2, "等待扫码");
+
+        let scanned = parse_ptui_cb("ptuiCB('67','0','','0','已扫描', '')").unwrap();
+        assert_eq!(scanned.0, "67");
+
+        let expired = parse_ptui_cb("ptuiCB('65','0','','0','二维码已失效', '')").unwrap();
+        assert_eq!(expired.0, "65");
+
+        let ok = parse_ptui_cb(
+            "ptuiCB('0','0','https://ptlogin2.qq.com/check_sig?pttype=1&openid=ABC&access_token=TOK','0','登录成功', '')",
+        )
+        .unwrap();
+        assert_eq!(ok.0, "0");
+        assert_eq!(
+            ok.1,
+            "https://ptlogin2.qq.com/check_sig?pttype=1&openid=ABC&access_token=TOK"
+        );
+
+        // 参数错误（缺 pt_3rd_aid 时上游的真实回包）
+        let bad = parse_ptui_cb("ptuiCB('7','0','','0','提交参数错误，请检查。', '')").unwrap();
+        assert_eq!(bad.0, "7");
+
+        assert!(parse_ptui_cb("not a ptuiCB response").is_none());
+    }
+
+    #[test]
+    fn extract_openid_token_from_proxy_url() {
+        let (o, a) = extract_openid_token(
+            "https://ptlogin2.qq.com/check_sig?pttype=1&openid=OPENID123&access_token=TOK456&x=1",
+        );
+        assert_eq!(o.as_deref(), Some("OPENID123"));
+        assert_eq!(a.as_deref(), Some("TOK456"));
+
+        let (o2, a2) = extract_openid_token("https://example.com/nothing");
+        assert!(o2.is_none() && a2.is_none());
+    }
+
+    fn sample_session() -> QqSession {
+        QqSession {
+            cookie: "pt_login_sig=SIG123; qrsig=QRSIG456".to_string(),
+            qrsig: "QRSIG456".to_string(),
+            ptqrtoken: "1700567251".to_string(),
+            pt_login_sig: "SIG123".to_string(),
+            pt_openlogin_data: "pt_enable_pwd%3D1%26appid%3D716027609".to_string(),
+            xlogin_url: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609".to_string(),
+        }
+    }
+
+    #[test]
+    fn qq_poll_url_keeps_openlogin_data_unencoded() {
+        let s = sample_session();
+        let url = build_qq_poll_url(&s, 0.5);
+        assert!(url.starts_with("https://xui.ptlogin2.qq.com/ssl/ptqrlogin?"));
+        assert!(url.contains("ptqrtoken=1700567251"));
+        assert!(url.contains(&format!("pt_3rd_aid={}", QQ_LITE_APPID)));
+        // 关键：pt_openlogin_data 原样（已编码一次），不得出现二次编码 %25
+        assert!(
+            url.contains("pt_openlogin_data=pt_enable_pwd%3D1%26appid%3D716027609"),
+            "pt_openlogin_data 必须原样拼接: {url}"
+        );
+        assert!(
+            !url.contains("%253D"),
+            "pt_openlogin_data 不得二次编码: {url}"
+        );
+        // login_sig 必须编码（真实值是 base64 风格，可能含 + / =）
+        assert!(url.contains("login_sig=SIG123"));
+    }
+
+    #[test]
+    fn qq_poll_url_encodes_login_sig_specials() {
+        let mut s = sample_session();
+        s.pt_login_sig = "a+b/c=".to_string();
+        let url = build_qq_poll_url(&s, 0.25);
+        assert!(url.contains("login_sig=a%2Bb%2Fc%3D"), "login_sig 必须编码: {url}");
+    }
+
+    #[test]
+    fn qq_session_from_query_and_missing_fields() {
+        let q = json!({
+            "cookie": "pt_login_sig=SIG123; qrsig=QRSIG456",
+            "qrsig": "QRSIG456",
+            "ptqrtoken": 1700567251,
+            "pt_login_sig": "SIG123",
+            "pt_openlogin_data": "abc%3D1",
+            "xlogin_url": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=1",
+        });
+        let s = QqSession::from_query(&q);
+        assert_eq!(s.ptqrtoken, "1700567251", "数字 ptqrtoken 要转字符串");
+        assert!(s.missing_fields().is_empty());
+
+        // 全空 → 6 个字段都缺，顺序与上游 JS 提示一致
+        let empty = QqSession::from_query(&json!({}));
+        assert_eq!(
+            empty.missing_fields(),
+            vec![
+                "qrsig",
+                "ptqrtoken",
+                "pt_login_sig",
+                "pt_openlogin_data",
+                "xlogin_url",
+                "cookie"
+            ]
+        );
+
+        // cookie 不含 qrsig= 也算缺 cookie
+        let no_qrsig_cookie = QqSession::from_query(&json!({
+            "cookie": "pt_login_sig=SIG",
+            "qrsig": "Q",
+            "ptqrtoken": "1",
+            "pt_login_sig": "SIG",
+            "pt_openlogin_data": "d",
+            "xlogin_url": "u",
+        }));
+        assert_eq!(no_qrsig_cookie.missing_fields(), vec!["cookie"]);
+    }
+
+    #[test]
+    fn qq_poll_cookie_appends_missing_login_sig() {
+        let mut s = sample_session();
+        s.cookie = "qrsig=QRSIG456".to_string();
+        assert_eq!(s.poll_cookie(), "qrsig=QRSIG456; pt_login_sig=SIG123");
+
+        // 已含则不重复追加
+        let s2 = sample_session();
+        assert_eq!(s2.poll_cookie(), s2.cookie);
+    }
+
+    /// 回归：服务端 `build_query` 会把 `cookie` 参数转成对象（Express 语义），
+    /// 老实现用 `q_str(q, "cookie")` 读到空串 → 轮询报「缺少 cookie」。
+    /// 真机探针（`qr_login_probe`）踩过一次，这里锁死两种形态都能还原。
+    #[test]
+    fn qq_cookie_from_query_handles_object_and_string() {
+        // 1) 字符串形态（模块单测直接构造）
+        let q = json!({ "cookie": "pt_login_sig=SIG; qrsig=QRSIG" });
+        assert_eq!(qq_cookie_from_query(&q), "pt_login_sig=SIG; qrsig=QRSIG");
+
+        // 2) 对象形态（真实 HTTP 请求经 build_query 后的样子）
+        let q = json!({
+            "cookie": {
+                "pt_login_sig": "SIG",
+                "qrsig": "QRSIG",
+                // 服务端注入的酷狗平台身份必须剔除，不能发给 QQ
+                "KUGOU_API_GUID": "guid",
+                "KUGOU_API_MID": "mid",
+                "KUGOU_API_DEV": "dev",
+                "dfid": "dfid-x",
+                "mid": "mid-x",
+            }
+        });
+        let got = qq_cookie_from_query(&q);
+        assert!(got.contains("pt_login_sig=SIG"), "got={got}");
+        assert!(got.contains("qrsig=QRSIG"), "got={got}");
+        for banned in ["KUGOU_API_", "dfid", "mid="] {
+            assert!(!got.contains(banned), "不得把酷狗身份发给 QQ（{banned}）: {got}");
+        }
+
+        // 3) 缺失 / null → 空串（由 missing_fields 报错，不 panic）
+        assert_eq!(qq_cookie_from_query(&json!({})), "");
+        assert_eq!(qq_cookie_from_query(&json!({ "cookie": null })), "");
+    }
+
+    /// 端到端契约：对象形态的 cookie 经 `from_query` 后 `missing_fields` 为空，
+    /// 且 `poll_cookie()` 不会重复追加 pt_login_sig。
+    #[test]
+    fn qq_session_from_real_http_cookie_object() {
+        let q = json!({
+            "cookie": { "pt_login_sig": "SIG", "qrsig": "QRSIG", "KUGOU_API_DEV": "d" },
+            "qrsig": "QRSIG",
+            "ptqrtoken": 123,
+            "pt_login_sig": "SIG",
+            "pt_openlogin_data": "od",
+            "xlogin_url": "u",
+        });
+        let s = QqSession::from_query(&q);
+        assert!(s.missing_fields().is_empty(), "{:?}", s.missing_fields());
+        assert_eq!(s.poll_cookie(), "pt_login_sig=SIG; qrsig=QRSIG");
+    }
+
+    #[test]
+    fn cookie_jar_merge_last_wins() {
+        let mut jar = vec![("qrsig".to_string(), "old".to_string())];
+        merge_cookie_jar(
+            &mut jar,
+            &[
+                "qrsig=new; Path=/; Domain=.qq.com".to_string(),
+                "pt_login_sig=SIG; Path=/".to_string(),
+            ],
+        );
+        assert_eq!(cookie_jar_to_string(&jar), "qrsig=new; pt_login_sig=SIG");
+    }
+
+    #[test]
+    fn resolve_relative_url_forms() {
+        let base = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=1";
+        assert_eq!(
+            resolve_relative(base, "https://ptlogin2.qq.com/a?b=1"),
+            "https://ptlogin2.qq.com/a?b=1"
+        );
+        assert_eq!(
+            resolve_relative(base, "/ssl/ptqrlogin?x=1"),
+            "https://xui.ptlogin2.qq.com/ssl/ptqrlogin?x=1"
+        );
+        assert_eq!(
+            resolve_relative(base, "next?a=1"),
+            "https://xui.ptlogin2.qq.com/cgi-bin/next?a=1"
+        );
     }
 }

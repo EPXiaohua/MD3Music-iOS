@@ -27,6 +27,7 @@ import androidx.media3.session.legacy.MediaBrowserServiceCompat;
 import androidx.media3.session.legacy.MediaSessionCompat;
 import androidx.media3.session.legacy.MediaSessionManager;
 import androidx.media3.session.legacy.MediaSessionManager.RemoteUserInfo;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -90,7 +91,45 @@ import java.util.concurrent.atomic.AtomicReference;
 
   @Override
   public void onLoadChildren(@Nullable String parentId, Result<List<MediaItem>> result) {
-    result.sendResult(/* result= */ null);
+    onLoadChildren(parentId, result, /* options= */ null);
+  }
+
+  /**
+   * MD3Music fork v39：带分页参数的子节点查询。
+   *
+   * <p>原生默认实现（见基类注释）会把 options 丢掉、只回调两参版本——vivo 原子随身听
+   * 的分页键 `vivomusicmix_key_media_page` 正是走 options，必须重写本重载才能拿到页号。
+   */
+  @Override
+  public void onLoadChildren(
+      @Nullable String parentId, Result<List<MediaItem>> result, @Nullable Bundle options) {
+    MediaSessionService.BrowseChildrenProvider provider = browseChildrenProvider;
+    if (provider == null) {
+      result.sendResult(/* result= */ null);
+      return;
+    }
+    List<MediaItem> items;
+    try {
+      items = provider.onLoadChildren(parentId, options);
+    } catch (Throwable t) {
+      Log.w(TAG, "browse children provider failed", t);
+      items = null;
+    }
+    result.sendResult(items == null ? Collections.<MediaItem>emptyList() : items);
+  }
+
+  /**
+   * MD3Music fork v39：legacy browse 子节点提供者（App 侧注入 vivo 原子随身听的三棵
+   * 列表树）。接口声明在 {@link MediaSessionService}——本类是包内可见，App 侧无法引用
+   * 它的嵌套类型。v40：volatile——写发生在 impl.lock 内，读在本类主线程无锁。
+   */
+  @Nullable
+  private volatile MediaSessionService.BrowseChildrenProvider browseChildrenProvider;
+
+  /** MD3Music fork v39：注入子节点提供者。 */
+  public void setBrowseChildrenProvider(
+      @Nullable MediaSessionService.BrowseChildrenProvider provider) {
+    browseChildrenProvider = provider;
   }
 
   public ControllerInfo createControllerInfo(RemoteUserInfo info, Bundle rootHints) {

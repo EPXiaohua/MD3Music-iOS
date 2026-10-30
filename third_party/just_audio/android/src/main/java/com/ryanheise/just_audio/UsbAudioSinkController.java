@@ -7,6 +7,7 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.ForwardingAudioSink;
 import java.nio.ByteBuffer;
@@ -16,6 +17,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * USB 独占输出控制器（MD3Music fork）。
@@ -284,8 +290,25 @@ public final class UsbAudioSinkController {
 
     private static volatile StallRecoveryListener stallRecoveryListener = null;
 
-    public static void setStallRecoveryListener(@Nullable StallRecoveryListener l) {
+    /** MD3Music fork: 最近一次注册监听器的 AudioPlayer（identity 比对）。
+     *  静态监听捕获的是"播放中的活跃实例"，跨fade 重建后新实例覆盖注册；
+     *  清除必须按 owner 对账，否则旧实例 dispose 会摘掉新实例的监听。 */
+    private static volatile Object stallRecoveryOwner = null;
+
+    public static void setStallRecoveryListener(@Nullable StallRecoveryListener l,
+                                                @Nullable Object owner) {
         stallRecoveryListener = l;
+        stallRecoveryOwner = owner;
+    }
+
+    /** MD3Music fork: 按 owner identity 释放静态监听。原先监听器滞留最后
+     *  一个已 dispose 的 AudioPlayer（内含 context 引用），停在终局位置时
+     *  整实例泄漏永不释放；dispose 侧调用本方法收尾。 */
+    public static void clearStallRecoveryListenerIfCurrent(@Nullable Object owner) {
+        if (stallRecoveryOwner == owner) {
+            stallRecoveryListener = null;
+            stallRecoveryOwner = null;
+        }
     }
 
     /** 停喂判定阈值（ms）：最后一次入队后静默超过该值视为停喂。 */
@@ -294,6 +317,13 @@ public final class UsbAudioSinkController {
     private static final long STALL_COOLDOWN_MS = 8000L;
     /** 单轮停喂自愈次数上限，超过则放弃等待用户操作。 */
     private static final int STALL_MAX_ATTEMPTS = 3;
+
+    /**
+     * USB 流重建窗口（reconfigStream 内 activeStream 被临时置空的区间）。
+     * 窗口内不得判定「无在途数据」：那会让渲染器被判 not-ready → ExoPlayer 掉
+     * BUFFERING + stopRenderers()，而恢复又依赖渲染器 → 同类死锁。见 hasPendingDataExclusive。
+     */
+    private static volatile boolean reconfigInProgress = false;
 
     private static volatile long lastDataEnqueueMs = 0L;
     private static volatile long lastRecoveryMs = 0L;
@@ -312,21 +342,147 @@ public final class UsbAudioSinkController {
     /** 写线程空转探测回调（每 100ms 一次）。仅播放中才判定停喂。 */
     static void onStallProbe(boolean sinkPlaying) {
         if (!sinkPlaying) return;
+        if (lastDataEnqueueMs <= 0 || nowMs() - lastDataEnqueueMs < STALL_THRESHOLD_MS) return;
+        tryConsumeRecoveryBudget("renderer stalled");
+    }
+
+    // ── 起播无数据看门狗（P0-3，勿删） ─────────────────────────────
+    // onStallProbe 依赖写线程（首个 handleBuffer 才创建）与 lastDataEnqueueMs（首个入队才
+    // 置位），因此「play() 之后从未收到任何数据」的场景（configure 迟到、渲染器不被调度）
+    // 完全探测不到，也无任何自愈 —— 实测表现为开独占后点播放 13 秒无声，直到用户手动
+    // 暂停→播放才打破（2026-09-11 诊断包 20260911_164255，16:42:01.309–16:42:14.449）。
+    // 这里用独立调度线程做兜底探测：超时未收到数据就复用 auto-seek 自愈
+    // （seek → onPositionReset → 渲染器重走 format/configure/handleBuffer，等效用户暂停→播放）。
+    /** 起播后多久仍无任何 handleBuffer 即触发自愈（ms）。需大于正常起播耗时（<1s）。 */
+    private static final long FIRST_DATA_WATCHDOG_MS = 3000L;
+    /** 看门狗探测周期（ms）。 */
+    private static final long FIRST_DATA_WATCHDOG_PERIOD_MS = 500L;
+    private static final ScheduledExecutorService FIRST_DATA_WATCHDOG_EXEC =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "UsbSinkFirstDataWatchdog");
+                t.setDaemon(true);
+                return t;
+            });
+    private static volatile ScheduledFuture<?> firstDataWatchdogFuture;
+
+    private static synchronized void ensureFirstDataWatchdog() {
+        if (firstDataWatchdogFuture != null) return;
+        firstDataWatchdogFuture = FIRST_DATA_WATCHDOG_EXEC.scheduleAtFixedRate(
+                () -> {
+                    for (UsbInterceptAudioSink s : liveSinks) s.probeNoDataStall();
+                },
+                FIRST_DATA_WATCHDOG_PERIOD_MS, FIRST_DATA_WATCHDOG_PERIOD_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private static synchronized void maybeCancelFirstDataWatchdog() {
+        if (!liveSinks.isEmpty() || firstDataWatchdogFuture == null) return;
+        firstDataWatchdogFuture.cancel(false);
+        firstDataWatchdogFuture = null;
+    }
+
+    // ── 异步 USB 流重建（P0-4 修复，2026-09-12） ─────────────────────────────
+    // 背景：configure() 在 ExoPlayer 播放线程上被调用，且与 codec 格式变更
+    // （MediaCodec flush/reinit）处在同一调用栈。此前在 configure() 内同步执行整条
+    // native 重建（停写线程 → release 旧流 → openDevice → setAlt/SET_CUR → start），
+    // 阻塞播放线程 100~400ms；实测该窗口与「解码器不再提供输入缓冲
+    // （dequeueInputBufferIndex=-1）、也不再吐输出」的停喂强相关。
+    // 现在：configure() 只登记目标格式并立即返回，重建由独立线程串行执行；
+    // 重建窗口内 handleBuffer 返回 false（不消费、不丢弃），ExoPlayer 稍后重试同一 buffer。
+    private static final ExecutorService RECONFIG_EXEC =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "UsbSinkReconfig");
+                t.setDaemon(true);
+                return t;
+            });
+    /** 待重建请求（latest-wins）。null = 无待处理请求；复合状态一律在 reconfigLock 内读写。 */
+    private static UsbInterceptAudioSink pendingReconfigSink;
+    private static int pendingReconfigRate;
+    private static int pendingReconfigChannels;
+    private static int pendingReconfigEncoding;
+    /** 重建窗口标记：从「登记请求」持续到「worker 处理完队列为空」，供 handleBuffer 门控。 */
+    private static volatile boolean rebuildPending;
+    private static boolean reconfigWorkerScheduled;
+    /**
+     * 登记簿专用锁：**不得**与 UsbAudioSinkController.class 锁混用。
+     * worker 在原生重建期间持有 class 锁 100~400ms，而本方法由播放线程调用
+     * （configure 内），共用 class 锁会把这段阻塞搬回播放线程，修复即失效。
+     */
+    private static final Object reconfigLock = new Object();
+
+    /** 登记一次异步重建（在 configure() 内调用，不阻塞播放线程）。 */
+    private static void requestReconfig(UsbInterceptAudioSink sink, int rate, int channels,
+            int encoding) {
+        boolean needStartWorker;
+        synchronized (reconfigLock) {
+            pendingReconfigSink = sink;
+            pendingReconfigRate = rate;
+            pendingReconfigChannels = channels;
+            pendingReconfigEncoding = encoding;
+            rebuildPending = true;
+            needStartWorker = !reconfigWorkerScheduled;
+            if (needStartWorker) reconfigWorkerScheduled = true;
+        }
+        if (needStartWorker) {
+            RECONFIG_EXEC.execute(UsbAudioSinkController::runReconfigWorker);
+        }
+    }
+
+    /** 串行执行登记的重建请求（latest-wins）；队列空则退出并把窗口标记归零。 */
+    private static void runReconfigWorker() {
+        while (true) {
+            UsbInterceptAudioSink sink;
+            int rate;
+            int channels;
+            int encoding;
+            synchronized (reconfigLock) {
+                sink = pendingReconfigSink;
+                rate = pendingReconfigRate;
+                channels = pendingReconfigChannels;
+                encoding = pendingReconfigEncoding;
+                if (sink == null) {
+                    rebuildPending = false;
+                    reconfigWorkerScheduled = false;
+                    return;
+                }
+                pendingReconfigSink = null;
+            }
+            if (!exclusiveEnabled || !liveSinks.contains(sink)) {
+                // 期间已关独占或 sink 已释放：跳过（下轮循环会把窗口标记归零）
+                logW(TAG, "async reconfig skipped (enabled=" + exclusiveEnabled
+                        + " live=" + liveSinks.contains(sink) + ")");
+                continue;
+            }
+            try {
+                // 不持 reconfigLock：内部自带 class 锁与 enable/disable 互斥
+                sink.reconfigStream(rate, channels, encoding);
+            } catch (Throwable t) {
+                logE(TAG, "async reconfig threw: " + t.getMessage(), t);
+            }
+        }
+    }
+
+    /** 是否有 USB 流重建未完成（handleBuffer 的重建窗口门控）。 */
+    static boolean isRebuildPending() {
+        return rebuildPending || reconfigInProgress;
+    }
+
+    /** 共享自愈预算（与 onStallProbe 同用冷却与上限，防双看门狗 seek 风暴）。 */
+    private static boolean tryConsumeRecoveryBudget(String reason) {
         StallRecoveryListener l = stallRecoveryListener;
-        if (l == null) return;
+        if (l == null) return false;
         long now = nowMs();
-        if (lastDataEnqueueMs <= 0 || now - lastDataEnqueueMs < STALL_THRESHOLD_MS) return;
-        if (now - lastRecoveryMs < STALL_COOLDOWN_MS) return;
-        if (recoveryAttempts >= STALL_MAX_ATTEMPTS) return;
+        if (now - lastRecoveryMs < STALL_COOLDOWN_MS) return false;
+        if (recoveryAttempts >= STALL_MAX_ATTEMPTS) return false;
         lastRecoveryMs = now;
         recoveryAttempts++;
-        logE(TAG, "renderer stalled — auto-seek recovery fired (attempt "
+        logE(TAG, reason + " — auto-seek recovery fired (attempt "
                 + recoveryAttempts + "/" + STALL_MAX_ATTEMPTS + ")");
         try {
             l.onRendererStalled();
         } catch (Exception e) {
             logE(TAG, "stall recovery listener threw: " + e.getMessage());
         }
+        return true;
     }
 
     // ── PCM 频谱捕获（MD3Music 频谱功能用） ────────────────────────
@@ -517,6 +673,15 @@ public final class UsbAudioSinkController {
         private boolean delegateMuted = false;
         private float pendingVolume = 1f;
         private int currentEncoding = C.ENCODING_PCM_16BIT;
+        /**
+         * 当前 sink 输入是否是线性 PCM。
+         *
+         * <p><b>为什么需要</b>：硬解（audio offload）下 {@code MediaCodecAudioRenderer} 走
+         * bypass，喂给 AudioSink 的是**压缩码流**（audio/mpeg、audio/mp4a-latm…），不是 PCM。
+         * 频谱的 PCM 截取若不过滤，会把压缩字节当样本送进 FFT —— 既算不出频谱（噪声），
+         * 又白烧渲染线程的 CPU。因此 tee 只在 PCM 时生效。
+         */
+        private boolean currentInputIsPcm = true;
         private int currentSampleRate = 0;
         private int currentChannelCount = 0;
         private boolean isPlaying = false;
@@ -524,15 +689,97 @@ public final class UsbAudioSinkController {
         private long posLogCount = 0;
         private long lastPosLogMs = 0L;
         private long lastBackpressureLogMs = 0L;
+        private long lastDiscardLogMs = 0L;
+        /** CONVERT 路径心跳：已记录的转换参数键与累计次数（参数变化或每 500 块打一条）。 */
+        private String lastConvertKey = "";
+        private long convertCallCount = 0;
+        /** [UsbDiag] 无数据看门狗判据快照限频。 */
+        private long lastNoDataProbeLogMs = 0L;
         /** 本 sink 是否已实际写入过数据（同率切歌时 ring 可能残留上一首 URB，用于判定是否 drain）。 */
         private boolean hasPlayedData = false;
+        /**
+         * 上次 handleBuffer 是否走了「独占拦截」分支。用于在「独占 → 非独占」的交接点
+         * 清一次 delegate 的粘滞输入状态（详见 handleBuffer 转发分支的注释）。
+         */
+        private boolean interceptedSinceLastForward = false;
+        /** EOS 等待期 playToEndOfStream 的调用计数（探针限频用；EOS 等待期会以 ~200Hz 驱动）。 */
+        private long eosProbeCount = 0;
         private long usbStartMediaTimeUs = 0L;
         private boolean usbStartMediaTimeNeedsInit = true;
         private boolean handledEndOfStream = false;
+        /** hasPendingData() 上次返回值（诊断：仅在翻转时留痕，定位 load/BUFFERING 死锁）。 */
+        private boolean lastHasPendingData = false;
+
+        // ── 提交量活性窗口（P0-1 精细判据，勿删） ─────────────────────
+        // 上一版 `!handledEndOfStream → true` 粒度太粗：它让 hasPendingData() 恒 true →
+        // MediaCodecAudioRenderer.isReady() 恒 true（`hasPendingData() || super.isReady()`），
+        // 把「inputFormat 是否就绪」彻底旁路，代价是 ExoPlayer 认为渲染器随时就绪 →
+        // 掉 BUFFERING 自愈路径与 getDurationToProgressUs 重试调度双双失效（实测 192k
+        // 跨率重建后 submitted 冻结 10.9s 无任何错误）。
+        // 现在改为有依据地报 true：只有在「最近 STALL 窗口内提交量确实在增长」或
+        // 「刚起播还没机会增长」时才报 true；一旦提交量长期停滞，就如实报 false，
+        // 把判断权交回 ExoPlayer（它会掉 BUFFERING 并重新调度 → 自愈）。
+        /** 提交量停滞多久后不再声称「有在途数据」（ms）。需 > 正常喂入间隔（单块 ~85ms）。 */
+        private static final long SUBMIT_LIVENESS_WINDOW_MS = 1500L;
+        /** 最近一次观察到 framesWritten 增长的时刻与数值。 */
+        private long lastSubmitGrowMs = 0L;
+        private long lastSubmitFrames = -1L;
+        /** 本流是否曾有过提交量增长（区分「尚未起播」与「起播后停滞」）。 */
+        private boolean submitEverGrew = false;
+        /** 本次 play() 的起播时刻（P0-3 无数据看门狗用；flush 时播放中同样重置为新窗口）。 */
+        private long playStartedMs = 0L;
+
+        // ── 墙钟位置时钟（对齐系统 AudioTrack 的硬件播放头语义） ──
+        // framesWritten 是「已 submit 给 USB」的帧数，数据提交后仍停在 native ring
+        // （16 URB×8pkt≈1.36s）里等 DAC 播放，直接用它算位置会超前硬件最多一个 ring。
+        // 改为：播放中按墙钟 + DAC 速率估位置，并用 framesWritten 做上限钳制
+        // （不允许超过已提交量，欠载/停喂时停在最后 submit 帧）。
+        /** 本次播放段起点的墙钟（elapsedRealtime）。 */
+        private long playStartWallMs = 0L;
+        /** 本次播放段起点时已 submit 的帧数。 */
+        private long startFramesAtPlay = 0L;
+        /** 暂停时冻结的「已播放帧数」（相对本次流起点）。 */
+        private long frozenPlayedFrames = 0L;
+        /** hasPendingData 在途判定下限：约 100ms 帧数（小于 ring 1.36s、大于单块 85ms 抖动）。 */
+        private static final long PENDING_MIN_MEDIA_US = 100_000L;
 
         UsbInterceptAudioSink(AudioSink delegate, Context ctx) {
             super(delegate);
             this.context = ctx.getApplicationContext();
+        }
+
+        /**
+         * USB 独占下声明「可直接吃 32bit 表示」，让上游把解码精度推到位深上限。
+         *
+         * <p>独占直写层自带「任意线性 PCM → 端点位深」的转换（native
+         * convertFloatToInt16/24/32），所以独占期间 FLOAT / PCM_32BIT 都视为
+         * {@link AudioSink#SINK_FORMAT_SUPPORTED_DIRECTLY}。这一步是「独占默认 32bit」
+         * 的<strong>唯一生效点</strong>：{@code MediaCodecAudioRenderer.getMediaFormatForPlayback}
+         * 正是用本方法对 FLOAT 的返回值决定是否给解码器下发
+         * {@code KEY_PCM_ENCODING=ENCODING_PCM_FLOAT}（见其 1037-1043 行）。
+         *
+         * <p>为什么不能再依赖「32bit 播放支持」开关：{@code DefaultAudioSink.floatOutputRequested()}
+         * 在独占开启时硬编码返回 false，开关能否生效只取决于「解码器创建时刻独占是否已开」，
+         * 实测同一首歌会因顺序不同而得到 FLOAT / 24BIT 两种结果。此处按「独占状态本身」
+         * 决定，语义与顺序无关，开关不再参与独占路径。
+         *
+         * <p>降位由 native 完成：32bit DAC 走 convertFloatToInt32、24bit 走 convertFloatToInt24、
+         * 16bit 走 convertFloatToInt16 —— 即「DAC 不支持则自动降位」。float32 尾数 24bit，
+         * 对 16/24bit 源为数学无损。
+         *
+         * <p>门控 {@code activeStream.isAlive()} 是必要的：流未就绪时数据会走 delegate
+         * 兜底（AudioTrack），而 delegate 的 float 输出在部分设备上有变速/变调历史问题，
+         * 不允许在那种窗口期宣称支持 float。
+         */
+        @Override
+        public @AudioSink.SinkFormatSupport int getFormatSupport(Format format) {
+            if (exclusiveEnabled && activeStream != null && activeStream.isAlive()
+                    && MimeTypes.AUDIO_RAW.equals(format.sampleMimeType)
+                    && (format.pcmEncoding == C.ENCODING_PCM_FLOAT
+                            || format.pcmEncoding == C.ENCODING_PCM_32BIT)) {
+                return AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY;
+            }
+            return super.getFormatSupport(format);
         }
 
         @Override
@@ -540,6 +787,8 @@ public final class UsbAudioSinkController {
                 throws ConfigurationException {
             // 应用静态偏好路由（关闭独占后新建/重配的 sink 也要显式走 USB DAC）
             applyPreferredDeviceIfNeeded(this);
+            // 硬解（offload）时输入是压缩码流：记录一下，供 PCM tee 门控与状态展示使用。
+            currentInputIsPcm = MimeTypes.AUDIO_RAW.equals(inputFormat.sampleMimeType);
             int enc = inputFormat.pcmEncoding;
             if (enc != Format.NO_VALUE) currentEncoding = enc;
             int sr = inputFormat.sampleRate > 0 ? inputFormat.sampleRate : 0;
@@ -551,7 +800,10 @@ public final class UsbAudioSinkController {
             lastEncoding = currentEncoding;
             currentSampleRate = sr;
             currentChannelCount = ch;
-            logI(TAG, "configure: enc=" + encName(currentEncoding) + " rate=" + sr + " ch=" + ch);
+            // [UsbDiag] mime 是本路径的关键判据：audio/raw = extractor 层已解出 PCM（FLAC 扩展
+            // /WAV 走 bypass，无解码器，enc=源位深）；audio/flac|mpeg 等 = 走 MediaCodec 解码器。
+            logI(TAG, "configure: enc=" + encName(currentEncoding) + " rate=" + sr + " ch=" + ch
+                    + " mime=" + inputFormat.sampleMimeType);
 
             if (exclusiveEnabled && activeStream != null) {
                 // 格式纪元边界复位：每次 configure 都从干净状态开始。
@@ -573,7 +825,10 @@ public final class UsbAudioSinkController {
                 boolean needReconfig = sr > 0 && ch > 0
                         && (sr != usbSampleRate || ch != usbChannelCount || !activeStream.isAlive());
                 if (needReconfig) {
-                    reconfigStream(sr, ch, currentEncoding);
+                    // 异步重建：不阻塞播放线程（P0-4：详见 requestReconfig 注释）。
+                    // 重建完成前 handleBuffer 返回 false（未消费），格式转换在
+                    // usbSampleRate 更新后的下一次 handleBuffer 才会按新格式进行。
+                    requestReconfig(this, sr, ch, currentEncoding);
                     // 重建后的新流 ring 为空，重新起算
                     hasPlayedData = false;
                 } else if (hasPlayedData) {
@@ -618,6 +873,9 @@ public final class UsbAudioSinkController {
             }
             // 与 enable/disable 互斥，避免并发切换时 double-release
             synchronized (UsbAudioSinkController.class) {
+            // 重建窗口标记：窗口内 hasPendingData() 不得报「已抽干」（见 hasPendingDataExclusive）
+            reconfigInProgress = true;
+            try {
             // 1) 停掉所有写线程（线程持有旧流引用）
             for (UsbInterceptAudioSink s : liveSinks) s.stopStreamingThread();
             // 2) 停旧流并释放原生上下文（drain 必须在 setAlt(0) 前完成）。
@@ -649,6 +907,9 @@ public final class UsbAudioSinkController {
                 disable();
                 onUsbReleased();
             }
+            } finally {
+                reconfigInProgress = false;
+            }
             }
         }
 
@@ -656,8 +917,11 @@ public final class UsbAudioSinkController {
         public boolean handleBuffer(ByteBuffer buffer, long presentationTimeUs, int encodedAccessUnitCount)
                 throws InitializationException, WriteException {
             // ── 频谱 PCM 捕获：无论是否 USB 独占都截取（解码后、混音前，静音也有数据） ──
+            // 硬解（offload）下这条路径收到的是压缩码流（currentInputIsPcm=false），
+            // 绝不能当 PCM 送 FFT —— 门控保证「硬解期间频谱拿不到数据」而不是拿到噪声。
             PcmCaptureListener pcmListener = pcmCaptureListener;
-            if (pcmListener != null && currentSampleRate > 0 && buffer != null && buffer.remaining() > 0) {
+            if (pcmListener != null && currentInputIsPcm
+                    && currentSampleRate > 0 && buffer != null && buffer.remaining() > 0) {
                 try {
                     pcmListener.onPcm(
                             buffer.duplicate().order(buffer.order()),
@@ -666,13 +930,30 @@ public final class UsbAudioSinkController {
                     logW(TAG, "pcm capture listener threw: " + e.getMessage());
                 }
             }
-            UsbAudioSink stream = activeStream;
             if (exclusiveEnabled) {
+                interceptedSinceLastForward = true;
+                if (isRebuildPending()) {
+                    // 重建窗口（含「已登记未开工」）：既不能按旧格式继续喂（会变调/装包错），
+                    // 也不能像死流那样吞掉（会丢音频）。返回 false = 未消费，
+                    // ExoPlayer 稍后重试同一条 buffer；等待由 getDurationToProgressUs 节流。
+                    return false;
+                }
+                // 注：必须在门控之后再取 activeStream —— 重建由独立线程执行，
+                // 门控前取的引用可能已被 worker 释放（use-after-free）。
+                UsbAudioSink stream = activeStream;
                 if (stream == null || !stream.isAlive()) {
                     // 独占开启但流不可用（重建窗口/死流）：吞掉数据保持静音。
                     // 不能送 delegate —— 会从手机扬声器漏音，且 delegate 可能按源
                     // 格式（如 192k）初始化失败抛 InitializationException 导致停播。
                     // reconfigStream 失败路径已自行 disable() 回普通输出，不受影响。
+                    // P0-4 观测：此分支此前完全静默——区分「handleBuffer 被调用但
+                    // 吞掉」与「handleBuffer 根本未被调度」的关键证据点（限频 1s）。
+                    if (nowMs() - lastDiscardLogMs >= 1000L) {
+                        lastDiscardLogMs = nowMs();
+                        logW(TAG, "handleBuffer DISCARDED (stream " + (stream == null ? "null" : "dead")
+                                + ") pts=" + presentationTimeUs + " hbCount=" + handleBufferCallCount
+                                + " reconfigInProgress=" + reconfigInProgress);
+                    }
                     buffer.position(buffer.limit());
                     return true;
                 }
@@ -688,12 +969,16 @@ public final class UsbAudioSinkController {
                 if (usbStartMediaTimeNeedsInit) {
                     usbStartMediaTimeUs = Math.max(0L, presentationTimeUs);
                     usbStartMediaTimeNeedsInit = false;
+                    // 对齐墙钟播放基线：以当前已 submit 帧为起点。新流/flush 后
+                    // framesWritten 已归零；起播时墙钟从现在起算。
+                    alignPlaybackBaseline(stream.getFramesWritten());
                     logI(TAG, "usbStartMediaTimeUs=" + usbStartMediaTimeUs);
                 }
                 handleBufferCallCount++;
                 lastHandleBufferCount = (int) handleBufferCallCount;
-                // 诊断：前 5 次 + 每 500 次打印，观察暂停后是否仍有数据喂入
-                if (handleBufferCallCount <= 5 || handleBufferCallCount % 500 == 0) {
+                // 诊断：前 5 次 + 每 10 次打印。P0-4 观测：旧 %500 在总喂 <500 块的
+                // 停喂会话里完全不可见，%10 才能看出停喂窗口内 handleBuffer 是否仍被调度
+                if (handleBufferCallCount <= 5 || handleBufferCallCount % 10 == 0) {
                     logI(TAG, "handleBuffer #" + handleBufferCallCount + " pts=" + presentationTimeUs
                             + " isPlaying=" + isPlaying + " queue=" + streamingThread.queueSize()
                             + " enc=" + encName(currentEncoding));
@@ -702,9 +987,13 @@ public final class UsbAudioSinkController {
                 // 有界阻塞等空位，而不是返回 false 让 ExoPlayer 按「(pts−clock位置)/2」
                 // 调度睡眠。我们的 clock 位置依赖持续喂入（framesWritten），睡眠会与
                 // 位置冻结形成死锁（实测 192k 首曲 hbCount 永久冻结、无声）。
-                // awaitSpace 内部带 1s 超时 + pause/stop/flush 退出，边界不会挂死。
+                // awaitSpace 内部带超时 + pause/stop/flush 退出，边界不会挂死。
+                // [P1 修复 v2 2026-09-13]：超时 1s→120ms→15ms —— 暂停消息排在渲染线程
+                // 队列里，阻塞中的 doSomeWork 必须返回后才能处理 pause；实测 120ms 时暂停
+                // 消息仍被 render 循环（每 ~213ms 一次 handleBuffer+awaitSpace）饿 4.1s。
+                // 15ms 让渲染循环快速自旋重试，暂停消息 ≤ ~40ms 内被处理。
                 if (streamingThread.queueSize() >= QUEUE_BACKPRESSURE_THRESHOLD) {
-                    if (!streamingThread.awaitSpace(1000L)) {
+                    if (!streamingThread.awaitSpace(15L)) {
                         // 被打断/超时：回退旧契约（同一 buffer 稍后重试），行为不劣化
                         if (nowMs() - lastBackpressureLogMs >= 2000L) {
                             lastBackpressureLogMs = nowMs();
@@ -733,17 +1022,28 @@ public final class UsbAudioSinkController {
                                 + encName(currentEncoding));
                     }
                     if (f != null && f.length > 0) {
-                        if (handleBufferCallCount <= 3) {
-                            logI(TAG, "handleBuffer #" + handleBufferCallCount
-                                    + ": CONVERT src=" + currentSampleRate + "Hz/"
-                                    + currentChannelCount + "ch → " + usbSampleRate + "Hz/"
-                                    + usbChannelCount + "ch");
-                        }
+                        final int inFrames = currentChannelCount > 0
+                                ? f.length / currentChannelCount : f.length;
                         if (needCh) f = UsbPcmResampler.convertChannels(f, currentChannelCount, usbChannelCount);
                         if (needResample) {
                             // 必须先设置重采样格式（srcRate/声道/目标率），否则 process 恒直通
                             usbResampler.setFormat(currentSampleRate, usbChannelCount, usbSampleRate);
                             f = usbResampler.process(f);
+                        }
+                        // 诊断：重采样/声道转换的可见性。参数变化打一条（含 in/out 帧数，
+                        // 可据此确认 192k→96k 这类降采样真的执行），此后每 500 块一条心跳。
+                        // 旧实现只用全局 handleBufferCallCount<=3 打点，会话首个流之后完全不可见。
+                        convertCallCount++;
+                        String ckey = currentSampleRate + "/" + currentChannelCount + "→"
+                                + usbSampleRate + "/" + usbChannelCount;
+                        if (!ckey.equals(lastConvertKey) || convertCallCount % 500 == 0) {
+                            lastConvertKey = ckey;
+                            logI(TAG, "CONVERT " + ckey
+                                    + (needResample ? " resample" : "")
+                                    + (needCh ? " chmap" : "")
+                                    + " in=" + inFrames + "frames out="
+                                    + (usbChannelCount > 0 ? f.length / usbChannelCount : f.length)
+                                    + "frames #" + convertCallCount);
                         }
                         if (f.length > 0) {
                             streamingThread.enqueue(f);
@@ -781,8 +1081,65 @@ public final class UsbAudioSinkController {
                 buffer.position(buffer.limit());
                 return true;
             }
+            // ── 独占 → 非独占的交接：清一次 delegate 的粘滞输入状态 ──
+            // 独占期间 delegate 收不到 handleBuffer（数据被本层拦走），它的 inputBuffer
+            // 可能仍指向上一次未消费完的缓冲；而「关独占」是分两步的（disable() 先置
+            // exclusiveEnabled=false，真正恢复 delegate 的 onExclusiveChanged(false) 要等
+            // USB 设备释放完才执行），所以这个窗口内 renderer 会先把数据转发给 delegate。
+            // 若此时 AudioTrack 已被释放，DefaultAudioSink.flush() 原本不会清 inputBuffer
+            // （清理被 isAudioTrackInitialized() 守卫挡住）→ 新缓冲撞
+            // checkArgument(inputBuffer == null || buffer == inputBuffer)
+            // → IllegalArgumentException → ExoPlaybackException errorCode=1004（实测 2026-09-12）。
+            // 与其依赖外部在"正确时刻"恰好 flush，不如在转入转发的那一次调用里、同线程清一次：
+            // 依赖 DefaultAudioSink.flush() 的无条件清理补丁（fork）。
+            if (interceptedSinceLastForward) {
+                interceptedSinceLastForward = false;
+                logI(TAG, "exclusive→delegate handover: clearing stale delegate input state");
+                // 只清 delegate（super = ForwardingAudioSink → DefaultAudioSink）：
+                // 本层的 streamingThread 已被 stopStreamingThread() 置空、重采样器会在
+                // 下次 configure/flush 时重设，无需在此重复处理。
+                super.flush();
+            }
             unmuteDelegateIfNeeded();
             return super.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount);
+        }
+
+        /**
+         * 对齐墙钟播放基线（起播/首个 buffer/flush 后）。
+         * @param submittedFrames 当前活动流已 submit 帧数
+         */
+        private void alignPlaybackBaseline(long submittedFrames) {
+            playStartWallMs = nowMs();
+            startFramesAtPlay = submittedFrames;
+            frozenPlayedFrames = 0L;
+        }
+
+        /**
+         * 估计「已播放帧数」（相对当前流 framesWritten 零点）：
+         * 播放中按墙钟+DAC 速率推进，暂停时冻结；并用 submitted 上限钳制，
+         * 保证不超前已提交数据（欠载时停在最后 submit 帧）。
+         */
+        private long estimatedPlayedFrames(long submittedFrames) {
+            if (usbSampleRate <= 0) return submittedFrames;
+            long played;
+            if (isPlaying) {
+                long elapsedMs = nowMs() - playStartWallMs;
+                if (elapsedMs < 0) elapsedMs = 0;
+                played = frozenPlayedFrames + elapsedMs * (long) usbSampleRate / 1000L;
+            } else {
+                played = frozenPlayedFrames;
+            }
+            // 新流/flush 后 framesWritten 归零，基线可能大于当前 submitted：重对齐防负值
+            if (startFramesAtPlay > submittedFrames) {
+                startFramesAtPlay = submittedFrames;
+                playStartWallMs = nowMs();
+                frozenPlayedFrames = 0L;
+                played = isPlaying ? 0L : frozenPlayedFrames;
+            }
+            long rel = startFramesAtPlay + played;
+            // 不允许超过已提交量（submit≠播放，位置不得跑到 ring 前端之前）
+            if (rel > submittedFrames) rel = submittedFrames;
+            return rel;
         }
 
         @Override
@@ -796,16 +1153,18 @@ public final class UsbAudioSinkController {
                     }
                     return AudioSink.CURRENT_POSITION_NOT_SET;
                 }
-                long frames = activeStream.getFramesWritten();
                 // 分母用有效输出采样率（usbSampleRate）：自适应时等于源率；
                 // 强制采样率时 framesWritten 为重采样后的输出率帧数，用源率会漂移。
                 if (usbSampleRate > 0) {
-                    long posUs = usbStartMediaTimeUs + frames * C.MICROS_PER_SECOND / usbSampleRate;
+                    long submittedFrames = activeStream.getFramesWritten();
+                    long playFrames = estimatedPlayedFrames(submittedFrames);
+                    long posUs = usbStartMediaTimeUs + playFrames * C.MICROS_PER_SECOND / usbSampleRate;
                     // 节流快照（≥1s）：定位 position 停滞（停喂根因观测点）
                     if (nowMs() - lastPosLogMs >= 1000L) {
                         lastPosLogMs = nowMs();
-                        logI(TAG, "posUs=" + posUs + " frames=" + frames + " usbRate=" + usbSampleRate
-                                + " base=" + usbStartMediaTimeUs + " ended=" + sourceEnded);
+                        logI(TAG, "posUs=" + posUs + " played=" + playFrames + " submitted=" + submittedFrames
+                                + " usbRate=" + usbSampleRate + " base=" + usbStartMediaTimeUs
+                                + " ended=" + sourceEnded);
                     }
                     return posUs;
                 }
@@ -861,12 +1220,37 @@ public final class UsbAudioSinkController {
 
         @Override public void play() {
             super.play();
+            if (!isPlaying) {
+                // 从暂停恢复：墙钟基线平移到「冻结帧 + 当前已 submit 量」，位置从冻结点继续
+                UsbAudioSink s = activeStream;
+                long submitted = (s != null) ? s.getFramesWritten() : 0L;
+                long frozen = (s != null && usbSampleRate > 0) ? estimatedPlayedFrames(submitted) : 0L;
+                frozenPlayedFrames = frozen;
+                startFramesAtPlay = 0L;
+                playStartWallMs = nowMs();
+            }
             isPlaying = true;
+            if (exclusiveEnabled) {
+                // P0-3 无数据看门狗基准 = **数据纪元起点**，只由 flush()（切歌/seek）与
+                // 开启独占时设置；**play() 不再刷新**（2026-09-12 修）：
+                // v2 活性窗口的停滞振荡会以 ~1.5s 周期反复 pause→play，若这里刷新基准，
+                // playingForMs 永远攒不到 FIRST_DATA_WATCHDOG_MS → 看门狗永远不触发
+                // （实测 19:30 窗口 3.1s 无喂数、看门狗静默）。
+                // 只重启提交量活性窗口（那是防「恢复瞬间误报停滞」用的，必须刷新）。
+                lastSubmitGrowMs = nowMs();
+                ensureFirstDataWatchdog();
+            }
             if (streamingThread != null) streamingThread.resumeStreaming();
             logI(TAG, "sink.play() → isPlaying=true (exclusive=" + exclusiveEnabled + ")");
         }
 
         @Override public void pause() {
+            if (isPlaying) {
+                // 进入暂停：把当前估计已播帧冻结，墙钟停走
+                UsbAudioSink s = activeStream;
+                long submitted = (s != null) ? s.getFramesWritten() : 0L;
+                frozenPlayedFrames = (s != null && usbSampleRate > 0) ? estimatedPlayedFrames(submitted) : 0L;
+            }
             isPlaying = false;
             if (streamingThread != null) streamingThread.pauseStreaming();
             super.pause();
@@ -874,6 +1258,9 @@ public final class UsbAudioSinkController {
         }
 
         @Override public void flush() {
+            // 诊断：切歌/seek/prepare 的边界（载入新曲卡死排查的起点，此前无任何留痕）
+            logI(TAG, "sink.flush() exclusive=" + exclusiveEnabled + " hasPending(before)="
+                    + lastHasPendingData);
             super.flush();
             if (streamingThread != null) streamingThread.flush();
             usbResampler.reset();
@@ -885,18 +1272,38 @@ public final class UsbAudioSinkController {
             }
             usbStartMediaTimeNeedsInit = true;
             handledEndOfStream = false;
+            // 提交量活性窗口复位：flush 后 framesWritten 归零（native 侧同样清零），
+            // 旧的 lastSubmitFrames 会比新值大 → 若不复位会误判「停滞」（见 hasPendingDataExclusive）。
+            lastSubmitFrames = -1L;
+            lastSubmitGrowMs = 0L;
+            submitEverGrew = false;
+            // 转换参数键复位：每首歌（新数据纪元）至少重新留一条 CONVERT 痕迹
+            lastConvertKey = "";
+            // flush = 新的数据纪元（切歌/seek）：**无条件**重置无数据看门狗基准，
+            // 给渲染器重新走 configure→handleBuffer 的正常耗时预算（正常切歌装载实测 ~1.3s，
+            // < FIRST_DATA_WATCHDOG_MS=3s，故不会误触发）。play() 不再刷新该基准（见 play()）。
+            playStartedMs = nowMs();
             if (streamingThread != null) streamingThread.resetEmptySnapshot();
+        }
+
+        /** 诊断：渲染器报告流内断点（gap/skip），此前无留痕。 */
+        @Override public void handleDiscontinuity() {
+            logI(TAG, "sink.handleDiscontinuity() exclusive=" + exclusiveEnabled);
+            super.handleDiscontinuity();
         }
 
         @Override public void reset() {
             // USB 流跨 reset 存活，configure() 管理其生命周期（与 dec 一致）
+            logI(TAG, "sink.reset() exclusive=" + exclusiveEnabled);
             super.reset();
         }
 
         @Override public void release() {
+            logI(TAG, "sink.release() exclusive=" + exclusiveEnabled);
             stopStreamingThread();
             super.release();
             liveSinks.remove(this);
+            maybeCancelFirstDataWatchdog();
         }
 
         @Override public void setVolume(float volume) {
@@ -923,8 +1330,11 @@ public final class UsbAudioSinkController {
         }
 
         @Override public void playToEndOfStream() throws WriteException {
-            // EOS 留痕：若停喂由 EOS 误判/提前结束引发，日志可直接确认
-            logI(TAG, "playToEndOfStream (EOS)");
+            // EOS 留痕（限频）：EOS 等待期渲染器会以 ~200Hz 反复驱动本方法，不限频会把
+            // 诊断环形缓冲/导出全部灌满（实测一次会话 4716 行、占导出体积 81%）。
+            if (++eosProbeCount % 200 == 1L) {
+                logI(TAG, "playToEndOfStream (EOS) probe#" + eosProbeCount);
+            }
             handledEndOfStream = true;
             super.playToEndOfStream();
         }
@@ -939,10 +1349,128 @@ public final class UsbAudioSinkController {
         }
 
         @Override public boolean hasPendingData() {
-            if (exclusiveEnabled && streamingThread != null && streamingThread.hasPendingData()) {
+            if (!exclusiveEnabled) return super.hasPendingData();
+            boolean r = hasPendingDataExclusive();
+            if (r != lastHasPendingData) {
+                lastHasPendingData = r;
+                logI(TAG, "hasPendingData=" + r + " | " + pendingSnapshot());
+            }
+            return r;
+        }
+
+        /**
+         * 独占态的「还有在途数据」判定（P0-1）。
+         *
+         * 历史：旧实现用在途量 = framesWritten − played，played 是按墙钟从 play() 起算的
+         * DAC 播放头估计并钳到 framesWritten。起播瞬间 native ring（16 URB≈1.36s）是满的，
+         * 估计值会**先于真播放头追上 framesWritten**，于是在 ring 尚未播完时就报 pending=0；
+         * 一旦 Java 队列也抽干，hasPendingData() 立刻变 false →
+         * MediaCodecAudioRenderer.isReady()=false → ExoPlayerImplInternal 判定
+         * renderersAllowPlayback=false → 掉 BUFFERING + stopRenderers()；而渲染器不再被调度
+         * 就永远不会再喂入数据 → position/在途量同时冻结 → 只能靠 seek 打破。
+         *
+         * 上一版修复改成 `!handledEndOfStream → true`（无条件真）——治好了误判，但破坏了
+         * isReady() 语义（见字段区注释与 SUBMIT_LIVENESS_WINDOW_MS）。现在改为三层：
+         *
+         * 1. 流不可用（重建窗口）→ 报 true，但**必须流真的在**；否则如实报 false
+         *    （退化到 isReady()=false → ExoPlayer 掉 BUFFERING 并重新调度，是正路而非死锁，
+         *    因为此时没有「已提交未播」的数据可被误解）。
+         * 2. 队列还有待 submit 的数据 → 报 true（无需估算，客观事实）。
+         * 3. 否则看**提交量活性**：最近 SUBMIT_LIVENESS_WINDOW_MS 内 framesWritten 有增长 →
+         *    报 true（ring 里确实压着已提交未播完的 URB）；从未增长过（刚起播、首个 buffer
+         *    还没喂进来）→ 也报 true（不能把「还没开始」误判成「已播完」，这正是旧死锁入口）；
+         *    曾经增长但已停滞超过窗口 → 报 false，把控制权交回 ExoPlayer。
+         *
+         * isEnded()/EOS 判定不受影响（走 delegate，与本方法无关）。
+         */
+        private boolean hasPendingDataExclusive() {
+            UsbAudioSink stream = activeStream;
+            // 异步重建窗口（含「已登记未开工」到「重建结束」）：与下面流暂空同理，
+            // 窗口内 handleBuffer 返回 false 不喂数、位置不会推进；若此时报 false
+            // 会让 ExoPlayer 掉 BUFFERING + stopRenderers() 形成抖动，故窗口内报 true。
+            if (isRebuildPending()) return true;
+            if (stream == null || !stream.isAlive()) {
+                // 重建窗口内 activeStream 暂空：数据只是没地方放、并非「已播完」，
+                // 此时报 false 会让 ExoPlayer 掉 BUFFERING + stopRenderers()，而恢复又要
+                // 依赖渲染器 → 同类死锁。窗口内报 true。窗口外（真死流）如实报 false。
+                return reconfigInProgress;
+            }
+            // 1) Java 队列还有待 submit 的数据（客观事实，无需估算）
+            if (streamingThread != null && streamingThread.hasPendingData()) return true;
+            // 2) 提交量活性判定（核心：替代上一版的无条件 true）
+            long submitted = stream.getFramesWritten();
+            if (submitted > lastSubmitFrames) {
+                lastSubmitFrames = submitted;
+                lastSubmitGrowMs = nowMs();
+                submitEverGrew = true;
+            }
+            // 3) EOS 之后：按帧差判断 ring 尾巴是否播完（收尾路径，保持原语义）
+            if (handledEndOfStream) {
+                if (usbSampleRate > 0) {
+                    long played = estimatedPlayedFrames(submitted);
+                    long pendingUs = (submitted - played) * C.MICROS_PER_SECOND / usbSampleRate;
+                    if (pendingUs >= PENDING_MIN_MEDIA_US) return true;
+                }
+                return false;
+            }
+            // 4) 未到 EOS：按活性窗口判定
+            if (!submitEverGrew) {
+                // 本流还没喂进第一块数据（起播前/刚 enable）——这是旧死锁的入口，
+                // 必须报 true，否则渲染器被判 not-ready 后就再没人喂数据了。
+                // （该场景若长期持续由「起播无数据看门狗」兜底自愈，见 probeNoDataStall。）
                 return true;
             }
-            return super.hasPendingData();
+            if (!isPlaying) {
+                // 暂停中提交量天然不增长，ring/队列里客观还压着已提交未播的数据，
+                // 不参与「停滞」衰减；恢复播放由 play() 重启活性窗口。
+                return true;
+            }
+            return nowMs() - lastSubmitGrowMs < SUBMIT_LIVENESS_WINDOW_MS;
+        }
+
+        /** hasPendingData() 翻转时的状态快照（无副作用，勿调用有重对齐副作用的估计函数）。 */
+        private String pendingSnapshot() {
+            UsbAudioSink s = activeStream;
+            long growAgoMs = submitEverGrew ? (nowMs() - lastSubmitGrowMs) : -1L;
+            return "queue=" + (streamingThread != null ? streamingThread.queueSize() : -1)
+                    + " submitted=" + (s != null ? s.getFramesWritten() : -1L)
+                    + " grewAgoMs=" + growAgoMs
+                    + " needsInit=" + usbStartMediaTimeNeedsInit
+                    + " playing=" + isPlaying + " eos=" + handledEndOfStream
+                    + " alive=" + (s != null && s.isAlive())
+                    + " rate=" + usbSampleRate + " ch=" + usbChannelCount;
+        }
+
+        /**
+         * 起播无数据看门狗探测（P0-3，独立调度线程每 500ms 调用一次）。
+         * 仅处理「独占播放中、流健康、但从 play()/flush() 起从未有任何 handleBuffer」的场景：
+         * onStallProbe 依赖写线程（首个 handleBuffer 才创建）与入队时间戳（首个入队才置位），
+         * 该场景完全探测不到 —— 实测表现为开独占后点播放 13 秒无声，直到用户手动暂停→播放。
+         * 触发后复用 auto-seek 自愈（seek → onPositionReset → 渲染器重走
+         * format/configure/handleBuffer，等效用户暂停→播放）。与 onStallProbe 共享
+         * 自愈冷却与次数上限（tryConsumeRecoveryBudget），防止 seek 风暴。
+         * 写线程已存在的情况不走本方法（由 onStallProbe 的队列侧停喂探测兜底）。
+         */
+        private void probeNoDataStall() {
+            if (!exclusiveEnabled || !isPlaying) return;
+            if (reconfigInProgress) return;
+            UsbAudioSink stream = activeStream;
+            if (stream == null || !stream.isAlive()) return;
+            if (streamingThread != null) return;
+            if (playStartedMs <= 0) return;
+            long playingForMs = nowMs() - playStartedMs;
+            // [UsbDiag] 判据快照（限频 1s）：进入「播放中且无写线程」的疑似停喂态时留痕，
+            // 用于区分「看门狗条件不满足所以没触发」与「触发了但恢复无效」。
+            if (nowMs() - lastNoDataProbeLogMs >= 1000L) {
+                lastNoDataProbeLogMs = nowMs();
+                logW(TAG, "first-data watchdog: playingFor=" + (playingForMs / 1000L)
+                        + "s (threshold=" + (FIRST_DATA_WATCHDOG_MS / 1000L) + "s)"
+                        + " submitted=" + stream.getFramesWritten()
+                        + " needsInit=" + usbStartMediaTimeNeedsInit
+                        + " reconfig=" + reconfigInProgress);
+            }
+            if (playingForMs < FIRST_DATA_WATCHDOG_MS) return;
+            tryConsumeRecoveryBudget("no data since play (" + (playingForMs / 1000L) + "s)");
         }
 
         /** 开关状态变化时由控制器调用。 */
@@ -954,6 +1482,13 @@ public final class UsbAudioSinkController {
                 // 打开必然失败并自动 fallback，无需显式路由即可防抢占。
                 muteDelegateIfNeeded();
                 usbStartMediaTimeNeedsInit = true;
+                if (isPlaying) {
+                    // 播放中开启独占：与 play() 相同的看门狗/活性窗口基准
+                    // （覆盖「先播放后开独占」路径，play() 不会再被调用一次）。
+                    playStartedMs = nowMs();
+                    lastSubmitGrowMs = nowMs();
+                    ensureFirstDataWatchdog();
+                }
             } else {
                 stopStreamingThread();
                 unmuteDelegateIfNeeded();

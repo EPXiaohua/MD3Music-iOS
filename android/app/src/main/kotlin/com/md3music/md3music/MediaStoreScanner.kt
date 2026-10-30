@@ -1,6 +1,10 @@
 package com.md3music.md3music
 
 import android.app.Activity
+import android.content.ContentResolver
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
 import android.content.ContentUris
 import android.database.Cursor
 import android.net.Uri
@@ -34,9 +38,15 @@ object MediaStoreScanner {
     /// @return 音频文件信息列表（title/artist/album/durationMs/filePath）
     fun queryAudioFiles(activity: Activity): List<Map<String, Any?>> {
         val results = mutableListOf<Map<String, Any?>>()
-        val collection: Uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        // Android 10+ 的 VOLUME_EXTERNAL 是所有已挂载外部卷的合并视图，
+        // EXTERNAL_CONTENT_URI 只覆盖主卷，会漏掉已索引的 U 盘音乐。
+        val collection: Uri = if (Build.VERSION.SDK_INT >= 29) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
 
-        val projection = arrayOf(
+        val projection = mutableListOf(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.DISPLAY_NAME,
             MediaStore.Audio.Media.TITLE,
@@ -46,36 +56,50 @@ object MediaStoreScanner {
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.SIZE,
             MediaStore.Audio.Media.MIME_TYPE,
-            MediaStore.Audio.Media.RELATIVE_PATH,
             MediaStore.Audio.Media.IS_MUSIC,
-            // BITRATE 列在 API 30+ 可用，低版本查询会忽略不认识的列
-            "bitrate",
         )
 
-        val selectionBase = "${'$'}{MediaStore.Audio.Media.IS_MUSIC} != 0"
-        val sortOrder = "${'$'}{MediaStore.Audio.Media.DATE_ADDED} DESC"
+        if (Build.VERSION.SDK_INT >= 29) projection.add(MediaStore.Audio.Media.RELATIVE_PATH)
+        if (Build.VERSION.SDK_INT >= 29) projection.add(MediaStore.Audio.Media.VOLUME_NAME)
+        if (Build.VERSION.SDK_INT >= 30) projection.add("bitrate")
+        val columns = projection.toTypedArray()
+
+        val selectionBase = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
+        val sortOrder = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
 
         // P0: 分页查询（LIMIT/OFFSET），避免一次性查询全部音频。
         // 个别 ContentProvider 不支持 LIMIT 语法，第一页失败时回退为单次全量查询。
+        if (Build.VERSION.SDK_INT < 26) {
+            return queryAll(activity, collection, columns, selectionBase, sortOrder)
+        }
+        val seenIds = mutableSetOf<Long>()
         var offset = 0
         while (true) {
             var pageCount = 0
-            val selection = "$selectionBase LIMIT $PAGE_SIZE OFFSET $offset"
+            val before = seenIds.size
+            val args = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selectionBase)
+                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sortOrder)
+                putInt(ContentResolver.QUERY_ARG_LIMIT, PAGE_SIZE)
+                putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
+            }
             try {
                 val cursor: Cursor? = activity.contentResolver.query(
-                    collection, projection, selection, null, sortOrder
+                    collection, columns, args, null
                 )
                 cursor?.use { c ->
-                    pageCount = collectPage(c, results, collection)
+                    pageCount = collectPage(c, results, collection, seenIds)
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w("LibraryScan", "分页查询失败，offset=$offset", e)
                 if (offset == 0) {
                     // 分页语法不被支持：回退全量查询
-                    return queryAll(activity, collection, projection, selectionBase, sortOrder)
+                    return queryAll(activity, collection, columns, selectionBase, sortOrder)
                 }
                 break
             }
-            if (pageCount < PAGE_SIZE) break
+            // 某些厂商忽略 OFFSET。没有新 ID 时终止，不能反复追加同页直到 OOM。
+            if (pageCount < PAGE_SIZE || seenIds.size == before) break
             offset += PAGE_SIZE
         }
         return results
@@ -86,7 +110,8 @@ object MediaStoreScanner {
     private fun collectPage(
         c: Cursor,
         results: MutableList<Map<String, Any?>>,
-        collection: Uri
+        collection: Uri,
+        seenIds: MutableSet<Long> = mutableSetOf()
     ): Int {
         val idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
         val nameCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
@@ -95,7 +120,8 @@ object MediaStoreScanner {
         val albumCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
         val albumIdCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
         val durationCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
-        val relativePathCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.RELATIVE_PATH)
+        val relativePathCol = c.getColumnIndex(MediaStore.Audio.Media.RELATIVE_PATH)
+        val volumeNameCol = c.getColumnIndex(MediaStore.Audio.Media.VOLUME_NAME)
         val mimeTypeCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
         // bitrate 列可能不存在（API < 30），用 getColumnIndex 安全获取
         val bitrateCol = c.getColumnIndex("bitrate")
@@ -103,36 +129,43 @@ object MediaStoreScanner {
         var count = 0
         while (c.moveToNext()) {
             count++
-            val id = c.getLong(idCol)
-            val contentUri: Uri = ContentUris.withAppendedId(collection, id)
-            val displayName = c.getString(nameCol) ?: "unknown"
-            val title = c.getString(titleCol)?.takeIf { it.isNotBlank() } ?: displayName
-            val artist = c.getString(artistCol)?.takeIf { it.isNotBlank() } ?: "未知艺术家"
-            val album = c.getString(albumCol)?.takeIf { it.isNotBlank() } ?: "未知专辑"
-            val albumId = c.getLong(albumIdCol)
-            val duration = c.getLong(durationCol)
-            val relativePath = c.getString(relativePathCol) ?: ""
-            val mimeType = c.getString(mimeTypeCol) ?: ""
+            try {
+                val id = c.getLong(idCol)
+                if (!seenIds.add(id)) continue
+                val contentUri: Uri = ContentUris.withAppendedId(collection, id)
+                val displayName = c.getString(nameCol) ?: "unknown"
+                val title = c.getString(titleCol)?.takeIf { it.isNotBlank() } ?: displayName
+                val artist = c.getString(artistCol)?.takeIf { it.isNotBlank() } ?: "未知艺术家"
+                val album = c.getString(albumCol)?.takeIf { it.isNotBlank() } ?: "未知专辑"
+                val albumId = c.getLong(albumIdCol)
+                val duration = c.getLong(durationCol)
+                val relativePath = if (relativePathCol >= 0) c.getString(relativePathCol) ?: "" else ""
+                val volumeName = if (volumeNameCol >= 0) c.getString(volumeNameCol) ?: "" else ""
+                val mimeType = c.getString(mimeTypeCol) ?: ""
 
-            // 二次过滤：排除非音频 MIME type（部分设备将 .m3u8/.mp4 等标记为 IS_MUSIC）
-            if (!isAudioMimeType(mimeType, displayName)) continue
+                // 二次过滤：排除非音频 MIME type（部分设备将 .m3u8/.mp4 等标记为 IS_MUSIC）
+                if (!isAudioMimeType(mimeType, displayName)) continue
 
-            results.add(
-                mapOf(
-                    "filePath" to contentUri.toString(),
-                    "displayName" to displayName,
-                    "title" to title,
-                    "artist" to artist,
-                    "album" to album,
-                    "albumId" to albumId,
-                    "albumArtUri" to albumArtUri(albumId),
-                    "durationMs" to duration,
-                    "relativePath" to relativePath,
-                    "mimeType" to mimeType,
-                    // bitrate 可能不存在（API < 30 或部分设备不填充）
-                    "bitrate" to if (bitrateCol >= 0) c.getInt(bitrateCol) else 0,
+                results.add(
+                    mapOf(
+                        "filePath" to contentUri.toString(),
+                        "displayName" to displayName,
+                        "title" to title,
+                        "artist" to artist,
+                        "album" to album,
+                        "albumId" to albumId,
+                        "albumArtUri" to albumArtUri(albumId),
+                        "durationMs" to duration,
+                        "relativePath" to relativePath,
+                        "volumeName" to volumeName,
+                        "mimeType" to mimeType,
+                        // bitrate 可能不存在（API < 30 或部分设备不填充）
+                        "bitrate" to if (bitrateCol >= 0) c.getInt(bitrateCol) else 0,
+                    )
                 )
-            )
+            } catch (e: Exception) {
+                Log.w("LibraryScan", "跳过异常 MediaStore 行", e)
+            }
         }
         return count
     }
@@ -153,7 +186,9 @@ object MediaStoreScanner {
             cursor?.use { c ->
                 collectPage(c, results, collection)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("LibraryScan", "MediaStore 全量查询失败", e)
+        }
         return results
     }
 

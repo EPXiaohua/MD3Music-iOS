@@ -5,6 +5,8 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'depth_cover_feature.dart';
+
 /// 深度分层结果缓存：key → 3 层 PNG。目录结构 `<base>/<key>/layer{0,1,2}.png`。
 /// 编排入口 [requestLayers]：命中直接回调；未命中且模型就绪时调用原生推理，
 /// 结果经 [addListener] 通知（首次请求返回 false，UI 先展示平面封面）。
@@ -29,32 +31,68 @@ class DepthCoverCache {
     return () => _listeners.remove('$key#$id');
   }
 
-  static String cacheKey(String artworkUri) =>
-      md5.convert(artworkUri.codeUnits).toString();
+  /// 缓存键版本前缀：**生成算法改变像素输出时必须改这里**，否则旧缓存会继续被
+  /// 复用（用户看到的一直是旧结果）。
+  ///
+  /// 2026-10-28 · `ffi-v2`：Windows Dart FFI 后端的 `rgbaToArgb32` 把 B 通道取成
+  /// R，分层图整体发红紫。修好代码后，旧的分层图（坏色）仍躺在缓存里，必须靠前缀
+  /// 作废。只加在 FFI 后端上 —— Android 的 Kotlin 生成一直是正确的，不该因这次
+  /// 修复白丢一遍 depth3d 缓存。
+  static const String _ffiCacheSchema = 'ffi-v2';
+
+  static String cacheKey(String artworkUri) => md5
+      .convert(utf8.encode(
+          kDepthDartFfi ? '$_ffiCacheSchema|$artworkUri' : artworkUri))
+      .toString();
 
   Future<String> _baseDir() async {
     final override = baseDirOverride;
     if (override != null) return override;
-    // getExternalStorageDirectory 仅 Android 提供，iOS/macOS 上会直接抛
-    // UnsupportedError（?? 兜底接不住异常）。此前设置页读缓存大小时在 iOS
-    // 上被这里中断，导致整个设置加载失败、所有开关回落默认值。
-    final base = Platform.isAndroid
-        ? await getExternalStorageDirectory()
-        : null;
-    final dir = base ?? await getApplicationDocumentsDirectory();
-    return '${dir.path}${Platform.pathSeparator}stream_cache'
+    Directory? base;
+    try {
+      base = await getExternalStorageDirectory();
+    } on UnimplementedError {
+      // Windows 的 path_provider 没有外部存储目录，沿用下面的应用文档目录回退。
+    }
+    base ??= await getApplicationDocumentsDirectory();
+    return '${base.path}${Platform.pathSeparator}stream_cache'
         '${Platform.pathSeparator}depth_cover';
   }
 
   /// 只读：命中返回 [bg, mid, fg] 绝对路径，未命中 null。
+  ///
+  /// Windows（FFI 后端）额外要求修补底板 `bg_fill.png` 存在（见
+  /// [requireLayerBackground]）：缺底板的分层渲染看不到修补效果，视为未命中
+  /// 才能自愈 —— 用户机器上旧的分层缓存不必手动清理。
   Future<List<String>?> getCachedLayers(String key) async {
     final dir = Directory(_join(await _baseDir(), key));
     final paths = [0, 1, 2].map((i) => _join(dir.path, 'layer$i.png')).toList();
+    if (requireLayerBackground &&
+        !File(_join(dir.path, _layerBackgroundName)).existsSync()) {
+      return null;
+    }
     if (paths.every((s) => File(s).existsSync())) {
       _touch(key);
       return paths;
     }
     return null;
+  }
+
+  /// 多层路径的修补底板文件名（全尺寸、主体已填补）。
+  static const String _layerBackgroundName = 'bg_fill.png';
+
+  /// 是否要求多层缓存必须自带修补底板。
+  ///
+  /// 默认跟随后端：**只有 Windows 的 Dart FFI 后端**产/用底板。Android 的 Kotlin
+  /// `generate` 不产底板，若无条件要求会让其多层回退路径永远不命中 → 反复重生成。
+  /// 测试可覆写以便两条分支都能验。
+  @visibleForTesting
+  bool requireLayerBackground = kDepthDartFfi;
+
+  /// 多层路径的修补底板绝对路径；没有（旧缓存 / Android）返回 null。
+  Future<String?> getLayerBackground(String key) async {
+    final path = _join(_join(await _baseDir(), key), _layerBackgroundName);
+    return File(path).existsSync() ? path : null;
   }
 
   /// 编排：命中→立即回调；未命中→模型就绪则发起原生推理。

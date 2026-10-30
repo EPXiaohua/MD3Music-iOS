@@ -8,7 +8,11 @@ project(runner LANGUAGES CXX)
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
   "flutter_window.cpp"
+  "desktop_toast.cpp"
   "floating_lyric_window.cpp"
+  "media_controls.cpp"
+  "spectrum_capture.cpp"
+  "taskbar_controls.cpp"
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
@@ -34,11 +38,20 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
+# SMTC（media_controls.cpp）用 C++/WinRT 调用 RoGetActivationFactory 与
+# Windows.Media 运行库，需要 windowsapp.lib。
+target_link_libraries(${BINARY_NAME} PRIVATE "windowsapp.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # 桌面歌词用 AlphaBlend 混合半透明背板（0% 纯透明 → 100% 纯黑）
 target_link_libraries(${BINARY_NAME} PRIVATE "msimg32.lib")
+# 音乐频谱（spectrum_capture.cpp）用 ActivateAudioInterfaceAsync / IAudioClient
+# 做 WASAPI 环回采集，接口与激活函数都在 Mmdevapi.lib。
+target_link_libraries(${BINARY_NAME} PRIVATE "mmdevapi.lib")
 # 桌面歌词悬浮窗用注册表持久化拖动后的窗口位置（RegSetValueExW）
 target_link_libraries(${BINARY_NAME} PRIVATE "advapi32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib")
+# main.cpp 给开始菜单快捷方式写 PKEY_AppUserModel_ID 属性（SMTC 应用身份）
+target_link_libraries(${BINARY_NAME} PRIVATE "propsys.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

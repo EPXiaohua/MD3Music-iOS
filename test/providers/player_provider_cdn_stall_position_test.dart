@@ -60,6 +60,61 @@ void main() {
     }
   });
 
+  test('seek 后换源断点取 seek 目标，平台缓存被清零也不回到起点', () async {
+    SharedPreferences.setMockInitialValues({});
+    final audio = ControlledAudioService();
+    AudioServiceLoader.setTestOverride(() async => audio);
+    final player = PlayerProvider();
+    try {
+      await player.audioReady.timeout(const Duration(seconds: 10));
+      final song = Song(
+        id: 'cdn-stall-seek-target',
+        title: 'CDN Stall Seek Target',
+        artist: 'Artist',
+        album: 'Album',
+        duration: const Duration(minutes: 3),
+        url: 'https://media.example/original.mp3',
+        isOnline: true,
+      );
+
+      final initialPlay = player.playSong(song);
+      await audio.waitForPlaylistLoads(1);
+      await audio.completeSourceLoad(0);
+      await initialPlay;
+      audio.emitPlaying(true);
+
+      // seek 前平台只推进到 61s；用户拖动进度条到 2:00。
+      audio.emitPosition(const Duration(milliseconds: 61426));
+      await Future<void>.delayed(Duration.zero);
+      const seekTarget = Duration(minutes: 2);
+      await player.seek(seekTarget);
+      expect(player.position, seekTarget);
+
+      player.debugSetPrefetchedCdnUrlForTest(
+        songId: song.id,
+        url: 'https://media.example/refreshed.mp3',
+        quality: '128',
+      );
+      // 慢网下 seek 落点尚未缓冲完成，平台在装载窗口内上报 0（非零缓存
+      // 也已被 resume 的 _issuePlaybackRequest 清空）——换源断点仍必须是
+      // seek 目标，不能从 0:00 重播。
+      audio.emitPosition(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      final recovery = player.debugHandleCdnStallForTest();
+      await audio.waitForPlaylistLoads(2);
+      expect(audio.sourceInitialPositions[1], seekTarget);
+
+      await audio.completeSourceLoad(1);
+      await recovery;
+      expect(player.position, seekTarget);
+      expect(player.currentSong?.url, 'https://media.example/refreshed.mp3');
+    } finally {
+      player.dispose();
+      await audio.dispose();
+      AudioServiceLoader.setTestOverride(null);
+    }
+  });
+
   test('缓冲充足不重建音源，余量到阈值时才通过位置流换源', () async {
     SharedPreferences.setMockInitialValues({});
     final audio = ControlledAudioService();

@@ -101,13 +101,14 @@ void main() {
       );
 
   /// 屏幕上真正生效的圆角 = 局部半径 × scale（子树被 Transform 缩放）。
-  /// 与 player_cover_morph_test.dart 的 screenRadiusAt 同一算法。
+  /// 与 player_cover_morph_test.dart 的 screenRadiusAt 同一算法：
+  /// 边长与圆角都按**平抛的加速项** q = p² 走（见 coverMorphFlightRect）。
   double screenRadiusAt(WidgetTester tester, double p) {
     final local = (tester.widget<ClipRRect>(layerClip()).borderRadius
             as BorderRadius)
         .topLeft
         .x;
-    final targetWidth = 44 + (720 - 44) * p;
+    final targetWidth = 44 + (720 - 44) * p * p;
     return local * (targetWidth / 720);
   }
 
@@ -142,11 +143,11 @@ void main() {
       expect(playerCoverMorphDebugLayerBuilds, steps.length);
       expect(playerCoverMorphDebugLayerBuilds, greaterThanOrEqualTo(2));
 
-      // 圆角逐帧变化：屏幕半径 = 6 + (16-6) × t，t 直接等于 expansion。
+      // 圆角逐帧变化：屏幕半径 = 6 + (16-6) × q，q 是平抛的加速项 = expansion²。
       for (var i = 0; i < radii.length; i++) {
         expect(
           radii[i],
-          closeTo(6 + 10 * steps[i], 1e-6),
+          closeTo(6 + 10 * steps[i] * steps[i], 1e-6),
           reason: 'p=${steps[i]} 的屏幕圆角',
         );
         if (i > 0) {

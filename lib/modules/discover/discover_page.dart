@@ -1,19 +1,24 @@
 import '../../core/layout/page_layout.dart';
-import '../../core/layout/responsive_layout.dart';
 import '../../core/remote/tv_scroll_region.dart';
 import '../../core/layout/adaptive_navigator.dart';
 import '../../core/platform_capabilities.dart';
 import 'dart:async';
+import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:m3e_core/m3e_core.dart';
 import 'package:dpad/dpad.dart';
+import '../../core/build_flags.dart';
+import '../../core/layout/bottom_chrome_dimens.dart';
 import '../../core/theme/app_dimens.dart';
+import '../../core/layout/responsive_layout.dart';
 import '../../core/utils/reveal_label.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
+import '../../widgets/m3e_container_transform.dart';
 
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
@@ -26,6 +31,12 @@ import '../personal_fm/personal_fm_section.dart';
 import '../player/secondary_mini_player.dart';
 import '../recognition/song_recognition_page.dart';
 import '../search/search_page.dart';
+import '../album/album_detail_page.dart';
+import '../album/new_album_browse_page.dart';
+import '../../widgets/compact_album_grid.dart';
+import '../../widgets/playlist_cover_hero.dart';
+import '../../core/utils/app_toast.dart';
+import 'discover_sections.dart';
 
 /// 顶栏图标按钮（搜索 / 识曲）的尺寸：36 而不是 MD3 默认的 48，让两个图标之间
 /// 由 24dp 收到 12dp；纵向仍保留 40dp 触达高度。
@@ -46,27 +57,88 @@ class _DiscoverPageState extends State<DiscoverPage>
     with SingleTickerProviderStateMixin {
   static const String _kDiscoverLastDateKey = 'discover_last_date';
 
-  // 每日推荐区块的折叠状态（true=折叠）。SharedPreferences 存"是否折叠"。
-  //
-  // 发现页现在只有私人 FM + 每日推荐 + 刷歌推荐 + 新歌速递四块（主题歌单/场景音乐/
-  // 热门歌单/排行榜/新碟上架已迁移到搜索空白态，见 MusicExploreSections）。私人 FM
-  // 没有标题行（见 [PersonalFmSection]），卡片恒定展示、无折叠把手；其余三块各有一个
-  // 折叠键，共用下面 [_toggleCollapse] 的「prefs 存的是否折叠」语义。
-  static const String _kCollapsedDaily = 'discover_collapsed_daily';
-
-  // 刷歌推荐区块的折叠状态，键名与每日推荐同一套约定（前缀 + 分区），
-  // 这样两块共用 [_toggleCollapse] 的「prefs 存的是否折叠」语义。
-  static const String _kCollapsedHomeDiscover = 'discover_collapsed_home_discover';
-
-  // 新歌速递沿用同一套键名约定。
-  static const String _kCollapsedNewSong = 'discover_collapsed_new_song';
+  DiscoverSectionConfig _sectionConfig = const DiscoverSectionConfig();
 
   bool _isLoading = true;
   String? _error;
 
-  bool _isDailyExpanded = true;
-  bool _isHomeDiscoverExpanded = true;
-  bool _isNewSongExpanded = true;
+  /// 四个区块「›」详情入口的 M3E 容器变换转场源。
+  /// 区块的 State 字段持 key 保证跨重建稳定（build 里现场 new 的
+  /// GlobalKey 会在重建后失效，morph 静默退化）。
+  final GlobalKey _dailyMoreKey = GlobalKey();
+  final GlobalKey _homeDiscoverMoreKey = GlobalKey();
+  final GlobalKey _newSongMoreKey = GlobalKey();
+  final GlobalKey _newAlbumMoreKey = GlobalKey();
+
+  /// appbar「听歌识曲」入口的 M3E 容器变换转场源（同上，State 持 key）。
+  /// 搜索入口不接 morph（见 [_openSearch] 注释：会破坏 PlaylistCoverHero
+  /// 封面连续过渡），故无对应 key。
+  final GlobalKey _recognitionActionKey = GlobalKey();
+
+  /// 「›」详情入口统一分派：双栏（横屏/平板 B 类页面）与 TV 构建走
+  /// [AdaptiveNav.openDetail]（面板内嵌/原路由）；手机单栏走 M3E 容器变换
+  /// 转场——详情从「›」按钮矩形 morph 展开到全屏。
+  void _openSectionDetail(
+    BuildContext context,
+    GlobalKey sourceKey,
+    WidgetBuilder builder,
+  ) {
+    // Windows 主列表在 DetailPaneScope 下，不在右栏的 DetailPaneContent 下。
+    final windowsTwoPane = defaultTargetPlatform == TargetPlatform.windows &&
+        DetailPaneScope.isTwoPaneOf(context);
+    if (windowsTwoPane || DetailPaneContent.isTwoPaneOf(context) || kTvBuild) {
+      AdaptiveNav.openDetail(context, builder);
+      return;
+    }
+    m3eOpenContainerTransform(
+      context: context,
+      sourceKey: sourceKey,
+      closedColor: Theme.of(context).colorScheme.surfaceContainerLow,
+      openColor: Theme.of(context).colorScheme.surface,
+      closedRadius: BorderRadius.circular(20),
+      pageBuilder: builder,
+    );
+  }
+
+  /// appbar「搜索」入口：保持原 MaterialPageRoute。
+  ///
+  /// 为什么不用 M3E 容器变换转场：搜索页内含 [PlaylistCoverHero] 封面连贯
+  /// 过渡体系（flight bus/探针/路由动画侦测，见 playlist_cover_hero.dart），
+  /// 自定义 morph 路由会把目标页压进非全屏 rect 布局并干扰其路由动画侦测，
+  /// 实测封面连续过渡直接失效——存量核心效果优先，此处不做 morph。
+  void _openSearch(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const TwoPanePage(child: SearchPage()),
+      ),
+    );
+  }
+
+  /// appbar「听歌识曲」入口：morph **走内层 Navigator**（不用根 Navigator）。
+  ///
+  /// 为什么不能用 `useRootNavigator: true`：底栏收起 + 悬浮胶囊下移的联动由
+  /// shell 的**内层路由侦测**驱动（ResponsiveShell.onSecondaryRouteChanged /
+  /// onPageRouteEvent，见 responsive_shell.dart 顶部说明）——根 Navigator 的
+  /// 路由事件 shell 看不见，底栏不收、胶囊原位不动；morph 渐显转场又把这套
+  /// 「底栏 + 胶囊僵在原地」全程暴露在画面里（原 MaterialPageRoute 是整页
+  /// 瞬时盖住，没这么显眼）。改走内层后与区块「›」详情同一联动链路，底栏
+  /// 收起动画与胶囊下移照常触发。
+  void _openRecognition(BuildContext context) {
+    if (kTvBuild) {
+      Navigator.of(context, rootNavigator: true).push(
+        MaterialPageRoute(builder: (_) => const SongRecognitionPage()),
+      );
+      return;
+    }
+    m3eOpenContainerTransform(
+      context: context,
+      sourceKey: _recognitionActionKey,
+      closedColor: Theme.of(context).colorScheme.surfaceContainerLow,
+      openColor: Theme.of(context).colorScheme.surface,
+      closedRadius: BorderRadius.circular(20),
+      pageBuilder: (_) => const SongRecognitionPage(),
+    );
+  }
 
   /// 拿到昵称且首屏内容就绪后，胶囊停留多久再收回。
   static const Duration _kGreetingDwell = Duration(seconds: 3);
@@ -129,7 +201,7 @@ class _DiscoverPageState extends State<DiscoverPage>
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initIfNeeded();
-      _loadCollapseStates();
+      _loadSectionConfig();
       _watchGreetingNickname();
     });
   }
@@ -174,27 +246,11 @@ class _DiscoverPageState extends State<DiscoverPage>
     _greetingController.reverse();
   }
 
-  /// 从 SharedPreferences 恢复每日推荐 section 的折叠状态
-  Future<void> _loadCollapseStates() async {
-    final prefs = await SharedPreferences.getInstance();
+  /// 恢复发现页区块的布局配置（顺序 / 显隐）
+  Future<void> _loadSectionConfig() async {
+    final config = await DiscoverSectionConfig.load();
     if (!mounted) return;
-    setState(() {
-      _isDailyExpanded = !(prefs.getBool(_kCollapsedDaily) ?? false);
-      _isHomeDiscoverExpanded = !(prefs.getBool(_kCollapsedHomeDiscover) ?? false);
-      _isNewSongExpanded = !(prefs.getBool(_kCollapsedNewSong) ?? false);
-    });
-  }
-
-  /// 切换 section 展开/折叠并持久化
-  Future<void> _toggleCollapse({
-    required String prefKey,
-    required bool currentlyExpanded,
-    required ValueChanged<bool> apply,
-  }) async {
-    final next = !currentlyExpanded;
-    setState(() => apply(next));
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(prefKey, !next);
+    setState(() => _sectionConfig = config);
   }
 
   /// 每天只自动加载一次：内存有数据且是同一天则跳过，否则拉取
@@ -206,6 +262,7 @@ class _DiscoverPageState extends State<DiscoverPage>
     final lastDate = prefs.getString(_kDiscoverLastDateKey);
     final today = _todayString();
     if (kugou.hasLoadedDiscoverData && lastDate == today) {
+      if (kugou.topAlbums.isEmpty) unawaited(kugou.getTopAlbum());
       if (!mounted) return;
       setState(() => _isLoading = false);
       _maybeShowGreeting();
@@ -222,9 +279,8 @@ class _DiscoverPageState extends State<DiscoverPage>
       await _loadAllData();
       if (!mounted) return;
 
-      // 检查是否真的加载到了数据（发现页只剩每日推荐 + 私人 FM）
-      if (kugou.recommendSongs.isNotEmpty ||
-          kugou.personalFmSongs.isNotEmpty) {
+      // 任一分区有数据即可展示，其余分区自行补齐。
+      if (_hasAnySectionData) {
         break; // 有数据了，退出重试
       }
 
@@ -247,7 +303,8 @@ class _DiscoverPageState extends State<DiscoverPage>
     final kugou = context.read<KugouProvider>();
     return kugou.recommendSongs.isNotEmpty ||
         kugou.personalFmSongs.isNotEmpty ||
-        kugou.homeDiscoverSongs.isNotEmpty;
+        kugou.homeDiscoverSongs.isNotEmpty ||
+        kugou.topAlbums.isNotEmpty;
   }
 
   Future<void> _loadAllData() async {
@@ -278,8 +335,7 @@ class _DiscoverPageState extends State<DiscoverPage>
           ? await PersonalFmWidgetActions.restoreStationIndex()
           : 0;
       // 渐进加载：请求并行发起，每个分区完成后立即刷新一次。
-      // 发现页只保留每日推荐 + 私人 FM 两块；主题歌单/场景音乐/热门歌单/
-      // 排行榜/新碟上架已迁到搜索空白态（MusicExploreSections 按需拉取）。
+      // 新碟与其他区块并行加载；热门歌单/排行榜仍由搜索页按需拉取。
       final reqs = <Future<void>>[
         kugou.getRecommendDaily(forceRefresh: hasExistingData),
         // 默认档仍走无参首刷（action=login，按登录态出个性化批次）；非默认档按
@@ -299,6 +355,7 @@ class _DiscoverPageState extends State<DiscoverPage>
         // Selector 自己返回空占位就隐身了；把它算进闸门会让其它三区已经就绪时
         // 整页继续转圈，还会因为它一首都没取到而把全部区块重拉三轮。
         kugou.getNewSongs(forceRefresh: hasExistingData),
+        kugou.getTopAlbum(forceRefresh: hasExistingData),
       ];
       for (final f in reqs) {
         unawaited(f.then((_) {
@@ -351,27 +408,19 @@ class _DiscoverPageState extends State<DiscoverPage>
             icon: Icons.search,
             // 页面形态（非搜索 tab）也要能出双栏：包 TwoPanePage 让详情入口有
             // 面板作用域可分派；窄屏由 TwoPanePage 内部退化成单栏整屏，手机不变。
-            onPressed: () => Navigator.of(
-              context,
-            ).push(
-              MaterialPageRoute(
-                builder: (_) => const TwoPanePage(child: SearchPage()),
-              ),
-            ),
+            onPressed: () => _openSearch(context),
           ),
           // 听歌识曲：依赖 Android 端麦克风采集 + RMS 分析链路，
           // 桌面端点了只会进到一个不工作的页面，故整块隐藏。
           if (supportsSongRecognition)
             Padding(
               padding: const EdgeInsets.only(right: _kActionTrailingGap),
-              child: _buildActionIcon(
-                icon: Icons.mic_outlined,
-                onPressed: () => Navigator.of(context, rootNavigator: true)
-                    .push(
-                      MaterialPageRoute(
-                        builder: (_) => const SongRecognitionPage(),
-                      ),
-                    ),
+              child: KeyedSubtree(
+                key: _recognitionActionKey,
+                child: _buildActionIcon(
+                  icon: Icons.mic_outlined,
+                  onPressed: () => _openRecognition(context),
+                ),
               ),
             ),
         ],
@@ -381,60 +430,87 @@ class _DiscoverPageState extends State<DiscoverPage>
         onRefresh: _loadAllData,
         // 渐进加载：任一分区数据就绪即退出整页转圈，先显示已获取的分区；
         // 未就绪分区由各自 Selector 在数据到达时自动补出（空数据返回占位）。
-        child: _isLoading && !_hasAnySectionData
-            ? const Center(child: M3ELoadingIndicator())
-            : _error != null && !_hasAnySectionData
-            ? _buildError(colorScheme)
-            : CustomScrollView(
-                controller: _scrollController,
-                slivers: [
-                  _buildPersonalFmSection(),
-                  SliverLayoutBuilder(
-                      builder: (context, constraints) {
-                        final sections = [
-                          _buildDailySection(colorScheme),
-                  _buildHomeDiscoverSection(colorScheme),
-                  _buildNewSongSection(colorScheme),
-                        ];
-                        // 歌曲仍按各分区的单列播放顺序呈现。
-                        // 宽屏两两并排而不是三块全部并排：三块并排时每列只分到
-                        // 三分之一宽度，歌名 + 尾部的收藏钮就放不下，横向被截断。
-                        // 所以按 2 个一组切行，凑不成对的最后一块独占整行——它是
-                        // 单个 sliver，不能再套一层 cross-axis group
-                        // （SliverCrossAxisExpanded 只在 group 内有意义，
-                        // 单孩子的 group 只是白白多一层约束）。
-                        if (!usesNavigationRail(constraints.crossAxisExtent)) {
-                          return SliverMainAxisGroup(slivers: sections);
-                        }
-                        final rows = <Widget>[];
-                        for (var i = 0; i < sections.length; i += 2) {
-                          if (i + 1 < sections.length) {
-                            rows.add(SliverCrossAxisGroup(
-                              slivers: [
-                                SliverCrossAxisExpanded(
-                                  flex: 1,
-                                  sliver: sections[i],
-                                ),
-                                SliverCrossAxisExpanded(
-                                  flex: 1,
-                                  sliver: sections[i + 1],
-                                ),
-                              ],
-                            ));
-                          } else {
-                            rows.add(sections[i]);
-                          }
-                        }
-                        return SliverMainAxisGroup(slivers: rows);
-                      },
-                    ),
-                  const SliverToBoxAdapter(child: SizedBox(height: 80)),
-                ],
-                ),
-              ),
+        child: CustomScrollView(
+          controller: _scrollController,
+          slivers: [
+            DiscoverSectionsSliver(
+              config: _sectionConfig,
+              onEdit: _showSectionEditor,
+              status: _isLoading && !_hasAnySectionData
+                  ? const Padding(padding: EdgeInsets.all(32), child: Center(child: M3ELoadingIndicator()))
+                  : _error != null && !_hasAnySectionData ? _buildError(colorScheme) : null,
+              sectionBuilder: (section) => switch (section) {
+                DiscoverSection.personalFm => _buildPersonalFmSection(),
+                DiscoverSection.daily => _buildDailySection(colorScheme),
+                DiscoverSection.homeDiscover => _buildHomeDiscoverSection(colorScheme),
+                DiscoverSection.newSongs => _buildNewSongSection(colorScheme),
+                DiscoverSection.newAlbums => _buildNewAlbumSection(),
+              },
+            ),
+          ],
+        ),
+      ),
       ),
     );
   }
+
+  Future<void> _updateSectionConfig(DiscoverSectionConfig config) async {
+    if (!mounted) return;
+    setState(() => _sectionConfig = config);
+    try {
+      await config.save();
+    } catch (_) {
+      showToast('保存发现页布局失败');
+    }
+  }
+
+  void _showSectionEditor() {
+    showM3EModalBottomSheet(
+      context: context, isScrollControlled: true, showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: SizedBox(
+          height: discoverSectionManagerSheetHeight(MediaQuery.sizeOf(ctx).height),
+          child: DiscoverSectionManager(config: _sectionConfig, onChanged: _updateSectionConfig),
+        ),
+      ),
+    );
+  }
+
+  /// 新碟与新歌速递默认并排，复用原来的小封面列表、浏览页和 Hero ID。
+  Widget _buildNewAlbumSection() => Selector<KugouProvider, List<KugouAlbumBrief>>(
+        selector: (_, provider) => provider.topAlbums,
+        builder: (context, briefs, _) {
+          final albums = briefs.map((brief) => brief.toAlbum()).toList();
+          final firstId = firstIndexById([for (final album in albums) album.id]);
+          return SliverToBoxAdapter(
+            child: _SectionBlock(
+              title: '新碟上架',
+              trailing: KeyedSubtree(
+                key: _newAlbumMoreKey,
+                child: IconButton(
+                  onPressed: () => _openSectionDetail(
+                    context,
+                    _newAlbumMoreKey,
+                    (_) => const NewAlbumBrowsePage(),
+                  ),
+                  icon: const Icon(Icons.chevron_right),
+                ),
+              ),
+              child: albums.isEmpty
+                  ? const Padding(padding: EdgeInsets.all(16), child: Text('暂无新碟'))
+                  : CompactAlbumGrid(
+                      albums: albums,
+                      maxItems: 8,
+                      heroTags: [for (var i = 0; i < albums.length; i++)
+                        firstId[albums[i].id] == i ? albumCoverHeroTag(albums[i].id) : null],
+                      regionKey: 'tv/discover-new-albums',
+                      onTap: (index) => AdaptiveNav.openDetail(context,
+                          (_) => AlbumDetailPage(album: albums[index])),
+                    ),
+            ),
+          );
+        },
+      );
 
   String _getGreeting() {
     final h = DateTime.now().hour;
@@ -628,21 +704,18 @@ class _DiscoverPageState extends State<DiscoverPage>
         final all = songs.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _CollapsibleSection(
+          child: _SectionBlock(
             title: '每日推荐',
-            isExpanded: _isDailyExpanded,
-            onToggle: () => _toggleCollapse(
-              prefKey: _kCollapsedDaily,
-              currentlyExpanded: _isDailyExpanded,
-              apply: (v) => _isDailyExpanded = v,
-            ),
-            trailing: IconButton(
-              onPressed: () {
-                AdaptiveNav.openDetail(context,
+            trailing: KeyedSubtree(
+              key: _dailyMoreKey,
+              child: IconButton(
+                onPressed: () => _openSectionDetail(
+                  context,
+                  _dailyMoreKey,
                   (_) => const _DailyRecommendDetailPage(),
-                );
-              },
-              icon: const Icon(Icons.chevron_right),
+                ),
+                icon: const Icon(Icons.chevron_right),
+              ),
             ),
             child: Padding(
               // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
@@ -685,21 +758,18 @@ class _DiscoverPageState extends State<DiscoverPage>
         final all = details.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _CollapsibleSection(
+          child: _SectionBlock(
             title: '刷歌推荐',
-            isExpanded: _isHomeDiscoverExpanded,
-            onToggle: () => _toggleCollapse(
-              prefKey: _kCollapsedHomeDiscover,
-              currentlyExpanded: _isHomeDiscoverExpanded,
-              apply: (v) => _isHomeDiscoverExpanded = v,
-            ),
-            trailing: IconButton(
-              onPressed: () {
-                AdaptiveNav.openDetail(context,
+            trailing: KeyedSubtree(
+              key: _homeDiscoverMoreKey,
+              child: IconButton(
+                onPressed: () => _openSectionDetail(
+                  context,
+                  _homeDiscoverMoreKey,
                   (_) => const _HomeDiscoverDetailPage(),
-                );
-              },
-              icon: const Icon(Icons.chevron_right),
+                ),
+                icon: const Icon(Icons.chevron_right),
+              ),
             ),
             child: Padding(
               // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
@@ -737,21 +807,18 @@ class _DiscoverPageState extends State<DiscoverPage>
         final all = details.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _CollapsibleSection(
+          child: _SectionBlock(
             title: '新歌速递',
-            isExpanded: _isNewSongExpanded,
-            onToggle: () => _toggleCollapse(
-              prefKey: _kCollapsedNewSong,
-              currentlyExpanded: _isNewSongExpanded,
-              apply: (v) => _isNewSongExpanded = v,
-            ),
-            trailing: IconButton(
-              onPressed: () {
-                AdaptiveNav.openDetail(context,
+            trailing: KeyedSubtree(
+              key: _newSongMoreKey,
+              child: IconButton(
+                onPressed: () => _openSectionDetail(
+                  context,
+                  _newSongMoreKey,
                   (_) => const _NewSongDetailPage(),
-                );
-              },
-              icon: const Icon(Icons.chevron_right),
+                ),
+                icon: const Icon(Icons.chevron_right),
+              ),
             ),
             child: Padding(
               // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
@@ -928,6 +995,7 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
   bool _isLoading = true;
   bool _loadingMore = false;
   bool _hasMore = true;
+  bool _loadMoreFailed = false;
 
   final ScrollController _scrollController = ScrollController();
 
@@ -963,6 +1031,18 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
     }
   }
 
+  bool _onListScroll(ScrollNotification notification) {
+    if (notification.depth != 0 || !_hasMore || _loadingMore) return false;
+    final towardEnd =
+        (notification is ScrollUpdateNotification &&
+            (notification.scrollDelta ?? 0) > 0) ||
+        (notification is OverscrollNotification && notification.overscroll > 0);
+    if (towardEnd && notification.metrics.extentAfter <= 200) {
+      _loadMore();
+    }
+    return false;
+  }
+
   /// 列表装不满一屏时主动补批，直到它真的能滚。
   ///
   /// 这是"只有 4 首时怎么上拉都没反应"的根因：[_onScroll] 挂在 ScrollController
@@ -984,7 +1064,7 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
     _autoFilling = true;
     try {
       for (var round = 0; round < _maxAutoFillRounds; round++) {
-        if (!mounted || !_hasMore) return;
+        if (!mounted || !_hasMore || _loadMoreFailed) return;
         // 等新条目布局完再量，否则量到的还是补货前的 maxScrollExtent。
         await WidgetsBinding.instance.endOfFrame;
         if (!mounted) return;
@@ -1006,7 +1086,10 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
   /// 只改字段不重建的话指示器从出现到消失都不会画出来。
   Future<void> _loadMore() async {
     if (_loadingMore || !_hasMore) return;
-    setState(() => _loadingMore = true);
+    setState(() {
+      _loadingMore = true;
+      _loadMoreFailed = false;
+    });
     try {
       await _loadMoreBatch();
     } finally {
@@ -1021,8 +1104,10 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
     // 列表本身由 provider 追加（fetchMoreHomeDiscover 内部已经并进
     // homeDiscoverSongs 并 notifyListeners），这里只判"还有没有"。
     setState(() {
-      _hasMore = fresh.isNotEmpty;
+      _loadMoreFailed = fresh.isEmpty && kugou.homeDiscoverLastLoadFailed;
+      _hasMore = fresh.isNotEmpty || _loadMoreFailed;
     });
+    if (_loadMoreFailed) return;
     // 补完一批后再确认一次能否滚动：大屏/折叠屏展开态下，一屏装得下 30 首，
     // 光靠首屏那次自动补货还是滚不动。
     await _fillUntilScrollable();
@@ -1072,11 +1157,32 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
     }
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
+    if (_loadMoreFailed) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: TextButton(
+          onPressed: _loadingMore ? null : _loadMore,
+          child: Text('加载失败，点击重试', style: tt.bodySmall),
+        ),
+      );
+    }
+    if (_hasMore) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Center(
+          child: TextButton(
+            key: const ValueKey('home-discover-load-more'),
+            onPressed: _loadingMore ? null : _loadMore,
+            child: Text('继续上滑加载更多', style: tt.bodySmall),
+          ),
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 16),
       child: Center(
         child: Text(
-          _hasMore ? '继续上滑加载更多' : '没有更多了',
+          '没有更多了',
           style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
         ),
       ),
@@ -1099,6 +1205,22 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
                 builder: (context, details, _) {
                   final songs = details.map((e) => e.toSong()).toList();
                   if (songs.isEmpty) return const Center(child: Text('暂无数据'));
+                  final hasCurrentSong = context.select<PlayerProvider, bool>(
+                    (player) => player.currentSong != null,
+                  );
+                  final miniPlayerInset =
+                      hasCurrentSong &&
+                      kSecondaryPlayerEnabled.value &&
+                      !isDesktopLayout(context)
+                          ? BottomChromeDimens.discReservedBottom
+                          : 0.0;
+                  final listBottomPadding =
+                      AppSpacing.lg +
+                      math.max(
+                        MediaQuery.paddingOf(context).bottom,
+                        miniPlayerInset,
+                      ).toDouble() +
+                      AppSpacing.sm;
                   return Column(
                     children: [
                       // 播放全部：与每日推荐详情页同形态（FilledButton.icon +
@@ -1120,32 +1242,36 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
                         ),
                       ),
                       Expanded(
-                        child: TvScrollRegion(
-                          memoryKey: 'tv/discover-home-detail',
-                          horizontalEdge: DpadEdgeBehavior.leave,
-                          child: ListView.builder(
-                          controller: _scrollController,
-                          padding: EdgeInsets.fromLTRB(
-                            AppSpacing.lg,
-                            AppSpacing.sm,
-                            AppSpacing.lg,
-                            AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: _onListScroll,
+                          child: TvScrollRegion(
+                            memoryKey: 'tv/discover-home-detail',
+                            horizontalEdge: DpadEdgeBehavior.leave,
+                            child: ListView.builder(
+                              controller: _scrollController,
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              padding: EdgeInsets.fromLTRB(
+                                AppSpacing.lg,
+                                AppSpacing.sm,
+                                AppSpacing.lg,
+                                listBottomPadding,
+                              ),
+                              // +1 是底部哨兵行，兼作翻页指示与"没有更多"的落点。
+                              itemCount: songs.length + 1,
+                              itemBuilder: (context, index) {
+                                if (index == songs.length) {
+                                  return _buildListFooter(context);
+                                }
+                                return SongListItem(
+                                  song: songs[index],
+                                  // 与每日推荐详情页一致：收藏 + 三点，无时长。
+                                  trailingActions:
+                                      SongTrailingActions.favoriteAndMore,
+                                  onTap: () => _play(index),
+                                );
+                              },
+                            ),
                           ),
-                          // +1 是底部哨兵行，兼作翻页指示与"没有更多"的落点。
-                          itemCount: songs.length + 1,
-                          itemBuilder: (context, index) {
-                            if (index == songs.length) {
-                              return _buildListFooter(context);
-                            }
-                            return SongListItem(
-                              song: songs[index],
-                              // 与每日推荐详情页一致：收藏 + 三点，无时长。
-                              trailingActions:
-                                  SongTrailingActions.favoriteAndMore,
-                              onTap: () => _play(index),
-                            );
-                          },
-                        ),
                         ),
                       ),
                     ],
@@ -1440,29 +1566,22 @@ class _NewSongDetailPageState extends State<_NewSongDetailPage> {
   }
 }
 
-/// 可折叠 section 容器：
-/// - 标题行左侧可点击区域（标题 + chevron 图标）触发 onToggle 折叠/展开
-/// - 标题行右侧可放额外 widget（如"查看更多"按钮）
-/// - 内容用 AnimatedCrossFade 在展示态和零高度态间平滑过渡
-class _CollapsibleSection extends StatelessWidget {
-  const _CollapsibleSection({
+/// 发现页区块容器：标题行 + 内容。
+/// 标题行右侧可放额外 widget（如"查看更多"按钮）。
+class _SectionBlock extends StatelessWidget {
+  const _SectionBlock({
     required this.title,
-    required this.isExpanded,
-    required this.onToggle,
     required this.child,
     this.trailing,
   });
 
   final String title;
-  final bool isExpanded;
-  final VoidCallback onToggle;
   final Widget child;
   final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
     final tt = Theme.of(context).textTheme;
-    final cs = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1476,35 +1595,15 @@ class _CollapsibleSection extends StatelessWidget {
           child: Row(
             children: [
               Expanded(
-                child: InkWell(
-                  onTap: onToggle,
-                  borderRadius: AppRadius.smAll,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Flexible(
-                          child: Text(
-                            title,
-                            style: tt.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w600,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const Gap(AppSpacing.xs),
-                        AnimatedRotation(
-                          turns: isExpanded ? 0.5 : 0,
-                          duration: const Duration(milliseconds: 200),
-                          child: Icon(
-                            Icons.expand_more,
-                            color: cs.onSurfaceVariant,
-                          ),
-                        ),
-                      ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                  child: Text(
+                    title,
+                    style: tt.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
                     ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
               ),
@@ -1512,15 +1611,7 @@ class _CollapsibleSection extends StatelessWidget {
             ],
           ),
         ),
-        AnimatedCrossFade(
-          duration: const Duration(milliseconds: 200),
-          crossFadeState: isExpanded
-              ? CrossFadeState.showFirst
-              : CrossFadeState.showSecond,
-          sizeCurve: Curves.easeInOut,
-          firstChild: child,
-          secondChild: const SizedBox(width: double.infinity),
-        ),
+        child,
       ],
     );
   }

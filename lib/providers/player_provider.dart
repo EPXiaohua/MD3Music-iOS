@@ -12,26 +12,31 @@ import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/services/audio_offload_service.dart';
 import '../core/services/audio_service.dart';
 import '../core/services/audio_service_io.dart'
     hide AudioService, createAudioSource;
+import '../core/services/automix/automix_analysis.dart';
 import '../core/services/automix/automix_analysis_store.dart';
 import '../core/services/automix/automix_analyzer.dart';
 import '../core/services/automix/automix_planner.dart';
 import '../core/services/audio_source_load_deadline.dart';
 import '../core/services/desktop_lyric_service.dart';
 import '../core/services/diagnostic_logger.dart';
-import '../core/services/fm_widget_sync.dart';
+import '../core/services/equalizer_service.dart';
 import '../core/services/home_widget_service.dart';
+import '../core/services/fm_widget_sync.dart';
 import '../core/services/lyricon_provider_service.dart';
 import '../core/services/listening_grade_service.dart';
 import '../core/services/listen_report_service.dart';
+import '../core/services/listen_stats_record_service.dart';
 import '../core/services/playback_duration_tracker.dart';
 import '../core/services/media_notification_service.dart';
 import '../core/services/now_playing_service.dart';
 import '../core/services/play_history_sync_service.dart';
 import '../core/services/wakelock_service.dart';
 import '../core/services/media_store_service.dart';
+import '../core/services/spectrum_service.dart';
 import '../core/services/usb_audio_service.dart';
 import '../core/services/direct_pcm_service.dart';
 import '../core/services/output_mode_coordinator.dart';
@@ -39,6 +44,7 @@ import '../core/services/remote/playback_headers.dart';
 import '../core/services/remote/remote_download_cache.dart';
 import '../core/services/remote/remote_storage_config.dart';
 import '../core/services/remote/remote_storage_repository.dart';
+import '../core/services/viper_master_service.dart';
 import '../data/models/song.dart';
 import '../modules/player/comments_view.dart';
 import '../modules/player/song_accompany_sheet.dart';
@@ -47,6 +53,7 @@ import '../modules/player/mv_player_page.dart';
 import '../core/utils/app_toast.dart';
 import '../core/utils/audio_format_utils.dart';
 import '../core/utils/local_lyric_loader.dart';
+import '../utils/live_filter.dart';
 import '../data/repositories/history_repository.dart';
 import '../data/repositories/player_state_repository.dart';
 import '../data/repositories/settings_repository.dart';
@@ -155,6 +162,9 @@ String? safePlaybackErrorMessage(String? error) {
 bool kMiniPlayerSkipNextEntrance = false;
 
 class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
+  Timer? _idleKeepaliveStopTimer;
+  int _idleKeepaliveStopTimerGeneration = 0;
+  bool _idleKeepaliveEligible = false;
   static int _nextDiagnosticSessionId = 0;
   final String _diagnosticSessionId = (++_nextDiagnosticSessionId)
       .toRadixString(36);
@@ -298,10 +308,19 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             'androidExoType': playerError!.androidExoType!,
         },
       );
+      // 硬解初始化/写入失败（Media3 会自动关 offload 重试）：不当作播放失败，
+      // 不落「播放失败」提示、不触发换源重试，只交给硬解服务记一次平台回退。
+      if (playerError != null &&
+          (playerError.code == 5003 || playerError.code == 5004)) {
+        AudioOffloadService.instance.notePlatformFallback();
+        return false;
+      }
       final ownsCurrentSong = request == null
           ? _currentSong?.id == song?.id
           : _isPlaybackRequestCurrent(request);
       if (ownsCurrentSong && !_isDisposed) {
+        // 装载失败：先尝试曲库 MV 音轨兜底（成功即已接管播放，不置失败态）
+        if (await _tryMvAudioFallback(song, request: request)) return true;
         _completionReadyRequest = null;
         _isPlaying = false;
         _isResolvingUrl = false;
@@ -358,6 +377,16 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   Duration? _failedPlaybackPosition;
   Duration _lastNonZeroPlatformPosition = Duration.zero;
   String? _lastNonZeroPositionSongId;
+
+  /// 用户最近一次 seek 的目标位置（按歌曲隔离的乐观值）。
+  ///
+  /// 高音质（无损/Hi-Res）seek 到远端落点后需要重新缓冲，慢网下容易被 CDN
+  /// 限速看门狗误判换源；而 seek 流程的 `resume() → _issuePlaybackRequest()`
+  /// 会清空 [_lastNonZeroPlatformPosition]，装载窗口内平台又只上报 0——换源
+  /// 断点因此算出 0，从 0:00 重播。在 seek 落地（平台上报追上目标）之前，
+  /// [_stallRecoveryPosition] 优先取本值兜底。
+  Duration _lastSeekTarget = Duration.zero;
+  String? _lastSeekTargetSongId;
   Duration? _duration;
   List<Song> _playlist = [];
   List<Song> _originalPlaylist = [];
@@ -378,6 +407,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   AudioQuality _audioQuality = AudioQuality.standard;
   // 音质降级提示开关（设置→播放→音质降级提示）。默认关闭。
   bool _showQualityDowngradeToast = false;
+
+  // 「音频播放失败时尝试 MV 音频」开关（设置→音质与输出）。默认关闭。
+  // 开启后：当前在线歌曲拿不到播放地址、或播放/装载/异步播放报错时，
+  // 尝试用该歌曲关联的曲库 MV 音轨兜底（对齐 EchoMusic tryMvAudioFallback）。
+  bool _mvAudioFallbackEnabled = false;
+  // 当前播放的是否为 MV 兜底音轨（UI 音质胶囊据此显示「MV」）。
+  bool _isPlayingMvAudio = false;
+  // 已尝试过 MV 兜底的播放请求代次，防止同一请求重复查询/起播。
+  int? _mvFallbackAttemptedRequest;
+  // MV 兜底失败原因（仅入诊断日志，不直接展示给用户）。
+  String _mvAudioFallbackFailureReason = '';
 
   // 「关闭本地音乐评论区」开关（设置→播放→关闭本地音乐评论区）。默认开启：
   // 开启时本地歌曲不显示播放器评论 tab，也不提供「看评论」入口。
@@ -414,6 +454,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   // 「定时结束后播完当前歌曲」的用户勾选偏好。true 时定时到点不再立即暂停，
   // 而是进入 endOfTrack 等待态；该偏好到点后保留，供下一次定时沿用。
   bool _stopAfterTimerEnds = false;
+
+  // 「结束后减少待机耗电」的用户勾选偏好。true 时定时到点（含 endOfTrack
+  // 播完收尾）在停播之后继续走退出序列（停本地服务 + 结束任务），不驻留后台。
+  // 偏好持久化在 SettingsRepository；定时本身不跨进程存续（见上方注释），
+  // 内存字段由弹层切换时同步（弹层打开时还有一次冷启动回读，见
+  // showSleepTimerSheet），到点行为以本字段为准。「关闭定时」不重置本偏好，
+  // 与持久化值保持一致（区别于仅会话内有效的 _stopAfterTimerEnds）。
+  bool _killBackgroundOnTimerEnd = false;
 
   // —— 在线歌曲异常结束重试限制 ——
   // 当在线歌曲播放不足 80% 就触发 completed 时（URL 过期 / 流中断），
@@ -467,6 +515,24 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 取 15s：足够覆盖远端跳转的缓冲；中途限速发生在 ~60s 处（见上方注释），
   /// 不受影响。
   static const Duration _rateCheckStartupGrace = Duration(seconds: 15);
+
+  /// 无损/Hi-Res/母带等高音质的 seek 宽限期：大文件 seek 后远端再缓冲常超
+  /// 15s（与装载 deadline 撞车），宽限一过即被看门狗误判限速换源——用户感知
+  /// 「高音质拖进度条回到起点」。这些音质下把宽限延长到 30s；标准/高音质
+  /// 维持 15s，保持原有限速检测灵敏度（限速点在 ~60s，30s 宽限仍不遮蔽）。
+  static const Duration _rateCheckStartupGraceHighQuality =
+      Duration(seconds: 30);
+
+  Duration get _rateCheckGraceDuration {
+    switch (_audioQuality) {
+      case AudioQuality.flac:
+      case AudioQuality.hires:
+      case AudioQuality.viper:
+        return _rateCheckStartupGraceHighQuality;
+      default:
+        return _rateCheckStartupGrace;
+    }
+  }
   DateTime _rateCheckGraceUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 起播 / 跳转定位后开启速率检测宽限期（见 [_rateCheckStartupGrace]）。
@@ -475,7 +541,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 不会出现「position 慢速爬行」的假象。
   void _armRateCheckGrace(Duration? seekTo) {
     if (seekTo == null || seekTo <= Duration.zero) return;
-    _rateCheckGraceUntil = DateTime.now().add(_rateCheckStartupGrace);
+    _rateCheckGraceUntil = DateTime.now().add(_rateCheckGraceDuration);
   }
 
   bool _insideRateCheckGrace() => DateTime.now().isBefore(_rateCheckGraceUntil);
@@ -496,6 +562,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     seconds: SettingsRepository.kCrossfadeDefaultSeconds,
   );
 
+  // —— 过滤 Live/现场版本（MD3 fork）——
+  // 判定发生在 next/previous 的高频路径上，同 crossfade 口径缓存字段。
+  bool _skipLiveEnabled = false;
+
   // —— 自动混音（AutoMix）——
   bool _automixEnabled = false;
 
@@ -511,8 +581,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 只对**当前这首歌**生效的规划：换过歌就当没有，避免拿上一首的拍点去卡这一首。
   AutomixPlan? get _activePlan =>
       (_automixPlan != null && _automixPlanSongId == _currentSong?.id)
-      ? _automixPlan
-      : null;
+          ? _automixPlan
+          : null;
 
   /// 正在解析/预加载下一首（避免同一时间重入）。
   bool _crossfadePreparing = false;
@@ -550,6 +620,69 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   bool get isPlaybackNotReady => _playbackNotReady;
   bool _playbackNotReady = false;
 
+  /// 最近一次平台上报的处理态（只用于区分「数据没到位」与「播完/停止」）。
+  just_audio.ProcessingState _processingState = just_audio.ProcessingState.idle;
+
+  /// 音频流正在为出声准备数据：解析地址 / 装载 / 缓冲。
+  ///
+  /// 与 [isPlaybackNotReady] 的区别：不含 idle（停止 / 未装载）与 completed（播完），
+  /// 因此播放页的「缓冲中」提示**不需要**再用 `isPlaying` 兜底 —— 拖动进度条后
+  /// 播放器是被我们主动 `pauseForSeek()` 暂停的，但为落点重新缓冲照样在跑，
+  /// 用 isPlaying 门控会把整段缓冲吞掉，表现成「不显示 / 只闪一下」。
+  ///
+  /// 保留 [_isResolvingUrl] 一项：地址解析窗口里平台处理态往往还是 idle，
+  /// 而这段同样是「数据没到位」（切歌装载/换源），提示口径要一致。
+  bool get isStreamBuffering =>
+      _isResolvingUrl ||
+      _processingState == just_audio.ProcessingState.loading ||
+      _processingState == just_audio.ProcessingState.buffering;
+
+  /// 起播延迟判定窗口：播放/恢复命令下发后，平台在这个时长内还没真正开始播，
+  /// 才当作「等待起播」。取 350ms —— 正常恢复的位置推进通常在 200ms 内到达，
+  /// 短于此不提示，避免每次恢复播放都闪一下「缓冲中」。
+  static const Duration _playStartGrace = Duration(milliseconds: 350);
+
+  Timer? _playStartGraceTimer;
+
+  /// 已下发播放命令、尚未看到平台进入「正在播」。
+  bool _playStartPending = false;
+
+  /// 起播等待已超过 [_playStartGrace]。
+  bool _slowPlayStart = false;
+
+  /// 已下发播放命令、但平台迟迟没有真正出声（起播 / 定位后的起步延迟）。
+  ///
+  /// 为什么需要它：[isStreamBuffering] 只认平台的处理态，而 **Windows/WinRT 在
+  /// seek 与「暂停后恢复」这段起步延迟里一直是 ready**（真机日志实测：松手到
+  /// 出声之间 1.3s 只有 ready，没有任何 buffering 事件），因此单靠处理态在桌面端
+  /// 永远看不到「缓冲中」。这里改用「意图已下发、平台还没播」这一可观测的窗口来补，
+  /// 出声瞬间 `playingStream` 翻 true 即收掉。
+  ///
+  /// 与 [isAwaitingPlaybackProgress] 的区别：那条要求 `_isPlaying` 为真且位置真的
+  /// 推进过；起步延迟期间平台恰恰报的是「未在播」，用它永远为假。
+  bool get isWaitingForAudioStart => _slowPlayStart;
+
+  void _armPlayStartWatch() {
+    _playStartGraceTimer?.cancel();
+    _playStartPending = true;
+    _slowPlayStart = false;
+    _playStartGraceTimer = Timer(_playStartGrace, () {
+      _playStartGraceTimer = null;
+      if (_isDisposed || !_playStartPending) return;
+      _slowPlayStart = true;
+      notifyListeners();
+    });
+  }
+
+  void _clearPlayStartWatch({bool notify = false}) {
+    _playStartGraceTimer?.cancel();
+    _playStartGraceTimer = null;
+    _playStartPending = false;
+    if (!_slowPlayStart) return;
+    _slowPlayStart = false;
+    if (notify && !_isDisposed) notifyListeners();
+  }
+
   /// audio_service 实例（歌曲信息页读取源格式用）。
   dynamic get audioService => _audioService;
 
@@ -558,6 +691,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 现在高频更新只通知 [positionNotifier]，进度条/歌词等高频 UI 订阅它，
   /// 其它 widget 仅在 currentSong/isPlaying/duration 等低频字段变化时重建。
   final ValueNotifier<Duration> positionNotifier = ValueNotifier(Duration.zero);
+
+  /// 交叉淡化（播放页提示文案里的「音频过渡」）是否正在进行。
+  ///
+  /// 数据源是 `AudioService.crossfadingStream`：淡入斜坡开始为 true，淡完或
+  /// `abortCrossfade`（暂停 / 拖动 / 切歌）为 false，因此「过渡」的起止口径
+  /// 只由音频层定义，本类不另行推断。播放页把它并入进度条的 Listenable，
+  /// 据此在时间行中央显示「音频过渡中」胶囊（见 `widgets/playback_hint_pills.dart`）。
+  ///
+  /// 用独立 [ValueNotifier] 而不是 notifyListeners：一次淡化只变两下，
+  /// 不该让整页 `Consumer<PlayerProvider>` 跟着重建。
+  final ValueNotifier<bool> crossfadeActiveNotifier = ValueNotifier<bool>(false);
 
   /// 换源装载期间的「位置回退闸门」（见 [_updatePosition]、[PositionRewindGate]）。
   final PositionRewindGate _positionRewindGate = PositionRewindGate();
@@ -590,6 +734,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _diagnosticRequestClock = Stopwatch()..start();
     _isResolvingUrl = false;
     _manualRetryRequest = null;
+    // 新请求＝新的播放意图：开始盯「平台什么时候真的开始播」（起步延迟提示）。
+    // 平台此刻已经在播（切歌时旧歌还在响）就不盯：那一路该由 loading/buffering
+    // 处理态负责，否则切歌的瞬间会闪一下无意义的「缓冲中」。
+    if (_audioService?.player.playing != true) _armPlayStartWatch();
     _logPlaybackEvent('request.issued', request: request);
     return request;
   }
@@ -615,6 +763,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _playbackProgressGate.reset();
     _isResolvingUrl = false;
     _manualRetryRequest = null;
+    // 请求已作废（用户暂停 / 停止 / 拖条起手暂停）：不再等起播。
+    _clearPlayStartWatch(notify: true);
     return invalidation;
   }
 
@@ -707,6 +857,30 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 比较结果是假的——表现为「明明从 0 起播，纠偏却认为已对齐」。
   Duration get platformPosition => _lastPlatformPosition;
 
+  /// CDN 限速恢复/降级用的续播断点。
+  ///
+  /// [_lastPlatformPosition] 在换源装载期间会被平台上报的 0 覆盖（闸门只保护
+  /// UI 的 [_position]），看门狗在装载窗口内再次触发时拿 0 续播会把进度重置到
+  /// 开头。这里优先取同歌曲的最近非零位置，仅在无缓存时回落平台原始值。
+  ///
+  /// seek 落地前平台尚未上报目标位置，且非零缓存可能已被 `_issuePlaybackRequest`
+  /// 清空——此时优先取用户最后一次 seek 的目标（见 [_lastSeekTarget]）。
+  /// 平台上报追上/超过目标后该分支自然失效，不会把进度拉回旧目标。
+  Duration get _stallRecoveryPosition {
+    final songId = _currentSong?.id;
+    if (_lastSeekTargetSongId == songId &&
+        _lastSeekTarget > Duration.zero &&
+        _lastSeekTarget > _lastNonZeroPlatformPosition &&
+        _lastSeekTarget > _lastPlatformPosition) {
+      return _lastSeekTarget;
+    }
+    if (_lastNonZeroPositionSongId == songId &&
+        _lastNonZeroPlatformPosition > _lastPlatformPosition) {
+      return _lastNonZeroPlatformPosition;
+    }
+    return _lastPlatformPosition;
+  }
+
   /// 平台真实播放态（just_audio 的 `playing` 标志）。
   ///
   /// [_isPlaying] 是乐观缓存：平台事件迟到/丢失、平台自恢复事件都会让它与
@@ -795,6 +969,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 等当前正在播放的这首自然播完再暂停；到点后本偏好保留，供下次定时沿用。
   bool get stopAfterTimerEnds => _stopAfterTimerEnds;
 
+  /// 「结束后减少待机耗电」的勾选态（面板选项行）。
+  ///
+  /// true 时定时到点（含 [SleepTimerMode.endOfTrack] 播完收尾）在停播之后
+  /// 继续调用 [onSleepTimerExit] 走退出序列，减少后台耗电。
+  bool get killBackgroundOnTimerEnd => _killBackgroundOnTimerEnd;
+
   /// 是否启用了睡眠定时（倒计时 **或** 已进入到点等待态）。
   ///
   /// 以 [_sleepTimerMode] 为单一真相源：endOfTrack 模式下 [_sleepTimerEndTime]
@@ -807,6 +987,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 在线歌曲先显示默认音质，播放链接解析完成后以实际档位更新（含降级）。
   /// 本地文件仍按文件音质展示，不使用在线偏好推断。
   String get currentQualityLabel {
+    // MV 音频兜底播放中：音质胶囊显示「MV」标识（对齐 EchoMusic）。
+    if (_isPlayingMvAudio) return 'MV';
     final song = _currentSong;
     if (song == null) return unknownQualityLabel;
     if (!song.isOnline) {
@@ -832,13 +1014,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// 无损容器（判定口径同 `local_music_repository._inferQuality` 的扩展名分支）。
-  static const Set<String> _losslessCodecs = {
-    'FLAC',
-    'APE',
-    'ALAC',
-    'WAV',
-    'DSD',
-  };
+  static const Set<String> _losslessCodecs = {'FLAC', 'APE', 'ALAC', 'WAV', 'DSD'};
 
   /// 离线文件没带音质档时的如实展示。
   ///
@@ -861,6 +1037,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 播放器错误订阅（进诊断日志，App 生命周期级）。
   StreamSubscription<dynamic>? _playerErrorSubscription;
   StreamSubscription<double>? _speedSubscription;
+
+  /// 交叉淡化状态订阅（驱动 [crossfadeActiveNotifier]）。
+  StreamSubscription<bool>? _crossfadeSubscription;
 
   /// 输出两层开关（USB 独占 / 系统 Direct PCM）变化监听。
   VoidCallback? _outputModeListener;
@@ -936,6 +1115,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 房主播放模式变化：同步到房间（player_operation action=1）。
   /// 入参为众乐房 play_mode 口径：1=顺序 2=单曲循环 3=随机。
   void Function(int playMode)? onRoomPlayModeChanged;
+
+  // —— 定时关闭到点退出（由壳层注入，公开构建不注册）——
+
+  /// 「结束后减少待机耗电」开启且定时到点（含 endOfTrack 播完收尾）时的
+  /// 退出回调：壳层实现复用「退出 App」序列（stopForAppExit 停播落盘 →
+  /// 停本地 Rust 服务 → Android 结束任务 / 桌面端 SystemNavigator 兜底）。
+  /// 未注入（测试 / 未接线）时到点保持原有的仅暂停行为。
+  Future<void> Function()? onSleepTimerExit;
 
   // —— 一起听听众起播确认（由私有装配层注入，公开构建不注册）——
 
@@ -1164,6 +1351,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       PlayHistorySyncService.instance.onSongEnded(
         reason: PlaybackEndReason.switched,
       );
+      // 听歌统计本地库同边沿结账（service 内部幂等，无活动段时直接返回）。
+      // ignore: discarded_futures
+      ListenStatsRecordService.instance.onSongEnded(
+        reason: PlaybackEndReason.switched,
+      );
     }
     _lastListenReportSongId = songId;
 
@@ -1171,6 +1363,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 云端播放历史：在线歌曲开新段（无 albumAudioId 的本地文件由 service 内部跳过）
     // ignore: discarded_futures
     PlayHistorySyncService.instance.onSongStarted(
+      song: song,
+      playing: _isPlaying,
+    );
+    // 听歌统计：本地歌也记录（不区分 isOnline、不要求登录），必须挂在
+    // 下方 `if (!song.isOnline) return` 之前，否则本地歌整段丢失。
+    // ignore: discarded_futures
+    ListenStatsRecordService.instance.onSongStarted(
       song: song,
       playing: _isPlaying,
     );
@@ -1235,6 +1434,20 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       MediaNotificationService.onSeekTo = (pos) {
         if (!_isDisposed) seek(Duration(milliseconds: pos));
       };
+      MediaNotificationService.onSetLoopMode = (mode) {
+        if (_isDisposed) return;
+        setLoopMode(AppLoopMode.values.firstWhere(
+          (m) => m.name == mode,
+          orElse: () => AppLoopMode.off,
+        ));
+      };
+      // 概念版 4×1 小组件的播放模式键：与播放页底部模式按钮同一条 cyclePlayMode。
+      // 装在这里而不是 DesktopLyricService——那里的 _player 是惰性绑定，未开桌面
+      // 歌词时为 null，模式键会静默失效。
+      MediaNotificationService.onCyclePlayMode = () {
+        if (_isDisposed) return;
+        cyclePlayMode();
+      };
       final audioServiceModule = await _loadAudioService();
       _ensureNotDisposed();
       _audioService = audioServiceModule;
@@ -1255,10 +1468,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 直写开启失败（含拔插广播触发的自动恢复失败 —— 那种情况原生没有
       // MethodChannel result，只能靠 onExclusiveFailed 事件）→ 关闭外层总开关，
       // 整体回到系统默认输出。
-      UsbAudioService.instance.onExclusiveFailed =
-          (String code, String message) {
-            OutputModeCoordinator.instance.onExclusiveFailed(code, message);
-          };
+      UsbAudioService.instance.onExclusiveFailed = (String code, String message) {
+        OutputModeCoordinator.instance.onExclusiveFailed(code, message);
+      };
       // 输出两层开关（USB 独占 / 系统 Direct PCM）+ 效果链旁路。注册重建回调：
       // float 强制 / performanceMode / 缓冲都在 DefaultAudioSink.configure 生效，
       // 切档后必须重建 AudioTrack，复刻 USB 独占的 pause→play 机制。
@@ -1273,6 +1485,32 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       await DirectPcmService.instance.init();
       _ensureNotDisposed();
       await OutputModeCoordinator.instance.init();
+      _ensureNotDisposed();
+      // 硬件解码播放（offload）：注入冲突判定器（任一条命中即让路），并恢复
+      // 持久化开关。条件器全部是同步闭包，服务只在 refresh 时拉取，避免把
+      // provider 状态变化逐条推给服务。
+      // 注：每条 `=>` 闭包外面那层括号不能省 —— 箭头函数体是「表达式」，不加
+      // 括号时下一行开头的 `..xxx =` 会被解析成对前一个 bool 表达式的级联。
+      AudioOffloadService.instance
+        ..speedIsNormal = (() => _speed == 1.0)
+        ..dspActive = (() => ViperMasterService.instance.enabled)
+        ..equalizerActive = (() => EqualizerService.instance.enabled)
+        ..volumeNormalizationActive =
+            (() => _audioService?.volumeNormalizationEnabled ?? false)
+        ..spectrumCapturing =
+            (() => SpectrumService.instance.isNativeCaptureActive)
+        ..usbOrDirectPcmActive =
+            (() =>
+                UsbAudioService.instance.lastStatus['enabled'] == true ||
+                OutputModeCoordinator.instance.isDirectPcmActive)
+        ..crossfadeEnabled = (() => _crossfadeEnabled || _automixEnabled)
+        ..isPlaying = (() => _isPlaying)
+        ..rebuildRequester = _rebuildOutputForModeChange
+        ..addListener(_onOffloadChanged);
+      // 频谱原生采集状态变化同样会改变「硬解输出通道能否抢占」，回调服务重判。
+      SpectrumService.instance.onCaptureStateChanged = () =>
+          AudioOffloadService.instance.refresh();
+      await AudioOffloadService.instance.init();
       _ensureNotDisposed();
       // 独占失败 / 拔线自动关闭：消费一次提示并告知 UI。
       _outputModeListener = _onOutputModeChanged;
@@ -1290,9 +1528,16 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 读取交叉淡化设置到字段缓存（判定在 positionStream 高频路径上）
       await _loadCrossfadeSettings();
       _ensureNotDisposed();
+      // 恢复「过滤 Live/现场版本」开关（重启后保留用户选择）
+      await _loadLiveFilterSettings();
+      _ensureNotDisposed();
       // 恢复音质降级提示开关（重启后保留用户选择）
       _showQualityDowngradeToast = await SettingsRepository()
           .getShowQualityDowngradeToast();
+      _ensureNotDisposed();
+      // 恢复「音频播放失败时尝试 MV 音频」开关（重启后保留用户选择）
+      _mvAudioFallbackEnabled = await SettingsRepository()
+          .getMvAudioFallbackEnabled();
       _ensureNotDisposed();
       // 恢复「关闭本地音乐评论区」开关（重启后保留用户选择）。
       // 加载后按需通知一次：播放器若已挂载，据此重建 tab 结构。
@@ -1516,9 +1761,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     final mapped = _legacyQualityMap[qualityValue] ?? qualityValue;
     // 实验开关关闭时，蝰蛇母带档钳回 Hi-Res（与设置页显示一致，不改写存储值）
     final tapeEnabled = await settings.getViperTapeQualityEnabled();
-    final effective = (mapped == AudioQuality.viper.value && !tapeEnabled)
-        ? AudioQuality.hires.value
-        : mapped;
+    final effective =
+        (mapped == AudioQuality.viper.value && !tapeEnabled)
+            ? AudioQuality.hires.value
+            : mapped;
     final quality = AudioQuality.values.firstWhere(
       (q) => q.value == effective,
       orElse: () {
@@ -1589,6 +1835,21 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
     try {
       await SettingsRepository().setShowQualityDowngradeToast(value);
+    } catch (_) {}
+  }
+
+  /// 「音频播放失败时尝试 MV 音频」开关当前值。
+  bool get mvAudioFallbackEnabled => _mvAudioFallbackEnabled;
+
+  /// 当前播放的是否为 MV 兜底音轨（UI 据此显示「MV」标识）。
+  bool get isPlayingMvAudio => _isPlayingMvAudio;
+
+  /// 设置「音频播放失败时尝试 MV 音频」开关：持久化 + 更新内存缓存。
+  Future<void> setMvAudioFallbackEnabled(bool value) async {
+    _mvAudioFallbackEnabled = value;
+    notifyListeners();
+    try {
+      await SettingsRepository().setMvAudioFallbackEnabled(value);
     } catch (_) {}
   }
 
@@ -1700,9 +1961,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // ignore: avoid_dynamic_calls
       await player.playCommand();
       // ignore: avoid_print
-      print(
-        '[PlayerProvider] output mode changed — reconfigure via pause/play',
-      );
+      print('[PlayerProvider] output mode changed — reconfigure via pause/play');
     } catch (_) {
       // 静默：重建失败时用户手动暂停/重播仍会重配
     }
@@ -1722,6 +1981,21 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (saved != null) {
         OutputModeCoordinator.instance.volumeApplier?.call(saved);
       }
+    }
+  }
+
+  /// 硬解服务状态变化：消费一次待播提示并 Toast。
+  ///
+  /// 服务在 refresh 的同步通知链里回调本方法，故这里只做「取提示 + 弹 Toast」，
+  /// 绝不能再回头调服务的方法，否则会自激成无限递归。
+  void _onOffloadChanged() {
+    try {
+      final notice = AudioOffloadService.instance.consumeNotice();
+      if (notice != null && notice.isNotEmpty) {
+        showToast(notice);
+      }
+    } catch (_) {
+      // 静默：提示失败不影响播放
     }
   }
 
@@ -1863,6 +2137,33 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 这只保证本次进程内的写入队列已经排空，不代表系统强杀时仍有机会完成落盘。
   Future<void> flushPersistence() async {
     _saveState();
+    await _stateRepo.flush();
+  }
+
+  /// TV「退出 App」：立即停止播放输出、移除媒体通知并落盘结算。
+  ///
+  /// 与 [clearPlaylist] 的区别：**保留播放队列与游标**，下次冷启动仍恢复
+  /// 上次歌曲（暂停态）；这里只负责「关闭音乐」，不清空用户列表。
+  /// 停音频失败不阻断退出，由调用方继续关本地服务并结束任务。
+  Future<void> stopForAppExit() async {
+    // 先让尚未完成的解析/装载请求失效，避免退出途中又被拉起播放。
+    _invalidatePlaybackRequest(
+      source: _PlaybackRequestCancellationSource.userStop,
+    );
+    _saveDebounce?.cancel();
+    try {
+      await _audioService?.stop();
+    } catch (error, stack) {
+      DiagnosticLogger.instance.e('退出 App：停止音频输出失败 $error\n$stack');
+    }
+    _isPlaying = false;
+    notifyListeners();
+    // 与 dispose 同口径结算：CSCC 收听段 + 云端播放历史，避免进程退出丢记录。
+    _flushListenReportOnExit();
+    _saveState();
+    // 前台播放服务只挂在通知上（Manifest 中 stopWithTask=false），必须显式
+    // 移除，否则「退出 App」后通知与播放服务会残留在后台。
+    await MediaNotificationService.hideNotification();
     await _stateRepo.flush();
   }
 
@@ -2032,12 +2333,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         // true），必须能看到事件本体才能定位来源。
         debugPrint('[PlayerState] playingStream → $isPlaying');
         _isPlaying = isPlaying;
+        // 平台真的开始播了：收掉「等待起播」提示（本监听随后就会 notifyListeners）。
+        if (isPlaying) _clearPlayStartWatch();
+        _syncIdleKeepaliveStopTimer();
         _updatePlaybackDiagnosticSampling(isPlaying);
         WakelockService.instance.setSongPlaying(isPlaying);
         // CSCC 时长计时：暂停时停表、恢复时续表（墙钟累计，天然扣除暂停）。
         ListenReportService.instance.onPlayingChanged(isPlaying);
         // 云端播放历史同口径（独立 tracker，同一播放/暂停状态源）。
         PlayHistorySyncService.instance.onPlayingChanged(isPlaying);
+        // 听歌统计同口径（独立 tracker，同一播放/暂停状态源）。
+        ListenStatsRecordService.instance.onPlayingChanged(isPlaying);
         // try-catch：_updateNotification 内部（updateWidget 等）异常不应
         // 中断后续，否则暂停时 Kotlin 收不到 isPlaying=false，WakeLock 不释放
         try {
@@ -2120,6 +2426,18 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
               if (e.androidExoType != null) 'androidExoType': e.androidExoType!,
             },
           );
+          // 硬解初始化/写入失败（Media3 会自动关 offload 重试）：不当作播放失败，
+          // 也不触发 MV 换源兜底，只交给硬解服务记一次平台回退（下次自动软解）。
+          if (e.code == 5003 || e.code == 5004) {
+            AudioOffloadService.instance.notePlatformFallback();
+            return;
+          }
+          // 播放/解码/网络错误：先尝试曲库 MV 音轨兜底（异步，不阻塞事件流；
+          // 兜底失败时会自行收口为失败态，故此处直接 return）。
+          if (_canAttemptMvAudioFallback(song, request)) {
+            unawaited(_tryMvAudioFallback(song, request: request));
+            return;
+          }
           _completionReadyRequest = null;
           _isResolvingUrl = false;
           _isPlaying = false;
@@ -2159,9 +2477,20 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           // 播放流未就绪跟踪：loading/buffering 期间 position 冻结且不可靠，
           // 歌词逐字动画冻结（语义对齐暂停）。processingState 变化必发
           // playerState 事件（→ready 无残留），无需在切歌路径手动重置。
+          final bool wasStreamBuffering =
+              _processingState == just_audio.ProcessingState.loading ||
+              _processingState == just_audio.ProcessingState.buffering;
+          _processingState = playerState.processingState;
+          final bool isStreamBufferingNow =
+              _processingState == just_audio.ProcessingState.loading ||
+              _processingState == just_audio.ProcessingState.buffering;
           final bool notReady =
               playerState.processingState != just_audio.ProcessingState.ready;
-          if (notReady != _playbackNotReady) {
+          // 「缓冲中」提示要区分 loading/buffering 与 idle/completed（后两者也算
+          // notReady）；进出装载/缓冲时必须各通知一次，否则提示会停在旧状态。
+          // loading↔buffering 两者提示文案相同，不必为此再通知。
+          if (notReady != _playbackNotReady ||
+              isStreamBufferingNow != wasStreamBuffering) {
             _playbackNotReady = notReady;
             notifyListeners();
           }
@@ -2236,6 +2565,18 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         _speed = speed;
         notifyListeners();
       }, onError: (e) {});
+
+      // 交叉淡化状态：播放页「音频过渡中」胶囊的唯一数据源。
+      // 单独 try/catch —— `_audioService` 是 dynamic，测试替身可能没有该 getter，
+      // 抛出的 NoSuchMethodError 不能连累上面已建好的订阅。
+      try {
+        _crossfadeSubscription = _audioService.crossfadingStream.listen((active) {
+          if (_isDisposed) return;
+          crossfadeActiveNotifier.value = active;
+        }, onError: (e) {});
+      } catch (_) {
+        // 替身音频服务没有 crossfadingStream：视为永不淡化。
+      }
     } catch (e) {}
     _logPlaybackEvent(
       'engine.ready',
@@ -2384,6 +2725,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           !completedAbnormally) {
         _sleepTimerMode = SleepTimerMode.off;
         notifyListeners();
+        // 「结束后减少待机耗电」：播完即走退出序列（回调内 stopForAppExit
+        // 会停播并落盘），不再单独 pause；随后 return，不进入后续连播逻辑。
+        if (_killBackgroundOnTimerEnd) {
+          _triggerSleepTimerExit();
+          return;
+        }
         unawaited(pause());
         return;
       }
@@ -2598,6 +2945,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _prefetchedCdnUrl = null;
     _prefetchedCdnSongId = null;
     _prefetchedCdnQuality = null;
+    // 用户主动切歌：重置 MV 兜底状态（新歌重新具备兜底资格）
+    _isPlayingMvAudio = false;
+    _mvFallbackAttemptedRequest = null;
+    _mvAudioFallbackFailureReason = '';
   }
 
   /// 后台预取 CDN 播放 URL，供卡死时直接使用（免 API 等待）。
@@ -2658,7 +3009,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 看门狗的速率判定使用平台真实位置；恢复断点也必须使用同一口径。
     // _position 是 UI/本地乐观位置，可能落后于平台位置（或是尚未落地的 seek 目标），
     // 用它换源会把播放位置倒回，造成重复片段或跳段。
-    final stallPos = _lastPlatformPosition;
+    // [_stallRecoveryPosition]：装载窗口内 _lastPlatformPosition 被清零时
+    // 回退到同歌曲最近非零位置，避免从 0 续播（进度重置）。
+    final stallPos = _stallRecoveryPosition;
     final songIdAtCall = song.id;
     final songIndexAtCall = _currentIndex;
     final recoveryTimer = Stopwatch()..start();
@@ -2801,7 +3154,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     // 与 URL 刷新共用平台真实断点，避免音质降级时按过期 UI 位置回跳。
-    final stallPos = _lastPlatformPosition;
+    // [_stallRecoveryPosition]：装载窗口内平台位置被清零时回退最近非零位置。
+    final stallPos = _stallRecoveryPosition;
     final songIdAtCall = song.id;
     final songIndexAtCall = _currentIndex;
     final recoveryTimer = Stopwatch()..start();
@@ -2929,6 +3283,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       }
       final automix = await settings.getAutomixEnabled();
       _automixEnabled = automix;
+      // crossfade / automix 都是硬解冲突条件：开关变了就要重判一次（异步下发，
+      // 不阻塞设置读取链；条件命中时服务会立即让路，消失则播放中挂起到下一首）。
+      unawaited(AudioOffloadService.instance.refresh());
       // AutoMix：设置（含每首歌开头的补读）刷新后立刻预热「当前曲 + 下一曲」的分析。
       // 放在这里而不是 _maybeCrossfade 的设置重读分支里：那条分支是 fire-and-forget
       // 调本方法，此刻读到的 _automixEnabled 还是旧值，首播那次会漏掉预热。
@@ -2943,10 +3300,57 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// 设置页修改 crossfade 设置后调用，刷新字段缓存。
+  /// 仅刷新 Windows 的偏好缓存，不恢复队列、不重新加载当前歌曲。
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await audioReady;
+    _ensureNotDisposed();
+    final repo = SettingsRepository();
+    await refreshQualityForNetwork();
+    await _syncIgnoreAudioFocus();
+    await _syncAudioFocusMode();
+    await _loadCrossfadeSettings();
+    await _loadLiveFilterSettings();
+    _showQualityDowngradeToast = await repo.getShowQualityDowngradeToast();
+    _mvAudioFallbackEnabled = await repo.getMvAudioFallbackEnabled();
+    _closeLocalMusicComments = await repo.getCloseLocalMusicComments();
+    _restoreMemoryEnabled = await repo.getRestoreMemoryEnabled();
+    final prefs = await SharedPreferences.getInstance();
+    await setVolume(prefs.getDouble('player_volume') ?? 1.0, persist: false);
+    notifyListeners();
+  }
+
   Future<void> refreshCrossfadeSettings() => _loadCrossfadeSettings();
 
   /// 设置页改动后刷新（与 [refreshCrossfadeSettings] 同通路）。
   Future<void> refreshAutomixSettings() => _loadCrossfadeSettings();
+
+  /// 从设置读取「过滤 Live/现场版本」开关到字段缓存。
+  /// 设置页改动后由 [refreshLiveFilterSettings] 重新调用。
+  Future<void> _loadLiveFilterSettings() async {
+    try {
+      _skipLiveEnabled = await SettingsRepository().getSkipLiveEnabled();
+    } catch (_) {}
+  }
+
+  /// 设置页修改「过滤 Live/现场版本」后调用，刷新字段缓存。
+  Future<void> refreshLiveFilterSettings() => _loadLiveFilterSettings();
+
+  /// 过滤 Live/现场 的起播点校正——起点命中且存在非 live 曲，从起点向后
+  /// 环形找第一个非 live；环形一圈必停，全部 live 则原样返回。
+  int _liveFilteredStartIndex(List<Song> songs, int startIndex) {
+    if (!_skipLiveEnabled ||
+        startIndex < 0 ||
+        startIndex >= songs.length ||
+        !isLiveSong(songs[startIndex])) {
+      return startIndex;
+    }
+    for (int i = 1; i < songs.length; i++) {
+      final idx = (startIndex + i) % songs.length;
+      if (!isLiveSong(songs[idx])) return idx;
+    }
+    return startIndex;
+  }
 
   /// 上次已按当前歌曲刷新过设置缓存的歌曲 id。
   ///
@@ -3006,16 +3410,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 解析期间用户可能关掉了开关
     if (!_automixEnabled) return;
     // ignore: avoid_print
-    print(
-      '[Automix] 预热分析 current=${current.id}'
-      '(${currentUrl == null ? "无地址" : "就绪"}) '
-      'next=${next?.id ?? '-'}'
-      '(${next == null
-          ? "-"
-          : nextUrl == null
-          ? "无地址"
-          : "就绪"})',
-    );
+    print('[Automix] 预热分析 current=${current.id}'
+        '(${currentUrl == null ? "无地址" : "就绪"}) '
+        'next=${next?.id ?? '-'}'
+        '(${next == null ? "-" : nextUrl == null ? "无地址" : "就绪"})');
 
     if (currentUrl != null) {
       // ignore: discarded_futures
@@ -3023,10 +3421,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (next != null && nextUrl != null) {
       // ignore: discarded_futures
-      analyzer.analyze(
-        key: buildAutomixKey(songId: next.id),
-        url: nextUrl,
-      );
+      analyzer.analyze(key: buildAutomixKey(songId: next.id), url: nextUrl);
     }
   }
 
@@ -3140,6 +3535,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (OutputModeCoordinator.instance.isDirectPcmActive) {
       return '系统 Direct PCM 已开启';
     }
+    // 硬件解码播放（offload）生效时同样是单条硬解输出通道，两个播放器交替
+    // 写入会错乱而非混音。
+    if (AudioOffloadService.instance.effective) return '硬件解码播放已开启';
     return null;
   }
 
@@ -3215,6 +3613,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (_crossfadePreparing || _crossfadePreparedIndex != null) return;
     final nextIndex = _nextIndexForCrossfade();
     if (nextIndex == null) return;
+    // md3 fork：过滤 Live/现场——目标命中时放弃预混（未 prepared 时淡化
+    // 根本不会启动，自然播完走 next() 的过滤跳过），避免淡进 live 曲。
+    if (_skipLiveEnabled && isLiveSong(_playlist[nextIndex])) return;
     // AutoMix：先把过渡规划算出来 —— prepare 时就要用它的变速倍率。
     if (_automixEnabled) {
       await _planAutomixFor(nextIndex);
@@ -3338,8 +3739,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 拿不到就返回 null 传给 `planAutomix`，它会降级为 fallback。
   Future<void> _planAutomixFor(int nextIndex) async {
     final current = _currentSong;
-    if (current == null || nextIndex < 0 || nextIndex >= _playlist.length)
-      return;
+    if (current == null || nextIndex < 0 || nextIndex >= _playlist.length) return;
     final next = _playlist[nextIndex];
     final analyzer = await _automixAnalyzerFor();
     final out = await analyzer.cached(buildAutomixKey(songId: current.id));
@@ -3354,14 +3754,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _automixPlan = plan;
     _automixPlanSongId = current.id;
     // ignore: avoid_print
-    print(
-      '[Automix] plan ${plan.strategy.name} '
-      'out=${out?.bpm.toStringAsFixed(1) ?? '-'} '
-      'in=${incoming?.bpm.toStringAsFixed(1) ?? '-'} '
-      'fade=${plan.fadeDuration.inSeconds}s '
-      'start=${plan.fadeStartPosition.inSeconds}s '
-      'rate=${plan.incomingRate.toStringAsFixed(3)}',
-    );
+    print('[Automix] plan ${plan.strategy.name} '
+        'out=${out?.bpm.toStringAsFixed(1) ?? '-'} '
+        'in=${incoming?.bpm.toStringAsFixed(1) ?? '-'} '
+        'fade=${plan.fadeDuration.inSeconds}s '
+        'start=${plan.fadeStartPosition.inSeconds}s '
+        'rate=${plan.incomingRate.toStringAsFixed(3)}');
   }
 
   /// 启动淡化并把"当前歌曲"账目切到新歌。
@@ -3549,6 +3947,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 一起听房主：本地曲目不在房间歌单内，交由守卫拦截并提示
     if (onRoomOwnerInterceptPlayback?.call(song) ?? false) return;
 
+    // 切歌意图已确立：立刻停掉旧声。解析播放链接 + 装载新源要数百毫秒到数秒
+    // （弱网概率性更久），这段窗口不打断的话旧歌会继续响——正是「切歌后
+    // 上一首还播了一会才切」的残留声。下一首/上一首/队列点播同此处理。
+    await _audioService?.pause();
+
     _queueRevision++;
     _prefetchedUrlQuality.clear();
     _currentSong = song;
@@ -3622,6 +4025,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             error: error,
             retryable: false,
           );
+          // play future 报错：先尝试曲库 MV 音轨兜底（异步；兜底失败会自行收口）
+          if (_canAttemptMvAudioFallback(_currentSong, playbackRequest)) {
+            unawaited(
+              _tryMvAudioFallback(_currentSong, request: playbackRequest),
+            );
+            return;
+          }
           _resolveError = _resolveErrorText(_currentSong);
           _isPlaying = false;
           notifyListeners();
@@ -3654,13 +4064,21 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     final request = playbackRequest ?? _issuePlaybackRequest();
     final apiClient = KugouApiClient();
-    if (!apiClient.isLoggedIn) {
+    // 先等凭证加载完成再判定登录态，避免启动窗口期误弹登录提示
+    if (!await apiClient.isLoggedInWhenReady()) {
+      // v28d：await 期间的顶替再起播会让本续延失效，直接 write 旧歌会覆盖
+      // 持久化 playlist（_savePlaylistIfChanged 冷启动恢复错歌）——比对代次。
+      if (!_isPlaybackRequestCurrent(request)) return;
       onLoginRequired?.call();
       return;
     }
+    if (!_isPlaybackRequestCurrent(request)) return;
     // 一起听房主：房间歌单外的曲目交由守卫拦截（本地队列播放不走此入口）
     if (onRoomOwnerInterceptPlayback?.call(song) ?? false) return;
     _resetAbnormalRetry();
+
+    // 切歌意图已确立：立刻停掉旧声（解析/装载窗口内旧歌不再续响）。
+    await _audioService?.pause();
 
     // 可选扩展：播放前解析本地已持久化的音频（默认关闭，由私有构建注入）
     String? cachedPath;
@@ -3774,13 +4192,20 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         );
       } else {
         _isResolvingUrl = false;
-        _resolveError = _resolveErrorText(song);
         notifyListeners();
+        // 拿不到播放地址：先尝试曲库 MV 音轨兜底（成功即已接管播放）
+        if (!await _tryMvAudioFallback(song, request: request)) {
+          _resolveError = _resolveErrorText(song);
+          notifyListeners();
+        }
       }
     } catch (e) {
       _isResolvingUrl = false;
-      _resolveError = e.toString();
       notifyListeners();
+      if (!await _tryMvAudioFallback(song, request: request)) {
+        _resolveError = e.toString();
+        notifyListeners();
+      }
     }
   }
 
@@ -3807,6 +4232,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> playPlaylist(List<Song> songs, int startIndex) async {
     if (songs.isEmpty) return;
+    // 过滤 Live/现场——起播点校正（放在一起听门控之前，让判定基于最终
+    // 起播的那首）
+    startIndex = _liveFilteredStartIndex(songs, startIndex);
     // 一起听听众：房间内点播其他歌曲的确认窗（列表起播按点击曲目判定）
     final guestGate = _roomGuestPlayGate(songs[startIndex]);
     if (guestGate != null && !await guestGate) return;
@@ -3905,6 +4333,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> playOnlinePlaylist(List<Song> songs, int startIndex) async {
     if (songs.isEmpty) return;
+    // 过滤 Live/现场——起播点校正（同 playPlaylist，门控之前）
+    startIndex = _liveFilteredStartIndex(songs, startIndex);
     // 一起听听众：房间内点播其他歌曲的确认窗（列表起播按点击曲目判定）
     final guestGate = _roomGuestPlayGate(songs[startIndex]);
     if (guestGate != null && !await guestGate) return;
@@ -3925,11 +4355,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (!_isPlaybackRequestCurrent(playbackRequest)) return;
     }
 
-    // 缓存未命中且未登录时才提示登录
-    if (cachedPath == null && !KugouApiClient().isLoggedIn) {
-      onLoginRequired?.call();
+    // 缓存未命中且未登录时才提示登录（先等凭证加载完成，避免启动期误判）
+    if (cachedPath == null && !await KugouApiClient().isLoggedInWhenReady()) {
+      // v31：等待期被顶替则静默作罢——登录提示只属于仍在途的请求，防误弹。
+      if (_isPlaybackRequestCurrent(playbackRequest)) {
+        onLoginRequired?.call();
+      }
       return;
     }
+    // v28d：await 期间被顶替则作罢——_loadPlaylist 会全表替换并落盘，
+    // 旧列表续延跑赢就是持久化污染。
+    if (!_isPlaybackRequestCurrent(playbackRequest)) return;
 
     _loadPlaylist(songs, startIndex);
     _currentSong = _playlist[_currentIndex];
@@ -4126,14 +4562,23 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 失败再回退到 /song/url，适配用户上传到云盘的音乐。
   Future<void> playCloudPlaylist(List<Song> songs, int startIndex) async {
     if (songs.isEmpty) return;
+    // 过滤 Live/现场——起播点校正（同 playPlaylist，门控之前）
+    startIndex = _liveFilteredStartIndex(songs, startIndex);
     // 一起听听众：云盘列表同样是「列表点击」入口
     final guestGate = _roomGuestPlayGate(songs[startIndex]);
     if (guestGate != null && !await guestGate) return;
-    if (!KugouApiClient().isLoggedIn) {
-      onLoginRequired?.call();
+    // v28d：先领代次再 await 登录态——旧"先 await 后领"会让本续延在凭证
+    // 就绪后才发出新代次，反而作废用户在等待期里的更新起播，旧云盘列表赢。
+    final playbackRequest = _issuePlaybackRequest();
+    if (!await KugouApiClient().isLoggedInWhenReady()) {
+      // v31：等待期被顶替则静默作罢，防误弹（同 playOnlinePlaylist 口径）。
+      if (_isPlaybackRequestCurrent(playbackRequest)) {
+        onLoginRequired?.call();
+      }
       return;
     }
-    final playbackRequest = _issuePlaybackRequest();
+    // 等待期被顶替则作罢，不入队不落盘。
+    if (!_isPlaybackRequestCurrent(playbackRequest)) return;
 
     _loadPlaylist(songs, startIndex);
     _currentSong = _playlist[_currentIndex];
@@ -4266,6 +4711,121 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// 是否满足 MV 音频兜底的前置条件（纯判定，无副作用，供错误闸门复用）。
+  ///
+  /// 条件：功能已开启；是曲库在线歌曲（非云盘/听书/远程存储）；有
+  /// albumAudioId；本次播放请求未尝试过；当前不在播放 MV 兜底音轨。
+  bool _canAttemptMvAudioFallback(Song? song, int? request) {
+    if (!_mvAudioFallbackEnabled) return false;
+    if (song == null || !song.isOnline) return false;
+    if (song.remoteType != SongRemoteType.none) return false;
+    if (song.isCloud || song.isLongAudio) return false;
+    if ((song.albumAudioId ?? '').trim().isEmpty) return false;
+    final req = request ?? _diagnosticPlaybackRequest;
+    if (req == null) return false;
+    if (_mvFallbackAttemptedRequest == req) return false;
+    if (_isPlayingMvAudio) return false;
+    return true;
+  }
+
+  /// 尝试用曲库 MV 音轨兜底当前歌曲（对齐 EchoMusic tryMvAudioFallback）。
+  ///
+  /// 返回 true 表示已接管播放 —— 调用方不得再置失败态。
+  /// MV 音轨从头播放（position 0），且不改写 [Song.url]（与原曲播放地址解耦，
+  /// 不污染后续解析/队列身份/历史记录）。
+  Future<bool> _tryMvAudioFallback(Song? song, {int? request}) async {
+    final req = request ?? _diagnosticPlaybackRequest;
+    if (req == null || !_canAttemptMvAudioFallback(song, req)) return false;
+    final target = song!;
+    _mvFallbackAttemptedRequest = req;
+    _mvAudioFallbackFailureReason = '';
+    bool isCurrent() =>
+        _isPlaybackRequestCurrent(req) && _currentSong?.id == target.id;
+    if (!isCurrent()) return false;
+    _logPlaybackEvent(
+      'mv.fallback.begin',
+      request: req,
+      song: target,
+      entry: 'mv_fallback',
+      outcome: 'resolving',
+      details: <String, Object?>{'albumAudioId': target.albumAudioId},
+    );
+    List<String> urls;
+    try {
+      urls = await KugouApiClient().resolveMvAudioUrls(
+        (target.albumAudioId ?? '').trim(),
+      );
+    } catch (e) {
+      _mvAudioFallbackFailureReason = '曲库 MV 查询异常';
+      _logPlaybackEvent(
+        'mv.fallback.failed',
+        request: req,
+        song: target,
+        entry: 'mv_fallback',
+        outcome: 'exception',
+        error: e,
+      );
+      return false;
+    }
+    if (!isCurrent() || urls.isEmpty) {
+      _mvAudioFallbackFailureReason = '未找到可用曲库 MV';
+      _logPlaybackEvent(
+        'mv.fallback.failed',
+        request: req,
+        song: target,
+        entry: 'mv_fallback',
+        outcome: 'unavailable',
+        details: <String, Object?>{'reason': _mvAudioFallbackFailureReason},
+      );
+      return false;
+    }
+    _isPlayingMvAudio = true;
+    _resolveError = null;
+    for (final url in urls) {
+      if (!isCurrent()) return false;
+      final ok = await _setUrlAndPlay(
+        url,
+        seekTo: Duration.zero,
+        playAfter: true,
+        playbackRequest: req,
+      );
+      if (ok && isCurrent()) {
+        _updatePosition(Duration.zero);
+        notifyListeners();
+        _logPlaybackEvent(
+          'mv.fallback.playing',
+          request: req,
+          song: target,
+          entry: 'mv_fallback',
+          outcome: 'playing',
+        );
+        return true;
+      }
+      if (!isCurrent()) return false;
+    }
+    _isPlayingMvAudio = false;
+    _mvAudioFallbackFailureReason = 'MV 音频片源均无法播放';
+    _logPlaybackEvent(
+      'mv.fallback.failed',
+      request: req,
+      song: target,
+      entry: 'mv_fallback',
+      outcome: 'all_candidates_failed',
+      details: <String, Object?>{'reason': _mvAudioFallbackFailureReason},
+    );
+    // 兜底彻底失败：在这里统一收口为既有失败态（调用方可能已提前 return）。
+    if (isCurrent() && !_isDisposed) {
+      _isPlaying = false;
+      _isResolvingUrl = false;
+      _resolveError = '播放失败，请重试';
+      notifyListeners();
+      try {
+        _updateNotification();
+      } catch (_) {}
+    }
+    return false;
+  }
+
   /// 设置音频源并等待就绪后播放。
   ///
   /// 不直接使用 [playerStateStream.firstWhere] 等待 ready 状态,因为
@@ -4304,19 +4864,53 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 有明确 seek 目标时开启闸门，装载全程丢弃小于目标的采样，seek 后回填目标值。
     final bool gateRewind = seekTo != null && seekTo > Duration.zero;
     if (gateRewind) _positionRewindGate.arm(seekTo);
+    // 同步 seek 目标缓存：本次装载带定位则以 seekTo 为准；从头装载则清掉
+    // 旧值，防止上次播放遗留的 seek 目标在后续换源恢复时把进度拉回。
+    if (seekTo != null && seekTo > Duration.zero) {
+      _lastSeekTarget = seekTo;
+      _lastSeekTargetSongId = song?.id;
+    } else {
+      _lastSeekTarget = Duration.zero;
+      _lastSeekTargetSongId = null;
+    }
     // 换源后同样落到歌曲中段，需要缓冲；跳过速率判定避免把首次缓冲误判为限速
     _armRateCheckGrace(seekTo);
     try {
-      // 音量均衡 + iOS 挂起恢复自愈（setUrl 秒抛 -1004 时重建播放器再试）。
+      // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
       //
       // 定位一律走 initialPosition（平台层 prepare 阶段一次性生效）：
       // 原先的「setUrl 后轮询等 ready 再 seek」有致命窗口——超时 10s 仍停在
       // `ProcessingState.loading` 时，那段 seek 会被 just_audio 静默丢弃
       // （见铁律 18），用户感知就是「进房有概率从头播，暂停再播放才对上」。
+      // MD3Music fork（vivo 原子随身听/锁屏第二首起信息消失修复）：给 setUrl 带上
+      // 当前歌曲元数据 tag。无 tag 时新 MediaItem 元数据全空，切歌过渡瞬间 media3
+      // 会话发布「无标题无身份」元数据，vivo hook 因 title 为空补不了身份 →
+      // 原子随身听/锁屏清空卡片。刻意不带 id：framework MEDIA_ID 须保持空串由
+      // hook 补 title|artist 身份，与 lrc_change extras 的 meidia_id 匹配口径
+      // 一致（实测数字 ID 不匹配，见 pushVivoAtomicExtras 注释）。
+      final mediaTag = song == null
+          ? null
+          : {
+              'title': song.displayName,
+              'artist': song.artist,
+              'album': song.album,
+              'artUri':
+                  song.isOnline && song.artworkUri != null
+                  ? song.artworkUri
+                  : null,
+            };
+      // 硬解时机：换源本来就要重跑 sink.configure（Media3 必然重建 AudioSink），
+      // 是恢复被挂起的硬解输出的零成本时机 —— 装载新源前先把挂起的决策冲刷下去。
+      await AudioOffloadService.instance.beforeSourceLoad();
+      if (!_isPlaybackRequestCurrent(request)) return false;
       final loaded = await _runAudioSourceLoad(
         // iOS 挂起自愈：setUrl 秒抛 -1004 时由 [_loadUrlWithSuspendRecovery]
         // 重建播放器再试；非 iOS 平台等价于直接 setUrl。
-        () => _loadUrlWithSuspendRecovery(url, initialPosition: seekTo),
+        () => _loadUrlWithSuspendRecovery(
+          url,
+          initialPosition: seekTo,
+          tag: mediaTag,
+        ),
         request: request,
         song: song,
       );
@@ -4350,6 +4944,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
               error: error,
               retryable: false,
             );
+            // play future 报错：先尝试曲库 MV 音轨兜底（异步；兜底失败会自行收口）
+            if (_canAttemptMvAudioFallback(song, request)) {
+              unawaited(_tryMvAudioFallback(song, request: request));
+              return;
+            }
             _resolveError = _resolveErrorText(song);
             _isPlaying = false;
             notifyListeners();
@@ -4435,6 +5034,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> _loadUrlWithSuspendRecovery(
     String url, {
     Duration? initialPosition,
+    dynamic tag,
   }) async {
     try {
       await _audioService!.setUrl(
@@ -4442,6 +5042,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         loudnessLufs: _currentSong?.loudnessLufs,
         loudnessPeakDb: _currentSong?.loudnessPeakDb,
         initialPosition: initialPosition,
+        tag: tag,
       );
     } catch (e) {
       if (!Platform.isIOS) rethrow;
@@ -4457,6 +5058,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         loudnessLufs: _currentSong?.loudnessLufs,
         loudnessPeakDb: _currentSong?.loudnessPeakDb,
         initialPosition: initialPosition,
+        tag: tag,
       );
     }
   }
@@ -4541,11 +5143,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 取证：暂停淡出收尾会直接把音量拉回 _volume。若它发生在交叉淡化期间
       // （未被 _fadeToken 拦住），听感正是「音量突然变大」。
       // ignore: avoid_print
-      print(
-        '[VolAudit] 暂停淡出收尾 tokenOk=${fadeToken == _fadeToken} '
-        '目标=${_volume.toStringAsFixed(3)} '
-        '播放器当前=${target.volume.toStringAsFixed(3)}',
-      );
+      print('[VolAudit] 暂停淡出收尾 tokenOk=${fadeToken == _fadeToken} '
+          '目标=${_volume.toStringAsFixed(3)} '
+          '播放器当前=${target.volume.toStringAsFixed(3)}');
       if (fadeToken == _fadeToken) target.setVolume(_volume);
     } else {
       if (!_playbackRequestGate.isCurrent(pauseGeneration) || _isDisposed) {
@@ -4719,6 +5319,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       song: _currentSong,
       outcome: 'user_intent',
     );
+    if (Platform.isWindows && song != null && !song.isOnline &&
+        await _removeMissingLocalSong(song, playbackRequest, playAfter: true)) {
+      return;
+    }
+    if (!_isPlaybackRequestCurrent(playbackRequest)) return;
     // 乐观同步本地播放态（同 pause() 处注释）：play() 已下发即视为播放中，
     // 不等平台事件。否则一起听恢复跟随的漂移纠偏分支永远判不中。
     _isPlaying = true;
@@ -4795,12 +5400,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       }
       // 取证：暂停淡入收尾同样会把音量一次性拉到 targetVolume。
       // ignore: avoid_print
-      print(
-        '[VolAudit] 暂停淡入收尾 superseded=$superseded '
-        'tokenOk=${token == _fadeToken} '
-        '目标=${targetVolume.toStringAsFixed(3)} '
-        '播放器当前=${target.volume.toStringAsFixed(3)}',
-      );
+      print('[VolAudit] 暂停淡入收尾 superseded=$superseded '
+          'tokenOk=${token == _fadeToken} '
+          '目标=${targetVolume.toStringAsFixed(3)} '
+          '播放器当前=${target.volume.toStringAsFixed(3)}');
       if (!superseded && token == _fadeToken) target.setVolume(targetVolume);
     } else {
       await _audioService?.playCommand();
@@ -4823,6 +5426,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     ListenReportService.instance.onSeek();
     // 云端播放历史同口径重新起表。
     PlayHistorySyncService.instance.onSeek();
+    // 听歌统计同口径重新起表。
+    ListenStatsRecordService.instance.onSeek();
     // 立即更新位置，让 UI（进度条、歌词行高亮、滚动）即时响应
     // 否则要等 just_audio positionStream 触发，会有一帧的滞后，
     // 导致拖动 slider 后歌词不跟随。
@@ -4830,6 +5435,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _updatePosition(position);
       notifyListeners();
     }
+    // 记录 seek 目标：高音质慢网下看门狗误判换源时，[_stallRecoveryPosition]
+    // 用它续播，而不是被清零的平台位置缓存（从 0:00 重播）。
+    _lastSeekTarget = position;
+    _lastSeekTargetSongId = _currentSong?.id;
     // 用户主动拖动进度：立即通告房间。必须在平台 await **之前**同步触发——
     // 房间侧的抑制窗口（suppressPlaybackNotify）只覆盖 awaited 调用期间，
     // 放在 await 之后会逃出窗口，被当成用户操作上报（房主回声 / 成员自激）。
@@ -4837,6 +5446,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // （抑制窗口开启）也必须让一起听层感知——否则听众的「拖动即脱离」会被
     // 静默吞掉并被纠偏拉回（实测复现）。
     _notifySeekToRoom(position.inMilliseconds, force: forceNotify);
+    // seek 落点需重新缓冲：高音质流再缓冲耗时与 CDN 限速在速率采样上同形，
+    // 不开启宽限期会被看门狗误判限速并换源（表现为进度被重置）。
+    // 与 [_setUrlAndPlay] 的 [_armRateCheckGrace] 同口径，并重置采样基线。
+    _armRateCheckGrace(position);
+    _rateCheckPos = position;
+    _rateCheckTime = DateTime.now();
+    _rateCheckSeenPlay = false;
     await _audioService?.seek(position);
     _saveState();
     // 同步进度到 Lyricon（仅 enabled 时推送，避免无意义 IPC；
@@ -4957,12 +5573,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           prefetchedQuality != _audioQuality.value;
       if (song.url == null || cachedUrlStale) {
         // URL 不存在，需要解析
-        if (!KugouApiClient().isLoggedIn) {
+        if (!await KugouApiClient().isLoggedInWhenReady()) {
           // 仅用户主动播放（play=true）才提示登录。play=false 是启动恢复等
           // 静默路径：启动早期登录 token 可能尚未从存储加载完成、本地服务器
           // 也未必就绪，此刻误判未登录会误弹「请先登录」。改为静默跳过，
           // 待用户点击播放时用已就绪的状态重新校验（届时仍会正确判断）。
-          if (play) {
+          // v31：登录提示只属于仍在途的请求——等待期被顶替则静默作罢；
+          // play=false 路径与代次由上层复审，不需要任何提示。
+          if (play && _isPlaybackRequestCurrent(request)) {
             onLoginRequired?.call();
           }
           return false;
@@ -5038,6 +5656,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             // 这次 notify 才会从「解析中」的状态里回到真实档位。
             _isResolvingUrl = false;
             notifyListeners();
+            // 拿不到播放地址：先尝试曲库 MV 音轨兜底（成功即已接管播放）
+            if (await _tryMvAudioFallback(_currentSong, request: request)) {
+              return true;
+            }
             return false;
           }
         } catch (e) {
@@ -5051,6 +5673,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           );
           _isResolvingUrl = false;
           notifyListeners();
+          if (await _tryMvAudioFallback(_currentSong, request: request)) {
+            return true;
+          }
           return false;
         }
       } else {
@@ -5079,6 +5704,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       final playbackUrl = await _resolvePlaybackUrl(
         _currentSong!,
         playbackRequest: request,
+        playAfter: play,
       );
       if (!_isPlaybackRequestCurrent(request) ||
           _currentSong?.id != requestedSongId) {
@@ -5120,11 +5746,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 冷启动时 main() 中的 KugouApiServer.start() 可能因 MethodChannel 尚未注册
   /// 而失败（MissingPluginException），导致后续所有 API 请求因连接被拒绝而失败。
   /// 此方法在播放流程中做二次兜底：探测端口，若不通则重新尝试启动。
-  ///
-  /// Android：前台服务保活下服务器极少死，此处主要防冷启动失败。
-  /// iOS：锁屏后无活跃音频会话时进程被挂起（后台时序里 detached 还可能
-  /// 误触发 stop()），回前台后端口不通——播放前必须探测并重启，否则表现
-  /// 为「锁屏回来后音乐播不了，而已加载的 MV 等正常」。
   Future<void> _ensureApiServerReady() async {
     if (kIsWeb) return;
     final port = KugouApiServer.currentPort;
@@ -5145,9 +5766,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 端口不通，尝试重新启动
     }
     try {
-      // 注意不能只调 start()：_started/RUNNING 标志仍为 true 时 start()
-      // 直接返回旧端口不重新 bind，必须 restart() 先停后起才能自愈。
-      await KugouApiServer.restart();
+      await KugouApiServer.start();
     } catch (_) {}
   }
 
@@ -5238,11 +5857,29 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     final startIndex = _currentIndex;
+    // 切歌意图已确立：立刻停掉旧声（解析/装载窗口内旧歌不再续响）。
+    await _audioService?.pause();
     // 自动跳过无法获取播放链接的歌曲，直到找到可播放的或全部试过
     for (int i = 0; i < _playlist.length; i++) {
       final nextIndex = (_currentIndex + 1) % _playlist.length;
-      // 绕回起点：所有歌曲都试过了
-      if (nextIndex == startIndex) break;
+      // 绕回起点：所有歌曲都试过了。md3 fork：live 跳过只推游标不动
+      // _currentSong，全部试完仍失败时把游标锁回与 _currentSong 一致的
+      // 起播位（解析失败落定曲的路径本来就一致，不碰），避免队列高亮/
+      // 末尾判定/下次 crossfade 目标拿到脱钩索引。
+      if (nextIndex == startIndex) {
+        if (_currentSong == null ||
+            _playlist[_currentIndex].id != _currentSong!.id) {
+          _currentIndex = startIndex;
+        }
+        break;
+      }
+
+      // 过滤 Live/现场版本——只推进游标（下一轮 +1 从这里继续），不动
+      // 播放状态/历史/通知。
+      if (_skipLiveEnabled && isLiveSong(_playlist[nextIndex])) {
+        _currentIndex = nextIndex;
+        continue;
+      }
 
       _currentIndex = nextIndex;
       _currentSong = _playlist[nextIndex];
@@ -5307,6 +5944,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     final startIndex = _currentIndex;
+    // 切歌意图已确立：立刻停掉旧声（解析/装载窗口内旧歌不再续响）。
+    await _audioService?.pause();
     int prevIndex = _currentIndex;
     for (int i = 0; i < _playlist.length; i++) {
       prevIndex = prevIndex > 0 ? prevIndex - 1 : _playlist.length - 1;
@@ -5315,6 +5954,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         await _seekInternally(Duration.zero);
         return;
       }
+
+      // 过滤 Live/现场版本——只回退游标继续往前找，不动播放状态。
+      if (_skipLiveEnabled && isLiveSong(_playlist[prevIndex])) continue;
 
       _currentIndex = prevIndex;
       _currentSong = _playlist[prevIndex];
@@ -5339,8 +5981,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  Future<void> playSongAt(int index) async {
+  Future<void> playSongAt(int index, {bool autoPlay = true}) async {
     if (index < 0 || index >= _playlist.length) return;
+    // 过滤 Live/现场——点中 live 曲时自动移到下一个非 live 曲（全部 live
+    // 照常播）；重入目标必为非 live，环形一圈必停，无死循环。
+    if (_skipLiveEnabled && isLiveSong(_playlist[index])) {
+      final start = _liveFilteredStartIndex(_playlist, index);
+      if (start != index) return playSongAt(start, autoPlay: autoPlay);
+    }
     await _audioService?.resetAutomixRate(_speed);
     _automixPlan = null;
     _automixPlanSongId = null;
@@ -5355,6 +6003,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     // 一起听房主：房间歌单外的曲目交由守卫拦截（上一曲/下一曲等自动续播不经此入口）
     if (onRoomOwnerInterceptPlayback?.call(_playlist[index]) ?? false) return;
+
+    // 切歌意图已确立：立刻停掉旧声（解析/装载窗口内旧歌不再续响）。
+    await _audioService?.pause();
 
     // 可选扩展：播放源停止回调（默认关闭）
     if (_currentSong != null && _currentSong!.isOnline) {
@@ -5374,6 +6025,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     final result = await _resolveAndPlayCurrentSong(
       playbackRequest: playbackRequest,
+      play: autoPlay,
     );
     if (!_isPlaybackRequestCurrent(playbackRequest)) return;
     if (!result.succeeded) {
@@ -5383,7 +6035,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 听书付费章节失败不自动跳下一曲：整专辑大概率连续付费，
       // 自动切会疯狂刷日志且无意义，由用户手动选择。
       if (_playlist.length > 1 && !failedSong.isLongAudio) {
-        await next(autoPlay: true);
+        await next(autoPlay: autoPlay);
       }
     }
   }
@@ -5821,6 +6473,76 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// 撤销条用：把此前删除的（原索引, 歌曲）对按原位恢复回播放队列。
+  ///
+  /// 恢复语义：
+  /// - 按 index 升序逐个 insert 回 `_playlist`；原索引越界（期间又有增删）
+  ///   时 clamp 到当前长度；
+  /// - 插入点 ≤ 当前播放索引时当前索引右移，**不打断当前播放**；
+  /// - audio_service 队列同步逐个 insertAudioSourceAt（与 insertAfterCurrent
+  ///   同策略，不重建队列）；队列在删除时被清空（当前歌为空）则整体重加，
+  ///   不自动起播；
+  /// - `_originalPlaylist` 同索引恢复（仅用于退出随机时还原顺序，
+  ///   期间发生过重排时位置可能有微小漂移，可接受）。
+  Future<void> restorePlaylistEntries(
+    List<({int index, Song song})> entries,
+  ) async {
+    if (entries.isEmpty) return;
+    final sorted = [...entries]..sort((a, b) => a.index.compareTo(b.index));
+    final queueWasEmpty = _playlist.isEmpty;
+    final added = <Song>[];
+
+    for (final e in sorted) {
+      // 防重复插入（同 id 已在队列中就跳过该条）
+      if (_playlist.any((s) => s.id == e.song.id)) continue;
+      final idx = e.index.clamp(0, _playlist.length);
+      _playlist.insert(idx, e.song);
+      final oidx = e.index.clamp(0, _originalPlaylist.length);
+      _originalPlaylist.insert(oidx, e.song);
+      added.add(e.song);
+      // 插入点在当前播放之前（含正中）：当前索引右移
+      if (_currentIndex >= 0 && idx <= _currentIndex) _currentIndex++;
+    }
+    if (added.isEmpty) return;
+
+    _queueRevision++;
+    _resetCrossfadePrepared();
+    notifyListeners();
+    // 队列结构已变化：持久化队列本体
+    _savePlaylistIfChanged();
+
+    if (_audioService != null) {
+      if (queueWasEmpty || _currentSong == null) {
+        // 删除时队列被清空过：audio_service 队列已停空，整体重加（不起播）
+        final resolved = await _resolveLocalPathsForBatch(added);
+        final sources = resolved.map(_createAudioSource).toList();
+        await _audioService!.addAllAudioSources(sources);
+        // 回写真实路径
+        for (final song in resolved) {
+          final idx = _playlist.indexWhere((s) => s.id == song.id);
+          if (idx >= 0) _playlist[idx] = song;
+        }
+      } else {
+        // 逐个插入到 audio_service 队列（_playlist 已就位，按最终索引插），
+        // 不打断当前播放
+        for (final song in added) {
+          final idx = _playlist.indexWhere((s) => s.id == song.id);
+          if (idx < 0) continue;
+          final resolved = await _resolveLocalPathsForBatch([song]);
+          final target = resolved.isNotEmpty ? resolved.first : song;
+          final ridx = _playlist.indexWhere((s) => s.id == song.id);
+          if (ridx >= 0) _playlist[ridx] = target;
+          await _audioService!.insertAudioSourceAt(
+            ridx >= 0 ? ridx : idx,
+            _createAudioSource(target),
+          );
+        }
+      }
+      notifyListeners();
+      _prefetchNextSongs(_currentIndex);
+    }
+  }
+
   /// 直接设定循环模式（MCP 等程序化调用用；UI 仍走 toggleLoopMode/cyclePlayMode）。
   Future<void> setLoopMode(AppLoopMode mode) => _applyLoopMode(mode);
 
@@ -5887,6 +6609,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     onRoomPlayModeChanged?.call(roomPlayModeValue);
     _saveState();
     notifyListeners();
+    // 同步到 MediaSession/SMTC：Windows 媒体浮层的循环按钮高亮随 loopMode
+    // 变化，切换后立即回写，否则要等下一次切歌/播放态翻转才刷新。
+    _updateNotification();
   }
 
   Future<void> toggleShuffle() async {
@@ -5923,6 +6648,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     onRoomPlayModeChanged?.call(roomPlayModeValue);
     _savePlaylistIfChanged();
     notifyListeners();
+    // 随机开关也会改变循环按钮语义（随机视作「列表循环+打乱」），同步给 SMTC。
+    _updateNotification();
   }
 
   /// [persist] 为 false 时跳过 SharedPreferences 落盘（常驻音量条拖动中的高频
@@ -5955,6 +6682,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> setSpeed(double speed) async {
     _speed = speed.clamp(0.25, 4.0);
     await _audioService?.setSpeed(_speed);
+    // 硬解：倍速非 1.0 必须立即让路；回到 1.0 时允许恢复（播放中会挂起到下一首）。
+    await AudioOffloadService.instance.refresh(immediate: _speed != 1.0);
     notifyListeners();
   }
 
@@ -5976,9 +6705,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _sleepTimerTicker = null;
     // mode 表达倒计时进行中；到点后的 endOfTrack 等待态由 ticker 分支设置。
     // 「关闭定时」(null) 连同到点等待态与勾选偏好一起清掉。
-    _sleepTimerMode = duration == null
-        ? SleepTimerMode.off
-        : SleepTimerMode.countdown;
+    _sleepTimerMode =
+        duration == null ? SleepTimerMode.off : SleepTimerMode.countdown;
     if (duration == null) {
       _stopAfterTimerEnds = false;
       _sleepTimerEndTime = null;
@@ -6007,6 +6735,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           _sleepTimerMode = SleepTimerMode.off;
           _audioService?.pause();
           notifyListeners();
+          // 「结束后减少待机耗电」：到点即走退出序列（回调内先 stopForAppExit
+          // 停播落盘，再停本地服务并结束任务），不保留后台播放。
+          if (_killBackgroundOnTimerEnd) _triggerSleepTimerExit();
         }
       } else {
         // 每秒只刷新独立通道的剩余时间，不触发全量 notifyListeners
@@ -6031,6 +6762,27 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _sleepTimerMode = SleepTimerMode.off;
     }
     notifyListeners();
+  }
+
+  /// 设置 / 取消「结束后减少待机耗电」偏好（仅内存态）。
+  ///
+  /// 持久化由定时关闭弹层写入 SettingsRepository；定时本身不跨进程存续，
+  /// 内存字段在弹层切换时同步即足够新鲜（冷启动回读见 showSleepTimerSheet）。
+  void setKillBackgroundOnTimerEnd(bool enabled) {
+    _killBackgroundOnTimerEnd = enabled;
+    notifyListeners();
+  }
+
+  /// 到点触发「结束后减少待机耗电」的退出序列。
+  ///
+  /// 回调由壳层注入（见 [onSleepTimerExit]），内部先 stopForAppExit
+  /// （停播 + 落盘）再停本地服务并结束任务，Provider 不重复停播。
+  /// 未注入时静默跳过，保持原有的仅暂停行为。
+  void _triggerSleepTimerExit() {
+    final exit = onSleepTimerExit;
+    if (exit == null) return;
+    // ignore: discarded_futures
+    unawaited(exit());
   }
 
   /// 延迟一帧更新睡眠定时剩余时间 notifier。
@@ -6286,13 +7038,17 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         PlayerProvider.resolveLocalArtworkPath != null) {
       _pushNotificationWithCachedArtwork(song, isFavorited);
     }
-    // 同步更新桌面小组件（封面由原生侧从 MediaSession 缓存同步，无需传路径）
+    // 同步更新桌面小组件（封面由原生侧从 MediaSession 缓存同步，无需传路径）。
+    // 播放模式/收藏态只被概念版 4×1 卡片消费，旧组件忽略。
     HomeWidgetService.updateWidget(
       title: song.displayName,
       artist: song.artist,
       isPlaying: _isPlaying,
       position: _position,
       duration: _duration ?? Duration.zero,
+      loopMode: _loopMode.name,
+      shuffleEnabled: _shuffleEnabled,
+      isFavorited: isFavorited,
     );
   }
 
@@ -6364,6 +7120,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       duration: _duration ?? Duration.zero,
       desktopLyricEnabled: DesktopLyricService.instance.enabled,
       isFavorited: isFavorited,
+      loopMode: _loopMode.name,
+      shuffleEnabled: _shuffleEnabled,
     );
   }
 
@@ -6424,7 +7182,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   ///
   /// 解析结果会回写到 song 的 `localPath`（去掉 `content://` 前缀后的真实路径），
   /// 后续切歌/重播时无需重新解析。
-  Future<String?> _resolvePlaybackUrl(Song song, {int? playbackRequest}) async {
+  Future<String?> _resolvePlaybackUrl(
+    Song song, {int? playbackRequest, bool playAfter = true}
+  ) async {
     final timer = Stopwatch()..start();
     _logPlaybackEvent(
       'source.resolve.begin',
@@ -6433,6 +7193,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       source: song.isOnline ? 'online' : 'local',
     );
     try {
+      if (Platform.isWindows && !song.isOnline && playbackRequest != null &&
+          await _removeMissingLocalSong(song, playbackRequest, playAfter: playAfter)) {
+        _logPlaybackEvent('source.resolve.end', request: playbackRequest,
+            song: song, elapsed: timer.elapsed, outcome: 'local_missing_removed');
+        return null;
+      }
       final resolved = await _resolvePlaybackUrlImpl(song);
       _logPlaybackEvent(
         'source.resolve.end',
@@ -6457,6 +7223,69 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       );
       rethrow;
     }
+  }
+
+  /// 仅确认 Windows 本机文件的“不存在”错误；离线网络盘、未挂载磁盘、
+  /// SAF/远程源和权限错误均保留，不能将“暂时读不到”当作删除。
+  Future<bool> _isMissingWindowsLocalFile(Song song) async {
+    if (!Platform.isWindows || song.isOnline ||
+        song.remoteType != SongRemoteType.none) return false;
+    final raw = song.localPath;
+    if (raw == null || raw.isEmpty) return false;
+    String path;
+    try {
+      path = raw.startsWith('file:')
+          ? Uri.parse(raw).toFilePath(windows: true) : raw;
+    } on FormatException {
+      return false;
+    } on UnsupportedError {
+      return false;
+    }
+    // UNC/无盘符路径不作自动移除，避免网络或挂载状态变化导致误删队列。
+    if (!RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(path)) return false;
+    try {
+      final file = await File(path).open();
+      await file.close();
+      return false;
+    } on FileSystemException catch (error) {
+      final code = error.osError?.errorCode;
+      if (code != 2 && code != 3) return false;
+      return Directory(path.substring(0, 3)).exists();
+    }
+  }
+
+  /// 缺失歌曲只从播放队列移除；库索引和磁盘文件不动。
+  /// 使用新播放请求续播，让旧解析/恢复流程自然取消，避免重复切歌。
+  Future<bool> _removeMissingLocalSong(
+    Song song, int request, {required bool playAfter}
+  ) async {
+    if (!await _isMissingWindowsLocalFile(song)) return false;
+    if (!_isPlaybackRequestCurrent(request) || _currentSong?.id != song.id) return true;
+    final revision = _queueRevision;
+    final snapshot = List<Song>.from(_playlist);
+    final missing = <String>{song.id};
+    for (final item in snapshot) {
+      if (missing.contains(item.id)) continue;
+      if (await _isMissingWindowsLocalFile(item)) missing.add(item.id);
+    }
+    if (!_isPlaybackRequestCurrent(request) || revision != _queueRevision) return true;
+    final nextIndex = snapshot.take(_currentIndex).where((s) => !missing.contains(s.id)).length;
+    _issuePlaybackRequest();
+    _playlist.removeWhere((s) => missing.contains(s.id));
+    _originalPlaylist.removeWhere((s) => missing.contains(s.id));
+    _queueRevision++;
+    _resetCrossfadePrepared();
+    _isResolvingUrl = false;
+    _logPlaybackEvent('queue.local_missing', request: request, song: song,
+        outcome: 'removed', resources: {'removedSongs': missing.length});
+    if (_playlist.isEmpty) {
+      await clearPlaylist();
+    } else {
+      // 先保存干净队列；新当前曲及游标由 playSongAt 同步并持久化。
+      _savePlaylistIfChanged();
+      await playSongAt(nextIndex.clamp(0, _playlist.length - 1), autoPlay: playAfter);
+    }
+    return true;
   }
 
   Future<String?> _resolvePlaybackUrlImpl(Song song) async {
@@ -6532,11 +7361,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (song.remoteType != SongRemoteType.none) {
         final resolved = await _resolvePlaybackUrl(song);
         if (resolved != null && resolved.isNotEmpty) {
-          result.add(
-            song.remoteType == SongRemoteType.webdav
-                ? song
-                : song.copyWith(localPath: resolved),
-          );
+          result.add(song.remoteType == SongRemoteType.webdav
+              ? song
+              : song.copyWith(localPath: resolved));
         } else {
           result.add(song);
         }
@@ -6636,9 +7463,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (song != null) {
         // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
         await SongMatchRepository().ensureLoaded();
-        final matchInfo = song.isOnline
-            ? null
-            : SongMatchRepository().get(song.id);
+        final matchInfo =
+            song.isOnline ? null : SongMatchRepository().get(song.id);
         final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
         // 本地歌曲优先读取内嵌歌词；单曲偏好开启时跳过，直接走在线
@@ -6649,7 +7475,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             if (filePath.startsWith('file://')) {
               filePath = Uri.parse(filePath).toFilePath();
             }
-            final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
+            final embedded = song.localLyrics?.isNotEmpty == true
+                ? song.localLyrics
+                : await LocalLyricLoader.loadForAudioAsync(filePath);
             if (embedded != null && embedded.isNotEmpty) {
               lines = await parseLyricOffMainThread(embedded);
             }
@@ -6725,14 +7553,18 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     final tracker = ListenReportService.instance.tracker;
     if (tracker.isTracking) {
       // ignore: discarded_futures
-      ListenReportService.instance.onSongEnded(
-        reason: PlaybackEndReason.stopped,
-      );
+      ListenReportService.instance.onSongEnded(reason: PlaybackEndReason.stopped);
     }
     // 云端播放历史同样在退出前结账：阈值内直接上传，失败落 pending 队列
     // （持久化，下次启动补传），进程被杀也不丢记录。
     // ignore: discarded_futures
     PlayHistorySyncService.instance.onSongEnded(
+      reason: PlaybackEndReason.stopped,
+    );
+    // 听歌统计同样在退出前结账：段只在内存里，不结算这次收听就永久丢失
+    // （本地库写入无网络跳数，比上报链路更容易赶在进程退出前落地）。
+    // ignore: discarded_futures
+    ListenStatsRecordService.instance.onSongEnded(
       reason: PlaybackEndReason.stopped,
     );
   }
@@ -6749,6 +7581,15 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       _isAppBackgrounded = true;
+      _idleKeepaliveEligible =
+          state == AppLifecycleState.paused;
+      if (_idleKeepaliveEligible) {
+        _syncIdleKeepaliveStopTimer();
+      } else {
+        _idleKeepaliveStopTimer?.cancel();
+        _idleKeepaliveStopTimer = null;
+        _idleKeepaliveStopTimerGeneration++;
+      }
       // App 进入后台或即将被杀死，立即保存播放状态
       _saveState();
       _saveDebounce?.cancel();
@@ -6764,9 +7605,37 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     } else if (state == AppLifecycleState.resumed) {
       // 回到前台：停止兜底定时器，立即重试一次失败的当前歌曲
       _isAppBackgrounded = false;
+      _idleKeepaliveEligible = false;
+      _idleKeepaliveStopTimer?.cancel();
+      _idleKeepaliveStopTimer = null;
+      _idleKeepaliveStopTimerGeneration++;
       _stopRetryFailedTimer();
       _retryFailedPlayback();
     }
+  }
+
+  Future<void> _syncIdleKeepaliveStopTimer() async {
+    final generation = ++_idleKeepaliveStopTimerGeneration;
+    _idleKeepaliveStopTimer?.cancel();
+    _idleKeepaliveStopTimer = null;
+    if (_isPlaying || !_idleKeepaliveEligible || _isDisposed) return;
+    final prefs = await SharedPreferences.getInstance();
+    final minutes = prefs.getInt('settings_idle_keepalive_stop_minutes') ?? 10;
+    if (generation != _idleKeepaliveStopTimerGeneration ||
+        minutes <= 0 || _isPlaying || !_idleKeepaliveEligible || _isDisposed) {
+      return;
+    }
+    _idleKeepaliveStopTimer = Timer(Duration(minutes: minutes), () async {
+      if (generation != _idleKeepaliveStopTimerGeneration ||
+          _isPlaying || !_idleKeepaliveEligible || _isDisposed) {
+        return;
+      }
+      await MediaNotificationService.hideNotification();
+    });
+  }
+
+  void refreshIdleKeepaliveStopTimer() {
+    _syncIdleKeepaliveStopTimer();
   }
 
   @override
@@ -6780,6 +7649,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (_isDisposed) return;
     _logPlaybackResourceSnapshot();
     _isDisposed = true;
+    _idleKeepaliveStopTimer?.cancel();
+    _idleKeepaliveStopTimer = null;
+    _idleKeepaliveStopTimerGeneration++;
     _playbackDiagnosticSampleTimer?.cancel();
     _playbackDiagnosticSampleTimer = null;
     _invalidatePlaybackRequest(
@@ -6803,6 +7675,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       OutputModeCoordinator.instance.removeListener(_outputModeListener!);
       _outputModeListener = null;
     }
+    // 硬解服务注销：单例持有本 provider 的回调闭包，不摘除会把 provider 钉住。
+    AudioOffloadService.instance.removeListener(_onOffloadChanged);
+    SpectrumService.instance.onCaptureStateChanged = null;
     _positionSubscription?.cancel();
     _durationSubscription?.cancel();
     _playingSubscription?.cancel();
@@ -6810,10 +7685,15 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _sequenceStateSubscription?.cancel();
     _playerErrorSubscription?.cancel();
     _speedSubscription?.cancel();
+    _crossfadeSubscription?.cancel();
+    _crossfadeSubscription = null;
+    _playStartGraceTimer?.cancel();
+    _playStartGraceTimer = null;
     _sleepTimerTicker?.cancel();
     _sleepTimerTicker = null;
     sleepTimerRemainingNotifier.dispose();
     positionNotifier.dispose();
+    crossfadeActiveNotifier.dispose();
     super.dispose();
   }
 }

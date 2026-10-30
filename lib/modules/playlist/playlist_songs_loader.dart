@@ -6,7 +6,7 @@ import '../../data/models/song.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
 import '../../providers/kugou_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
-import '../../services/kugou_api/kugou_models.dart';
+import '../../utils/playlist_song_sort.dart';
 
 /// 歌单歌曲加载结果。[apiSucceeded] 用于区分「空歌单」与「网络失败」。
 class PlaylistSongsResult {
@@ -36,7 +36,9 @@ class PlaylistSongsLoader {
     final key = cacheKey(playlist, isInMyFavorites: isInMyFavorites);
     if (key == null) return const [];
     try {
-      return await FavoriteListsCache.readPlaylistSongs(key);
+      return sortSongsByPlaylistPosition(
+        await FavoriteListsCache.readPlaylistSongs(key),
+      );
     } catch (_) {
       return const [];
     }
@@ -50,6 +52,8 @@ class PlaylistSongsLoader {
     BuildContext context,
     Playlist playlist, {
     bool isInMyFavorites = true,
+    bool isAlbum = false,
+    String? albumId,
   }) async {
     final api = KugouApiClient();
     final isLoggedIn = api.isLoggedIn;
@@ -58,7 +62,15 @@ class PlaylistSongsLoader {
     List<Song> all = [];
     bool apiSucceeded = false;
 
-    if (isLoggedIn && fetchListid != null && fetchListid.isNotEmpty) {
+    if (isAlbum) {
+      if (albumId != null && albumId.isNotEmpty) {
+        final result = await api.getAlbumSongsAll(albumId);
+        if (result != null) {
+          all = result.songs.map((song) => song.toSong()).toList();
+          apiSucceeded = true;
+        }
+      }
+    } else if (isLoggedIn && fetchListid != null && fetchListid.isNotEmpty) {
       const int pageSize = 200;
       const int maxSongs = 9999;
       const int maxPages = (maxSongs + pageSize - 1) ~/ pageSize;
@@ -83,14 +95,18 @@ class PlaylistSongsLoader {
       final fallbackGid = playlist.listCreateGid ??
           (playlist.listCreateListid != null ? null : playlist.id);
       if (all.isEmpty && fallbackGid != null && fallbackGid.isNotEmpty) {
-        if (!context.mounted) return PlaylistSongsResult(all, apiSucceeded);
+        if (!context.mounted) {
+          return PlaylistSongsResult(all, apiSucceeded);
+        }
         final kugou = context.read<KugouProvider>();
         await kugou.getPlaylistTrackAll(id: fallbackGid, forceRefresh: true);
         all = kugou.currentPlaylistSongs.map((e) => e.toSong()).toList();
         if (all.isNotEmpty) apiSucceeded = true;
       }
     } else if (playlist.id.isNotEmpty) {
-      if (!context.mounted) return PlaylistSongsResult(all, apiSucceeded);
+      if (!context.mounted) {
+        return PlaylistSongsResult(all, apiSucceeded);
+      }
       final kugou = context.read<KugouProvider>();
       await kugou.getPlaylistTrackAll(id: playlist.id, forceRefresh: true);
       all = kugou.currentPlaylistSongs.map((e) => e.toSong()).toList();
@@ -98,9 +114,9 @@ class PlaylistSongsLoader {
     }
 
     // 只过滤标题为空的歌曲；保留时长未知（duration=0）的歌曲
-    final filtered = all
+    final filtered = sortSongsByPlaylistPosition(all
         .where((song) => song.title.isNotEmpty && song.title != '-')
-        .toList();
+        .toList());
 
     if (apiSucceeded && filtered.isNotEmpty) {
       final key = cacheKey(playlist, isInMyFavorites: isInMyFavorites);

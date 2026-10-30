@@ -12,8 +12,8 @@ import '../../core/utils/app_toast.dart';
 import '../../core/utils/entry_transition_gate.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../core/utils/app_text_context_menu.dart';
-import '../../core/widgets/app_background.dart';
 import '../../data/models/playlist.dart';
+import '../../widgets/m3e_undo_pill_host.dart';
 import '../../data/models/song.dart';
 import '../../data/repositories/collected_playlist_store.dart';
 import '../../data/repositories/favorite_lists_cache.dart';
@@ -26,6 +26,7 @@ import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
 import '../../utils/playlist_song_sort.dart';
+import '../../utils/playlist_write_payload.dart' show buildTrackAddBatches;
 import '../../widgets/m3e_sort_sheet.dart';
 import '../../widgets/playlist_comments_view.dart';
 import '../../widgets/playlist_cover_hero.dart';
@@ -126,7 +127,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   // 批量选择模式
   bool _isMultiSelectMode = false;
   final Set<String> _selectedSongIds = {};
-  bool _isDeleting = false;
+
+  /// M3E 撤销条：删歌采用「延迟提交」——本地列表先移除，撤销窗口（5s）内
+  /// 可无网络恢复；倒计时归零 / 点 ✕ / 页面卸载时才真正提交远端删除。
+  final ValueNotifier<M3EUndoRequest?> _undoRequest = ValueNotifier(null);
 
   /// 删除歌曲用的 listid（仅自己创建的歌单有效）
   String? get _deleteListid => widget.playlist.listCreateListid;
@@ -154,12 +158,15 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _headerCoverReady.dispose();
     _searchController.dispose();
     _searchFocusNode.dispose();
+    // 宿主卸载时若撤销窗口未结算，M3EUndoPillHost 会先触发远端提交
+    _undoRequest.dispose();
     super.dispose();
   }
 
   @override
   void initState() {
     super.initState();
+    _sortAscending = widget.isDefaultFavorite;
     // ignore: avoid_print
     print('[FlashTrace] PlaylistPage initState id=${widget.playlist.id} '
         'name=${widget.playlist.name} hash=$hashCode');
@@ -362,20 +369,27 @@ class _PlaylistPageState extends State<PlaylistPage> {
     });
   }
 
-  /// 排序选择持久化（全局一份，所有歌单共用；与本地音乐页口径一致）。
+  /// 「我喜欢」独立保存排序方向，默认按服务端 sort 从小到大。
   static const String _kSortByKey = 'playlist_song_sort_by';
   static const String _kSortAscKey = 'playlist_song_sort_asc';
+  static const String _kFavoriteSortByKey = 'favorite_song_sort_by';
+  static const String _kFavoriteSortAscKey = 'favorite_song_sort_asc';
+
+  String get _sortByKey =>
+      widget.isDefaultFavorite ? _kFavoriteSortByKey : _kSortByKey;
+  String get _sortAscKey =>
+      widget.isDefaultFavorite ? _kFavoriteSortAscKey : _kSortAscKey;
 
   Future<void> _loadSortPreference() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
     final restored = PlaylistSongSort.values.firstWhere(
-      (e) => e.name == prefs.getString(_kSortByKey),
+      (e) => e.name == prefs.getString(_sortByKey),
       orElse: () => PlaylistSongSort.time,
     );
     setState(() {
       _sortBy = restored;
-      _sortAscending = prefs.getBool(_kSortAscKey) ?? false;
+      _sortAscending = prefs.getBool(_sortAscKey) ?? widget.isDefaultFavorite;
       _invalidateDisplaySongs();
     });
     // 恢复的维度若依赖播放数据，立即补加载
@@ -384,8 +398,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   Future<void> _saveSortPreference() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kSortByKey, _sortBy.name);
-    await prefs.setBool(_kSortAscKey, _sortAscending);
+    await prefs.setString(_sortByKey, _sortBy.name);
+    await prefs.setBool(_sortAscKey, _sortAscending);
   }
 
   // ==================== 批量选择模式 ====================
@@ -483,6 +497,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 批量删除选中歌曲（M3E 撤销条「延迟提交」模式）。
+  ///
+  /// 流程：确认对话框 → 本地列表乐观移除 + 弹出撤销条 →
+  /// - 撤销：按原索引插回（纯本地，零网络）；
+  /// - 倒计时归零 / 点 ✕ / 页面卸载：才真正调用远端 deletePlaylistTracks。
   Future<void> _deleteSelectedSongs() async {
     if (_selectedSongIds.isEmpty) return;
     final listid = _deleteListid;
@@ -506,50 +525,68 @@ class _PlaylistPageState extends State<PlaylistPage> {
         ],
       ),
     );
-    if (confirmed != true) return;
-
-    setState(() => _isDeleting = true);
+    if (confirmed != true || !mounted) return;
 
     // 构造 fileids：优先用 fileId（>0），否则用 song.id（hash）
-    final selectedSongs = _songs
+    final fileids = _songs
         .where((s) => _selectedSongIds.contains(s.id))
-        .toList();
-    final fileids = selectedSongs
         .map((s) {
           if (s.fileId != null && s.fileId! > 0) return s.fileId.toString();
           return s.id;
         })
         .join(',');
 
-    try {
-      final api = KugouApiClient();
-      final result = await api.deletePlaylistTracks(listid, fileids);
-      if (!mounted) return;
+    // 删除前快照（原索引 + 歌曲对象）：撤销时按原位插回
+    final entries = <({int index, Song song})>[
+      for (var i = 0; i < _songs.length; i++)
+        if (_selectedSongIds.contains(_songs[i].id)) (index: i, song: _songs[i]),
+    ];
+    // 闭包捕获实例而非 context：撤销窗口结束后页面可能已卸载
+    final collectionNotifier = context.read<PlaylistCollectionNotifier>();
 
-      if (result != null) {
-        // 从本地列表中移除已删除的歌曲
-        setState(() {
-          _songs.removeWhere((s) => _selectedSongIds.contains(s.id));
-          _isMultiSelectMode = false;
-          _selectedSongIds.clear();
-          _isDeleting = false;
-          _invalidateDisplaySongs();
-        });
-        // 通知「我的收藏」刷新歌曲数
-        context.read<PlaylistCollectionNotifier>().notifyChanged();
-        if (mounted) {
-          showToast('已删除 $count 首歌曲', long: true);
+    setState(() {
+      // 本地乐观移除（远端删除延后到撤销窗口结束）
+      _songs.removeWhere((s) => _selectedSongIds.contains(s.id));
+      _isMultiSelectMode = false;
+      _selectedSongIds.clear();
+      _invalidateDisplaySongs();
+    });
+
+    void commitDelete() {
+      // 通知「我的收藏」刷新歌曲数
+      collectionNotifier.notifyChanged();
+      // ignore: discarded_futures
+      () async {
+        try {
+          final api = KugouApiClient();
+          final result = await api.deletePlaylistTracks(listid, fileids);
+          if (result == null) {
+            showToast('删除失败，请重试', long: true);
+          }
+        } catch (e) {
+          showToast('删除失败: $e', long: true);
         }
-      } else if (mounted) {
-        setState(() => _isDeleting = false);
-        showToast('删除失败，请重试', long: true);
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isDeleting = false);
-        showToast('删除失败: $e', long: true);
-      }
+      }();
     }
+
+    void restoreSongs() {
+      if (!mounted) return;
+      setState(() {
+        final sorted = [...entries]..sort((a, b) => a.index.compareTo(b.index));
+        for (final e in sorted) {
+          if (_songs.any((s) => s.id == e.song.id)) continue;
+          final idx = e.index.clamp(0, _songs.length);
+          _songs.insert(idx, e.song);
+        }
+        _invalidateDisplaySongs();
+      });
+    }
+
+    _undoRequest.value = M3EUndoRequest(
+      label: '已从歌单移除 $count 首歌曲',
+      onUndo: restoreSongs,
+      onConfirm: commitDelete,
+    );
   }
 
   void _toggleSearch() {
@@ -688,16 +725,21 @@ class _PlaylistPageState extends State<PlaylistPage> {
     debugPrint(
       '[CommentsSheet] commentId=$commentId, commentType=$commentType',
     );
-    showModalBottomSheet(
+    const minChildSize = 0.3;
+    const maxChildSize = 1.0;
+    showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       builder: (context) => KeyboardExpandScrollableSheet(
-        initialChildSize: 0.5,
-        minChildSize: 0.3,
-        // 键盘弹出时也展开到这个高度，否则打字时列表被托盘比例限制成一条缝
-        maxChildSize: 0.95,
-        builder: (context, scrollController) {
+        // Windows 桌面用鼠标时内容区拖不动托盘（Flutter 默认不含鼠标拖拽），
+        // 默认就开到近全屏；顶部标题区仍可用鼠标拖到 1.0 或收回。
+        initialChildSize: commentSheetInitialChildSize(),
+        minChildSize: minChildSize,
+        // 允许拖到最顶部（全屏高度），与歌曲评论托盘同口径；键盘弹出时
+        // 也展开到这里，否则打字时列表被托盘比例限制成一条缝
+        maxChildSize: maxChildSize,
+        builderWithController: (context, scrollController, sheetController) {
           final colorScheme = Theme.of(context).colorScheme;
           return Container(
             decoration: BoxDecoration(
@@ -708,39 +750,50 @@ class _PlaylistPageState extends State<PlaylistPage> {
             ),
             child: Column(
               children: [
-                // 拖动手柄
-                Container(
-                  margin: const EdgeInsets.only(top: AppSpacing.md),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                // 标题栏
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: AppSpacing.lg,
-                    vertical: AppSpacing.md,
-                  ),
-                  child: Row(
+                DraggableSheetHeader(
+                  controller: sheetController,
+                  minChildSize: minChildSize,
+                  maxChildSize: maxChildSize,
+                  child: Column(
                     children: [
-                      Icon(
-                        Icons.comment_outlined,
-                        size: 20,
-                        color: colorScheme.onSurfaceVariant,
+                      // 拖动手柄
+                      Container(
+                        margin: const EdgeInsets.only(top: AppSpacing.md),
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: colorScheme.onSurfaceVariant.withValues(
+                            alpha: 0.4,
+                          ),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
                       ),
-                      const Gap(AppSpacing.sm),
-                      Text(
-                        '评论',
-                        style: Theme.of(context).textTheme.titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w600),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 20),
-                        onPressed: () => Navigator.pop(context),
+                      // 标题栏
+                      Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: AppSpacing.lg,
+                          vertical: AppSpacing.md,
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.comment_outlined,
+                              size: 20,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                            const Gap(AppSpacing.sm),
+                            Text(
+                              '评论',
+                              style: Theme.of(context).textTheme.titleMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                            const Spacer(),
+                            IconButton(
+                              icon: const Icon(Icons.close, size: 20),
+                              onPressed: () => Navigator.pop(context),
+                            ),
+                          ],
+                        ),
                       ),
                     ],
                   ),
@@ -912,9 +965,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
         listCreateListid: listCreateListid,
         globalCollectionId: widget.playlist.id,
       );
-      if (result == null) {
+      // status/error_code 双判定：上游业务失败时也可能回 200 + status:0，
+      // 只看 null 会把失败当成功（红心变红了但云端没收到）。
+      final collected = result != null &&
+          (result['status'] == 1 || result['error_code'] == 0);
+      if (!collected) {
         if (mounted) {
-          showToast('收藏失败，请重试', long: true);
+          final msg = result?['msg']?.toString();
+          showToast(
+            (msg != null && msg.isNotEmpty) ? msg : '收藏失败，请重试',
+            long: true,
+          );
         }
         return;
       }
@@ -931,11 +992,64 @@ class _PlaylistPageState extends State<PlaylistPage> {
         context.read<PlaylistCollectionNotifier>().notifyChanged();
         showToast('收藏成功', long: true);
       }
+      // 把原歌单下的歌曲搬进新收藏的歌单（API 文档的推荐做法：
+      // 「收藏成功后建议使用 /playlist/tracks/add 把原歌单下的歌曲添加到新的歌单」）。
+      // 不做的话新歌单在云端是空的，只有本页内存里看着有歌。
+      _migrateTracksToCollectedPlaylist(api, newId);
     } catch (e) {
       if (mounted) {
         showToast('收藏失败', long: true);
       }
     }
+  }
+
+  /// 收藏成功后把已在内存里的歌曲批量搬进新歌单（后台，不阻塞 UI）。
+  ///
+  /// 分批（[buildTrackAddBatches]）而非一次全量：data 走 URL query，
+  /// 全量提交在大歌单上会被网关按 URI 过长截断。
+  ///
+  /// 用 `_songs`（进页面时已加载的完整歌单）而不是重新拉一遍——本按钮只在
+  /// 歌单详情页出现，此刻歌曲通常已在内存；若确实为空则跳过并留日志，
+  /// 用户仍可手动「添加到歌单」补。
+  void _migrateTracksToCollectedPlaylist(
+    KugouApiClient api,
+    String? newListId,
+  ) {
+    if (newListId == null || newListId.isEmpty) {
+      debugPrint('[CollectPlaylist] 无新歌单 listid，跳过歌曲搬迁');
+      return;
+    }
+    final songs = List<Song>.of(_songs);
+    if (songs.isEmpty) {
+      debugPrint('[CollectPlaylist] 歌曲列表为空，跳过搬迁');
+      return;
+    }
+
+    final batches = buildTrackAddBatches(songs);
+    debugPrint(
+      '[CollectPlaylist] 搬迁 ${songs.length} 首到 listid=$newListId，'
+      '共 ${batches.length} 批',
+    );
+
+    // 顺序提交（不并发）：add_song 对同一 listid 的写是读改写，
+    // 并发会让后一批基于过期 list_ver 覆盖前一批。
+    () async {
+      var okBatches = 0;
+      for (final data in batches) {
+        final r = await api.addPlaylistTracks(newListId, data);
+        final ok =
+            r != null && (r['status'] == 1 || r['error_code'] == 0);
+        if (!ok) {
+          debugPrint('[CollectPlaylist] 批次搬迁失败 result=$r data=$data');
+          break;
+        }
+        okBatches++;
+      }
+      if (okBatches < batches.length) {
+        showToast('收藏成功，但部分歌曲未同步完成', long: true);
+      }
+      debugPrint('[CollectPlaylist] 搬迁完成 $okBatches/${batches.length} 批');
+    }();
   }
 
   Future<void> _uncollectPlaylist() async {
@@ -987,6 +1101,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
         context,
         widget.playlist,
         isInMyFavorites: widget.isInMyFavorites,
+        isAlbum: widget.isAlbum,
+        albumId: widget.albumGlobalCollectionId,
       );
       if (!mounted) return;
       final all = result.songs;
@@ -1043,7 +1159,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     // 「我喜欢」（默认收藏）歌单本身无封面：头部封面套用与收藏页一致的
     // 动态来源——最新收藏歌曲的专辑封面（FavoritesProvider 实时优先，
     // favorites 本地点红心按新增时间倒序，first 即最新），
-    // 回退到已加载歌单的最新收藏封面（云端正序取末），最后才用歌单自带封面。
+    // 回退到按服务端 sort 排序后的歌单封面，最后才用歌单自带封面。
     // 始终优先「最新收藏」，不再因云端返回了非空默认封面而跳过动态解析
     // （见改版计划补充二）。
     String? effectiveArtwork = widget.playlist.artworkUri;
@@ -1054,9 +1170,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
           favs.first.artworkUri!.isNotEmpty) {
         effectiveArtwork = favs.first.artworkUri; // 应用内实时最新收藏（倒序取首）
       } else if (_songs.isNotEmpty) {
-        // 回退：已加载歌单里的最新收藏（云端「我喜欢」歌单接口按收藏时间
-        // **正序**返回——最早在前、最新在最后——故从末尾取带封面的歌）
-        for (final s in _songs.reversed) {
+        // 数组位置不等于歌单顺序；加载器已按服务端 sort 排序。
+        for (final s in _songs) {
           if (s.artworkUri != null && s.artworkUri!.isNotEmpty) {
             effectiveArtwork = s.artworkUri;
             break;
@@ -1086,7 +1201,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
             if (!didPop && _isMultiSelectMode) _exitMultiSelectMode();
           },
           child: Scaffold(
-            body: SecondaryMiniPlayerHost(
+            body: Stack(
+              children: [
+                SecondaryMiniPlayerHost(
               child: Column(
               children: [
                 // 加载失败时显示顶部 banner（不再完全覆盖 UI，
@@ -1438,6 +1555,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
               ],
             ),
               ),
+                // M3E 撤销条（延迟提交型删除的撤销窗口）
+                M3EUndoPillHost(request: _undoRequest),
+              ],
+            ),
           ),
         );
       },
@@ -1459,9 +1580,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     return SliverAppBar(
       expandedHeight: DetailPaneContent.headerHeight(context, 280),
       pinned: true,
-      // 背景图模式：顶栏恒透明——flexibleSpace 是普通 Stack
-      // （非 FlexibleSpaceBar，折叠时不产生视差位移，壁纸层顶部
-      // 固定裁剪），任意滚动位置壁纸都与主体背景对齐、不透 UI；
+      // 背景图模式：顶栏恒透明，透出页面底层的同一张壁纸；
       // 非背景图：折叠后一次性切到 surface（原渐变 lerp 改为阈值切换，
       // 避免 SliverAppBar 每帧重建；跨阈值时由 AnimatedOpacity 过渡）
       backgroundColor: useBackgroundImage
@@ -1512,19 +1631,22 @@ class _PlaylistPageState extends State<PlaylistPage> {
               (value: PlaylistSongSort.playCount, label: '播放次数'),
               (value: PlaylistSongSort.lastPlayed, label: '最近播放'),
             ],
-            onPicked: (value, repeated) {
+            onPicked: (value) {
               setState(() {
-                if (repeated) {
-                  // 再次点当前项 → 翻转升/降序
-                  _sortAscending = !_sortAscending;
-                } else {
-                  _sortBy = value;
-                  _sortAscending = !_descendingByDefault.contains(value);
-                }
+                _sortBy = value;
+                _sortAscending = !_descendingByDefault.contains(value);
                 _invalidateDisplaySongs();
               });
               _saveSortPreference();
               _ensureSortData(_sortBy);
+            },
+            ascending: _sortAscending,
+            onDirectionChanged: (ascending) {
+              setState(() {
+                _sortAscending = ascending;
+                _invalidateDisplaySongs();
+              });
+              _saveSortPreference();
             },
           ),
       ],
@@ -1539,11 +1661,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
           style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
         ),
       ),
-      // 不用 FlexibleSpaceBar：折叠时不产生视差位移，壁纸层
-      // 顶部固定裁剪，滚动中始终与主体背景对齐。
-      // 显式 ClipRect：全屏壁纸层（OverflowBox+RepaintBoundary）
-      // 仅靠 Stack 默认 hardEdge 裁剪可能失效，必须显式裁剪，
-      // 否则壁纸会溢出覆盖下方歌曲列表
+      // 不用 FlexibleSpaceBar：折叠时封面与文字按可用高度缩放。
       flexibleSpace: _buildCachedFlexibleSpace(
         context,
         colorScheme,
@@ -1609,7 +1727,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
             return Stack(
               fit: StackFit.expand,
               children: [
-                if (useBackgroundImage) const WallpaperHeaderBackground(),
                 Container(
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
@@ -1884,36 +2001,27 @@ class _PlaylistPageState extends State<PlaylistPage> {
                   ),
                 ),
               ),
-              if (_isDeleting)
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                  child: M3ELoadingIndicator(
-                    constraints: BoxConstraints.tightFor(width: 20, height: 20),
-                  ),
-                )
-              else ...[
+              IconButton(
+                icon: Icon(allSelected ? Icons.deselect : Icons.select_all),
+                onPressed: _toggleSelectAll,
+                tooltip: allSelected ? '取消全选' : '全选',
+              ),
+              // 可选扩展：私有构建注入的额外操作按钮（默认无）
+              ...?PlaylistPage.extraMultiSelectActions?.call(
+                context,
+                colorScheme,
+                selectedCount,
+                _songs.where((s) => _selectedSongIds.contains(s.id)).toList(),
+              ),
+              if (widget.isUserCreated)
                 IconButton(
-                  icon: Icon(allSelected ? Icons.deselect : Icons.select_all),
-                  onPressed: _toggleSelectAll,
-                  tooltip: allSelected ? '取消全选' : '全选',
-                ),
-                // 可选扩展：私有构建注入的额外操作按钮（默认无）
-                ...?PlaylistPage.extraMultiSelectActions?.call(
-                  context,
-                  colorScheme,
-                  selectedCount,
-                  _songs.where((s) => _selectedSongIds.contains(s.id)).toList(),
-                ),
-                if (widget.isUserCreated)
-                  IconButton(
-                    icon: Icon(
-                      Icons.delete_outline,
-                      color: selectedCount > 0 ? colorScheme.error : null,
-                    ),
-                    onPressed: selectedCount > 0 ? _deleteSelectedSongs : null,
-                    tooltip: '删除',
+                  icon: Icon(
+                    Icons.delete_outline,
+                    color: selectedCount > 0 ? colorScheme.error : null,
                   ),
-              ],
+                  onPressed: selectedCount > 0 ? _deleteSelectedSongs : null,
+                  tooltip: '删除',
+                ),
             ],
           ),
         ),

@@ -11,12 +11,17 @@ class HomeWidgetService {
   /// 更新桌面小组件显示内容。
   ///
   /// 封面由原生侧从 MediaSession 缓存同步，无需 Flutter 传递路径。
+  /// [loopMode] / [shuffleEnabled] / [isFavorited] 只被概念版 4×1 小组件消费
+  /// （旧组件忽略这些字段），默认值即旧行为。
   static Future<void> updateWidget({
     required String title,
     required String artist,
     required bool isPlaying,
     required Duration position,
     required Duration duration,
+    String loopMode = 'off',
+    bool shuffleEnabled = false,
+    bool isFavorited = false,
   }) async {
     try {
       await _channel.invokeMethod('updateWidget', {
@@ -25,6 +30,9 @@ class HomeWidgetService {
         'isPlaying': isPlaying,
         'position': position.inMilliseconds,
         'duration': duration.inMilliseconds,
+        'loopMode': loopMode,
+        'shuffleEnabled': shuffleEnabled,
+        'isFavorited': isFavorited,
       });
     } catch (e) {
       debugPrint('HomeWidgetService.updateWidget error: $e');
@@ -63,6 +71,7 @@ class HomeWidgetService {
   /// widget 按钮把命令写入 App Group 并打开 app，原生回前台时经
   /// invokeMethod("widgetCommand") 转发到此处；[onCommand] 收到
   /// "play_pause" / "next" 等动作后执行对应播放控制。
+  /// （Android 小组件命令走原生广播直控播放器，不经过这里。）
   static void setCommandHandler(Future<void> Function(String action) onCommand) {
     _channel.setMethodCallHandler((call) async {
       if (call.method == 'widgetCommand') {

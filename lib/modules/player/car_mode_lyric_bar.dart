@@ -37,6 +37,8 @@ import '../../data/repositories/song_match_repository.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/apple_lyrics/models/lyric_line.dart';
+import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
+import '../../widgets/apple_lyrics/utils/lyric_credit_filter.dart';
 import '../../widgets/smart_artwork_image.dart';
 import 'full_player_route.dart';
 
@@ -55,7 +57,13 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
   KugouProvider? _kugou;
   PlayerProvider? _player;
 
+  // 显示列表：经「屏蔽歌词作者信息」过滤后的行（[_linesRaw] 的派生值）
   List<LyricLine> _lines = const [];
+  // 未经过滤的完整解析结果：过滤开关/正则变化时即时重派生，无需重新取词
+  List<LyricLine> _linesRaw = const [];
+  // 上次派生时的过滤开关/正则快照（无关偏好通知不重派生）
+  bool _derivedFilterEnabled = false;
+  String _derivedFilterPattern = '';
   int _fetchToken = 0;
   String _loadedLyricKey = '';
 
@@ -65,6 +73,8 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
     _player = context.read<PlayerProvider>();
     _player!.addListener(_onPlayerChanged);
     _kugou = context.read<KugouProvider>();
+    // 设置页改「屏蔽歌词作者信息」时即时重派生显示行（同 AM/MD3 播放页口径）
+    LyricPreferences.instance.addListener(_onFilterPrefsChanged);
     _loadLyricFor(_player!.currentSong);
   }
 
@@ -85,8 +95,25 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
   @override
   void dispose() {
     _player?.removeListener(_onPlayerChanged);
+    LyricPreferences.instance.removeListener(_onFilterPrefsChanged);
     _fetchToken++; // 使在途解析结果作废
     super.dispose();
+  }
+
+  /// 「屏蔽歌词作者信息」开关/正则变化：从 raw 行即时重派生显示行。
+  ///
+  /// 只在过滤相关偏好真正变化时 setState，字号等无关通知直接返回。
+  void _onFilterPrefsChanged() {
+    final filterEnabled = LyricCreditFilter.enabled;
+    final filterPattern = LyricPreferences.instance.creditPattern;
+    if (filterEnabled == _derivedFilterEnabled &&
+        filterPattern == _derivedFilterPattern) {
+      return;
+    }
+    _derivedFilterEnabled = filterEnabled;
+    _derivedFilterPattern = filterPattern;
+    if (!mounted) return;
+    setState(() => _lines = LyricCreditFilter.filterLines(_linesRaw));
   }
 
   void _onPlayerChanged() {
@@ -101,12 +128,22 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
     return '${song.id}|${song.title}|${song.artist}';
   }
 
+  /// 提交解析结果：raw 与过滤后的显示行同源更新，并记录过滤快照。
+  void _commitLines(List<LyricLine> raw) {
+    _linesRaw = raw;
+    _lines = LyricCreditFilter.filterLines(raw);
+    _derivedFilterEnabled = LyricCreditFilter.enabled;
+    _derivedFilterPattern = LyricPreferences.instance.creditPattern;
+  }
+
   Future<void> _loadLyricFor(Song? song) async {
     final token = ++_fetchToken;
     final key = _lyricKeyOf(song);
     _loadedLyricKey = key;
     if (song == null || key.isEmpty) {
-      if (mounted && token == _fetchToken) setState(() => _lines = const []);
+      if (mounted && token == _fetchToken) {
+        setState(() => _commitLines(const []));
+      }
       return;
     }
     try {
@@ -145,7 +182,9 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
         translation = lyric?.translatedContent;
       }
       if (text == null || text.isEmpty) {
-        if (mounted && token == _fetchToken) setState(() => _lines = const []);
+        if (mounted && token == _fetchToken) {
+          setState(() => _commitLines(const []));
+        }
         return;
       }
       final lines = await parseLyricOffMainThread(
@@ -155,9 +194,11 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
       // isolate 解析期间可能已切歌/面板已销毁：迟到结果丢弃
       if (!mounted || token != _fetchToken) return;
       if (_lyricKeyOf(_player?.currentSong) != key) return;
-      setState(() => _lines = lines);
+      setState(() => _commitLines(lines));
     } catch (_) {
-      if (mounted && token == _fetchToken) setState(() => _lines = const []);
+      if (mounted && token == _fetchToken) {
+        setState(() => _commitLines(const []));
+      }
     }
   }
 

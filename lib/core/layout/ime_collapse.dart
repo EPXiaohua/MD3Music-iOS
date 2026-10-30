@@ -33,7 +33,14 @@ class TextInputFocusTracker {
   static void attach() {
     if (_refs++ > 0) return;
     WidgetsBinding.instance.focusManager.addListener(_onChange);
-    _sync();
+    // 首次挂同步也必须延后一帧：attach 的调用点在 _ImeCollapseState.initState，
+    // 即元素挂载（build 阶段）内；_sync → hasFocusedTextInput →
+    // _subtreeHasEditableText 会走 visitChildElements，同步执行会抛
+    // 「visitChildElements() called during build」并把元素树置成半挂载态 ——
+    // 之后整场会话连锁 _dependents.isEmpty / notifyClients 断言与
+    // 「此处内容加载出错」（2026-10-16 TV 版真机日志实锤，三个会话同一起因）。
+    // 与 _onChange 的延后口径一致。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _sync());
   }
 
   static void detach() {
@@ -65,7 +72,10 @@ class TextInputFocusTracker {
 bool hasFocusedTextInput() {
   final FocusNode? node = FocusManager.instance.primaryFocus;
   final BuildContext? context = node?.context;
-  if (node == null || context is! Element) return false;
+  // context.mounted 防护：路由 dispose 帧里 postFrame 回调可能拿到已失活
+  // element，对它探查仍会命中 EditableText，导致 kTextInputFocused 卡在 true、
+  // miniplayer 永久收没。
+  if (node == null || context is! Element || !context.mounted) return false;
   if (node is FocusScopeNode) return false;
   if (context.widget is EditableText) return true;
   if (context.findAncestorWidgetOfExactType<EditableText>() != null) return true;
@@ -161,6 +171,11 @@ class _ImeCollapseState extends State<ImeCollapse>
   /// 动画走完之前就关闭时，`forward` 方向的 status 既不是 completed、value 也没到 0，
   /// 用 status 判会命中"无需动作"的早退分支，而外层 build 之后不会被动画回调再触发
   /// （`AnimatedBuilder` 只重建它自己那层），于是永久卡在收没态、要切页或重启才恢复。
+  ///
+  /// **挂起的反向动画必须取消**：子树被不透明路由盖住时 ticker 静音，
+  /// `forward/reverse` 只会停在起点且 `isAnimating` 挂起（例：设置页搜索框聚焦
+  /// 发出 forward、value 仍为 0）。此时目标翻回 0 的话，若只按 value 早退，
+  /// 挂起的 forward 会在 ticker 恢复（返回首页）那帧续跑到 1，把内容收没。
   void _sync({required bool visible, required bool reduceMotion}) {
     if (!mounted) return;
     final double target = visible ? 1.0 : 0.0;
@@ -169,8 +184,17 @@ class _ImeCollapseState extends State<ImeCollapse>
       _sink.value = target;
       return;
     }
-    if ((_sink.value - target).abs() < 0.001) return;
-    if (reduceMotion) {
+    final bool atTarget = (_sink.value - target).abs() < 0.001;
+    if (_sink.isAnimating) {
+      final bool towardTarget =
+          (_sink.status == AnimationStatus.forward) == (target > 0.5);
+      // 已在朝目标播（含静音期挂起的同向动画）则不干预。
+      if (towardTarget && !atTarget) return;
+      _sink.stop(canceled: true);
+    } else if (atTarget) {
+      return;
+    }
+    if (reduceMotion || atTarget) {
       _sink.value = target;
     } else if (visible) {
       _sink.forward();

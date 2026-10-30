@@ -3,8 +3,10 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -143,6 +145,148 @@ void PromoteDrawnPixels(std::uint32_t* pixels, int width, int height) {
 /// alpha 通道写进 32bpp ARGB 位图（子像素抗锯齿要靠 alpha 合成），
 /// 导致同一行文字出现"彩色描边 + 重影"。改用灰度抗锯齿后 alpha 由调用方
 /// 的 `ForceOpaque` 统一补齐。
+std::vector<std::wstring> WrapTextByChars(HDC dc, const std::wstring& text,
+                                           int max_width) {
+  std::vector<std::wstring> lines(1);
+  int line_width = 0;
+  for (size_t i = 0; i < text.size();) {
+    if (text[i] == L'\r') {
+      i++;
+      continue;
+    }
+    if (text[i] == L'\n') {
+      lines.emplace_back();
+      line_width = 0;
+      i++;
+      continue;
+    }
+    std::wstring glyph(1, text[i++]);
+    if (!glyph.empty() && glyph[0] >= 0xD800 && glyph[0] <= 0xDBFF &&
+        i < text.size() && text[i] >= 0xDC00 && text[i] <= 0xDFFF) {
+      glyph.push_back(text[i++]);
+    }
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, glyph.c_str(), static_cast<int>(glyph.size()),
+                          &extent);
+    const int glyph_width = extent.cx > 0 ? extent.cx : 1;
+    if (!lines.back().empty() && line_width + glyph_width > max_width) {
+      lines.emplace_back();
+      line_width = 0;
+    }
+    lines.back() += glyph;
+    line_width += glyph_width;
+  }
+  return lines;
+}
+
+struct TimedWordPart {
+  std::wstring text;
+  int width = 0;
+  int word_index = 0;
+  int char_offset = 0;
+  int word_offset = 0;
+  int word_width = 0;
+};
+
+using TimedLyricLine = std::vector<TimedWordPart>;
+
+std::vector<TimedLyricLine> LayoutTimedWords(
+    HDC dc, const std::vector<FloatingLyricWord>& words, int max_width) {
+  std::vector<TimedLyricLine> lines(1);
+  int line_width = 0;
+  for (size_t word_index = 0; word_index < words.size(); word_index++) {
+    const std::wstring& text = words[word_index].text;
+    std::vector<TimedWordPart> fragments;
+    TimedWordPart part;
+    part.word_index = static_cast<int>(word_index);
+    int word_char_offset = 0;
+    for (size_t i = 0; i < text.size();) {
+      std::wstring glyph(1, text[i++]);
+      if (glyph[0] >= 0xD800 && glyph[0] <= 0xDBFF && i < text.size() &&
+          text[i] >= 0xDC00 && text[i] <= 0xDFFF) {
+        glyph.push_back(text[i++]);
+      }
+      SIZE extent{};
+      GetTextExtentPoint32W(dc, glyph.c_str(), static_cast<int>(glyph.size()),
+                            &extent);
+      const int glyph_width = extent.cx > 0 ? extent.cx : 1;
+      if (!part.text.empty() && part.width + glyph_width > max_width) {
+        fragments.push_back(std::move(part));
+        part = TimedWordPart{};
+        part.word_index = static_cast<int>(word_index);
+        part.char_offset = word_char_offset;
+      }
+      part.text += glyph;
+      part.width += glyph_width;
+      ++word_char_offset;
+    }
+    if (!part.text.empty()) fragments.push_back(std::move(part));
+    for (auto& fragment : fragments) {
+      SIZE extent{};
+      GetTextExtentPoint32W(dc, fragment.text.c_str(),
+                            static_cast<int>(fragment.text.size()), &extent);
+      fragment.width = extent.cx > 0 ? extent.cx : 1;
+    }
+    int word_width = 0;
+    for (const auto& fragment : fragments) word_width += fragment.width;
+    int word_offset = 0;
+    for (auto& fragment : fragments) {
+      if (line_width > 0 && line_width + fragment.width > max_width) {
+        lines.emplace_back();
+        line_width = 0;
+      }
+      fragment.word_offset = word_offset;
+      fragment.word_width = word_width;
+      word_offset += fragment.width;
+      line_width += fragment.width;
+      lines.back().push_back(std::move(fragment));
+    }
+  }
+  return lines;
+}
+
+/// 给浅色歌词加细暗色描边，避免桌面背景偏白时歌词融入背景。
+void DrawReadableText(HDC dc, const std::wstring& text, RECT rect,
+                      UINT format, COLORREF color) {
+  constexpr int kOutlineOffsets[][2] = {
+      {-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1},
+  };
+  SetTextColor(dc, RGB(18, 18, 18));
+  for (const auto& offset : kOutlineOffsets) {
+    RECT outline_rect{rect.left + offset[0], rect.top + offset[1],
+                      rect.right + offset[0], rect.bottom + offset[1]};
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &outline_rect,
+              format);
+  }
+  SetTextColor(dc, color);
+  DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &rect, format);
+}
+
+void DrawReadableTextLifted(HDC dc, const std::wstring& text, RECT rect,
+                            UINT format, COLORREF color, double lift_px) {
+  if (lift_px <= 0.001) {
+    DrawReadableText(dc, text, rect, format, color);
+    return;
+  }
+  const int saved = SaveDC(dc);
+  if (SetGraphicsMode(dc, GM_ADVANCED) != 0) {
+    XFORM transform{1.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                    static_cast<FLOAT>(-lift_px)};
+    if (SetWorldTransform(dc, &transform)) {
+      DrawReadableText(dc, text, rect, format, color);
+    } else {
+      rect.top -= static_cast<int>(std::lround(lift_px));
+      rect.bottom -= static_cast<int>(std::lround(lift_px));
+      DrawReadableText(dc, text, rect, format, color);
+    }
+  } else {
+    rect.top -= static_cast<int>(std::lround(lift_px));
+    rect.bottom -= static_cast<int>(std::lround(lift_px));
+    DrawReadableText(dc, text, rect, format, color);
+  }
+  RestoreDC(dc, saved);
+}
+
 void DrawGradientText(HDC dc, const std::wstring& text, RECT rect,
                       std::uint32_t start_color, std::uint32_t end_color,
                       int font_height) {
@@ -154,32 +298,235 @@ void DrawGradientText(HDC dc, const std::wstring& text, RECT rect,
                            DEFAULT_PITCH, L"Microsoft YaHei UI");
   HGDIOBJ old_font = SelectObject(dc, font);
 
-  SIZE extent{};
-  GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()),
-                        &extent);
-  const int total = extent.cx > 0 ? extent.cx : 1;
-
-  int pen_x = rect.left;
-  for (size_t i = 0; i < text.size(); i++) {
-    const wchar_t ch = text[i];
-    SIZE ch_extent{};
-    GetTextExtentPoint32W(dc, &ch, 1, &ch_extent);
-    const int ch_width = ch_extent.cx;
-    if (ch_width <= 0) continue;
-    // 字符中心点在整串宽度里的归一化位置 → 渐变插值
-    const double t =
-        ClampDouble((pen_x + ch_width / 2.0 - rect.left) / total, 0.0, 1.0);
-    SetTextColor(dc, LerpArgb(start_color, end_color, t));
-    RECT ch_rect{pen_x, rect.top, pen_x + ch_width + 1, rect.bottom};
-    DrawTextW(dc, &ch, 1, &ch_rect,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    pen_x += ch_width;
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  const int line_height = metrics.tmHeight + metrics.tmExternalLeading;
+  const auto lines = WrapTextByChars(dc, text, rect.right - rect.left);
+  const int total_height = line_height * static_cast<int>(lines.size());
+  int y = rect.top + ((rect.bottom - rect.top) - total_height) / 2;
+  for (const auto& line : lines) {
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, line.c_str(), static_cast<int>(line.size()),
+                          &extent);
+    const int total = extent.cx > 0 ? extent.cx : 1;
+    int x = rect.left + ((rect.right - rect.left) - total) / 2;
+    for (size_t i = 0; i < line.size();) {
+      std::wstring glyph(1, line[i++]);
+      if (glyph[0] >= 0xD800 && glyph[0] <= 0xDBFF && i < line.size() &&
+          line[i] >= 0xDC00 && line[i] <= 0xDFFF) {
+        glyph.push_back(line[i++]);
+      }
+      SIZE glyph_extent{};
+      GetTextExtentPoint32W(dc, glyph.c_str(), static_cast<int>(glyph.size()),
+                            &glyph_extent);
+      const int glyph_width = glyph_extent.cx > 0 ? glyph_extent.cx : 1;
+      const double t = ClampDouble((x + glyph_width / 2.0 - rect.left) / total,
+                                   0.0, 1.0);
+      RECT glyph_rect{x, y, x + glyph_width + 1, y + line_height};
+      DrawReadableText(dc, glyph, glyph_rect,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                       LerpArgb(start_color, end_color, t));
+      x += glyph_width;
+    }
+    y += line_height;
   }
 
   SelectObject(dc, old_font);
   DeleteObject(font);
 }
 
+int WrappedTextLineCount(HDC dc, const std::wstring& text, int max_width) {
+  return static_cast<int>(WrapTextByChars(dc, text, max_width).size());
+}
+
+int TimedTextLineCount(HDC dc, const std::vector<FloatingLyricWord>& words,
+                       int max_width) {
+  return static_cast<int>(LayoutTimedWords(dc, words, max_width).size());
+}
+
+void DrawWrappedText(HDC dc, const std::wstring& text, RECT rect,
+                     std::uint32_t color, int font_height) {
+  if (text.empty()) return;
+  SetBkMode(dc, TRANSPARENT);
+  HFONT font = CreateFontW(font_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+                           FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                           DEFAULT_PITCH, L"Microsoft YaHei UI");
+  HGDIOBJ old_font = SelectObject(dc, font);
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  const int line_height = metrics.tmHeight + metrics.tmExternalLeading;
+  const auto lines = WrapTextByChars(dc, text, rect.right - rect.left);
+  const int total_height = line_height * static_cast<int>(lines.size());
+  int y = rect.top + ((rect.bottom - rect.top) - total_height) / 2;
+  SetTextColor(dc, RGB((color >> 16) & 0xff, (color >> 8) & 0xff,
+                       color & 0xff));
+  for (const auto& line : lines) {
+    RECT line_rect{rect.left, y, rect.right, y + line_height};
+    DrawReadableText(dc, line, line_rect,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                     RGB((color >> 16) & 0xff, (color >> 8) & 0xff,
+                         color & 0xff));
+    y += line_height;
+  }
+  SelectObject(dc, old_font);
+  DeleteObject(font);
+}
+
+double CubicBezierProgress(double t, double p1, double p2) {
+  const double inverse = 1.0 - t;
+  return 3.0 * inverse * inverse * t * p1 +
+         3.0 * inverse * t * t * p2 + t * t * t;
+}
+
+int CountTimedGlyphs(const std::wstring& text) {
+  int count = 0;
+  for (size_t i = 0; i < text.size(); ++count) {
+    if (text[i] >= 0xD800 && text[i] <= 0xDBFF && i + 1 < text.size() &&
+        text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF) {
+      i += 2;
+    } else {
+      ++i;
+    }
+  }
+  return count;
+}
+
+double AmGlyphLiftPx(const FloatingLyricWord& word, int position_ms,
+                     int char_index, int char_count, int font_px,
+                     bool is_last_word) {
+  if (word.duration_ms <= 0 || char_count <= 0) return 0;
+  const double duration = static_cast<double>(std::max(1000, word.duration_ms));
+  const double char_delay = duration / 2.5 / char_count * char_index;
+  const double word_de = word.start_ms + char_delay;
+  const double bump_phase = (position_ms - word_de) / duration;
+  const double float_phase =
+      (position_ms - (word_de - 400.0)) / (duration * 1.4);
+  const bool bump_active = bump_phase >= 0.0 && bump_phase <= 1.0;
+  const bool float_active = float_phase >= 0.0 && float_phase <= 1.0;
+
+  double edge_fade = 0.0;
+  if (bump_active) {
+    if (bump_phase < 0.15) {
+      edge_fade = bump_phase / 0.15;
+    } else if (bump_phase > 0.85) {
+      edge_fade = (1.0 - bump_phase) / 0.15;
+    } else {
+      edge_fade = 1.0;
+    }
+  }
+  const double float_em = float_active
+      ? std::sin(3.14159265358979323846 * float_phase) * 0.075 * edge_fade
+      : 0.0;
+
+  double bump = 0.0;
+  if (bump_active) {
+    if (bump_phase < 0.5) {
+      bump = CubicBezierProgress(bump_phase * 2.0, 0.2, 0.4);
+    } else {
+      bump = 1.0 - CubicBezierProgress((bump_phase - 0.5) * 2.0, 0.3, 0.0);
+    }
+  }
+  double amount = std::min(1.2, std::sqrt(word.duration_ms / 2000.0) * 0.6);
+  if (is_last_word) amount *= 1.6;
+  // AM 的 0.05em 浮层提高到 0.075em，并保留其 0.025em 凸起。
+  return (float_em + bump * amount * 0.025) * font_px;
+}
+
+void DrawTimedWords(HDC dc, const std::wstring& full_text,
+                    const std::vector<FloatingLyricWord>& words,
+                    int position_ms, RECT rect, std::uint32_t unplayed_color,
+                    std::uint32_t gradient_start, std::uint32_t gradient_end,
+                    int font_height) {
+  if (words.empty()) {
+    DrawGradientText(dc, full_text, rect, gradient_start, gradient_end,
+                     font_height);
+    return;
+  }
+  std::wstring joined;
+  for (const auto& word : words) joined += word.text;
+  if (joined != full_text) {
+    DrawWrappedText(dc, full_text, rect, unplayed_color, font_height);
+    return;
+  }
+
+  SetBkMode(dc, TRANSPARENT);
+  HFONT font = CreateFontW(font_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+                           FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                           DEFAULT_PITCH, L"Microsoft YaHei UI");
+  HGDIOBJ old_font = SelectObject(dc, font);
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  const int line_height = metrics.tmHeight + metrics.tmExternalLeading;
+  const int font_px = std::abs(font_height);
+  const int max_width = rect.right - rect.left;
+  const auto lines = LayoutTimedWords(dc, words, max_width);
+  const int total_height = line_height * static_cast<int>(lines.size());
+  int y = rect.top + ((rect.bottom - rect.top) - total_height) / 2;
+  for (const auto& line : lines) {
+    int line_width = 0;
+    for (const auto& part : line) line_width += part.width;
+    int x = rect.left + (max_width - line_width) / 2;
+    for (const auto& part : line) {
+      const auto& word = words[part.word_index];
+      double progress = 0.0;
+      if (word.duration_ms <= 0) {
+        progress = position_ms >= word.start_ms ? 1.0 : 0.0;
+      } else if (position_ms >= word.start_ms + word.duration_ms) {
+        progress = 1.0;
+      } else if (position_ms > word.start_ms) {
+        progress = static_cast<double>(position_ms - word.start_ms) /
+                   word.duration_ms;
+      }
+      const int char_count = CountTimedGlyphs(word.text);
+      const int part_x = x;
+      double glyph_word_offset = part.word_offset;
+      int char_index = part.char_offset;
+      for (size_t i = 0; i < part.text.size();) {
+        std::wstring glyph(1, part.text[i++]);
+        if (glyph[0] >= 0xD800 && glyph[0] <= 0xDBFF && i < part.text.size() &&
+            part.text[i] >= 0xDC00 && part.text[i] <= 0xDFFF) {
+          glyph.push_back(part.text[i++]);
+        }
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, glyph.c_str(), static_cast<int>(glyph.size()),
+                              &extent);
+        const int glyph_width = extent.cx > 0 ? extent.cx : 1;
+        const double glyph_progress = ClampDouble(
+            progress * part.word_width - glyph_word_offset, 0.0, glyph_width);
+        const double reveal = glyph_progress / glyph_width;
+        const double gradient_t = ClampDouble(
+            (x + glyph_width / 2.0 - rect.left) / max_width, 0.0, 1.0);
+        const COLORREF played = LerpArgb(gradient_start, gradient_end, gradient_t);
+        const COLORREF unplayed = RGB((unplayed_color >> 16) & 0xff,
+                                      (unplayed_color >> 8) & 0xff,
+                                      unplayed_color & 0xff);
+        const auto mix = [reveal](int from, int to) {
+          return static_cast<int>(from + (to - from) * reveal + 0.5);
+        };
+        const double lift = AmGlyphLiftPx(
+            word, position_ms, char_index, char_count, font_px,
+            part.word_index == static_cast<int>(words.size()) - 1);
+        RECT glyph_rect{x, y, x + glyph_width + 2, y + line_height};
+        DrawReadableTextLifted(
+            dc, glyph, glyph_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            RGB(mix(GetRValue(unplayed), GetRValue(played)),
+                mix(GetGValue(unplayed), GetGValue(played)),
+                mix(GetBValue(unplayed), GetBValue(played))),
+            lift);
+        glyph_word_offset += glyph_width;
+        ++char_index;
+        x += glyph_width;
+      }
+      x = part_x + part.width;
+    }
+    y += line_height;
+  }
+  SelectObject(dc, old_font);
+  DeleteObject(font);
+}
 }  // namespace
 
 FloatingLyricWindow::~FloatingLyricWindow() { Stop(); }
@@ -222,6 +569,7 @@ bool FloatingLyricWindow::Start(HWND owner, const std::wstring& lyric,
         L"MD3Music 桌面歌词", WS_POPUP, 0, 0, 800, 96, nullptr, nullptr,
         GetModuleHandleW(nullptr), this);
     if (!window_) return false;
+    SetTimer(window_, 1, 16, nullptr);
     ApplyInteractionStyle();
     // 跟踪鼠标离开，才能清掉悬停高亮
     TRACKMOUSEEVENT track{};
@@ -238,6 +586,7 @@ bool FloatingLyricWindow::Start(HWND owner, const std::wstring& lyric,
 
 void FloatingLyricWindow::Stop() {
   if (window_) {
+    KillTimer(window_, 1);
     DestroyWindow(window_);
     window_ = nullptr;
   }
@@ -247,15 +596,51 @@ void FloatingLyricWindow::Stop() {
   positioned_ = false;
 }
 
-void FloatingLyricWindow::UpdateLyric(const std::wstring& lyric,
-                                      const std::wstring& next) {
+void FloatingLyricWindow::UpdateLyric(
+    const std::wstring& lyric, const std::wstring& next,
+    const std::vector<FloatingLyricWord>& words, int position_ms) {
   lyric_ = lyric;
   next_ = next;
+  words_ = words;
+  position_ms_ = position_ms;
+  position_tick_ = GetTickCount64();
+  Position(window_);
+  Invalidate();
+}
+
+void FloatingLyricWindow::UpdateProgress(int position_ms) {
+  const ULONGLONG now = GetTickCount64();
+  if (playing_) {
+    const int estimated = position_ms_ + static_cast<int>(now - position_tick_);
+    // 播放时滤掉常见的小幅音频时钟抖动，避免已高亮的字瞬间退回；
+    // 明显跳变（用户 seek / 切段）仍立即校准。
+    const int correction = position_ms - estimated;
+    if (correction < 0 && correction >= -750) {
+      position_ms_ = estimated;
+    } else if (correction >= 0 && correction <= 120) {
+      position_ms_ = estimated;
+    } else {
+      position_ms_ = position_ms;
+    }
+  } else {
+    position_ms_ = position_ms;
+  }
+  position_tick_ = now;
+  Invalidate();
+}
+
+void FloatingLyricWindow::UpdatePlaying(bool playing) {
+  if (playing_ && !playing) {
+    position_ms_ += static_cast<int>(GetTickCount64() - position_tick_);
+  }
+  position_tick_ = GetTickCount64();
+  playing_ = playing;
   Invalidate();
 }
 
 void FloatingLyricWindow::UpdateTitle(const std::wstring& title) {
   title_ = title;
+  Position(window_);
   Invalidate();
 }
 
@@ -266,12 +651,14 @@ void FloatingLyricWindow::SetConfig(double font_size, double display_scale,
                                     std::uint32_t unplayed_color,
                                     int color_mode, std::uint32_t custom_start,
                                     std::uint32_t custom_end,
-                                    std::uint32_t custom_unplayed) {
-  font_size_ = ClampDouble(font_size, 12.0, 32.0);
+                                    std::uint32_t custom_unplayed,
+                                    bool allow_horizontal_move) {
+  font_size_ = ClampDouble(font_size, 10.0, 100.0);
   display_scale_ = ClampDouble(display_scale, 0.85, 1.6);
   double_line_ = double_line;
   opacity_ = ClampInt(opacity, 0, 100);
   locked_ = locked;
+  allow_horizontal_move_ = allow_horizontal_move;
   gradient_start_ = gradient_start;
   gradient_end_ = gradient_end;
   unplayed_color_ = unplayed_color;
@@ -319,19 +706,62 @@ void FloatingLyricWindow::Position(HWND owner) {
   }
   const RECT& work = monitor_info.rcWork;
   const int work_width = static_cast<int>(work.right - work.left);
-  int width = work_width * 9 / 10;
-  if (width > 860) width = 860;
-  if (width > 0 && width < 320) width = 320;
+  const int work_height = static_cast<int>(work.bottom - work.top);
+  int width = work_width - 40;
+  if (width > 0 && width < 320) width = work_width;
 
   // 字号（正数语义）。GDI 的 CreateFontW 要负高度表示字符高度，
   // 但布局计算全程用正值——早期版本在这里直接用负的 font_height 做加法，
   // 导致高度算反（双行反而更矮），面板区也会跟着错位。
   const int font_px = ClampInt(
-      static_cast<int>(font_size_ * display_scale_ + 0.5), 12, 64);
-  // 单行区：字号 + 上下留白；双行区：两行 + 额外间距
-  int height = font_px + 30;
-  if (double_line_) height += static_cast<int>(font_px * 0.9) + 10;
+      static_cast<int>(font_size_ * display_scale_ + 0.5), 10, 160);
+  int current_lines = 1;
+  int next_lines = double_line_ ? 1 : 0;
+  HDC measure_dc = GetDC(window_);
+  HFONT measure_font = CreateFontW(-font_px, 0, 0, 0, FW_SEMIBOLD, FALSE,
+                                   FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   ANTIALIASED_QUALITY, DEFAULT_PITCH,
+                                   L"Microsoft YaHei UI");
+  if (measure_dc && measure_font) {
+    HGDIOBJ old_font = SelectObject(measure_dc, measure_font);
+    const int text_width = width - 40;
+    const std::wstring& shown = lyric_.empty() ? title_ : lyric_;
+    std::wstring joined_words;
+    for (const auto& word : words_) joined_words += word.text;
+    current_lines = !words_.empty() && joined_words == shown
+                        ? TimedTextLineCount(measure_dc, words_, text_width)
+                        : WrappedTextLineCount(measure_dc, shown, text_width);
+    if (double_line_ && !next_.empty()) {
+      next_lines = WrappedTextLineCount(measure_dc, next_, text_width);
+    }
+    SelectObject(measure_dc, old_font);
+  }
+  if (measure_font) DeleteObject(measure_font);
+  if (measure_dc) ReleaseDC(window_, measure_dc);
+  if (current_lines < 1) current_lines = 1;
+  if (next_lines < 1 && double_line_) next_lines = 1;
+  TEXTMETRICW metrics{};
+  HDC line_dc = GetDC(window_);
+  HFONT line_font = CreateFontW(-font_px, 0, 0, 0, FW_SEMIBOLD, FALSE,
+                                FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                ANTIALIASED_QUALITY, DEFAULT_PITCH,
+                                L"Microsoft YaHei UI");
+  if (line_dc && line_font) {
+    HGDIOBJ old_font = SelectObject(line_dc, line_font);
+    GetTextMetricsW(line_dc, &metrics);
+    SelectObject(line_dc, old_font);
+  }
+  if (line_font) DeleteObject(line_font);
+  if (line_dc) ReleaseDC(window_, line_dc);
+  const int line_height = metrics.tmHeight > 0
+                              ? metrics.tmHeight + metrics.tmExternalLeading
+                              : font_px + 8;
+  int height = 24 + current_lines * line_height;
+  if (double_line_) height += 8 + next_lines * line_height;
   if (panel_expanded_) height += kPanelHeight;
+  if (height > work_height) height = work_height;
 
   // **位置归用户所有**：Position() 会被 Start / SetConfig / 面板展开频繁调用
   // （歌词每更新一次就可能走一遍 SetConfig），若无条件重算 x/y，
@@ -340,7 +770,7 @@ void FloatingLyricWindow::Position(HWND owner) {
   // 且优先恢复上次拖动后持久化的位置。
   if (!positioned_) {
     positioned_ = true;
-    if (!RestorePosition(work, width, height)) {
+    if (!RestorePosition(width, height)) {
       const int x = work.left + (work_width - width) / 2;
       const int y = work.bottom - height - 24;
       SetWindowPos(window_, HWND_TOPMOST, x, y, width, height,
@@ -348,10 +778,13 @@ void FloatingLyricWindow::Position(HWND owner) {
     }
   } else {
     // 之后只更新尺寸，保留用户设定的位置（SWP_NOMOVE）。
-    // 高度会随字号/单双行/面板展开变化，必须同步给窗口，
+    // 尺寸会随字号/歌词换行/单双行/面板展开变化，必须同步给窗口，
     // 否则 UpdateLayeredWindow 会按旧尺寸提交，画面被裁。
-    SetWindowPos(window_, HWND_TOPMOST, 0, 0, width, height,
-                 SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RECT current_rect{};
+    GetWindowRect(window_, &current_rect);
+    SetWindowPos(window_, HWND_TOPMOST, current_rect.left, current_rect.top,
+                 width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
   }
   LayoutButtons();
 }
@@ -685,44 +1118,48 @@ void FloatingLyricWindow::Paint() {
   // 与 Position() 用同一套字号换算，避免两处算出不同高度导致文字被裁。
   // 传给 GDI 的 CreateFontW / DrawGradientText 时取负值（字符高度语义）。
   const int font_px = ClampInt(
-      static_cast<int>(font_size_ * display_scale_ + 0.5), 12, 64);
+      static_cast<int>(font_size_ * display_scale_ + 0.5), 10, 160);
   const int font_height = -font_px;
 
-  // 当前行：歌词优先，无歌词时退回歌名
+  // 当前行：歌词优先，无歌词时退回歌名；超宽时按字换行而非裁切。
   const std::wstring& shown = lyric_.empty() ? title_ : lyric_;
-  RECT current = lyric_area;
-  current.left += 20;
-  current.right -= 20;
-  if (double_line_) {
-    current.top = 6;
-    current.bottom = lyric_area.bottom / 2 + 6;
-  } else {
-    current.top = 0;
-    current.bottom = lyric_area.bottom;
-  }
-  DrawGradientText(mem, shown, current, gradient_start_, gradient_end_,
-                   font_height);
+  HFONT layout_font = CreateFontW(font_height, 0, 0, 0, FW_SEMIBOLD, FALSE,
+                                  FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  ANTIALIASED_QUALITY, DEFAULT_PITCH,
+                                  L"Microsoft YaHei UI");
+  HGDIOBJ old_layout_font = SelectObject(mem, layout_font);
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(mem, &metrics);
+  const int line_height = metrics.tmHeight + metrics.tmExternalLeading;
+  const int text_width = lyric_area.right - lyric_area.left - 40;
+  std::wstring joined_words;
+  for (const auto& word : words_) joined_words += word.text;
+  const int current_lines = !words_.empty() && joined_words == shown
+                                ? TimedTextLineCount(mem, words_, text_width)
+                                : WrappedTextLineCount(mem, shown, text_width);
+  const int next_lines = double_line_ && !next_.empty()
+                             ? WrappedTextLineCount(mem, next_, text_width)
+                             : (double_line_ ? 1 : 0);
+  SelectObject(mem, old_layout_font);
+  DeleteObject(layout_font);
 
-  // 下一行：未唱色（双行模式）
+  RECT current{lyric_area.left + 20, lyric_area.top + 12,
+               lyric_area.right - 20,
+               lyric_area.top + 12 + current_lines * line_height};
+  const int position = position_ms_ +
+                       (playing_ ? static_cast<int>(GetTickCount64() -
+                                                    position_tick_)
+                                 : 0);
+  DrawTimedWords(mem, shown, words_, position, current, unplayed_color_,
+                 gradient_start_, gradient_end_, font_height);
+
+  // 下一行：使用真实换行，不再以省略号吞掉歌词尾部。
   if (double_line_ && !next_.empty()) {
-    RECT next = lyric_area;
-    next.left += 20;
-    next.right -= 20;
-    next.top = lyric_area.bottom / 2 + 4;
-    next.bottom = lyric_area.bottom - 6;
-    SetTextColor(mem, RGB((unplayed_color_ >> 16) & 0xff,
-                          (unplayed_color_ >> 8) & 0xff,
-                          unplayed_color_ & 0xff));
-    HFONT font = CreateFontW(font_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
-                             FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                             DEFAULT_PITCH, L"Microsoft YaHei UI");
-    HGDIOBJ old_font = SelectObject(mem, font);
-    DrawTextW(mem, next_.c_str(), -1, &next,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
-                  DT_NOPREFIX);
-    SelectObject(mem, old_font);
-    DeleteObject(font);
+    RECT next{lyric_area.left + 20, current.bottom + 8,
+              lyric_area.right - 20,
+              current.bottom + 8 + next_lines * line_height};
+    DrawWrappedText(mem, next_, next, unplayed_color_, font_height);
   }
 
   if (panel_expanded_) PaintPanel(mem, rect);
@@ -773,12 +1210,11 @@ void FloatingLyricWindow::BeginDrag(HWND window) {
   GetWindowRect(window, &window_rect);
   drag_offset_.x = cursor.x - window_rect.left;
   drag_offset_.y = cursor.y - window_rect.top;
+  drag_origin_x_ = window_rect.left;
   dragging_ = true;
-  // 刻意**不**调 SetCapture：捕获会把后续 WM_LBUTTONUP 重定向并可能额外触发
-  // 一次 UP，使 dragging_ 在真正要判定"点击还是拖动"的那一次之前就被清掉，
-  // 表现为"点击歌词区没反应"。用 WM_MOUSEMOVE 的 wparam & MK_LBUTTON
-  // 判断按键是否仍按下即可。
-  (void)window;
+  // 捕获鼠标直到左键抬起，避免指针移出窗口后收不到 WM_LBUTTONUP，
+  // 导致拖动状态残留、下次移动又把歌词窗带走。
+  SetCapture(window);
 }
 
 void FloatingLyricWindow::OnPanelClick(int x, int y) {
@@ -796,7 +1232,8 @@ void FloatingLyricWindow::OnPanelClick(int x, int y) {
   }
   // 字号 −
   if (HitTestButton(x, y, kBtnFontMinus)) {
-    const int next_font = ClampInt(static_cast<int>(font_size_) - 1, 12, 32);
+    const int current = static_cast<int>(font_size_);
+    const int next_font = ClampInt(((current + 9) / 10 - 1) * 10, 10, 100);
     if (next_font != static_cast<int>(font_size_)) {
       font_size_ = next_font;
       Emit("fontSize", next_font);
@@ -807,7 +1244,8 @@ void FloatingLyricWindow::OnPanelClick(int x, int y) {
   }
   // 字号 +
   if (HitTestButton(x, y, kBtnFontPlus)) {
-    const int next_font = ClampInt(static_cast<int>(font_size_) + 1, 12, 32);
+    const int current = static_cast<int>(font_size_);
+    const int next_font = ClampInt((current / 10 + 1) * 10, 10, 100);
     if (next_font != static_cast<int>(font_size_)) {
       font_size_ = next_font;
       Emit("fontSize", next_font);
@@ -867,10 +1305,9 @@ const wchar_t* ActivePositionKey(const wchar_t* overridden) {
 /// 从注册表读取上次拖动后的窗口位置。
 ///
 /// 找不到 / 值非法时返回 false，调用方回退到默认「底部居中」。
-/// 读到后还要校验是否**仍在当前显示器可见范围内** —— 用户上次可能把窗口
-/// 拖到了已拔掉的副屏上，直接恢复会让它消失得无影无踪。
-bool FloatingLyricWindow::RestorePosition(const RECT& work, int width,
-                                           int height) {
+/// 读到后只校验是否仍与任一显示器相交，允许自由跨屏摆放；若上次所在
+/// 显示器已拔掉且位置完全不可见，则回退到默认底部居中。
+bool FloatingLyricWindow::RestorePosition(int width, int height) {
   HKEY key = nullptr;
   if (RegOpenKeyExW(HKEY_CURRENT_USER, ActivePositionKey(position_key_), 0,
                     KEY_QUERY_VALUE,
@@ -897,16 +1334,14 @@ bool FloatingLyricWindow::RestorePosition(const RECT& work, int width,
   RegCloseKey(key);
   if (!ok) return false;
 
-  // 至少要有一半落在工作区内，否则视为无效位置（拖到屏幕外/换显示器了）
-  const int work_w = work.right - work.left;
-  const int work_h = work.bottom - work.top;
-  const int visible_w = width < work_w / 2 ? width : work_w / 2;
-  const int visible_h = height < work_h / 2 ? height : work_h / 2;
-  const bool x_visible = x + width > work.left + visible_w &&
-                         x < work.right - visible_w;
-  const bool y_visible = y + height > work.top + visible_h &&
-                         y < work.bottom - visible_h;
-  if (!x_visible || !y_visible) return false;
+  // 允许窗口跨屏并部分移出工作区；只有完全不与任何显示器相交时，
+  // 才视为失效位置，避免显示器配置变化后悬浮窗彻底不可找回。
+  RECT saved_rect{static_cast<LONG>(x), static_cast<LONG>(y),
+                  static_cast<LONG>(x + width),
+                  static_cast<LONG>(y + height)};
+  if (MonitorFromRect(&saved_rect, MONITOR_DEFAULTTONULL) == nullptr) {
+    return false;
+  }
 
   SetWindowPos(window_, HWND_TOPMOST, static_cast<int>(x), static_cast<int>(y),
                width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -952,6 +1387,10 @@ LRESULT CALLBACK FloatingLyricWindow::WndProc(HWND window, UINT message,
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (message == WM_PAINT && self) {
     self->Paint();
+    return 0;
+  }
+  if (message == WM_TIMER && self) {
+    if (self->playing_ && !self->words_.empty()) self->Invalidate();
     return 0;
   }
   if (!self) return DefWindowProcW(window, message, wparam, lparam);
@@ -1011,14 +1450,26 @@ LRESULT CALLBACK FloatingLyricWindow::WndProc(HWND window, UINT message,
           self->OnPanelDrag(mouse_x, mouse_y, true);
           return 0;
         }
+        if ((wparam & MK_LBUTTON) == 0) {
+          // 防御系统在异常输入路径下漏发 WM_LBUTTONUP；不可继续跟随光标。
+          self->dragging_ = false;
+          self->pressed_button_ = -1;
+          self->OnPanelDrag(mouse_x, mouse_y, false);
+          self->PersistPosition();
+          if (GetCapture() == window) ReleaseCapture();
+          self->Invalidate();
+          return 0;
+        }
         POINT cursor{};
         GetCursorPos(&cursor);
-        SetWindowPos(window, HWND_TOPMOST, cursor.x - self->drag_offset_.x,
+        const int next_x = self->allow_horizontal_move_
+                               ? cursor.x - self->drag_offset_.x
+                               : self->drag_origin_x_;
+        // 保持现有置顶层级，移动分层窗口时复用当前位图；松手后再重绘，
+        // 避免每个鼠标采样点都排入一次额外 Paint。
+        SetWindowPos(window, nullptr, next_x,
                      cursor.y - self->drag_offset_.y, 0, 0,
-                     SWP_NOSIZE | SWP_NOACTIVATE);
-        // **分层窗口必须显式重绘**：`WS_EX_LAYERED` 的窗口不会因移动
-        // 自动重画，不补这一刀就是「窗口跟过去了但画面停在原处」。
-        self->Invalidate();
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
         return 0;
       }
       // 悬停高亮
@@ -1052,6 +1503,7 @@ LRESULT CALLBACK FloatingLyricWindow::WndProc(HWND window, UINT message,
         self->OnPanelDrag(mouse_x, mouse_y, false);
         self->dragging_ = false;
         self->pressed_button_ = -1;
+        if (GetCapture() == window) ReleaseCapture();
         if (was_lyric_area) {
           // 点击（未产生位移）→ 展开/收起设置面板
           self->panel_expanded_ = !self->panel_expanded_;
@@ -1060,10 +1512,32 @@ LRESULT CALLBACK FloatingLyricWindow::WndProc(HWND window, UINT message,
           return 0;
         }
         self->PersistPosition();
+        self->Invalidate();
         return 0;
       }
       break;
     }
+    case WM_CAPTURECHANGED:
+      if (self->dragging_) {
+        // 外部窗口抢走捕获时也结束拖动，并保存最后一个有效位置。
+        self->dragging_ = false;
+        self->pressed_button_ = -1;
+        self->OnPanelDrag(mouse_x, mouse_y, false);
+        self->PersistPosition();
+        self->Invalidate();
+      }
+      break;
+    case WM_CANCELMODE:
+      if (self->dragging_) {
+        self->dragging_ = false;
+        self->pressed_button_ = -1;
+        self->OnPanelDrag(mouse_x, mouse_y, false);
+        self->PersistPosition();
+        if (GetCapture() == window) ReleaseCapture();
+        self->Invalidate();
+        return 0;
+      }
+      break;
     case WM_MOUSELEAVE:
       if (self->hover_button_) {
         self->hover_button_ = false;

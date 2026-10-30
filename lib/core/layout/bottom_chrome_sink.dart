@@ -30,6 +30,26 @@ class PlayerPanelSignal {
   static double anchorTop = 0.0;
   static double anchorBottom = 0.0;
 
+  /// 面板锚点的**横向范围**（左缘 / 宽度，逻辑像素，屏幕坐标）。
+  ///
+  /// **为什么需要它**：常驻条是通栏的（left = 0、width = 屏宽），而二级悬浮胶囊
+  /// 是左右各 16dp 内缩的悬浮块（Pad 下还限宽 400 并靠右停靠）。面板起点若恒按
+  /// 全宽铺，胶囊点开那一帧面板就比真身宽出一整圈 —— 用户看到的会是「一个比方块
+  /// 更宽的窗口凭空出现」，而不是「胶囊自己在长」。
+  ///
+  /// 约定：`width <= 0` 表示**未登记 / 通栏**，消费端回退到整屏宽（= 常驻条口径，
+  /// 与引入这两个字段之前逐像素一致）。[publishAnchor] 每次都会写这两个字段，
+  /// 所以胶囊留下的窄矩形不会泄漏给下一次常驻条拖拽。
+  static double anchorLeft = 0.0;
+  static double anchorWidth = 0.0;
+
+  /// 面板锚点的**外轮廓圆角**（逻辑像素）。
+  ///
+  /// 常驻条是方角（0），悬浮胶囊 / 圆盘是 32（= 直径/2；圆盘态退化为正圆）。
+  /// 展开动画里它逐帧插值到「屏幕 r 角」，正是「悬浮条外轮廓 → 覆盖全屏」
+  /// 这段形变的起点。
+  static double anchorRadius = 0.0;
+
   /// 锚点未登记时的迷你条兜底高度（dp）。
   ///
   /// **取值来源**：桌面外壳 `NowPlayingBar` 的固定高（`_kHeight = 72.0`，
@@ -41,10 +61,23 @@ class PlayerPanelSignal {
   /// [resolveBottomChromeSinkOffset]）。
   static const double fallbackBarHeight = 72.0;
 
-  /// 登记锚点（顶端 + 底端，成对写）。
-  static void publishAnchor({required double top, required double bottom}) {
+  /// 登记锚点（顶端 + 底端 + 横向范围 + 外轮廓圆角，**成组写**）。
+  ///
+  /// [left] / [width] / [radius] 的默认值就是常驻条口径（通栏、方角），因此既有的
+  /// 两参调用点无需改动；但**必须每次全写**（不能用 `??` 保留旧值）——否则悬浮
+  /// 胶囊登记的窄矩形/32 圆角会泄漏给下一次常驻条拖拽，面板起点凭空变窄变圆。
+  static void publishAnchor({
+    required double top,
+    required double bottom,
+    double left = 0.0,
+    double width = 0.0,
+    double radius = 0.0,
+  }) {
     anchorTop = top;
     anchorBottom = bottom;
+    anchorLeft = left;
+    anchorWidth = width;
+    anchorRadius = radius;
   }
 }
 

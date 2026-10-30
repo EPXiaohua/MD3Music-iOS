@@ -1,7 +1,7 @@
 // 设置页 Pad 双列容器（列表-详情）。
 //
 // 左列固定宽 AppLayout.twoPaneMasterWidth，承载分类/搜索列表；右列弹性伸展，
-// 内容约束到 AppLayout.twoPaneDetailMaxWidth 居中，避免宽屏拉伸 ListTile。
+// 右侧内容按局部宽度自适应，窄面板保留原可读宽度。
 // 中间 1dp outlineVariant 分隔线，与 ResponsiveScaffold 侧栏分隔一致。
 //
 // 纯布局容器：master/detail 由 SettingsPage 提供（复用其全部状态与构建方法），
@@ -9,6 +9,7 @@
 import 'package:material_ui/material_ui.dart';
 
 import '../../core/theme/app_dimens.dart';
+import '../../core/layout/page_layout.dart';
 
 class SettingsTwoPaneBody extends StatelessWidget {
   const SettingsTwoPaneBody({
@@ -36,10 +37,8 @@ class SettingsTwoPaneBody extends StatelessWidget {
         VerticalDivider(thickness: 1, width: 1, color: dividerColor),
         Expanded(
           child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(
-                maxWidth: AppLayout.twoPaneDetailMaxWidth,
-              ),
+            child: ContentWidth(
+              maxWidth: AppLayout.twoPaneDetailMaxWidth,
               child: detail,
             ),
           ),

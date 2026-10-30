@@ -88,6 +88,10 @@ void main() {
   }
 
   testWidgets('加号随播放栏占位上移，菜单过滤默认关闭且可切换', (tester) async {
+    // 竖屏保留 FAB；横屏扫描入口已移到右上角工具栏。
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     final library = LibraryProvider();
     addTearDown(library.dispose);
     var reserved = 0.0;
@@ -116,7 +120,7 @@ void main() {
     await tester.pumpAndSettle();
     final raised = tester.getCenter(find.byIcon(Icons.add)).dy;
     expect(original - raised, greaterThanOrEqualTo(76));
-    expect(tester.getRect(find.byIcon(Icons.add)).bottom, lessThan(600 - 76));
+    expect(tester.getRect(find.byIcon(Icons.add)).bottom, lessThan(800 - 76));
     await tester.tap(find.byIcon(Icons.add));
     await tester.pumpAndSettle();
     expect(
@@ -203,6 +207,9 @@ void main() {
   });
 
   testWidgets('非 TV：扫描 FAB 整树禁聚焦，M3E 内核焦点环不随键盘遍历出现', (tester) async {
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     final library = LibraryProvider();
     addTearDown(library.dispose);
     await tester.pumpWidget(

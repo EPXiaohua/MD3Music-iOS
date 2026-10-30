@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
@@ -7,6 +9,7 @@ import '../../core/danmaku/danmaku_buckets.dart';
 import '../../core/danmaku/danmaku_clock.dart';
 import '../../core/danmaku/danmaku_entry.dart';
 import '../../core/danmaku/danmaku_render_mapping.dart';
+import 'scroll_danmaku_layer.dart' show kDanmakuRandomPalette;
 
 /// MV 弹幕渲染层（PiliPlus `PlDanmaku` 模式）：
 /// 把 [entries] 按 [controller] 的播放位置弹到视频上方。
@@ -27,6 +30,17 @@ class MvDanmakuLayer extends StatefulWidget {
   /// 弹幕总透明度（0.1-1.0），经 [AnimatedOpacity] 生效，不触碰渲染缓存。
   final double opacity;
 
+  /// v54：速度倍率（0.5~2.0，1.0=默认 10s 飞行时长；倍率越大 duration 越短
+  /// 越快）。变更会重建渲染缓存（设置页低频操作，可接受）。
+  final double speedScale;
+
+  /// v54：全局颜色覆盖（null=跟随弹幕池 entry.color）。
+  final Color? overrideColor;
+
+  /// v54：随机颜色——每条从 [kDanmakuRandomPalette] 随机取色（优先于
+  /// [overrideColor]，与歌曲弹幕同调色板同口径）。
+  final bool randomColor;
+
   /// 渲染器就绪 / 重建时回调，供页面直接投递「自己刚发送」的弹幕。
   /// **build 期间回调：只允许赋值，禁止 setState / addDanmaku。**
   final ValueChanged<DanmakuController<String>>? onControllerCreated;
@@ -37,6 +51,9 @@ class MvDanmakuLayer extends StatefulWidget {
     required this.entries,
     required this.enabled,
     this.opacity = 1.0,
+    this.speedScale = 1.0,
+    this.overrideColor,
+    this.randomColor = false,
     this.onControllerCreated,
   });
 
@@ -47,13 +64,25 @@ class MvDanmakuLayer extends StatefulWidget {
 class _MvDanmakuLayerState extends State<MvDanmakuLayer>
     with SingleTickerProviderStateMixin {
   /// 显示区域/描边在 V1 内固定。`DanmakuOption` 每次变动都会销毁渲染缓存并重建，
-  /// 必须用 const 实例，避免父级 setState 反复触发缓存重建。
-  static const DanmakuOption _option = DanmakuOption(
-    area: 0.75,
-    safeArea: true,
-    // MV 无字幕轨，保留底部安全区仅用于避开 Chewie 控件栏
-    strokeWidth: 1.5,
-  );
+  /// v54 起速度经 [DanmakuOption.duration] 表达：按 [MvDanmakuLayer.speedScale]
+  /// 构建一次并缓存，只在倍率变化时重建（设置页低频，可接受）。
+  static DanmakuOption _optionFor(double scale) => DanmakuOption(
+        area: 0.75,
+        safeArea: true,
+        // MV 无字幕轨，保留底部安全区仅用于避开 Chewie 控件栏
+        strokeWidth: 1.5,
+        duration: (10 / scale).clamp(2.5, 20.0),
+      );
+
+  late DanmakuOption _option = _optionFor(widget.speedScale);
+
+  /// v54：随机取色器（randomColor 模式，与歌曲弹幕同调色板）。
+  final Random _random = Random();
+
+  /// v54：本条弹幕的最终覆盖色（null=跟随弹幕池）。
+  Color? _colorFor(DanmakuEntry entry) => widget.randomColor
+      ? kDanmakuRandomPalette[_random.nextInt(kDanmakuRandomPalette.length)]
+      : widget.overrideColor;
 
   late final Ticker _ticker;
   DanmakuController<String>? _renderController;
@@ -83,6 +112,9 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
   @override
   void didUpdateWidget(covariant MvDanmakuLayer oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.speedScale != widget.speedScale) {
+      _option = _optionFor(widget.speedScale);
+    }
     if (!identical(oldWidget.entries, widget.entries)) {
       _rebuildTimeline();
     }
@@ -179,7 +211,8 @@ class _MvDanmakuLayerState extends State<MvDanmakuLayer>
     // 渲染器可能在本层开始播放之后才创建（build 期间回调），此处幂等自愈
     if (!controller.isRunning()) controller.resume();
     for (final entry in result.due) {
-      controller.addDanmaku(toContentItem(entry));
+      controller.addDanmaku(toContentItem(entry,
+          overrideColor: _colorFor(entry)));
     }
   }
 

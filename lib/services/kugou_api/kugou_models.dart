@@ -332,6 +332,13 @@ class KugouPlaylistBrief {
   final int type; // 0=自己创建, 1=收藏/订阅他人
   final int source; // 0=普通歌单, 2=收藏的专辑等
   final String? description;
+  /// 是否隐私歌单（`is_pri`）。编辑保存时需原样回传（v4 modify_list），
+  /// 否则会把隐私歌单擅自改成公开。
+  final bool isPri;
+  /// 歌单在列表里的排序位（`sort`）。编辑保存时原样回传，避免被 sort=0 置顶。
+  final int sort;
+  /// 歌单总版本号（`/user/playlist` 的 `total_ver`）：写接口的乐观锁。
+  final int totalVer;
 
   const KugouPlaylistBrief({
     required this.id,
@@ -347,6 +354,9 @@ class KugouPlaylistBrief {
     this.type = 0,
     this.source = 0,
     this.description,
+    this.isPri = false,
+    this.sort = 0,
+    this.totalVer = 0,
   });
 
   factory KugouPlaylistBrief.fromJson(Map<String, dynamic> json) {
@@ -388,6 +398,9 @@ class KugouPlaylistBrief {
       description: _strNull(
         json['intro'] ?? json['description'] ?? json['desc'],
       ),
+      isPri: _parseInt(json['is_pri'] ?? 0) == 1,
+      sort: _parseInt(json['sort'] ?? 0),
+      totalVer: _parseInt(json['total_ver'] ?? json['list_ver'] ?? 0),
     );
   }
 
@@ -403,6 +416,9 @@ class KugouPlaylistBrief {
       listCreateListid: listCreateListid,
       listCreateGid: listCreateGid,
       subscribedListId: listId, // 用户订阅版本的 listid，用于拉取歌曲
+      totalVer: totalVer,
+      isPri: isPri,
+      sort: sort,
     );
   }
 }
@@ -427,6 +443,8 @@ class KugouSongDetail {
   final String? albumAudioId2;
   final String? songId;
   final int? fileId;
+  /// 歌曲在云端歌单里的顺序位，不是歌曲本身的元数据。
+  final int? playlistSort;
   /// 私人 FM 反馈令牌（上游 rec_song_info.cur_mark）：红心/垃圾桶/播放完成等
   /// action 回报时必须原样带回，缺了服务端就无法定位这条推荐。
   final String? curMark;
@@ -451,6 +469,7 @@ class KugouSongDetail {
     this.albumAudioId2,
     this.songId,
     this.fileId,
+    this.playlistSort,
     this.curMark,
   });
 
@@ -480,6 +499,7 @@ class KugouSongDetail {
       albumAudioId2: albumAudioId2,
       songId: songId,
       fileId: fileId,
+      playlistSort: playlistSort,
       curMark: curMark ?? this.curMark,
     );
   }
@@ -762,6 +782,7 @@ class KugouSongDetail {
         json2['songid'] ?? json2['song_id'] ?? json2['SongId'] ?? json2['SongID'],
       ),
       fileId: _parseInt(json2['fileid'] ?? json2['file_id']),
+      playlistSort: _parseIntOrNull(json2['sort']),
       curMark: curMark,
     );
   }
@@ -802,6 +823,7 @@ class KugouSongDetail {
       artworkUri: artworkUri,
       albumAudioId: albumAudioId,
       fileId: fileId,
+      playlistSort: playlistSort,
     );
   }
 }
@@ -1766,7 +1788,10 @@ class KugouPlaylistSongs {
   final List<KugouSongDetail> songs;
   final int total;
 
-  const KugouPlaylistSongs({this.songs = const [], this.total = 0});
+  const KugouPlaylistSongs({
+    this.songs = const [],
+    this.total = 0,
+  });
 
   factory KugouPlaylistSongs.fromJson(Map<String, dynamic> json) {
     final data = json['data'] as Map<String, dynamic>? ?? json;
@@ -1943,8 +1968,218 @@ class KugouQrCheck {
   }
 }
 
+/// 微信扫码登录会话（`/login/wx/create` 的输出）。
+///
+/// 上游响应根级为 `{errcode, uuid, appname, qrcode:{qrcodebase64, qrcodeurl}}`，
+/// 图片是 **JPEG**（不是 PNG），故前端用 `Image.memory` 按字节嗅探格式，
+/// 不要假定 PNG 或拼 `data:image/png`。
+class KugouWxQrSession {
+  final String uuid;
+
+  /// `qrcode.qrcodebase64`（不含 data: 前缀）。
+  final String? imageBase64;
+
+  /// `qrcode.qrcodeurl`（后端补的 `https://open.weixin.qq.com/connect/confirm?uuid=`）。
+  final String? imageUrl;
+
+  const KugouWxQrSession({
+    required this.uuid,
+    this.imageBase64,
+    this.imageUrl,
+  });
+
+  /// 解析失败（无 uuid）时返回 null。
+  static KugouWxQrSession? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final uuid = _strNull(json['uuid']);
+    if (uuid == null || uuid.isEmpty) return null;
+    final qr = json['qrcode'];
+    String? base64;
+    String? url;
+    if (qr is Map) {
+      base64 = _strNull(qr['qrcodebase64']);
+      url = _strNull(qr['qrcodeurl']);
+    }
+    return KugouWxQrSession(uuid: uuid, imageBase64: base64, imageUrl: url);
+  }
+
+  bool get hasImage =>
+      (imageBase64 != null && imageBase64!.isNotEmpty) ||
+      (imageUrl != null && imageUrl!.isNotEmpty);
+}
+
+/// QQ 扫码登录会话（`/login/qq/qr/create` 的输出）。
+///
+/// 上游是**根级扁平**结构（不是 `{data:{...}}` 嵌套），check 时必须把
+/// [toQuery] 的 6 个字段原样回传，否则上游回 `ptuiCB('7')` 参数错误。
+class KugouQqQrSession {
+  /// 二维码图片 base64（**JPEG**，ptqrshow 返回的就是 JPEG）。
+  final String imageBase64;
+  final String qrsig;
+  final int ptqrtoken;
+  final String ptLoginSig;
+  final String ptOpenloginData;
+  final String xloginUrl;
+  final String cookie;
+
+  const KugouQqQrSession({
+    required this.imageBase64,
+    required this.qrsig,
+    required this.ptqrtoken,
+    required this.ptLoginSig,
+    required this.ptOpenloginData,
+    required this.xloginUrl,
+    required this.cookie,
+  });
+
+  /// 会话字段缺失（任一必需项为空）时返回 null。
+  static KugouQqQrSession? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final image = _strNull(json['qrcode']);
+    final qrsig = _strNull(json['qrsig']);
+    final token = _parseIntOrNull(json['ptqrtoken']);
+    final loginSig = _strNull(json['pt_login_sig']);
+    final openlogin = _strNull(json['pt_openlogin_data']);
+    final xlogin = _strNull(json['xlogin_url']);
+    final cookie = _strNull(json['cookie']);
+    if (image == null ||
+        image.isEmpty ||
+        qrsig == null ||
+        qrsig.isEmpty ||
+        token == null ||
+        loginSig == null ||
+        loginSig.isEmpty ||
+        openlogin == null ||
+        openlogin.isEmpty ||
+        xlogin == null ||
+        xlogin.isEmpty ||
+        cookie == null ||
+        cookie.isEmpty) {
+      return null;
+    }
+    return KugouQqQrSession(
+      imageBase64: image,
+      qrsig: qrsig,
+      ptqrtoken: token,
+      ptLoginSig: loginSig,
+      ptOpenloginData: openlogin,
+      xloginUrl: xlogin,
+      cookie: cookie,
+    );
+  }
+
+  /// check 接口的 query（不含图片）。
+  ///
+  /// `pt_openlogin_data` 在这里**原样**下发：Rust 侧 `build_qq_poll_url` 直接拼接，
+  /// 不会再编码一次；Dio 的 query 序列化会把它还原成单次编码态，正好与上游一致。
+  Map<String, dynamic> toQuery() => {
+    'qrsig': qrsig,
+    'ptqrtoken': ptqrtoken,
+    'pt_login_sig': ptLoginSig,
+    'pt_openlogin_data': ptOpenloginData,
+    'xlogin_url': xloginUrl,
+    'cookie': cookie,
+  };
+}
+
+/// 微信扫码轮询状态。
+enum WxScanKind {
+  /// 等待扫码（上游 408）
+  waiting,
+
+  /// 已扫码，待手机确认（上游 404）
+  scanned,
+
+  /// 二维码过期（上游 402）
+  expired,
+
+  /// 用户在手机上拒绝（上游 403）
+  rejected,
+
+  /// 登录成功（上游 405 且已换到酷狗 token）
+  success,
+
+  /// 其它错误（网络 / 上游返回异常）
+  error,
+}
+
+class WxScanResult {
+  final WxScanKind kind;
+
+  /// 登录成功时的酷狗凭证。
+  final String? token;
+  final String? userid;
+  final String? vipToken;
+
+  /// 失败原因 / 状态文案。
+  final String? message;
+
+  const WxScanResult(
+    this.kind, {
+    this.token,
+    this.userid,
+    this.vipToken,
+    this.message,
+  });
+
+  bool get isSuccess => kind == WxScanKind.success;
+  bool get isTerminal =>
+      kind == WxScanKind.success ||
+      kind == WxScanKind.expired ||
+      kind == WxScanKind.rejected ||
+      kind == WxScanKind.error;
+}
+
+/// QQ 扫码轮询状态。
+enum QqScanKind {
+  /// 等待扫码（ptuiCB '66'）
+  waiting,
+
+  /// 已扫码，待确认（ptuiCB '67'）
+  scanned,
+
+  /// 二维码失效（ptuiCB '65'）
+  expired,
+
+  /// 上游风控拦截 / 链路不可用（HTTP 403、空响应、传输失败）。
+  /// **不是**登录失败，UI 应提示改用其它方式并停止轮询。
+  blocked,
+
+  /// 登录成功（ptuiCB '0' 且已换到酷狗 token）
+  success,
+
+  /// 其它错误
+  error,
+}
+
+class QqScanResult {
+  final QqScanKind kind;
+
+  /// 登录成功时的酷狗凭证。
+  final String? token;
+  final String? userid;
+  final String? vipToken;
+
+  /// 失败原因 / 状态文案。
+  final String? message;
+
+  const QqScanResult(
+    this.kind, {
+    this.token,
+    this.userid,
+    this.vipToken,
+    this.message,
+  });
+
+  bool get isSuccess => kind == QqScanKind.success;
+  bool get isTerminal =>
+      kind == QqScanKind.success ||
+      kind == QqScanKind.expired ||
+      kind == QqScanKind.blocked ||
+      kind == QqScanKind.error;
+}
+
 class KugouQuality {
-  KugouQuality._();
 
   static const String standard = '128';
   static const String high = '320';
@@ -2777,17 +3012,63 @@ class KugouThemeInfo {
   }
 }
 
+/// 曲谱条目（/sheet/song、/sheet/explore、/sheet/rank 共用）。
+///
+/// 键名按 2026-10-24 实测（tmp/sheet_song_68435136.txt）：上游 opern 服务返回
+/// `opern_id/opern_name/opern_level/instruments/jump_url` 等，保留旧键兜底防改版。
+/// 谱面渲染不在客户端解析（musicxml/pulu 加密文件），统一跳 [jumpUrl]
+/// （酷狗官方 H5 渲染页，匿名可访问）。
 class KugouSheetInfo {
   final String id;
   final String name;
   final String? coverUrl;
   final int songCount;
 
+  /// 曲谱 id（酷狗 H5 渲染页 opernid 参数），如 `68435136_7_335924`。
+  final String opernId;
+
+  /// 所属歌曲名（外层歌曲壳的 song_name；展开内层谱目时注入）。
+  final String? songName;
+
+  /// 所属歌手（外层歌曲壳的 singer_name；展开内层谱目时注入）。
+  final String? singerName;
+
+  /// 谱面渲染页地址（jump_url），null=上游未提供。
+  final String? jumpUrl;
+
+  /// 曲谱类型：1 吉他 / 2 尤克里里 / 3 钢琴 / 4 简谱。
+  final int instruments;
+
+  /// 难度等级（随类型语义不同，见接口文档）。
+  final int opernLevel;
+
+  /// 谱面类型名（如「AI弹唱谱」「弹唱谱」）。
+  final String? opernTypeName;
+
+  /// 谱面记法名（如「六线谱/和弦谱」「和弦谱」）。
+  final String? opernDrawTypeName;
+
+  /// 原曲调性（如 D / Eb）。
+  final String? originalTune;
+
+  /// 谱作者。
+  final String? opernAuthor;
+
   const KugouSheetInfo({
     required this.id,
     required this.name,
     this.coverUrl,
     this.songCount = 0,
+    this.opernId = '',
+    this.songName,
+    this.singerName,
+    this.jumpUrl,
+    this.instruments = 0,
+    this.opernLevel = 0,
+    this.opernTypeName,
+    this.opernDrawTypeName,
+    this.originalTune,
+    this.opernAuthor,
   });
 
   factory KugouSheetInfo.fromJson(Map<String, dynamic> json) {
@@ -2797,9 +3078,40 @@ class KugouSheetInfo {
         json['name'] ?? json['sheet_name'] ?? json['specialname'] ?? '',
       ),
       coverUrl: _resolveArtworkUri(
-        json['img'] ?? json['imgurl'] ?? json['cover'],
+        json['img'] ??
+            json['imgurl'] ??
+            json['cover'] ??
+            // 外层歌曲壳（/sheet/explore、/sheet/rank）的封面键
+            json['song_cover'],
       ),
       songCount: _parseInt(json['songcount'] ?? json['song_count'] ?? 0),
+      opernId: _str(json['opern_id'] ?? ''),
+      songName: _strNull(json['song_name']),
+      singerName: _strNull(json['singer_name']),
+      jumpUrl: _strNull(json['jump_url']),
+      instruments: _parseInt(json['instruments'] ?? 0),
+      opernLevel: _parseInt(json['opern_level'] ?? 0),
+      opernTypeName: _strNull(
+        json['opern_type_name'] ?? json['opern_name'],
+      ),
+      opernDrawTypeName: _strNull(json['opern_draw_type_name']),
+      originalTune: _strNull(json['original_tune']),
+      opernAuthor: _strNull(json['opern_author']),
+    );
+  }
+}
+
+/// 曲谱标签（/sheet/tags，2026-10-24 实测：`tagid/tagname`）。
+class KugouSheetTag {
+  final String id;
+  final String name;
+
+  const KugouSheetTag({required this.id, required this.name});
+
+  factory KugouSheetTag.fromJson(Map<String, dynamic> json) {
+    return KugouSheetTag(
+      id: _str(json['tagid'] ?? json['id'] ?? ''),
+      name: _str(json['tagname'] ?? json['name'] ?? ''),
     );
   }
 }

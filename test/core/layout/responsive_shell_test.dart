@@ -1,3 +1,4 @@
+import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/layout/adaptive_navigator.dart';
@@ -12,6 +13,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:md3music/widgets/resizable_splitter.dart';
 
 void main() {
+  // 双栏开关三端通用后，宽屏双栏/分隔条用例需显式开启（全局初值 false）。
+  setUp(() {
+    kWindowsTwoPaneEnabled.value = true;
+  });
+  tearDown(() => kWindowsTwoPaneEnabled.value = false);
+
   testWidgets('窄双栏分隔条触及上限后能立即回拖', (tester) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = const Size(1000, 800);
@@ -452,7 +459,7 @@ void main() {
     );
     expect(
       tester.getSize(find.byKey(const Key('content'))).width,
-      AppLayout.maxContentWidth,
+      1280 * 0.85,
     );
     tester.view.physicalSize = const Size(400, 800);
     await tester.pump();
@@ -595,6 +602,46 @@ void main() {
     await tester.pumpAndSettle();
     expect(state.mounted, isFalse);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('focusActiveTabContent 把焦点交还当前 tab 内容区', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final shellKey = GlobalKey<ResponsiveShellState>();
+    await tester.pumpWidget(
+      ChangeNotifierProvider(
+        create: (_) => ThemeProvider(),
+        child: MaterialApp(
+          home: ResponsiveShell(
+            key: shellKey,
+            visibleTabs: const [
+              TabItem(id: 'a', label: 'A'),
+              TabItem(id: 'b', label: 'B'),
+            ],
+            selectedIndex: 0,
+            pageBuilder: (id) => Center(
+              child: DpadFocusable(
+                key: Key('content-$id'),
+                child: const SizedBox(height: 48, width: 200),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(shellKey.currentState!.focusActiveTabContent(), isTrue);
+    await tester.pumpAndSettle();
+    expect(
+      FocusManager.instance.primaryFocus,
+      isNotNull,
+      reason: '焦点应落在 tab a 的内容项上',
+    );
+    expect(
+      FocusManager.instance.primaryFocus!.context,
+      isNotNull,
+      reason: '焦点节点挂在树上',
+    );
   });
 }
 

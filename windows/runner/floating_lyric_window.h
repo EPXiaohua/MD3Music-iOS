@@ -6,6 +6,9 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+struct FloatingLyricWord { std::wstring text; int start_ms; int duration_ms; };
 
 // Windows 桌面歌词：独立置顶工具窗口，不依赖 Android 悬浮窗服务。
 //
@@ -45,7 +48,10 @@ class FloatingLyricWindow {
   bool Start(HWND owner, const std::wstring& lyric, const std::wstring& title);
 
   void Stop();
-  void UpdateLyric(const std::wstring& lyric, const std::wstring& next);
+  void UpdateLyric(const std::wstring& lyric, const std::wstring& next,
+                   const std::vector<FloatingLyricWord>& words, int position_ms);
+  void UpdateProgress(int position_ms);
+  void UpdatePlaying(bool playing);
   void UpdateTitle(const std::wstring& title);
 
   /// 下发完整配置。参数与 Dart 侧 `setDesktopLyricConfig` 的字段一一对应。
@@ -53,7 +59,8 @@ class FloatingLyricWindow {
                  int opacity, bool locked, std::uint32_t gradient_start,
                  std::uint32_t gradient_end, std::uint32_t unplayed_color,
                  int color_mode, std::uint32_t custom_start,
-                 std::uint32_t custom_end, std::uint32_t custom_unplayed);
+                 std::uint32_t custom_end, std::uint32_t custom_unplayed,
+                 bool allow_horizontal_move = true);
 
   void SetConfigCallback(ConfigCallback callback, void* user_data);
 
@@ -110,20 +117,25 @@ class FloatingLyricWindow {
   void PersistPosition();
   /// 从注册表恢复上次拖动后的位置（带可见性校验）。
   /// 返回 false 表示无可用记录或记录已失效，调用方应回退到默认位置。
-  bool RestorePosition(const RECT& work, int width, int height);
+  bool RestorePosition(int width, int height);
 
   HWND window_ = nullptr;
   std::wstring lyric_;
   std::wstring next_;
   std::wstring title_;
+  std::vector<FloatingLyricWord> words_;
+  int position_ms_ = 0;
+  ULONGLONG position_tick_ = 0;
+  bool playing_ = false;
 
   // ---- 配置（与 Dart 侧字段一一对应） ----
-  double font_size_ = 18.0;
+  double font_size_ = 40.0;
   double display_scale_ = 1.0;
   bool double_line_ = true;
   /// 背板不透明度 0~100。0 = 完全透出壁纸，100 = 纯黑。
   int opacity_ = 50;
   bool locked_ = false;
+  bool allow_horizontal_move_ = true;
   std::uint32_t gradient_start_ = 0xFF00E5FF;
   std::uint32_t gradient_end_ = 0xFFFF00FF;
   std::uint32_t unplayed_color_ = 0xFFFFFFFF;
@@ -143,6 +155,7 @@ class FloatingLyricWindow {
   bool hover_button_ = false;
   int pressed_button_ = -1;
   POINT drag_offset_{0, 0};
+  int drag_origin_x_ = 0;
   /// 拖动滑杆时的临时值，松手才落盘。
   int dragging_opacity_ = -1;
   /// 按下时的位置；与松手位置比对判定"点击"还是"拖动窗口"。

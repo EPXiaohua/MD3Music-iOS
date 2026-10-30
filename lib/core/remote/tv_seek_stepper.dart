@@ -33,6 +33,7 @@ class TvSeekStepper {
     required this.onAbort,
     this.stepSeconds = defaultStepSeconds,
     this.commitDelay = defaultCommitDelay,
+    this.escalation,
   });
 
   /// 默认单次步进（秒）：遥控调进度条的常规手感。
@@ -59,6 +60,13 @@ class TvSeekStepper {
   /// 静默多久后落定（连按期间不断顺延）。
   final Duration commitDelay;
 
+  /// 连按升级的步长序列（秒）。null = 恒用 [stepSeconds]（旧行为，默认）。
+  ///
+  /// 语义：会话内第 1 次有效步进取 `escalation[0]`，之后每按一次前进一档、
+  /// 到末档保持；**静默超过 [commitDelay] 落定或新会话开始时回到第 0 档**。
+  /// 这样「单击 = 精调 5s」「连按 = 粗调 30s」，按住连发不会被 5s 拖慢。
+  final List<int>? escalation;
+
   /// 会话是否进行中（已步进、尚未落定或放弃）。
   bool _open = false;
 
@@ -67,6 +75,12 @@ class TvSeekStepper {
   /// 必须是**会话内累加**的基准而不是每次都从 `currentMs` 起算：拖动期间控件
   /// 上报的展示位置不随按键变化，用它当基准会让连按 N 次只偏移一步的量。
   int _targetMs = 0;
+
+  /// 连按升级的当前档位下标（仅在配置了 [escalation] 时有意义）。
+  ///
+  /// 每次有效步进后自增；[flush] / [cancel] / [dispose] 收摊时复位到 0，
+  /// 于是「落定或新会话」都从最低档重新开始（见 [escalation] 的语义说明）。
+  int _tier = 0;
 
   Timer? _debounce;
 
@@ -87,9 +101,18 @@ class TvSeekStepper {
     // 时长未知：不消费、不进会话，按键交回遍历。
     if (durationMs <= 0) return false;
 
+    // 本次步进秒数：配置了 escalation（且非空）时按档位取，否则恒用 stepSeconds。
+    final int seconds;
+    if (escalation == null || escalation!.isEmpty) {
+      seconds = stepSeconds;
+    } else {
+      final int tier = _open ? _tier.clamp(0, escalation!.length - 1) : 0;
+      seconds = escalation![tier];
+      // 本次用当前档，下一击进档；到末位保持。
+      _tier = tier + 1;
+    }
     final int stepMs =
-        (direction == TraversalDirection.right ? stepSeconds : -stepSeconds) *
-        1000;
+        (direction == TraversalDirection.right ? seconds : -seconds) * 1000;
     // 会话内用上次的目标连加（连按不重复偏移），新会话才以当前展示位置为基准。
     final int base = _open ? _targetMs : currentMs;
     // 夹取用 math.max/min：int.clamp 的静态类型是 num，赋回 int 还要额外转换。
@@ -111,6 +134,7 @@ class TvSeekStepper {
   void flush() {
     _debounce?.cancel();
     _debounce = null;
+    _tier = 0;
     if (!_open) return;
     _open = false;
     onCommit();
@@ -120,6 +144,7 @@ class TvSeekStepper {
   void cancel() {
     _debounce?.cancel();
     _debounce = null;
+    _tier = 0;
     if (!_open) return;
     _open = false;
     onAbort();
@@ -130,5 +155,6 @@ class TvSeekStepper {
     _debounce?.cancel();
     _debounce = null;
     _open = false;
+    _tier = 0;
   }
 }

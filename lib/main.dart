@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'package:flutter/services.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:quick_actions/quick_actions.dart';
@@ -14,6 +15,8 @@ import 'core/layout/responsive_layout.dart';
 import 'core/utils/app_haptics.dart';
 import 'core/services/desktop_lyric_service.dart';
 import 'core/services/diagnostic_logger.dart';
+import 'core/services/windows_default_font.dart';
+import 'core/services/windows_app_lifecycle.dart' as windows_lifecycle;
 import 'modules/recognition/floating_recognition_service.dart';
 import 'core/services/equalizer_service.dart';
 import 'core/services/viper_master_service.dart';
@@ -49,6 +52,12 @@ String? pendingShortcutType;
 /// _MainLayout 在 initState 中监听此 notifier，收到非 null 值后处理并清空。
 final ValueNotifier<String?> shortcutTabRequest = ValueNotifier<String?>(null);
 
+const MethodChannel _windowsTrayChannel = MethodChannel('md3music/window_tray');
+bool _windowsExitInProgress = false;
+
+Future<void> finishWindowsAppExit() =>
+    windows_lifecycle.finishWindowsAppExit();
+
 Future<void> main() async {
   // Zone 级兜底：任何未被 try/catch 与错误钩子接住的异步错误都记入诊断日志
   runZonedGuarded(_main, (error, stack) {
@@ -61,6 +70,7 @@ Future<void> _main() async {
     needsOnboarding,
     needsUserAgreement,
     initialUseBackgroundImage,
+    initialThemeMode,
   ) = await runBootstrap();
 
   runApp(
@@ -68,6 +78,7 @@ Future<void> _main() async {
       showOnboarding: needsOnboarding,
       showUserAgreement: needsUserAgreement,
       initialUseBackgroundImage: initialUseBackgroundImage,
+      initialThemeMode: initialThemeMode,
     ),
   );
 
@@ -88,8 +99,24 @@ Future<void> _main() async {
 /// 返回 onboarding / 用户协议状态，以及首帧使用的背景图开关值。
 /// 公开入口（main）与私有入口（lib/private/main_private）复用同一流程，
 /// 私有入口在此基础上安装扩展钩子后 runApp。
-Future<(bool, bool, bool)> runBootstrap() async {
+/// 返回 (是否首次引导, 是否需用户协议, 背景图开关, 主题模式播种值)。
+/// 主题模式为 null 时表示从未持久化，由 ThemeProvider 保持初值 ThemeMode.system。
+Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final windowsFontFuture = WindowsDefaultFont.load();
+  if (Platform.isWindows) {
+    _windowsTrayChannel.setMethodCallHandler((call) async {
+      if (call.method != 'requestQuit' || _windowsExitInProgress) return;
+      _windowsExitInProgress = true;
+      try {
+        await KugouApiServer.stop();
+      } catch (error, stack) {
+        DiagnosticLogger.instance.e('退出时停止本地服务失败: $error\n$stack');
+      } finally {
+        await finishWindowsAppExit();
+      }
+    });
+  }
   final startupClock = Stopwatch()..start();
   void markStartup(String phase) {
     final elapsedMs = startupClock.elapsedMilliseconds;
@@ -157,6 +184,9 @@ Future<(bool, bool, bool)> runBootstrap() async {
     // 必须在 runApp 前：迷你条上滑展开时跟手覆盖层是当场新建的播放页，
     // 其封面连贯资格在第一帧就要读到真值，等不及各播放页自己的异步读取。
     _restoreSpectrumCoverPref(),
+    // 回填歌曲弹幕四镜像（开关/速度/颜色/只看）：宿主直读镜像，
+    // 不回填则重启后设置静默回退默认值。
+    _restoreSongDanmakuPref(),
   ]);
   markStartup('local_preferences_ready');
 
@@ -234,13 +264,24 @@ Future<(bool, bool, bool)> runBootstrap() async {
 
   // 检测是否需要显示首次启动引导页（仅新安装/未完成教程时弹出）
   bool needsOnboarding = false;
-  var initialUseBackgroundImage = true;
+  var initialUseBackgroundImage = false;
+  // 主题模式播种值：null = 未持久化过，保持 ThemeProvider 初值 ThemeMode.system
+  ThemeMode? initialThemeMode;
   try {
     final prefs = await prefsFuture;
     needsOnboarding = !(prefs.getBool(kOnboardingCompletedKey) ?? false);
     initialUseBackgroundImage =
         prefs.getBool(ThemeProvider.backgroundImageEnabledPreferenceKey) ??
-            true;
+            false;
+    // 主题模式：ThemeProvider._themeMode 的初值是 ThemeMode.system，而恢复持久值
+    // 的 _loadThemeMode 是异步的。不在此播种的话，首帧会先按 system 渲染——锁浅色
+    // 而系统深色时即开屏闪黑，随后才切到用户选择的模式。故必须 runApp 前同步就位。
+    final themeIndex = prefs.getInt(ThemeProvider.themeModePreferenceKey);
+    if (themeIndex != null &&
+        themeIndex >= 0 &&
+        themeIndex < ThemeMode.values.length) {
+      initialThemeMode = ThemeMode.values[themeIndex];
+    }
     // TV 构建强制关悬浮形态、首帧即常驻条（悬浮条本体无 DpadFocusable 停点，
     // 见 app.dart _loadSecondaryPlayerEnabled 同一门控）；只门控播种值，
     // 不回写 prefs——切回手机版不丢用户设置。
@@ -255,6 +296,12 @@ Future<(bool, bool, bool)> runBootstrap() async {
               SettingsRepository.secondaryPlayerProgressPreferenceKey,
             ) ??
             true;
+    kSecondaryPlayerOpacity.value =
+        (prefs.getDouble(
+                  SettingsRepository.secondaryPlayerOpacityPreferenceKey,
+                ) ??
+                1.0)
+            .clamp(0.2, 1.0);
     kSecondaryPlayerOnPrimaryPages.value =
         prefs.getBool(
               SettingsRepository.secondaryPlayerOnPrimaryPreferenceKey,
@@ -269,6 +316,18 @@ Future<(bool, bool, bool)> runBootstrap() async {
     kDesktopModeEnabled.value =
         prefs.getBool(SettingsRepository.desktopModeEnabledPreferenceKey) ??
             false;
+    // 双栏开关三端通用：非 Windows（含 TV）默认 true，宽屏双栏行为不回退；
+    // Windows 默认关（上游 2026-10-24 起的口径）。与 SettingsRepository
+    // .getWindowsTwoPaneEnabled 的回退值保持一致。
+    // TV 构建强制 true（不回写 prefs）：TV 焦点体系以双栏 master-detail 为
+    // 前提，单栏下焦点无法进入列表；切回手机版不丢用户设置。
+    // 同 kSecondaryPlayerEnabled 的 TV 门控播种模式（见上方注释）。
+    kWindowsTwoPaneEnabled.value = kTvBuild
+        ? true
+        : prefs.getBool(
+              SettingsRepository.windowsTwoPaneEnabledPreferenceKey,
+            ) ??
+            !Platform.isWindows;
   } catch (_) {}
   markStartup('onboarding_state_ready');
 
@@ -283,8 +342,14 @@ Future<(bool, bool, bool)> runBootstrap() async {
     suppress: needsOnboarding || needsUserAgreement,
   );
 
+  await windowsFontFuture;
   markStartup('bootstrap_ready');
-  return (needsOnboarding, needsUserAgreement, initialUseBackgroundImage);
+  return (
+    needsOnboarding,
+    needsUserAgreement,
+    initialUseBackgroundImage,
+    initialThemeMode,
+  );
 }
 
 /// 恢复蓝牙歌词开关 + 实时歌词推送协议（Lyricon/SuperLyric/LyricInfo 三选一 + 关闭）。
@@ -310,6 +375,13 @@ Future<void> _restoreLyricPushPref() async {
     DesktopLyricService.instance.setLockScreenLyricEnabled(
       lockScreenLyricEnabled,
     );
+
+    // MD3Music fork：悬浮窗桌面歌词的开关恢复。其它歌词通道都在上面恢复了，
+    // 唯独桌面歌词此前没有——引擎被 vivo 等机型杀掉后，进程内的原生悬浮窗
+    // 原封不动，但 Dart 侧 _enabled 归零，黑框从此收不到任何推送（有框无词）。
+    // 以原生窗口实况为准按开启恢复（关窗服务必停，查询自然为 false）。
+    // ignore: discarded_futures
+    DesktopLyricService.instance.restoreFloatingFromNative();
 
     // 魅族 Flyme 状态栏歌词（独立开关）：冷启动/后台唤醒后无需进设置页即可继续推送
     // 顺序有讲究：先灌提前量再开开关。开启会立刻回灌当前行，
@@ -386,6 +458,27 @@ Future<void> _restoreSpectrumCoverPref() async {
     await Future.wait([
       settings.getSpectrumEnabled(),
       settings.getSpectrumStyle(),
+    ]);
+  } catch (_) {}
+}
+
+/// 回填歌曲弹幕四镜像（开关 / 速度 / 颜色 / 只看弹幕）。
+/// 播放页宿主与设置页都直读静态镜像，进程重启后镜像停在默认值——四个 getter
+/// 除设置页初始化外无人调用，持久化成了只写不读（v47 独立审查发现），重启后
+/// 设置静默回退。getter 读盘即回填镜像（同 getLyricTimeOffset 口径），返回值
+/// 不需要。
+Future<void> _restoreSongDanmakuPref() async {
+  try {
+    final settings = SettingsRepository();
+    await Future.wait([
+      settings.getSongDanmakuEnabled(),
+      settings.getSongDanmakuSpeed(),
+      settings.getSongDanmakuColor(),
+      settings.getSongDanmakuReadOnly(),
+      settings.getSongDanmakuOpacity(),
+      // v54：MV 弹幕速度/颜色镜像同批回填。
+      settings.getMvDanmakuSpeed(),
+      settings.getMvDanmakuColor(),
     ]);
   } catch (_) {}
 }

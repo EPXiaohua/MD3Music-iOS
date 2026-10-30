@@ -1,29 +1,23 @@
-// 私人 FM 独立页的横屏两栏布局回归。
-//
-// 要害：横屏下「动作按钮 + 档位/歌池 + 即将播放」必须整体离开左列卡片，成为右列；
-// 竖屏必须仍是上下堆叠（本页原先只有单栏，横竖共用一套 Column，改分栏时最容易
-// 顺手把竖屏也改掉）。这里用**几何断言**钉住两栏/单栏的形态差异，而不是断言
-// 某种具体实现（Row / Column / 组件树），这样内部重构不会误报。
-//
-// 判据用 dx / dy 而不是找同级的类型：按钮在右列时它的圆心必然在封面圆心的**右侧**；
-// 单栏时它在封面**下方**。两者互斥，且与字号/密度无关。
+// 私人 FM 横屏：FM 卡片和即将播放在左列，推荐选项卡片在右列。
+// 验证真实几何位置，动作按钮继续留在 FM 卡片中，竖屏保持单栏。
 import 'package:material_ui/material_ui.dart';
-import 'package:m3e_core/m3e_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/theme/app_theme.dart';
 import 'package:md3music/data/models/song.dart';
 import 'package:md3music/modules/personal_fm/personal_fm_page.dart';
+import 'package:md3music/modules/personal_fm/personal_fm_page_preferences.dart';
 import 'package:md3music/providers/favorites_provider.dart';
 import 'package:md3music/providers/kugou_provider.dart';
 import 'package:md3music/providers/player_provider.dart';
 import 'package:md3music/providers/tab_config_provider.dart';
 import 'package:md3music/providers/theme_provider.dart';
-import 'package:md3music/services/kugou_api/kugou_api_client.dart';
 import 'package:md3music/services/kugou_api/kugou_models.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-class _FakeKugou extends KugouProvider {
+class _FakeKugou extends ChangeNotifier implements KugouProvider {
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
   _FakeKugou(this.songs);
 
   final List<KugouSongDetail> songs;
@@ -110,10 +104,6 @@ const List<KugouSongDetail> _songs = [
 ];
 
 void main() {
-  // [KugouProvider] 构造会发一次 registerDevice，拦截器要等本地 API 服务器就绪
-  // （测试里永远不会），那个 timeout(8s) 会留下待触发的 timer。
-  setUpAll(KugouApiClient.markServerReady);
-
   Future<void> drainProviderStartup(WidgetTester tester) =>
       tester.pump(const Duration(seconds: 5));
 
@@ -169,11 +159,9 @@ void main() {
     (w) => w is ClipRRect && w.borderRadius == BorderRadius.circular(24),
   );
 
-  /// 档位/歌池切换器。不按文案取：m3e 的连体按钮组会同时构建「选中 / 未选中」
-  /// 两套标签来测宽，同一个档位名在树里有两个 Text，按文案取是歧义的。
-  Finder stationSwitcher() => find.byType(M3EToggleButtonGroup).first;
+  Finder stationSwitcher() => find.byKey(const ValueKey('fm-mode-normal'));
 
-  testWidgets('横屏两栏：档位与队列在卡片右侧，动作按钮留在卡片内', (tester) async {
+  testWidgets('横屏两栏：队列在 FM 卡片左下，推荐选项在右列，动作按钮留在卡片内', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await pumpPage(tester, size: const Size(900, 420));
 
@@ -183,26 +171,22 @@ void main() {
     final station = tester.getCenter(stationSwitcher());
     final queue = tester.getCenter(find.text('即将播放'));
 
-    // 右列的两块：必须整体落在封面右侧。
-    expect(
-      station.dx,
-      greaterThan(cover.right),
-      reason: '档位/歌池切换必须在右列（封面右缘之外）',
+    final hero = tester.getRect(find.byKey(const ValueKey('fm-hero-card')));
+    final controls = tester.getRect(
+      find.byKey(const ValueKey('fm-recommendation-controls')),
     );
-    expect(queue.dx, greaterThan(cover.right), reason: '队列必须在右列');
-
-    // 动作行必须回到卡片内：在封面下方（纵向属于卡片），且没有越过封面右缘
-    // 跑到右列去——右缘那条线正是左右两列的分界。
-    expect(play.dy, greaterThan(cover.bottom), reason: '播放按钮在封面下方');
-    expect(heart.dy, greaterThan(cover.bottom), reason: '红心在封面下方');
-    expect(
-      play.dx,
-      lessThan(station.dx),
-      reason: '动作按钮留在左列卡片里，不能和右列的切换器混在一起',
+    final upcoming = tester.getRect(
+      find.byKey(const ValueKey('fm-upcoming-queue')),
     );
-
-    // 右列两块的上下次序：档位 → 队列。
-    expect(station.dy, lessThan(queue.dy), reason: '档位切换在队列之上');
+    expect(controls.left, greaterThan(hero.right));
+    expect(controls.top, closeTo(hero.top, .1));
+    expect(upcoming.left, closeTo(hero.left, .1));
+    expect(upcoming.right, closeTo(hero.right, .1));
+    expect(upcoming.top, closeTo(hero.bottom + 16, .1));
+    expect(queue.dy, greaterThan(play.dy));
+    expect(play.dy, greaterThan(cover.bottom));
+    expect(heart.dy, greaterThan(cover.bottom));
+    expect(play.dx, lessThan(station.dx));
 
     await drainProviderStartup(tester);
   });
@@ -220,27 +204,19 @@ void main() {
       greaterThan(coverBottom),
       reason: '竖屏按钮必须在封面下方（上下堆叠），不能变成右侧两栏',
     );
-    expect(
-      queueCenter.dy,
-      greaterThan(playCenter.dy),
-      reason: '竖屏队列在按钮行之下',
-    );
+    expect(queueCenter.dy, greaterThan(playCenter.dy), reason: '竖屏队列在按钮行之下');
 
     await drainProviderStartup(tester);
   });
 
-  testWidgets('横屏封面按视口高度收缩，右列档位与队列落进首屏', (tester) async {
+  testWidgets('横屏封面按视口高度收缩，右列选项与左侧队列标题落进首屏', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await pumpPage(tester, size: const Size(900, 420));
 
     final cover = tester.getRect(heroCover());
     // 竖屏走的是「按宽度封顶 320」；横屏左列只有 ~457dp 宽，若不引入高度约束，
     // 封面会取到宽度预算，把动作行整块顶出首屏。
-    expect(
-      cover.height,
-      lessThan(300),
-      reason: '横屏封面要受视口高度约束，不能沿用竖屏的 320 上限',
-    );
+    expect(cover.height, lessThan(300), reason: '横屏封面要受视口高度约束，不能沿用竖屏的 320 上限');
     expect(cover.height, greaterThan(100), reason: '不能缩到不可辨');
 
     // 用户要的是「按钮留在卡片里」，那它就必须真的还在首屏内摸得到——这是
@@ -251,8 +227,7 @@ void main() {
       reason: '动作按钮留在卡内，且必须落在首屏内',
     );
 
-    // 分栏真正要换来的东西：右列的档位与标题在**首屏内**可见（分栏前它们被压到
-    // 一整屏之下）。队列整块可能超出首屏，由整页 SingleChildScrollView 兜住。
+    // 右列选项和左列队列标题在首屏内，队列剩余内容可通过整页滚动访问。
     expect(
       tester.getCenter(stationSwitcher()).dy,
       lessThan(420),
@@ -283,6 +258,35 @@ void main() {
       );
       expect(find.text('即将播放'), findsOneWidget);
 
+      await drainProviderStartup(tester);
+    });
+  }
+  for (final size in const [Size(400, 900), Size(900, 420)]) {
+    testWidgets('选择卡片可点击并持久化 $size', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await pumpPage(tester, size: size);
+      final mode = find.byKey(const ValueKey('fm-mode-small'));
+      await tester.ensureVisible(mode);
+      await tester.pumpAndSettle();
+      await tester.tap(mode);
+      await tester.pumpAndSettle();
+      final pool = find.byKey(const ValueKey('fm-pool-1'));
+      await tester.ensureVisible(pool);
+      await tester.pumpAndSettle();
+      await tester.tap(pool);
+      await tester.pumpAndSettle();
+      final selection = await PersonalFmPagePreferences.load();
+      expect(selection.mode, 'small');
+      expect(selection.songPoolId, 1);
+      final selectedSemantics = find.ancestor(
+        of: pool,
+        matching: find.byType(Semantics),
+      );
+      expect(
+        tester.widget<Semantics>(selectedSemantics.first).properties.selected,
+        isTrue,
+      );
+      expect(tester.takeException(), isNull);
       await drainProviderStartup(tester);
     });
   }

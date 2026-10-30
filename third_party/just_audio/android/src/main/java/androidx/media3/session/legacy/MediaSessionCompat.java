@@ -344,9 +344,12 @@ public class MediaSessionCompat {
   // 进度自行滚动整段 LRC，不需要推送"当前第几行"。
   static final String UCAR_LYRICS_WHOLE = "ucar.media.metadata.LYRICS_WHOLE";
   static final String UCAR_LYRICS_STATUS = "ucar.media.metadata.LYRICS_STATUS";
-  // vivomusicmix 原子随身听能力位（7|8|16：播控+歌词+进度）。字段名照抄 vivo 拼写。
+  // vivomusicmix 原子随身听能力位。字段名照抄 vivo 拼写。
+  // v45：与 LegacyConversions.VMM_SUPPORT_EVENT_VALUE 同值（两包私有互不可见，
+  // 改值必须同步）——31 + 收藏 64 + 循环 128 + 三类列表 256|512|1024 = 2015，
+  // 每一位都有对应实现（v45 起循环/收藏已接通）；不随歌词有无增删。
   static final String VMM_SUPPORT_EVENT = "vivomusicmix.media.metadata.support_event";
-  static final long VMM_SUPPORT_EVENT_VALUE = 31L;
+  static final long VMM_SUPPORT_EVENT_VALUE = 2015L;
   static final String VMM_ACTION_KEY = "vivomusicmix.meida.extra.key.action";
   static final String VMM_MEDIA_ID_KEY = "vivomusicmix.extra.key.meidia_id";
   static final String VMM_LYRIC_KEY = "vivomusicmix.extra.key.lyric";
@@ -387,6 +390,67 @@ public class MediaSessionCompat {
     }
     android.util.Log.i("MD3CarLyrics", "lrc_change resend: mediaId=" + mediaId
         + " lrcLen=" + wholeLrc.length() + " sessions=" + live.size());
+  }
+
+  /// MD3Music fork（方向3·shadow 播放态镜像）：把【当前活跃会话】刚生成的
+  /// PlaybackStateCompat 同步写进其它存活 legacy 会话。vivo 原子随身听/锁屏
+  /// 媒体控件按"会话是否在播"决定卡片存留：交叉淡化把活跃播放器迁到新会话后，
+  /// 被 #146 保留的 shadow 会话 PlaybackState 停在 paused，岛与锁屏控件被系统
+  /// 判定死亡而整块收起（2026-10-16 真机修复版实测：App 供血正常、双会话
+  /// 存活、lrc 正常重发，但岛/锁屏仍消失——缺的就是播放态）。metadata/封面/
+  /// 歌词已有 App 层镜像（AudioPlayer.updateActiveSession*），这里补齐播放态。
+  /// [excludeCompat] 为发布方自己，避免把活跃会话的态覆盖回它自己。
+  /// 仅 shadow 镜像开关（SHADOW_SESSION_MODE：vivo/iQOO）开启时被调用。
+  public static void mirrorPlaybackStateToShadows(
+      @Nullable PlaybackStateCompat state,
+      @Nullable MediaSessionCompat excludeCompat) {
+    if (state == null) return;
+    MediaSessionImplApi21 exclude = null;
+    if (excludeCompat != null
+        && excludeCompat.mImpl instanceof MediaSessionImplApi21) {
+      exclude = (MediaSessionImplApi21) excludeCompat.mImpl;
+    }
+    java.util.ArrayList<MediaSessionImplApi21> live;
+    synchronized (sVivoLrcLock) {
+      live = new java.util.ArrayList<>(sLiveApi21Impls);
+    }
+    for (MediaSessionImplApi21 impl : live) {
+      if (impl == exclude || impl.mDestroyed) continue;
+      try {
+        impl.setPlaybackState(state);
+      } catch (Throwable t) {
+        // 单个 session 失败不影响其他
+      }
+    }
+  }
+
+  /// MD3Music fork（方向3·队列镜像，v36）：把队列（含标题）同步进影子会话。
+  /// 原子岛把 MediaControllerCompat 长期钉在首个会话（shadow）上：收敛保活后
+  /// 影子自身的时间线已清空，元数据/播放态有镜像而队列无人写，其列表面板恒空
+  /// （"vivo 原子岛播放列表获取不到"的根因）。形状与 mirrorPlaybackStateToShadows
+  /// 同构；标题空传不影响 getQueue 可读性。
+  public static void mirrorQueueToShadows(
+      @Nullable List<QueueItem> queue,
+      @Nullable CharSequence title,
+      @Nullable MediaSessionCompat excludeCompat) {
+    MediaSessionImplApi21 exclude = null;
+    if (excludeCompat != null
+        && excludeCompat.mImpl instanceof MediaSessionImplApi21) {
+      exclude = (MediaSessionImplApi21) excludeCompat.mImpl;
+    }
+    java.util.ArrayList<MediaSessionImplApi21> live;
+    synchronized (sVivoLrcLock) {
+      live = new java.util.ArrayList<>(sLiveApi21Impls);
+    }
+    for (MediaSessionImplApi21 impl : live) {
+      if (impl == exclude || impl.mDestroyed) continue;
+      try {
+        impl.setQueue(queue);
+        impl.setQueueTitle(title);
+      } catch (Throwable t) {
+        // 单个 session 失败不影响其他
+      }
+    }
   }
 
   /// 原子随身听 lrc_change 是否需要发送：歌词变化立即发，相同歌词 25s 节流兜底
@@ -4127,6 +4191,16 @@ public class MediaSessionCompat {
       mMetadata = metadata;
       MediaMetadata fwkMetadata =
           metadata == null ? null : (MediaMetadata) metadata.getMediaMetadata();
+      boolean isVivoFamily =
+          "vivo".equalsIgnoreCase(Build.MANUFACTURER)
+              || "vivo".equalsIgnoreCase(Build.BRAND)
+              || "iqoo".equalsIgnoreCase(Build.BRAND);
+      // MD3Music fork：vivo 原子随身听改写不得影响其他系统。非 vivo 设备恢复
+      // 63a5154f 的标准直通路径，由 SystemUI 直接读取原始 DISPLAY_ICON/ALBUM_ART。
+      if (!isVivoFamily) {
+        mSessionFwk.setMetadata(fwkMetadata);
+        return;
+      }
       // MD3Music fork: 注册活跃 impl（供 lrc_change 定时重发走 framework extras）
       synchronized (sVivoLrcLock) {
         if (!sLiveApi21Impls.contains(this)) {
@@ -4161,8 +4235,8 @@ public class MediaSessionCompat {
                 .build();
           }
         }
-        // MD3Music fork（封面 1x1 纯色根因修复 v14）：只保留 ALBUM_ART 一个 bitmap，
-        // 剥掉 ART/DISPLAY_ICON，保留 artUri。实测证据（2026-09-13）：
+        // MD3Music fork（vivo 封面 1x1 纯色规避）：本分支仅在 vivo/iQOO 上执行。
+        // 实测证据（2026-09-13）：
         // 1) v12（ALBUM_ART+ART+DISPLAY_ICON 三个 400x400 bitmap ≈1.3MB bundle）→ 原子端
         //    covers/ 把封面存成 1x1 像素 PNG（像素=各歌封面主色调）→ 显示 = 纯色封面；
         // 2) 音哩音哩（com.spotify.music，原生 framework MediaSession，metadata 仅 1 个
@@ -4182,10 +4256,12 @@ public class MediaSessionCompat {
               if (MediaMetadata.METADATA_KEY_ALBUM_ART.equals(k)
                   || MediaMetadata.METADATA_KEY_ART.equals(k)
                   || MediaMetadata.METADATA_KEY_DISPLAY_ICON.equals(k)) {
-                // MD3Music fork v19：剥掉全部 bitmap（不只 ART/DISPLAY_ICON）。
+                // MD3Music fork v19：仅在 vivo/iQOO 剥掉全部 bitmap（不只 ART/DISPLAY_ICON）。
                 // 实测矩阵：c0+bitmap(无论数量)→原子端封面降为 1x1 平均色（v12-v18）；
-                // 原子对 http URI 走自己 Glide 下载显示（kgka c0+无bitmap+http 已验证）。
-                // bitmap 路径在 vivo 上根本坏，必须全剥让原子走纯 URI 路径。
+                // bitmap 路径在 vivo 上异常，必须全剥让原子走纯 URI 路径。
+                // ⚠️ 回归警告（2026-09-16）：曾有人把这里改成「重新注入一张 192px
+                // ALBUM_ART bitmap」，结果融合中心与系统媒体面板封面同时消失/变纯色
+                // —— 即 v12-v18 已证伪的路径，不要再试。
                 continue;
               }
               // MD3Music fork v16 修复：bitmap 键必须按 Bitmap 复制（v14/v15 的循环把
@@ -4210,7 +4286,7 @@ public class MediaSessionCompat {
               stripped.putLong(k, fwkMetadata.getLong(k));
             }
             fwkMetadata = stripped.build();
-            android.util.Log.i("MD3CarLyrics", "artwork bitmaps stripped (uri-only, http kgka-style), uri="
+            android.util.Log.i("MD3CarLyrics", "artwork bitmaps stripped (vivo uri-only), uri="
                 + fwkMetadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI));
           }
         } catch (Throwable t) {
@@ -4243,6 +4319,8 @@ public class MediaSessionCompat {
           // 移除）。对照音哩音哩（metadata 1 bitmap + 11 键无大字符串，封面完整到达），
           // 我们的 metadata bitmap+歌词大字符串 → 原子端封面被降为 1x1 平均色（v12-v17
           // 全部实测）。歌词照走 lrc_change extras 事件（c0 控制器消费，已验证）。
+          // 车机多行歌词实测不依赖本顶层键（ef77080 顶层键关闭状态下仍常驻多行，三绿），
+          // 所以保持关闭，不要为"多行"打开它。
           if (false && wholeLrc != null && !wholeLrc.isEmpty()) {
             // v18：metadata 歌词键停用（见上方注释）。保留分支结构便于回滚。
             MediaMetadata.Builder fwkBuilder = new MediaMetadata.Builder(fwkMetadata);

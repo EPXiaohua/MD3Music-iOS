@@ -32,6 +32,10 @@ class FmWidgetSync {
   bool _attached = false;
   bool _fmLoading = false;
   String? _lastPayload;
+  /// 上一拍观察到的「当前歌曲收藏态」，用于判断收藏变化是否值得重推通知。
+  bool _lastCurrentSongFavorited = false;
+  /// 上述基线所属的歌曲 id：切歌后基线失效，需按新歌重新记录。
+  String? _favoriteBaselineSongId;
 
   /// App 首帧后调用（provider 惰性 create 已就绪）。
   void attach({
@@ -46,9 +50,30 @@ class FmWidgetSync {
     _favorites = favorites;
     kugou.addListener(_scheduleSync);
     player.addListener(_scheduleSync);
-    favorites.addListener(_scheduleSync);
+    favorites.addListener(_onFavoritesChanged);
     _bindActions();
     _scheduleSync();
+  }
+
+  /// 收藏态变化：除了推 FM 快照，还要刷新通知/小组件载荷。
+  /// 概念版 4×1 小组件的爱心取自 `isFavorited`，只在 _updateNotification 里
+  /// 组装；不主动刷新的话，在 App 内点收藏后卡片爱心要等下一次切歌才更新。
+  ///
+  /// 只在「当前歌曲收藏态真的翻转」时刷新：FavoritesProvider 启动加载与
+  /// 云端同步会连续 notifyListeners，无条件刷新会造成一批无谓的通知重建
+  /// 与小组件广播（既有性能优化专门压过这类高频刷新）。切歌后基线随之失效，
+  /// 按新歌重新记录——否则「上一首已收藏、切到未收藏的歌再点收藏」会被
+  /// 误判成无变化。
+  void _onFavoritesChanged() {
+    _scheduleSync();
+    final song = _player?.currentSong;
+    if (song == null) return;
+    final favorited = _favorites?.isFavorite(song.id) ?? false;
+    final songChanged = song.id != _favoriteBaselineSongId;
+    if (!songChanged && favorited == _lastCurrentSongFavorited) return;
+    _favoriteBaselineSongId = song.id;
+    _lastCurrentSongFavorited = favorited;
+    _player?.refreshNotification();
   }
 
   /// 档位切换等动作的前后钩子：立即推送加载态，不等 debounce。
@@ -105,49 +130,37 @@ class FmWidgetSync {
     };
     // 封面点击：app 已被拉起，打开播放器页（与发现页 _openPlayerDetail
     // 同一条 fullPlayerRoute 路由，已有播放页在栈顶时不重复压栈）
-    MediaNotificationService.onWidgetFmOpenPlayer = _openPlayer;
+    MediaNotificationService.onWidgetFmOpenPlayer = () {
+      final nav = appNavigatorKey.currentState;
+      final navContext = appNavigatorKey.currentContext;
+      if (nav == null || navContext == null) return;
+      openFullPlayer(navContext);
+    };
     // 登录引导卡点击：app 已被拉起（MainActivity 转发），这里进登录页。
-    MediaNotificationService.onWidgetFmOpenLogin = _openLogin;
+    MediaNotificationService.onWidgetFmOpenLogin = () {
+      final nav = appNavigatorKey.currentState;
+      if (nav == null) return;
+      nav.push(MaterialPageRoute(builder: (_) => const LoginPage()));
+    };
   }
 
-  void _openPlayer() {
-    final nav = appNavigatorKey.currentState;
-    final navContext = appNavigatorKey.currentContext;
-    if (nav == null || navContext == null) return;
-    openFullPlayer(navContext);
-  }
-
-  void _openLogin() {
-    final nav = appNavigatorKey.currentState;
-    if (nav == null) return;
-    nav.push(MaterialPageRoute(builder: (_) => const LoginPage()));
-  }
-
-  /// iOS 中号小组件（私人FM卡）按钮命令入口。与安卓同源动作走
-  /// MediaNotificationService 回调不同，iOS widget 命令经 App Group
-  /// widget_command -> 原生 WidgetSync -> player_provider 分流到这里。
-  /// 预告封面用槽位编号（fm_open_track_1/2/3）：命令串不带参数，
-  /// hash 由这里按与 [_push] 相同的算法重算。
+  /// 执行小组件按钮命令（iOS 中号 FM 卡：MD3Widget AppIntent 写入 App Group，
+  /// 原生回前台经 HomeWidgetService "widgetCommand" 转发到 PlayerProvider，
+  /// 再由 fm_ 前缀分流到这里）。
+  ///
+  /// play_pause / toggle_favorite / open_track 直接复用 [_bindActions] 绑定的
+  /// 同一套 MediaNotificationService 回调（Android 通知栏与 iOS 小组件共用），
+  /// 保证行为一致；select_station 上游协议带目标档位下标，iOS 命令串不带参数，
+  /// 按旧口径「当前档位 +1 循环」。
   Future<void> handleCommand(String action) async {
-    final kugou = _kugou;
-    final player = _player;
-    final favorites = _favorites;
-    if (kugou == null || player == null) return;
     switch (action) {
       case 'fm_play_pause':
-        if (_fmLoading) return;
-        // ignore: discarded_futures
-        PersonalFmWidgetActions.handlePlayPause(kugou: kugou, player: player);
+        MediaNotificationService.onWidgetFmPlayPause?.call();
       case 'fm_toggle_favorite':
-        if (favorites == null) return;
-        // ignore: discarded_futures
-        PersonalFmWidgetActions.handleToggleFavorite(
-          kugou: kugou,
-          player: player,
-          favorites: favorites,
-        );
+        MediaNotificationService.onWidgetFmToggleFavorite?.call();
       case 'fm_select_station':
-        if (_fmLoading) return;
+        final kugou = _kugou;
+        if (kugou == null || _fmLoading) return;
         markFmLoading(true);
         try {
           final current = await PersonalFmWidgetActions.restoreStationIndex();
@@ -159,40 +172,23 @@ class FmWidgetSync {
           markFmLoading(false);
         }
       case 'fm_open_track_1' || 'fm_open_track_2' || 'fm_open_track_3':
-        final hash = _nextHashAt(
-          int.parse(action.substring('fm_open_track_'.length)) - 1,
-        );
-        if (hash == null) return;
-        // ignore: discarded_futures
-        PersonalFmWidgetActions.handleOpenTrack(
-          kugou: kugou,
-          player: player,
-          hash: hash,
-        );
-      case 'fm_open_player':
-        _openPlayer();
-      case 'fm_open_login':
-        _openLogin();
+        final kugou = _kugou;
+        final player = _player;
+        if (kugou == null || player == null) return;
+        // 与 [_push] 同一套计算：列表顺序不随播放移动，slot 取播放位之后第 N 首
+        final slot = int.parse(action.substring('fm_open_track_'.length)) - 1;
+        final songs = kugou.personalFmSongs;
+        final playingId = player.currentSong?.id;
+        final playingIndex = playingId == null
+            ? -1
+            : songs.indexWhere((s) => s.hash == playingId);
+        final currentIndex = playingIndex >= 0 ? playingIndex : 0;
+        final nextTracks = songs.isEmpty
+            ? const <KugouSongDetail>[]
+            : songs.sublist(currentIndex + 1).take(3).toList();
+        if (slot >= nextTracks.length) return;
+        MediaNotificationService.onWidgetFmOpenTrack?.call(nextTracks[slot].hash);
     }
-  }
-
-  /// 与 [_push] 同一套计算：播放器当前曲之后第 [slot] 首预告曲的 hash。
-  String? _nextHashAt(int slot) {
-    final kugou = _kugou;
-    final player = _player;
-    if (kugou == null || player == null) return null;
-    final songs = kugou.personalFmSongs;
-    if (songs.isEmpty || slot < 0) return null;
-    final playingId = player.currentSong?.id;
-    final playingIndex = playingId == null
-        ? -1
-        : songs.indexWhere((s) => s.hash == playingId);
-    final currentIndex = playingIndex >= 0 ? playingIndex : 0;
-    final nextTracks = songs
-        .sublist(currentIndex + 1)
-        .take(3)
-        .toList();
-    return slot < nextTracks.length ? nextTracks[slot].hash : null;
   }
 
   void _scheduleSync() {

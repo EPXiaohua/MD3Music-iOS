@@ -3,6 +3,7 @@ import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../core/build_flags.dart';
+import '../core/theme/app_dimens.dart';
 
 /// 一个排序选项：值 + 显示文本。
 typedef M3ESortOption<T> = ({T value, String label});
@@ -36,8 +37,15 @@ class M3ESortButton<T> extends StatefulWidget {
   /// 当前生效的排序项，必须能在 [options] 中找到。
   final T current;
 
-  /// 选中回调。`repeated` 为 true 表示「再次点了当前项」（用于翻转升/降序）。
-  final void Function(T value, bool repeated) onPicked;
+  /// 当前是否正序；null 表示该入口只做筛选、没有方向概念（如 MV 分类），
+  /// 此时面板不显示方向切换。
+  final bool? ascending;
+
+  /// 选中排序字段回调（再点当前项不动作）。
+  final ValueChanged<T> onPicked;
+
+  /// 方向切换回调（点面板底部的「正序 / 倒序」分段控件）；[ascending] 非 null 时必传。
+  final ValueChanged<bool>? onDirectionChanged;
 
   const M3ESortButton({
     super.key,
@@ -45,7 +53,9 @@ class M3ESortButton<T> extends StatefulWidget {
     this.icon = Icons.sort,
     required this.options,
     required this.current,
+    this.ascending,
     required this.onPicked,
+    this.onDirectionChanged,
   });
 
   @override
@@ -79,19 +89,19 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
   /// `widget.xxx` 取实时值，不能捕获 build 时的局部变量。
   void _handleSelectionChanged(List<M3EDropdownItem<T>> selected) {
     if (selected.isEmpty) {
-      // 再次点当前项：单选下当前项被取消选中 → 空列表 → 翻转升/降序
-      widget.onPicked(widget.current, true);
+      // 再点当前项：单选下当前项被取消选中 → 空列表。方向已改由面板
+      // 底部的分段控件切换，这里只重建一次把高亮回灌到当前项。
+      setState(() {});
       return;
     }
     final value = selected.first.value;
     if (value == widget.current) {
       // 回调值与组件声明的当前值一致：这是上游 setItems 的回灌
       // （父级每次重建都会经 didUpdateWidget → setItems 触发一次），
-      // 不是用户操作，必须忽略，否则排序方向会被反复翻转。
-      // 用户真正「再点当前项」走的是上面的空列表分支。
+      // 不是用户操作，必须忽略。
       return;
     }
-    widget.onPicked(value, false);
+    widget.onPicked(value);
   }
 
   /// 图标取色：与相邻 IconButton 的规则保持一致。
@@ -120,10 +130,10 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
   /// 2. 面板条目是 `GestureDetector` + `onTap`，不带焦点节点，就算把面板
   ///    拉开了遥控也选不中任何一项。
   ///
-  /// 故 TV 构建换成底部弹层，每行一个 [DpadFocusable]：OK 选排序项，
-  /// 再 OK 点当前项 = 翻转升/降序（与触屏的 `repeated` 语义一致）。
+  /// 故 TV 构建换成底部弹层，每行一个 [DpadFocusable]：OK 选排序项；
+  /// 方向切换用与触屏面板同款的「正序 / 倒序」分段控件。
   Future<void> _openTvSortPicker() async {
-    final picked = await showM3EModalBottomSheet<M3ESortOption<T>>(
+    await showM3EModalBottomSheet<void>(
       context: context,
       builder: (ctx) {
         final cs = Theme.of(ctx).colorScheme;
@@ -150,7 +160,10 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
                     // 弹层首项自动聚焦：一打开就看得见焦点在哪
                     autofocus: i == 0,
                     debugLabel: 'sort_option_$i',
-                    onSelect: () => Navigator.pop(ctx, widget.options[i]),
+                    onSelect: () {
+                      Navigator.pop(ctx);
+                      widget.onPicked(widget.options[i].value);
+                    },
                     child: ListTile(
                       title: Text(widget.options[i].label),
                       trailing: widget.options[i].value == widget.current
@@ -158,6 +171,16 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
                           : null,
                     ),
                   ),
+                if (widget.ascending != null) ...[
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                    child: _SortDirectionToggle(
+                      ascending: widget.ascending!,
+                      onChanged: widget.onDirectionChanged!,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
               ],
             ),
@@ -165,8 +188,6 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
         );
       },
     );
-    if (picked == null) return;
-    widget.onPicked(picked.value, picked.value == widget.current);
   }
 
   @override
@@ -209,6 +230,17 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
             ],
             singleSelect: true,
             showChipAnimation: false,
+            // 外层 20 = 条目外角 12 + 列表内边距 8，同心圆（默认 28 过大）
+            containerRadius: AppRadius.dropdownPanel,
+            // 面板底部独立分组：「正序 | 倒序」分段控件，与上方字段条目区分
+            dropdownStyle: M3EDropdownStyle(
+              footer: widget.ascending == null
+                  ? null
+                  : _SortDirectionFooter(
+                      ascending: widget.ascending!,
+                      onChanged: widget.onDirectionChanged!,
+                    ),
+            ),
             onSelectionChanged: _handleSelectionChanged,
             // 字段里不显示任何文字，外观只由 suffixIcon 提供
             selectedItemBuilder: (_) => const SizedBox.shrink(),
@@ -239,5 +271,62 @@ class _M3ESortButtonState<T> extends State<M3ESortButton<T>> {
         ),
       ),
     );
+  }
+}
+
+/// 下拉面板底部的方向切换区：细分隔线 + 「正序 | 倒序」分段控件，
+/// 与上方字段条目列表分组区分；点选只切方向，面板保持打开。
+class _SortDirectionFooter extends StatelessWidget {
+  final bool ascending;
+  final ValueChanged<bool> onChanged;
+
+  const _SortDirectionFooter({required this.ascending, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Divider(height: 1, color: cs.outlineVariant.withValues(alpha: 0.5)),
+          const SizedBox(height: 8),
+          _SortDirectionToggle(ascending: ascending, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+}
+
+/// 「正序 | 倒序」分段控件：带方向箭头图标，触屏面板与 TV 弹层共用。
+class _SortDirectionToggle extends StatelessWidget {
+  final bool ascending;
+  final ValueChanged<bool> onChanged;
+
+  const _SortDirectionToggle({required this.ascending, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return M3EToggleButtonGroup(
+            actions: const [
+              M3EToggleButtonGroupAction(
+                icon: Icon(Icons.arrow_upward_rounded),
+                label: Text('正序'),
+              ),
+              M3EToggleButtonGroupAction(
+                icon: Icon(Icons.arrow_downward_rounded),
+                label: Text('倒序'),
+              ),
+            ],
+            size: M3EButtonSize.xs,
+            density: M3EButtonGroupDensity.compact,
+            style: M3EButtonStyle.outlined,
+            selectedIndex: ascending ? 0 : 1,
+            onSelectedIndexChanged: (index) {
+              if (index == null) return;
+              onChanged(index == 0);
+            },
+          );
   }
 }

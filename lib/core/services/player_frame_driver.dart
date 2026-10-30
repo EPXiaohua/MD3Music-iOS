@@ -27,10 +27,14 @@ class PlayerFrameDriver with WidgetsBindingObserver {
   Timer? _timer;
   final List<VoidCallback> _listeners = <VoidCallback>[];
 
-  /// App 是否处于「引擎不产帧」的生命周期（后台 / 熄屏 / 失焦）。
+  /// App 是否处于「引擎不产帧」的生命周期（后台 / 熄屏）。
   ///
   /// 闸门放在驱动侧而非各订阅方：一处停表即覆盖全部订阅者，订阅方不必各自
   /// 再记一份生命周期状态（对照 [FlowingBackground] 里那份是历史实现）。
+  ///
+  /// md3 fork 口径：inactive（可见但无焦点——车机投屏、浮窗、通知栏下拉）
+  /// 时引擎**照常合成帧**，不算挂起；否则投屏/浮窗场景下频谱与封面全部
+  /// 冻结（与 MusicHapticsService 的前端口径对齐）。
   bool _suspended = false;
 
   /// 是否已有订阅者（诊断用）。
@@ -69,8 +73,9 @@ class PlayerFrameDriver with WidgetsBindingObserver {
   /// 用真实帧间隔推进的订阅方（如 SpectrumArtwork 的包络）自行钳制 dt。
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // md3 fork：只有引擎真正不产帧的状态才挂起（后台/熄屏）。inactive 下引擎
+    // 仍合成帧，停表会让车机投屏等场景频谱/封面冻结。
     final bool suspended = state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached;
     if (suspended == _suspended) return;

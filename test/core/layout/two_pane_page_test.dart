@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:md3music/core/layout/adaptive_navigator.dart';
+import 'package:md3music/core/layout/responsive_layout.dart';
 
 /// TwoPanePage：LaunchPad「打开为页面」/快捷方式/发现页搜索图标等**不经 tab
 /// 壳层**的整屏入口的双栏包装（回归钉子）。
@@ -13,6 +14,12 @@ import 'package:md3music/core/layout/adaptive_navigator.dart';
 void main() {
   const phoneSize = Size(400, 800);
   const tabletSize = Size(1280, 853);
+
+  // 双栏开关三端通用后，宽屏双栏用例需显式开启（全局 notifier 初值 false）。
+  setUp(() {
+    kWindowsTwoPaneEnabled.value = true;
+  });
+  tearDown(() => kWindowsTwoPaneEnabled.value = false);
 
   Future<void> pumpHarness(
     WidgetTester tester, {

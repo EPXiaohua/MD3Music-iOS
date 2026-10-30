@@ -8,7 +8,6 @@ import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/utils/entry_transition_gate.dart';
-import '../../core/widgets/app_background.dart';
 import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../data/repositories/collected_playlist_store.dart';
@@ -229,7 +228,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
     try {
       final api = KugouApiClient();
       final detailFuture = api.getAlbumDetail(widget.album.id);
-      final songsFuture = api.getAlbumSongs(widget.album.id);
+      final songsFuture = api.getAlbumSongsAll(widget.album.id);
 
       final results = await Future.wait([detailFuture, songsFuture]);
 
@@ -396,16 +395,21 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
   // ==================== 评论 ====================
 
   void _showCommentsSheet(BuildContext context) {
-    showModalBottomSheet(
+    const minChildSize = 0.3;
+    const maxChildSize = 1.0;
+    showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       builder: (context) => KeyboardExpandScrollableSheet(
-        initialChildSize: 0.5,
-        minChildSize: 0.3,
-        // 键盘弹出时也展开到这个高度，否则打字时列表被托盘比例限制成一条缝
-        maxChildSize: 0.95,
-        builder: (context, scrollController) {
+        // Windows 桌面用鼠标时内容区拖不动托盘（Flutter 默认不含鼠标拖拽），
+        // 默认就开到近全屏；顶部标题区仍可用鼠标拖到 1.0 或收回。
+        initialChildSize: commentSheetInitialChildSize(),
+        minChildSize: minChildSize,
+        // 允许拖到最顶部（全屏高度），与歌曲评论托盘同口径；键盘弹出时
+        // 也展开到这里，否则打字时列表被托盘比例限制成一条缝
+        maxChildSize: maxChildSize,
+        builderWithController: (context, scrollController, sheetController) {
           final colorScheme = Theme.of(context).colorScheme;
           return Container(
             decoration: BoxDecoration(
@@ -414,29 +418,38 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
             ),
             child: Column(
               children: [
-                Container(
-                  margin: const EdgeInsets.only(top: AppSpacing.md),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
-                  child: Row(
+                DraggableSheetHeader(
+                  controller: sheetController,
+                  minChildSize: minChildSize,
+                  maxChildSize: maxChildSize,
+                  child: Column(
                     children: [
-                      Icon(Icons.comment_outlined, size: 20, color: colorScheme.onSurfaceVariant),
-                      const Gap(AppSpacing.sm),
-                      Text(
-                        '评论',
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                      Container(
+                        margin: const EdgeInsets.only(top: AppSpacing.md),
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
                       ),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 20),
-                        onPressed: () => Navigator.pop(context),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.md),
+                        child: Row(
+                          children: [
+                            Icon(Icons.comment_outlined, size: 20, color: colorScheme.onSurfaceVariant),
+                            const Gap(AppSpacing.sm),
+                            Text(
+                              '评论',
+                              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                            const Spacer(),
+                            IconButton(
+                              icon: const Icon(Icons.close, size: 20),
+                              onPressed: () => Navigator.pop(context),
+                            ),
+                          ],
+                        ),
                       ),
                     ],
                   ),
@@ -534,21 +547,27 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                               if (_songs.isNotEmpty)
                                 M3ESortButton<_SortBy>(
                                   tooltip: '排序',
+                                  // 图标随升/降序切换（与歌单页一致）
+                                  icon: _sortAscending
+                                      ? Icons.arrow_upward_rounded
+                                      : Icons.arrow_downward_rounded,
                                   current: _sortBy,
                                   options: const [
                                     (value: _SortBy.time, label: '添加时间'),
                                     (value: _SortBy.title, label: '歌曲名称'),
                                     (value: _SortBy.duration, label: '时长'),
                                   ],
-                                  onPicked: (value, repeated) {
+                                  onPicked: (value) {
                                     setState(() {
-                                      if (repeated) {
-                                        // 再次点当前项 → 翻转升/降序
-                                        _sortAscending = !_sortAscending;
-                                      } else {
-                                        _sortBy = value;
-                                        _sortAscending = value == _SortBy.time ? false : true;
-                                      }
+                                      _sortBy = value;
+                                      _sortAscending = value == _SortBy.time ? false : true;
+                                      _invalidateDisplaySongs();
+                                    });
+                                  },
+                                  ascending: _sortAscending,
+                                  onDirectionChanged: (ascending) {
+                                    setState(() {
+                                      _sortAscending = ascending;
                                       _invalidateDisplaySongs();
                                     });
                                   },
@@ -589,8 +608,6 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                   return Stack(
                                     fit: StackFit.expand,
                                     children: [
-                                      if (useBackgroundImage)
-                                        const WallpaperHeaderBackground(),
                                       Container(
                                         decoration: BoxDecoration(
                                           gradient: LinearGradient(
@@ -955,6 +972,14 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                 ),
                               ),
                             ),
+                          // CustomScrollView 不会像 ListView 自动消费 MediaQuery.padding；
+                          // 宿主已把悬浮播放器高度合入底部 padding，这里显式补成可滚动空间，
+                          // 让专辑最后一首歌也能滚到悬浮条上方。
+                          SliverToBoxAdapter(
+                            child: SizedBox(
+                              height: MediaQuery.paddingOf(context).bottom,
+                            ),
+                          ),
                         ],
                       ),
                     ),

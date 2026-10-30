@@ -12,6 +12,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import androidx.media3.common.C;
+import androidx.media3.decoder.flac.FlacLibrary;
+import androidx.media3.decoder.flac.LibflacAudioRenderer;
 import androidx.media3.exoplayer.AudioFocusManager;
 import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl;
 import androidx.media3.exoplayer.DefaultLoadControl;
@@ -174,7 +176,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 if (player.getPlayWhenReady()) {
                     handler.postDelayed(this, 500);
                 } else {
-                    handler.postDelayed(this, 1000);
+                    // 暂停态无需周期轮询；播放态/缓冲态事件会重新启动观察。
                 }
                 break;
             default:
@@ -518,6 +520,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     @Override
     public void onEvents(Player player, Player.Events events) {
         if (events.contains(Player.EVENT_PLAY_WHEN_READY_CHANGED)
+                && player.getPlayWhenReady()) {
+            startWatchingBuffer();
+        }
+        if (events.contains(Player.EVENT_PLAY_WHEN_READY_CHANGED)
                 || events.contains(Player.EVENT_IS_PLAYING_CHANGED)) {
             updatePosition();
             broadcastImmediatePlaybackEvent();
@@ -535,6 +541,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onPlayerError(PlaybackException error) {
+        // MD3Music fork: 硬解初始化/写入失败（Media3 对这两个码会自动关掉 offload 重试，
+        // 见 ExoPlayerImplInternal 的可恢复错误恢复路径）。这里只做记录与状态上报，
+        // 不改既有错误上报语义：Dart 侧据状态显示「本曲已回落软解」。
+        try {
+            if (error != null
+                    && (error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_OFFLOAD_INIT_FAILED
+                        || error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_OFFLOAD_WRITE_FAILED)) {
+                AudioOffloadController.onFailed();
+            }
+        } catch (Throwable ignored) { }
         // MD3Music fork: 完整异常信息写入 USB 日志环（随诊断 usb.log 导出）。
         // 仅向 Dart 传 getMessage() 会丢 cause 链/堆栈（如 32bit FLAC code=2
         // TYPE_UNEXPECTED 无法定位）。截断到 3000 字符防止环形缓冲刷屏。
@@ -909,7 +925,15 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         }
     }
 
-    private static void applyPlayerTag(MediaItem.Builder builder, Object tagObj) {
+    /// MD3Music fork（方向2配套）：standby（活跃播放器之外）预加载时按下 tag 的会话元数据，
+    /// 暂存到 [heldSessionTagMetadata]，等 play() 激活本实例时一次性补写。否则阴影会话
+    /// 在预加载阶段就会拿到下一首的标题/封面，原子岛（shadow 会话的持有方）会提前
+    /// 显示还没开始播的歌。mediaId 不按下：它是源自身的身份，declare 时就写。
+    private Map<?, ?> heldSessionTagMetadata;
+    /// 本实例是否真正播放过（play() 触发过）。shadow 保活只保留「播过」的实例。
+    private boolean everPlayed;
+
+    private void applyPlayerTag(MediaItem.Builder builder, Object tagObj) {
         if (!(tagObj instanceof Map<?, ?>)) return;
         Map<?, ?> tagMap = (Map<?, ?>)tagObj;
         // just_audio 顶层 map.id 是 AudioSource 的内部实例 ID，不是歌曲 ID。
@@ -918,7 +942,18 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (tagMediaId != null && !tagMediaId.isEmpty()) {
             builder.setMediaId(tagMediaId);
         }
+        if (SHADOW_SESSION_MODE && sActivePlayer != null && sActivePlayer != this) {
+            heldSessionTagMetadata = tagMap;
+            return;
+        }
         MediaMetadata.Builder metadata = new MediaMetadata.Builder();
+        applyTagMetadataFields(metadata, tagMap);
+        builder.setMediaMetadata(metadata.build());
+    }
+
+    /// 提取 tag 中的标题/艺术家/专辑/封面 URI 写进 MediaMetadata.Builder
+    /// （applyPlayerTag 与 play() 激活补写共用）。字段缺失则保留 item 原值。
+    private static void applyTagMetadataFields(MediaMetadata.Builder metadata, Map<?, ?> tagMap) {
         String title = (String)tagMap.get("title");
         if (title != null && !title.isEmpty()) metadata.setTitle(title);
         String artist = (String)tagMap.get("artist");
@@ -932,7 +967,32 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (artUri != null && !artUri.isEmpty()) {
             metadata.setArtworkUri(android.net.Uri.parse(artUri));
         }
-        builder.setMediaMetadata(metadata.build());
+    }
+
+    /// play() 激活本实例时补写按住的 tag 元数据（与活跃元数据相同值由调用方后续
+    /// 推送幂等合并；镜像未覆盖到时，此写入保证跨fade 交叉点元数据即刻正确）。
+    /// 与原值一致时不替换，避免多余的 MediaItem 替换事件。
+    private void reApplyHeldSessionTagMetadata() {
+        Map<?, ?> tagMap = heldSessionTagMetadata;
+        heldSessionTagMetadata = null;
+        if (tagMap == null || player == null) return;
+        try {
+            androidx.media3.common.MediaItem cur = player.getCurrentMediaItem();
+            if (cur == null) return;
+            MediaMetadata m = cur.mediaMetadata;
+            String curTitle = m.title != null ? m.title.toString() : null;
+            String curArtist = m.artist != null ? m.artist.toString() : null;
+            String title = (String)tagMap.get("title");
+            String artist = (String)tagMap.get("artist");
+            if (equalsOrBothNull(curTitle, title) && equalsOrBothNull(curArtist, artist)) return;
+            MediaMetadata.Builder metadata = m.buildUpon();
+            applyTagMetadataFields(metadata, tagMap);
+            androidx.media3.common.MediaItem updated =
+                    cur.buildUpon().setMediaMetadata(metadata.build()).build();
+            player.replaceMediaItem(player.getCurrentMediaItemIndex(), updated);
+        } catch (Exception e) {
+            Log.w("AudioFocusFork", "reApplyHeldSessionTagMetadata failed: " + e);
+        }
     }
 
     private MediaSource[] getAudioSourcesArray(final Object json) {
@@ -1038,11 +1098,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     private void ensurePlayerInitialized() {
         if (player == null) {
+            // MD3Music fork: 硬解能力探测需要 AudioManager，在此注入 application context
+            // （Kotlin 插件注册时也会注入一次，两处幂等）。
+            AudioOffloadCapabilities.attachContext(context);
             // MD3Music fork: 子类化 DefaultRenderersFactory 并 override buildAudioSink()，
             // 注入 USB 独占输出拦截层（UsbAudioSinkController.wrap）。
             // 包装器始终存在（未开启独占时完全透传），因此运行时开关无需重建 ExoPlayer。
             // 注意：本机 Media3 为 1.4.1，buildAudioSink 签名只有 3 个参数（无 enableOffload）。
-            DefaultRenderersFactory drf = new DefaultRenderersFactory(context) {
+            var drf = new DefaultRenderersFactory(context) {
                 @Override
                 public AudioSink buildAudioSink(
                         Context ctx, boolean enableFloatOutput, boolean enableAudioTrackPlaybackParams) {
@@ -1053,9 +1116,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     AudioSink defaultSink = new DefaultAudioSink.Builder(ctx)
                             .setEnableFloatOutput(enableFloatOutput)
                             .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                            // MD3Music fork: 抗卡顿档加深 PCM 缓冲（默认 250~750ms 在后台
+                            // 高负载下余量不够），「Direct PCM + 低延迟」档仍用 Media3 默认值。
+                            // 见 AdaptiveAudioTrackBufferSizeProvider 的取舍说明。
+                            .setAudioTrackBufferSizeProvider(
+                                    new AdaptiveAudioTrackBufferSizeProvider())
                             .setAudioProcessorChain(
                                     new DefaultAudioSink.DefaultAudioProcessorChain(
                                             new ViperMasterProcessor()))
+                            // MD3Music fork: 硬件解码播放（offload）能力收窄 + 实际状态回报。
+                            // provider 只用「设备能力探测快照 + 机型黑名单」收窄，不随开关变化
+                            // （否则改开关后要等一次渲染器 enable 才生效，表现为开关没反应）；
+                            // listener 把 AudioTrack 是否真的 offload、是否进入休眠调度
+                            // 收敛成状态，供设置页「硬件解码播放」页展示。
+                            .setAudioOffloadSupportProvider(
+                                    AudioOffloadController.policyProvider(ctx))
+                            .setExperimentalAudioOffloadListener(
+                                    AudioOffloadController.listener())
                             .build();
                     // MD3Music fork: 系统 Direct PCM 档的拦截层。必须放在
                     // UsbAudioSinkController.wrap 之内（即更靠近 delegate），因为
@@ -1063,6 +1140,11 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     // 且 DirectPcmController 需要 AudioManager 才能探测原生输出率。
                     DirectPcmController.attachContext(ctx);
                     return new DirectPcmSink(UsbAudioSinkController.wrap(defaultSink, ctx));
+                }
+
+                /** 供扩展渲染器（libflac，P0-5）复用同一 USB 拦截 sink 构建逻辑。 */
+                public AudioSink buildUsbAudioSinkForExtension() {
+                    return buildAudioSink(context, false, false);
                 }
             };
             // MD3Music fork: float 输出曾用于让 24/32bit 高规格音频走高解析，
@@ -1073,8 +1155,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             RenderersFactory renderersFactory = (eventHandler, videoListener, audioListener, textOutput, metadataOutput) -> {
                 Renderer[] defaultRenderers = drf.createRenderers(
                         eventHandler, videoListener, audioListener, textOutput, metadataOutput);
-                Renderer[] allRenderers = Arrays.copyOf(defaultRenderers, defaultRenderers.length + 1);
+                // MD3Music fork: P0-5 —— 追加 libflac 扩展渲染器（输入缓冲可增长，无 64KB 上限），
+                // 仅当 c2 解码器标记「超出能力」（FLAC 且 maxInputSize>65536，见
+                // MediaCodecAudioRenderer.supportsFormatInternal）时被 TrackSelector 选中；
+                // 其余格式仍优先走 MediaCodec（数组序在前 + 能力更高）。
+                boolean flacExtensionAvailable = FlacLibrary.isAvailable();
+                if (flacExtensionAvailable) {
+                    android.util.Log.i("UsbDiag", "flac extension renderer enabled");
+                }
+                int extra = 1 + (flacExtensionAvailable ? 1 : 0);
+                Renderer[] allRenderers = Arrays.copyOf(defaultRenderers, defaultRenderers.length + extra);
                 allRenderers[defaultRenderers.length] = new ObserverRenderer();
+                if (flacExtensionAvailable) {
+                    allRenderers[defaultRenderers.length + 1] = new LibflacAudioRenderer(
+                            eventHandler,
+                            audioListener,
+                            drf.buildUsbAudioSinkForExtension());
+                }
                 return allRenderers;
             };
             ExoPlayer.Builder builder = new ExoPlayer.Builder(context, renderersFactory);
@@ -1107,7 +1204,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                         android.util.Log.w("UsbAudioSinkCtrl", "stall recovery seek failed: " + e);
                     }
                 });
-            });
+            }, AudioPlayer.this);
             // MD3Music fork: 固定 audioSessionId，使 Media3 MediaSession 与 AudioTrack
             // 关联。系统（小米等）按「AudioTrack 的 audioSessionId 是否与 MediaSession
             // 关联」判定播放器可识别性（hasUid）：未关联时独占型中断（如 B 站视频
@@ -1125,7 +1222,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             player.setTrackSelectionParameters(
                 player.getTrackSelectionParameters()
                     .buildUpon()
-                    .setAudioOffloadPreferences(audioOffloadPreferences)
+                    // MD3Music fork: 硬解偏好由进程级开关翻译而来（默认 DISABLED，
+                    // 与改动前行为一致）；开关变化经 setGlobalAudioOffloadEnabled 下发。
+                    .setAudioOffloadPreferences(buildOffloadPrefs())
                     .build()
             );
             setAudioSessionId(player.getAudioSessionId());
@@ -1158,6 +1257,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 android.content.Intent launch =
                         context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
                 if (launch != null) {
+                    // MD3Music fork v21（车机卡片）：媒体卡片/通知点击走这里——携带深链
+                    // 标记，由 MainActivity 在投屏虚拟屏上识别并直达全屏歌词（手机主屏
+                    // 维持旧行为）。
+                    launch.putExtra("md3_open_lyric_fullscreen", true);
                     android.app.PendingIntent activityIntent = android.app.PendingIntent.getActivity(
                             context, 0, launch,
                             android.app.PendingIntent.FLAG_UPDATE_CURRENT
@@ -1178,6 +1281,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     // MD3Music fork: 让自定义命令（桌面歌词/收藏）对所有 controller 可用，
                     // 否则内部媒体通知 controller 的 customLayout 会把它们过滤成禁用/移除，
                     // 通知栏自定义按钮无法渲染（阶段4）。
+                    // MD3Music fork v48：Builder() 起底是空集——上面三个 add 会把默认全量
+                    // 授权替换成仅 3 条，导致 legacy 控制器（vivo 原子随身听等）的
+                    // setRating / PLAY_MODE 自定义命令在 MediaSessionLegacyStub 的
+                    // isSessionCommandAvailable 门被静默丢弃（真机实证：岛按钮不灰但点了
+                    // 无反应）。这里显式补两条岛链路必需命令：
+                    // - COMMAND_CODE_SESSION_SET_RATING：岛心形收藏（HeartRating）；
+                    // - VMM_ACTION_PLAY_MODE：岛循环模式切换（1=列表/2=单曲/3=随机）。
                     MediaSession.ConnectionResult.AcceptedResultBuilder builder =
                             new MediaSession.ConnectionResult.AcceptedResultBuilder(session);
                     androidx.media3.session.SessionCommands.Builder cmdBuilder =
@@ -1185,6 +1295,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     cmdBuilder.add(CMD_TOGGLE_DESKTOP_LYRIC);
                     cmdBuilder.add(CMD_TOGGLE_FAVORITE);
                     cmdBuilder.add(CMD_TOGGLE_TRANSLATION);
+                    cmdBuilder.add(androidx.media3.session.SessionCommand
+                            .COMMAND_CODE_SESSION_SET_RATING);
+                    cmdBuilder.add(new androidx.media3.session.SessionCommand(
+                            VMM_ACTION_PLAY_MODE, new android.os.Bundle()));
                     builder.setAvailableSessionCommands(cmdBuilder.build());
                     return builder.build();
                 }
@@ -1241,6 +1355,40 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                             listener.onToggleDesktopLyric();
                         } else if (CMD_TOGGLE_FAVORITE.customAction.equals(action)) {
                             listener.onToggleFavorite();
+                        } else if (VMM_ACTION_PLAY_MODE.equals(action)) {
+                            // MD3Music fork v45：原子随身听循环模式切换。
+                            // v48：协议 extras 用 Long 装 LOOP_MODE——getInt 读 Long 拿 0，
+                            // 按 Number 取值容忍两种类型。
+                            android.os.Bundle modeArgs = args != null ? args : new android.os.Bundle();
+                            Object modeRaw = modeArgs.get(VMM_KEY_LOOP_MODE);
+                            int mode = modeRaw instanceof Number
+                                    ? ((Number) modeRaw).intValue() : 1;
+                            listener.onPlayMode(mode);
+                        }
+                    }
+                    return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_SUCCESS));
+                }
+
+                // MD3Music fork v45：原子随身听心形收藏——岛经 setRating 发
+                // HeartRating，转发 App 自有收藏切换（此前未覆写 → 岛报
+                // ERROR_NOT_SUPPORTED，心形点击无反应）。HeartRating 是
+                // androidx.media3.common 的顶级类（非 Rating 嵌套类）。
+                // v50 修复"只能收藏不能取消"：旧条件 isHeart()==true 才转发，
+                // 岛发的取消（heart=false）被静默丢弃。岛发的是目标态，App 侧
+                // 是 toggle——与 Dart 推送的当前镜像（sVivoFavHeart）不一致才
+                // 切一次，一致则 no-op（岛状态过期时防误切）；镜像未知(null)
+                // 时尽力切换。
+                @Override
+                public ListenableFuture<SessionResult> onSetRating(
+                        MediaSession session, MediaSession.ControllerInfo controller,
+                        String mediaId, androidx.media3.common.Rating rating) {
+                    final CustomActionListener listener = sCustomActionListener;
+                    if (listener != null
+                            && rating instanceof androidx.media3.common.HeartRating) {
+                        boolean want = ((androidx.media3.common.HeartRating) rating).isHeart();
+                        Boolean current = sVivoFavHeart;
+                        if (current == null || current != want) {
+                            listener.onToggleFavorite();
                         }
                     }
                     return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_SUCCESS));
@@ -1248,8 +1396,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             });
             mediaSession = sessionBuilder.build();
             // MediaSession 可由交叉淡化预加载创建，不在构造时抢占活跃播放器或归入 host。
-            // 只有 play() 才确定活跃会话（play 内已含 sActivePlayer 收敛 + 会话重建 +
-            // syncSingleSessionToHost）；保留延迟到达的自定义按钮状态。
+            // 只有 play() 才确定活跃会话；保留延迟到达的自定义按钮状态。
             applyPendingSessionCustomActions();
     }
 
@@ -1266,6 +1413,90 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     /// 由 App 设置：headless 引擎传 false（禁用媒体会话），前台 UI 引擎传 true。
     public static void setMediaSessionEnabled(boolean enabled) {
         sMediaSessionEnabled = enabled;
+    }
+
+    // ==== MD3Music fork: 硬件解码播放（audio offload）总开关 ====
+    //
+    // 为什么是「进程级静态开关 + 广播」而不是 per-player 通道方法：
+    // 1) 与本 fork 既有做法一致（setMediaSessionEnabled / NormalizationGainAudioSink
+    //    .setGlobalGainDb 都是静态广播），不污染 just_audio 上游 Dart API；
+    // 2) 主播放器、交叉淡化辅播放器、以及 headless 引擎的播放器都能被一次调用覆盖；
+    // 3) 新创建的播放器在 ensurePlayerInitialized 里按同一静态标志初始化，不存在漏配。
+    //
+    // 只改 TrackSelectionParameters 即可让 Media3 重选轨并重建 AudioTrack
+    // （TrackSelectorResult.isEquivalent 会比较 rendererConfigurations，其中含
+    // offloadModePreferred），因此**不需要重建播放器**。代价是一次极短的 sink 重配断音，
+    // 所以 Dart 侧把「恢复硬解」安排在换源点生效。
+
+    /// 由 App（Kotlin 插件）下发：是否请求硬解。返回最新状态快照。
+    public static Map<String, Object> setGlobalAudioOffloadEnabled(boolean enabled) {
+        AudioOffloadController.setEffective(enabled);
+        AudioPlayer[] snapshot;
+        synchronized (sPlayers) {
+            snapshot = sPlayers.toArray(new AudioPlayer[0]);
+        }
+        for (AudioPlayer p : snapshot) {
+            try {
+                p.applyAudioOffloadPreferences();
+            } catch (Throwable t) {
+                Log.w(TAG, "apply offload to player failed: " + t);
+            }
+        }
+        return AudioOffloadController.status();
+    }
+
+    /// 把当前静态开关翻译成 TrackSelectionParameters 下发（幂等；值未变时 Media3 内部短路）。
+    private void applyAudioOffloadPreferences() {
+        if (player == null) {
+            // 播放器尚未初始化：ensurePlayerInitialized 会按同一静态标志补发。
+            return;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyAudioOffloadPreferencesOnMain();
+        } else {
+            handler.post(this::applyAudioOffloadPreferencesOnMain);
+        }
+    }
+
+    private void applyAudioOffloadPreferencesOnMain() {
+        final ExoPlayer p = player;
+        if (p == null) return;
+        try {
+            p.setTrackSelectionParameters(
+                    p.getTrackSelectionParameters()
+                            .buildUpon()
+                            .setAudioOffloadPreferences(buildOffloadPrefs())
+                            .build());
+        } catch (Throwable t) {
+            Log.w(TAG, "applyAudioOffloadPreferences failed: " + t);
+        }
+    }
+
+    /**
+     * 构造当前的 offload 偏好。
+     *
+     * <p>关闭态一律 DISABLED（即便构造期参数误传了 ENABLED，也以本开关为准，
+     * 避免「开关关了却仍在硬解」的悖论）。
+     *
+     * <p>开启态：mode=ENABLED，两个约束都取 false，理由：
+     * <ul>
+     *   <li>{@code isGaplessSupportRequired=false}：本 App 全走「单源 + 换源切歌」，
+     *       不做 gapless 播放列表；设为 true 会让 API 29–32 上绝大多数带 encoder delay
+     *       的 MP3 永久失去 offload（DefaultTrackSelector#rendererSupportsOffload）；</li>
+     *   <li>{@code isSpeedChangeSupportRequired=false}：该字段是**约束**而非能力开关，
+     *       设 true 会在多数设备把 offload 直接关死（社区 issue #1110）；变速保护由
+     *       Dart 侧「倍速≠1.0 即让路」承担。</li>
+     * </ul>
+     */
+    private AudioOffloadPreferences buildOffloadPrefs() {
+        final boolean on = AudioOffloadController.isEffective();
+        return new AudioOffloadPreferences.Builder()
+                .setIsGaplessSupportRequired(false)
+                .setIsSpeedChangeSupportRequired(false)
+                .setAudioOffloadMode(on
+                        ? AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
+                        : AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED)
+                .build();
     }
 
     // MD3Music fork: 媒体3会话唯一 ID（构造时生成）与全局递增计数器（避免 SESSION_ID 判重冲突）
@@ -1314,6 +1545,107 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         return p != null ? p.mediaSession : null;
     }
 
+    /// shadow 播放态镜像的总开关（方向3）：仅 vivo/iQOO 上为 true。由 media3
+    /// legacy stub 查询；开启时 stub 把活跃会话的 PlaybackState 同步给 shadow
+    /// 会话，否则岛/锁屏媒体控件在淡化切歌后因 shadow 停在 paused 而整块消失
+    /// （真机 6.0.5 修复版实测：会话保活+元数据镜像后仍会消失，缺的就是播放态）。
+    public static boolean isShadowPlaybackMirrorEnabled() {
+        return SHADOW_SESSION_MODE;
+    }
+
+    /// 诊断辅助：shadow 播放态镜像每次广播打一行 logcat，便于真机核对链路在工作
+    /// （预期现象：淡化收尾后岛/锁屏继续显示新歌并走进度）。
+    public static void logShadowPlaybackSync(
+            androidx.media3.session.legacy.PlaybackStateCompat state) {
+        Log.i("AudioFocusFork", "shadow playback mirror: state=" + state.getState()
+                + " pos=" + state.getPosition() + " speed=" + state.getPlaybackSpeed());
+    }
+
+    // ==== MD3Music fork（方向2·shadow 会话保活，2026-10-16） ====
+    // vivo 原子随身听（vivomusicmix）在冷启动时经 MediaBrowserServiceCompat 绑定本 App
+    // 的媒体会话，之后把该 MediaControllerCompat 常驻钉在**首个会话对象**上：交叉淡化
+    // 切换活跃播放器时若把旧会话 release()，其 Binder 死亡而原子岛不会重连（真机实测
+    // 表现为第二首起歌词/标题/封面全部失效，直到重启 App；关闭交叉淡化立即恢复）。
+    // 因此仅 vivo/iQOO 机型（SHADOW_SESSION_MODE）：
+    //   1) 收敛时不 release 非活跃播放器的会话，改为保留（shadow 会话）；
+    //   2) 元数据镜像链路（updateActiveSession* 三处）把与活跃会话同一份内容写入
+    //      shadow，使原子岛持有的旧会话始终携带当前曲目的标题/艺术家/封面/LyricInfo，
+    //      且 MediaSessionCompat.resendVivoLrcChange 的静态广播会同时抵达 shadow；
+    //   3) standby 预加载时按住 tag 的元数据（applyPlayerTag hold），play() 激活时
+    //      一次性补写——避免 shadow 在预加载阶段提前显示下一首的标题。
+    // 非 vivo 机型保持原 release 行为（保证系统 Sessions Stack 干净）。
+    private static final boolean SHADOW_SESSION_MODE = isShadowSessionBrand();
+
+    private static boolean isShadowSessionBrand() {
+        try {
+            final String manufacturer = android.os.Build.MANUFACTURER;
+            final String brand = android.os.Build.BRAND;
+            if (manufacturer != null
+                    && manufacturer.toLowerCase(java.util.Locale.US).contains("vivo")) {
+                return true;
+            }
+            if (brand != null) {
+                final String lb = brand.toLowerCase(java.util.Locale.US);
+                if (lb.contains("vivo") || lb.contains("iqoo")) return true;
+            }
+        } catch (Exception ignore) {}
+        return false;
+    }
+
+    /// shadow 会话镜像：把与活跃播放器同一份元数据写入其它存活播放器的会话。
+    /// 仅 SHADOW_SESSION_MODE 生效；走与活跃会话相同的 applySession* 守卫
+    /// （generation 防旧帧 + 幂等跳过），不额外引入写入路径差异。
+    private static void mirrorSessionMetadata(
+            final String expectedMediaId, final long generation,
+            final String title, final String artist, final Bitmap art, final String artUri) {
+        if (!SHADOW_SESSION_MODE) return;
+        final AudioPlayer active = sActivePlayer;
+        if (active == null) return;
+        final AudioPlayer[] snapshot;
+        synchronized (sPlayers) { snapshot = sPlayers.toArray(new AudioPlayer[0]); }
+        for (final AudioPlayer other : snapshot) {
+            if (other == null || other == active || other.mediaSession == null) continue;
+            try {
+                other.applySessionMetadata(
+                        expectedMediaId, generation, title, artist, art, artUri);
+            } catch (Exception ignore) {}
+        }
+    }
+
+    private static void mirrorSessionTitleArtist(
+            final String expectedMediaId, final long generation,
+            final String title, final String artist) {
+        if (!SHADOW_SESSION_MODE) return;
+        final AudioPlayer active = sActivePlayer;
+        if (active == null) return;
+        final AudioPlayer[] snapshot;
+        synchronized (sPlayers) { snapshot = sPlayers.toArray(new AudioPlayer[0]); }
+        for (final AudioPlayer other : snapshot) {
+            if (other == null || other == active || other.mediaSession == null) continue;
+            try {
+                other.applySessionTitleArtist(expectedMediaId, generation, title, artist);
+            } catch (Exception ignore) {}
+        }
+    }
+
+    private static void mirrorSessionTitleArtistAndLyricInfo(
+            final String expectedMediaId, final long generation,
+            final String title, final String artist, final String lyricInfo,
+            final String btTitle, final String btArtist) {
+        if (!SHADOW_SESSION_MODE) return;
+        final AudioPlayer active = sActivePlayer;
+        if (active == null) return;
+        final AudioPlayer[] snapshot;
+        synchronized (sPlayers) { snapshot = sPlayers.toArray(new AudioPlayer[0]); }
+        for (final AudioPlayer other : snapshot) {
+            if (other == null || other == active || other.mediaSession == null) continue;
+            try {
+                other.applySessionTitleArtistAndLyricInfo(
+                        expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
+            } catch (Exception ignore) {}
+        }
+    }
+
     /// 幂等地把活跃会话加入已注册的 host（重复加入会抛 IllegalArgumentException）。
     /// MD3Music fork（方向1·安全收敛）：再把「非活跃播放器」的会话从 host 移除（不 release
     /// 播放器、不置 null），使系统仅暴露当前活跃播放器的一个会话。调用方保证 sActivePlayer
@@ -1337,11 +1669,23 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 if (ms == null) continue;
                 try {
                     if (host.isSessionAdded(ms)) host.removeSession(ms);
-                    // MD3Music fork：彻底 release 非活跃会话，从系统 Sessions Stack 注销，
-                    // 使 SystemUI/媒体卡片只跟随当前活跃播放器的一个会话（避免旧歌会话
-                    // 干扰导致封面不更新/显示旧歌）。
-                    try { ms.release(); } catch (Exception ignore) {}
-                    other.mediaSession = null;
+                    if (SHADOW_SESSION_MODE) {
+                        // MD3Music fork（方向2·shadow 会话保活）：vivo 原子随身听把控制器
+                        // 钉在冷启动绑定的首个会话上（release 后 Binder 死亡且不会重连），
+                        // 已播放过的实例（everPlayed）保留会话对象不释放，由 mirror 链路
+                        // 持续同步元数据；从未播放过的实例（如纯备用播放器）仍 release，
+                        // 避免系统栈里多出一张空会话卡片。
+                        if (!other.everPlayed) {
+                            try { ms.release(); } catch (Exception ignore) {}
+                            other.mediaSession = null;
+                        }
+                    } else {
+                        // MD3Music fork：彻底 release 非活跃会话，从系统 Sessions Stack 注销，
+                        // 使 SystemUI/媒体卡片只跟随当前活跃播放器的一个会话（避免旧歌会话
+                        // 干扰导致封面不更新/显示旧歌）。
+                        try { ms.release(); } catch (Exception ignore) {}
+                        other.mediaSession = null;
+                    }
                 } catch (Exception ignore) {}
             }
         }
@@ -1365,14 +1709,85 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 if (ms == null) continue;
                 try {
                     if (host.isSessionAdded(ms)) host.removeSession(ms);
-                    // MD3Music fork：play() 收敛时同样彻底 release 非活跃会话，从系统
-                    // Sessions Stack 注销，避免跨fade 角色互换后多个 md3music 会话残留在
-                    // 系统栈里干扰 SystemUI/媒体卡片（显示旧歌封面）。该播放器下次 play()
-                    // 时会按 createMediaSession 重建会话（见 play()）。
-                    try { ms.release(); } catch (Exception ignore) {}
-                    other.mediaSession = null;
+                    if (SHADOW_SESSION_MODE) {
+                        // MD3Music fork（方向2·shadow 会话保活）：同 ensureActiveSessionHosted
+                        // —— vivo 上保留已播放过的实例的会话（mirror 养着），未播放过的
+                        // 仍 release；其余机型按原注释 release（见上方）。
+                        if (!other.everPlayed) {
+                            try { ms.release(); } catch (Exception ignore) {}
+                            other.mediaSession = null;
+                        }
+                    } else {
+                        // MD3Music fork：play() 收敛时同样彻底 release 非活跃会话，从系统
+                        // Sessions Stack 注销，避免跨fade 角色互换后多个 md3music 会话残留在
+                        // 系统栈里干扰 SystemUI/媒体卡片（显示旧歌封面）。该播放器下次 play()
+                        // 时会按 createMediaSession 重建会话（见 play()）。
+                        try { ms.release(); } catch (Exception ignore) {}
+                        other.mediaSession = null;
+                    }
                 } catch (Exception ignore) {}
             }
+        }
+    }
+
+    /// MD3Music fork v50：Dart 推送岛状态回显（循环模式 1/2/3 + 当前曲红心），存静态
+    /// 后立即重发一次会话 metadata——岛端 onMetadataChanged 才会读到新值。播放器未
+    /// 就绪时静态值由下一次 applySessionMetadata（切歌/封面注入）自然带上。
+    public static void updateVivoIslandState(int loopMode, Boolean heart) {
+        sVivoLoopMode = loopMode;
+        sVivoFavHeart = heart;
+        republishAllVivoIsland();
+    }
+
+    /// v50：无参版（MainActivity.onResume 兜底用）——按最近一次 Dart 推送的
+    /// 状态原样重发，触发岛端 onMetadataChanged 刷新源/控制器。
+    public static void republishVivoIslandState() {
+        republishAllVivoIsland();
+    }
+
+    /// v50：活跃会话 + shadow 会话一并重发（审查 P1 修复）——岛可能钉在冷启动
+    /// 绑定的首个会话上（交叉淡化换活跃会话后仍在旧会话读 metadata），只重发
+    /// 活跃会话会让这类岛收不到回显。对每个 everPlayed 实例幂等重发，全部同
+    /// main looper 串行。
+    private static void republishAllVivoIsland() {
+        AudioPlayer p = sActivePlayer;
+        if (p != null) {
+            p.republishVivoIslandMetadata();
+        }
+        synchronized (sPlayers) {
+            for (AudioPlayer other : sPlayers) {
+                if (other == null || other == p || !other.everPlayed) continue;
+                try {
+                    other.republishVivoIslandMetadata();
+                } catch (Throwable ignore) {
+                    // 单个 shadow 会话失败不影响其余（同本文件 mirror 系列口径）。
+                }
+            }
+        }
+    }
+
+    /// v50：把当前会话 metadata 原地重发（只改 overallRating 与 extras，不动播放）。
+    /// 与 applySessionMetadata 同机制（replaceMediaItem 同 uri 只更新 metadata），
+    /// v45 起真机验证不打断播放。
+    private void republishVivoIslandMetadata() {
+        try {
+            MediaItem cur = player.getCurrentMediaItem();
+            if (cur == null) return;
+            androidx.media3.common.MediaMetadata.Builder mb = cur.mediaMetadata.buildUpon();
+            if (sVivoFavHeart != null) {
+                mb.setOverallRating(new androidx.media3.common.HeartRating(sVivoFavHeart));
+            }
+            android.os.Bundle extras = cur.mediaMetadata.extras != null
+                    ? new android.os.Bundle(cur.mediaMetadata.extras)
+                    : new android.os.Bundle();
+            if (sVivoLoopMode >= 1) {
+                extras.putLong(VMM_KEY_LOOP_MODE, sVivoLoopMode);
+            }
+            mb.setExtras(extras);
+            int index = player.getCurrentMediaItemIndex();
+            player.replaceMediaItem(index, cur.buildUpon().setMediaMetadata(mb.build()).build());
+        } catch (Exception e) {
+            Log.w("AudioFocusFork", "republishVivoIslandMetadata failed: " + e);
         }
     }
 
@@ -1389,7 +1804,47 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             p.applySessionMetadata(
                     expectedMediaId, generation, title, artist, art, artUri);
         } else {
-            Log.w("AudioFocusFork", "updateActiveSessionMetadata: no active AudioPlayer");
+            // v42（元数据先行）：播放器未就绪——暂存为 pending，play() 时回放。
+            Log.w("AudioFocusFork", "updateActiveSessionMetadata: no active AudioPlayer, pending");
+            sPendingMetadata = new PendingMetadata(
+                    expectedMediaId, generation, title, artist, art, artUri);
+        }
+        mirrorSessionMetadata(expectedMediaId, generation, title, artist, art, artUri);
+    }
+
+    /** v42：早到元数据的暂存快照（单份，后到覆盖先到——恢复链只关心最新一份）。 */
+    private static volatile PendingMetadata sPendingMetadata;
+
+    private static final class PendingMetadata {
+        final String expectedMediaId;
+        final long generation;
+        final String title;
+        final String artist;
+        final Bitmap art;
+        final String artUri;
+
+        PendingMetadata(String expectedMediaId, long generation, String title,
+                String artist, Bitmap art, String artUri) {
+            this.expectedMediaId = expectedMediaId;
+            this.generation = generation;
+            this.title = title;
+            this.artist = artist;
+            this.art = art;
+            this.artUri = artUri;
+        }
+    }
+
+    /** v42：活跃播放器就位时回放 pending 元数据（一次即清，防止陈旧覆盖后续推送）。 */
+    private void applyPendingSessionMetadataIfAny() {
+        PendingMetadata pending = sPendingMetadata;
+        if (pending == null) return;
+        sPendingMetadata = null;
+        Log.i("AudioFocusFork", "applying pending session metadata: " + pending.title);
+        try {
+            applySessionMetadata(pending.expectedMediaId, pending.generation,
+                    pending.title, pending.artist, pending.art, pending.artUri);
+        } catch (Throwable t) {
+            Log.w("AudioFocusFork", "apply pending metadata failed: " + t);
         }
     }
 
@@ -1399,9 +1854,20 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         AudioPlayer p = sActivePlayer;
         if (p != null) {
             p.applySessionTitleArtist(expectedMediaId, generation, title, artist);
+            // v43（审查 P1）：活跃播放器已存在，任何滞留 pending 都是陈旧的——清。
+            sPendingMetadata = null;
         } else {
-            Log.w("AudioFocusFork", "updateActiveSessionTitleArtist: no active AudioPlayer");
+            // v42：标题/歌手早到同样暂存。v43：加代次守卫——旧歌的 lite pending
+            // 不得阻止新歌（generation 更大）的标题覆盖，否则岛/锁屏会短暂显示
+            // 上一首的歌名（"错信息卡片"比"无信息卡片"更扎眼）。
+            Log.w("AudioFocusFork", "updateActiveSessionTitleArtist: no active AudioPlayer, pending-lite");
+            PendingMetadata cur = sPendingMetadata;
+            if (cur == null || generation >= cur.generation) {
+                sPendingMetadata = new PendingMetadata(
+                        expectedMediaId, generation, title, artist, null, null);
+            }
         }
+        mirrorSessionTitleArtist(expectedMediaId, generation, title, artist);
     }
 
     /// 写媒体3 MediaItem 的 MediaMetadata（标题/艺术家/内嵌封面位图）。
@@ -1536,7 +2002,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     // 绝不写 LYRICS_LINE（单行模式信号）。
     private static final String UCAR_LYRICS_WHOLE = "ucar.media.metadata.LYRICS_WHOLE";
     private static final String UCAR_LYRICS_STATUS = "ucar.media.metadata.LYRICS_STATUS";
-    private static final String VMM_SUPPORT_EVENT = "vivomusicmix.media.metadata.support_event";
+    // v40：support_event 的写入收敛到通用转换路径（LegacyConversions /
+    // legacy MediaSessionCompat 两份常量），本类不再按歌词有无增删能力位。
 
     /**
      * 从 lyricInfo JSON 提取可用于 Vivo 车机的整段 LRC：
@@ -1627,6 +2094,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         } else {
             Log.w("AudioFocusFork", "updateActiveSessionTitleArtistAndLyricInfo: no active AudioPlayer");
         }
+        mirrorSessionTitleArtistAndLyricInfo(
+                expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
     }
 
     // ==== MD3Music fork: 媒体3自定义命令（阶段4，自研 action 迁往媒体3） ====
@@ -1637,10 +2106,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     public interface CustomActionListener {
         void onToggleDesktopLyric();
         void onToggleFavorite();
-        // MD3Music fork（阶段6·修复媒体卡片上一首/下一首）：
+        // MD3Music fork（阶段·修复媒体卡片上一首/下一首）：
         // 原生 PREVIOUS/NEXT 命令拦截后回调，走 App 自有切歌逻辑。
         void onPrevious();
         void onNext();
+        // MD3Music fork v45：vivo 原子随身听循环模式按钮——岛发
+        // vivomusicmix.media.action.PLAY_MODE（extras 带目标 LOOP_MODE 1/2/3）。
+        void onPlayMode(int loopMode);
         void onPause();
     }
 
@@ -1703,6 +2175,18 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             new SessionCommand(
                     "io.github.andrealtb.lockscreenlyrics.action.TOGGLE_TRANSLATION",
                     new android.os.Bundle());
+    // MD3Music fork v45：vivo 原子随身听循环模式——岛经 media3 自定义命令发
+    // PLAY_MODE（extras 带目标 LOOP_MODE 1=列表/2=单曲/3=随机）。
+    public static final String VMM_ACTION_PLAY_MODE = "vivomusicmix.media.action.PLAY_MODE";
+    public static final String VMM_KEY_LOOP_MODE = "vivomusicmix.media.metadata.LOOP_MODE";
+
+    // MD3Music fork v50：原子随身听状态回显源（Dart 权威 → AudioPlaybackService 转推）。
+    // 岛只在 metadata 变化时读 LOOP_MODE（岛端 c0.l0）来显示并计算下一次点击；此前
+    // extras 取自 media3 player 的 repeat/shuffle（Dart 自管队列下恒为列表循环），岛
+    // 永远收到 1 → 每次点击都发"单曲"（真机症状：循环模式只能切到单曲循环）。
+    // sVivoLoopMode 0=未推送（发布时跳过）；sVivoFavHeart null=未知（跳过 RATING）。
+    public static volatile int sVivoLoopMode = 0;
+    public static volatile Boolean sVivoFavHeart = null;
 
     /// 由 App 注册，接收媒体3通知按钮触发的自定义命令。
     public static void setCustomActionListener(CustomActionListener listener) {
@@ -1827,8 +2311,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             if (!isExternalMetadataGenerationCurrent(generation)) return;
             MediaItem cur = player.getCurrentMediaItem();
             if (cur == null) {
-                // 会话元数据先于 MediaItem 到达（切歌竞态）：暂存，等
-                // onMediaItemTransition 后再落（6.0.2）。
                 deferSessionMetadataUpdate(
                         expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
                 return;
@@ -1871,11 +2353,12 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             if (carLrc == null || carLrc.isEmpty()) {
                 newExtras.remove(UCAR_LYRICS_WHOLE);
                 newExtras.remove(UCAR_LYRICS_STATUS);
-                newExtras.remove(VMM_SUPPORT_EVENT);
+                // MD3Music fork v40：能力位（support_event）不再随歌词有无增删——
+                // 它描述的是 App 能力而非当前曲目内容；无歌词歌随后会由通用转换
+                // 路径（LegacyConversions/MediaSessionCompat 常量）无条件补写。
             } else {
                 newExtras.putString(UCAR_LYRICS_WHOLE, carLrc);
                 newExtras.putLong(UCAR_LYRICS_STATUS, 0L);
-                newExtras.putLong(VMM_SUPPORT_EVENT, 31L);
             }
             MediaMetadata updated = mb.setExtras(newExtras).build();
             player.replaceMediaItem(
@@ -1949,20 +2432,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             MediaMetadata.Builder mb = cur.mediaMetadata.buildUpon();
             if (title != null && !title.isEmpty()) mb.setTitle(title);
             if (artist != null && !artist.isEmpty()) mb.setArtist(artist);
+            // MD3Music fork v50：红心回显——岛读 metadata RATING 的 heart 位点亮红心
+            // 按钮（岛端 c0.l0；melodist/YTM 补丁同款）。null=未知时不写。
+            if (sVivoFavHeart != null) {
+                mb.setOverallRating(new androidx.media3.common.HeartRating(sVivoFavHeart));
+            }
             // MD3Music fork：注入 artworkUri（Lyricon autoSync / 外部读取封面用），
             // 通知栏封面仍用 artworkData（bitmap，稳定，避免 artUri 异步加载闪烁）。
-            // MD3Music fork v18：反向替换 https:// → http://（撤销 v11）。
-            // 实测修正：原子 networkSecurityConfig 允许明文（cleartextTrafficPermitted=true），
-            // kgka 传给原子的是 kugou API 原生 http:// URL（封面显示正常）；v13 实测
-            // https URI 原子不消费（不下载不显示）。酷狗 CDN 同时支持 http/https。
             if (artUri != null && !artUri.isEmpty()) {
-                if (artUri.startsWith("https://")) {
-                    artUri = "http://" + artUri.substring(8);
-                }
-                // MD3Music fork v19：/400/ → /480/，与 kgka 的 kugou flexible_cover {size}=480
-                // 完全一致（原子 p.q kugou 分支 replaceFirst("/480/","/800/") 期望 /480/）。
-                // kugou stdmusic CDN 同图支持 /400/ 与 /480/ 目录尺寸。
-                artUri = artUri.replaceFirst("/400/", "/480/");
                 mb.setArtworkUri(android.net.Uri.parse(artUri));
             }
             if (art != null) {
@@ -1980,6 +2457,22 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             MediaItem updated = cur.buildUpon().setMediaMetadata(mb.build()).build();
             // 官方推荐：同 uri 替换 → 只更新 metadata，不打断播放
             player.replaceMediaItem(index, updated);
+            // MD3Music fork v45：原子随身听循环模式回写（extras → LegacyConversions
+            // 拷为 framework 顶层键，岛据此渲染循环按钮状态：1=列表/2=单曲/3=随机）。
+            // Bundle 是 final：不能用双花括号匿名子类，用局部变量装配。
+            // v48：协议口径是 Long（岛端 getLong 读 Int 会拿 0），putInt 改 putLong。
+            // v50：值改用 Dart 权威状态（sVivoLoopMode）——Dart 自管队列下 player 的
+            // repeat/shuffle 恒为列表循环，按它回写岛永远显示"列表循环"。
+            android.os.Bundle loopExtras = new android.os.Bundle();
+            loopExtras.putLong(VMM_KEY_LOOP_MODE,
+                    sVivoLoopMode >= 1 ? sVivoLoopMode
+                    : player.getShuffleModeEnabled() ? 3
+                    : player.getRepeatMode() == androidx.media3.common.Player.REPEAT_MODE_ONE ? 2 : 1);
+            androidx.media3.common.MediaMetadata withLoop =
+                    updated.mediaMetadata.buildUpon()
+                        .setExtras(loopExtras)
+                        .build();
+            player.replaceMediaItem(index, updated.buildUpon().setMediaMetadata(withLoop).build());
             Log.d("AudioFocusFork", "applySessionMetadata OK title=" + title + " art=" + (art != null)
                     + " onMainThread=" + (Thread.currentThread() == Looper.getMainLooper().getThread()));
         } catch (Exception e) {
@@ -2156,6 +2649,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     public void play(Result result) {
+        everPlayed = true;
         if (player.getPlayWhenReady()) {
             result.success(new HashMap<String, Object>());
             return;
@@ -2164,6 +2658,11 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         // 使封面/歌词/自定义按钮注入（updateActiveSessionMetadata 等）落到真正播放的会话，
         // 避免多播放器并存时 sActivePlayer 指向占位/最后一个创建的播放器。
         sActivePlayer = this;
+        // MD3Music fork v42（元数据先行）：连车唤醒等冷恢复场景，Dart 恢复早期推的
+        // 元数据先于播放器实例到达（updateActiveSessionMetadata no active AudioPlayer
+        // ×3 实锤），被丢后岛在窗口期弹"无信息卡片"。此处回放 pending 快照，
+        // 保证会话激活前元数据已就位——岛弹卡即有歌名/封面。
+        applyPendingSessionMetadataIfAny();
         // MD3Music fork：跨fade 角色互换时本播放器的会话可能已被 syncSingleSessionToHost
         // release（从系统注销），play 时若已释放则重建，保证系统始终有当前活跃播放器的会话。
         if (createMediaSession && mediaSession == null) {
@@ -2172,6 +2671,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         // MD3Music fork（方向1）：play 是权威收敛点——把本实例会话设为唯一 host 会话，
         // 其余实例的会话仅从 host 移除（不 release 播放器/会话对象），使系统只跟随本播放器。
         syncSingleSessionToHost();
+        // MD3Music fork（方向2配套）：本实例刚从 standby 激活，补写按住的预加载元数据，
+        // 交叉点瞬间会话标题/封面即为新歌（等不到后续 pipeline 推送）。
+        reApplyHeldSessionTagMetadata();
         if (playResult != null) {
             playResult.success(new HashMap<String, Object>());
         }
@@ -2337,10 +2839,18 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         }
         // MD3Music fork（阶段6·收敛单一会话）：注销实例登记
         unregisterPlayer(this);
+        // MD3Music fork: 硬解状态跟着播放器一起清（避免设置页残留上一实例的「正在硬解」）
+        AudioOffloadController.onPlayerReleased();
+        // MD3Music fork（v35 泄漏防线）：停喂自愈静态监听按 identity 释放——
+        // 静态滞留已 dispose 实例（含 context 引用）在无下次播放创建时永不释放。
+        UsbAudioSinkController.clearStallRecoveryListenerIfCurrent(this);
         // MD3Music fork: 本播放器销毁后清空活跃引用，避免注入至过期会话
         if (sActivePlayer == this) {
             sActivePlayer = null;
         }
+        // MD3Music fork v43（审查 P1）：dispose 一并清 pending 元数据——
+        // 单槽持有 ~1MB 位图，播放器销毁后不再有正确的消费时机，滞留即泄漏向。
+        sPendingMetadata = null;
     }
 
     private void abortSeek() {

@@ -1008,7 +1008,8 @@ pub fn handle_update(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRespo
 
 /// 图床防盗链 token：md5(北京时间 yyyyMMdd + 固定盐)，小写 hex。
 /// JS 版取设备本地日期；上游为中国服务器，这里固定按北京时间（UTC+8）计算。
-const UPLOAD_SALT: &str = "hewry678WEK23D";
+/// playlist.rs 的歌单封面上传校验值同盐，故 pub(crate)。
+pub(crate) const UPLOAD_SALT: &str = "hewry678WEK23D";
 
 /// Howard Hinnant 的 civil_from_days：天数 → (年, 月, 日)。
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -1024,7 +1025,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn beijing_ymd() -> String {
+/// 北京时间 yyyyMMdd。playlist.rs 的封面上传校验值与图床上传同一口径，故 pub(crate)。
+pub(crate) fn beijing_ymd() -> String {
     let secs = now_secs() + 8 * 3600;
     let (y, m, d) = civil_from_days(secs.div_euclid(86400));
     format!("{y:04}{m:02}{d:02}")
@@ -1056,7 +1058,8 @@ fn is_strict_base64(s: &str) -> bool {
 }
 
 /// magic bytes 判定图片类型：返回对应 MIME（JPEG/PNG/GIF/BMP/WEBP）。
-fn image_mime(buf: &[u8]) -> Option<&'static str> {
+/// playlist.rs 的歌单封面上传做同一判定，故 pub(crate)（只认扩展名不够）。
+pub(crate) fn image_mime(buf: &[u8]) -> Option<&'static str> {
     if buf.len() < 4 {
         return None;
     }
@@ -1202,12 +1205,22 @@ pub fn handle_update_avatar(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, Modu
     Ok(result)
 }
 
+// 保留旧调用的默认行为；收藏页完整同步时才显式传入分页参数。
+fn apply_follow_pagination(q: &Value, dm: &mut Value) {
+    if q.get("page").is_some() {
+        dm["page"] = json!(q_num(q, "page", 1));
+    }
+    if q.get("pagesize").is_some() {
+        dm["pagesize"] = json!(q_num(q, "pagesize", 100));
+    }
+}
+
 /// user_follow.js → /user/follow（获取用户关注的歌手）。
 pub fn handle_follow(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
     let token = param_or_cookie_str(q, "token", "");
     let userid = param_or_cookie_str(q, "userid", "0");
     let clienttime = now_secs();
-    let dm = json!({
+    let mut dm = json!({
         "merge": 2,
         "need_iden_type": 1,
         "ext_params": "k_pic,jumptype,singerid,score",
@@ -1216,6 +1229,7 @@ pub fn handle_follow(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleRespo
         "id_type": 0,
         "p": rsa_pk_upper(&json!({ "clienttime": clienttime, "token": token })),
     });
+    apply_follow_pagination(q, &mut dm);
     forward(
         q, ctx, "POST", "/v4/follow_list", None,
         Some(json!({ "plat": 1 })), Some(dm), "android", &[("x-router", "relationuser.kugou.com")], false, false,
@@ -1578,5 +1592,25 @@ mod cloud_upload_tests {
 
         let miss = json!({"album_audio_id": 0, "audio_id": 0, "hash": ""});
         assert!(normalize_match_candidate(&miss).is_none());
+    }
+}
+
+#[cfg(test)]
+mod follow_paging_tests {
+    use super::apply_follow_pagination;
+    use serde_json::json;
+
+    #[test]
+    fn follow_paging_preserves_legacy_request_without_parameters() {
+        let mut data = json!({"merge": 2});
+        apply_follow_pagination(&json!({}), &mut data);
+        assert_eq!(data, json!({"merge": 2}));
+    }
+
+    #[test]
+    fn follow_paging_forwards_numeric_query_parameters() {
+        let mut data = json!({"merge": 2});
+        apply_follow_pagination(&json!({"page": "2", "pagesize": "100"}), &mut data);
+        assert_eq!(data, json!({"merge": 2, "page": 2, "pagesize": 100}));
     }
 }

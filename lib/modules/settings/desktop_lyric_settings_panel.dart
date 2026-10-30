@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:dpad/dpad.dart';
 import 'package:flutter/material.dart';
 import 'package:m3e_core/m3e_core.dart';
@@ -648,14 +650,10 @@ class _DesktopLyricSettingsPanelState
               _buildStepper(
                 glyphSize: 11,
                 tooltip: '减小字号',
-                enabled: fontSize > DesktopLyricService.minFontSize,
+                enabled: fontSize > DesktopLyricService.fontSizeMin,
                 onTap: () async {
                   AppHaptics.lightImpact(HapticCategory.control);
-                  final next = (fontSize - 2)
-                      .clamp(
-                        DesktopLyricService.minFontSize,
-                        DesktopLyricService.maxFontSize,
-                      );
+                  final next = DesktopLyricService.stepFontSize(fontSize, increase: false);
                   await _svc.setFontSize(next);
                 },
               ),
@@ -664,9 +662,9 @@ class _DesktopLyricSettingsPanelState
                 child: kTvBuild
                     ? RemoteSlider(
                         value: fontSize,
-                        min: DesktopLyricService.minFontSize,
-                        max: DesktopLyricService.maxFontSize,
-                        divisions: 20,
+                        min: DesktopLyricService.fontSizeMin,
+                        max: DesktopLyricService.fontSizeMax,
+                        divisions: Platform.isWindows ? 9 : 20,
                         label: '${fontSize.round()} sp',
                         onChanged: (v) {
                           AppHaptics.tick(HapticCategory.control);
@@ -682,9 +680,9 @@ class _DesktopLyricSettingsPanelState
                     : M3ESlider(
                         decoration: _panelSliderDecoration,
                         value: fontSize,
-                        min: DesktopLyricService.minFontSize,
-                        max: DesktopLyricService.maxFontSize,
-                        divisions: 20,
+                        min: DesktopLyricService.fontSizeMin,
+                        max: DesktopLyricService.fontSizeMax,
+                        divisions: Platform.isWindows ? 9 : 20,
                         label: '${fontSize.round()} sp',
                         onChanged: (v) {
                           AppHaptics.tick(HapticCategory.control);
@@ -701,14 +699,10 @@ class _DesktopLyricSettingsPanelState
               _buildStepper(
                 glyphSize: 18,
                 tooltip: '增大字号',
-                enabled: fontSize < DesktopLyricService.maxFontSize,
+                enabled: fontSize < DesktopLyricService.fontSizeMax,
                 onTap: () async {
                   AppHaptics.lightImpact(HapticCategory.control);
-                  final next = (fontSize + 2)
-                      .clamp(
-                        DesktopLyricService.minFontSize,
-                        DesktopLyricService.maxFontSize,
-                      );
+                  final next = DesktopLyricService.stepFontSize(fontSize, increase: true);
                   await _svc.setFontSize(next);
                 },
               ),
@@ -884,6 +878,20 @@ class _DesktopLyricSettingsPanelState
                   ),
           ),
         ),
+        if (Platform.isWindows) ...[
+          const SizedBox(height: AppSpacing.xs),
+          SwitchListTile.adaptive(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            title: const Text('允许左右移动'),
+            subtitle: const Text('关闭后拖动桌面歌词时只上下移动'),
+            value: _svc.allowHorizontalMove,
+            onChanged: (value) {
+              AppHaptics.lightImpact(HapticCategory.control);
+              // ignore: discarded_futures
+              _svc.setAllowHorizontalMove(value);
+            },
+          ),
+        ],
         const SizedBox(height: AppSpacing.xs),
         // 锁定/点击穿透是 Android 悬浮窗专属（FLAG_NOT_TOUCHABLE）；
         // iOS PiP 由系统渲染与交互，无此概念，隐藏该行

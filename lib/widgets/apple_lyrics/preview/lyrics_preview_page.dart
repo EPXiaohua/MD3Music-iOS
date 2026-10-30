@@ -17,6 +17,8 @@ import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences_panel.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
+import 'package:md3music/widgets/apple_lyrics/utils/lyric_credit_filter.dart';
 
 class LyricsPreviewPage extends StatefulWidget {
   const LyricsPreviewPage({super.key});
@@ -35,6 +37,8 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
   late final AnimationController _playController;
 
   List<LyricLine> _parsedLines = const [];
+  /// 未经「屏蔽歌词作者信息」过滤的解析结果：开关变化时即时重派生。
+  List<LyricLine> _parsedLinesRaw = const [];
   int _currentTimeMs = 0;
   bool _isPlaying = false;
 
@@ -46,6 +50,8 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
     super.initState();
     _textController = TextEditingController(text: _krcSample);
     _parseAndRender();
+    // 「屏蔽歌词作者信息」开关/正则变化时即时重派生（预览与播放页同口径）
+    LyricPreferences.instance.addListener(_onFilterPrefsChanged);
     _playController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 1),
@@ -63,7 +69,12 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
   void _parseAndRender() {
     final text = _textController.text;
     setState(() {
-      _parsedLines = LyricParserChain.parse(text);
+      _parsedLinesRaw = LyricParserChain.parse(text);
+      _parsedLines = LyricCreditFilter.filterLines(_parsedLinesRaw);
+      // 记录过滤快照：否则「进页面时开关已开」的情况下，监听器会把
+      // 第一次关闭误判为无变化而跳过重派生。
+      _derivedFilterEnabled = LyricCreditFilter.enabled;
+      _derivedFilterPattern = LyricPreferences.instance.creditPattern;
       _currentTimeMs = 0;
     });
   }
@@ -74,8 +85,28 @@ class _LyricsPreviewPageState extends State<LyricsPreviewPage>
     });
   }
 
+  /// 「屏蔽歌词作者信息」开关/正则变化：从 raw 结果即时重派生预览行。
+  ///
+  /// 只在过滤相关偏好真正变化时 setState（字号等无关通知直接返回），
+  /// 避免打穿 AppleLyricsView 的行高/模糊缓存。
+  bool _derivedFilterEnabled = false;
+  String _derivedFilterPattern = '';
+  void _onFilterPrefsChanged() {
+    final filterEnabled = LyricCreditFilter.enabled;
+    final filterPattern = LyricPreferences.instance.creditPattern;
+    if (filterEnabled == _derivedFilterEnabled &&
+        filterPattern == _derivedFilterPattern) {
+      return;
+    }
+    _derivedFilterEnabled = filterEnabled;
+    _derivedFilterPattern = filterPattern;
+    if (!mounted) return;
+    setState(() => _parsedLines = LyricCreditFilter.filterLines(_parsedLinesRaw));
+  }
+
   @override
   void dispose() {
+    LyricPreferences.instance.removeListener(_onFilterPrefsChanged);
     _playController.dispose();
     _textController.dispose();
     super.dispose();

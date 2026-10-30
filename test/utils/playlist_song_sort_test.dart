@@ -7,6 +7,7 @@ Song s(
   String? title,
   String artist = '某歌手',
   int seconds = 60,
+  int? playlistSort,
 }) {
   return Song(
     id: id,
@@ -14,6 +15,7 @@ Song s(
     artist: artist,
     album: '',
     duration: Duration(seconds: seconds),
+    playlistSort: playlistSort,
   );
 }
 
@@ -165,5 +167,21 @@ void main() {
           baseOrder: b, sort: PlaylistSongSort.title, ascending: false);
       expect(ids(desc), ids(asc.reversed.toList()));
     });
+  });
+
+  test('服务端 sort 优先于响应数组顺序，缺失和同位保持稳定', () {
+    final songs = [
+      s('a', playlistSort: 3),
+      s('b', playlistSort: 0),
+      s('c'),
+      s('d', playlistSort: 3),
+    ];
+    expect(ids(sortSongsByPlaylistPosition(songs)), ['b', 'a', 'd', 'c']);
+    expect(ids(songs), ['a', 'b', 'c', 'd']);
+  });
+
+  test('无 sort 的旧缓存不凭数组顺序反转', () {
+    final songs = [s('a'), s('b')];
+    expect(identical(sortSongsByPlaylistPosition(songs), songs), isTrue);
   });
 }

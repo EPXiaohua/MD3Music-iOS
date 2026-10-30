@@ -1,14 +1,15 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:sensors_plus/sensors_plus.dart';
 
+import '../core/platform_capabilities.dart';
 import '../core/services/depth_cover_feature.dart';
 import '../core/services/depth_cover_cache.dart';
 import '../data/repositories/settings_repository.dart';
 import '../services/depth_cover_service.dart';
 import 'depth_parallax_cover.dart';
 import 'depth_shader_cover.dart';
+import 'depth_tilt_source.dart';
 import 'player_artwork_image.dart';
 
 /// 3D 深度封面宿主：挂载在播放页"新封面"淡入位置（保留外层淡入 [Opacity]）。
@@ -54,9 +55,9 @@ class _DepthCoverHostState extends State<DepthCoverHost>
 
   /// shader（逐像素位移）路径开关：位移单位 bug（uv 与像素混用，49a0738）与
   /// DPR bug（6057b1b）均已修复，待真机复验；确认真机渲染正常后保持 true。
+  ///
+  /// **Android / TV 专用**：Windows 走多层视差，见 [_useShaderPath] 的平台门控。
   static const bool _preferShader = true;
-  /// 倾斜增益：重力分量 /9.81 在常见握持角度下只有 0.1–0.35，放大后再 clamp 到 -1..1。
-  static const double _tiltGain = 2.5;
 
   /// 进程级 shader 支持标记：某设备一旦编译失败，本进程内其余封面直接走多层视差，
   /// 不再逐个重试（避免每次进播放页都失败一次）。
@@ -68,10 +69,15 @@ class _DepthCoverHostState extends State<DepthCoverHost>
   bool _shaderFailed = false;
 
   List<String>? _layers;
+  /// 多层路径的修补底板（`bg_fill.png`，主体已填补）：垫在三层之下，前景移开处
+  /// 才能露出修补后的背景。缺失（旧缓存 / Android）为 null —— 渲染与旧版一致。
+  String? _layerBackground;
   /// shader 路径命中：{'depth','depthStd','cover'}；非空即优先渲染逐像素位移封面。
   Map<String, Object?>? _depthInfo;
-  /// 默认倾斜源（创建一次复用，避免 build 每次重建传感器流）。
-  Stream<(double, double)>? _tiltSource;
+  /// 倾斜源控制器：Windows = 鼠标指针（仅封面矩形内），Android/TV = 重力传感器。
+  /// 创建一次复用，避免 build 每次重建流；输出类型与原传感器流同型，
+  /// 故 DepthShaderCover / DepthParallaxCover 零改动。
+  DepthTiltController? _tilt;
   bool _depthEnabled = false;
   double _strength = 9.0;
   VoidCallback? _cancel;
@@ -84,9 +90,36 @@ class _DepthCoverHostState extends State<DepthCoverHost>
   AnimationController? _ringCtrl;
   bool _ringVisible = false;
 
+  /// 诊断面包屑：`[DepthCover] +Nms` 相对时间，出问题时能一眼看出卡在哪个阶段
+  /// （`FrameTiming` 看不到事件循环阻塞，见 windows-desktop.md W5.8）。
+  static final Stopwatch _clock = Stopwatch()..start();
+  static int get _ms => _clock.elapsedMilliseconds;
+
   /// 是否走 shader 逐像素路径（设备 shader 不受支持时降级为多层视差）。
+  ///
+  /// **Windows 桌面端强制走多层视差（[DepthParallaxCover]）**，不使用 runtime
+  /// fragment shader —— 这是「打开 3D 封面后整窗无响应」的修复点：
+  ///
+  /// - `shaders/depth_parallax.frag` 每像素做 `kLayers = 16` 次深度纹理采样 + 分支/
+  ///   混合；鼠标移动时满帧重绘，在 Impeller-on-Windows 上会把 UI/光栅线程压死。
+  /// - 更关键的是**它以前从未在 Windows 上跑过**：改动前 Windows 构建不传
+  ///   `ENABLE_DEPTH_3D`，`kDepthCoverAvailable` 恒 false、本组件 initState 直接
+  ///   return，整条渲染路径在桌面端是死代码，直到本次适配才第一次真跑。
+  /// - 仓内已有同款先例：`docs/agents/windows-desktop.md` W5.7 —— m3e 的
+  ///   `InkSparkle` 也是 runtime fragment shader，「首次按下要等着色器编译/管线创建，
+  ///   表现就是点一下暂停整窗卡一下」，桌面端已回退 `InkRipple`
+  ///   （`now_playing_bar.dart`）。连一个简单的 sparkle shader 都要退，这个 16 采样
+  ///   的 shader 更没有理由在桌面端留下。
+  /// - 降级判据只有「抛异常」，**渲染极慢不触发任何降级**（[_onShaderFailed] 只在
+  ///   加载失败时调用），所以桌面端只能靠这道平台门控兜住。
+  ///
+  /// 逐像素质量若要在 Windows 恢复，需要单独做一次 shader 预热基准
+  /// （启动期离屏编译 + 帧时实测）通过后再切回，不随本修复打开。
   bool get _useShaderPath =>
-      _preferShader && !_shaderFailed && !_shaderUnsupported;
+      _preferShader &&
+      !isWindowsDesktop &&
+      !_shaderFailed &&
+      !_shaderUnsupported;
 
   /// shader 编译/加载失败：降级多层视差 + 原生 toast 提示（每次进程一次）。
   void _onShaderFailed() {
@@ -142,7 +175,7 @@ class _DepthCoverHostState extends State<DepthCoverHost>
     WidgetsBinding.instance.addObserver(this);
     // 开关状态信号（设置页/播放页界面设置弹层）变化 → 重走初始化，即时生效。
     DepthCoverService.enabledSignal.addListener(_onEnabledSignal);
-    _tiltSource = _defaultTiltStream();
+    _tilt = DepthTiltController(onTiltError: _onTiltError);
     _init();
   }
 
@@ -156,6 +189,7 @@ class _DepthCoverHostState extends State<DepthCoverHost>
     if (mounted) {
       setState(() {
         _layers = null;
+        _layerBackground = null;
         _depthInfo = null;
       });
     }
@@ -177,7 +211,8 @@ class _DepthCoverHostState extends State<DepthCoverHost>
     final enabled =
         kDepthCoverAvailable && await SettingsRepository().getDepthCoverEnabled();
     final strength = await SettingsRepository().getDepthCoverStrength();
-    debugPrint('[DepthCover] host init: enabled=$enabled uri=${widget.artworkUri}');
+    debugPrint('[DepthCover] +${_ms}ms host init: enabled=$enabled '
+        'shaderPath=$_useShaderPath uri=${widget.artworkUri}');
     if (!mounted) return;
     setState(() {
       _depthEnabled = enabled;
@@ -225,23 +260,35 @@ class _DepthCoverHostState extends State<DepthCoverHost>
     debugPrint('[DepthCover] host layers hit=${cached != null} key=$key');
     if (!mounted) return;
     if (cached != null) {
-      setState(() => _layers = cached);
+      final plate = await service.cache.getLayerBackground(key);
+      if (!mounted) return;
+      setState(() {
+        _layers = cached;
+        _layerBackground = plate;
+      });
       _revealWithRing();
       return;
     }
     _cancel ??= service.cache.addListener(key, _onReady);
     _requesting = true;
-    final bool ok;
-    if (_useShaderPath) {
-      ok = await service.requestDepth(uri);
-    } else {
-      ok = await service.request(uri); // 多层切割路径（原稳定行为）
+    final sw = Stopwatch()..start();
+    debugPrint('[DepthCover] +${_ms}ms 发起生成 → ${_useShaderPath ? "shader(深度图)" : "layers(三层)"}');
+    var ok = false;
+    try {
+      ok = _useShaderPath
+          ? await service.requestDepth(uri)
+          : await service.request(uri); // 多层切割路径（原稳定行为）
+    } catch (e, s) {
+      // 后端任何异常都不许冒泡成未处理异步异常（那会刷错误日志、并让
+      // `_requesting` 停在 true 使后续重试全被早退挡住）。按失败处理即可。
+      debugPrint('[DepthCover] 生成请求异常: $e ${s.toString().split('\n').take(2).join(' << ')}');
+    } finally {
+      _requesting = false;
     }
-    _requesting = false;
     _attempts++;
     debugPrint(
-        '[DepthCover] host ${_useShaderPath ? "depth " : "layers "}request → $ok '
-        '(attempt $_attempts/$_maxAttempts)');
+        '[DepthCover] +${_ms}ms host ${_useShaderPath ? "depth " : "layers "}request → $ok '
+        '(${sw.elapsedMilliseconds}ms, attempt $_attempts/$_maxAttempts)');
     if (ok || !mounted || _depthInfo != null || _layers != null) return;
     if (_attempts < _maxAttempts) {
       await Future<void>.delayed(_retryDelay);
@@ -254,44 +301,49 @@ class _DepthCoverHostState extends State<DepthCoverHost>
     }
   }
 
-  /// 生成完成回调：同时探测两种缓存，shader 深度优先于多层。
+  /// 生成完成回调：探测缓存并切到对应的渲染路径。
+  ///
+  /// **两条分支必须各管各的**（2026-10-28 修）：Windows 走多层（`_useShaderPath`
+  /// false）时不得再去认深度缓存 —— 旧版本在 Windows 上生成过 `depth.png`
+  /// 却没有 `layer*.png`，若这里先命中 `_depthInfo` 就会把 layers 分支的
+  /// `_depthInfo == null` 守卫永久堵死，表现为「3D 开关打开但永远是平面封面」。
   void _onReady() {
     final key = DepthCoverCache.cacheKey(widget.artworkUri ?? '');
-    DepthCoverService.instance.cache.getCachedDepth(key).then((d) {
-      if (mounted && d != null) {
-        final isNew = _depthInfo == null && _layers == null;
-        setState(() => _depthInfo = d);
-        if (isNew) _revealWithRing();
-      }
-    });
+    if (_useShaderPath) {
+      DepthCoverService.instance.cache.getCachedDepth(key).then((d) {
+        if (mounted && d != null && _depthInfo == null && _layers == null) {
+          setState(() => _depthInfo = d);
+          _revealWithRing();
+        }
+      });
+    }
     DepthCoverService.instance.cache.getCachedLayers(key).then((ls) {
-      if (mounted && ls != null && _depthInfo == null && _layers == null) {
+      // 多层路径下只看 layers；shader 路径下仍保持「深度优先」的旧语义。
+      final blocked = _useShaderPath ? _depthInfo != null : false;
+      if (mounted && ls != null && !blocked && _layers == null) {
+        // 底板与 layers 同批取：它是「主体已被填补的背景」，缺了就看到错位重影。
+        DepthCoverService.instance.cache.getLayerBackground(key).then((plate) {
+          if (!mounted) return;
+          setState(() => _layerBackground = plate);
+        });
         setState(() => _layers = ls);
         _revealWithRing();
       }
     });
   }
 
-  /// 默认倾斜源：重力向量归一化（与 [DepthParallaxCover] 同款 2.5× 增益）。
-  /// [DepthShaderCover] 内部再做 0.35 EMA 平滑。shader widget 的 tiltStream 必填，
-  /// 故由宿主提供默认流，等价「传 null 时用传感器默认流」的语义。
-  Stream<(double, double)> _defaultTiltStream() {
-    // uiInterval ≈ 60Hz：与屏幕刷新率对齐，避免高于刷新率的无效重绘。
-    return accelerometerEventStream(
-          samplingPeriod: SensorInterval.uiInterval,
-        )
-        .map((e) => (e.x / 9.81 * _tiltGain, e.y / 9.81 * _tiltGain))
-        .map((v) => (
-              v.$1.clamp(-1.0, 1.0).toDouble(),
-              v.$2.clamp(-1.0, 1.0).toDouble(),
-            ));
-  }
+  /// 倾斜源已由 [DepthTiltController] 接管（Windows = 鼠标指针；Android/TV = 重力
+  /// 传感器）。此处不再直接持有传感器流：sensors_plus 无 Windows 实现，在桌面端
+  /// 创建它会 MissingPluginException 并误报「无重力传感器」。
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     DepthCoverService.enabledSignal.removeListener(_onEnabledSignal);
     _cancel?.call();
+    _tilt?.dispose();
+    _tilt = null;
+    _layerBackground = null;
     _depthInfo = null;
     _ringCtrl?.dispose();
     super.dispose();
@@ -301,22 +353,25 @@ class _DepthCoverHostState extends State<DepthCoverHost>
   Widget _buildCover() {
     Widget cover;
     if (_useShaderPath && _depthInfo != null) {
+      debugPrint('[DepthCover] +${_ms}ms 挂载 DepthShaderCover（runtime shader）');
       cover = DepthShaderCover(
         coverPath: _depthInfo!['cover'] as String,
         depthPath: _depthInfo!['depth'] as String,
         depthStd: _depthInfo!['depthStd'] as double,
         bgFillPath: _depthInfo!['bgFill'] as String?,
-        tiltStream: _tiltSource!,
+        tiltStream: _tilt!.stream,
         strengthPx: _strength,
         onFailed: _onShaderFailed,
         onTiltError: _onTiltError,
       );
     } else if (_layers != null) {
+      debugPrint('[DepthCover] +${_ms}ms 挂载 DepthParallaxCover（三层视差，无 runtime shader）');
       // 回退：多层切割视差。
       cover = DepthParallaxCover(
         layerPaths: _layers!,
+        backgroundPath: _layerBackground,
         strength: _strength,
-        tiltStream: _tiltSource,
+        tiltStream: _tilt!.stream,
         onTiltError: _onTiltError,
       );
     } else {
@@ -327,6 +382,42 @@ class _DepthCoverHostState extends State<DepthCoverHost>
         iconSize: widget.iconSize,
         backgroundColor: widget.backgroundColor,
         iconColor: widget.iconColor,
+      );
+    }
+    // 鼠标跟随：只在 Windows 桌面且确实走了 3D 渲染路径时包 MouseRegion。
+    // - behavior 用 translucent：既收 onHover，又不吞掉既有的点击/长按手势
+    //   （播放页封面有「长按 2s 进 Zen」「单击 peek」等手势，不能挡）。
+    // - 尺寸即封面矩形（外层 Positioned.fill / Opacity 已给满），因此 local
+    //   坐标天然就是「封面矩形内坐标」，符合 DepthTiltController 的契约。
+    //
+    // **不要用 LayoutBuilder 取尺寸**（2026-10-28 实测踩坑）：播放页会同时挂
+    // 前后两张封面做淡入淡出、封面形变层还会离屏取用封面子树，此时 LayoutBuilder
+    // 会出现「没有 layout 就被 paint」——日志是每帧刷
+    // `RenderBox was not laid out: _RenderLayoutBuilder ... NEEDS-PAINT`，
+    // 框架反复重试导致整窗卡死。改为在 hover 回调里用本 State 自己的
+    // `context.findRenderObject()` 读当前尺寸：它就是这个封面槽位的盒子，
+    // 布局已完成（回调都在 layout 之后），零额外 RenderObject、无布局依赖。
+    if (_tilt != null && _tilt!.usesPointerSource && _hasDepthContent) {
+      cover = MouseRegion(
+        // MouseRegion 的参数是 hitTestBehavior（不是 Listener 的 behavior）；
+        // translucent + opaque:false 才能既收 onHover、又不让本区域吞掉
+        // 身后其它 MouseRegion/手势的命中（播放页封面还要接长按进 Zen、
+        // 单击 peek 等手势，见 docs/agents/windows-desktop.md W8 同类坑）。
+        hitTestBehavior: HitTestBehavior.translucent,
+        opaque: false,
+        // 用 localPosition（= position 按本 RenderMouseRegion 的
+        // entry.transform 变换后的坐标，见 gestures/binding.dart:508
+        // `entry.target.handleEvent(event.transformed(entry.transform), entry)`），
+        // 它已经是「封面矩形内坐标」，符合 DepthTiltController 的契约。
+        // 不要用 event.position：那是全局坐标，直接喂进去会让中心偏移到
+        // 整个窗口原点，视差的方向与幅度全错。
+        onHover: (event) {
+          final box = context.findRenderObject();
+          if (box is! RenderBox || !box.hasSize) return;
+          _tilt!.handleHover(event.localPosition, box.size);
+        },
+        onExit: (_) => _tilt!.handleExit(),
+        child: cover,
       );
     }
     if (!_ringVisible || _ringCtrl == null) return cover;
@@ -348,6 +439,10 @@ class _DepthCoverHostState extends State<DepthCoverHost>
       ],
     );
   }
+
+  /// 是否已有 3D 内容（shader 深度图或多层）——只有这时挂 MouseRegion 才有意义，
+  /// 平面封面阶段挂上去等于给一张不动的图加一层无用的命中测试。
+  bool get _hasDepthContent => _depthInfo != null || _layers != null;
 
   @override
   Widget build(BuildContext context) {

@@ -140,6 +140,36 @@ void main() {
       );
     });
 
+    test('SAF 不同授权根下相同 U 盘子目录命中排除', () {
+      expect(
+        LocalMusicRepository.isExcluded(
+          'content://com.android.externalstorage.documents/tree/ABCD-1234%3AMusic/document/ABCD-1234%3AMusic%2FPodcasts%2Fsub',
+          ['content://com.android.externalstorage.documents/tree/ABCD-1234%3AMusic%2FPodcasts'],
+        ),
+        isTrue,
+      );
+    });
+
+    test('SAF U 盘排除目录与 MediaStore volume 路径可互相匹配', () {
+      expect(
+        LocalMusicRepository.isExcluded(
+          'storage://abcd-1234/Music/Podcasts/episode.mp3',
+          ['content://com.android.externalstorage.documents/tree/ABCD-1234%3AMusic%2FPodcasts'],
+        ),
+        isTrue,
+      );
+    });
+
+    test('SAF 主存储排除目录匹配 MediaStore 真实路径', () {
+      expect(
+        LocalMusicRepository.isExcluded(
+          '/storage/emulated/0/Music/Podcasts/episode.mp3',
+          ['content://com.android.externalstorage.documents/tree/primary%3AMusic%2FPodcasts'],
+        ),
+        isTrue,
+      );
+    });
+
     test('不在排除列表内则不过滤', () {
       expect(
         LocalMusicRepository.isExcluded(r'C:\Music\songs\a.mp3', [r'C:\Music\recordings']),

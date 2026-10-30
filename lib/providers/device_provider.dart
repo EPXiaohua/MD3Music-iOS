@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -29,8 +31,17 @@ class DeviceProvider extends ChangeNotifier {
   /// 自动检测结果的中文描述（仅在 [deviceType] 为 [DeviceType.auto] 时有意义）。
   String get autoDetectedLabel => _autoDetect() ? 'Pad' : '手机';
 
+  late final Future<void> settingsReady;
+
   DeviceProvider() {
-    _load();
+    settingsReady = _load();
+  }
+
+  /// Windows 还原设置后同步运行值，先等待启动读取完成以免旧值晚到。
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await settingsReady;
+    await _load();
   }
 
   Future<void> _load() async {

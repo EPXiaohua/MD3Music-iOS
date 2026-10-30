@@ -67,10 +67,10 @@ void main() {
   });
 
   group('CarModePanelSide.fromIndex', () {
-    test('null / 越界一律回落到左侧', () {
-      expect(CarModePanelSide.fromIndex(null), CarModePanelSide.left);
-      expect(CarModePanelSide.fromIndex(-1), CarModePanelSide.left);
-      expect(CarModePanelSide.fromIndex(2), CarModePanelSide.left);
+    test('null / 越界一律回落到右侧', () {
+      expect(CarModePanelSide.fromIndex(null), CarModePanelSide.right);
+      expect(CarModePanelSide.fromIndex(-1), CarModePanelSide.right);
+      expect(CarModePanelSide.fromIndex(2), CarModePanelSide.right);
     });
 
     test('1 → 右侧', () {

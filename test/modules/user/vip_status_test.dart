@@ -55,6 +55,30 @@ void main() {
       expect(findActiveBusiVip(list, 'tvip'), isNull);
       expect(findActiveBusiVip(list, 'svip'), isNull);
     });
+
+    test('同业务线多条已开通记录时取最晚到期的一条', () {
+      final dayVip = _vipItem('tvip', 1)
+        ..['vip_end_time'] = _fmt(DateTime.now().add(const Duration(hours: 23)));
+      final yearVip = _vipItem('tvip', 1)
+        ..['vip_end_time'] = _fmt(DateTime.now().add(const Duration(days: 340)));
+      // 短期记录在前（模拟签到领取记录排在购买记录之前）与顺序颠倒都应命中长期记录
+      expect(findActiveBusiVip([dayVip, yearVip], 'tvip'), same(yearVip));
+      expect(findActiveBusiVip([yearVip, dayVip], 'tvip'), same(yearVip));
+    });
+
+    test('同业务线多条记录时 is_vip=0 的项不参与比较', () {
+      final stale = _vipItem('tvip', 0)
+        ..['vip_end_time'] = _fmt(DateTime.now().add(const Duration(days: 400)));
+      final active = _vipItem('tvip', 1)
+        ..['vip_end_time'] = _fmt(DateTime.now().add(const Duration(days: 30)));
+      expect(findActiveBusiVip([stale, active], 'tvip'), same(active));
+    });
+
+    test('匹配项的到期时间均无法解析时退回第一个匹配项', () {
+      final first = _vipItem('tvip', 1)..['vip_end_time'] = '';
+      final second = _vipItem('tvip', 1)..['vip_end_time'] = 'not-a-date';
+      expect(findActiveBusiVip([first, second], 'tvip'), same(first));
+    });
   });
 
   group('formatVipExpireText', () {

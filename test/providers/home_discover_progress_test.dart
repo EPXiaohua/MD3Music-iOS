@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -57,6 +58,16 @@ void main() {
       expect(adapter.requestedPagesizes, [4]);
       expect(adapter.requestedTodayPlayNums, [0]);
       expect(provider.homeDiscoverSongs, hasLength(4));
+    });
+
+    test('上游首屏少返回一首时补齐四首预览', () async {
+      adapter.firstPageLimit = 3;
+
+      await provider.getHomeDiscover();
+
+      expect(provider.homeDiscoverSongs, hasLength(33));
+      expect(adapter.requestedTodayPlayNums, [0, 3]);
+      expect(adapter.requestedPagesizes, [4, 30]);
     });
 
     test('续拉把游标推上去：next today_play_num = 已消费总数', () async {
@@ -120,6 +131,40 @@ void main() {
 
       await provider.fetchMoreHomeDiscover(minCount: 4);
       expect(notified, greaterThan(afterFirst));
+    });
+
+    test('续拉请求进行中再次触发时共享同一批结果', () async {
+      await provider.getHomeDiscover();
+      adapter.pauseNextDiscoverRequest();
+
+      final first = provider.fetchMoreHomeDiscover(minCount: 30);
+      await adapter.discoverRequestEntered!.future;
+      final second = provider.fetchMoreHomeDiscover(minCount: 30);
+
+      expect(identical(first, second), isTrue);
+      adapter.resumeDiscoverRequest!.complete();
+      final results = await Future.wait([first, second]);
+
+      expect(results[0], hasLength(30));
+      expect(results[1], hasLength(30));
+      expect(adapter.requestedPagesizes, [4, 30]);
+      expect(provider.homeDiscoverSongs, hasLength(34));
+    });
+
+    test('网络续拉失败保持可重试，后续成功后清除失败状态', () async {
+      await provider.getHomeDiscover();
+      adapter.failedDiscoverResponses = 3;
+
+      expect(await provider.fetchMoreHomeDiscover(minCount: 30), isEmpty);
+      expect(provider.homeDiscoverLastLoadFailed, isTrue);
+      expect(provider.homeDiscoverSongs, hasLength(4));
+
+      final retry = await provider.fetchMoreHomeDiscover(minCount: 30);
+
+      expect(retry, hasLength(30));
+      expect(provider.homeDiscoverLastLoadFailed, isFalse);
+      expect(provider.homeDiscoverSongs, hasLength(34));
+      expect(adapter.requestedPagesizes, [4, 30, 30, 30, 30]);
     });
 
     test('下拉刷新不清游标：重新请求时 today_play_num 仍是已消费总数', () async {
@@ -196,6 +241,18 @@ class _HomeDiscoverApiAdapter implements HttpClientAdapter {
 
   /// 非空时上游开始重放这批 hash（模拟服务端不认 today_play_num 的情况）。
   List<String>? replayHashes;
+  int? firstPageLimit;
+  int failedDiscoverResponses = 0;
+
+  Completer<void>? _pauseNextRequest;
+  Completer<void>? discoverRequestEntered;
+  Completer<void>? resumeDiscoverRequest;
+
+  void pauseNextDiscoverRequest() {
+    discoverRequestEntered = Completer<void>();
+    resumeDiscoverRequest = Completer<void>();
+    _pauseNextRequest = resumeDiscoverRequest;
+  }
 
   int _batch = 0;
   int _index = 0;
@@ -223,6 +280,22 @@ class _HomeDiscoverApiAdapter implements HttpClientAdapter {
     requestedTodayPlayNums.add(todayPlayNum ?? -1);
     requestedPagesizes.add(pagesize);
 
+    if (failedDiscoverResponses > 0) {
+      failedDiscoverResponses--;
+      return ResponseBody.fromString(
+        jsonEncode({'status': 0, 'error': 'temporary upstream failure'}),
+        503,
+        headers: {Headers.contentTypeHeader: ['application/json']},
+      );
+    }
+
+    final pause = _pauseNextRequest;
+    if (pause != null) {
+      _pauseNextRequest = null;
+      discoverRequestEntered!.complete();
+      await pause.future;
+    }
+
     final replay = replayHashes;
     final List<Map<String, dynamic>> songs;
     if (replay != null) {
@@ -230,12 +303,15 @@ class _HomeDiscoverApiAdapter implements HttpClientAdapter {
           .map((h) => {'hash': h, 'song_name': '重放_$h', 'filename': '重放_$h'})
           .toList();
     } else {
-      songs = List.generate(pagesize, (i) {
+      final responseSize = _batch == 0
+          ? (firstPageLimit ?? pagesize).clamp(0, pagesize).toInt()
+          : pagesize;
+      songs = List.generate(responseSize, (i) {
         _index++;
         return {
           'hash': 'batch${_batch}_song$_index',
           'song_name': '歌$_index',
-          'album_name': '专辑${_batch}',
+          'album_name': '专辑$_batch',
           'album_id': '${1000 + _batch}',
           'timelength': 200000,
         };

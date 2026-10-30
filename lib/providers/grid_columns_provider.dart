@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:material_ui/material_ui.dart';
 
 import '../data/repositories/settings_repository.dart';
@@ -18,9 +20,17 @@ class GridColumnsProvider extends ChangeNotifier {
 
   int get gridColumns => _gridColumns;
 
+  late final Future<void> settingsReady;
+
   GridColumnsProvider() {
-    // 仿照 DeviceProvider：构造时异步加载持久化偏好
-    loadFromSettings();
+    // 构造时同步读取任务，重置前等待，避免旧值晚到。
+    settingsReady = loadFromSettings();
+  }
+
+  Future<void> reloadWindowsSettings() async {
+    if (!Platform.isWindows) return;
+    await settingsReady;
+    await loadFromSettings();
   }
 
   /// 从 [SettingsRepository] 读取列数偏好并初始化。

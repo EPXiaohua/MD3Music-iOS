@@ -115,6 +115,26 @@ class _SongDanmakuHostState extends State<SongDanmakuHost> {
   bool _enabled = false;
   bool _bound = false;
 
+  /// v46：弹幕速度倍率与颜色覆盖（设置页可调，静态镜像即时生效）。
+  double _speedScale = 1.0;
+  Color? _overrideColor;
+
+  /// v49：随机颜色（每条弹幕从固定调色板随机取色，自己发送的仍用高亮色）。
+  /// 由颜色镜像的哨值 -1 表示，与 overrideColor 互斥。
+  bool _randomColor = false;
+
+  /// v47：只看弹幕——隐藏右下角"发弹幕"按钮（设置页可调）。
+  bool _readOnly = false;
+
+  /// v52：整体透明度（0.1~1.0，1.0=不透明）。
+  double _opacity = 1.0;
+
+  /// 颜色镜像 → 覆盖色（-1=随机哨值 → null，由 _randomColor 承载）。
+  static Color? _colorOf(int? value) =>
+      value == null || value < 0 ? null : Color(value);
+
+  static bool _isRandomColor(int? value) => value != null && value < 0;
+
   /// `TickerMode` 为 false（例如被离屏 TabView 冻结）时不得产帧。
   bool _tickerVisible = true;
 
@@ -130,9 +150,39 @@ class _SongDanmakuHostState extends State<SongDanmakuHost> {
   @override
   void initState() {
     super.initState();
+    // v49：四个镜像全部回填初值——此前只回填 enabled，速度/颜色/只读在新 State
+    // 挂载时静默用默认值（真机实测：设置里调好再进播放页，三项全部失效；
+    // 只有当着播放页面改设置才生效）。监听器只管"变化"，初值必须自己读。
     _enabled = SettingsRepository.songDanmakuEnabled.value;
+    _speedScale = SettingsRepository.songDanmakuSpeed.value;
+    _overrideColor = _colorOf(SettingsRepository.songDanmakuColor.value);
+    _randomColor = _isRandomColor(SettingsRepository.songDanmakuColor.value);
+    _readOnly = SettingsRepository.songDanmakuReadOnly.value;
+    _opacity = SettingsRepository.songDanmakuOpacity.value;
     SettingsRepository.songDanmakuEnabled.addListener(_onSettingsChanged);
+    SettingsRepository.songDanmakuSpeed.addListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuColor.addListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuOpacity.addListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuReadOnly.addListener(_onReadOnlyChanged);
     SongDanmakuHost.delivery.addListener(_onDelivery);
+  }
+
+  /// v47：只看弹幕开关（隐藏/显示右下角"发弹幕"按钮）。
+  void _onReadOnlyChanged() {
+    if (!mounted) return;
+    setState(() => _readOnly = SettingsRepository.songDanmakuReadOnly.value);
+  }
+
+  /// v46：速度/颜色变化只影响后续 spawn 与绘制步长——setState 刷新传参即可。
+  /// v49：颜色镜像 -1 哨值 = 随机色。v52：透明度同口径。
+  void _onAppearanceChanged() {
+    if (!mounted) return;
+    setState(() {
+      _speedScale = SettingsRepository.songDanmakuSpeed.value;
+      _overrideColor = _colorOf(SettingsRepository.songDanmakuColor.value);
+      _randomColor = _isRandomColor(SettingsRepository.songDanmakuColor.value);
+      _opacity = SettingsRepository.songDanmakuOpacity.value;
+    });
   }
 
   @override
@@ -170,6 +220,10 @@ class _SongDanmakuHostState extends State<SongDanmakuHost> {
   @override
   void dispose() {
     SettingsRepository.songDanmakuEnabled.removeListener(_onSettingsChanged);
+    SettingsRepository.songDanmakuSpeed.removeListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuColor.removeListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuOpacity.removeListener(_onAppearanceChanged);
+    SettingsRepository.songDanmakuReadOnly.removeListener(_onReadOnlyChanged);
     SongDanmakuHost.delivery.removeListener(_onDelivery);
     _player?.positionNotifier.removeListener(_onPositionSample);
     _player?.removeListener(_onPlayerChanged);
@@ -399,27 +453,35 @@ class _SongDanmakuHostState extends State<SongDanmakuHost> {
             child: ScrollDanmakuLayer(
               controller: _danmaku,
               highlightColor: colorScheme.primary,
+              // v46：速度倍率与颜色覆盖（设置页可调）；v49：随机色模式；
+              // v52：整体透明度。
+              speed: 120 * _speedScale,
+              overrideColor: _overrideColor,
+              randomColor: _randomColor,
+              opacity: _opacity,
             ),
           ),
         ),
-        Positioned(
-          right: 8,
-          bottom: 8,
-          child: M3EFilledButton.tonal(
-            onPressed: _openComposer,
-            tooltip: '发弹幕',
-            shape: M3EButtonShape.round,
-            decoration: M3EButtonDecoration(
-              fixedSize: const Size(40, 40),
-              padding: EdgeInsets.zero,
-              backgroundColor:
-                  WidgetStatePropertyAll(colorScheme.secondaryContainer),
-              foregroundColor:
-                  WidgetStatePropertyAll(colorScheme.onSecondaryContainer),
+        // v47：只看弹幕——隐藏"发弹幕"按钮（设置页开关）。
+        if (!_readOnly)
+          Positioned(
+            right: 8,
+            bottom: 8,
+            child: M3EFilledButton.tonal(
+              onPressed: _openComposer,
+              tooltip: '发弹幕',
+              shape: M3EButtonShape.round,
+              decoration: M3EButtonDecoration(
+                fixedSize: const Size(40, 40),
+                padding: EdgeInsets.zero,
+                backgroundColor:
+                    WidgetStatePropertyAll(colorScheme.secondaryContainer),
+                foregroundColor:
+                    WidgetStatePropertyAll(colorScheme.onSecondaryContainer),
+              ),
+              child: const Icon(Icons.subtitles_outlined, size: 20),
             ),
-            child: const Icon(Icons.subtitles_outlined, size: 20),
           ),
-        ),
       ],
     );
   }

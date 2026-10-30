@@ -4,6 +4,7 @@ import '../data/models/song.dart';
 import '../data/repositories/favorites_repository.dart';
 import '../services/kugou_api/kugou_api_client.dart';
 import '../services/kugou_api/kugou_models.dart';
+import '../utils/playlist_write_payload.dart';
 
 class FavoritesProvider extends ChangeNotifier {
   final FavoritesRepository _repository = FavoritesRepository();
@@ -277,8 +278,7 @@ class FavoritesProvider extends ChangeNotifier {
       invalidateCloudFavoriteSongs();
 
       if (isLoggedIn) {
-        final data =
-            '${song.title}|${song.id}|${song.albumId ?? 0}|${int.tryParse(song.albumAudioId ?? '') ?? 0}';
+        final data = buildTrackAddData(song);
         // 后台同步，不阻塞 UI；失败时静默记录，下次启动时重试
         api.addPlaylistTracks(listid, data).then((result) {
           if (result == null) {
@@ -314,8 +314,8 @@ class FavoritesProvider extends ChangeNotifier {
     Song song,
   ) async {
     final api = KugouApiClient();
-    final data = '${song.title}|${song.id}';
-    return await api.addPlaylistTracks(listid, data);
+    // 与「添加到歌单」共用同一份拼装（四段齐全，两段在部分曲库下会被上游拒）
+    return await api.addPlaylistTracks(listid, buildTrackAddData(song));
   }
 
   Future<Map<String, dynamic>?> removeTrackFromPlaylist(

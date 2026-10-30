@@ -21,6 +21,13 @@ internal object HomeWidgetChannel {
                         context, title, artist, isPlaying, position, duration
                     )
                     CoverPlayerWidgetProvider.updateAllWidgets(context, title, artist, isPlaying)
+                    // 概念版 4×1 小部件额外需要播放模式与收藏态（旧两个组件不消费这些字段）
+                    ConceptWidgetProvider.updateAllWidgets(
+                        context, title, artist, isPlaying,
+                        call.argument<String>("loopMode") ?: "off",
+                        call.argument<Boolean>("shuffleEnabled") ?: false,
+                        call.argument<Boolean>("isFavorited") ?: false
+                    )
                     result.success(true)
                 }
                 "updateFmWidget" -> {
@@ -34,6 +41,7 @@ internal object HomeWidgetChannel {
                     val colors = call.arguments as? Map<String, Number> ?: emptyMap()
                     MusicWidgetProvider.updateTheme(context, colors)
                     CoverPlayerWidgetProvider.updateTheme(context, colors)
+                    ConceptWidgetProvider.updateTheme(context, colors)
                     result.success(true)
                 }
                 else -> result.notImplemented()

@@ -9,6 +9,7 @@ import 'package:md3music/core/layout/responsive_layout.dart';
 import 'package:md3music/core/services/player_frame_driver.dart';
 import 'package:md3music/data/repositories/settings_repository.dart';
 import 'package:md3music/data/models/song.dart';
+import 'package:md3music/modules/player/bottom_bar_morph_overlay.dart';
 import 'package:md3music/modules/player/full_player_route.dart';
 import 'package:md3music/modules/player/mini_player.dart';
 import 'package:md3music/modules/player/player_morph_scene.dart';
@@ -1909,7 +1910,7 @@ void main() {
       expect(capsuleCoverOpacity(1.0, layerWillDraw: false), 0.0);
     });
 
-    testWidgets('展开态点击：push 的路由拿到「胶囊自身矩形」作为展开起点', (
+    testWidgets('展开态点击：push 的路由拿到「胶囊可见本体矩形」作为展开起点', (
       tester,
     ) async {
       _setViewport(tester, _kPhonePortrait);
@@ -1919,21 +1920,19 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
-      // 胶囊所在宿主 render box（与采集口径相同：锚点空间、含 SafeArea + 12dp
-      // 底距，底端到屏底）。本 harness 不在 DisplayScaleScope 内，锚点空间 ≡ 根空间。
-      final RenderBox box = tester.renderObject<RenderBox>(
-        find.byType(SecondaryMiniPlayer),
-      );
-      final Rect boxRect = box.localToGlobal(Offset.zero) & box.size;
+      // 可见本体 = 胶囊 Material 那一层（宽 = 视口 − 32、高 64）。
+      // 本 harness 不在 DisplayScaleScope 内，锚点空间 ≡ 根空间。
+      final Rect bodyRect = tester.getRect(capsule(tester));
       expect(
-        boxRect.bottom,
-        closeTo(_kPhonePortrait.height, 0.5),
-        reason: '前置：宿主底端即屏底（含底部净空的整块）',
+        bodyRect.width,
+        closeTo(_kPhonePortrait.width - 32, 0.5),
+        reason: '前置：胶囊可见本体撑满可用宽（左右各 16 内边距）',
       );
+      expect(bodyRect.height, closeTo(64, 0.5), reason: '前置：胶囊高 = 直径 64');
       expect(
-        boxRect.height,
-        closeTo(76.0, 0.5),
-        reason: '前置：胶囊 64 + 12dp 底距（测试视口无底部安全区）',
+        bodyRect.bottom,
+        closeTo(_kPhonePortrait.height - 12, 0.5),
+        reason: '前置：底端距屏底 12dp（宿主 76 高 = 64 + 12）',
       );
 
       await tester.tap(capsule(tester));
@@ -1946,15 +1945,22 @@ void main() {
       expect(scene!.form, PlayerBarForm.floatingCapsule);
       expect(
         scene.panelRect,
-        boxRect,
-        reason: 'panelRect 必须等于胶囊自身矩形（同空间同值），否则面板从偏低处长出',
+        bodyRect,
+        reason: 'panelRect 必须是**可见本体**（不是宿主外框）：'
+            '用外框会让面板一上来就比真身宽 32、横偏 16',
+      );
+      expect(
+        scene.panelRadius,
+        32,
+        reason: '起点圆角 = 胶囊外轮廓半径，展开时才从它插值到屏幕 r 角',
       );
       expect(scene.screenHeight, closeTo(_kPhonePortrait.height, 0.5));
-      // 面板锚点消费端：起点 = 胶囊顶端、高度 = 胶囊宿主高（含底部净空）。
-      expect(
-        route.panelAnchorFor(_kPhonePortrait.height),
-        (top: boxRect.top, height: boxRect.height),
+      // 面板几何消费端：起点矩形 + 圆角原样透传。
+      final geometry = route.panelGeometryFor(
+        Size(_kPhonePortrait.width, _kPhonePortrait.height),
       );
+      expect(geometry.rect, bodyRect);
+      expect(geometry.radius, 32);
 
       // 清理：把尚未构建的路由移除，避免收尾 pump 时真的 build FullPlayer。
       // 再推进 400ms 让 onTap 里 AppHaptics.click 的 300ms 定时器落地
@@ -1990,6 +1996,224 @@ void main() {
       );
       expect(coverHandoffOpacity(tester), 0.0, reason: 'p=1 封面也必须收干净');
 
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  // —— 上拉展开（悬浮胶囊的跟手手势，与常驻条同语义）——
+
+  group('上拉展开', () {
+    setUp(() {
+      playerDragActive.value = false;
+      // 五字段成组复位（top/bottom 归零 + 通栏 + 方角）
+      publishPlayerDragOrigin(top: 0, bottom: 0);
+      activePlayerRoute = null;
+    });
+
+    tearDown(() {
+      playerDragActive.value = false;
+      playerExpansion.value = 0.0;
+      publishPlayerDragOrigin(top: 0, bottom: 0);
+      activePlayerRoute = null;
+    });
+
+    testWidgets('上拉过 slop 即跟手：起点登记为胶囊可见本体 + 圆角 32', (
+      tester,
+    ) async {
+      _setViewport(tester, _kPhonePortrait);
+      collapsed.value = false;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final Rect body = tester.getRect(capsule(tester));
+      final gesture = await tester.startGesture(body.center);
+      addTearDown(gesture.removePointer);
+      await gesture.moveBy(const Offset(0, -60));
+      await tester.pump();
+
+      expect(playerDragActive.value, isTrue, reason: '上拉激活后必须挂出跟手覆盖层');
+      expect(
+        playerExpansion.value,
+        closeTo(60 / body.top, 1e-6),
+        reason: '进度 = 上滑距离 / 胶囊顶端（1:1 跟手）',
+      );
+      // 成组登记：胶囊写的是**可见本体**（非宿主外框）+ 外轮廓圆角
+      expect(playerDragOriginTop, closeTo(body.top, 0.5));
+      expect(playerDragOriginBottom, closeTo(body.bottom, 0.5));
+      expect(playerDragOriginLeft, closeTo(body.left, 0.5));
+      expect(playerDragOriginWidth, closeTo(body.width, 0.5));
+      expect(playerDragOriginRadius, kCapsuleOutlineRadius);
+
+      await gesture.up();
+      // 未达阈值 → 回弹；把回弹跑完（220ms + 余量），并 flush 触觉的 300ms 定时器
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(playerExpansion.value, 0.0);
+      expect(playerDragActive.value, isFalse);
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('松手达标：push 的路由带胶囊本体快照并从当前进度续展', (
+      tester,
+    ) async {
+      _setViewport(tester, _kPhonePortrait);
+      collapsed.value = false;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final Rect body = tester.getRect(capsule(tester));
+      // 一次快速甩动：距离 = 300 > 阈值（0.2 × 869 = 173.8）
+      await tester.dragFrom(body.center, const Offset(0, -300));
+
+      final route = activePlayerRoute;
+      expect(route, isNotNull, reason: '松手达标必须 push 播放页路由');
+      final scene = (route as DraggablePlayerRoute<dynamic>).scene;
+      expect(scene, isNotNull);
+      expect(
+        scene!.panelRect,
+        body,
+        reason: '上拉起点的快照矩形 = 胶囊可见本体（与 tap 路径同一口径）',
+      );
+      expect(scene.panelRadius, 32);
+      expect(scene.form, PlayerBarForm.floatingCapsule);
+      // 拖拽参数成对传入（路由的 panelAnchorFor 走 scene 分支，这里核快照本身）
+      expect(route.dragOriginTop, closeTo(body.top, 0.5));
+      expect(route.dragOriginBottom, closeTo(body.bottom, 0.5));
+
+      // 立刻移除路由：不 pump 出 FullPlayer 页面（本 harness 不铺全依赖）；
+      // 后续 pump 只会让 handOffDragToRoute 的等待回调发现路由已不在而收口。
+      route.navigator?.removeRoute(route);
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(
+        playerDragActive.value,
+        isFalse,
+        reason: '路由在等待期被移除时也要收掉覆盖层（不留幽灵面板）',
+      );
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('松手未达标：动画回弹逐帧归零，不 push 路由', (tester) async {
+      _setViewport(tester, _kPhonePortrait);
+      collapsed.value = false;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final Rect body = tester.getRect(capsule(tester));
+      final gesture = await tester.startGesture(body.center);
+      addTearDown(gesture.removePointer);
+      // 缓慢小位移：距离 50 < 阈值，速度≈0（每步间隔 100ms）
+      for (var i = 0; i < 5; i++) {
+        await gesture.moveBy(const Offset(0, -10));
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(playerExpansion.value, greaterThan(0.0));
+      await gesture.up();
+
+      // 回弹中途：仍有帧在推进（不是单帧硬归零）。
+      // **必须泵两帧**：`forward(from: 0)` 起播后的第一帧 elapsed 恒为 0
+      // （Ticker._tickImpl 首帧只记录起点），Tween 落在 begin = 起点值上，
+      // 读不到下降；这不是实现缺陷，是帧调度语义。
+      await tester.pump(const Duration(milliseconds: 40));
+      await tester.pump(const Duration(milliseconds: 40));
+      final mid = playerExpansion.value;
+      expect(mid, greaterThan(0.0), reason: '回弹必须是逐帧动画，中途不能已经归零');
+      expect(mid, lessThan(50 / body.top));
+
+      final List<double> samples = [];
+      void record() => samples.add(playerExpansion.value);
+      playerExpansion.addListener(record);
+      addTearDown(() => playerExpansion.removeListener(record));
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
+      // 只认「采集到中间值」的单调性：允许采样间相等，禁止回升。
+      // （泵帧粒度是 300ms 一大帧，回弹全程 220ms，采集数天然很少 ——
+      // 「逐帧推进」的证据在上面 mid 那次双帧读取，这里不重复要求条数。）
+      for (var i = 1; i < samples.length; i++) {
+        expect(samples[i], lessThanOrEqualTo(samples[i - 1] + 1e-9));
+      }
+      expect(playerExpansion.value, 0.0);
+      expect(activePlayerRoute, isNull, reason: '未达阈值不得入栈');
+      expect(playerDragActive.value, isFalse);
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('斜向滑动不激活上拉（守卫不误吞横向拖动 / 点击）', (tester) async {
+      _setViewport(tester, _kPhonePortrait);
+      collapsed.value = false;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final Rect body = tester.getRect(capsule(tester));
+      final gesture = await tester.startGesture(body.center);
+      addTearDown(gesture.removePointer);
+      // 垂直位移小于水平：主导轴判据必须拒掉
+      await gesture.moveBy(const Offset(-120, -30));
+      await tester.pump();
+
+      expect(playerDragActive.value, isFalse, reason: '斜向滑动不该激活上拉展开');
+      expect(playerExpansion.value, 0.0);
+
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('上拉激活后同一次手势的 tap 不再触发点击进入', (tester) async {
+      _setViewport(tester, _kPhonePortrait);
+      collapsed.value = false;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final Rect body = tester.getRect(capsule(tester));
+      final gesture = await tester.startGesture(body.center);
+      addTearDown(gesture.removePointer);
+      await gesture.moveBy(const Offset(0, -60));
+      await tester.pump();
+      expect(playerDragActive.value, isTrue);
+      // 松手（未达阈值）：竞技场 sweep 会补发 tap，守卫必须挡住它
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        activePlayerRoute,
+        isNull,
+        reason: '上拉收尾不得被 sweep 出来的 tap 二次触发 push',
+      );
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  group('收缩态登记（交棒端点冻结取值）', () {
+    // 回归：收缩动画只重建卡片内层 AnimatedBuilder，卡片本体不 rebuild ——
+    // 若收缩态走 build/postFrame 登记，值会停在收缩前的 0，交棒冻结取到 0、
+    // 浮层首帧按展开胶囊盖住圆盘（真机报障「返回一瞬间变展开态」）。
+    testWidgets('收缩/展开全程登记簿跟随 _morph（终值 1 → 0 → 1）', (tester) async {
+      _setViewport(tester, _kPhonePortrait);
+      final registry = BottomBarMorphRegistry.instance;
+      // 初始即收起：initState 直接落端点 1，靠卡片 build 的同步登记兜住。
+      collapsed.value = true;
+      await tester.pumpWidget(host());
+      await tester.pump();
+      expect(registry.capsuleCollapseT, 1.0);
+
+      // 展开动画：listener 每 tick + 落定都要同步登记。
+      collapsed.value = false;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(registry.capsuleCollapseT, 0.0);
+
+      // 再收起：这是真机报障路径（收起后卡片不再 rebuild）。
+      collapsed.value = true;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(registry.capsuleCollapseT, 1.0);
+      expect(registry.capsuleDockSide, SecondaryPlayerDockSide.center);
       await tester.pumpWidget(const SizedBox());
     });
   });

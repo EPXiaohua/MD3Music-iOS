@@ -41,6 +41,26 @@ const Set<String> audioExtensions = {
   '.aif', '.aiff', '.aifc',
 };
 
+/// Android 默认 Media3 解复用器不支持的常见容器，不作为可播放本地歌曲扫描。
+const Set<String> androidUnsupportedAudioExtensions = {
+  '.ape', '.wma', '.aif', '.aiff', '.aifc',
+};
+
+String _audioExtension(String path) {
+  final fileName = path.split(RegExp(r'[/\\]')).last.toLowerCase();
+  final dot = fileName.lastIndexOf('.');
+  return dot < 0 ? '' : fileName.substring(dot);
+}
+
+bool isAudioFileSupported(String path, {required bool isAndroid}) {
+  final extension = _audioExtension(path);
+  return audioExtensions.contains(extension) &&
+      (!isAndroid || !androidUnsupportedAudioExtensions.contains(extension));
+}
+
+bool isAndroidUnsupportedAudioFile(String path) =>
+    androidUnsupportedAudioExtensions.contains(_audioExtension(path));
+
 /// Isolate 入口函数：批量扫描音频文件并读取 metadata。
 ///
 /// 在 [compute] 中调用，[filePaths] 为文件路径字符串列表。
@@ -100,14 +120,17 @@ Map<String, dynamic>? readArtworkInIsolate(String filePath) {
 
 /// 递归收集目录中的音频文件路径。
 ///
-/// 在主 Isolate 中同步调用（文件列表收集阶段）。
+/// 同步工作函数，扫描入口应通过 [collectAudioFilesInIsolate] 在后台调用。
 /// 使用 [audioExtensions] 过滤，去重后返回路径列表。
 /// [excludedDirs] 中的目录及其子目录会被跳过。
 List<String> collectAudioFiles(List<String> rootDirs, {List<String>? excludedDirs}) {
   final filePaths = <String>[];
   final seen = <String>{};
+  final visitedDirs = <String>{};
   final excluded = excludedDirs ?? [];
-  for (final rootPath in rootDirs) {
+  final pending = List<String>.from(rootDirs);
+  while (pending.isNotEmpty) {
+    final rootPath = pending.removeLast();
     try {
       final dir = Directory(rootPath);
       if (!dir.existsSync()) {
@@ -119,18 +142,22 @@ List<String> collectAudioFiles(List<String> rootDirs, {List<String>? excludedDir
         debugPrint('[AudioScanner] 跳过排除目录: $rootPath');
         continue;
       }
-      final entities = dir.listSync(recursive: true, followLinks: false);
+      final directoryKey = dir.absolute.path.replaceAll('\\', '/');
+      if (!visitedDirs.add(Platform.isWindows ? directoryKey.toLowerCase() : directoryKey)) {
+        continue;
+      }
+      // 每个目录单独处理：无权限的子目录不能让整个根目录的结果丢失；
+      // 也不进入排除目录，避免先枚举全盘再过滤导致内存暴涨。
+      final entities = dir.listSync(followLinks: false);
       for (final entity in entities) {
-        if (entity is File) {
+        if (entity is Directory) {
+          if (!_isPathExcluded(entity.path, excluded)) pending.add(entity.path);
+        } else if (entity is File) {
           final path = entity.path;
           // 排除文件夹过滤
           if (_isPathExcluded(path, excluded)) continue;
-          final lowerPath = path.toLowerCase();
-          final lastDot = lowerPath.lastIndexOf('.');
-          if (lastDot == -1) continue;
-          final ext = lowerPath.substring(lastDot);
-          if (audioExtensions.contains(ext)) {
-            if (seen.add(path)) {
+          if (isAudioFileSupported(path, isAndroid: Platform.isAndroid)) {
+            if (seen.add(Platform.isWindows ? path.toLowerCase() : path)) {
               filePaths.add(path);
             }
           }
@@ -147,12 +174,18 @@ List<String> collectAudioFiles(List<String> rootDirs, {List<String>? excludedDir
   return filePaths;
 }
 
+/// compute 入口只接收可序列化路径，不在 UI Isolate 做递归文件 I/O。
+List<String> collectAudioFilesInIsolate(Map<String, List<String>> input) =>
+    collectAudioFiles(input['roots']!, excludedDirs: input['excluded']);
+
 /// 判断路径是否位于排除文件夹内（支持子目录匹配）。
 bool _isPathExcluded(String path, List<String> excludedDirs) {
   if (excludedDirs.isEmpty) return false;
-  final normalized = path.replaceAll('\\', '/');
+  var normalized = path.replaceAll('\\', '/');
+  if (Platform.isWindows) normalized = normalized.toLowerCase();
   for (final excluded in excludedDirs) {
-    final normalizedExcluded = excluded.replaceAll('\\', '/');
+    var normalizedExcluded = excluded.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+    if (Platform.isWindows) normalizedExcluded = normalizedExcluded.toLowerCase();
     if (normalized == normalizedExcluded ||
         normalized.startsWith('$normalizedExcluded/')) {
       return true;

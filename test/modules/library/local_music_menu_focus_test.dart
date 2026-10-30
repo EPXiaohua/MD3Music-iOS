@@ -118,4 +118,43 @@ void main() {
       expect(tester.takeException(), isNull);
     }, variant: TargetPlatformVariant.only(TargetPlatform.android));
   }
+
+  testWidgets('横屏进入本地音乐不自动请求输入焦点，点搜索框才弹键盘', (
+    tester,
+  ) async {
+    final library = _SearchLibrary();
+    final player = _IdlePlayer();
+    addTearDown(library.dispose);
+    addTearDown(player.dispose);
+    tester.view.physicalSize = const Size(900, 420);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<LibraryProvider>.value(value: library),
+          ChangeNotifierProvider<PlayerProvider>.value(value: player),
+          ChangeNotifierProvider(create: (_) => LocalFavoritesProvider()),
+          ChangeNotifierProvider(create: (_) => TabConfigProvider()),
+        ],
+        child: const MaterialApp(home: LibraryPage()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final focus = tester.widget<TextField>(find.byType(TextField)).focusNode!;
+    expect(focus.canRequestFocus, isFalse);
+    expect(focus.hasFocus, isFalse);
+    expect(tester.testTextInput.hasAnyClients, isFalse);
+
+    await tester.tap(find.byType(TextField));
+    await tester.pumpAndSettle();
+    expect(focus.hasFocus, isTrue);
+    expect(tester.testTextInput.isVisible, isTrue);
+
+    await tester.tapAt(const Offset(850, 400));
+    await tester.pumpAndSettle();
+    expect(focus.canRequestFocus, isFalse);
+    expect(focus.hasFocus, isFalse);
+    expect(tester.testTextInput.hasAnyClients, isFalse);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }

@@ -258,9 +258,10 @@ class AudioService {
     // 因此辅播放器**不请求音频焦点**：否则同一个 app 的第二次焦点请求会让
     // 主播放器收到 AUDIOFOCUS_LOSS，淡出的那一路会被 Media3 直接掐掉。
     androidApplyAudioAttributes: !aux,
-    // MD3Music fork: 辅播放器跳过 MediaSession 创建（避免系统看到两个活跃
-    // 媒体会话），并与主播放器共享同一个 audioSessionId（均衡器/频谱在
-    // 淡化全程对两路音频同时生效）。
+    // MD3Music fork: 辅播放器与主播放器共享同一个 audioSessionId（均衡器/频谱在
+    // 淡化全程对两路音频同时生效）。原生侧所有播放器（含辅播放器）都会建 Media3
+    // 会话，会话归属由 AudioPlayer.play() 收敛：只有真正开始播放的播放器，
+    // 其会话才被归入 host（其余会话被释放），系统任意时刻只暴露一个活跃会话。
     androidAuxPlayer: aux,
     // 音量均衡：挂一个 LoudnessEnhancer 用于放大安静歌（跨引擎、Dart 侧可靠）。
     audioPipeline: enhancer != null
@@ -331,6 +332,12 @@ class AudioService {
     if (referenceLufs != null) _vnReferenceLufs = referenceLufs;
     await _applyNormalizationGainActive();
   }
+
+  /// 音量均衡（响度归一）当前是否开启。
+  ///
+  /// 供「硬件解码播放」让路判定读取：音量均衡会对样本施加增益，与 audio offload
+  /// 的「逐字节直通解码器」互斥，开启时必须让硬解让路。
+  bool get volumeNormalizationEnabled => _vnEnabled;
 
   /// 用 AutoMix 实测响度补上缺失的上游响度。
   ///
@@ -611,10 +618,8 @@ class AudioService {
     // 这条日志是坐实/排除该路径的唯一判据（abort 自身只打 crossed=…，看不出触发原因）。
     if (_crossfading) {
       // ignore: avoid_print
-      print(
-        '[VolAudit] 淡化中收到焦点变化 focusChange=$focusChange '
-        'mode=${_interruptionMode.name} playing=${_activePlayer.playing}',
-      );
+      print('[VolAudit] 淡化中收到焦点变化 focusChange=$focusChange '
+          'mode=${_interruptionMode.name} playing=${_activePlayer.playing}');
     }
     if (_interruptionMode == AudioFocusInterruptionMode.keepPlaying) {
       // keepPlaying：短暂中断（导航等 transient/duck）native 已 skip（保持播放
@@ -654,12 +659,22 @@ class AudioService {
     try {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
-      // MD3Music fork: 停用 audio_session 的音频焦点请求（setActive(false)）。
-      // 焦点由 Media3 的 AudioFocusManager 唯一持有（handleAudioFocus=true），
-      // 原始事件经 just_audio fork 转发到 audioFocusChangeStream；避免双焦点
-      // 内斗（Media3 与 audio_session 交替 request/abandon 导致播放反复暂停）。
-      // 拔耳机由 Media3 的 becomingNoisy 自动暂停（不标记可自动恢复）。
-      await session.setActive(false);
+      // MD3Music fork: Android 上停用 audio_session 的音频焦点请求
+      // （setActive(false)）。焦点由 Media3 的 AudioFocusManager 唯一持有
+      // （handleAudioFocus=true），原始事件经 just_audio fork 转发到
+      // audioFocusChangeStream；避免双焦点内斗（Media3 与 audio_session 交替
+      // request/abandon 导致播放反复暂停）。拔耳机由 Media3 的 becomingNoisy
+      // 自动暂停（不标记可自动恢复）。
+      //
+      // iOS 没有 Media3，不能照搬：AVAudioSession 不激活（setActive(true)）
+      // 时 AVPlayer 起播只能依赖系统的隐式激活，冷启动首播、其他 app 中断
+      // 恢复后概率性失败，表现为「播放器在播、频谱动、无声」。iOS 无音频
+      // 焦点概念，激活不参与竞争，configure 后立即激活并保持即可。
+      if (Platform.isIOS) {
+        await session.setActive(true);
+      } else {
+        await session.setActive(false);
+      }
     } catch (e) {
       // P2-2: 焦点/会话配置失败必须留痕，否则无法用 logcat 排障
       // ignore: avoid_print
@@ -775,6 +790,7 @@ class AudioService {
     double? loudnessLufs,
     double? loudnessPeakDb,
     Duration? initialPosition,
+    dynamic tag,
   }) async {
     abortCrossfade();
     // 音量均衡响度：歌曲未带响度时，回退查「url → 响度」缓存（KugouPlayUrl 解析时记录）
@@ -789,6 +805,7 @@ class AudioService {
       url,
       headers: const {},
       initialPosition: initialPosition ?? Duration.zero,
+      tag: tag,
     );
     await _applyNormalizationGainActive();
   }
@@ -1005,12 +1022,13 @@ class AudioService {
       // 用带 artUri 的 AudioSource 加载：MediaSession 仅在 onMediaItemTransition 时
       // 同步系统封面（SystemUI 从 artUri 下载显示）；setUrl 无 artUri 时通知栏缺失封面，
       // 而 applySessionMetadata 的 bitmap 经 replaceMediaItem 注入不触发 MediaSession 同步。
+      // 刻意不带 id（与 _setUrlAndPlay 口径一致）：framework MEDIA_ID 保持空串由
+      // vivo hook 补 title|artist 身份，与 lrc_change extras 的 meidia_id 匹配口径一致。
       final artUriParsed = artUri != null ? Uri.tryParse(artUri) : null;
       final loaded = await standby.setAudioSource(
         AudioSource.uri(
           Uri.parse(url),
           tag: {
-            'id': id,
             'title': title ?? '',
             'artist': artist,
             'album': null,
@@ -1115,10 +1133,8 @@ class AudioService {
           // 手动切歌）接管了这两个播放器。若用户听到「音量突然变大」，
           // 这条日志与紧随其后的 VolAudit 一起能定位是谁写的音量。
           // ignore: avoid_print
-          print(
-            '[Crossfade] ⚠ 斜坡被中止（token 失效）'
-            ' t=${(DateTime.now().difference(started).inMilliseconds / (totalMs <= 0 ? 1 : totalMs)).clamp(0.0, 1.0).toStringAsFixed(2)}',
-          );
+          print('[Crossfade] ⚠ 斜坡被中止（token 失效）'
+              ' t=${(DateTime.now().difference(started).inMilliseconds / (totalMs <= 0 ? 1 : totalMs)).clamp(0.0, 1.0).toStringAsFixed(2)}');
           return;
         }
         // 进度按**真实经过时间**算，不是累加步数。切歌那一瞬 Dart 事件循环要
@@ -1155,7 +1171,7 @@ class AudioService {
           final inDrift = (actualIn - expectedIn).abs();
           final driftNote = (outDrift > 0.1 || inDrift > 0.1)
               ? ' ⚠音量偏差 out实际=${actualOut.toStringAsFixed(2)}'
-                    ' in实际=${actualIn.toStringAsFixed(2)}'
+                  ' in实际=${actualIn.toStringAsFixed(2)}'
               : '';
           // ignore: avoid_print
           print(
@@ -1266,9 +1282,8 @@ class AudioService {
         .skip(1)
         .take(3)
         .map((l) {
-          final m = RegExp(
-            r'\((?:(?:package|dart):[^)]*?/)?([^/)]+\.dart(?::\d+)?)',
-          ).firstMatch(l);
+          final m = RegExp(r'\((?:(?:package|dart):[^)]*?/)?([^/)]+\.dart(?::\d+)?)')
+              .firstMatch(l);
           return m?.group(1) ?? l.trim().split(' ').first;
         })
         .join(' <- ');

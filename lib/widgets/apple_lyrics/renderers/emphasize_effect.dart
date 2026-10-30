@@ -26,10 +26,16 @@ class EmphasizeState {
   /// 缩放比例，1.0~1.12（含末尾字加强后可能略高）。
   final double scale;
 
-  /// 辉光强度 0~1.2（作为 textShadow 的 alpha 通道）。
+  /// 辉光强度 0~1.2（作为辉光层的整体 alpha）。
   final double glowLevel;
 
   /// 阴影模糊半径（em 单位），封顶 0.3。
+  ///
+  /// **注意**：自「辉光剖面」改造后，绘制层的模糊半径改为固定剖面
+  /// （紧 / 中 / 松三层，见 `WordRenderer` 的 `_glowRimSigmaEm` 等常量），
+  /// 不再由本值决定——单层大半径正是"方块字糊成一坨"的根因。本字段保留为
+  /// 与时长相关的**相对强度**读数（供测试与后续调参），强度差异由
+  /// [glowLevel] 体现。
   final double shadowBlurEm;
 
   /// 水平外扩位移（em 单位）：左字向左、右字向右，随凸起涨落。
@@ -123,6 +129,8 @@ class EmphasizeEffect {
   /// 慢歌过密；改用 [resolveThresholdMs] 按歌曲 BPM / 歌词字长中位数 ×
   /// [LyricPreferences.glowThresholdFactor] 自适应推断（设置页可调 1.0~2.0），
   /// 再经 [shouldEmphasize] 的 [thresholdMs] 传入。
+  /// 另支持固定时长判定（[GlowThresholdMode.fixed]，设置页可调 500~2000ms，
+  /// 默认 1000ms），二选一由 [LyricPreferences.glowThresholdMode] 决定。
   static const int _nonCjkMaxLength = 7;
 
   // ============== 内容过滤常量 ==============
@@ -270,26 +278,41 @@ class EmphasizeEffect {
     return false;
   }
 
-  /// 解析整首歌的辉光触发阈值（ms）：**单位字长 × 阈值系数**，随节奏自适应。
+  /// 解析整首歌的辉光触发阈值（ms）：**判定模式二选一**。
   ///
-  /// 单位字长来源（结合 BPM 真数据 + 歌词字长推断）：
-  /// 1. [songBpm] 非空（酷狗接口 / 本地音频 TBPM 标签）：按「一字一拍」
-  ///    换算 `60000 / BPM` 作为单位字长（如 BPM=120 → 500ms）。
-  /// 2. 歌词字长统计（KRC 逐字）：取所有字时长中位数作为单位字长；
-  ///    样本不足返回 null 交给兜底。
-  /// 3. 兜底返回 [fallback]（默认 [_durationThresholdMs]=500）。
+  /// - 固定时长模式（[GlowThresholdMode.fixed]，默认）：直接返回
+  ///   [LyricPreferences.glowFixedThresholdMs]（设置页可调 500~2000ms，
+  ///   默认 1000ms），忽略 BPM / 歌词统计。
+  /// - 自适应模式（[GlowThresholdMode.adaptive]，原有逻辑）：
+  ///   **单位字长 × 阈值系数**，随节奏自适应：
+  ///   1. [songBpm] 非空（酷狗接口 / 本地音频 TBPM 标签）：按「一字一拍」
+  ///      换算 `60000 / BPM` 作为单位字长（如 BPM=120 → 500ms）。
+  ///   2. 歌词字长统计（KRC 逐字）：取所有字时长中位数作为单位字长；
+  ///      样本不足返回 null 交给兜底。
+  ///   3. 兜底返回 [fallback]（默认 [_durationThresholdMs]=500）。
   ///
   /// 阈值系数默认取 [LyricPreferences.glowThresholdFactor]（设置页可调
-  /// 1.0~2.0，默认 1.4），也可经 [thresholdFactor] 显式传入（供测试）。
+  /// 1.0~2.0，默认 1.2），也可经 [thresholdFactor] 显式传入（供测试）。
+  /// 判定模式与固定阈值同样可经 [mode] / [fixedThresholdMs] 显式传入（供测试）。
   ///
-  /// 例：字长中位数 400ms（快歌）× 1.4 → 阈值 560ms；800ms（慢歌）→ 1120ms，
-  /// 快慢之间平滑过渡，不再使用固定两档。
+  /// 例（自适应）：字长中位数 400ms（快歌）× 1.4 → 阈值 560ms；
+  /// 800ms（慢歌）→ 1120ms，快慢之间平滑过渡，不再使用固定两档。
   static int resolveThresholdMs({
     List<LyricLine>? lines,
     int? songBpm,
     int fallback = _durationThresholdMs,
     double? thresholdFactor,
+    GlowThresholdMode? mode,
+    double? fixedThresholdMs,
   }) {
+    // 固定时长判定：直接使用用户设定的固定阈值，不做任何自适应推断
+    final GlowThresholdMode effectiveMode =
+        mode ?? LyricPreferences.instance.glowThresholdMode;
+    if (effectiveMode == GlowThresholdMode.fixed) {
+      final double fixed = fixedThresholdMs ??
+          LyricPreferences.instance.glowFixedThresholdMs;
+      return fixed.round();
+    }
     final double factor =
         thresholdFactor ?? LyricPreferences.instance.glowThresholdFactor;
     // 1. 显式 BPM：一字一拍换算单位字长，再 × 系数

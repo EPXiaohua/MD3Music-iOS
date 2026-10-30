@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../utils/audio_scanner.dart';
+import '../utils/local_media_path.dart';
 
 /// 本地音乐封面懒加载缓存服务。
 ///
@@ -45,30 +46,47 @@ class LocalArtworkCache {
   ///
   /// 未命中缓存时在 Isolate 中读取文件元数据提取封面。
   /// 返回 null 表示该文件无封面图。
+  ///
+  /// **入参先经 [normalizeLocalMediaPath] 归一**：播放解析会把本地歌曲的
+  /// `localPath` 回写成 `file://` URI（中文/空格还带 percent 编码），而
+  /// `File()` 不认这些前缀与编码——不归一时 `existsSync()` 恒为 false，
+  /// 播放页封面恒为占位符（列表用曲库对象、未经回写，所以不受影响）。
+  /// 归一后的路径同时用作缓存键：同一文件经裸路径与 `file://` 两种入参
+  /// 只读一次盘、共用一份字节。
   Future<Uint8List?> getArtwork(String filePath) async {
+    final normalized = normalizeLocalMediaPath(filePath);
+    if (normalized == null) return null;
+    // 归一后仍非本地形态（content:// / http(s):// 等）：`dart:io` 读不了，
+    // 保持既有「无内嵌封面」语义，且不占用缓存位（原实现会把 null 写进缓存）。
+    if (normalized.startsWith('content://') ||
+        normalized.startsWith('http://') ||
+        normalized.startsWith('https://')) {
+      return null;
+    }
+
     // 命中即刷新访问序（remove + put 移到末尾）
-    if (_cache.containsKey(filePath)) {
-      final v = _cache.remove(filePath);
-      _cache[filePath] = v;
+    if (_cache.containsKey(normalized)) {
+      final v = _cache.remove(normalized);
+      _cache[normalized] = v;
       return v;
     }
-    final pending = _inFlight[filePath];
+    final pending = _inFlight[normalized];
     if (pending != null) return pending;
 
     final generation = _generation;
     late final Future<Uint8List?> request;
-    request = _readArtwork(filePath)
+    request = _readArtwork(normalized)
         .then((bytes) {
           // clear() 后仍允许旧调用者拿到结果，但不能把过期结果写回新缓存。
-          if (generation == _generation) _put(filePath, bytes);
+          if (generation == _generation) _put(normalized, bytes);
           return bytes;
         })
         .whenComplete(() {
-          if (identical(_inFlight[filePath], request)) {
-            _inFlight.remove(filePath);
+          if (identical(_inFlight[normalized], request)) {
+            _inFlight.remove(normalized);
           }
         });
-    _inFlight[filePath] = request;
+    _inFlight[normalized] = request;
     return request;
   }
 
@@ -77,7 +95,12 @@ class LocalArtworkCache {
       final reader = _reader;
       if (reader != null) return await reader(filePath);
       final result = await compute(readArtworkInIsolate, filePath);
-      return result != null ? result['bytes'] as Uint8List : null;
+      final bytes = result != null ? result['bytes'] as Uint8List : null;
+      if (bytes == null) {
+        // 真机取证用：区分「文件不存在/读不了」与「元数据里确实没有封面」。
+        debugPrint('[LocalArtworkCache] 未提取到内嵌封面 path=$filePath');
+      }
+      return bytes;
     } catch (_) {
       return null;
     }

@@ -9,6 +9,7 @@ import 'package:md3music/data/models/song.dart';
 import 'package:md3music/modules/player/am_artist_photo_cover.dart';
 import 'package:md3music/modules/player/artist_photo_service.dart';
 import 'package:md3music/modules/player/full_player_am.dart';
+import 'package:md3music/modules/player/full_player_route.dart';
 import 'package:md3music/modules/player/player_cover_morph.dart';
 import 'package:md3music/modules/player/player_cover_morph_layer.dart';
 import 'package:md3music/providers/comment_display_provider.dart';
@@ -20,6 +21,7 @@ import 'package:md3music/providers/local_favorites_provider.dart';
 import 'package:md3music/providers/player_provider.dart';
 import 'package:md3music/providers/theme_provider.dart';
 import 'package:md3music/services/kugou_api/kugou_models.dart';
+import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -172,6 +174,93 @@ void main() {
       expect(find.byType(PlayerCoverSlot), findsNothing);
       // 标题块叠在写真下缘
       expect(find.text('Narrow Layout Playback Target'), findsOneWidget);
+    } finally {
+      player.dispose();
+    }
+  });
+
+  testWidgets('写真只在封面页：竖屏停在歌词页时不渲染写真背景', (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    // 打开即停在歌词页：窄屏下标 0=歌单 1=封面 2=歌词。用全局信号而不是手势，
+    // 保证「停在歌词页」这一前提是确定的（否证见下方 AppleLyricsView 断言）。
+    final originalTabIndex = playerTabIndex.value;
+    addTearDown(() => playerTabIndex.value = originalTabIndex);
+    playerTabIndex.value = 2;
+    SharedPreferences.setMockInitialValues({
+      'use_am_style_player': true,
+      'use_artist_photo_background': true,
+    });
+    _mockPlatformChannels();
+    KugouProvider.restoreLyric = (_) async => const KugouLyric(
+      content: '[00:00.00]test lyric',
+      decodedContent: '[00:00.00]test lyric',
+    );
+    // 写真数据照常注入：本用例要证明的是「有图也不在歌词页画」，不是「没图」
+    injectPhotos({
+      'narrow-page-target': ['https://photo.invalid/a.jpg'],
+    });
+
+    final player = await startPlayer(tester);
+    final kugou = KugouProvider(registerDeviceOnStart: false);
+    try {
+      await tester.pumpWidget(
+        _host(player, kugou, const AmStyleFullPlayer()),
+      );
+      // 停在歌词页时 AppleLyricsView 的 Ticker 与 PlayerFrameDriver 都在跑，
+      // pumpAndSettle 在这类页面上永不收敛；写真拉取只走 async 微任务，
+      // 有界推进 1 秒虚拟时间足够落地。
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(tester.takeException(), isNull);
+      // 前提确认：确实停在歌词页（否则下面的负例断言毫无意义）
+      expect(find.byType(AppleLyricsView), findsOneWidget);
+      // 写真层整层不构建：歌词页不该再有写真背景（用户反馈的缺陷）
+      expect(find.byType(AmArtistPhotoCover), findsNothing);
+    } finally {
+      player.dispose();
+    }
+  });
+
+  testWidgets('写真背景透明度：设置值接到写真层（遮罩浓度越大写真越淡）', (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    SharedPreferences.setMockInitialValues({
+      'use_am_style_player': true,
+      'use_artist_photo_background': true,
+      // 与默认 0.55 拉开差距，避免「恰好等于默认值」蒙混过关
+      'artist_photo_opacity': 0.9,
+    });
+    _mockPlatformChannels();
+    KugouProvider.restoreLyric = (_) async => const KugouLyric(
+      content: '[00:00.00]test lyric',
+      decodedContent: '[00:00.00]test lyric',
+    );
+    // 唯一 song id：Controller 的写真缓存是 static（跨用例共享）
+    injectPhotos({
+      'opacity-target': ['https://photo.invalid/o.jpg'],
+    });
+
+    final player = await startPlayer(tester, songId: 'opacity-target');
+    final kugou = KugouProvider(registerDeviceOnStart: false);
+    try {
+      await tester.pumpWidget(
+        _host(player, kugou, const AmStyleFullPlayer()),
+      );
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(tester.takeException(), isNull);
+      final photo = tester.widget<AmArtistPhotoCover>(
+        find.byType(AmArtistPhotoCover),
+      );
+      // 设置 0.9 是「遮罩浓度」→ 写真层自身不透明度 0.1（与 MD3 同一套取值）
+      expect(photo.opacity, closeTo(0.1, 1e-6));
     } finally {
       player.dispose();
     }
