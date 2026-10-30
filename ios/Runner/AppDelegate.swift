@@ -907,13 +907,13 @@ final class LyricsPipManager: NSObject {
   private var pendingIntent: Bool?
   /// 已真正调用 startPictureInPicture()、等待系统 didStart/failed 回调
   private var awaitingStartCallback = false
-  /// 视频画布尺寸（pt）：固定 2.35:1 全幅卡片。PiP 窗口宽高比有系统上限
-  /// （约 2.39:1），此前按条宽高比（6.8~13.6:1）出帧，窗口装不下必然被
-  /// 系统 letterbox——PiP 顶部黑边即此，与帧内容无关。改为 2.35:1 后
-  /// 窗口比例 = 视频比例，内容满幅绘制，任何设备上都没有黑边。字号/
-  /// 行数只影响画布内文字布局，不再改变视频尺寸（比例恒定，也杜绝
-  /// 启动期尺寸抖动引发的窗口/帧比例微差黑边）。
-  private static let canvasSize = CGSize(width: 360, height: 153)
+  /// 视频画布尺寸（pt）：固定 5:1 细长条（对齐酷狗桌面歌词形态，实测
+  /// ~5.16:1 无黑边）。PiP 窗口高度基本固定（约 70pt），宽度随视频宽高比
+  /// 增加、封顶约 0.97 屏宽（≈5.2:1）——此前 6.8~13.6:1 的超宽帧超出上限，
+  /// 窗口被限宽后上下 letterbox，表现为 PiP 顶部黑边。5:1 在上限内，窗口
+  /// 与帧精确同比例，任何设备都无黑边。字号/行数只影响画布内文字布局，
+  /// 不再改变视频尺寸（比例恒定，杜绝窗口/帧比例微差黑边）。
+  private static let canvasSize = CGSize(width: 360, height: 72)
 
   private override init() {}
 
@@ -1535,7 +1535,7 @@ final class LyricsPipManager: NSObject {
       let totalMs = Double(max(last.start + last.duration, 1))
       progress = min(max(estimatedPositionMs / totalMs, 0), 1)
     }
-    // 高度随画布比例取 7%，上限 5pt——卡片画布较高，等比放大会过粗
+    // 高度取画布高 7%（≈5pt），上限 5pt 防大字号下过粗
     let barHeight = min(5, max(1.2, height * 0.07))
     ctx.setFillColor(UIColor.white.withAlphaComponent(0.15).cgColor)
     ctx.fill(CGRect(x: 0, y: height - barHeight, width: width, height: barHeight))
@@ -1546,8 +1546,7 @@ final class LyricsPipManager: NSObject {
     let textAreaHeight = height - barHeight
     let dual = configDoubleLine
     let fontSize = CGFloat(configFontSize) * 0.8
-    // 卡片画布较高：双行不再按半幅均分（行距过大），改为主副行围绕
-    // 中心紧凑排布（行距 ≈ 0.9×字号），单行居中——观感对齐歌词卡片
+    // 双行主副行围绕中心紧凑排布（行距 ≈ 0.9×字号），单行居中
     let lineGap = fontSize * 0.9
     let rowHeight = dual ? lineGap * 2 : textAreaHeight
     let rowCenter1 = textAreaHeight / 2 - (dual ? lineGap : 0)
