@@ -4,13 +4,15 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/utils/app_toast.dart' as toast_util;
 import '../../data/repositories/settings_repository.dart';
 import 'depth_engine.dart';
 
-/// 原生 MethodChannel 后端（Android / TV）。
+/// 原生 MethodChannel 后端（Android / TV / iOS）。
 ///
-/// 从 `DepthCoverService` 原样搬出，行为逐字不变：通道名与协议由
-/// `android/app/src/depth3d/kotlin/.../DepthCoverPlugin.kt` 实现。
+/// Android 的通道协议由 `DepthCoverPlugin.kt` 实现；iOS 由
+/// `DepthCoverPlugin.swift` 实现同名协议（模型从 bundle 读取，不走
+/// APK 内置资产提取，loadModel 的 modelAsset 只取 basename）。
 /// standard 包（未编译 DepthCoverPlugin）走 MissingPluginException 分支，
 /// 属预期降级，不提示、不重试刷日志。
 class ChannelDepthEngine implements DepthEngine {
@@ -37,6 +39,14 @@ class ChannelDepthEngine implements DepthEngine {
 
   @override
   Future<void> showToast(String message) async {
+    // iOS 原生侧的 showToast 只会打系统日志（无系统 toast），用户完全
+    // 看不到失败原因，表现为「开了开关但封面没有 3D」。改走 app 内
+    // fluttertoast（iOS 有实现）。Android 仍走原生通道（fluttertoast 与
+    // 原生 DepthCoverPlugin 的 toast 会重复弹）。
+    if (!kIsWeb && Platform.isIOS) {
+      toast_util.showToast(message, long: true);
+      return;
+    }
     try {
       await _channel.invokeMethod<void>('showToast', {'message': message});
     } on PlatformException {
@@ -46,11 +56,12 @@ class ChannelDepthEngine implements DepthEngine {
     }
   }
 
-  void _notifyLoadFailureOnce() {
+  void _notifyLoadFailureOnce([String? detail]) {
     if (_loadFailureToastShown) return;
     _loadFailureToastShown = true;
     // ignore: discarded_futures
-    showToast('3D 封面模型初始化失败');
+    showToast(
+        detail == null ? '3D 封面模型初始化失败' : '3D 封面模型初始化失败: $detail');
   }
 
   @override
@@ -93,7 +104,8 @@ class ChannelDepthEngine implements DepthEngine {
       _notifyLoadFailureOnce();
     } on PlatformException catch (e) {
       debugPrint('[DepthCover] loadModel/isModelLoaded failed: ${e.code} ${e.message}');
-      _notifyLoadFailureOnce();
+      // 具体原因透传给用户（iOS 原生失败此前完全静默，无从排查）
+      _notifyLoadFailureOnce(e.message?.isNotEmpty == true ? e.message : e.code);
       return false;
     } on MissingPluginException catch (e) {
       // standard 包无 DepthCoverPlugin（通道未注册）走这里；depth3d 包不应出现。

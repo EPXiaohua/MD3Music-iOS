@@ -1569,11 +1569,21 @@ final class LyricsPipManager: NSObject {
     let textAreaHeight = height - barHeight
     let dual = configDoubleLine
     let fontSize = CGFloat(configFontSize) * 0.8
-    // 双行主副行围绕中心紧凑排布（行距 ≈ 0.9×字号），单行居中
-    let lineGap = fontSize * 0.9
-    let rowHeight = dual ? lineGap * 2 : textAreaHeight
-    let rowCenter1 = textAreaHeight / 2 - (dual ? lineGap : 0)
-    let rowCenter2 = textAreaHeight / 2 + (dual ? lineGap : 0)
+    // 行高/行距：font 在卡拉OK绘制前就要用，提前创建
+    let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+    let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
+    // 单行：文字在文字区垂直居中。双行：主副行按「上隙 / 行间 / 下隙三等分」
+    // 居中——行距不再用固定 1.8×字号（大字号双行时两行高 + 行距会超出文字
+    // 区，表现为第一行顶部被裁、第二行贴进度条），改为按剩余空间均分，任何
+    // 字号下两行都完整落在文字区内且上下留白对称。
+    let lineHeight = font.lineHeight
+    var rowCenter1 = textAreaHeight / 2
+    var rowCenter2 = textAreaHeight / 2
+    if dual {
+      let gap = max(2, (textAreaHeight - lineHeight * 2) / 3)
+      rowCenter1 = gap + lineHeight / 2
+      rowCenter2 = gap * 2 + lineHeight * 1.5
+    }
 
     // 占位文案（歌词加载中/暂无歌词/歌词加载失败）：跨两行居中
     if !placeholder.isEmpty {
@@ -1607,8 +1617,6 @@ final class LyricsPipManager: NSObject {
     // 再 clip 已唱宽度重画渐变色层——蒙版右缘 = 已完成字宽累加 + 当前字按
     // 字内播放比例推进，硬边逐字向右扫过；已唱渐变按字 x 位置跨行采样
     //（近似安卓 LinearGradient 0..行宽）。LRC 无逐字：整行渐变不蒙版 ——
-    let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
-    let nextFont = UIFont.systemFont(ofSize: fontSize, weight: .regular)
     let horizontalPadding = max(6, width * 0.03)
     let maxWidth = width - horizontalPadding * 2
 
@@ -1619,7 +1627,7 @@ final class LyricsPipManager: NSObject {
       // 未唱层：整行未唱色
       drawScrollingLine(
         ctx: ctx, glyphs: grayGlyphs(glyphs), font: font,
-        rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter1, rowHeight: textAreaHeight, width: width,
         scrollOffset: scroll, padding: horizontalPadding)
       // 已唱层：clip 已唱宽度（蒙版右缘随播放右移、随行滚动平移）后重画渐变色
       let sungWidth = sungKaraokeWidth(glyphs: glyphs)
@@ -1629,7 +1637,7 @@ final class LyricsPipManager: NSObject {
         ctx.clip(to: CGRect(x: 0, y: 0, width: min(edgeX, width), height: height))
         drawScrollingLine(
           ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
-          rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
+          rowCenterY: rowCenter1, rowHeight: textAreaHeight, width: width,
           scrollOffset: scroll, padding: horizontalPadding)
         ctx.restoreGState()
       }
@@ -1637,7 +1645,7 @@ final class LyricsPipManager: NSObject {
       // LRC/纯文本：整行渐变色（安卓 GradientTextView 的 LRC 路径同款）
       drawScrollingLine(
         ctx: ctx, glyphs: gradientGlyphs(glyphs), font: font,
-        rowCenterY: rowCenter1, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter1, rowHeight: textAreaHeight, width: width,
         scrollOffset: scroll, padding: horizontalPadding)
     }
 
@@ -1648,7 +1656,7 @@ final class LyricsPipManager: NSObject {
       // 两者节奏无关，跟着滚会被误读成副行在逐字推进（旧实现 bug）。
       drawScrollingLine(
         ctx: ctx, glyphs: nextGlyphs, font: nextFont,
-        rowCenterY: rowCenter2, rowHeight: rowHeight, width: width,
+        rowCenterY: rowCenter2, rowHeight: textAreaHeight, width: width,
         scrollOffset: 0, padding: horizontalPadding)
     }
   }
