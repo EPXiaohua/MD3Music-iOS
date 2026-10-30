@@ -1729,6 +1729,99 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _scheduleNextFailedRetry(_currentSong?.id);
   }
 
+  /// iOS 挂起死亡观察去重 token（新一轮武装使旧观察循环失效）。
+  int _suspendDeathWatchToken = 0;
+
+  /// iOS 回前台后对播放会话做短窗死亡观察（见 [didChangeAppLifecycleState]）。
+  ///
+  /// 短暂挂起（锁屏/切后台数分钟）可能触发 media services reset：AVPlayer
+  /// 被系统清空/管道失效，而 Dart 侧 playing 仍为 true——此后用户点播放只是
+  /// 对死播放器补发一条 play（just_audio 的 playing 快路径 fire-and-forget，
+  /// 无错误、无事件），切歌的 setUrl 失败自愈（[_loadUrlWithSuspendRecovery]）
+  /// 也不会触发，表现为「短暂挂起回来后播放不了」。回前台后 120s 内盯
+  /// position：playing 且 ready 却 10s 零走针即判死，重建播放器并重播当前歌。
+  /// position 一旦推进（活的）或用户暂停立即解除；暂停态挂起时等用户点播放
+  /// 后同样覆盖。
+  void _armSuspendDeathWatch() {
+    if (!Platform.isIOS) return;
+    final token = ++_suspendDeathWatchToken;
+    // ignore: discarded_futures
+    () async {
+      for (var round = 0; round < 24; round++) {
+        await Future<void>.delayed(const Duration(seconds: 5));
+        if (token != _suspendDeathWatchToken || _isDisposed) {
+          return;
+        }
+        final service = _audioService;
+        if (service == null) return;
+        if (!service.playing) continue; // 尚未起播/已暂停：继续等
+        if (service.processingState != just_audio.ProcessingState.ready) {
+          continue; // 装载/缓冲中不判定，否则弱网会误判
+        }
+        final pos0 = service.position;
+        await Future<void>.delayed(const Duration(seconds: 5));
+        if (token != _suspendDeathWatchToken || _isDisposed) {
+          return;
+        }
+        if (!service.playing) return;
+        if (service.position > pos0) {
+          return; // 在走针：播放器是活的，解除观察
+        }
+        // ready 且 10s 走针为 0：播放器已被挂起杀掉 → 自愈
+        await _recoverDeadPlayerAfterSuspend();
+        return;
+      }
+    }();
+  }
+
+  /// 挂起死亡自愈：重建播放器实例，失效化旧 URL 强制重新解析当前歌并恢复
+  /// 到观察到的位置（失效化口径与 [_retryFailedPlayback] 一致——否则解析器
+  /// 直接重播同一个已失效资源）。
+  Future<void> _recoverDeadPlayerAfterSuspend() async {
+    final song = _currentSong;
+    if (song == null || _isDisposed) return;
+    final recoveryPosition = _position;
+    _logPlaybackEvent(
+      'suspend.dead_player',
+      request: _diagnosticPlaybackRequest,
+      song: song,
+      outcome: 'rebuild',
+    );
+    try {
+      await _audioService!.rebuildMainPlayer();
+    } catch (e) {
+      _logPlaybackEvent(
+        'suspend.dead_player',
+        request: _diagnosticPlaybackRequest,
+        song: song,
+        outcome: 'rebuild_failed',
+        error: e,
+      );
+    }
+    if (_isDisposed) return;
+    if (_currentSong?.id == song.id && _currentSong!.url != null) {
+      final invalidatedSong = _currentSong!.copyWith(clearUrl: true);
+      _currentSong = invalidatedSong;
+      if (_currentIndex >= 0 && _currentIndex < _playlist.length) {
+        _playlist[_currentIndex] = invalidatedSong;
+      }
+      _prefetchedUrlQuality.remove(song.id);
+    }
+    try {
+      await _resolveAndPlayCurrentSong(
+        seekTo: recoveryPosition > Duration.zero ? recoveryPosition : null,
+      );
+    } catch (e) {
+      _logPlaybackEvent(
+        'suspend.dead_player',
+        request: _diagnosticPlaybackRequest,
+        song: song,
+        outcome: 'replay_failed',
+        error: e,
+      );
+    }
+  }
+
   void _scheduleNextFailedRetry(String? songId) {
     if (!_isAppBackgrounded ||
         _resolveError == null ||
@@ -7610,6 +7703,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _idleKeepaliveStopTimer = null;
       _idleKeepaliveStopTimerGeneration++;
       _stopRetryFailedTimer();
+      // iOS：短暂挂起可能触发 media services reset 杀掉 AVPlayer，而 Dart
+      // 侧状态不变（playing 仍 true）——此后点播放是无错误的空操作，现有的
+      // setUrl 失败自愈链完全不会触发（6.0.6 修复只覆盖了切歌/失败路径）。
+      // 回前台后短窗观察 position 走针，判死即重建播放器重播当前歌。
+      if (Platform.isIOS) {
+        _armSuspendDeathWatch();
+      }
       _retryFailedPlayback();
     }
   }
