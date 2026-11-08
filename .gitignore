@@ -4,6 +4,7 @@
 *.pyc
 *.swp
 .DS_Store
+_commit_msg.tmp
 .atom/
 .build/
 .buildlog/
