@@ -5846,21 +5846,42 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       await KugouApiServer.start();
       return;
     }
-    // 快速探测端口是否可用
+    // 真实 HTTP 探测，不能用 TCP connect：iOS 短暂挂起（锁屏/切后台，系统
+    // 重置网络栈）后 Rust 服务器处理线程可能死亡，但 listen socket 仍留在
+    // 内核——TCP connect 由内核 backlog 代答必然成功，探不出半死状态；而
+    // Dio 复用挂起前的 stale keep-alive 连接则立即被 RST（表现为回前台后
+    // 所有解析 serverUnavailable、几毫秒即失败且永不自愈）。必须收到
+    // HTTP 响应才算服务器活着。
+    if (await _probeLocalApiServer(port)) return;
     try {
-      final socket = await Socket.connect(
-        '127.0.0.1',
-        port,
-        timeout: const Duration(milliseconds: 500),
-      );
-      await socket.close();
-      return; // 服务器已就绪
-    } catch (_) {
-      // 端口不通，尝试重新启动
-    }
-    try {
-      await KugouApiServer.start();
+      // restart（而非 start）：stop_server + 全新随机端口 + 更新 baseUrl，
+      // 彻底绕开半死状态（Rust 内部 is_running 标志可能仍为 true，start()
+      // 的快捷路径会误判已就绪而跳过重建）。
+      await KugouApiServer.restart();
     } catch (_) {}
+    // restart 后复探一次留档；仍不通则等下一次播放流程再触发。
+    await _probeLocalApiServer(KugouApiServer.currentPort);
+  }
+
+  /// 本地 API 服务器健康探测：发起真实 HTTP 请求，收到任何 HTTP 响应（含
+  /// 4xx/5xx）即认为服务器存活。
+  Future<bool> _probeLocalApiServer(int port) async {
+    if (port <= 0) return false;
+    final client = HttpClient();
+    try {
+      client.connectionTimeout = const Duration(milliseconds: 800);
+      final request = await client
+          .getUrl(Uri(scheme: 'http', host: '127.0.0.1', port: port, path: '/'))
+          .timeout(const Duration(milliseconds: 1500));
+      final response =
+          await request.close().timeout(const Duration(milliseconds: 1500));
+      await response.drain<void>();
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   /// 异步获取当前歌曲的高潮时间数据。
@@ -7710,6 +7731,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (Platform.isIOS) {
         _armSuspendDeathWatch();
       }
+      // iOS：挂起恢复可能杀掉本地 API 服务器处理线程（listen socket 残留
+      // 内核导致 TCP 探测误判就绪），回前台立即做健康探测，死亡则 restart
+      // 全新端口——否则用户点播放/切歌全部 serverUnavailable。
+      unawaited(_ensureApiServerReady());
       _retryFailedPlayback();
     }
   }
