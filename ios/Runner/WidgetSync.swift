@@ -118,6 +118,12 @@ final class WidgetSync {
     NotificationCenter.default.addObserver(
       self, selector: #selector(onSceneDidActivate),
       name: UIScene.didActivateNotification, object: nil)
+    // 进程内命令通知：widget intent 的 perform 在主 app 进程执行时
+    // （AudioPlaybackIntent / foreground immediate），写入命令后立即转发，
+    // 无需等回前台；extension 进程中此通知无监听者，无副作用。
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(onSceneDidActivate),
+      name: Notification.Name("com.md3music.widget.command"), object: nil)
   }
 
   private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
