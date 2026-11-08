@@ -812,6 +812,13 @@ struct PlayPauseIntent: AppIntent {
   static var title: LocalizedStringResource = "播放 / 暂停"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("play_pause")
     return .result()
@@ -823,6 +830,13 @@ struct PreviousIntent: AppIntent {
   static var title: LocalizedStringResource = "上一首"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("previous")
     return .result()
@@ -833,6 +847,13 @@ struct PreviousIntent: AppIntent {
 struct NextIntent: AppIntent {
   static var title: LocalizedStringResource = "下一首"
   static var openAppWhenRun = true
+
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("next")
@@ -848,6 +869,13 @@ struct FmPlayPauseIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 播放 / 暂停"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_play_pause")
     return .result()
@@ -858,6 +886,13 @@ struct FmPlayPauseIntent: AppIntent {
 struct FmToggleFavoriteIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 收藏"
   static var openAppWhenRun = true
+
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_toggle_favorite")
@@ -870,6 +905,13 @@ struct FmSelectStationIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 切换档位"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_select_station")
     return .result()
@@ -880,6 +922,13 @@ struct FmSelectStationIntent: AppIntent {
 struct FmOpenTrack1Intent: AppIntent {
   static var title: LocalizedStringResource = "FM 起播预告曲 1"
   static var openAppWhenRun = true
+
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_open_track_1")
@@ -892,6 +941,13 @@ struct FmOpenTrack2Intent: AppIntent {
   static var title: LocalizedStringResource = "FM 起播预告曲 2"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_open_track_2")
     return .result()
@@ -902,6 +958,13 @@ struct FmOpenTrack2Intent: AppIntent {
 struct FmOpenTrack3Intent: AppIntent {
   static var title: LocalizedStringResource = "FM 起播预告曲 3"
   static var openAppWhenRun = true
+
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_open_track_3")
@@ -914,6 +977,13 @@ struct FmOpenPlayerIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 打开播放器"
   static var openAppWhenRun = true
 
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
+
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_open_player")
     return .result()
@@ -924,6 +994,13 @@ struct FmOpenPlayerIntent: AppIntent {
 struct FmOpenLoginIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 去登录"
   static var openAppWhenRun = true
+
+  // iOS 26 起 openAppWhenRun 被弃用，且在 app extension 中运行的 intent 设
+  // true 会报错（widget 按钮的 intent 全部运行在 extension 里）——系统改查
+  // supportedModes。foreground(.immediate) = 执行前把 app 拉到前台，与原
+  // openAppWhenRun=true 语义一致；iOS 17~25 仍读 openAppWhenRun。
+  @available(iOSApplicationExtension 26.0, *)
+  static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
     WidgetSyncBridge.writeCommand("fm_open_login")
