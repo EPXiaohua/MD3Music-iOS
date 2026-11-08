@@ -188,7 +188,7 @@ struct FmOpenPlayerIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 打开播放器"
   static var openAppWhenRun = true
 
-  @available(iOSApplicationExtension 26.0, *)
+  @available(iOS 26.0, iOSApplicationExtension 26.0, *)
   static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
@@ -202,7 +202,7 @@ struct FmOpenLoginIntent: AppIntent {
   static var title: LocalizedStringResource = "FM 去登录"
   static var openAppWhenRun = true
 
-  @available(iOSApplicationExtension 26.0, *)
+  @available(iOS 26.0, iOSApplicationExtension 26.0, *)
   static let supportedModes: IntentModes = [.foreground(.immediate)]
 
   func perform() async throws -> some IntentResult {
