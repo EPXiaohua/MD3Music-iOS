@@ -195,12 +195,19 @@ class DepthCoverCache {
     final meta = File(_join(dir.path, 'depth.meta'));
     if (!f.existsSync() || !meta.existsSync()) return null;
     final map = (jsonDecode(meta.readAsStringSync()) as Map).cast<String, Object?>();
+    // 完整性校验：meta 记录的封面原图也必须存在。缓存清理器按容量清理
+    // stream_cache 时可能删掉 cover.img 而留下 depth.png/meta（脏条目），
+    // 不校验会让 shader 读文件抛 PathNotFoundException，被 host 误判为
+    // 「设备不支持 shader」触发全进程降级。缺失即视为未命中，上层走重新
+    // 推理覆盖脏条目（自愈闭环）。
+    final cover = map['cover'];
+    if (cover is String && !File(cover).existsSync()) return null;
     _touch(key);
     final bgFill = File(_join(dir.path, 'bg_fill.png'));
     return {
       'depth': f.path,
       'depthStd': map['depthStd'],
-      'cover': map['cover'],
+      'cover': cover,
       if (bgFill.existsSync()) 'bgFill': bgFill.path,
       if (map['inpaint'] is String) 'inpaint': map['inpaint'],
     };
