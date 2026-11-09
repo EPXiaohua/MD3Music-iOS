@@ -57,7 +57,19 @@ jobs:
           ./build_ios.sh
 
       - name: Build iOS standard (no codesign, 无 3D 封面)
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --no-codesign --verbose
+
+      # flutter build 失败时会把 xcodebuild 详细错误（Error (Xcode): …）写进
+      # xcresult/标准输出被摘要吞掉的场景下，从 xcresult 提取真实失败原因
+      - name: Extract xcodebuild errors from xcresult
+        if: failure()
+        run: |
+          XCRESULT=$(find build -name "*.xcresult" -type d | head -1)
+          if [ -n "$XCRESULT" ]; then
+            xcrun xcresulttool get test-results summary --path "$XCRESULT" 2>&1 | head -120 || true
+          else
+            echo "no xcresult found"
+          fi
 
       - name: Package standard unsigned ipa
         run: |
@@ -135,7 +147,7 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/ios/ort"
 
       - name: Build iOS 3D cover variant (no codesign, ENABLE_DEPTH_3D=true)
-        run: flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true
+        run: flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true --verbose
 
       - name: Package 3D variant unsigned ipa
         run: |
