@@ -56,8 +56,16 @@ jobs:
           cd kugou_api_server/rust
           ./build_ios.sh
 
+      # sqlite3 等 native assets hook 需从 GitHub 下载预编译库，偶发 504/超时
+      # （曾两次导致构建失败），加重试兜底：每次失败后重新构建重跑 hook 下载
       - name: Build iOS standard (no codesign, 无 3D 封面)
-        run: flutter build ios --release --no-codesign --verbose
+        run: |
+          for i in 1 2 3; do
+            if flutter build ios --release --no-codesign --verbose; then exit 0; fi
+            echo "::warning::iOS standard build failed (attempt $i), retrying in 30s"
+            sleep 30
+          done
+          exit 1
 
       # flutter build 失败时会把 xcodebuild 详细错误（Error (Xcode): …）写进
       # xcresult/标准输出被摘要吞掉的场景下，从 xcresult 提取真实失败原因
@@ -147,7 +155,13 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/ios/ort"
 
       - name: Build iOS 3D cover variant (no codesign, ENABLE_DEPTH_3D=true)
-        run: flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true --verbose
+        run: |
+          for i in 1 2 3; do
+            if flutter build ios --release --no-codesign --dart-define=ENABLE_DEPTH_3D=true --verbose; then exit 0; fi
+            echo "::warning::iOS 3D build failed (attempt $i), retrying in 30s"
+            sleep 30
+          done
+          exit 1
 
       - name: Package 3D variant unsigned ipa
         run: |
