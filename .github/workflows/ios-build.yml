@@ -140,7 +140,18 @@ jobs:
       # 启用 DEPTH_3D_LINKED 编译条件（标准构建已在上一步用占位空配置完成）
       - name: Prepare ONNX Runtime for 3D variant
         run: |
-          curl -fL --retry 3 -o /tmp/ort.zip https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip
+          # download.onnxruntime.ai 偶发 SSL 证书校验失败（curl exit 60，
+          # --retry 默认不重试证书类错误，需 --retry-all-errors）+ 外层重试兜底
+          for i in 1 2 3; do
+            if curl -fL --retry 3 --retry-all-errors -o /tmp/ort.zip \
+              https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip; then
+              break
+            fi
+            echo "::warning::ONNX Runtime download failed (attempt $i), retrying in 30s"
+            rm -f /tmp/ort.zip
+            sleep 30
+          done
+          test -f /tmp/ort.zip
           mkdir -p /tmp/ort_extract ios/ort
           cd /tmp/ort_extract
           unzip -q /tmp/ort.zip
