@@ -19,11 +19,16 @@
 /// - 年份胶囊每个一颗 [DpadFocusable] 单停点（OK 即切年），横向带包
 ///   [TvScrollRegion]（memoryKey 记忆 + wrap 回绕，规则 §12.4-2/5）。
 /// - 进入页面焦点落在故事区（一个 autofocus，规则 §12.4-1）。
+///
+/// Windows 桌面鼠标滚轮（W8 规则）：横向 PageView 收不到纵向滚轮增量，
+/// 故事区包 [Listener.onPointerSignal] 累积一格（100 逻辑像素）翻一页，
+/// 基址与动画位置解耦防快滚丢步（照 coverflow_page.dart 先例）。
 library;
 
 import 'dart:async';
 
 import 'package:dpad/dpad.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
@@ -114,6 +119,20 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
 
   int _pageIndex = 0;
 
+  // ---- 鼠标滚轮翻页（Windows 桌面，照 coverflow W8 先例） ----
+
+  /// 滚轮增量累积：触控板小步长合并到一格（100 逻辑像素）才翻一页。
+  double _wheelAccum = 0;
+
+  /// 滚轮翻页的目标基址，与 PageView 动画位置解耦：快速连滚时上一次
+  /// animateToPage 还在中途，按动画位置取整累加会拿中间值丢步；
+  /// 以此基址一路累加，滚轮停止后动画自然吸附到最终目标。
+  /// 非滚轮入口（键盘/遥控/拖拽/换年）会清空归位（见 [_resetWheelTarget]）。
+  double? _wheelTargetPage;
+
+  /// 滚轮空闲检测：停止 120ms 后清基址，下次滚动从静止位置重新计步。
+  Timer? _wheelIdleTimer;
+
   @override
   void initState() {
     super.initState();
@@ -125,6 +144,7 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
 
   @override
   void dispose() {
+    _wheelIdleTimer?.cancel();
     _pageController.dispose();
     super.dispose();
   }
@@ -202,6 +222,7 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
     if (_pageController.hasClients) {
       _pageController.jumpToPage(0);
     }
+    _resetWheelTarget(); // 换年跳页：滚轮基址作废，从封面页重新计步
   }
 
   /// 年份胶囊点击（Selector 回调里丢弃 Future，忽略未等待告警）。
@@ -253,6 +274,7 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
   /// 封面/结尾页到边即停（非轮播，不合 §12.4-5 的 wrap 口径）。
   /// 320ms 一次性补间与 artist_photo_banner.flipBy 同参。
   void _flipStoryPage(int delta) {
+    _resetWheelTarget(); // 键盘/遥控接管翻页：滚轮基址作废
     if (!_pageController.hasClients) return;
     final current = _pageController.page?.round() ?? _pageIndex;
     final target = (current + delta).clamp(0, _kStoryPageCount - 1);
@@ -262,6 +284,60 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
       duration: const Duration(milliseconds: 320),
       curve: Curves.easeOutCubic,
     );
+  }
+
+  /// 非滚轮入口接管翻页时清掉滚轮基址：下一次滚轮从当前动画位置重新计步，
+  /// 避免旧基址还在旧位置上跳变（照 coverflow _resetWheelTarget 口径）。
+  void _resetWheelTarget() {
+    _wheelTargetPage = null;
+    _wheelAccum = 0;
+  }
+
+  /// 鼠标滚轮翻页（Windows 桌面）：滚轮事件不走拖拽手势竞技场，
+  /// 必须 Listener.onPointerSignal 显式接收（W8 规则）。
+  ///
+  /// 离散步进：一格滚轮（Windows 引擎 ≈100 逻辑像素）= 翻一页故事卡；
+  /// 触控板的小步长增量累积到一格才翻。滚轮向下 = 故事线前进（下一页），
+  /// 与封面流"列表前进"同口径（与触屏拖拽内容跟手方向相反）。
+  /// Shift 按住时直接放行：框架 pointerAxisModifiers 把滚轮翻转为横向轴，
+  /// 本页 PageView 本身横向，由框架处理，避免内外两层同时滚（W8 口径）。
+  void _onWheelSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (HardwareKeyboard.instance.logicalKeysPressed
+        .contains(LogicalKeyboardKey.shiftLeft)) {
+      return;
+    }
+    _handleWheelDelta(event.scrollDelta.dy);
+  }
+
+  void _handleWheelDelta(double dy) {
+    // 只认主轴语义：纵向滚轮增量驱动故事线前进/后退；横向滚轮（dx）忽略。
+    _wheelAccum += dy;
+    const double notch = 100.0;
+    final steps = (_wheelAccum / notch).truncate();
+    if (steps == 0) return;
+    _wheelAccum -= steps * notch;
+    // 基址与动画位置解耦（快滚不丢步，照 coverflow _handleWheelDelta）：
+    // 首格（基址为空）从当前动画位置取整起步。
+    final base = _wheelTargetPage ?? _pageController.page?.round().toDouble();
+    if (base == null) return; // PageView 尚未挂载
+    final target = (base + steps).clamp(0.0, (_kStoryPageCount - 1).toDouble());
+    _wheelTargetPage = target;
+    if (target != _pageController.page) {
+      _pageController.animateToPage(
+        target.round(),
+        duration: const Duration(milliseconds: 320),
+        curve: Curves.easeOutCubic,
+      );
+    }
+    // 滚轮停止（120ms 无新事件）后清基址：下次滚动从静止位置重新计步。
+    // 120ms > 常见滚轮事件间隔（Windows 连滚约 30~50ms/格），
+    // 小于一次 320ms 翻页动画，动画本身不受影响。
+    _wheelIdleTimer?.cancel();
+    _wheelIdleTimer = Timer(const Duration(milliseconds: 120), () {
+      _wheelTargetPage = null;
+      _wheelAccum = 0;
+    });
   }
 
   // ---- 页面骨架 ----
@@ -324,10 +400,29 @@ class _ListenWrappedPageState extends State<ListenWrappedPage> {
           child: Focus(
             autofocus: true,
             onKeyEvent: _handleStoryKey,
-            child: PageView(
-              controller: _pageController,
-              onPageChanged: (i) => setState(() => _pageIndex = i),
-              children: pages,
+            child: Listener(
+              // 鼠标滚轮（Windows 桌面）：横向 PageView 收不到纵向滚轮增量，
+              // 包一层 Listener 显式接收 PointerSignalEvent（W8 规则）。
+              // behavior: opaque——卡片间空隙/无绘制区域也必须命中，
+              // 否则滚轮信号整个丢失。
+              behavior: HitTestBehavior.opaque,
+              onPointerSignal: _onWheelSignal,
+              child: NotificationListener<ScrollNotification>(
+                // 触屏拖拽接管翻页时清滚轮基址：只有真拖拽（dragDetails
+                // 非空）才算，滚轮驱动的 animateToPage 不会产生 drag 通知。
+                onNotification: (n) {
+                  if (n is ScrollStartNotification &&
+                      n.dragDetails != null) {
+                    _resetWheelTarget();
+                  }
+                  return false;
+                },
+                child: PageView(
+                  controller: _pageController,
+                  onPageChanged: (i) => setState(() => _pageIndex = i),
+                  children: pages,
+                ),
+              ),
             ),
           ),
         ),

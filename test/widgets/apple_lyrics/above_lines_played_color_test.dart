@@ -11,11 +11,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// 「上方行使用已播颜色」的渲染回归测试。
 ///
-/// 只验证可观测的两条契约：
-/// 1. 当前行**上方**那一行的模糊图被 `ColorFiltered(srcIn)` 染成已播色，
-///    当前行下方那一行不染（仍按主题色烘焙）；
-/// 2. 关掉开关或调整混色比例时着色即时变化，且不依赖模糊图重渲染
-///    （缓存签名不含颜色，图仍是同一张）。
+/// 模糊层已改为**画布合成**（不再有 ColorFiltered/Opacity widget），因此改用
+/// `debugBlurDraws` 观察每张模糊图的染色与不透明度。只验证三条契约：
+/// 1. 当前行**上方**那一行的模糊图带已播色 tint，下方那一行不带；
+/// 2. 关掉开关时着色立即消失、重新开启恢复；
+/// 3. 调整混色比例即时改变颜色，且不依赖模糊图重渲染（图仍是同一张）。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -69,13 +69,13 @@ void main() {
     return tester.state(find.byType(AppleLyricsView));
   }
 
-  /// 注入假模糊渲染器后打开高斯模糊，等异步缓存就位并重建模糊层。
+  /// 注入假模糊渲染器后打开高斯模糊，等异步缓存就位并重绘模糊层。
   Future<void> enableBlur(WidgetTester tester, dynamic state) async {
     state.lineBlurRendererForTest =
         (int lineIndex, int blurLevel, DuetAlignment align) async => makeImage();
     await LyricPreferences.instance.setUseGaussianBlur(true);
     // 第 1 次 pump：偏好通知 → 重建 → 触发异步模糊图请求；
-    // 第 2 次 pump：请求完成后的 setState → 模糊层真正进入 widget 树。
+    // 第 2 次 pump：请求完成后的 setState → 模糊图进入合成队列并重绘。
     for (int i = 0; i < 3; i++) {
       await tester.pump();
     }
@@ -88,22 +88,28 @@ void main() {
     await prefs.setDynamicColorMixRatio(0.5);
 
     final state = await mount(tester);
+    final draws = <({int? tint, double opacity})>[];
+    state.debugBlurDraws = draws;
     await enableBlur(tester, state);
 
-    final filters =
-        tester.widgetList<ColorFiltered>(find.byType(ColorFiltered)).toList();
-    expect(filters, hasLength(1),
-        reason: '当前行上方只有第 0 行，下方第 2 行不应着色');
+    expect(draws, hasLength(2), reason: '当前行上下各一行模糊层');
+    final tinted = draws.where((d) => d.tint != null).toList();
+    expect(
+      tinted,
+      hasLength(1),
+      reason: '当前行上方只有第 0 行，下方第 2 行不应着色',
+    );
 
-    final int expected = resolveActiveLineColorValue(
+    final int? expected = resolveActiveLineColorValue(
       useDynamicColor: true,
       accentColor: accent,
       customTextColor: null,
-      mixRatio: 0.5,
-    )!;
+      // 比例会按平台范围夹取，用读回的实际值计算期望。
+      mixRatio: prefs.dynamicColorMixRatio,
+    );
     expect(
-      filters.single.colorFilter,
-      equals(ColorFilter.mode(Color(expected), BlendMode.srcIn)),
+      tinted.single.tint,
+      expected,
       reason: '模糊层应按「当前行已播色」整体染色（保留模糊 alpha）',
     );
   });
@@ -114,19 +120,24 @@ void main() {
     await prefs.setUseAboveLinesPlayedColor(true);
 
     final state = await mount(tester);
+    final draws = <({int? tint, double opacity})>[];
+    state.debugBlurDraws = draws;
     await enableBlur(tester, state);
-    expect(find.byType(ColorFiltered), findsOneWidget);
+    expect(draws.where((d) => d.tint != null), hasLength(1));
 
     await prefs.setUseAboveLinesPlayedColor(false);
     await tester.pump();
     await tester.pump();
-    expect(find.byType(ColorFiltered), findsNothing,
-        reason: '关掉独立开关后上方行必须回到主题歌词色');
+    expect(
+      draws.where((d) => d.tint != null),
+      isEmpty,
+      reason: '关掉独立开关后上方行必须回到主题歌词色',
+    );
 
     await prefs.setUseAboveLinesPlayedColor(true);
     await tester.pump();
     await tester.pump();
-    expect(find.byType(ColorFiltered), findsOneWidget);
+    expect(draws.where((d) => d.tint != null), hasLength(1));
   });
 
   testWidgets('调整混色比例即时改变上方行颜色（不重建模糊图）', (tester) async {
@@ -136,20 +147,27 @@ void main() {
     await prefs.setDynamicColorMixRatio(0.2);
 
     final state = await mount(tester);
+    final draws = <({int? tint, double opacity})>[];
+    state.debugBlurDraws = draws;
     await enableBlur(tester, state);
+
     final ui.Image? imageBefore = state.lineBlurImageForTest(0);
-    final ColorFilter filterBefore =
-        tester.widget<ColorFiltered>(find.byType(ColorFiltered)).colorFilter;
+    final int? tintBefore = draws.firstWhere((d) => d.tint != null).tint;
 
     await prefs.setDynamicColorMixRatio(1.0);
     await tester.pump();
     await tester.pump();
 
-    final ColorFilter filterAfter =
-        tester.widget<ColorFiltered>(find.byType(ColorFiltered)).colorFilter;
-    expect(filterAfter, isNot(equals(filterBefore)),
-        reason: '比例变化必须反映到上方行颜色上');
-    expect(state.lineBlurImageForTest(0), same(imageBefore),
-        reason: '颜色着色发生在合成期，模糊图缓存不应重建');
+    final int? tintAfter = draws.firstWhere((d) => d.tint != null).tint;
+    expect(
+      tintAfter,
+      isNot(equals(tintBefore)),
+      reason: '比例变化必须反映到上方行颜色上',
+    );
+    expect(
+      state.lineBlurImageForTest(0),
+      same(imageBefore),
+      reason: '颜色着色发生在合成期，模糊图缓存不应重建',
+    );
   });
 }

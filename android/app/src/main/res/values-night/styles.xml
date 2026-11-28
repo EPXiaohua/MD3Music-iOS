@@ -18,8 +18,8 @@
              该属性随系统 uiMode 解析，系统浅色时解析成浅色（即使父主题是
              Theme.Black），Dart 首帧上屏前就会「深色启动屏 → 浅 → 深色首帧」。 -->
         <item name="android:windowBackground">@android:color/black</item>
-        <!-- 刘海/挖孔屏：内容延伸到短边（与日间版/锁屏歌词主题同款）。API 28+
-             才生效，低版本自动忽略。 -->
-        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <!-- 刘海/挖孔屏：内容延伸到短边（与日间版/锁屏歌词主题同款）。该属性
+             API 27+ 才引入，必须放在 values-night-v27/（见该目录下的
+             styles.xml）；低版本自动忽略。 -->
     </style>
 </resources>

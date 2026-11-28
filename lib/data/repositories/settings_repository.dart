@@ -5,6 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/services/accompany/accompany_source.dart';
 import '../../core/services/audio_service_io.dart';
 import '../../core/services/spectrum_service.dart';
 import '../../core/services/volume_normalization_service.dart';
@@ -61,6 +62,7 @@ class SettingsRepository {
       'local_music_scan_folders',
       'local_music_excluded_folders',
       'local_music_filter_short_audio',
+      'local_music_scan_only_selected_folders',
     };
     final keys = prefs.getKeys().where((key) {
       // 签到日期是账号数据，不是设置；游客与每个账号的记录均保留。
@@ -152,6 +154,11 @@ class SettingsRepository {
       'settings_upload_listening_duration';
   // 逐字歌词时间偏移（ms，默认 0；仅在线音乐生效，正值 = 歌词延后显示）
   static const String _keyLyricTimeOffset = 'lyric_time_offset_ms';
+  // 伴唱功能开关（默认关闭；关闭时播放页不显示任何伴唱入口）
+  static const String _keyAccompanyFeatureEnabled =
+      'settings_accompany_feature_enabled';
+  // 伴唱伴奏来源（'online' = 在线伴奏 / 'on_device' = 端侧分离；默认在线）
+  static const String _keyAccompanySource = 'settings_accompany_source';
 
   /// 新版本提醒开关：启动时检查 GitHub Release，发现新版本 toast 提醒。默认开启。
   static const String _keyUpdateReminderEnabled =
@@ -818,6 +825,50 @@ class SettingsRepository {
     await prefs.setInt(_keyLyricTimeOffset, clamped);
   }
 
+  /// 伴唱伴奏来源（内存镜像，默认在线伴奏）。
+  ///
+  /// 用 ValueNotifier：设置页切换后播放页的伴唱按钮可用性与当前会话要即时响应，
+  /// 不必重进页面。
+  static final ValueNotifier<AccompanySource> accompanySource =
+      ValueNotifier<AccompanySource>(AccompanySource.online);
+
+  /// 读取伴唱伴奏来源（默认 [AccompanySource.online]）。
+  Future<AccompanySource> getAccompanySource() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = AccompanySource.parse(prefs.getString(_keyAccompanySource));
+    accompanySource.value = v;
+    return v;
+  }
+
+  /// 保存伴唱伴奏来源，并同步内存镜像。
+  Future<void> setAccompanySource(AccompanySource v) async {
+    accompanySource.value = v;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyAccompanySource, v.wireValue);
+  }
+
+  /// 伴唱功能开关（内存镜像，默认关闭）。
+  ///
+  /// 关闭时播放页的伴唱按钮与比例胶囊整体不渲染；开关状态变化通过
+  /// [ValueNotifier] 即时通知已打开的播放页，无需重进页面。
+  static final ValueNotifier<bool> accompanyFeatureEnabled =
+      ValueNotifier<bool>(false);
+
+  /// 读取伴唱功能开关（默认 false）。
+  Future<bool> getAccompanyFeatureEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getBool(_keyAccompanyFeatureEnabled) ?? false;
+    accompanyFeatureEnabled.value = v;
+    return v;
+  }
+
+  /// 保存伴唱功能开关，并同步内存镜像。
+  Future<void> setAccompanyFeatureEnabled(bool v) async {
+    accompanyFeatureEnabled.value = v;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyAccompanyFeatureEnabled, v);
+  }
+
   // ===== 桌面歌词配置 =====
 
   Future<double> getDesktopLyricFontSize() async {
@@ -1138,6 +1189,40 @@ class SettingsRepository {
       _keyFlymeLyricAdvanceMs,
       v.clamp(0, kFlymeLyricAdvanceMaxMs),
     );
+  }
+
+  // ===== 小米 CarWith（车机互联）=====
+  // 「跟随CarWith」主题开关。键名带 settings_ 前缀以命中 resetAllSettingsToDefaults
+  // 的前缀清理表。读取方为 CarWithService（主题覆盖值 themeOverride 的单一数据源），
+  // UI 不直接读写 prefs，一律经 CarWithService.instance 的 getter/setter，
+  // 保证心跳启停与持久化状态永远同步。
+  static const String _keyFollowCarWithDark = 'settings_follow_carwith_dark';
+
+  Future<bool> getFollowCarWithDark() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyFollowCarWithDark) ?? false;
+  }
+
+  Future<void> setFollowCarWithDark(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyFollowCarWithDark, v);
+  }
+
+  // 「显示CarWith / Jovi InCar歌词」开关。读取方为 CarWithService（持久化 +
+  // lyricEnabled getter）与 DesktopLyricService.setCarWithLyricEnabled（由
+  // main.dart 在启动时注入）；原生侧收到逐句歌词推送时现读连接态，不需要
+  // 本键的原生镜像（与 Flyme 开关不同 —— 那个要原生先于 Dart 恢复）。
+  static const String _keyCarWithLyricEnabled =
+      'settings_carwith_lyric_enabled';
+
+  Future<bool> getCarWithLyricEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyCarWithLyricEnabled) ?? false;
+  }
+
+  Future<void> setCarWithLyricEnabled(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyCarWithLyricEnabled, v);
   }
 
   // ===== 蓝牙歌词配置 =====
@@ -2101,6 +2186,29 @@ class SettingsRepository {
     await prefs.setBool(_keyMvAudioFallback, value);
   }
 
+  // ===== 划掉后台即退出 =====
+  /// Dart 侧对应 `SwipeExitPolicy`（原生任务移除监听每次现读同一 key，
+  /// 带 `flutter.` 前缀），改完开关下一次划掉后台即生效。
+  static const String _keySwipeExitOnTaskRemoved =
+      'settings_swipe_exit_on_task_removed';
+
+  /// 「划掉后台自动退出」开关，默认 **开启**。
+  ///
+  /// 开启时，所有 Android 手机从最近任务划掉应用 = 停止播放并退出进程
+  /// （原生 stopWithTask 任务移除监听与 onTaskRemoved 双路径执行，不等系统回收）。
+  /// 背景：部分 ROM 会在移除任务时立即杀进程，但 offload 硬解仍可能在
+  /// 进程死亡后继续输出尾音，因此本开关开启时硬解必须让路给普通 PCM 输出。
+  /// 关闭后走现状逻辑（划掉不停播，由系统决定是否回收）。
+  Future<bool> getSwipeExitOnTaskRemoved() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keySwipeExitOnTaskRemoved) ?? true;
+  }
+
+  Future<void> setSwipeExitOnTaskRemoved(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keySwipeExitOnTaskRemoved, value);
+  }
+
   // ===== 记忆播放状态 =====
   static const String _keyRestoreMemory = 'settings_restore_memory';
 
@@ -2187,8 +2295,9 @@ class SettingsRepository {
   static const String _keyAutoMatchOnlineInfo = 'settings_auto_match_online';
 
   /// 「自动匹配在线信息」开关，默认开启。
-  /// 开启时扫描/启动后自动为本地歌曲搜索匹配在线歌曲（高置信度才确认），
-  /// 补充封面兜底、歌词精确检索与评论区；关闭后仍可手动逐首匹配。
+  /// 开启时扫描/启动后自动为本地歌曲、云盘列表加载后为云盘歌曲搜索匹配
+  /// 在线歌曲（高置信度才确认），补充封面兜底、歌词精确检索与评论区；
+  /// 关闭后仍可手动逐首匹配。
   Future<bool> getAutoMatchOnlineInfo() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getBool(_keyAutoMatchOnlineInfo) ?? true;
@@ -2262,6 +2371,26 @@ class SettingsRepository {
   Future<void> setCarModeAutoScreenEnabled(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyCarModeAutoScreen, value);
+  }
+
+  /// 车机下电（熄火 / 关机）自动暂停：默认 **关闭**。
+  ///
+  /// 开启后原生 `AudioPlaybackService` 收到厂商下电广播或 `ACTION_SHUTDOWN` 时暂停播放；
+  /// 关闭时信号到达即静默返回，行为与历史版本完全一致（接收器仍注册，
+  /// 以保证开关改完即时生效，不需要重启进程）。
+  /// 原生侧读的是同一个 key（带 `flutter.` 前缀），见
+  /// `AudioPlaybackService.isCarPowerOffPauseEnabled`。
+  static const String _keyCarModePowerOffPause =
+      'settings_car_mode_power_off_pause';
+
+  Future<bool> getCarModePowerOffPause() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyCarModePowerOffPause) ?? false;
+  }
+
+  Future<void> setCarModePowerOffPause(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyCarModePowerOffPause, value);
   }
 
   /// 常驻播放器面板的宽度占比，默认 0.30。

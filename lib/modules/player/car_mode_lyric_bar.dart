@@ -36,6 +36,7 @@ import '../../data/models/song.dart';
 import '../../data/repositories/song_match_repository.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
+import '../../providers/song_match_provider.dart';
 import '../../widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/utils/lyric_credit_filter.dart';
@@ -150,13 +151,14 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
       String? text;
       String? translation;
       // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
+      // 云盘歌曲同样可持有匹配记忆（云盘 hash 非官方 hash）
       await SongMatchRepository().ensureLoaded();
-      final matchInfo =
-          song.isOnline ? null : SongMatchRepository().get(song.id);
+      final matchInfo = matchInfoForSong(song);
       final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
-      // 1) 本地歌曲：优先读内嵌歌词；单曲偏好开启时跳过，直接走在线
-      if (!song.isOnline && !preferOnlineLyrics) {
+      // 1) 本地歌曲：优先读内嵌歌词；单曲偏好开启时跳过，直接走在线。
+      //    云盘歌曲无本地文件，跳过内嵌读取。
+      if (!song.isOnline && !song.isCloud && !preferOnlineLyrics) {
         var path = song.localPath;
         if (path != null && path.isNotEmpty) {
           if (path.startsWith('file://')) path = Uri.parse(path).toFilePath();
@@ -169,7 +171,7 @@ class _CarModeLyricBarState extends State<CarModeLyricBar> {
         final searchName = song.artist != '未知艺术家'
             ? '${song.title} ${song.artist}'
             : song.title;
-        // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
+        // 本地/云盘歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
         final matchedHash = (matchInfo != null && matchInfo.isMatched)
             ? matchInfo.hash
             : null;

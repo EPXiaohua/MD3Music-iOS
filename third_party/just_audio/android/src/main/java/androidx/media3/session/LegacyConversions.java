@@ -112,7 +112,13 @@ import java.util.concurrent.TimeoutException;
   // 与 legacy MediaSessionCompat.VMM_SUPPORT_EVENT_VALUE 同值（两包私有互不可
   // 见，改值必须同步）。
   static final String VMM_SUPPORT_EVENT_KEY = "vivomusicmix.media.metadata.support_event";
-  static final long VMM_SUPPORT_EVENT_VALUE = 2015L;
+  // MD3Music fork v64：能力位给满 4095（bit0~11 全开，对齐官方 QQ音乐/酷狗/本地音乐
+  // 白名单口径）。原值 2015 = 31|64|128|256|512|1024，缺 32（自定义颜色/互传）与 2048。
+  // 关键事实：原子的三类列表按钮（256 播放列表 / 512 喜欢列表 / 1024 本地列表）读的是
+  // 按包名白名单查出的能力值 e1.a(pkg)；白名单包返回 4095，非白名单包回退到
+  // support_event 本身 —— 所以非白名单包也必须给满 4095，三个列表按钮才点亮。
+  // 能力位与歌词内容解耦（无歌词的曲子同样要带），否则收藏/列表按钮会连带置灰。
+  static final long VMM_SUPPORT_EVENT_VALUE = 4095L;
 
   private static boolean isVivoFamily() {
     return "vivo".equalsIgnoreCase(Build.MANUFACTURER)
@@ -749,11 +755,28 @@ import java.util.concurrent.TimeoutException;
       builder.putLong(MediaMetadataCompat.METADATA_KEY_YEAR, metadata.recordingYear);
     }
 
-    if (mediaUri != null) {
+    // ==== MD3Music fork（CarWith 封面/媒体地址门控，2026-11）====
+    // 三条规则全部只认 AudioPlayer.sCarWithConnected；断开时 carWithOn=false，
+    // 下面各分支走回与现状逐字节一致的路径（vivo 原子随身听实测依赖
+    // MEDIA_URI/三个 *_URI，不能动）。为什么连着要这样：
+    // 1) 不写 MEDIA_URI —— CarWith 见 mediaUri 就去「从音频地址扒内嵌封面」，
+    //    扒不到就不再回到 metadata 里带的位图 ⇒ 封面永远空白。
+    // 2) 已带到位图时三个 *_URI 一个都不写 —— 车机取图是 description.getIconUri()
+    //    优先，而 iconUri 由 DISPLAY_ICON_URI/ART_URI/ALBUM_ART_URI 级联出来
+    //    （MediaMetadataCompat.PREFERRED_URI_ORDER），只断一个还有两个顶上；
+    //    远程 http URI 车机加载不回来，反而把到位的位图冲掉。
+    // 3) 连着时只带一张位图（ALBUM_ART，规格 §一 真车实测口径）。同一 Binder
+    //    事务塞多张大位图会被跨进程降采样/丢弃（vivo 侧 v12-v19 矩阵同款结论；
+    //    下面「CarWith 只读 ART 键」的旧注释来自更早一轮尝试，与 §一 冲突处以
+    //    §一 为准——断开路径保持旧行为逐字节不变，仅连着时收敛为一张）。
+    final boolean carWithOn = com.ryanheise.just_audio.AudioPlayer.sCarWithConnected;
+    final boolean carWithSuppressArtUri = carWithOn && artworkBitmap != null;
+
+    if (mediaUri != null && !carWithOn) {
       builder.putString(MediaMetadataCompat.METADATA_KEY_MEDIA_URI, mediaUri.toString());
     }
 
-    if (metadata.artworkUri != null) {
+    if (metadata.artworkUri != null && !carWithSuppressArtUri) {
       builder.putString(
           MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, metadata.artworkUri.toString());
       builder.putString(
@@ -765,8 +788,15 @@ import java.util.concurrent.TimeoutException;
     }
 
     if (artworkBitmap != null) {
-      builder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, artworkBitmap);
+      if (!carWithOn) {
+        builder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, artworkBitmap);
+      }
       builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, artworkBitmap);
+      if (!carWithOn) {
+        // 一些车机（包括 CarWith）只读取标准 ART 键，不回退到 DISPLAY_ICON/ALBUM_ART。
+        // 与现有封面共用同一 Bitmap，避免引入另一份解码/缩放或改动其他播放元数据。
+        builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, artworkBitmap);
+      }
     }
 
     if (metadata.folderType != null && metadata.folderType != MediaMetadata.FOLDER_TYPE_NONE) {

@@ -35,7 +35,7 @@ void main() {
           artist: '歌手',
           songCount: 0,
           artworkUri: File(
-            'assets/images/app_icon.png',
+            'assets/images/app_icon.webp',
           ).absolute.uri.toString(),
         ),
       ],

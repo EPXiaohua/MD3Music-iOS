@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import '../../data/repositories/settings_repository.dart';
 import '../../data/repositories/song_match_repository.dart';
 import '../../data/models/song.dart';
+import '../../providers/song_match_provider.dart';
 import '../../main.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/kugou_provider.dart';
@@ -136,6 +137,14 @@ class DesktopLyricService {
   bool get lyricInfoEnabled => _lyricInfoEnabled;
   // 当前歌曲是否已推送过 lyricInfo（避免每 250ms tick 重复推送）
   bool _lyricInfoPushed = false;
+  bool _lyricInfoPushInProgress = false;
+  int _lyricInfoPushRevision = 0;
+
+  void _resetLyricInfoPush() {
+    _lyricInfoPushed = false;
+    _lyricInfoPushRevision++;
+  }
+
   // ColorOS Bridge 兼容模式：开启后 lyricInfo JSON 输出 lyric=纯 LRC +
   // rawLyric=ELRC 逐字（插件据此启用逐字高亮等增强）；关闭保持 ELRC+format 格式
   bool _lyricInfoColorOs = true;
@@ -197,6 +206,14 @@ class DesktopLyricService {
   /// 上一次观测到的播放位置（ms），-1 表示尚未采样。
   /// 只用来判定"位置真的往回走了"，见 [_tickFlymeAdvance]。
   int _flymePrevPosMs = -1;
+
+  // CarWith 车机投屏歌词开关：复用本服务的定时器与解析管线，行切换时把当前句
+  // 推给原生（floating_lyric 通道的 updateCarWithLyricLine），整首经 lyricInfo
+  // 由原生提取成 LYRICS_WHOLE。与其余设备歌词通道不同，**熄屏时逐行定时器
+  // 也要跑**（字显示在车机上，不在手机屏幕上）。开关来自 CarWithService
+  // （main.dart 启动时注入，设置页里即时同步），本文件不读写 prefs。
+  bool _carWithLyricEnabled = false;
+  bool get carWithLyricEnabled => _carWithLyricEnabled;
   // 共用偏好（设置页三种推送协议共用一份）：
   // - 翻译歌词开关：是否推送翻译（影响 SuperLyric 与 LyricInfo）
   bool _pushTranslation = true;
@@ -229,7 +246,10 @@ class DesktopLyricService {
   Timer? _lineTimer;
   bool _awaitingLyric = false;
   int _lyricFetchToken = 0;
-  int _sessionGeneration = 0;
+  // 原生 AudioPlaybackService 可能比 FlutterEngine 活得更久，不能在 Dart
+  // engine 重建后从 0 开始，否则原生端会把新会话误判为旧 generation 并丢弃。
+  // Unix 秒级时间戳在 Android Int 范围内（至 2038 年），随后仍按切歌递增。
+  int _sessionGeneration = DateTime.now().millisecondsSinceEpoch ~/ 1000;
   bool _lastPushedPlaying = false;
   // 歌词拉取退避：临时失败按 250ms→10s 指数退避，确认无词按5分钟冷却，
   // 防止播放期间重复请求；错误状态分别显示给歌词消费者。
@@ -248,11 +268,14 @@ class DesktopLyricService {
   int _unplayedColor = 0xFFFFFFFF;
   bool _locked = false;
   bool _allowHorizontalMove = true;
+
   /// 配色模式：0 = 预设配色，1 = 自调颜色。持久化，重启后保持。
   int _colorMode = kColorModePreset;
+
   /// 最近一次选中的预设下标。进入自调颜色后**保留**，
   /// 切回预设配色时据此还原（见 [setColorMode]）。
   int _activePreset = 0;
+
   /// 自定义配色槽位。「自调颜色」写这里，**不写** [_gradientStart] 那份 ——
   /// 预设色是常量不能被拖坏，第 5 个「自定义」色块读的就是这份。
   int _customStart = 0xFF00E5FF;
@@ -299,8 +322,8 @@ class DesktopLyricService {
   /// 少写一个独立的"选中态"字段，就少一处和真实颜色对不上的机会 ——
   /// 之前原生用自己那份 `activePreset` 记选中态，Dart 侧改了颜色它也照旧亮着。
   int get matchedPresetIndex => gradientPresets.indexWhere(
-        (p) => p.$1 == _gradientStart && p.$2 == _gradientEnd,
-      );
+    (p) => p.$1 == _gradientStart && p.$2 == _gradientEnd,
+  );
 
   /// 字号上下限，与原生 A−/A+ 的 clamp 保持一致（12f … 32f sp）。
   static const double minFontSize = 12.0;
@@ -310,7 +333,9 @@ class DesktopLyricService {
 
   static double stepFontSize(double value, {required bool increase}) {
     if (!Platform.isWindows) {
-      return (value + (increase ? 2 : -2)).clamp(fontSizeMin, fontSizeMax).toDouble();
+      return (value + (increase ? 2 : -2))
+          .clamp(fontSizeMin, fontSizeMax)
+          .toDouble();
     }
     final next = increase
         ? ((value / 10).floor() + 1) * 10
@@ -442,7 +467,8 @@ class DesktopLyricService {
     final m = mode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
     _colorMode = m;
     if (m == kColorModePreset) {
-      final p = gradientPresets[_activePreset.clamp(0, gradientPresets.length - 1)];
+      final p =
+          gradientPresets[_activePreset.clamp(0, gradientPresets.length - 1)];
       _gradientStart = p.$1;
       _gradientEnd = p.$2;
       _unplayedColor = kPresetUnplayedColor;
@@ -553,7 +579,7 @@ class DesktopLyricService {
     MediaNotificationService.onScreenStateChanged = (on) {
       _screenOn = on;
       _syncNativeSyncProbeInterval();
-      if (!on && !_lockScreenLyricEnabled) {
+      if (!on && !_lockScreenLyricEnabled && !_carWithLyricEnabled) {
         // 熄屏且未开锁屏歌词：停表前先清掉预测调度，否则它们仍会到点唤醒
         _cancelLineTimer();
         _cancelFlymeLineTimer();
@@ -606,7 +632,8 @@ class DesktopLyricService {
   /// 不去重会打出一批无谓的通道调用。
   void _pushLockScreenFavorite(String songId, bool favorited) {
     if (!_lockScreenLyricEnabled) return;
-    if (_lockFavoriteSongId == songId && _lockFavoriteValue == favorited) return;
+    if (_lockFavoriteSongId == songId && _lockFavoriteValue == favorited)
+      return;
     _lockFavoriteSongId = songId;
     _lockFavoriteValue = favorited;
     // ignore: discarded_futures
@@ -657,17 +684,14 @@ class DesktopLyricService {
     final doubleLine = config['doubleLine'] as bool?;
     final opacity = config['opacity'] as int?;
     final locked = config['locked'] as bool?;
-    final gradientStart =
-        (config['gradientStart'] as int?)?.toUnsigned(32);
+    final gradientStart = (config['gradientStart'] as int?)?.toUnsigned(32);
     final gradientEnd = (config['gradientEnd'] as int?)?.toUnsigned(32);
-    final unplayedColor =
-        (config['unplayedColor'] as int?)?.toUnsigned(32);
+    final unplayedColor = (config['unplayedColor'] as int?)?.toUnsigned(32);
     final colorMode = config['colorMode'] as int?;
     final activePreset = config['activePreset'] as int?;
     final customStart = (config['customStart'] as int?)?.toUnsigned(32);
     final customEnd = (config['customEnd'] as int?)?.toUnsigned(32);
-    final customUnplayed =
-        (config['customUnplayed'] as int?)?.toUnsigned(32);
+    final customUnplayed = (config['customUnplayed'] as int?)?.toUnsigned(32);
 
     if (fontSize != null) {
       _fontSize = fontSize;
@@ -698,8 +722,9 @@ class DesktopLyricService {
       await _settings.setDesktopLyricUnplayedColor(unplayedColor);
     }
     if (colorMode != null) {
-      _colorMode =
-          colorMode == kColorModeCustom ? kColorModeCustom : kColorModePreset;
+      _colorMode = colorMode == kColorModeCustom
+          ? kColorModeCustom
+          : kColorModePreset;
       await _settings.setDesktopLyricColorMode(_colorMode);
     }
     if (activePreset != null) {
@@ -885,7 +910,9 @@ class DesktopLyricService {
     await _loadConfig();
     final song = _player!.currentSong;
     final sameSong = song != null && song.id == _currentSongId;
-    final index = sameSong ? _findLineIndex(_player!.position.inMilliseconds) : -1;
+    final index = sameSong
+        ? _findLineIndex(_player!.position.inMilliseconds)
+        : -1;
     final initialLyric = sameSong && _lines.isNotEmpty
         ? (index >= 0 ? _lines[index].text : '')
         : (song == null ? '' : '歌词加载中...');
@@ -942,7 +969,8 @@ class DesktopLyricService {
   /// 查到窗口在显示就按开启恢复。失败静默：下一次引擎重启仍会重试。
   Future<void> restoreFloatingFromNative() async {
     if (_enabled) return;
-    final running = await MediaNotificationService.isFloatingLyricWindowRunning();
+    final running =
+        await MediaNotificationService.isFloatingLyricWindowRunning();
     if (!running) return;
     _enabled = true;
     // 行索引与推送基线全部复位：下一拍（或 provider 绑定成功后那一拍）按
@@ -979,7 +1007,8 @@ class DesktopLyricService {
     final seconds = (playing ?? _player?.isPlaying ?? false) || _screenOn
         ? 5
         : 30;
-    if (_nativeSyncProbe != null && seconds == _nativeSyncProbeIntervalSeconds) {
+    if (_nativeSyncProbe != null &&
+        seconds == _nativeSyncProbeIntervalSeconds) {
       return;
     }
     _nativeSyncProbe?.cancel();
@@ -1030,14 +1059,14 @@ class DesktopLyricService {
     _lyricInfoEnabled = enabled;
     _bindProvidersFromContext();
     if (enabled) {
-      _lyricInfoPushed = false;
+      _resetLyricInfoPush();
       _updateTicker();
       // 启用时若已有歌词立即推送一次（无需等下一个 tick）
       if (_lines.isNotEmpty) {
-        _maybePushLyricInfo();
+        unawaited(_maybePushLyricInfo());
       }
     } else {
-      _lyricInfoPushed = false;
+      _resetLyricInfoPush();
       _updateTicker();
       // 关闭时移除 lyricInfo，让原生端元数据不再携带
       try {
@@ -1053,8 +1082,8 @@ class DesktopLyricService {
     if (_lyricInfoColorOs == enabled) return;
     _lyricInfoColorOs = enabled;
     if (_lyricInfoEnabled) {
-      _lyricInfoPushed = false;
-      _maybePushLyricInfo();
+      _resetLyricInfoPush();
+      unawaited(_maybePushLyricInfo());
     }
     _notify();
   }
@@ -1067,8 +1096,9 @@ class DesktopLyricService {
     _bindProvidersFromContext();
     _updateTicker();
     try {
-      await _flymeChannel.invokeMethod(
-          'setFlymeStatusBarLyricEnabled', {'enabled': enabled});
+      await _flymeChannel.invokeMethod('setFlymeStatusBarLyricEnabled', {
+        'enabled': enabled,
+      });
     } catch (_) {}
     if (enabled) {
       // 回灌走"提前量之后"的时间轴，否则刚打开时显示的还是原始时间轴的那一行，
@@ -1095,9 +1125,47 @@ class DesktopLyricService {
   /// 只发行级纯文本。原生侧对空串做清空处理。
   Future<void> _pushFlymeLine(String text) async {
     try {
-      await _flymeChannel
-          .invokeMethod('updateFlymeStatusBarLyric', {'lyric': text.trim()});
+      await _flymeChannel.invokeMethod('updateFlymeStatusBarLyric', {
+        'lyric': text.trim(),
+      });
     } catch (_) {}
+  }
+
+  /// CarWith 车机投屏歌词开关（来自 CarWithService；main.dart 启动时注入，
+  /// 设置页即时同步）。开启立即回灌当前行（对齐 [setFlymeStatusBarLyricEnabled]
+  /// 的做法，不等下一句）；关闭推一次「enabled=false + 空串」让车机歌词收掉，
+  /// 而不是停在最后一句（规格 §九 第 5 条）。
+  ///
+  /// 回灌不必像 Flyme 那样归零自己的索引：车机侧按「文本没变就不重发」去重，
+  /// 而这里回灌前最后一次推送（若有）是关闭/切歌时的空串，当前行必然与它不同。
+  /// 也不走 Flyme 的提前量时间轴 —— 那套是状态栏通知链路的固定损耗补偿，
+  /// 车机按规格「每换一句重新提交一次元数据」即可，复用共享行索引。
+  Future<void> setCarWithLyricEnabled(bool enabled) async {
+    if (_carWithLyricEnabled == enabled) return;
+    _carWithLyricEnabled = enabled;
+    _bindProvidersFromContext();
+    _updateTicker();
+    if (enabled) {
+      // 整首链路：LYRICS_WHOLE 由原生从 lyricInfo 提取，本开关勾选期间
+      // 要保证整首已发布 —— 立即触发一次（_maybePushLyricInfo 内部自带
+      // 去重与失败重试；歌词还没就绪时由后续 tick 补）。
+      unawaited(_maybePushLyricInfo());
+      final i = _currentLineIndex;
+      final current = (i >= 0 && i < _lines.length) ? _lines[i].text : '';
+      await MediaNotificationService.updateCarWithLyricLine(true, current);
+    } else {
+      await MediaNotificationService.updateCarWithLyricLine(false, '');
+      // 关掉后清掉自己经手的 lyricInfo 发布，回到上游形态（extras 不带整首，
+      // 否则 ColorOS LyricInfo 模块等第三方读车机开期间发布的整首，形同没关）。
+      // LyricInfo 开关还开着时不能清 —— 那是它的数据，与车机无关。
+      if (!_lyricInfoEnabled) {
+        try {
+          await MediaNotificationService.removeLyricInfo();
+        } catch (_) {}
+        _resetLyricInfoPush();
+      }
+    }
+    _notify();
   }
 
   /// SuperLyric 歌词推送开关：独立于悬浮窗/蓝牙歌词/LyricInfo。
@@ -1207,8 +1275,8 @@ class DesktopLyricService {
     _flymeLineIndex = -1;
     _flymeLastSwitchAt = null;
     _flymePrevPosMs = -1;
-    _lyricInfoPushed = false;
-    _maybePushLyricInfo();
+    _resetLyricInfoPush();
+    unawaited(_maybePushLyricInfo());
   }
 
   /// 推送整首歌词 + 样式到原生锁屏界面（切歌 / 歌词就绪 / 偏好变化时调用）。
@@ -1330,8 +1398,8 @@ class DesktopLyricService {
       }
     }
     if (_lyricInfoEnabled) {
-      _lyricInfoPushed = false;
-      _maybePushLyricInfo();
+      _resetLyricInfoPush();
+      unawaited(_maybePushLyricInfo());
     }
     if (_lockScreenLyricEnabled) {
       _pushLockScreenFullData();
@@ -1363,13 +1431,13 @@ class DesktopLyricService {
       }
     }
     if (_lyricInfoEnabled) {
-      _lyricInfoPushed = false;
-      _maybePushLyricInfo();
+      _resetLyricInfoPush();
+      unawaited(_maybePushLyricInfo());
     }
   }
 
   /// 定时器是否需要运行：悬浮窗、蓝牙歌词、LyricInfo、SuperLyric、锁屏歌词
-  /// 或 iOS PiP 悬浮歌词任一开启即需运行
+  /// 或 iOS PiP 悬浮歌词 / CarWith 车机歌词任一开启即需运行
   bool _shouldTick() =>
       _enabled ||
       _bluetoothLyricEnabled ||
@@ -1377,13 +1445,18 @@ class DesktopLyricService {
       _superLyricEnabled ||
       _flymeStatusBarLyricEnabled ||
       _lockScreenLyricEnabled ||
+      _carWithLyricEnabled ||
       _pipActive;
 
-  /// 除「有通道开启」外，还需亮屏、或开了锁屏歌词。
+  /// 除「有通道开启」外，还需亮屏、或开了锁屏歌词、或开了 CarWith 车机歌词。
   ///
   /// 熄屏且未开锁屏歌词时悬浮窗不可见，tick 纯耗电——必须真的停表，
   /// 而不是在 [_onTick] 里早退：早退省不掉定时器对 CPU 的周期性唤醒（§10.4.6）。
-  bool _tickNeeded() => _shouldTick() && (_screenOn || _lockScreenLyricEnabled);
+  /// CarWith 例外：字显示在车机上，手机熄屏时逐行定时器也要跑（规格 §一 铁律），
+  /// 与锁屏歌词同款处理。
+  bool _tickNeeded() =>
+      _shouldTick() &&
+      (_screenOn || _lockScreenLyricEnabled || _carWithLyricEnabled);
 
   /// 根据开关与屏幕状态启停定时器（250ms tick：逐行歌词足够检测切行）
   void _updateTicker() {
@@ -1483,7 +1556,9 @@ class DesktopLyricService {
     if (player == null || !player.isPlaying) return;
     if (nextIndex >= _lines.length) return;
     final delayMs =
-        _lines[nextIndex].startTime - _flymeAdvanceMs - player.position.inMilliseconds;
+        _lines[nextIndex].startTime -
+        _flymeAdvanceMs -
+        player.position.inMilliseconds;
     if (delayMs <= 0) return; // 已经错过，交给下一次 tick 收敛
     _flymeLineTimer = Timer(Duration(milliseconds: delayMs), () {
       final p = _player;
@@ -1571,16 +1646,17 @@ class DesktopLyricService {
     _fontSize = await _settings.getDesktopLyricFontSize();
     _doubleLine = await _settings.getDesktopLyricDoubleLine();
     _opacity = await _settings.getDesktopLyricOpacity();
-    _allowHorizontalMove =
-        await _settings.getDesktopLyricAllowHorizontalMove();
+    _allowHorizontalMove = await _settings.getDesktopLyricAllowHorizontalMove();
     _gradientStart = await _settings.getDesktopLyricGradientStart();
     _gradientEnd = await _settings.getDesktopLyricGradientEnd();
     _unplayedColor = await _settings.getDesktopLyricUnplayedColor();
     _locked = await _settings.getDesktopLyricLocked();
     _colorMode = await _settings.getDesktopLyricColorMode();
     // 预设下标可能落在越界位置（旧版本数据 / 预设表被改短），clamp 兜底
-    _activePreset = (await _settings.getDesktopLyricPresetIndex())
-        .clamp(0, gradientPresets.length - 1);
+    _activePreset = (await _settings.getDesktopLyricPresetIndex()).clamp(
+      0,
+      gradientPresets.length - 1,
+    );
     _customStart = await _settings.getDesktopLyricCustomGradStart();
     _customEnd = await _settings.getDesktopLyricCustomGradEnd();
     _customUnplayed = await _settings.getDesktopLyricCustomUnplayed();
@@ -1632,8 +1708,9 @@ class DesktopLyricService {
     'com.md3music.md3music/super_lyric',
   );
   // 通道名与原生 FlymeLyricBridge.CHANNEL_NAME 必须逐字一致
-  static const _flymeChannel =
-      MethodChannel('com.md3music.md3music/flyme_status_bar_lyric');
+  static const _flymeChannel = MethodChannel(
+    'com.md3music.md3music/flyme_status_bar_lyric',
+  );
 
   void _syncCurrentFromPlayer() {
     if (_player == null) return;
@@ -1678,7 +1755,7 @@ class DesktopLyricService {
     // 熄屏且未开锁屏歌词：Android 悬浮窗不可见，tick 纯耗电，直接休眠。
     // iOS PiP 悬浮歌词在熄屏/锁屏时仍可见（系统 PiP 窗口常显），不能休眠。
     // （点亮屏幕时由 screenStateChanged 回调补一拍对齐漂移）
-    if (!_screenOn && !_lockScreenLyricEnabled && !_pipActive) {
+    if (!_screenOn && !_lockScreenLyricEnabled && !_carWithLyricEnabled && !_pipActive) {
       _cancelLineTimer();
       _cancelFlymeLineTimer();
       return;
@@ -1750,9 +1827,16 @@ class DesktopLyricService {
       _flymeLineIndex = -1;
       _flymeLastSwitchAt = null;
       _flymePrevPosMs = -1;
-      // LyricInfo：切歌时立即移除上一首的 lyricInfo，避免旧歌词短暂匹配到新歌
-      if (_lyricInfoEnabled) {
-        _lyricInfoPushed = false;
+      // CarWith 车机歌词：切歌同款清空（参照魅族段落的理由）——原生按
+      // 「文本没变就不重发」去重，新歌首句撞旧歌末句时不先清一次会被吞掉。
+      if (_carWithLyricEnabled) {
+        MediaNotificationService.updateCarWithLyricLine(true, '');
+      }
+      // LyricInfo：切歌时立即移除上一首的 lyricInfo，避免旧歌词短暂匹配到新歌。
+      // CarWith 开着时同款移除 + 复位去重：LYRICS_WHOLE 从 lyricInfo 提取，
+      // 不先清掉旧歌整首会被新歌首句撞句时当成还是同一份整首而漏重发。
+      if (_lyricInfoEnabled || _carWithLyricEnabled) {
+        _resetLyricInfoPush();
         MediaNotificationService.removeLyricInfo(
           songId: song.id,
           sessionGeneration: _sessionGeneration,
@@ -1782,7 +1866,7 @@ class DesktopLyricService {
     }
 
     // LyricInfo：歌词加载完成后推送一次整首歌词（_lyricInfoPushed 去重）
-    _maybePushLyricInfo();
+    unawaited(_maybePushLyricInfo());
 
     // Sync progress (500ms throttle)
     final pos = _player!.position;
@@ -1791,12 +1875,6 @@ class DesktopLyricService {
     if (_lastPushedPosMs == null || (posMs - _lastPushedPosMs!).abs() > 500) {
       _lastPushedPosMs = posMs;
       _pushProgress(pos, dur);
-    }
-
-    // iOS PiP 悬浮歌词：行/占位变化推送 + 进度校准。放在 _lines.isEmpty
-    // 早退之前——切歌清空行列表后 PiP 条才能及时切到占位文案。
-    if (_pipActive) {
-      _pipTick(_lines.isEmpty ? -1 : _findLineIndex(posMs));
     }
 
     // Find current line
@@ -1841,6 +1919,11 @@ class DesktopLyricService {
         if (_superLyricEnabled) {
           _pushSuperLyricLine(line);
         }
+        // CarWith 车机歌词：换一句就重新提交一次元数据（规格 §一 歌词键与优先级），
+        // 与悬浮窗共享同一行索引与 300ms 迟滞，不另起时间轴。
+        if (_carWithLyricEnabled) {
+          MediaNotificationService.updateCarWithLyricLine(true, current);
+        }
         // 魅族状态栏歌词不在此处推：它有自己的提前量与迟滞，见 _tickFlymeAdvance。
         // 预测调度：下一行起始时刻精确触发，切行延迟从最坏 250ms 降到 Timer 精度
         if (newIndex + 1 < _lines.length) {
@@ -1860,12 +1943,13 @@ class DesktopLyricService {
     _awaitingLyric = true;
     try {
       // 这首歌自己的匹配记录：hash 精确检索 + 单曲偏好「使用在线歌词」
+      // 云盘歌曲同样可持有匹配记忆（云盘 hash 非官方 hash）
       await SongMatchRepository().ensureLoaded();
-      final matchInfo =
-          song.isOnline ? null : SongMatchRepository().get(song.id);
+      final matchInfo = matchInfoForSong(song);
       final preferOnlineLyrics = matchInfo?.preferOnlineLyrics == true;
 
-      if (!song.isOnline && !preferOnlineLyrics) {
+      // 仅本地歌曲读内嵌歌词；云盘歌曲无本地文件，跳过
+      if (!song.isOnline && !song.isCloud && !preferOnlineLyrics) {
         final localPath = song.localPath;
         if (localPath != null && localPath.isNotEmpty) {
           String filePath = localPath;
@@ -1901,9 +1985,10 @@ class DesktopLyricService {
       final searchName = !isUnknownArtist(song.artist)
           ? '${song.title} ${song.artist}'
           : song.title;
-      // 本地歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
-      final matchedHash =
-          (matchInfo != null && matchInfo.isMatched) ? matchInfo.hash : null;
+      // 本地/云盘歌曲：命中匹配记忆时用在线 hash 精确检索；未命中退化为按歌名搜索
+      final matchedHash = (matchInfo != null && matchInfo.isMatched)
+          ? matchInfo.hash
+          : null;
       // 首份 LRC 先显示，不等待补充逐字歌词；串行解析防止迟到的初稿覆盖终稿。
       Future<void> progressCommit = Future<void>.value();
       final result = await _kugou!.getLyricResult(
@@ -1950,8 +2035,7 @@ class DesktopLyricService {
           return;
       }
     } catch (_) {
-      if (_isCurrentLyricRequest(token, requestedSongId) &&
-          _rawLines.isEmpty) {
+      if (_isCurrentLyricRequest(token, requestedSongId) && _rawLines.isEmpty) {
         _recordLyricFailure(
           requestedSongId,
           '歌词加载失败',
@@ -1986,8 +2070,7 @@ class DesktopLyricService {
         romaText: lyric.romaContent,
       );
     } catch (_) {
-      if (_isCurrentLyricRequest(token, requestedSongId) &&
-          _rawLines.isEmpty) {
+      if (_isCurrentLyricRequest(token, requestedSongId) && _rawLines.isEmpty) {
         _recordLyricFailure(
           requestedSongId,
           '歌词解析失败',
@@ -2008,11 +2091,11 @@ class DesktopLyricService {
       return false;
     }
     _setParsedLines(lines);
-    _lyricInfoPushed = false;
+    _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
+    _resetLyricInfoPush();
     _currentLineIndex = -2;
     _lastLineSwitchAt = null;
     _clearLyricRetryState();
-    _pushPipLyricsFull(); // iOS PiP：整包歌词就绪即推
     _markLockLyricLoaded('');
     _onTick();
     debugPrint('[DesktopLyric] lyrics ready: lines=${lines.length}');
@@ -2162,11 +2245,36 @@ class DesktopLyricService {
   /// LyricInfo：歌词就绪后推送一次整首歌词（_lyricInfoPushed 去重，每首歌 1 次）。
   /// 仅在 [_pushLyricInfo] 真正完成推送后才置位去重标志：若中途因无歌/空行等提前
   /// 返回，则保持 false 让后续 tick 重试，避免该曲 lyricInfo 永久丢失。
-  void _maybePushLyricInfo() {
-    if (!_lyricInfoEnabled || _lyricInfoPushed) return;
+  ///
+  /// 门控放宽：CarWith 车机歌词开启时也要走这条链路 —— 原生把整首
+  /// `ucar.media.metadata.LYRICS_WHOLE` 从 lyricInfo 里提取（Dart 侧无需另拼），
+  /// 规格 §一 要求「车机歌词开着就必须保证整首已发布」。两开关都关时
+  /// 判据与上游逐字相同。
+  Future<void> _maybePushLyricInfo() async {
+    if ((!_lyricInfoEnabled && !_carWithLyricEnabled) ||
+        _lyricInfoPushed ||
+        _lyricInfoPushInProgress) {
+      return;
+    }
     if (_lines.isEmpty) return;
-    if (_pushLyricInfo()) {
-      _lyricInfoPushed = true;
+    final player = _player;
+    final song = player?.currentSong;
+    if (song == null) return;
+    final revision = _lyricInfoPushRevision;
+    final sessionGeneration = _sessionGeneration;
+    _lyricInfoPushInProgress = true;
+    try {
+      final delivered = await _pushLyricInfo();
+      if (delivered &&
+          revision == _lyricInfoPushRevision &&
+          sessionGeneration == _sessionGeneration &&
+          song.id == _player?.currentSong?.id) {
+        _lyricInfoPushed = true;
+      }
+    } catch (_) {
+      // 保留未推送状态，后续歌词 tick 会重试。
+    } finally {
+      _lyricInfoPushInProgress = false;
     }
   }
 
@@ -2179,8 +2287,11 @@ class DesktopLyricService {
   /// 翻译/罗马音 lane 受共用开关 [_pushTranslation] / [_pushRoma] 控制
   /// （与 ColorOS 模式共用归一化规则，原生侧 hasTranslation 能力位口径一致）。
   /// 返回是否真正发起了推送（供 _maybePushLyricInfo 决定是否置位去重标志）。
-  bool _pushLyricInfo() {
-    if (!_lyricInfoEnabled || _player == null) return false;
+  /// 门控与 [_maybePushLyricInfo] 同步放宽（CarWith 整首链路），两处成对改。
+  Future<bool> _pushLyricInfo() async {
+    if ((!_lyricInfoEnabled && !_carWithLyricEnabled) || _player == null) {
+      return false;
+    }
     final song = _player!.currentSong;
     if (song == null) return false;
 
@@ -2199,7 +2310,7 @@ class DesktopLyricService {
     );
     if (json.isEmpty) return false; // 无有效歌词行：不推送（保持移除状态）
 
-    MediaNotificationService.updateLyricInfo(
+    return MediaNotificationService.tryUpdateLyricInfo(
       jsonEncode(json),
       songId: song.id,
       sessionGeneration: _sessionGeneration,
@@ -2208,7 +2319,6 @@ class DesktopLyricService {
         includeTranslation: _pushTranslation,
       ),
     );
-    return true;
   }
 
   /// 二分查找当前播放位置对应的歌词行 index。

@@ -17,7 +17,6 @@
   <a href="#-快速开始">构建指南</a> ·
   <a href="MCP_GUIDE.md">AI 代理接入</a> ·
   <a href="CONTRIBUTING.md">贡献指南</a> ·
-  <a href="#sponsor">赞助支持</a>
 </p>
 
 </div>
@@ -32,7 +31,7 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，内置嵌
 
 > **版本说明**：V5 之前的所有版本与分支均已废弃并彻底删除，请勿使用过时版本。最新版请前往 [GitHub Releases](https://github.com/zzyoxml/md3Music/releases)。
 >
-> 由于私有库开发同步会覆盖公开库代码，公开库代码现由脚本全量推送至公开库 `rust-local-force` 分支。
+> 公开仓库代码由脚本从上游仓库全量同步（覆盖式）；直接提交到公开仓的改动可能被下次同步覆盖。
 >
 > **投屏功能声明**：投屏采用行业标准的通用传输协议（DLNA/AirPlay），仅用于在个人家庭网络内将音乐流转至用户本人合法拥有的播放设备，不涉及对音乐文件的再存储、分发或向公众传播。
 >
@@ -44,7 +43,10 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，内置嵌
 <p align="center">
   <a href="https://trendshift.io/repositories/123225"><img src="https://trendshift.io/api/badge/repositories/123225" alt="Featured on GitHub Trending" /></a>
   <a href="https://trendshift.io/repositories/123225"><img src="https://trendshift.io/api/badge/trendshift/repositories/123225/daily?language=Dart" alt="#2 Dart Repository Of The Day on Trendshift" /></a>
+</p>
+<p align="center">
   <a href="https://trendshift.io/repositories/123225"><img src="https://trendshift.io/api/badge/trendshift/repositories/123225/weekly?language=Dart" alt="#5 Dart Repository Of The Week on Trendshift" /></a>
+  <a href="https://trendshift.io/repositories/123225?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-123225" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/123225/monthly?language=Dart" alt="zzyoxml%2Fmd3Music | Trendshift" width="250" height="55"/></a>
 </p>
 
 ## 📈 GitHub Star 趋势
@@ -64,7 +66,7 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，内置嵌
 - **在线音乐** — 搜索、每日推荐、排行榜、新碟上架、听歌识曲、私人 FM、歌单/专辑/歌手/评论/MV、云盘、听书、场景音乐、频道、刷刷短视频、一起听、刷歌推荐
 - **本地音乐** — 文件夹浏览、内嵌封面与歌词、本地收藏、音质标签、多维度排序、在线歌曲元数据智能匹配；Android 支持扫描系统授权目录中的 U 盘等外部存储音乐
 - **播放体验** — 多音质选择（标准/高质/无损/Hi-Res）、USB 独占输出、均衡器、AutoMix 无缝过渡、响度均衡、DLNA 投屏、睡眠定时、倍速、进度记忆、画中画
-- **视觉效果** — 动态封面、3D 景深封面、流动背景，歌曲/MV 弹幕支持透明度、速度与颜色设置
+- **视觉效果** — 动态封面、3D 景深封面（全功能版）、流动背景，歌曲/MV 弹幕支持透明度、速度与颜色设置
 - **歌词显示** — Apple Music 风格逐字歌词（KRC/LRC），支持翻译/罗马音、辉光、模糊、动态取色，以及桌面/锁屏/蓝牙歌词与 lyricinfo lyricon词幕 SuperLyric flyme歌词 推送协议
 - **用户中心** — VIP 三签到、多账号管理、听歌等级/排行/识曲、收藏与播放历史、桌面小组件
 - **个性化** — MD3E/AM 双风格、主题色与动态取色、深色模式、自定义壁纸与字体；全局文字及两种播放页歌词颜色独立设置，支持双栏开关（左右各 50%）、悬浮迷你播放器与主页 Tab 管理
@@ -116,7 +118,7 @@ MD3Music 是一款基于酷狗音乐 API 的 Flutter 音乐播放器，内置嵌
 - `MD3Music-<版本>-tv-armeabi-v7a.apk`：Android TV（32 位）
 - `md3music-windows-<版本>.zip`：Windows 便携版
 
-例如 v6.0.5 的以上 5 个产物可在[最新 Release](https://github.com/zzyoxml/md3Music/releases/latest)下载。注意：公开仓库不包含私有库的一键入口 `scripts/md3.ps1`；公开树仅保留 `scripts/tasks/android.ps1`、`scripts/tasks/windows.ps1` 和 `scripts/tools/mcp_stdio_bridge.py`。
+例如 v6.0.5 的以上 5 个产物可在[最新 Release](https://github.com/zzyoxml/md3Music/releases/latest)下载。注意：一键入口 `scripts/md3.ps1` 不在公开树；公开树仅保留 `scripts/tasks/android.ps1`、`scripts/tasks/windows.ps1` 和 `scripts/tools/mcp_stdio_bridge.py`。
 
 ***
 
@@ -210,15 +212,19 @@ flutter run
 
 ### 5. 构建发布版 APK
 
-公开仓库没有私有库的一键入口 `scripts/md3.ps1`。在 Windows PowerShell 中直接运行公开树提供的独立构建脚本：
+公开仓库没有上游仓库的一键入口 `scripts/md3.ps1`。在 Windows PowerShell 中直接运行公开树提供的独立构建脚本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\tasks\android.ps1
 ```
 
-该脚本默认构建标准版（arm64-v8a、armeabi-v7a、x86\_64）、3D 封面版（arm64-v8a）及随身听兼容版（arm64-v8a），本地默认共 5 个 APK，输出到 `build\app\outputs\flutter-apk\`。要获取项目正式发布的版本，请前往 [GitHub Releases](https://github.com/zzyoxml/md3Music/releases/latest)；当前 Release 是 4 个 Android APK（标准版、随身听兼容版、TV 版 64/32 位）和 1 个 Windows ZIP，共 5 个下载文件。
+该脚本默认构建标准版（内部 flavor `lite`，arm64-v8a、armeabi-v7a、x86_64）及随身听兼容版（arm64-v8a），共 4 个本地 APK，输出到 `build\app\outputs\flutter-apk\`；默认不构建 3D 封面和端侧分离版本。
 
-> 公开仓库仅包含 `scripts/tasks/android.ps1`、`scripts/tasks/windows.ps1`、`scripts/tools/mcp_stdio_bridge.py` 三个脚本文件；构建 Windows 便携版请使用 `scripts/tasks/windows.ps1`，而不是私有库的 `scripts/md3.ps1`。
+正式发布 CI 固定提供 4 个 Android APK（标准版、随身听兼容版、TV 版 64/32 位）和 1 个 Windows ZIP，共 5 个下载文件，文件名保持本页「下载」列表中的格式。请前往 [GitHub Releases](https://github.com/zzyoxml/md3Music/releases/latest) 获取正式发布版本。
+
+> 标准版使用内部 flavor `lite`，发布文件名仍为 `MD3Music-<版本>-standard-arm64-v8a.apk`。全功能 flavor `full` 仅保留手动构建能力，不进入 CI 默认构建和正式发布产物。
+
+> 公开仓库仅包含 `scripts/tasks/android.ps1`、`scripts/tasks/windows.ps1`、`scripts/tools/mcp_stdio_bridge.py` 三个脚本文件；构建 Windows 便携版请使用 `scripts/tasks/windows.ps1`，而不是上游仓库的 `scripts/md3.ps1`。
 
 ***
 
@@ -307,7 +313,6 @@ md3Music/
 | **图片缓存**     | cached\_network\_image                                           |
 | **嵌入式服务器**   | Rust（tiny\_http + ureq）                                          |
 | **加密**       | rsa / aes / md-5 / sha1 / sha2                                   |
-| **元数据读写**    | audio\_metadata\_reader + JAudioTagger (MP3/FLAC/M4A)            |
 | **DLNA 投屏**  | dlna\_dart                                                       |
 | **MV 播放**    | video\_player + chewie                                           |
 | **USB 独占输出** | 原生 JNI + CMake C++（usbdevfs）                                     |
@@ -409,19 +414,9 @@ A: Rust 的 TLS 依赖（`ring` crate）需要交叉编译为 Android 平台的 
 A: 该开关仅在魅族 Flyme 机型上出现（由设备能力探测决定），其他品牌不显示。
 
 **Q: 切歌提示只能看MV**
-A: 登录过期，请重新登录
-
-***
+A: 登录过期或者没有登录
 
 <a id="sponsor"></a>
-
-## 💖 赞助支持
-
-如果 MD3Music 对你有帮助，欢迎自愿赞助，支持项目持续开发与维护。
-
-[GitHub Sponsors](https://github.com/sponsors/zzyoxm1) · [爱发电](https://afdian.com/a/md3Music)
-
-***
 
 ## 🤝 致谢
 
@@ -439,7 +434,6 @@ A: 登录过期，请重新登录
 - [MaterialKolor](https://github.com/jordond/MaterialKolor) — 莫奈取色 / Material Design 3 动态配色
 - [tiny\_http](https://github.com/tiny-http/tiny-http) — Rust HTTP 服务器
 - [ureq](https://github.com/algesten/ureq) — Rust HTTP 客户端
-- [JAudioTagger](https://www.jthink.net/jaudiotagger/) — 音频元数据读写
 - [decent-player](https://github.com/Ma145/decent-player) — USB 独占音频输出（DAC 独占驱动 C++/Kotlin 移植自其 `decent-usb-audio-driver`）
 - [infplayer](https://github.com/Shiqi-SQ/infplayer) — 自动混音（AutoMix）无缝过渡参考（BPM 自相关检测、拍点吸附、保音高变速对拍、等功率淡化曲线）
 - [Depth-Anything-ONNX](https://github.com/fabio-sim/Depth-Anything-ONNX) — 深度估计模型 ONNX 导出与推理参考
@@ -466,6 +460,8 @@ A: 登录过期，请重新登录
   <a href="https://github.com/floveey"><img src="https://avatars.githubusercontent.com/u/54261748?v=4&s=80" width="80" height="80" alt="floveey" title="floveey" /></a>
   <a href="https://github.com/nn3456"><img src="https://avatars.githubusercontent.com/u/74135472?v=4&s=80" width="80" height="80" alt="nn3456" title="nn3456" /></a>
   <a href="https://github.com/huaaaajjj"><img src="https://avatars.githubusercontent.com/u/170057899?v=4&s=80" width="80" height="80" alt="huaaaajjj" title="huaaaajjj" /></a>
+  <a href="https://github.com/WeiErLiTeo"><img src="https://avatars.githubusercontent.com/u/222311740?v=4&s=80" width="80" height="80" alt="WeiErLiTeo" title="WeiErLiTeo" /></a>
+  <a href="https://github.com/YYan99"><img src="https://avatars.githubusercontent.com/u/74341446?v=4&s=80" width="80" height="80" alt="YYan99" title="YYan99" /></a>
 </p>
 
 ***

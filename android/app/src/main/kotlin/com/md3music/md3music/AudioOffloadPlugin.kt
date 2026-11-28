@@ -87,9 +87,13 @@ class AudioOffloadPlugin(private val context: Context) {
             when (call.method) {
                 "getStatus" -> result.success(AudioOffloadController.status())
                 "setEnabled" -> {
-                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    val requested = call.argument<Boolean>("enabled") ?: false
+                    // 主引擎与 headless 引擎都会下发；原生现读划掉退出开关，
+                    // 防止某个引擎状态滞后而在进程被杀后留下 offload 尾音。
+                    val enabled = requested &&
+                        !SwipeExitPolicy.shouldSwipeExit(context)
                     val status = AudioPlayer.setGlobalAudioOffloadEnabled(enabled)
-                    UsbLog.i(TAG, "setEnabled=$enabled")
+                    UsbLog.i(TAG, "setEnabled=$enabled requested=$requested")
                     result.success(status)
                 }
                 "probeCapabilities" -> probeCapabilitiesAsync(result)

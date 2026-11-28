@@ -17,9 +17,9 @@ import '../providers/player_provider.dart';
 /// - **静音 + 不抢音频焦点**：`setVolume(0)` + `VideoPlayerOptions(mixWithOthers: true)`，
 ///   绝不打断 just_audio 的音乐播放（USB 独占路径同样不受影响）。
 /// - **字节来源二选一**：
-///   - 私有构建：命中本地缓存 → `VideoPlayerController.file`（零网络）；
-///     未命中 → `networkUrl`（回环代理，边下边播）并通知私有层后台落盘。
-///   - 公开构建：始终 `networkUrl`（回环代理，每次流式、不落盘）。
+///   - 宿主注入了本地路径解析：命中本地缓存 → `VideoPlayerController.file`（零网络）；
+///     未命中 → `networkUrl`（回环代理，边下边播）并通知宿主层后台落盘。
+///   - 默认（未注入）：始终 `networkUrl`（回环代理，每次流式、不落盘）。
 ///   两条路径都不直连 CDN 明文域名。
 /// - **自订阅播放状态**：用 `context.select` 只在本层响应 play/pause，
 ///   不让父级 Selector 因 isPlaying 而重建整块封面。
@@ -59,16 +59,16 @@ class DynamicCoverView extends StatefulWidget {
     this.enabled = true,
   });
 
-  /// —— 私有接线层扩展点（公开构建恒为 null）——
+  /// —— 可选扩展（默认全部为 null）——
   ///
   /// 命中本地缓存返回绝对文件路径；未命中返回 null。
   static Future<String?> Function(String albumAudioId)? resolveLocalPath;
 
-  /// 流式播放已开始（未命中缓存时调用），私有层据此后台落盘。
-  /// [streamUrl] 是本地回环代理地址，私有层无需感知 CDN 细节。
+  /// 流式播放已开始（未命中缓存时调用），宿主层据此后台落盘。
+  /// [streamUrl] 是本地回环代理地址，宿主层无需感知 CDN 细节。
   static void Function(String albumAudioId, String streamUrl)? onStreamStarted;
 
-  /// 离开该曲（切歌 / 销毁）时调用，私有层据此取消未完成的落盘。
+  /// 离开该曲（切歌 / 销毁）时调用，宿主层据此取消未完成的落盘。
   static void Function(String albumAudioId)? onStreamStopped;
 
   @override
@@ -117,7 +117,7 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
     }
   }
 
-  /// 释放视频层并恢复静态封面兜底（不清 `_notifiedId`：后台下载继续跑，
+  /// 释放视频层并恢复静态封面兜底（不清 `_notifiedId`：后台落盘继续跑，
   /// 回前台若已落盘会直接命中本地文件、瞬间可见）。
   Future<void> _suspendVideo() async {
     _loadVersion++; // 作废在途解析
@@ -191,7 +191,7 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
     // 开关关闭：不读缓存、不探针、不起播放器（父级已销毁旧实例）
     if (!widget.enabled) return;
 
-    // 1) 私有构建：命中本地缓存 → 播本地文件（零网络，跳过元数据预检）
+    // 1) 本地缓存：命中则播本地文件（零网络，跳过元数据预检）
     try {
       final localPath = await DynamicCoverView.resolveLocalPath?.call(
         albumAudioId,
@@ -216,7 +216,7 @@ class _DynamicCoverViewState extends State<DynamicCoverView>
     if (!await service.hasDynamicCover(albumAudioId)) return;
     if (!mounted || version != _loadVersion) return;
 
-    // 3) 流式播放（边下边播）+ 通知私有层后台落盘
+    // 3) 流式播放（边下边播）+ 通知宿主层后台落盘
     final streamUrl = service.streamUrlFor(albumAudioId);
     if (await _initFromNetwork(streamUrl, version)) {
       if (!mounted || version != _loadVersion) return;

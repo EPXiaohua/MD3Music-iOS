@@ -1,7 +1,7 @@
 name: md3music
 description: "MD3Music - Music player with Material Design 3"
 publish_to: 'none'
-version: 6.2.0+53
+version: 6.4.1+56
 
 environment:
   sdk: ^3.12.0
@@ -93,6 +93,7 @@ dependencies:
   share_plus: ^13.3.0
   # 诊断日志导出：纯 Dart zip 打包（无原生代码，跨平台）
   archive: ^4.0.7
+  pinyin: ^3.3.0
 
 dependency_overrides:
   # 钉住 material_ui 1.7.0：1.8.0 新导出 RoundedPolygon/CornerRounding（src/shapes/），
@@ -103,6 +104,7 @@ dependency_overrides:
   # sqlite3 3.5.2 的 native assets hook 在 iOS 构建时下载预编译 dylib 的哈希
   # 校验失败（上游重新发布文件但包内哈希未更新，CI 于 2026-11-09 起复现）；
   # 升级到 3.9.0 取新哈希。sqflite_common_ffi 的约束本就允许 3.9.x。
+  # iOS fork：上游无 iOS 构建链路，未带此 override。
   sqlite3: ^3.9.0
 
 dev_dependencies:

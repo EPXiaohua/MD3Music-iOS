@@ -26,7 +26,7 @@ Future<bool> requestStoragePermission() async {
 
   // Android 13+ (API 33+) 使用 READ_MEDIA_AUDIO
   // Android 12 及以下 (API ≤ 32) 使用 READ_EXTERNAL_STORAGE
-  // 注：原代码针对 Android 11 请求 MANAGE_EXTERNAL_STORAGE，体验差，
+  // 注：本应用不请求 MANAGE_EXTERNAL_STORAGE（该权限体验差），
   // 且 MediaStore 方案下不需要此权限（仅需 READ_MEDIA_AUDIO/READ_EXTERNAL_STORAGE）。
   final sdkInt = await _getAndroidSdkVersion();
 

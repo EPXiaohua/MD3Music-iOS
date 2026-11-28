@@ -1,24 +1,76 @@
 #include "flutter_window.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <flutter/standard_method_codec.h>
+#include <flutter_windows.h>
+#include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <windowsx.h>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "audio_input_devices.h"
 #include "desktop_toast.h"
+#include "caption_snap.h"
 #include "resource.h"
+#include "window_corner.h"
+#include "window_placement.h"
 
 namespace {
 using Arguments = flutter::EncodableMap;
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayMenuShow = 1;
 constexpr UINT kTrayMenuExit = 2;
+// Flutter 视图子窗口命中钩子的 subclass id（仅本窗口使用）。
+constexpr UINT_PTR kChildHitTestSubclassId = 1;
 const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+// DWMWA_TRANSITIONS_TO_DISABLED（DWM 过渡动画开关）：老版本 Windows SDK 的
+// dwmapi.h 未声明该枚举，按文档取值 3 直接使用，行为一致。
+constexpr DWORD kDwmTransitionsAttribute = 3;
+
+/// 开/关本窗口的 DWM 过渡动画（最小化/还原/最大化等 show-state 变化时播的
+/// 那段）。全屏形态切换的瞬间必须关掉，否则旧窗口纹理的缩放动画会叠在
+/// 真窗口之上，表现为「窗口套窗口」残影；平时保持打开。
+void DisableDwmTransitions(HWND hwnd, bool disable = true) {
+  const BOOL value = disable ? TRUE : FALSE;
+  DwmSetWindowAttribute(hwnd, kDwmTransitionsAttribute, &value,
+                        sizeof(value));
+}
+
+/// 临时关闭系统的「最小化/还原窗口动画」（MinAnimate）。DWMWA_TRANSITIONS_
+/// TO_DISABLED 对 SetWindowPlacement 触发的最大化/还原动画实测无效：退出
+/// 全屏时旧窗口纹理仍会从还原矩形放大到最大化矩形，叠在真窗口上（用户
+/// 截图的「残影叠加」）。用系统级开关才能压掉；切换完立即恢复原值，用户
+/// 平时的窗口动画不受影响。
+class ScopedMinAnimateOff {
+ public:
+  ScopedMinAnimateOff() {
+    ANIMATIONINFO info{sizeof(ANIMATIONINFO)};
+    SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0);
+    previous_ = info.iMinAnimate;
+    if (previous_ != FALSE) {
+      info.iMinAnimate = FALSE;
+      SystemParametersInfoW(SPI_SETANIMATION, sizeof(info), &info, 0);
+    }
+  }
+  ~ScopedMinAnimateOff() {
+    if (previous_ != FALSE) {
+      ANIMATIONINFO info{sizeof(ANIMATIONINFO), previous_};
+      SystemParametersInfoW(SPI_SETANIMATION, sizeof(info), &info, 0);
+    }
+  }
+  ScopedMinAnimateOff(const ScopedMinAnimateOff&) = delete;
+  ScopedMinAnimateOff& operator=(const ScopedMinAnimateOff&) = delete;
+
+ private:
+  int previous_ = FALSE;
+};
 
 std::string StringArg(const Arguments* args, const char* key) {
   if (!args) return {};
@@ -138,6 +190,14 @@ void FlutterWindow::SetFullscreen(bool fullscreen) {
   HWND hwnd = GetHandle();
   if (!hwnd || fullscreen == fullscreen_) return;
 
+  // 形态切换期间关闭本窗口的 DWM 过渡动画，收尾再恢复。只在切换瞬间关闭，
+  // 用户平时手动最大化/还原的动画不受影响。注意：中途改窗口样式可能让该
+  // 属性被重置，所以真正会触发 show-state 变化的调用前还要再关一次（见
+  // 退出路径），不能只在函数开头关一次。
+  DisableDwmTransitions(hwnd);
+  // 同时压掉系统级 MinAnimate（见类注释；函数返回时自动恢复原值）。
+  ScopedMinAnimateOff min_animate_off;
+
   if (fullscreen) {
     // 先留快照：退出时要回到「用户原来那个形态」，而不是一律还原成普通窗口
     // （用户可能本来就是最大化 / 手动拖到某个位置）。
@@ -146,30 +206,31 @@ void FlutterWindow::SetFullscreen(bool fullscreen) {
       fullscreen_restore_placement_ = {sizeof(WINDOWPLACEMENT)};
     }
     fullscreen_restore_style_ = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    // 从最大化进入时必须先退出最大化状态。留着 WS_MAXIMIZE 的话，Windows 仍把
-    // 窗口当「最大化窗口」：顶层窗口被 SetWindowPos 摆到 rcMonitor 是 1920×1080，
-    // 但 Flutter 的子窗口 FLUTTERVIEW 会被按 rcWork 定成 1920×1020，两者脱节 →
-    // 底部 60px 没有内容，任务栏（topmost）正好画在那条空带上，还挡住命中测试
-    // （表现为「进了全屏但底部留着状态栏、任务栏点不动、Win 键唤不出开始菜单」）。
-    // 快照已在上方取到，这里退出最大化不会丢失「退出全屏后回到最大化」的依据。
+    // 从最大化进入时必须把 Windows 内部的「已最大化」状态干净地退掉：只清
+    // WS_MAXIMIZE 样式位的话内部状态不变，退出全屏时无法用 SW_SHOWMAXIMIZED
+    // 直接恢复最大化（实测被当作无变化跳过）。这里先隐藏窗口再 SW_RESTORE：
+    // SW_RESTORE 会干净地退掉内部最大化状态且不改写「还原矩形」（退出全屏
+    // 要靠它回去）；直接调用时的缩放动画与中间帧由隐藏期挡住（transitions
+    // 与 MinAnimate 均已关，隐藏/显示都是瞬时切换）。
+    // 标志必须在改形态前置真：后续触发的 WM_NCCALCSIZE 按 fullscreen_ 取
+    // rcMonitor。放在 if 之外：即使取显示器信息失败也要让退出路径能还原。
+    fullscreen_ = true;
+    MONITORINFO monitor{sizeof(monitor)};
+    const bool haveMonitor = GetMonitorInfoW(
+        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor) == TRUE;
+    ShowWindow(hwnd, SW_HIDE);
     if (IsZoomed(hwnd)) {
       ShowWindow(hwnd, SW_RESTORE);
     }
     // 去掉标题栏与可缩放边框：WS_THICKFRAME 留着的话屏幕边缘那一圈像素会
     // 继续被算成缩放热区（见 MessageHandler 的 WM_NCHITTEST 守卫）。
-    // WS_MAXIMIZE 一并清掉：SW_RESTORE 已把窗口还原成普通矩形，样式里若还留着
-    // 这一位，窗口会立刻被当成「再次最大化」。
+    // WS_MAXIMIZE 一并清掉：上一步已退出最大化，样式里若还留着这一位，
+    // 窗口会立刻被当成「再次最大化」。
     const LONG_PTR borderless = fullscreen_restore_style_ &
         ~static_cast<LONG_PTR>(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
                                WS_MAXIMIZEBOX | WS_SYSMENU | WS_MAXIMIZE);
     SetWindowLongPtrW(hwnd, GWL_STYLE, borderless);
-    // 标志必须在 SetWindowPos 之前置真：SWP_FRAMECHANGED 会同步触发
-    // WM_NCCALCSIZE，那里按 fullscreen_ 决定客户区取 rcMonitor 还是 rcWork。
-    // 放在 if 之外：样式已改，即使取显示器信息失败也要让退出路径能还原。
-    fullscreen_ = true;
-    MONITORINFO monitor{sizeof(monitor)};
-    if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                        &monitor)) {
+    if (haveMonitor) {
       // rcMonitor 而非 rcWork：铺满整块显示器，任务栏一并覆盖。
       SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left,
                    monitor.rcMonitor.top,
@@ -177,29 +238,254 @@ void FlutterWindow::SetFullscreen(bool fullscreen) {
                    monitor.rcMonitor.bottom - monitor.rcMonitor.top,
                    SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
     }
+    // 形态落定后再显示（SW_HIDE 丢了激活，SW_SHOW 自带激活）。
+    ShowWindow(hwnd, SW_SHOW);
   } else {
-    if (fullscreen_restore_style_ != 0) {
-      SetWindowLongPtrW(hwnd, GWL_STYLE, fullscreen_restore_style_);
-    }
+    // 改样式可能让 DWM 重置过渡动画属性；SetWindowPlacement 的 show-state
+    // 变化是退出路径唯一的动画来源，先关一遍。
+    DisableDwmTransitions(hwnd);
+    // 「隐藏 → 落定全部原生几何/样式 → 显示」：恢复样式会让全屏矩形上瞬间
+    // 出现一帧原生标题栏、SetWindowPlacement 又是另一次几何变更，DWM 会把
+    // 这些中间帧与 Flutter 侧 Zen 退出的页面过渡动画叠加合成（用户截图的
+    // 「原生边框 + 过渡页叠加」）。transitions 已关，隐藏/显示都是瞬时切换，
+    // 隐藏期间 DWM 不合成本窗口，中间帧就没有任何可见机会。
+    ShowWindow(hwnd, SW_HIDE);
     fullscreen_ = false;
-    if (fullscreen_restore_placement_.length == sizeof(WINDOWPLACEMENT)) {
-      // 先 SW_RESTORE 再套快照：对「已处于 zoomed」的窗口，SetWindowPlacement
-      // 不会重跑最大化布局，窗口会停在全屏矩形 (0,0,rcMonitor) 而不是快照里的
-      // 最大化形态（实测：窗口盖住任务栏、客户区仍按 rcWork 裁）。
-      // 两步在同一个消息循环内完成，用户看不到中间态。
-      ShowWindow(hwnd, SW_RESTORE);
-      // 恢复形态/位置；SetWindowPlacement 会把最大化态一并还原。
-      SetWindowPlacement(hwnd, &fullscreen_restore_placement_);
+    // 先恢复样式再置形态，两点缺一不可（均为实测结论）：
+    // 1) SW_SHOWMAXIMIZED 要求窗口具备 WS_MAXIMIZEBOX 能力位，而无边框样式
+    //    里该位已被清掉——先置形态的话最大化会被静默跳过，退出 Zen 后回不到
+    //    最大化。
+    // 2) WS_MAXIMIZE 必须从恢复的样式里摘掉：它是进入全屏瞬间的过期位，留着
+    //    会让 Windows 认为「已处于最大化」从而跳过 SW_SHOWMAXIMIZED 的重排。
+    if (fullscreen_restore_style_ != 0) {
+      SetWindowLongPtrW(hwnd, GWL_STYLE,
+                        fullscreen_restore_style_ &
+                            ~static_cast<LONG_PTR>(WS_MAXIMIZE));
+    }
+    // 改样式/改形态都会让 DWM 重置过渡动画属性，show-state 变化必须在
+    // 「最后一刻」前关闭才真正生效（实测：只在函数开头关一次，退出瞬间的
+    // 旧窗口纹理缩放动画仍会叠在真窗口上）。
+    DisableDwmTransitions(hwnd);
+    // 直接用 ShowWindow 置目标形态，不再走 SetWindowPlacement：后者内部
+    // 「先落到还原矩形、再最大化」的两段式过程会被 DWM 抓到中间帧（实测
+    // 出现一帧空标题栏窗口摆在还原矩形上）。SW_SHOWMAXIMIZED 从当前矩形
+    // 一步最大化，动画已被 MinAnimate/DWM 开关压掉。
+    const bool to_maximized =
+        fullscreen_restore_placement_.length == sizeof(WINDOWPLACEMENT) &&
+        fullscreen_restore_placement_.showCmd == SW_SHOWMAXIMIZED;
+    if (to_maximized) {
+      ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+    } else if (fullscreen_restore_placement_.length ==
+               sizeof(WINDOWPLACEMENT)) {
+      // 普通形态：直接摆回快照的还原矩形。
+      const RECT& rc = fullscreen_restore_placement_.rcNormalPosition;
+      SetWindowPos(hwnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left,
+                   rc.bottom - rc.top,
+                   SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
     }
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                      SWP_NOACTIVATE);
+    // 形态全部落定后再显示并拿回焦点（SW_HIDE 会丢激活）；SW_SHOW 自带激活。
+    ShowWindow(hwnd, SW_SHOW);
     fullscreen_restore_style_ = 0;
     fullscreen_restore_placement_ = {sizeof(WINDOWPLACEMENT)};
+  }
+  // 圆角偏好必须按最终形态重设：Style 变更 / 快照恢复都可能让 DWM 重新计算窗口框架。
+  ApplyWindowCornerPreference();
+  // snap 接管登记随全屏形态作废：进全屏（ResolveResizeHit 的 fullscreen_
+  // 守卫已让该点回到 HTCLIENT）与退出全屏都清登记并广播易主，Dart 行据此
+  // 恢复 Tooltip/本地命中；退全屏后活动行会由 _onFullscreenChanged 重报。
+  if (!caption_max_id_.empty() || caption_hovered_ || caption_pressed_) {
+    caption_max_id_.clear();
+    caption_max_rect_ = RECT{0, 0, 0, 0};
+    caption_hovered_ = false;
+    caption_pressed_ = false;
+    NotifyCaptionMaxTakeover();
   }
   // 真机取证用：只记状态，不落任何用户数据。
   OutputDebugStringW(fullscreen ? L"[WindowsFullscreen] value=true\n"
                                 : L"[WindowsFullscreen] value=false\n");
+  // 形态已切换完毕，恢复 DWM 过渡动画（见函数开头的说明）。
+  DisableDwmTransitions(hwnd, false);
+}
+
+void FlutterWindow::ApplyWindowCornerPreference() {
+  HWND hwnd = GetHandle();
+  if (!hwnd) return;
+  // Win10 不支持该属性（返回 E_INVALIDARG）：圆角本来就是 Win11 能力，
+  // 失败静默，不改变 Win10 的直角观感。
+  const int preference =
+      ResolveCornerPreference(fullscreen_, IsZoomed(hwnd) != FALSE);
+  DwmSetWindowAttribute(hwnd, static_cast<DWORD>(kDwmWindowCornerPreference),
+                        &preference, static_cast<DWORD>(sizeof(preference)));
+}
+
+LRESULT FlutterWindow::ResolveResizeHit(POINT screen_point) {
+  HWND hwnd = GetHandle();
+  if (!hwnd) return HTCLIENT;
+  // 无边框全屏：整个窗口都是客户区。不做这条守卫的话，贴屏幕边缘的那一圈
+  // 像素会被下面的边框判定算成 HTLEFT/HTTOP… → 出现看不见的拉伸热区，
+  // 且顶部会变成可拖动的标题区（一拖就把窗口拽出全屏矩形）。
+  if (fullscreen_) return HTCLIENT;
+  RECT bounds{};
+  GetWindowRect(hwnd, &bounds);
+  // Win11 snap layouts：自绘最大化按钮必须返回 HTMAXBUTTON，悬停才会弹出
+  // 分屏选择器（无边框窗口系统给不出这个命中）。
+  //
+  // **必须排在缩放边判定之前**：播放页顶栏的三键「贴住窗口上沿」（W14 口径，
+  // 48dp 命中区一直顶到客户区顶部），按钮上沿那 ~9px 同时落在顶边缩放带
+  // （SM_CYSIZEFRAME + SM_CXPADDEDBORDER）内。判定排在后面时那一条会被
+  // HTTOP 抢先，表现为「最大化键上半部悬停无反应、下半部正常」（真机实测：
+  // 登记 y=60..119，真实命中只剩 69..119）。按钮矩形只有 46×48，其余边缘
+  // 仍照旧走缩放循环，W16 的边缘缩放不受影响。
+  if (caption_max_rect_.right > caption_max_rect_.left &&
+      caption_max_rect_.bottom > caption_max_rect_.top) {
+    POINT client_origin{0, 0};
+    ClientToScreen(hwnd, &client_origin);
+    const POINT client_point{screen_point.x - client_origin.x,
+                             screen_point.y - client_origin.y};
+    if (PtInCaptionRectExclusive(client_point, caption_max_rect_)) {
+      return kCaptionHitMaxButton;
+    }
+  }
+  const UINT dpi = GetDpiForWindow(hwnd);
+  const int x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
+                GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+  const int y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
+                GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+  if (!IsZoomed(hwnd)) {
+    const bool left = screen_point.x < bounds.left + x;
+    const bool right = screen_point.x >= bounds.right - x;
+    const bool top = screen_point.y < bounds.top + y;
+    const bool bottom = screen_point.y >= bounds.bottom - y;
+    if (top && left) return HTTOPLEFT;
+    if (top && right) return HTTOPRIGHT;
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (top) return HTTOP;
+    if (bottom) return HTBOTTOM;
+  }
+  // 按钮区域交给 Flutter；拖动由标题栏手势发送原生 HTCAPTION。
+  return HTCLIENT;
+}
+
+void FlutterWindow::ToggleMaximize() {
+  HWND hwnd = GetHandle();
+  if (!hwnd) return;
+  // 无边框全屏下没有「最大化」可言：此时最大化键语义是「退出全屏」，
+  // 直接退出而不是在无标题栏状态下再叠一次 SW_MAXIMIZE。
+  if (fullscreen_) {
+    SetFullscreen(false);
+    return;
+  }
+  ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+  // 最大化/还原不产生 WM_EXITSIZEMOVE，这里补一次落盘。
+  SaveWindowPlacement();
+}
+
+void FlutterWindow::NotifyCaptionMaxPointerState() {
+  if (tray_channel_ == nullptr) return;
+  flutter::EncodableMap payload;
+  payload[flutter::EncodableValue("hovered")] =
+      flutter::EncodableValue(caption_hovered_);
+  payload[flutter::EncodableValue("pressed")] =
+      flutter::EncodableValue(caption_pressed_);
+  tray_channel_->InvokeMethod(
+      "onCaptionMaxPointerState",
+      std::make_unique<flutter::EncodableValue>(payload));
+}
+
+void FlutterWindow::NotifyCaptionMaxTakeover() {
+  if (tray_channel_ == nullptr) return;
+  // 广播当前活动登记的行 id（空串 = 无人接管）。Dart 行据此决定自己是否
+  // 处于接管态：被覆盖的行退回纯 Flutter 命中路径（Tooltip 也恢复），
+  // 保证「原生对该点返回什么」与「Dart 认为谁在接管」严格一致。
+  tray_channel_->InvokeMethod(
+      "onCaptionMaxTakeover",
+      std::make_unique<flutter::EncodableValue>(
+          flutter::EncodableValue(caption_max_id_)));
+}
+
+LRESULT CALLBACK FlutterWindow::ChildHitTestProc(HWND hwnd, UINT message,
+                                                WPARAM wparam, LPARAM lparam,
+                                                UINT_PTR id, DWORD_PTR ref) {
+  auto* self = reinterpret_cast<FlutterWindow*>(ref);
+  if (self != nullptr && message == WM_NCHITTEST) {
+    const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    const LRESULT resolved = self->ResolveResizeHit(point);
+    if (resolved != HTCLIENT) {
+      // 子窗口没有非客户区：把边缘点让给同线程的父窗口，由顶层
+      // WM_NCHITTEST 返回 HT* 并进入系统缩放循环。
+      return HTTRANSPARENT;
+    }
+    // snap 悬停的离开信号：鼠标从按钮（父窗口 NC，子窗口逐点返回
+    // HTTRANSPARENT）移回客户区时，父窗口**不再收到任何 WM_NCHITTEST**
+    // （命中归属已切回子窗口），它自己的悬停状态机永远不会复位；
+    // TrackMouseEvent 的 TME_LEAVE 只在离开整个窗口时触发，覆盖不了这个
+    // 场景。子窗口钩子逐点都跑，这里就是「光标已离开按钮」的最早时机。
+    if (self->caption_hovered_) {
+      self->caption_hovered_ = false;
+      self->caption_pressed_ = false;
+      self->NotifyCaptionMaxPointerState();
+    }
+  }
+  return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void FlutterWindow::ApplyStartupPlacement() {
+  window_placement::Placement saved{};
+  const bool has_saved = window_placement::Load(&saved);
+
+  // 保存值所在显示器可能已被拔掉：MonitorFromRect 返回 NULL 时回主屏。
+  HMONITOR monitor = nullptr;
+  if (has_saved) {
+    monitor = MonitorFromRect(&saved.rect, MONITOR_DEFAULTTONULL);
+  }
+  if (!monitor) {
+    monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  }
+  MONITORINFO info{sizeof(MONITORINFO)};
+  if (!GetMonitorInfoW(monitor, &info)) return;
+
+  const UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
+  window_placement::Placement target{};
+  if (has_saved && window_placement::SanitizePlacement(
+                       saved, info.rcWork, static_cast<int>(dpi), &target)) {
+    // target 已被夹到该显示器工作区内。
+  } else {
+    const double scale = static_cast<double>(dpi) / 96.0;
+    target.rect = window_placement::CenterInWorkArea(
+        info.rcWork, static_cast<int>(1280.0 * scale),
+        static_cast<int>(720.0 * scale));
+    target.maximized = false;
+    target.dpi = static_cast<int>(dpi);
+  }
+
+  SetWindowPos(GetHandle(), nullptr, target.rect.left, target.rect.top,
+               target.rect.right - target.rect.left,
+               target.rect.bottom - target.rect.top,
+               SWP_NOZORDER | SWP_NOACTIVATE);
+  startup_maximized_ = target.maximized;
+}
+
+void FlutterWindow::SaveWindowPlacement() {
+  // Zen / F11 全屏的矩形不属于普通态，保存会污染下次启动的位置。
+  if (fullscreen_) return;
+  HWND hwnd = GetHandle();
+  if (!hwnd) return;
+  WINDOWPLACEMENT placement = {sizeof(WINDOWPLACEMENT)};
+  if (!GetWindowPlacement(hwnd, &placement)) return;
+  window_placement::Placement saved{};
+  saved.rect = placement.rcNormalPosition;
+  saved.maximized =
+      IsZoomed(hwnd) != FALSE || placement.showCmd == SW_SHOWMAXIMIZED ||
+      (placement.showCmd == SW_SHOWMINIMIZED &&
+       (placement.flags & WPF_RESTORETOMAXIMIZED) != 0);
+  saved.dpi = static_cast<int>(GetDpiForWindow(hwnd));
+  window_placement::Save(saved);
 }
 
 bool FlutterWindow::OnCreate() {
@@ -230,6 +516,7 @@ bool FlutterWindow::OnCreate() {
                                ? std::get_if<Arguments>(call.arguments())
                                : nullptr;
         if (call.method_name() == "finishExit") {
+          SaveWindowPlacement();
           SetQuitOnClose(true);
           result->Success(flutter::EncodableValue(true));
           Destroy();
@@ -239,14 +526,52 @@ bool FlutterWindow::OnCreate() {
         if (method == "minimize") {
           ShowWindow(GetHandle(), SW_MINIMIZE);
         } else if (method == "toggleMaximize") {
-          // 无边框全屏下没有「最大化」可言：这个按钮此时语义是「退出全屏」，
-          // 直接退出而不是在无标题栏状态下再叠一次 SW_MAXIMIZE。
-          if (fullscreen_) {
-            SetFullscreen(false);
-          } else {
-            ShowWindow(GetHandle(),
-                       IsZoomed(GetHandle()) ? SW_RESTORE : SW_MAXIMIZE);
+          ToggleMaximize();
+        } else if (method == "setCaptionMaxButtonRect") {
+          // Dart 上报自绘最大化按钮的命中矩形（客户区坐标、物理像素），
+          // 顶层 WM_NCHITTEST 命中后返回 HTMAXBUTTON → Win11 snap 面板。
+          // 全屏下不登记：无边框全屏没有系统按钮语义，且最大化键此时是
+          // 「退出全屏」，必须留在 Flutter 客户区命中（Tooltip/点击照旧）。
+          // 单槽 + 接管广播：后来者覆盖并广播新活动行；被覆盖行收到
+          // 广播后自己退回纯 Flutter 命中（Dart 行状态唯一事实源 = 广播）。
+          const std::string id = StringArg(args, "id");
+          if (fullscreen_ || id.empty()) {
+            result->Success(flutter::EncodableValue(false));
+            return;
           }
+          const std::string previous_id = caption_max_id_;
+          caption_max_id_ = id;
+          caption_max_rect_ = RECT{IntArg(args, "left", 0),
+                                   IntArg(args, "top", 0),
+                                   IntArg(args, "right", 0),
+                                   IntArg(args, "bottom", 0)};
+          if (caption_hovered_) {
+            // 换活动行时旧行的悬停状态不能残留。
+            caption_hovered_ = false;
+            caption_pressed_ = false;
+            NotifyCaptionMaxPointerState();
+          }
+          result->Success(flutter::EncodableValue(true));
+          if (previous_id != id) NotifyCaptionMaxTakeover();
+          return;
+        } else if (method == "clearCaptionMaxButtonRect") {
+          // 只有登记本人能撤销（迟到的旧行 dispose 不得抹掉新行）。
+          const std::string id = StringArg(args, "id");
+          const bool cleared = id == caption_max_id_;
+          if (cleared) {
+            caption_max_id_.clear();
+            caption_max_rect_ = RECT{0, 0, 0, 0};
+            if (caption_hovered_ || caption_pressed_) {
+              caption_hovered_ = false;
+              caption_pressed_ = false;
+              NotifyCaptionMaxPointerState();
+            }
+            // 归属已清空：广播空串，活着的其它行据此退回纯 Flutter 命中，
+            // 不留滞指向已注销行的悬停/Tooltip 状态。
+            NotifyCaptionMaxTakeover();
+          }
+          result->Success(flutter::EncodableValue(cleared));
+          return;
         } else if (method == "setFullscreen") {
           SetFullscreen(BoolArg(args, "value", false));
           result->Success(flutter::EncodableValue(fullscreen_));
@@ -407,14 +732,33 @@ bool FlutterWindow::OnCreate() {
           // Android 的 updateNotification 在 Windows 上映射到 SMTC
           // （媒体浮层/锁屏/媒体键）。Dart 侧已有完整的元数据/进度/播放态
           // 上报链路，这里直接消费，无需改 Dart。
+          //
+          // 同时这是**第三方任务栏歌词工具**（TaskbarLyrics / AF Media Bar）
+          // 的唯一数据源：它们按 GlobalSystemMediaTransportControlsSession
+          // 读这个会话。album / albumArtist 是它们的匹配身份维度，
+          // playbackRate 决定它们外推时间轴的速率（不发则一律按 1.0x，
+          // 倍速播放时歌词持续漂移）。
           media_controls_.UpdateMetadata(
               StringArg(args, "title"), StringArg(args, "artist"),
+              StringArg(args, "album"), StringArg(args, "albumArtist"),
               StringArg(args, "artUrl"), IntArg(args, "position", 0),
               IntArg(args, "duration", 0), BoolArg(args, "isPlaying", false),
-              StringArg(args, "loopMode"), BoolArg(args, "shuffleEnabled", false));
+              StringArg(args, "loopMode"), BoolArg(args, "shuffleEnabled", false),
+              DoubleArg(args, "playbackRate", 1.0));
+          result->Success(flutter::EncodableValue(true));
+        } else if (method == "updateNotificationPosition") {
+          // 每秒一次的位置推进轻量路径：只写时间轴与播放状态，不触碰
+          // DisplayUpdater。若走全量 UpdateMetadata，`DisplayUpdater.Update()`
+          // 会让系统每秒重建媒体卡片，播控中心封面随之闪烁。
+          media_controls_.UpdateTimeline(IntArg(args, "position", 0),
+                                         IntArg(args, "duration", 0),
+                                         BoolArg(args, "isPlaying", false));
           result->Success(flutter::EncodableValue(true));
         } else if (method == "hideNotification") {
-          media_controls_.SetPlaybackStatus(false);
+          // 主动停止（退出 App / 空闲停播）：置 Stopped 并清空显示。
+          // 只置 Paused 会让播控中心与第三方歌词工具一直挂着上一首的
+          // 卡片与歌词。
+          media_controls_.MarkStopped();
           result->Success(flutter::EncodableValue(true));
         } else {
           result->NotImplemented();
@@ -425,7 +769,7 @@ bool FlutterWindow::OnCreate() {
   media_controls_.Initialize(
       GetHandle(),
       [this](const std::string& action, int64_t position_ms,
-             const std::string& arg) {
+             const std::string& arg, double playback_rate) {
         if (!lyric_channel_) return;
         if (action == "seekTo") {
           lyric_channel_->InvokeMethod(
@@ -434,6 +778,17 @@ bool FlutterWindow::OnCreate() {
         } else if (action == "setLoopMode") {
           lyric_channel_->InvokeMethod(
               "setLoopMode", std::make_unique<flutter::EncodableValue>(arg));
+        } else if (action == "setShuffle") {
+          // 播控中心的随机按钮：arg 是 "true"/"false"（见 media_controls.cpp
+          // 的事件注册处），Dart 侧解析成 bool。
+          lyric_channel_->InvokeMethod(
+              "setShuffle",
+              std::make_unique<flutter::EncodableValue>(arg == "true"));
+        } else if (action == "setPlaybackSpeed") {
+          // 播控中心的倍速按钮：double 直接透传，Dart 侧 setSpeed 自己夹取。
+          lyric_channel_->InvokeMethod(
+              "setPlaybackSpeed",
+              std::make_unique<flutter::EncodableValue>(playback_rate));
         } else {
           lyric_channel_->InvokeMethod(
               action, std::make_unique<flutter::EncodableValue>());
@@ -510,6 +865,99 @@ bool FlutterWindow::OnCreate() {
         }
         result->NotImplemented();
       });
+  // 听歌识曲的麦克风枚举：record_windows 的 listInputDevices 依赖
+  // MediaFoundation 已启动，而该插件只在 InitRecording 里 MFStartup，
+  // 页面首次进入时枚举必然拿不到设备。故由 runner 直接走 WASAPI 枚举
+  // capture 端点；端点 ID 与
+  // MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID 是同一个字符串，
+  // Dart 侧可直接交给 record 的 InputDevice 选设备。
+  audio_input_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "md3music/windows_audio_input",
+          &flutter::StandardMethodCodec::GetInstance());
+  audio_input_channel_->SetMethodCallHandler(
+      [](const flutter::MethodCall<flutter::EncodableValue>& call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+             result) {
+        if (call.method_name() == "listInputDevices") {
+          flutter::EncodableList rows;
+          for (const auto& device : ListAudioInputDevices()) {
+            flutter::EncodableMap row;
+            row[flutter::EncodableValue("id")] =
+                flutter::EncodableValue(device.id);
+            row[flutter::EncodableValue("name")] =
+                flutter::EncodableValue(device.name);
+            row[flutter::EncodableValue("isSystemDefault")] =
+                flutter::EncodableValue(device.is_default);
+            rows.push_back(flutter::EncodableValue(row));
+          }
+          result->Success(flutter::EncodableValue(rows));
+          return;
+        }
+        result->NotImplemented();
+      });
+  // 听歌识曲的系统声音内录：设备环回采默认渲染端点的系统混音。
+  // **不能复用频谱的进程环回**——那只采本进程，用户在浏览器/其他播放器里
+  // 放的声音会全漏掉（识曲最常见的场景恰恰是识别别处放的音乐）。
+  system_audio_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "md3music/windows_system_audio",
+          &flutter::StandardMethodCodec::GetInstance());
+  system_audio_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const std::string& method = call.method_name();
+        if (method == "startCapture") {
+          int32_t max_duration_ms = 12000;
+          if (const auto* args =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            const auto it =
+                args->find(flutter::EncodableValue("maxDurationMs"));
+            if (it != args->end()) {
+              if (const auto* value = std::get_if<int32_t>(&it->second)) {
+                max_duration_ms = *value;
+              }
+            }
+          }
+          system_audio_capture_.EnablePcmTap(max_duration_ms);
+          const bool ok = system_audio_capture_.Start(
+              SpectrumCapture::LoopbackMode::kDeviceOnly);
+          if (!ok) system_audio_capture_.DisablePcmTap();
+          result->Success(flutter::EncodableValue(ok));
+          return;
+        }
+        if (method == "stopCapture") {
+          // Stop() 会把 Stats.sample_rate_hz 归零，采样率必须在停采前取下来。
+          const int sample_rate_hz =
+              system_audio_capture_.GetStats().sample_rate_hz;
+          system_audio_capture_.Stop();
+          SpectrumCapture::PcmSegment segment =
+              system_audio_capture_.TakePcm();
+          if (segment.sample_rate_hz <= 0) {
+            segment.sample_rate_hz = sample_rate_hz;
+          }
+          system_audio_capture_.DisablePcmTap();
+          std::vector<uint8_t> bytes;
+          bytes.reserve(segment.samples.size() * 2);
+          for (const int16_t sample : segment.samples) {
+            bytes.push_back(static_cast<uint8_t>(sample & 0xFF));
+            bytes.push_back(static_cast<uint8_t>((sample >> 8) & 0xFF));
+          }
+          flutter::EncodableMap payload;
+          payload[flutter::EncodableValue("pcm")] =
+              flutter::EncodableValue(bytes);
+          payload[flutter::EncodableValue("sampleRate")] =
+              flutter::EncodableValue(segment.sample_rate_hz);
+          payload[flutter::EncodableValue("truncated")] =
+              flutter::EncodableValue(segment.truncated);
+          result->Success(flutter::EncodableValue(payload));
+          return;
+        }
+        result->NotImplemented();
+      });
   // 采集线程不直接发平台通道消息（`flutter_messenger.h` 要求非平台线程的
   // 调用自己加锁，而 MethodChannel 封装没有暴露锁）；也不用
   // `FlutterEngine::PostPlatformThreadTask`——本引擎版本实测在平台线程执行
@@ -527,12 +975,40 @@ bool FlutterWindow::OnCreate() {
         PostMessageW(GetHandle(), kSpectrumFrameMessage, 0, 0);
       });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  // Flutter 视图铺满整个客户区，会盖住窗口边缘的缩放热区；给它挂命中钩子，
+  // 边缘点返回 HTTRANSPARENT 交给顶层窗口处理（见 ChildHitTestProc）。
+  child_view_ = flutter_controller_->view()->GetNativeWindow();
+  SetWindowSubclass(child_view_, &FlutterWindow::ChildHitTestProc,
+                    kChildHitTestSubclassId,
+                    reinterpret_cast<DWORD_PTR>(this));
   SetWindowPos(GetHandle(), nullptr, 0, 0, 0, 0,
                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                    SWP_NOACTIVATE);
+  // 窗口尚未 Show，此时设置圆角偏好会带到首帧显示（前端不闪方角）。
+  ApplyWindowCornerPreference();
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
+  // 窗口在 Show() 之前不可见，此时摆位不会闪。
+  ApplyStartupPlacement();
+
+  // 先以最终尺寸布局但暂不呈现，避免首帧后最大化重建 surface 时露白。
+  const BOOL cloak = TRUE;
+  const bool startup_cloaked = SUCCEEDED(DwmSetWindowAttribute(
+      GetHandle(), DWMWA_CLOAK, &cloak, sizeof(cloak)));
+  if (startup_cloaked) {
+    ShowWindow(GetHandle(), startup_maximized_ ? SW_SHOWMAXIMIZED
+                                              : SW_SHOWNORMAL);
+  }
+  flutter_controller_->engine()->SetNextFrameCallback([this, startup_cloaked]() {
+    if (startup_cloaked) {
+      // 最终尺寸首帧已提交，直接呈现，不加定时等待或纯色遮罩。
+      const BOOL uncloak = FALSE;
+      DwmSetWindowAttribute(GetHandle(), DWMWA_CLOAK, &uncloak, sizeof(uncloak));
+    } else {
+      // 不支持 DWM 隐藏时保留原来的首帧显示方式。
+      ShowWindow(GetHandle(), startup_maximized_ ? SW_SHOWMAXIMIZED
+                                                : SW_SHOWNORMAL);
+    }
+    startup_maximized_ = false;
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -545,6 +1021,12 @@ bool FlutterWindow::OnCreate() {
 
 void FlutterWindow::OnDestroy() {
   CloseDesktopToast();
+  // 先摘掉子窗口命中钩子，避免引擎销毁视图后仍回调到本对象。
+  if (child_view_ != nullptr) {
+    RemoveWindowSubclass(child_view_, &FlutterWindow::ChildHitTestProc,
+                         kChildHitTestSubclassId);
+    child_view_ = nullptr;
+  }
   if (tray_icon_added_) {
     NOTIFYICONDATAW tray_icon{};
     tray_icon.cbSize = sizeof(tray_icon);
@@ -559,12 +1041,15 @@ void FlutterWindow::OnDestroy() {
   // 先停采集线程（join）：之后不会再有新的帧写入信箱 / PostMessage。
   // 已排队的 WM_APP 频谱消息会随窗口销毁被丢弃，帧数据是成员变量，无泄漏。
   spectrum_capture_.Stop();
+  system_audio_capture_.Stop();
   {
     std::lock_guard<std::mutex> lock(spectrum_frame_mutex_);
     spectrum_frame_pending_ = false;
     spectrum_pending_bands_.clear();
   }
   spectrum_channel_.reset();
+  system_audio_channel_.reset();
+  audio_input_channel_.reset();
   lyric_channel_.reset();
   message_channel_.reset();
   tray_channel_.reset();
@@ -630,40 +1115,90 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     if (IsZoomed(hwnd)) {
       MONITORINFO monitor{sizeof(monitor)};
       if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
-        params->rgrc[0] = monitor.rcWork;
+        // 与传入窗口矩形求交，不能硬编码 rcWork：Win11 snap 后的窗口同样
+        // IsZoomed，但窗口矩形 = 分区矩形（半屏/四分之一屏）；直接给
+        // rcWork 会把客户区撑出分区、内容被裁。经典最大化时窗口矩形≈
+        // rcMonitor，rcMonitor∩rcWork=rcWork，求交与原逻辑逐像素等价。
+        params->rgrc[0] = IntersectOrFallback(monitor.rcWork, params->rgrc[0]);
       }
     }
     return 0;
   }
   if (message == WM_NCHITTEST) {
-    // 无边框全屏：整个窗口都是客户区。不做这条守卫的话，贴屏幕边缘的那一圈
-    // 像素会被下面的边框判定算成 HTLEFT/HTTOP… → 出现看不见的拉伸热区，
-    // 且顶部会变成可拖动的标题区（一拖就把窗口拽出全屏矩形）。
-    if (fullscreen_) return HTCLIENT;
-    RECT bounds{};
-    GetWindowRect(hwnd, &bounds);
-    const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-    const UINT dpi = GetDpiForWindow(hwnd);
-    const int x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
-                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-    const int y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
-                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-    if (!IsZoomed(hwnd)) {
-      const bool left = point.x < bounds.left + x;
-      const bool right = point.x >= bounds.right - x;
-      const bool top = point.y < bounds.top + y;
-      const bool bottom = point.y >= bounds.bottom - y;
-      if (top && left) return HTTOPLEFT;
-      if (top && right) return HTTOPRIGHT;
-      if (bottom && left) return HTBOTTOMLEFT;
-      if (bottom && right) return HTBOTTOMRIGHT;
-      if (left) return HTLEFT;
-      if (right) return HTRIGHT;
-      if (top) return HTTOP;
-      if (bottom) return HTBOTTOM;
+    const LRESULT hit = ResolveResizeHit(
+        POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+    // snap 命中点的悬停状态机：该点是父窗口非客户区，Flutter 收不到指针
+    // 事件（W16 让位的必然结果），高亮由原生回传驱动。每次命中都重新
+    // 布防 TME_LEAVE；离开按钮（下一次命中不是 HTMAXBUTTON）或收到
+    // WM_NCMOUSELEAVE 时清状态。
+    if (hit == kCaptionHitMaxButton) {
+      if (!caption_hovered_) {
+        caption_hovered_ = true;
+        NotifyCaptionMaxPointerState();
+      }
+      TRACKMOUSEEVENT leave{};
+      leave.cbSize = sizeof(leave);
+      leave.dwFlags = TME_LEAVE;
+      leave.hwndTrack = hwnd;
+      TrackMouseEvent(&leave);
+    } else if (caption_hovered_) {
+      caption_hovered_ = false;
+      caption_pressed_ = false;
+      NotifyCaptionMaxPointerState();
     }
-    // 按钮区域交给 Flutter；拖动由标题栏手势发送原生 HTCAPTION。
-    return HTCLIENT;
+    return hit;
+  }
+  if (message == WM_NCMOUSELEAVE) {
+    if (caption_hovered_ || caption_pressed_) {
+      caption_hovered_ = false;
+      caption_pressed_ = false;
+      NotifyCaptionMaxPointerState();
+    }
+    return 0;
+  }
+  if (wparam == kCaptionHitMaxButton &&
+      (message == WM_NCLBUTTONDOWN || message == WM_NCLBUTTONUP ||
+       message == WM_NCLBUTTONDBLCLK)) {
+    // HTMAXBUTTON 的系统默认动作（DefWindowProc 自己切最大化）必须吃掉：
+    // 我们的最大化切换还带退出全屏语义与落盘（ToggleMaximize）。
+    if (message == WM_NCLBUTTONDOWN) {
+      caption_pressed_ = true;
+      NotifyCaptionMaxPointerState();
+    } else if (message == WM_NCLBUTTONUP) {
+      ToggleMaximize();
+      caption_hovered_ = false;
+      caption_pressed_ = false;
+      NotifyCaptionMaxPointerState();
+    }
+    // DBLCLK：吞掉。双击的真实序列是 DOWN-UP-DBLCLK-UP，只按 UP 计数
+    // 切换两次，与系统标题栏按钮一致。
+    return 0;
+  }
+  if (message == kMsgGetTitleBarInfoEx) {
+    // DWM 弹层定位与读屏兜底（主判据是 HTMAXBUTTON 命中）：先让默认处理
+    // 填全量结构，再覆盖最大化按钮（索引 3）的矩形/状态。未登记时标记
+    // 不可见，避免 DWM 按系统默认位置弹面板。lparam 是 TITLEBARINFOEX*，
+    // wParam 未用（MSDN 约定）。
+    const LRESULT handled =
+        Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+    constexpr size_t kTitleBarMaxButton = 3;
+    if (lparam != 0) {
+      auto* info = reinterpret_cast<TITLEBARINFOEX*>(lparam);
+      if (info->cbSize >= sizeof(TITLEBARINFOEX)) {
+        if (caption_max_rect_.right > caption_max_rect_.left &&
+            caption_max_rect_.bottom > caption_max_rect_.top) {
+          RECT rect = caption_max_rect_;
+          POINT origin{0, 0};
+          ClientToScreen(hwnd, &origin);
+          OffsetRect(&rect, origin.x, origin.y);
+          info->rgrect[kTitleBarMaxButton] = rect;
+          info->rgstate[kTitleBarMaxButton] = STATE_SYSTEM_FOCUSABLE;
+        } else {
+          info->rgstate[kTitleBarMaxButton] |= STATE_SYSTEM_INVISIBLE;
+        }
+      }
+    }
+    return handled;
   }
   if (message == WM_DPICHANGED) {
     // 全屏跨到另一块缩放比不同的显示器时，基类实现会把窗口摆到系统建议矩形
@@ -687,7 +1222,25 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       return 0;
     }
   }
+  if (message == WM_EXITSIZEMOVE) {
+    // 用户拖动/缩放结束：这是保存普通态位置最可靠的时机。
+    SaveWindowPlacement();
+    return 0;
+  }
+  if (message == WM_SIZE) {
+    const bool maximized_now = wparam == SIZE_MAXIMIZED;
+    if (maximized_now) {
+      // 最大化只来一次 WM_SIZE；还原由 toggleMaximize / WM_EXITSIZEMOVE 落盘。
+      SaveWindowPlacement();
+    }
+    // 普通拖拽缩放也会发 SIZE_RESTORED，仅在最大化状态真正切换时重设圆角。
+    if (maximized_now != last_maximized_) {
+      last_maximized_ = maximized_now;
+      ApplyWindowCornerPreference();
+    }
+  }
   if (message == WM_CLOSE) {
+    SaveWindowPlacement();
     if (EnsureTrayIcon()) {
       ShowWindow(hwnd, SW_HIDE);
     } else {

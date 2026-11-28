@@ -16,7 +16,7 @@ enum UpdateCheckOutcome {
   notified,
   /// 已是最新（或远端版本无法比较）
   upToDate,
-  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非移动端）
+  /// 本次跳过（开关关闭 / 未到检查间隔 / 同一版本已提醒 / 非 Android）
   skipped,
   /// 查询失败（网络等原因，静默）
   failed,
@@ -74,9 +74,8 @@ class UpdateCheckService {
   /// [suppress] 为 true 时直接跳过（首次启动引导 / 用户协议未确认时不应打扰）。
   void scheduleStartupCheck({bool suppress = false}) {
     if (suppress) return;
-    // Android 资产是上游仓库的 APK；iOS 走移植仓库 EPXiaohua/MD3Music-iOS
-    // 发布的未签名 IPA——提醒后引导用户去 GitHub 下载，两端检查都有意义
-    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return;
+    // Release 资产只有 Android APK，其它平台检查无意义
+    if (kIsWeb || !Platform.isAndroid) return;
     Timer(startupDelay, () {
       // ignore: discarded_futures
       checkAndNotify();

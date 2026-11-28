@@ -66,6 +66,11 @@ void main() {
         matching: find.byType(AnimatedDefaultTextStyle),
       ).first,
     );
-    expect(style.style.color, lyricColor.withValues(alpha: 0.7));
+    // 首帧即定位当前行（`LyricsViewState.initState` 会按初始 position 求
+    // `_currentLineIndex`，不再保持 -1），position=0 时第一行就是当前行，
+    // 因此取当前行颜色（alpha 1.0）而非非当前行的 0.7。本用例要钉的是
+    // 「歌词用专属色而不是界面 onSurface 色」，两者都满足该意图。
+    expect(style.style.color, lyricColor);
+    expect(style.style.color, isNot(const Color(0xFFABCDEF)));
   });
 }

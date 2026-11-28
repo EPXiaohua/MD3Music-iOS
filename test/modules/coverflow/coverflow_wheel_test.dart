@@ -47,7 +47,7 @@ void main() {
   /// 灌 30 首而非 3~5 首：快速连滚/连续按键会越过补货阈值（index ≥ n-3），
   /// 补货请求的 FakeTimer 会挂到用例结束（「Timer is still pending」崩溃）。
   /// 30 首下所有用例的翻页幅度都够不着 index 27。
-  Future<void> pumpCoverFlow(WidgetTester tester) async {
+  Future<void> pumpCoverFlow(WidgetTester tester, {VoidCallback? onBack}) async {
     kCoverFlowSource.value = CoverFlowSource.fmHeart;
     final kugou = KugouProvider(registerDeviceOnStart: false);
     kugou.appendFmSongs([for (var i = 0; i < 30; i++) _song(i)]);
@@ -56,7 +56,7 @@ void main() {
         providers: [
           ChangeNotifierProvider<KugouProvider>.value(value: kugou),
         ],
-        child: const MaterialApp(home: CoverFlowPage()),
+        child: MaterialApp(home: CoverFlowPage(onBack: onBack)),
       ),
     );
     // 有界推进：封面流挂动画与补货异步，不用 pumpAndSettle
@@ -91,6 +91,19 @@ void main() {
     await tester.pump(const Duration(milliseconds: 150));
     await tester.pump(const Duration(milliseconds: 600));
   }
+
+  testWidgets('横屏返回箭头可点击并执行返回回调', (tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var backCount = 0;
+    await pumpCoverFlow(tester, onBack: () => backCount++);
+    expect(find.byKey(const ValueKey('coverflow-back')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('coverflow-back')));
+    await tester.pump();
+    expect(backCount, 1);
+  });
 
   testWidgets('滚轮向下翻到下一张（onPageChanged 上报 kCoverFlowIndex）',
       (tester) async {

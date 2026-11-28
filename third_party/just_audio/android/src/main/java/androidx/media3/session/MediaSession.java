@@ -1202,6 +1202,16 @@ public class MediaSession {
     return impl.getSessionCompat();
   }
 
+  /// MD3Music fork（CarWith）：强制 legacy 控制器立刻重读一次当前会话 metadata。
+  /// 背景：只改 extras（media3 MediaMetadata.equals 不比较 extras）不发
+  /// MEDIA_METADATA 事件时，legacy 控制器（CarWith 主机经 framework
+  /// MediaSessionCompat 读取）因此永远不重读；每换一句逐句歌词必须强制重发一次。
+  /// public：vendored just_audio 的 AudioPlayer（跨包）在门控位后调用；断开时
+  /// 调用方保证永不走到这里。
+  public final void forceLegacyMetadataBroadcast() {
+    impl.forceLegacyMetadataBroadcast();
+  }
+
   /**
    * Returns the legacy {@code android.support.v4.media.session.MediaSessionCompat.Token} of the
    * {@code android.support.v4.media.session.MediaSessionCompat} created internally by this session.

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:dlna_dart/xmlParser.dart' show AudioMime, PlayType;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
 
@@ -120,6 +121,19 @@ class DlnaProvider extends ChangeNotifier {
   BuildContext? _autoNextContext;
   void setAutoNextContext(BuildContext context) {
     _autoNextContext = context;
+  }
+
+  /// 测试专用：把状态切到 `searching` 并通知（不发 SSDP）。
+  ///
+  /// 真实的 [startSearch] 要走 socket 与 dlna_dart 的内部定时器，单测里会留下
+  /// pending timer；而"搜索中"这一态的 UI（M3E loading 指示器）需要被钉住，
+  /// 故开这个口子给替身 provider 用。
+  @visibleForTesting
+  void debugEnterSearching() {
+    _state = DlnaCastState.searching;
+    _devices = [];
+    _errorMessage = null;
+    notifyListeners();
   }
 
   /// 开始搜索局域网内的 DLNA 设备。

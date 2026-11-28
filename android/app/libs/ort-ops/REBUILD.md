@@ -104,9 +104,9 @@ python scripts/tools/ort/repack_aar.py <build_dir>/MinSizeRel/libonnxruntime.so
 ## 5. 验证
 
 ```bash
-flutter build apk --debug --flavor depth3d --dart-define=ENABLE_DEPTH_3D=true \
-  --split-per-abi --target-platform android-arm64 -t lib/private/main_private.dart
-adb push build/app/outputs/flutter-apk/app-arm64-v8a-depth3d-debug.apk /data/local/tmp/x.apk
+flutter build apk --debug --flavor full --dart-define=ENABLE_DEPTH_3D=true \
+  --split-per-abi --target-platform android-arm64
+adb push build/app/outputs/flutter-apk/app-arm64-v8a-full-debug.apk /data/local/tmp/x.apk
 adb shell pm install -r /data/local/tmp/x.apk
 adb logcat -c && adb shell monkey -p com.md3music.md3music -c android.intent.category.LAUNCHER 1
 # 进播放页触发一次深度生成后核对：

@@ -39,6 +39,7 @@ void main() {
     '关闭排除管理',
     '添加排除文件夹',
     '过滤开关',
+    '只扫描指定文件夹',
     '切换分类',
   ]) {
     testWidgets('$action 不恢复输入焦点，主动搜索仍可输入', (tester) async {
@@ -97,7 +98,14 @@ void main() {
             expect(pickerCalls, 1);
           }
           await tester.tap(find.text('关闭'));
+        } else if (action == '只扫描指定文件夹') {
+          await tester.ensureVisible(find.text('只扫描指定文件夹'));
+          await tester.tap(find.text('只扫描指定文件夹'));
+          await tester.pumpAndSettle();
+          expect(library.scanOnlySelectedFolders, isTrue);
+          await tester.binding.handlePopRoute();
         } else if (action == '过滤开关') {
+          await tester.ensureVisible(find.text('过滤不超过 60 秒的音频'));
           await tester.tap(find.text('过滤不超过 60 秒的音频'));
           await tester.pumpAndSettle();
           expect(library.filterShortAudio, isTrue);
@@ -107,6 +115,13 @@ void main() {
         }
       }
       await tester.pumpAndSettle();
+      if (action == '添加扫描文件夹') {
+        // 当前入口先展示目录管理面板，再由面板按钮打开系统选择器。
+        await tester.tap(find.text('添加扫描文件夹'));
+        await tester.pumpAndSettle();
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+      }
       expect(focus.hasFocus, isFalse);
       expect(tester.testTextInput.hasAnyClients, isFalse);
       if (action == '扫描音乐') expect(library.scans, 1);

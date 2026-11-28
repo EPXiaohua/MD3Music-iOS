@@ -203,6 +203,21 @@ random text
       expect(result[1].words, hasLength(7));
     });
 
+    test('孤立 word tag 续行：text 与 words 必须同步追加', () {
+      // 续行只带字级标签、没有行首时间戳：旧实现只拼 text，words 不补，
+      // 换行/绘制按 words 走会只显示前半句。
+      const input = '[1000,2000]<0,500,0>前半<500,500,0>句\n<1000,500,0>续<1500,500,0>写';
+      final result = KrcParser.parse(input);
+
+      expect(result, hasLength(1));
+      final line = result.first;
+      expect(line.text, '前半句续写');
+      expect(line.words, hasLength(4));
+      expect(line.words.map((w) => w.text).join(), line.text);
+      expect(line.words[2].startTime, 2000);
+      expect(line.words[3].startTime, 2500);
+    });
+
     test('字标签无 property 字段（仅 offset,duration）：能正确解析', () {
       // 部分变体 KRC 格式省略 property
       const input = '[0,500]<0,250>A<250,250>B';

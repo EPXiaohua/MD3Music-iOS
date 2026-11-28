@@ -57,14 +57,14 @@ class LyricPreferencesPanel extends StatelessWidget {
               // （上下左右全部调值），D-pad 落上去焦点无法移出；触屏原样。
               kTvBuild
                   ? RemoteSlider(
-                      min: LyricPreferences.minFontSize,
-                      max: LyricPreferences.maxFontSize,
+                      min: LyricPreferences.minFontSizeForCurrentPlatform,
+                      max: LyricPreferences.maxFontSizeForCurrentPlatform,
                       value: prefs.fontSize,
                       onChanged: prefs.setFontSize,
                     )
                   : M3ESlider(
-                      min: LyricPreferences.minFontSize,
-                      max: LyricPreferences.maxFontSize,
+                      min: LyricPreferences.minFontSizeForCurrentPlatform,
+                      max: LyricPreferences.maxFontSizeForCurrentPlatform,
                       value: prefs.fontSize,
                       onChanged: prefs.setFontSize,
                     ),
@@ -74,19 +74,19 @@ class LyricPreferencesPanel extends StatelessWidget {
               // tv: 同上（P-C 滑杆替换）
               kTvBuild
                   ? RemoteSlider(
-                      min: LyricPreferences.minFontWeight.toDouble(),
-                      max: LyricPreferences.maxFontWeight.toDouble(),
-                      divisions: ((LyricPreferences.maxFontWeight -
-                              LyricPreferences.minFontWeight) ~/
+                      min: LyricPreferences.minFontWeightForCurrentPlatform.toDouble(),
+                      max: LyricPreferences.maxFontWeightForCurrentPlatform.toDouble(),
+                      divisions: ((LyricPreferences.maxFontWeightForCurrentPlatform -
+                              LyricPreferences.minFontWeightForCurrentPlatform) ~/
                           100),
                       value: prefs.fontWeightValue.toDouble(),
                       onChanged: (v) => prefs.setFontWeight(v.round()),
                     )
                   : M3ESlider(
-                      min: LyricPreferences.minFontWeight.toDouble(),
-                      max: LyricPreferences.maxFontWeight.toDouble(),
-                      divisions: ((LyricPreferences.maxFontWeight -
-                              LyricPreferences.minFontWeight) ~/
+                      min: LyricPreferences.minFontWeightForCurrentPlatform.toDouble(),
+                      max: LyricPreferences.maxFontWeightForCurrentPlatform.toDouble(),
+                      divisions: ((LyricPreferences.maxFontWeightForCurrentPlatform -
+                              LyricPreferences.minFontWeightForCurrentPlatform) ~/
                           100),
                       value: prefs.fontWeightValue.toDouble(),
                       onChanged: (v) => prefs.setFontWeight(v.round()),
@@ -97,20 +97,20 @@ class LyricPreferencesPanel extends StatelessWidget {
               // tv: 同上（P-C 滑杆替换）
               kTvBuild
                   ? RemoteSlider(
-                      min: LyricPreferences.minLineSpacing,
-                      max: LyricPreferences.maxLineSpacing,
-                      divisions: ((LyricPreferences.maxLineSpacing -
-                                  LyricPreferences.minLineSpacing) *
+                      min: LyricPreferences.minLineSpacingForCurrentPlatform,
+                      max: LyricPreferences.maxLineSpacingForCurrentPlatform,
+                      divisions: ((LyricPreferences.maxLineSpacingForCurrentPlatform -
+                                  LyricPreferences.minLineSpacingForCurrentPlatform) *
                               10)
                           .round(),
                       value: prefs.lineSpacing,
                       onChanged: prefs.setLineSpacing,
                     )
                   : M3ESlider(
-                      min: LyricPreferences.minLineSpacing,
-                      max: LyricPreferences.maxLineSpacing,
-                      divisions: ((LyricPreferences.maxLineSpacing -
-                                  LyricPreferences.minLineSpacing) *
+                      min: LyricPreferences.minLineSpacingForCurrentPlatform,
+                      max: LyricPreferences.maxLineSpacingForCurrentPlatform,
+                      divisions: ((LyricPreferences.maxLineSpacingForCurrentPlatform -
+                                  LyricPreferences.minLineSpacingForCurrentPlatform) *
                               10)
                           .round(),
                       value: prefs.lineSpacing,

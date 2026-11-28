@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../core/services/diagnostic_logger.dart';
 import 'kugou_api/kugou_api_client.dart';
 import 'kugou_api/kugou_endpoints.dart';
 import 'local_server_lifecycle.dart';
@@ -75,6 +76,15 @@ class KugouApiServer {
   static Future<void>? _startFuture;
   static Future<void>? _stopFuture;
   static Future<bool>? _restartFuture;
+  static Timer? _autoReconnectTimer;
+  static int _autoReconnectAttempt = 0;
+  static bool _autoReconnectEnabled = true;
+  static const List<Duration> _autoReconnectDelays = [
+    Duration(seconds: 2),
+    Duration(seconds: 5),
+    Duration(seconds: 15),
+    Duration(seconds: 30),
+  ];
   static final AsyncSerialQueue _nativeTransitions = AsyncSerialQueue();
   static DynamicLibrary? _lib;
   static StopServer? _stopServerFn;
@@ -82,6 +92,10 @@ class KugouApiServer {
 
   static Future<void> start() {
     if (kIsWeb) return Future<void>.value();
+    _autoReconnectEnabled = true;
+    KugouApiClient.onLocalServerUnavailable = _onLocalServerUnavailable;
+    _autoReconnectTimer?.cancel();
+    _autoReconnectTimer = null;
     final pending = _startFuture;
     if (pending != null) return pending;
     if (_started) return _confirmRunning();
@@ -90,6 +104,20 @@ class KugouApiServer {
     final future = _doStart(generation);
     _startFuture = future;
     return future;
+  }
+
+  static void _onLocalServerUnavailable() {
+    if (!_autoReconnectEnabled || _stopFuture != null) return;
+    if (_started) {
+      final generation = KugouApiClient.localServerGeneration;
+      _started = false;
+      _startFuture = null;
+      KugouApiClient.markServerStartFailed(generation);
+      DiagnosticLogger.instance.w(
+        '[LocalAPI] request could not reach the server; scheduling reconnect',
+      );
+    }
+    if (_startFuture == null) _scheduleAutoReconnect();
   }
 
   static Future<void> _confirmRunning() async {
@@ -117,15 +145,41 @@ class KugouApiServer {
       KugouApiClient.markServerReady(generation);
     } catch (e) {
       print('KugouApiServer start failed: $e');
+      DiagnosticLogger.instance.e('[LocalAPI] start failed: $e');
     } finally {
       if (generation == KugouApiClient.localServerGeneration) {
         if (!succeeded) {
           _started = false;
           KugouApiClient.markServerStartFailed(generation);
+          _scheduleAutoReconnect();
+        } else {
+          _autoReconnectAttempt = 0;
+          _autoReconnectTimer?.cancel();
+          _autoReconnectTimer = null;
         }
         _startFuture = null;
       }
     }
+  }
+
+  /// 本地 API 暂不可用时只在后台按退避间隔重试，不向用户展示阻断横幅。
+  static void _scheduleAutoReconnect() {
+    if (!_autoReconnectEnabled || _autoReconnectTimer != null ||
+        _stopFuture != null) {
+      return;
+    }
+    final delay = _autoReconnectDelays[_autoReconnectAttempt];
+    if (_autoReconnectAttempt < _autoReconnectDelays.length - 1) {
+      _autoReconnectAttempt++;
+    }
+    DiagnosticLogger.instance.w(
+      '[LocalAPI] unavailable; retrying in ${delay.inSeconds}s',
+    );
+    _autoReconnectTimer = Timer(delay, () {
+      _autoReconnectTimer = null;
+      if (!_autoReconnectEnabled || _started || _stopFuture != null) return;
+      unawaited(start());
+    });
   }
 
   static Future<int> _startNativeServer() async {
@@ -162,16 +216,11 @@ class KugouApiServer {
     if (Platform.isWindows) return 'kugou_server.dll';
     if (Platform.isLinux) return 'libkugou_server.so';
     if (Platform.isMacOS) return 'libkugou_server.dylib';
-    if (Platform.isIOS) return 'libkugou_server.a (静态链接进可执行文件)';
     return 'libkugou_server.so'; // Android
   }
 
   static DynamicLibrary _loadLib() {
-    _lib ??= Platform.isIOS
-        // iOS：Rust 静态库经 -force_load 链接进 Runner 可执行文件，
-        // 符号需从进程自身查找，而非打开动态库文件
-        ? DynamicLibrary.process()
-        : DynamicLibrary.open(_libraryName());
+    _lib ??= DynamicLibrary.open(_libraryName());
     return _lib!;
   }
 
@@ -294,6 +343,8 @@ class KugouApiServer {
     if (!running && _started) {
       _started = false;
       KugouApiClient.markServerStartFailed(generation);
+      DiagnosticLogger.instance.w('[LocalAPI] server stopped; scheduling reconnect');
+      _scheduleAutoReconnect();
       if (generation == KugouApiClient.localServerGeneration) {
         _startFuture = null;
       }
@@ -306,6 +357,9 @@ class KugouApiServer {
   /// （确认退出 / Activity 销毁）场景能确定性关停。
   static Future<void> stop() {
     if (kIsWeb) return Future<void>.value();
+    _autoReconnectEnabled = false;
+    _autoReconnectTimer?.cancel();
+    _autoReconnectTimer = null;
     final pending = _stopFuture;
     if (pending != null) return pending;
 

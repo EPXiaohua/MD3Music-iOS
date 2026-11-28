@@ -63,6 +63,19 @@ void main() {
       expect(tester.getRect(bar).height, 32);
       expect(tester.getTopLeft(find.byKey(const ValueKey('body'))).dy, 32);
       expect(find.byType(Opacity), findsNothing);
+      // 左上角必须是应用图标（assets/images/app_icon.webp），而不是通用
+      // Material 音符字形——这是「Windows 端左上角没显示 app 图标」的回归守卫。
+      final iconImage = find.descendant(
+        of: bar,
+        matching: find.byType(Image),
+      );
+      expect(iconImage, findsOneWidget);
+      // cacheWidth 会把 AssetImage 包进 ResizeImage，断言时解包取内层。
+      final provider = tester.widget<Image>(iconImage).image;
+      final asset = provider is ResizeImage
+          ? provider.imageProvider as AssetImage
+          : provider as AssetImage;
+      expect(asset.assetName, 'assets/images/app_icon.webp');
       for (final action in ['minimize', 'toggleMaximize', 'closeWindow']) {
         final button = find.byKey(ValueKey('windows_$action'));
         expect(tester.getRect(button).size, const Size(46, 32));

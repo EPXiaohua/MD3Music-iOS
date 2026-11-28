@@ -13,7 +13,7 @@ void main() {
   late Uint8List secondArtwork;
 
   setUp(() {
-    firstArtwork = File('assets/images/app_icon.png').readAsBytesSync();
+    firstArtwork = File('assets/images/app_icon.webp').readAsBytesSync();
     secondArtwork = File('assets/images/app_icon_3.jpg').readAsBytesSync();
     SmartArtworkImage.localArtworkReader = null;
   });

@@ -95,9 +95,8 @@ void main() {
         ascending: true,
       );
       // 未知（'2','4' 归一为空串）在前：两者 artistKey 相同走 displayName
-      // 决胜（'歌2' < '歌4'）；其后按 String.compareTo 的 UTF-16 码元序，
-      // 乙(U+4E59) < 甲(U+7532)，故 1 先于 3（码元序，非笔画/拼音序）。
-      expect(ids(list), ['2', '4', '1', '3']);
+      // 决胜（'歌2' < '歌4'）；其后按拼音键：甲(ji) < 乙(yi)。
+      expect(ids(list), ['2', '4', '3', '1']);
     });
 
     test('artist 同名按 displayName 决胜', () {
@@ -112,7 +111,92 @@ void main() {
         sort: PlaylistSongSort.artist,
         ascending: true,
       );
-      expect(ids(list), ['1', '2']); // 同 artist 走 displayName 决胜：贝(U+8D1D) < 阿(U+963F)，码元序
+      // 同 artist 走 displayName 拼音决胜：阿(a) < 贝(bei)。
+      // 旧码位序是 贝(U+8D1D) < 阿(U+963F)，正是本次修复的行为差异点。
+      expect(ids(list), ['2', '1']);
+    });
+
+    test('artist 中文按拼音 A→Z，而非 Unicode 码位序', () {
+      final b = [
+        s('1', artist: '张学友'), // zhang…
+        s('2', artist: '陈奕迅'), // chen…
+        s('3', artist: '王靖雯'), // wang…
+        s('4', artist: '丁薇'), // ding…
+      ];
+      final list = List.of(b);
+      sortPlaylistSongs(
+        list,
+        baseOrder: b,
+        sort: PlaylistSongSort.artist,
+        ascending: true,
+      );
+      // 码位序会把 张(U+5F20) 排在 陈(U+9648) 前；拼音序为 chen<ding<wang<zhang
+      expect(ids(list), ['2', '4', '3', '1']);
+    });
+
+    test('artist 中英文混排按拼音键整体 A→Z', () {
+      final b = [
+        s('1', artist: 'Beyond'),
+        s('2', artist: '陈奕迅'),
+        s('3', artist: 'Eason Chan'),
+        s('4', artist: '阿杜'),
+      ];
+      final list = List.of(b);
+      sortPlaylistSongs(
+        list,
+        baseOrder: b,
+        sort: PlaylistSongSort.artist,
+        ascending: true,
+      );
+      // adu < beyond < chenyixun < eason chan
+      expect(ids(list), ['4', '1', '2', '3']);
+    });
+
+    test('artist 多歌手连写（顿号分隔）按拼音键可排序不抛异常', () {
+      final b = [
+        s('1', artist: '徐勋虎、金南玲'),
+        s('2', artist: '安与骑兵'),
+      ];
+      final list = List.of(b);
+      sortPlaylistSongs(
+        list,
+        baseOrder: b,
+        sort: PlaylistSongSort.artist,
+        ascending: true,
+      );
+      // anyuqibing < xuxunhu、jinnanling
+      expect(ids(list), ['2', '1']);
+    });
+
+    test('title 中文按拼音 A→Z', () {
+      final b = [
+        s('1', title: '晴天'), // qingtian
+        s('2', title: '夜曲'), // yequ
+        s('3', title: '稻香'), // daoxiang
+      ];
+      final list = List.of(b);
+      sortPlaylistSongs(
+        list,
+        baseOrder: b,
+        sort: PlaylistSongSort.title,
+        ascending: true,
+      );
+      expect(ids(list), ['3', '1', '2']); // dao < qing < ye
+    });
+
+    test('artist 降序为升序完全逆序', () {
+      final b = [
+        s('1', artist: '张学友'),
+        s('2', artist: '陈奕迅'),
+        s('3', artist: '丁薇'),
+      ];
+      final asc = List.of(b);
+      final desc = List.of(b);
+      sortPlaylistSongs(asc,
+          baseOrder: b, sort: PlaylistSongSort.artist, ascending: true);
+      sortPlaylistSongs(desc,
+          baseOrder: b, sort: PlaylistSongSort.artist, ascending: false);
+      expect(ids(desc), ids(asc.reversed.toList()));
     });
 
     test('duration 升序', () {

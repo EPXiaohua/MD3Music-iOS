@@ -109,6 +109,14 @@ class _ArtistPhotoBackgroundState extends State<ArtistPhotoBackground> {
   Widget build(BuildContext context) {
     if (_loading || _imageUrls.isEmpty) return const SizedBox.shrink();
     final opacity = context.watch<ThemeProvider>().artistPhotoOpacity;
+    // P0-A: 写真铺满窗口，按窗口物理宽限制解码尺寸。此前无 memCacheWidth，
+    // 4K 原图会全分辨率解码（单张可达 33MB），且 AnimatedSwitcher 转场期
+    // 新旧两张并存，是切歌/轮播时的引擎侧位图峰值来源之一。
+    final media = MediaQuery.of(context);
+    final physicalWidth = (media.size.width * media.devicePixelRatio).round();
+    final cacheWidth = physicalWidth > 1920
+        ? 1920
+        : (physicalWidth < 1 ? 1 : physicalWidth);
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -120,6 +128,7 @@ class _ArtistPhotoBackgroundState extends State<ArtistPhotoBackground> {
             fit: BoxFit.cover,
             width: double.infinity,
             height: double.infinity,
+            memCacheWidth: cacheWidth,
             placeholder: (_, __) => const SizedBox.shrink(),
             errorWidget: (_, __, ___) => const SizedBox.shrink(),
           ),

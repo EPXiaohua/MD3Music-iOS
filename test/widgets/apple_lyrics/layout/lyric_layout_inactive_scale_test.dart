@@ -15,18 +15,18 @@ void main() {
   });
 
   group('LyricLayout.inactiveScale', () {
-    test('默认值与可配置偏好保持一致（新安装默认 0.85）', () async {
+    test('默认值与可配置偏好保持一致（按当前平台）', () async {
       await LyricPreferences.instance.reset();
       expect(
         LyricLayout.inactiveScale,
-        equals(LyricPreferences.defaultInactiveScale),
+        equals(LyricPreferences.defaultInactiveScaleForCurrentPlatform),
       );
-      expect(LyricLayout.inactiveScale, equals(0.85));
     });
 
     test('跟随 LyricPreferences 变化', () async {
-      await LyricPreferences.instance.setInactiveScale(0.90);
-      expect(LyricLayout.inactiveScale, equals(0.90));
+      // 0.95 落在所有平台范围内（安卓 0.80~1.00，Windows 0.90~1.00）
+      await LyricPreferences.instance.setInactiveScale(0.95);
+      expect(LyricLayout.inactiveScale, equals(0.95));
     });
   });
 
@@ -47,7 +47,10 @@ void main() {
     });
 
     test('调节非当前行缩放时两层同步变化，任意取值下保持重合', () async {
-      for (final value in <double>[0.80, 0.855, 0.94, 1.00]) {
+      // 使用当前平台范围内的取值，确保 Windows/安卓均有效
+      final lo = LyricPreferences.minInactiveScaleForCurrentPlatform;
+      final hi = LyricPreferences.maxInactiveScaleForCurrentPlatform;
+      for (final value in <double>[lo, (lo + hi) / 2, hi - 0.01, hi]) {
         await LyricPreferences.instance.setInactiveScale(value);
         expect(
           LyricLayout.blurRenderScale(enableScale: true),
@@ -58,13 +61,12 @@ void main() {
   });
 
   group('LyricLayout.alignPosition（当前行垂直锚位）', () {
-    test('默认值保持历史写死值 0.35', () async {
+    test('默认值按当前平台生效', () async {
       await LyricPreferences.instance.reset();
       expect(
         LyricLayout.alignPosition,
-        equals(LyricPreferences.defaultAlignPosition),
+        equals(LyricPreferences.defaultAlignPositionForCurrentPlatform),
       );
-      expect(LyricLayout.alignPosition, equals(0.35));
     });
 
     test('跟随 LyricPreferences 变化', () async {
@@ -72,23 +74,30 @@ void main() {
       expect(LyricLayout.alignPosition, equals(0.5));
     });
 
-    test('低于下限被夹到 minAlignPosition', () async {
+    test('低于下限被夹到当前平台 minAlignPosition', () async {
       await LyricPreferences.instance.setAlignPosition(0.0);
       expect(
         LyricPreferences.instance.alignPosition,
-        equals(LyricPreferences.minAlignPosition),
+        equals(LyricPreferences.minAlignPositionForCurrentPlatform),
       );
     });
 
-    test('高于上限被夹到 maxAlignPosition', () async {
+    test('高于上限被夹到当前平台 maxAlignPosition', () async {
       await LyricPreferences.instance.setAlignPosition(0.9);
       expect(
         LyricPreferences.instance.alignPosition,
-        equals(LyricPreferences.maxAlignPosition),
+        equals(LyricPreferences.maxAlignPositionForCurrentPlatform),
       );
     });
 
-    test('滑块步长为 0.01', () {
+    test('默认值落在当前平台范围正中（两侧对称可调）', () {
+      final lo = LyricPreferences.minAlignPositionForCurrentPlatform;
+      final hi = LyricPreferences.maxAlignPositionForCurrentPlatform;
+      final mid = LyricPreferences.defaultAlignPositionForCurrentPlatform;
+      expect(mid, closeTo((lo + hi) / 2, 1e-9));
+    });
+
+    test('滑块步长为 0.01（安卓基线常量）', () {
       const step =
           (LyricPreferences.maxAlignPosition -
               LyricPreferences.minAlignPosition) /
@@ -117,23 +126,24 @@ void main() {
   });
 
   group('LyricPreferences.setInactiveScale 边界', () {
-    test('低于下限被夹到 minInactiveScale', () async {
-      await LyricPreferences.instance.setInactiveScale(0.5);
+    test('低于下限被夹到当前平台 minInactiveScale', () async {
+      // 传负值确保低于任何平台的 min（安卓 0.80 / Windows 0.00）
+      await LyricPreferences.instance.setInactiveScale(-1);
       expect(
         LyricPreferences.instance.inactiveScale,
-        equals(LyricPreferences.minInactiveScale),
+        equals(LyricPreferences.minInactiveScaleForCurrentPlatform),
       );
     });
 
-    test('高于上限被夹到 maxInactiveScale', () async {
+    test('高于上限被夹到当前平台 maxInactiveScale', () async {
       await LyricPreferences.instance.setInactiveScale(1.5);
       expect(
         LyricPreferences.instance.inactiveScale,
-        equals(LyricPreferences.maxInactiveScale),
+        equals(LyricPreferences.maxInactiveScaleForCurrentPlatform),
       );
     });
 
-    test('滑块档位步长为 0.005', () {
+    test('全局滑块档位步长为 0.005（安卓基线常量）', () {
       const step =
           (LyricPreferences.maxInactiveScale -
               LyricPreferences.minInactiveScale) /

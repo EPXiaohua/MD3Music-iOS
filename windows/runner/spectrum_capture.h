@@ -35,8 +35,28 @@ class SpectrumCapture {
 
   void SetFrameCallback(FrameCallback callback);
 
+  // 环回激活方式。
+  // - kProcessPreferred：进程环回优先（只采本进程，频谱用），失败回落设备环回；
+  // - kDeviceOnly：只走设备环回（默认渲染端点的系统混音）。
+  //   **识曲必须用这个**：进程环回会把用户在浏览器 / 其他播放器里放的声音漏光。
+  enum class LoopbackMode { kProcessPreferred, kDeviceOnly };
+
+  // 打开 PCM 旁路：不再做 FFT，改为把采集样本转成「单声道 int16」累积，
+  // 上限按 [max_duration_ms] 折算。识曲用它把一段系统声音交给指纹接口。
+  void EnablePcmTap(int max_duration_ms);
+  void DisablePcmTap();
+
+  struct PcmSegment {
+    std::vector<int16_t> samples;  // 单声道 16bit
+    int sample_rate_hz = 0;        // 原始采样率（不重采样，交由 Rust 降采样）
+    bool truncated = false;        // 达到时长上限被截断
+  };
+
+  // 取走本段 PCM（调用前先 Stop()，否则可能取到半段）；取走后缓冲清空。
+  PcmSegment TakePcm();
+
   // 建立采集并等待初始化结果（最多 3s）。已运行时会先停下再重建。
-  bool Start();
+  bool Start(LoopbackMode mode = LoopbackMode::kProcessPreferred);
   void Stop();
 
   struct Stats {
@@ -51,6 +71,9 @@ class SpectrumCapture {
  private:
   void ThreadMain();
   void EmitFrame(const std::vector<double>& bands);
+  // PCM 旁路：把一包交错样本（float32 或 int16）平均成单声道 int16 追加。
+  void AppendPcm(const BYTE* data, UINT32 frames, bool is_float, int channels);
+  void AppendPcmSilence(UINT32 frames);
 
   std::thread thread_;
   HANDLE init_event_ = nullptr;
@@ -66,6 +89,16 @@ class SpectrumCapture {
 
   std::mutex callback_mutex_;
   FrameCallback callback_;
+
+  // 采集模式与 PCM 旁路缓冲。pcm_mutex_ 同时保护 loopback_mode_
+  // （采集线程只在启动时读一次，无需为它另开锁）。
+  LoopbackMode loopback_mode_ = LoopbackMode::kProcessPreferred;
+  std::mutex pcm_mutex_;
+  std::vector<int16_t> pcm_samples_;
+  size_t pcm_max_samples_ = 0;
+  // 采集线程每包都会读，用原子量避免与 Enable/DisablePcmTap 数据竞争。
+  std::atomic<bool> pcm_tap_enabled_{false};
+  bool pcm_truncated_ = false;
 };
 
 #endif  // RUNNER_SPECTRUM_CAPTURE_H_

@@ -198,7 +198,7 @@ fn raw_query_param(url: &str, key: &str) -> String {
 ///   顺序读取即为「边下边播」，正是客户端需要的形态；
 /// - 万一客户端发了 Range 而拿到 200，ExoPlayer 会用 `bytesToSkip` 跳过已读字节，
 ///   不会报错（仅多耗一点带宽）；
-/// - 私有构建的落盘请求（Task 9，dio 单次 GET）同样不需要断点续传。
+/// - 客户端另发的落盘请求（dio 单次 GET）同样不需要断点续传。
 /// 若日后实测出现循环/seek 重新拉流造成的卡顿，再补 Range 支持（当前不做，YAGNI）。
 pub fn handle_media_proxy(request: tiny_http::Request, url: &str) -> Result<(), String> {
     use tiny_http::{Header, Response, StatusCode};

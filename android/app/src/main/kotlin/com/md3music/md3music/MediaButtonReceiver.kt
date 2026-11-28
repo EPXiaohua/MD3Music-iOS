@@ -50,6 +50,15 @@ class MediaButtonReceiver : BroadcastReceiver() {
         // 只处理按下事件，避免 ACTION_UP 重复触发
         if (event.action != KeyEvent.ACTION_DOWN) return
 
+        // 方向盘 / 车机按键通道观测：无法现场取证时，靠这条日志判断
+        // 「按键根本没到我们这里」还是「到了但被别的播放器吞了」。
+        // 低频（每次按键一行），不会冲掉环形缓冲。
+        RingLog.i(
+            "CarKey",
+            "media button keyCode=${event.keyCode} action=${event.action} " +
+                "repeat=${event.repeatCount} source=${event.source}"
+        )
+
         when (event.keyCode) {
             KeyEvent.KEYCODE_HEADSETHOOK,
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> handleMultiClickPlay(context.applicationContext)

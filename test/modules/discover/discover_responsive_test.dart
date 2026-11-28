@@ -5,7 +5,7 @@ import 'package:md3music/modules/discover/discover_sections.dart';
 Widget layout({TargetPlatform platform = TargetPlatform.android}) => MaterialApp(
   theme: ThemeData(platform: platform),
   home: Scaffold(body: CustomScrollView(slivers: [DiscoverSectionsSliver(
-    config: const DiscoverSectionConfig(), onEdit: () {},
+    config: const DiscoverSectionConfig(hidden: {}), onEdit: () {},
     sectionBuilder: (section) => SliverToBoxAdapter(child: SizedBox(
       key: ValueKey(section.name), height: 100)),
   )])),

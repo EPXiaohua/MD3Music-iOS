@@ -462,6 +462,13 @@ import org.checkerframework.checker.initialization.qual.Initialized;
 
   @Override
   public void onPlayFromSearch(@Nullable String query, @Nullable Bundle extras) {
+    // MD3Music fork v66：车机语音点歌。App 队列由 Dart 自维护，默认实现会把
+    // 「只有 searchQuery、没有 URI」的 item 塞进 ExoPlayer（播不出且污染
+    // media3 时间线）。钩子返回 true 表示已消费（App 侧自行搜索后起播）。
+    MediaSessionService.PlayFromSearchHook hook = MediaSessionService.playFromSearchHook;
+    if (hook != null && hook.onPlayFromSearch(query, extras)) {
+      return;
+    }
     handleMediaRequest(
         createMediaItemForMediaRequest(/* mediaId= */ null, /* mediaUri= */ null, query, extras),
         /* play= */ true);
@@ -898,6 +905,28 @@ import org.checkerframework.checker.initialization.qual.Initialized;
         });
   }
 
+  /// MD3Music fork（CarWith·逐句歌词强制重发，2026-11）：让 legacy 控制器立刻重读
+  /// 一次当前 metadata（清掉「上一帧」去重缓存后重跑转换+下发），三层口子：
+  /// MediaSession → 本方法、MediaSessionImpl → 转发、本类 ControllerLegacyCbForBroadcast
+  /// .forceMetadataBroadcast 落实现。
+  /// 背景：只改 extras 里的歌词键（media3 的 MediaMetadata.equals **不比较 extras**，
+  /// updateMetadataIfChanged 里补 legacyLyricInfo 专门对比就是为此）时，
+  /// onMediaMetadataChanged 不派发/被同一处去重吞掉，legacy 控制器（CarWith 主机读
+  /// framework MediaSessionCompat）因此永远不重读 —— 每换一句歌词必须强制重发一次，
+  /// 否则键写了也到不了车机。断开翻转时同样依赖这一次把 framework 顶层残留的
+  /// ucar 键冲掉。
+  public void forceLegacyMetadataBroadcast() {
+    postOrRun(
+        sessionImpl.getApplicationHandler(),
+        () -> {
+          // 与 v25 的进度补刷同口径：release 后回调可能已入队，这里自熄。
+          if (sessionImpl.isReleased()) {
+            return;
+          }
+          controllerLegacyCbForBroadcast.forceMetadataBroadcast();
+        });
+  }
+
   /// MD3Music fork（方向3·shadow 播放态镜像）：
   /// 仅当【本会话正是当前活跃会话】时，把刚发布的 PlaybackState 同步进
   /// 其它存活（shadow）会话；shadow 自己的发布（paused/旧态）不广播，
@@ -1324,6 +1353,16 @@ import org.checkerframework.checker.initialization.qual.Initialized;
       updateMetadataIfChanged();
     }
 
+    /// MD3Music fork（CarWith）：把上一帧 metadata 缓存重置为构造期同款的 EMPTY
+    /// 哨兵（不能用 null——updateMetadataIfChanged 对 lastMediaMetadata 直接取
+    /// .extras，null 会 NPE），让「这一次」必然穿过 Objects.equals 去重、把当前
+    /// 这份（含四个 ucar 歌词键）强制下发给 legacy 控制器；方法内随即重新赋值，
+    /// 不影响后续正常事件的判重。只由 forceLegacyMetadataBroadcast 在门控后调用。
+    public void forceMetadataBroadcast() {
+      lastMediaMetadata = MediaMetadata.EMPTY;
+      updateMetadataIfChanged();
+    }
+
     @Override
     public void onTimelineChanged(
         int seq, Timeline timeline, @Player.TimelineChangeReason int reason)
@@ -1472,6 +1511,11 @@ import org.checkerframework.checker.initialization.qual.Initialized;
       updateLegacySessionPlaybackState(sessionImpl.getPlayerWrapper());
     }
 
+    @Nullable
+    private static String legacyLyricInfo(MediaMetadata metadata) {
+      return metadata.extras == null ? null : metadata.extras.getString("lyricInfo");
+    }
+
     private void updateMetadataIfChanged() {
       PlayerWrapper player = sessionImpl.getPlayerWrapper();
       @Nullable MediaItem currentMediaItem = player.getCurrentMediaItemWithCommandCheck();
@@ -1489,6 +1533,7 @@ import org.checkerframework.checker.initialization.qual.Initialized;
               : null;
 
       if (Objects.equals(lastMediaMetadata, newMediaMetadata)
+          && Objects.equals(legacyLyricInfo(lastMediaMetadata), legacyLyricInfo(newMediaMetadata))
           && Objects.equals(lastMediaId, newMediaId)
           && Objects.equals(lastMediaUri, newMediaUri)
           && lastDurationMs == newDurationMs) {

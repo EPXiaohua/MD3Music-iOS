@@ -56,6 +56,11 @@ class FakePlayerControl implements McpPlayerControl {
 
   final List<String> calls = <String>[];
 
+  /// 最近一次 playSong/enqueue 收到的歌曲（issue #216：验证播放链路
+  /// 拿到的是补齐后的正确 albumAudioId，而非 /audio 的 audio_id）。
+  Song? lastPlayedSong;
+  Song? lastEnqueuedSong;
+
   @override
   McpPlayerSnapshot snapshot() => _snapshot;
 
@@ -84,10 +89,16 @@ class FakePlayerControl implements McpPlayerControl {
       calls.add('volume:${volume.toStringAsFixed(2)}');
 
   @override
-  Future<void> playSong(Song song) async => calls.add('play:${song.title}');
+  Future<void> playSong(Song song) async {
+    lastPlayedSong = song;
+    calls.add('play:${song.title}');
+  }
 
   @override
-  Future<void> enqueue(Song song) async => calls.add('enqueue:${song.title}');
+  Future<void> enqueue(Song song) async {
+    lastEnqueuedSong = song;
+    calls.add('enqueue:${song.title}');
+  }
 
   @override
   Future<void> setLoopMode(String mode) async => calls.add('loop:$mode');
@@ -126,11 +137,26 @@ class FakePlayerControl implements McpPlayerControl {
 /// 同时实现 [McpLibrarySource]，后续 Task 6 可以直接把
 /// `FakeApiClient()` 当 `library` 传给 `buildMcpTools`。
 class FakeApiClient implements KugouLibraryGateway, McpLibrarySource {
+  FakeApiClient({
+    this.songDetailOverride,
+    this.candidatesOverride,
+    this.throwOnSearch = false,
+  });
+
   /// 上一次请求实际下发的 pagesize，用于验证 limit 的钳制。
   int? lastPagesize;
 
   /// 搜索响应比请求量多返回的条数，用于验证上层截断。
   static const int extraPagesize = 5;
+
+  /// 注入 songDetail 返回值（null 时用默认的「晴天」/audio 形态）。
+  KugouSongDetail? Function(String hash)? songDetailOverride;
+
+  /// 注入搜索候选列表（非 null 时 search 直接返回它，用于 ID/封面补齐用例）。
+  List<KugouSongDetail>? candidatesOverride;
+
+  /// true 时 search 抛异常（用于验证补齐失败不阻断播放）。
+  bool throwOnSearch = false;
 
   List<KugouSongDetail> _fakeSongs(String keyword, int count) =>
       List<KugouSongDetail>.generate(
@@ -151,6 +177,10 @@ class FakeApiClient implements KugouLibraryGateway, McpLibrarySource {
     required int pagesize,
   }) async {
     lastPagesize = pagesize;
+    if (throwOnSearch) throw StateError('fake network failure');
+    if (candidatesOverride != null) {
+      return KugouSearchResult(songs: candidatesOverride!, total: candidatesOverride!.length);
+    }
     // 故意多返回几条，用于验证 searchSongs 的截断逻辑
     return KugouSearchResult(
       songs: _fakeSongs(keyword, pagesize + extraPagesize),
@@ -159,14 +189,18 @@ class FakeApiClient implements KugouLibraryGateway, McpLibrarySource {
   }
 
   @override
-  Future<KugouSongDetail?> songDetail(String hash) async => KugouSongDetail(
-        hash: hash,
-        songName: '晴天',
-        artistName: '周杰伦',
-        albumName: '叶惠美',
-        duration: 269,
-        // /audio 无封面字段（铁律 17）：detail 永远不带图，靠搜索命中补齐
-      );
+  Future<KugouSongDetail?> songDetail(String hash) async {
+    final custom = songDetailOverride?.call(hash);
+    if (custom != null) return custom;
+    return KugouSongDetail(
+      hash: hash,
+      songName: '晴天',
+      artistName: '周杰伦',
+      albumName: '叶惠美',
+      duration: 269,
+      // /audio 无封面字段（铁律 17）：detail 永远不带图，靠搜索命中补齐
+    );
+  }
 
   @override
   Future<KugouLyric?> lyric(String hash) async => KugouLyric(
@@ -218,6 +252,21 @@ class FakeApiClient implements KugouLibraryGateway, McpLibrarySource {
   // ---- 歌单内容（Task 8）----
 
   KugouPlaylistSongs? playlistSongs;
+
+  /// /user/playlist 原始响应注入（KugouApiClientLibrarySource.getUserPlaylists
+  /// 的过滤逻辑测试用）；null 时返回 null（未登录形态）。
+  Map<String, dynamic>? userPlaylistRaw;
+
+  /// McpLibrarySource.getUserPlaylists 的直接注入值（工具 handler 测试用）。
+  List<KugouPlaylistBrief> myPlaylists = const <KugouPlaylistBrief>[];
+
+  @override
+  Future<Map<String, dynamic>?> userPlaylist(int pagesize) async =>
+      userPlaylistRaw;
+
+  @override
+  Future<List<KugouPlaylistBrief>> getUserPlaylists({int limit = 30}) async =>
+      myPlaylists.take(limit).toList(growable: false);
 
   @override
   Future<KugouPlaylistSongs?> getPlaylistSongs(String globalCollectionId,
@@ -294,6 +343,9 @@ class StubGateway implements KugouLibraryGateway {
       null;
 
   @override
+  Future<Map<String, dynamic>?> userPlaylist(int pagesize) async => null;
+
+  @override
   Future<List<KugouSongDetail>?> getRecommendDaily() async => null;
 
   @override
@@ -362,6 +414,10 @@ class EmptyApiClient implements McpLibrarySource {
 
   @override
   Future<Map<String, dynamic>?> getUserListen({int type = 0}) async => null;
+
+  @override
+  Future<List<KugouPlaylistBrief>> getUserPlaylists({int limit = 30}) async =>
+      const <KugouPlaylistBrief>[];
 }
 
 /// 本地曲库假源。
@@ -389,12 +445,19 @@ class FakeLocalLibrary implements McpLocalLibrarySource {
 class FakeLibraryWrite implements McpLibraryWriteSource {
   final calls = <String>[];
 
+  /// createPlaylist 回执的 listid（工具层 listid 透出断言用）。
+  String? createdListid;
+
   @override
-  Future<void> addSongToPlaylist(String hash, String listid) async =>
+  Future<void> addSongToPlaylist(String hash, String listid,
+      {KugouSongDetail? enriched}) async =>
       calls.add('add:$hash->$listid');
 
   @override
-  Future<void> createPlaylist(String name) async => calls.add('create:$name');
+  Future<String?> createPlaylist(String name) async {
+    calls.add('create:$name');
+    return createdListid;
+  }
 }
 
 /// App 功能端口假实现：快照可定制，调用序列可断言。
@@ -479,6 +542,10 @@ class LongLyricApiClient implements McpLibrarySource {
 
   @override
   Future<Map<String, dynamic>?> getUserListen({int type = 0}) async => null;
+
+  @override
+  Future<List<KugouPlaylistBrief>> getUserPlaylists({int limit = 30}) async =>
+      const <KugouPlaylistBrief>[];
 }
 
 void main() {
@@ -608,6 +675,188 @@ void main() {
       expect(detail, isNotNull);
       expect(detail!.hash, 'abc');
       expect(detail.artworkUri, isNull);
+    });
+
+    // ── issue #216：/audio 的 audio_id 不再冒充 albumAudioId，
+    //    正确 MixSongID/albumId 由同 hash 搜索候选补齐 ──
+
+    test('getSongDetail ID 补齐：已有封面但缺 albumAudioId 仍触发搜索补齐',
+        () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+              artworkUri: 'https://img.example/cover.jpg',
+            ),
+        candidatesOverride: [
+          KugouSongDetail(
+            hash: 'HASH1',
+            songName: '野心家',
+            albumAudioId: '776042250',
+            albumId: '161637189',
+          ),
+        ],
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('hash1');
+      expect(detail!.albumAudioId, '776042250');
+      expect(detail.albumId, '161637189');
+      // 原封面不被无图候选清空
+      expect(detail.artworkUri, 'https://img.example/cover.jpg');
+    });
+
+    test('getSongDetail ID 补齐：封面与 ID 全缺时逐项回填', () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+            ),
+        candidatesOverride: [
+          KugouSongDetail(
+            hash: 'HASH1',
+            songName: '野心家',
+            artworkUri: 'https://img.example/c1.jpg',
+            albumAudioId: '776042250',
+            albumId: '161637189',
+          ),
+        ],
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('HASH1');
+      expect(detail!.artworkUri, 'https://img.example/c1.jpg');
+      expect(detail.albumAudioId, '776042250');
+      expect(detail.albumId, '161637189');
+    });
+
+    test('getSongDetail ID 补齐：首个候选缺项时继续查找后续同 hash 候选',
+        () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+            ),
+        candidatesOverride: [
+          // 同 hash 但什么都没有
+          KugouSongDetail(hash: 'HASH1', songName: '野心家'),
+          // 第二个候选带 ID、无封面
+          KugouSongDetail(
+            hash: 'HASH1',
+            songName: '野心家',
+            albumAudioId: '776042250',
+            albumId: '161637189',
+          ),
+          // 第三个候选带封面
+          KugouSongDetail(
+            hash: 'HASH1',
+            songName: '野心家',
+            artworkUri: 'https://img.example/c3.jpg',
+          ),
+          // 异 hash 干扰项（不该被采用）
+          KugouSongDetail(
+            hash: 'OTHER',
+            songName: '野心家',
+            albumAudioId: '999',
+            artworkUri: 'https://img.example/other.jpg',
+          ),
+        ],
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('HASH1');
+      expect(detail!.albumAudioId, '776042250');
+      expect(detail.albumId, '161637189');
+      expect(detail.artworkUri, 'https://img.example/c3.jpg');
+    });
+
+    test('getSongDetail ID 补齐：候选全空时不回填（保持 null，不误伤）', () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+            ),
+        candidatesOverride: [
+          KugouSongDetail(hash: 'HASH1', songName: '野心家'),
+        ],
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('HASH1');
+      expect(detail!.albumAudioId, isNull);
+      expect(detail.artworkUri, isNull);
+    });
+
+    test('getSongDetail 补齐：搜索抛异常时原样返回（不阻断播放）', () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+            ),
+        throwOnSearch: true,
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('HASH1');
+      expect(detail!.songName, '野心家');
+      expect(detail.albumAudioId, isNull);
+    });
+
+    test('getSongDetail 补齐：albumAudioId 为 "0" 视为缺失并回填', () async {
+      final fake = FakeApiClient(
+        songDetailOverride: (hash) => KugouSongDetail(
+              hash: hash,
+              songName: '野心家',
+              artistName: '张靓颖',
+              artworkUri: 'https://img.example/cover.jpg',
+              albumAudioId: '0',
+            ),
+        candidatesOverride: [
+          KugouSongDetail(hash: 'HASH1', songName: '野心家', albumAudioId: '776042250'),
+        ],
+      );
+      final source = KugouApiClientLibrarySource(fake);
+      final detail = await source.getSongDetail('HASH1');
+      expect(detail!.albumAudioId, '776042250');
+    });
+
+    test('md3_play_song 播放链路用补齐后的 albumAudioId（issue #216 端到端）',
+        () async {
+      const hash = '1789ad88cfdd254910125f22494c0e8b';
+      final control = FakePlayerControl();
+      final fake = FakeApiClient(
+        // /audio 形态：只有 audio_id（不同域，fromJson 已不采用）、无封面
+        songDetailOverride: (h) => KugouSongDetail.fromJson({
+              'hash': h,
+              'audio_name': '张靓颖 - 野心家',
+              'audio_id': 477568288,
+              'timelength': 282592,
+            }),
+        candidatesOverride: [
+          KugouSongDetail(
+            hash: hash.toUpperCase(),
+            songName: '野心家',
+            albumAudioId: '776042250',
+            albumId: '161637189',
+            artworkUri: 'https://img.example/yxj.jpg',
+          ),
+        ],
+      );
+      final registry = McpToolRegistry(buildMcpTools(
+        control: control,
+        library: KugouApiClientLibrarySource(fake),
+      ));
+      final res = await registry.execute(
+        'md3_play_song',
+        <String, Object?>{'hash': hash},
+      );
+      expect(res.isError, isFalse);
+      final played = control.lastPlayedSong!;
+      // 关键断言：传给播放 URL 解析的 albumAudioId 必须是 MixSongID 域，
+      // 不能是 /audio 的 audio_id（477568288 → 48 分钟口播的根因）
+      expect(played.albumAudioId, '776042250');
+      expect(played.albumId, '161637189');
+      expect(played.artworkUri, 'https://img.example/yxj.jpg');
     });
 
     test('KugouApiClientLibrarySource.getLyric 优先解码内容', () async {
@@ -1420,9 +1669,10 @@ void main() {
         localLibrary: FakeLocalLibrary(const []),
       ));
       final names = registry.visibleTools().map((t) => t.name).toList(growable: false);
-      expect(names, hasLength(37));
+      expect(names, hasLength(38));
       expect(names, contains('md3_get_player_state'));
       expect(names, contains('md3_search_songs'));
+      expect(names, contains('md3_get_my_playlists'));
       expect(names, contains('md3_search_local_songs'));
       expect(names, contains('md3_play_local_song'));
       expect(names, contains('md3_toggle'));
@@ -1433,7 +1683,8 @@ void main() {
       registry.readOnly = true;
       final readOnlyNames =
           registry.visibleTools().map((t) => t.name).toList(growable: false);
-      expect(readOnlyNames, hasLength(14));
+      expect(readOnlyNames, hasLength(15));
+      expect(readOnlyNames, contains('md3_get_my_playlists'));
       expect(readOnlyNames, isNot(contains('md3_play_keyword')));
     });
   });
@@ -1577,6 +1828,151 @@ void main() {
       expect(res.text, contains('我的歌单'));
     });
 
+    // 实测缺口：AI 建完歌单拿不到 listid，无法接着加歌（add_song 要可写
+    // listid，而全局搜索的结果 id 不是自己歌单的）。回执必须透出真实 ID。
+    test('md3_create_playlist 回执带新 listid', () async {
+      final write = FakeLibraryWrite()..createdListid = '8123456';
+      final registry = McpToolRegistry(buildMcpTools(
+        control: FakePlayerControl(),
+        library: FakeApiClient(),
+        libraryWrite: write,
+      ));
+      registry.confirmationEnabled = false;
+      final res = await registry.execute(
+          'md3_create_playlist', <String, Object?>{'name': '新歌单'});
+      expect(res.isError, isFalse);
+      final data = res.data! as Map<String, Object?>;
+      expect(data['created'], isTrue);
+      expect(data['listid'], '8123456');
+    });
+
+    test('md3_create_playlist 上游不回 listid 时仍算成功', () async {
+      final write = FakeLibraryWrite(); // createdListid 为 null
+      final registry = McpToolRegistry(buildMcpTools(
+        control: FakePlayerControl(),
+        library: FakeApiClient(),
+        libraryWrite: write,
+      ));
+      registry.confirmationEnabled = false;
+      final res = await registry.execute(
+          'md3_create_playlist', <String, Object?>{'name': '新歌单'});
+      expect(res.isError, isFalse);
+      final data = res.data! as Map<String, Object?>;
+      expect(data['created'], isTrue);
+      expect(data['listid'], isNull);
+    });
+
+    test('md3_get_my_playlists 投影 listid 供 add_song 使用', () async {
+      final library = FakeApiClient()
+        ..myPlaylists = const <KugouPlaylistBrief>[
+          KugouPlaylistBrief(
+            id: 'collection_3_1_1_0',
+            name: '工作专注',
+            songCount: 12,
+            globalCollectionId: 'collection_3_1_1_0',
+            listId: '8877',
+            type: 0,
+          ),
+          // listid 缺失的异常条目：兜底用 id，AI 仍能看到歌单
+          KugouPlaylistBrief(
+            id: 'gid-2',
+            name: '无 listid 歌单',
+            globalCollectionId: 'gid-2',
+            type: 0,
+          ),
+        ];
+      final registry = McpToolRegistry(buildMcpTools(
+        control: FakePlayerControl(),
+        library: library,
+      ));
+      final res =
+          await registry.execute('md3_get_my_playlists', <String, Object?>{});
+      expect(res.isError, isFalse);
+      final data = res.data! as Map<String, Object?>;
+      expect(data['count'], 2);
+      final items = data['items'] as List;
+      expect(items[0]['listid'], '8877');
+      expect(items[0]['name'], '工作专注');
+      expect(items[0]['song_count'], 12);
+      expect(items[1]['listid'], 'gid-2');
+    });
+
+    test('md3_get_my_playlists 空列表提示先建歌单', () async {
+      final registry = McpToolRegistry(buildMcpTools(
+        control: FakePlayerControl(),
+        library: FakeApiClient(),
+      ));
+      final res =
+          await registry.execute('md3_get_my_playlists', <String, Object?>{});
+      expect(res.isError, isTrue);
+      expect(res.text, contains('md3_create_playlist'));
+    });
+
+    test('md3_get_my_playlists limit 钳制在 1-30', () async {
+      final registry = McpToolRegistry(buildMcpTools(
+        control: FakePlayerControl(),
+        library: FakeApiClient(),
+      ));
+      final res = await registry.execute(
+          'md3_get_my_playlists', <String, Object?>{'limit': 99});
+      expect(res.isError, isTrue);
+      expect(res.text, contains('不能大于 30'));
+    });
+
+    test('KugouApiClientLibrarySource.getUserPlaylists 只保留可写歌单',
+        () async {
+      final fake = FakeApiClient()
+        ..userPlaylistRaw = <String, dynamic>{
+              'data': <String, dynamic>{
+                'info': <dynamic>[
+                  // 自己创建：保留
+                  <String, dynamic>{
+                    'listid': '8877',
+                    'specialname': '工作专注',
+                    'songcount': 12,
+                    'global_collection_id': 'collection_3_1_8877_0',
+                    'type': 0,
+                    'source': 0,
+                  },
+                  // 订阅他人歌单：不可写，剔除
+                  <String, dynamic>{
+                    'listid': '66',
+                    'specialname': '别人的精选',
+                    'songcount': 50,
+                    'type': 1,
+                    'source': 0,
+                  },
+                  // 系统「我喜欢」：走红心机制，剔除（与对话框同判定）
+                  <String, dynamic>{
+                    'listid': '2',
+                    'specialname': '我喜欢',
+                    'songcount': 187,
+                    'type': 0,
+                    'is_def': 2,
+                  },
+                  // 无 listid 用 id 兜底的场景仍保留
+                  <String, dynamic>{
+                    'specialid': 'sp-1',
+                    'specialname': '无 listid',
+                    'type': 0,
+                    'source': 0,
+                  },
+                ],
+              },
+            };
+      final source = KugouApiClientLibrarySource(fake);
+      final playlists = await source.getUserPlaylists();
+      expect(playlists.map((p) => p.name), ['工作专注', '无 listid']);
+      expect(playlists.first.listId, '8877');
+    });
+
+    test('KugouApiClientLibrarySource.getUserPlaylists 未登录/异常返回空',
+        () async {
+      // userPlaylistRaw 为 null（网关返回空 = 未登录/失败）
+      final source = KugouApiClientLibrarySource(FakeApiClient());
+      expect(await source.getUserPlaylists(), isEmpty);
+    });
+
     test('libraryWrite 未注入时不产生 library_write 组工具', () {
       final registry = McpToolRegistry(buildMcpTools(
         control: FakePlayerControl(),
@@ -1591,7 +1987,7 @@ void main() {
       expect(registry.find('md3_unfavorite_song'), isNull);
     });
 
-    test('装配 libraryWrite 后工具总数 39，含两个写工具', () {
+    test('装配 libraryWrite 后工具总数 40，含两个写工具', () {
       final registry = McpToolRegistry(buildMcpTools(
         control: FakePlayerControl(),
         library: FakeApiClient(),
@@ -1600,7 +1996,7 @@ void main() {
       ));
       final names =
           registry.visibleTools().map((t) => t.name).toList(growable: false);
-      expect(names, hasLength(39));
+      expect(names, hasLength(40));
       expect(names, contains('md3_add_song_to_playlist'));
       expect(names, contains('md3_create_playlist'));
       expect(names, isNot(contains('md3_favorite_song')));
@@ -1746,7 +2142,7 @@ void main() {
       expect(data['usb_device_available'], isFalse);
     });
 
-    test('装配 appFeatures 后工具总数 44，5 个工具归 app_features 组', () {
+    test('装配 appFeatures 后工具总数 45，5 个工具归 app_features 组', () {
       final registry = McpToolRegistry(buildMcpTools(
         control: FakePlayerControl(),
         library: FakeApiClient(),
@@ -1756,7 +2152,7 @@ void main() {
       ));
       final names =
           registry.visibleTools().map((t) => t.name).toList(growable: false);
-      expect(names, hasLength(44));
+      expect(names, hasLength(45));
       final appGroup =
           registry.visibleTools().where((t) => t.group == kMcpGroupAppFeatures);
       expect(
@@ -1784,7 +2180,7 @@ void main() {
       );
       expect(
         registry.visibleTools().map((t) => t.name).toList(growable: false),
-        hasLength(39),
+        hasLength(40),
       );
       expect(registry.find('md3_get_app_features'), isNull);
       expect(registry.find('md3_set_sleep_timer'), isNull);

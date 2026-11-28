@@ -3,9 +3,11 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart'
     show TargetPlatform, debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:material_ui/material_ui.dart';
+import 'package:provider/provider.dart';
 
 import '../build_flags.dart';
 import '../../data/repositories/settings_repository.dart';
+import '../../providers/theme_provider.dart';
 import '../../widgets/playlist_cover_flight_bus.dart';
 import '../../widgets/resizable_splitter.dart';
 import '../theme/app_dimens.dart';
@@ -219,8 +221,9 @@ class AdaptiveNav {
 
   static Future<T?> openDetail<T>(
     BuildContext context,
-    WidgetBuilder builder,
-  ) {
+    WidgetBuilder builder, {
+    bool lightweightTransition = false,
+  }) {
     final scope = DetailPaneScope._maybeOf(context);
     final detailNav = scope?.detailKey.currentState;
     // 点击发生在面板栈内部（如详情页里的「相似歌单」再开详情）：最近 Navigator
@@ -239,6 +242,7 @@ class AdaptiveNav {
       if (history != null && !history.replaying) history.invalidate();
       final route = _PaneDetailRoute<T>(
         builder: builder,
+        lightweightTransition: lightweightTransition,
         settings: RouteSettings(arguments: ForwardTag(builder)),
       );
       // 武装歌单封面连贯过渡：详情页加载期间页头（含封面 Hero）可能晚于整个
@@ -252,7 +256,14 @@ class AdaptiveNav {
     //
     // 中央内容导航（桌面 A 类）：最近的 Navigator 即当前 Tab 的中央栈；
     // 手机 / 竖屏：根 Navigator。两种情况都走 Navigator.push，行为不变。
-    return Navigator.of(context).push(MaterialPageRoute<T>(builder: builder));
+    return Navigator.of(context).push(lightweightTransition
+        ? _PaneDetailRoute<T>(
+            builder: builder,
+            lightweightTransition: true,
+            hidePreviousRoute: defaultTargetPlatform == TargetPlatform.android &&
+                Theme.of(context).scaffoldBackgroundColor == Colors.transparent,
+          )
+        : MaterialPageRoute<T>(builder: builder));
   }
 }
 
@@ -717,7 +728,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
                               ...widget.detailObservers,
                             ],
                             onGenerateRoute: (s) =>
-                                MaterialPageRoute<void>(
+                                _DetailBaseRoute<void>(
                               settings: s,
                               // tv: 双栏 tab 首次挂载时，本面板 Navigator 会
                               // didAdd 一条栈底空态路由；默认 requestFocus 会把
@@ -731,11 +742,7 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
                                       s.name == Navigator.defaultRouteName),
                               builder: (_) => _ResponsiveDetailBase(
                                 emptyState: widget.emptyState ??
-                                    DetailEmptyState(
-                                      color: transparentBackground
-                                          ? Colors.transparent
-                                          : null,
-                                    ),
+                                    const DetailEmptyState(),
                               ),
                             ),
                           ),
@@ -765,17 +772,13 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
                 child: Navigator(
                   key: _detailKey,
                   observers: widget.detailObservers,
-                  onGenerateRoute: (s) => MaterialPageRoute(
+                  onGenerateRoute: (s) => _DetailBaseRoute<void>(
                     settings: s,
                     // tv: 同响应式分支（见上方 onGenerateRoute 的说明）——
                     // 栈底空态路由不得在 TV 下抢顶栏焦点。
                     requestFocus:
                         !(kTvBuild && s.name == Navigator.defaultRouteName),
-                    builder: (_) => widget.emptyState ?? DetailEmptyState(
-                      color: transparentBackground
-                          ? Colors.transparent
-                          : null,
-                    ),
+                    builder: (_) => widget.emptyState ?? const DetailEmptyState(),
                   ),
                 ),
               ),
@@ -787,11 +790,66 @@ class _DesktopTwoPaneState extends State<DesktopTwoPane> {
   }
 }
 
-/// [AdaptiveNav.openDetail] 推入详情面板的专用路由：把 @protected 的进场/退场
-/// 动画对外暴露为 [transitionAnimation]，供 `_DesktopTwoPaneState` 判断
-/// 「转场是否收敛」以决定单栏态 master 列的藏匿时机（见 `_masterCovered`）。
+/// 详情栈底空态：不参与页面转场，不重复绘制全局壁纸。
+class _DetailBaseRoute<T> extends MaterialPageRoute<T> {
+  _DetailBaseRoute({required super.builder, super.settings, super.requestFocus});
+
+  @override
+  Widget buildTransitions(BuildContext context, Animation<double> animation,
+      Animation<double> secondaryAnimation, Widget child) {
+    // 栈底没有需要移动的页面：不能走全局 BgSafe 转场，否则会临时叠加
+    // 按面板尺寸裁切的壁纸，动画收敛时撤掉便产生一次亮度/底色跳变。
+    return AnimatedBuilder(
+      animation: secondaryAnimation,
+      child: child,
+      builder: (context, content) => Offstage(
+        offstage: secondaryAnimation.status != AnimationStatus.dismissed,
+        child: content,
+      ),
+    );
+  }
+}
+
+/// 详情路由对外暴露动画，供单栏态在转场结束后隐藏 master。
 class _PaneDetailRoute<T> extends MaterialPageRoute<T> {
-  _PaneDetailRoute({required super.builder, super.settings});
+  _PaneDetailRoute({required super.builder, super.settings,
+    this.lightweightTransition = false, this.hidePreviousRoute = false});
+
+  final bool lightweightTransition;
+  final bool hidePreviousRoute;
+
+  @override
+  Duration get transitionDuration => lightweightTransition
+      ? const Duration(milliseconds: 280) : super.transitionDuration;
+
+  @override
+  Duration get reverseTransitionDuration => lightweightTransition
+      ? const Duration(milliseconds: 260) : super.reverseTransitionDuration;
+
+  @override
+  Widget buildTransitions(BuildContext context, Animation<double> animation,
+      Animation<double> secondaryAnimation, Widget child) {
+    if (!lightweightTransition) {
+      return super.buildTransitions(context, animation, secondaryAnimation, child);
+    }
+    // 固定页面布局，只合成位移；透明壁纸页面不做半透明叠加，避免两页文字串影。
+    return SlideTransition(
+      position: Tween<Offset>(begin: const Offset(0, 0.015), end: Offset.zero)
+          .animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
+      child: RepaintBoundary(child: child),
+    );
+  }
+
+  // 手机单栏共享全局壁纸，转场期间只绘制详情，避免下层页面串影。
+  // 委托隐藏整棵旧页面，不另画局部壁纸，也不改变 Windows / 双栏。
+  @override
+  DelegatedTransitionBuilder? get delegatedTransition => hidePreviousRoute
+      ? (context, animation, secondaryAnimation, allowSnapshotting, child) =>
+          Offstage(
+            offstage: secondaryAnimation.status != AnimationStatus.dismissed,
+            child: child,
+          )
+      : super.delegatedTransition;
 
   Animation<double>? get transitionAnimation => animation;
 }
@@ -856,7 +914,7 @@ class _ResponsiveDetailBase extends StatelessWidget {
 ///
 /// 桌面外壳（[DesktopTwoPane]）与设置页 Pad 双列共用。默认参数保持
 /// 桌面外壳原行为；[icon]/[text] 可定制文案与图标，[color] 覆盖背景色
-/// （null = surface；悬浮于壁纸之上的页面传 [Colors.transparent]）。
+/// （null = 跟随当前主题：壁纸模式透明，否则 surface）。
 class DetailEmptyState extends StatelessWidget {
   const DetailEmptyState({
     super.key,
@@ -872,8 +930,14 @@ class DetailEmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    // 开关先于 AnimatedTheme 的颜色插值生效，首帧就清掉旧底色。
+    final wallpaper = context.select<ThemeProvider?, bool?>(
+      (theme) => theme?.useBackgroundImage,
+    ) ?? (Theme.of(context).scaffoldBackgroundColor.a < 1.0);
     return Material(
-      color: color ?? cs.surface,
+      // 壁纸透明度不再叠加 Material 默认的颜色补间，否则会残留旧实色一帧。
+      animationDuration: Duration.zero,
+      color: color ?? (wallpaper ? Colors.transparent : cs.surface),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,

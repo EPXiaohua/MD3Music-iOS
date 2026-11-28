@@ -23,6 +23,16 @@ SongMatchInfo? matchedInfoForLocal(BuildContext context, String localId) {
   }
 }
 
+/// 统一的「这首歌的匹配记录」读取入口（同步查内存；需先 ensureLoaded）。
+///
+/// 云盘歌曲（`isCloud`，id 为云盘文件 hash）与本地歌曲一样可以持有匹配记忆
+/// ——云盘 hash 非官方曲库 hash，匹配后歌词/评论才能精确检索；
+/// 纯在线歌曲（酷狗曲库直出）本身已是官方身份，恒返回 null。
+SongMatchInfo? matchInfoForSong(Song song) {
+  if (song.isOnline && !song.isCloud) return null;
+  return SongMatchRepository().get(song.id);
+}
+
 /// 本地歌曲 ↔ 在线歌曲匹配的状态入口。
 ///
 /// 包装 [SongMatchRepository] 提供 UI 可订阅的匹配状态，并内置自动匹配引擎：
@@ -66,9 +76,11 @@ class SongMatchProvider extends ChangeNotifier {
   /// 确保仓库内存缓存就绪（同步查询入口前的兜底；通常构造后即完成）。
   Future<void> ensureReady() => _repository.ensureLoaded();
 
-  /// 本地歌曲对应的在线歌曲（未匹配/在线歌曲返回 null）。同步查内存。
+  /// 本地歌曲对应的在线歌曲（未匹配/纯在线歌曲返回 null）。同步查内存。
+  ///
+  /// 云盘歌曲放行：云盘 hash 非官方 hash，命中匹配后可用于专辑跳转等在线能力。
   Song? matchedSongFor(Song song) {
-    if (song.isOnline) return null;
+    if (song.isOnline && !song.isCloud) return null;
     return matchedSongForId(song.id);
   }
 
@@ -141,6 +153,16 @@ class SongMatchProvider extends ChangeNotifier {
     await runAutoMatch(songs: songs);
   }
 
+  /// 云盘列表加载完成后触发自动匹配（云盘页调用）。
+  ///
+  /// 云盘歌曲 id 是云盘文件 hash 而非官方曲库 hash，需要匹配才能获得
+  /// 歌词/评论/专辑等在线能力。复用 [runAutoMatch] 的设置开关、7 天冷却、
+  /// dismissed 与 500ms 限速；引擎已运行时忽略。
+  Future<void> onCloudListLoaded(List<Song> cloudSongs) async {
+    if (_autoMatching) return;
+    await runAutoMatch(songs: cloudSongs);
+  }
+
   /// 全库自动匹配入口（启动延迟触发 / 扫描完成 / 设置页「立即匹配」）。
   ///
   /// [force] 为 true 时忽略设置开关与 7 天冷却（设置页手动触发用）。
@@ -158,7 +180,10 @@ class SongMatchProvider extends ChangeNotifier {
     final cooldownMs = SongMatchRepository.attemptCooldown.inMilliseconds;
     final pending = <Song>[];
     for (final song in all) {
-      if (song.isOnline || song.localPath == null) continue;
+      // 云盘歌曲无本地路径，但同样需要匹配（id 为云盘 hash 非官方 hash）；
+      // 本地歌曲必须可读文件（时长/内嵌歌词兜底依赖本地路径）。
+      if (song.isOnline && !song.isCloud) continue;
+      if (!song.isCloud && song.localPath == null) continue;
       final info = _repository.get(song.id);
       if (info != null && info.isMatched) continue;
       if (info != null && info.dismissed) continue;

@@ -1,20 +1,29 @@
 import 'package:dpad/dpad.dart';
+import 'package:flutter/gestures.dart' show TapGestureRecognizer;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../core/build_flags.dart';
+import '../core/platform_capabilities.dart' show isWindowsDesktop;
 import '../core/remote/tv_menu_key_shortcuts.dart';
 import '../core/services/lyrico_editor.dart';
 import '../core/utils/app_haptics.dart';
 import '../core/utils/app_toast.dart';
+import '../data/models/album.dart';
 import '../data/models/song.dart';
+import '../data/repositories/settings_repository.dart';
+import '../data/repositories/song_match_repository.dart';
+import '../modules/album/album_detail_page.dart';
+import '../modules/artist/artist_detail_page.dart';
 import '../modules/library/song_match_sheet.dart';
 import '../modules/player/comments_view.dart';
 import '../modules/player/song_accompany_sheet.dart';
 import '../modules/player/song_ranking_sheet.dart';
 import '../modules/sheet/song_sheet_sheet.dart';
-import '../modules/player/full_player_route.dart' show activePlayerRoute;
+import '../modules/player/full_player_route.dart'
+    show activePlayerRoute, openFullPlayer;
 import '../modules/player/mv_player_page.dart';
 import '../modules/player/player_cover_morph.dart' show PlayerCoverMorphBus;
 import '../providers/favorites_provider.dart';
@@ -22,12 +31,29 @@ import '../providers/blacklist_provider.dart';
 import '../providers/kugou_provider.dart';
 import '../providers/local_favorites_provider.dart';
 import '../providers/player_provider.dart';
+import '../services/kugou_api/kugou_api_client.dart';
 import 'add_to_playlist_dialog.dart';
+import 'menu_action_cell.dart';
 import 'play_next_flight.dart';
 import 'playing_spectrum_indicator.dart';
 import 'smart_artwork_image.dart';
 import 'song_menu_header.dart';
 import 'song_menu_info_badges.dart';
+
+/// 「复制歌名与歌手」写入剪贴板的文本（格式：`歌名 - 歌手`）。
+///
+/// 歌名取 [Song.displayName]（已剥离 `.mp3`/`.flac` 等扩展名后缀）；
+/// 歌手经 [isUnknownArtist] 判空（覆盖在线 `未知歌手` 与本地 `未知艺术家`），
+/// 缺省时退化为仅返回歌名——避免拼出 `歌名 - 未知歌手` 后缀。
+String formatSongCopyText(Song song) {
+  final title = song.displayName.trim();
+  if (isUnknownArtist(song.artist)) {
+    return title;
+  }
+  final artist = song.artist.trim();
+  if (title.isEmpty) return artist;
+  return '$title - $artist';
+}
 
 /// 歌曲行右侧操作区的呈现策略。
 ///
@@ -52,8 +78,11 @@ enum SongTrailingActions {
 }
 
 class SongListItem extends StatelessWidget {
-  /// 可选扩展：歌曲更多菜单的额外条目（默认关闭，由私有构建注入）。
-  /// 返回的 Widget 追加在菜单底部（「下一首播放」之前）。
+  /// 更多菜单宫格每行的列数（与播放页右上角菜单宫格同款四列布局）。
+  static const int _menuGridColumns = 4;
+
+  /// 可选扩展：歌曲更多菜单的额外条目（默认关闭，由宿主注入）。
+  /// 返回的 Widget 追加在菜单底部（收纳宫格之后）。
   static List<Widget> Function(BuildContext context, Song song)?
       extraMenuTilesBuilder;
 
@@ -65,10 +94,19 @@ class SongListItem extends StatelessWidget {
 
   /// 右侧操作区呈现策略，默认完整操作（见 [SongTrailingActions]）。
   final SongTrailingActions trailingActions;
+  /// 排序模式等场景替换整个右侧操作区。
+  final Widget? trailingOverride;
 
   /// 可选副标题覆盖：非空时替换默认的「歌手 - 专辑」行
   /// （如歌词搜索结果用于显示命中的歌词片段）。
   final Widget? subtitleOverride;
+
+  /// 副标题「歌手」分段的点击回调（可选，默认 null）。
+  ///
+  /// 两个回调都为 null 时副标题保持原来的单条纯文本渲染，既有调用方行为不变；
+  /// 任一非空时才把副标题拆成「歌手」「专辑」两段可点文本。
+  final VoidCallback? onArtistTap;
+  final VoidCallback? onAlbumTap;
 
   /// 多选模式：显示圆形复选框替代封面，点击切换选中而非播放。
   final bool isSelectMode;
@@ -88,7 +126,10 @@ class SongListItem extends StatelessWidget {
     this.showDuration = true,
     this.forceFavorited = false,
     this.trailingActions = SongTrailingActions.full,
+    this.trailingOverride,
     this.subtitleOverride,
+    this.onArtistTap,
+    this.onAlbumTap,
     this.isSelectMode = false,
     this.isSelected = false,
     this.onLongPress,
@@ -109,6 +150,155 @@ class SongListItem extends StatelessWidget {
     }
   }
 
+  /// 本地歌曲命中匹配记忆时返回对应的在线歌曲（歌手/专辑跳转用在线 id）。
+  /// 在线歌曲或未匹配时原样返回（口径同播放页 full_player 的同名方法）。
+  Song _resolveMatchedSong(Song song) {
+    if (song.isOnline) return song;
+    final info = SongMatchRepository().get(song.id);
+    return (info != null && info.isMatched) ? info.toSong() : song;
+  }
+
+  /// 从菜单跳转到歌曲所在歌手页（多歌手处理同播放页口径）：
+  /// 单歌手直接用 song.artistId 跳转；多位歌手弹二级 Sheet 让用户选择，
+  /// 非首位歌手通过 searchArtists 接口查询 ID 后跳转。
+  void _viewArtist(BuildContext itemContext) {
+    // 本地歌曲命中匹配记忆时用在线歌手信息（本地文件通常无 artistId）
+    final resolved = _resolveMatchedSong(song);
+    final artists = splitSongArtistNames(resolved.artist);
+    if (artists.isEmpty) {
+      showToast('暂无歌手信息', long: true);
+      return;
+    }
+    // 单歌手：直接跳转
+    if (artists.length == 1) {
+      _pushArtistPage(itemContext, resolved.artistId, artists.first);
+      return;
+    }
+    // 多位歌手：弹出二级菜单让用户选择
+    _showArtistSelector(itemContext, resolved, artists);
+  }
+
+  /// 弹出歌手选择 BottomSheet（多位歌手场景，见播放页 _showArtistSelector）。
+  /// 第一位歌手直接使用 song.artistId 跳转；其他歌手按名搜索后跳转。
+  void _showArtistSelector(
+    BuildContext itemContext,
+    Song song,
+    List<String> artists,
+  ) {
+    showM3EModalBottomSheet(
+      context: itemContext,
+      // 与本菜单其他弹层一致用实色背景，避免压在封面/壁纸上时内容透底难辨。
+      backgroundColor: Theme.of(itemContext).colorScheme.surfaceContainerLow,
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  '选择歌手',
+                  style: Theme.of(itemContext).textTheme.titleMedium,
+                ),
+              ),
+              ...artists.map((name) {
+                return ListTile(
+                  leading: const Icon(Icons.person),
+                  title: Text(name),
+                  onTap: () {
+                    Navigator.pop(sheetCtx);
+                    // 第一位歌手直接用 song.artistId（数据已存在）
+                    if (name == artists.first) {
+                      _pushArtistPage(itemContext, song.artistId, name);
+                    } else {
+                      // 其他歌手需要先搜索查询 ID
+                      _pushArtistPageByName(itemContext, name);
+                    }
+                  },
+                );
+              }),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// 通过歌手名搜索后跳转歌手详情页。
+  /// 显示 loading → 调用 searchArtists → 取第一个匹配 → 跳转。
+  Future<void> _pushArtistPageByName(
+    BuildContext itemContext,
+    String name,
+  ) async {
+    // 显示 loading
+    showDialog<void>(
+      context: itemContext,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: M3ELoadingIndicator()),
+    );
+    // showDialog 装在根 Navigator 上，await 后仍要关掉，先捕获引用
+    final navigator = Navigator.of(itemContext, rootNavigator: true);
+    void Function()? pendingPush;
+    try {
+      final api = KugouApiClient();
+      final result = await api.searchArtists(name, pagesize: 5);
+      if (result == null || result.isEmpty) {
+        showToast('未找到歌手「$name」', long: true);
+        return;
+      }
+      final artist = result.first;
+      // 跳转要用 context，且必须等 loading 关掉后再 push，故先存起来
+      pendingPush = () => _pushArtistPage(itemContext, artist.id, artist.name);
+    } catch (e) {
+      showToast('搜索歌手失败：$e', long: true);
+    } finally {
+      navigator.pop(); // 关闭 loading
+    }
+    pendingPush?.call();
+  }
+
+  /// 实际 push 歌手详情页（根 Navigator，与同菜单 MV 条目的跳转方式一致）。
+  void _pushArtistPage(
+    BuildContext itemContext,
+    String? artistId,
+    String artistName,
+  ) {
+    if (artistId == null || artistId.isEmpty) {
+      showToast('暂无歌手信息', long: true);
+      return;
+    }
+    Navigator.of(itemContext, rootNavigator: true).push(
+      MaterialPageRoute(
+        builder: (_) => ArtistDetailPage(
+          artistId: artistId,
+          artistName: artistName,
+          avatarUrl: null,
+        ),
+      ),
+    );
+  }
+
+  /// 从菜单跳转到歌曲所在专辑页。
+  /// 本地歌曲命中匹配记忆时用在线专辑信息（本地文件通常无 albumId）。
+  void _viewAlbum(BuildContext itemContext) {
+    final resolved = _resolveMatchedSong(song);
+    final albumId = resolved.albumId;
+    if (albumId == null || albumId.isEmpty) {
+      showToast('暂无专辑信息', long: true);
+      return;
+    }
+    final album = Album(
+      id: albumId,
+      name: resolved.album.isNotEmpty ? resolved.album : song.album,
+      artist: resolved.artist.isNotEmpty ? resolved.artist : song.artist,
+      artworkUri: resolved.artworkUri ?? song.artworkUri,
+      songCount: 0,
+    );
+    Navigator.of(itemContext, rootNavigator: true).push(
+      MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)),
+    );
+  }
+
   void _showMoreMenu(BuildContext context) {
     // 「下一首播放」的菜单内收缩控制器：每次打开菜单新建一次。
     final shrinkController = SongMenuHeaderShrinkController();
@@ -116,22 +306,29 @@ class SongListItem extends StatelessWidget {
     var playNextStarted = false;
     showM3EModalBottomSheet(
       context: context,
+      // 收纳成宫格后仍有宿主注入的条目在最下方，放开高度限制并让内容可滚动，
+      // 避免小屏/横屏 RenderFlex overflow（与播放页右上角菜单同款）。
+      isScrollControlled: true,
       // 「更多」菜单改为实色：全局 M3E 弹层主题默认用 0.97 alpha 让背景图
       // 透出，这里显式给不透明色，避免菜单压在封面/壁纸上时内容难以辨认。
       backgroundColor: Theme.of(context).colorScheme.surfaceContainerLow,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // 头部：圆角矩形封面 + 歌名/歌手/专辑 + 信息徽章（时长/音质/大小/VIP）
-            SongMenuHeader(
-              song: song,
-              shrinkController: shrinkController,
-              infoFetcher: _menuInfoFetcher(context),
-            ),
-            const Divider(height: 1),
+      builder: (ctx) {
+        final colorScheme = Theme.of(ctx).colorScheme;
+        // 各条目的门控条件与收纳前逐条一致，先一次求值再分派到宫格分组。
+        final hasComments = context.read<PlayerProvider>().showsCommentsFor(
+          song,
+        );
+        final hasAudioId =
+            song.albumAudioId != null && song.albumAudioId!.isNotEmpty;
+        final isLocalWithFile = !song.isOnline && song.localPath != null;
+
+        // 宫格分组（每组一行、最多四格，参照播放页右上角菜单的收纳方式）：
+        // 一行动作主入口、二行内容与社区、三行本地与其他低频操作。
+        final groups = <List<Widget>>[
+          <Widget>[
             // 收藏 / 取消收藏：详情面板内实时状态。搜索结果的收藏入口即在此
             // （列表行不再放独立收藏按钮），其他场景作为附加操作也无害。
+            // 不 pop 弹层：点完原地变成「取消收藏」，与收纳前的 ListTile 同款。
             Consumer2<FavoritesProvider, LocalFavoritesProvider>(
               builder: (ctx2, favorites, localFavorites, _) {
                 final favorited = forceFavorited
@@ -139,55 +336,37 @@ class SongListItem extends StatelessWidget {
                     : (song.isOnline
                         ? favorites.isFavorite(song.id)
                         : localFavorites.isFavorite(song.id));
-                final cs = Theme.of(ctx2).colorScheme;
-                return ListTile(
-                  leading: Icon(
-                    favorited ? Icons.favorite : Icons.favorite_border,
-                    color: favorited ? cs.error : null,
-                  ),
-                  title: Text(favorited ? '取消收藏' : '收藏'),
+                return MenuActionCell(
+                  icon: favorited
+                      ? Icons.favorite
+                      : Icons.favorite_border,
+                  label: favorited ? '取消收藏' : '收藏',
+                  active: favorited,
                   onTap: () => song.isOnline
                       ? favorites.toggleFavorite(song)
                       : localFavorites.toggleFavorite(song.id),
                 );
               },
             ),
-            // 本地音乐（有本地文件路径）：提供 Lyrico 外部编辑入口（公开功能）
-            if (!song.isOnline && song.localPath != null)
-              ListTile(
-                leading: const Icon(Icons.edit_outlined),
-                title: const Text('编辑歌曲信息'),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  final r = await LyricoEditor.launchLyricoEdit(song.localPath!);
-                  if (!r.installed) {
-                    showToast('未安装 Lyrico，请先安装后再编辑', long: true);
-                  } else if (!r.launched) {
-                    showToast('无法打开 Lyrico 编辑', long: true);
-                  }
-                },
-              ),
-            // 本地音乐：匹配在线歌曲，补充封面兜底/歌词精确检索/评论区
-            if (!song.isOnline && song.localPath != null)
-              ListTile(
-                leading: const Icon(Icons.manage_search),
-                title: const Text('匹配在线信息'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  showSongMatchSheet(context, song);
-                },
-              ),
+            MenuActionCell(
+              icon: Icons.playlist_add,
+              label: '下一首播放',
+              active: false,
+              onTap: () {
+                if (playNextStarted) return;
+                playNextStarted = true;
+                _playNextWithFlight(ctx, context, shrinkController);
+              },
+            ),
             if (song.isOnline)
-              ListTile(
-                leading: const Icon(Icons.music_video_outlined),
-                title: const Text('查看 MV'),
+              MenuActionCell(
+                // 与紧邻的「下一首播放」(playlist_add) 区分图标，避免同图标相邻
+                icon: Icons.add_to_queue_outlined,
+                label: '添加到歌单',
+                active: false,
                 onTap: () {
                   Navigator.pop(ctx);
-                  Navigator.of(
-                    context,
-                    rootNavigator: true).push(
-                    MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
-                  );
+                  showAddToPlaylistDialog(context, song);
                 },
               ),
             // 内容黑名单（在线歌曲）：「不感兴趣 / 取消不感兴趣」。黑名单内容
@@ -200,13 +379,12 @@ class SongListItem extends StatelessWidget {
                   final present =
                       blacklist.statusFor('song', song.id.toLowerCase()) ==
                           BlacklistStatus.present;
-                  return ListTile(
-                    leading: Icon(
-                      present
-                          ? Icons.thumb_up_off_alt
-                          : Icons.thumb_down_off_alt,
-                    ),
-                    title: Text(present ? '取消不感兴趣' : '不感兴趣'),
+                  return MenuActionCell(
+                    icon: present
+                        ? Icons.thumb_up_off_alt
+                        : Icons.thumb_down_off_alt,
+                    label: present ? '取消不感兴趣' : '不感兴趣',
+                    active: present,
                     onTap: () {
                       Navigator.pop(ctx);
                       if (present) {
@@ -218,70 +396,198 @@ class SongListItem extends StatelessWidget {
                   );
                 },
               ),
-            // 可选扩展：私有构建注入的额外菜单条目（默认无）
-            ...?SongListItem.extraMenuTilesBuilder?.call(ctx, song),
+          ],
+          <Widget>[
             if (song.isOnline)
-              ListTile(
-                // 与紧邻的「下一首播放」(playlist_add) 区分图标，避免同图标相邻
-                leading: const Icon(Icons.add_to_queue_outlined),
-                title: const Text('添加到歌单'),
+              MenuActionCell(
+                icon: Icons.music_video_outlined,
+                label: 'MV',
+                active: false,
                 onTap: () {
                   Navigator.pop(ctx);
-                  showAddToPlaylistDialog(context, song);
+                  Navigator.of(
+                    context,
+                    rootNavigator: true).push(
+                    MaterialPageRoute(builder: (_) => MvPlayerPage(song: song)),
+                  );
                 },
               ),
-            ListTile(
-              leading: const Icon(Icons.playlist_add),
-              title: const Text('下一首播放'),
-              onTap: () {
-                if (playNextStarted) return;
-                playNextStarted = true;
-                _playNextWithFlight(ctx, context, shrinkController);
-              },
-            ),
             // 在线歌曲恒提供；本地歌曲由「关闭本地音乐评论区」开关决定
-            if (context.read<PlayerProvider>().showsCommentsFor(song))
-              ListTile(
-                leading: const Icon(Icons.comment_outlined),
-                title: const Text('看评论'),
+            if (hasComments)
+              MenuActionCell(
+                icon: Icons.comment_outlined,
+                label: '评论',
+                active: false,
                 onTap: () {
                   Navigator.pop(ctx);
                   showSongCommentsSheet(context, song);
                 },
               ),
             // 成绩单依赖 album_audio_id（本地歌曲缺席该字段时隐藏入口）
-            if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
-              ListTile(
-                leading: const Icon(Icons.leaderboard_outlined),
-                title: const Text('看成绩单'),
+            if (hasAudioId)
+              MenuActionCell(
+                icon: Icons.leaderboard_outlined,
+                label: '成绩单',
+                active: false,
                 onTap: () {
                   Navigator.pop(ctx);
                   showSongRankingSheet(context, song);
                 },
               ),
-            // 伴奏匹配同样依赖 album_audio_id（与看成绩单同门控）
-            if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
-              ListTile(
-                leading: const Icon(Icons.mic_none),
-                title: const Text('获取伴奏'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  showSongAccompanySheet(context, song);
-                },
-              ),
             // 曲谱同样依赖 album_audio_id（/sheet/song 查询键）
-            if (song.albumAudioId != null && song.albumAudioId!.isNotEmpty)
-              ListTile(
-                leading: const Icon(Icons.library_music_outlined),
-                title: const Text('看曲谱'),
+            if (hasAudioId)
+              MenuActionCell(
+                icon: Icons.library_music_outlined,
+                label: '曲谱',
+                active: false,
                 onTap: () {
                   Navigator.pop(ctx);
                   showSongSheetSheet(context, song);
                 },
               ),
           ],
-        ),
-      ),
+          // 跳转组：查看歌手 / 查看专辑（多歌手处理同播放页口径，见 _viewArtist）
+          <Widget>[
+            MenuActionCell(
+              icon: Icons.person_outline,
+              label: '查看歌手',
+              active: false,
+              onTap: () {
+                Navigator.pop(ctx);
+                _viewArtist(context);
+              },
+            ),
+            MenuActionCell(
+              icon: Icons.album_outlined,
+              label: '查看专辑',
+              active: false,
+              onTap: () {
+                Navigator.pop(ctx);
+                _viewAlbum(context);
+              },
+            ),
+          ],
+          <Widget>[
+            // 复制歌名与歌手：仅手机与桌面端展示（TV 端无剪贴板粘贴场景）
+            if (!kTvBuild)
+              MenuActionCell(
+                icon: Icons.copy_outlined,
+                label: '复制',
+                active: false,
+                onTap: () async {
+                  AppHaptics.click(HapticCategory.listItem);
+                  final text = formatSongCopyText(song);
+                  Navigator.pop(ctx);
+                  await Clipboard.setData(ClipboardData(text: text));
+                  showToast('已复制: $text');
+                },
+              ),
+            // 本地音乐（有本地文件路径）：提供 Lyrico 外部编辑入口（公开功能）
+            if (isLocalWithFile)
+              MenuActionCell(
+                icon: Icons.edit_outlined,
+                label: '编辑信息',
+                active: false,
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final r = await LyricoEditor.launchLyricoEdit(song.localPath!);
+                  if (!r.installed) {
+                    showToast('未安装 Lyrico，请先安装后再编辑', long: true);
+                  } else if (!r.launched) {
+                    showToast('无法打开 Lyrico 编辑', long: true);
+                  }
+                },
+              ),
+            // 本地音乐（有本地文件路径）/ 云盘歌曲：匹配在线歌曲，
+            // 补充封面兜底/歌词精确检索/评论区
+            if (isLocalWithFile || song.isCloud)
+              MenuActionCell(
+                icon: Icons.manage_search,
+                label: '匹配在线',
+                active: false,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showSongMatchSheet(context, song);
+                },
+              ),
+            // 伴奏匹配同样依赖 album_audio_id（与看成绩单同门控）；
+            // 伴唱功能总开关关闭时连入口一起隐藏。
+            if (hasAudioId && SettingsRepository.accompanyFeatureEnabled.value)
+              MenuActionCell(
+                icon: Icons.mic_none,
+                label: '获取伴奏',
+                active: false,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showSongAccompanySheet(context, song);
+                },
+              ),
+          ],
+        ];
+        final rows = groups.where((group) => group.isNotEmpty).toList();
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 头部：圆角矩形封面 + 歌名/歌手/专辑 + 信息徽章（时长/音质/大小/VIP）
+                SongMenuHeader(
+                  song: song,
+                  shrinkController: shrinkController,
+                  infoFetcher: _menuInfoFetcher(context),
+                ),
+                const Divider(height: 1),
+                if (rows.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colorScheme.surfaceContainerHighest.withValues(
+                        alpha: 0.5,
+                      ),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < rows.length; i++) ...[
+                          // 行分割线（与容器左右内边距对齐），首行之前不放
+                          if (i > 0)
+                            Container(
+                              height: 1,
+                              margin: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 8,
+                              ),
+                              color: colorScheme.outlineVariant.withValues(
+                                alpha: 0.5,
+                              ),
+                            ),
+                          Row(
+                            children: [
+                              ...rows[i],
+                              // 不足四格用空位补齐，保证各行列宽一致
+                              for (
+                                var j = rows[i].length;
+                                j < _menuGridColumns;
+                                j++
+                              )
+                                const Expanded(child: SizedBox()),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                // 可选扩展：宿主注入的额外菜单条目（默认无）
+                ...?SongListItem.extraMenuTilesBuilder?.call(ctx, song),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -402,6 +708,13 @@ class SongListItem extends StatelessWidget {
     final tapHandler = isSelectMode ? onSelectToggle : onTap;
     final longPressHandler = onLongPress;
 
+    // 副标题样式：可点分支与纯文本分支共用，保证行高/配色完全一致。
+    final metaStyle = textTheme.labelSmall?.copyWith(
+      color: isCurrentSong
+          ? colorScheme.primary.withValues(alpha: 0.7)
+          : colorScheme.onSurfaceVariant,
+    );
+
     final row = InkWell(
       onTap: tapHandler == null
           ? null
@@ -453,22 +766,28 @@ class SongListItem extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   subtitleOverride ??
-                      Text(
-                        '${song.artist} - ${song.album}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: textTheme.labelSmall?.copyWith(
-                          color: isCurrentSong
-                              ? colorScheme.primary.withValues(alpha: 0.7)
-                              : colorScheme.onSurfaceVariant,
-                        ),
-                      ),
+                      ((onArtistTap == null && onAlbumTap == null)
+                          ? Text(
+                              '${song.artist} - ${song.album}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: metaStyle,
+                            )
+                          : _TappableSongMeta(
+                              artist: song.artist,
+                              album: song.album,
+                              onArtistTap: onArtistTap,
+                              onAlbumTap: onAlbumTap,
+                              style: metaStyle,
+                            )),
                 ],
               ),
             ),
 
             // 右侧操作区：多选模式下不显示
-            if (!isSelectMode)
+            if (trailingOverride != null)
+              trailingOverride!
+            else if (!isSelectMode)
               Row(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.center,
@@ -502,7 +821,8 @@ class SongListItem extends StatelessWidget {
 
     // tv: TV 构建下整行单停点（DpadFocusable 默认 excludeChildFocus: true，
     // 内层 InkWell 不再产生第二个停点，无需 canRequestFocus=false 手法）；
-    // OK=播放/切换选中，OK 长按=上下文菜单（页面可经 onContextMenuOverride 重定向）。
+    // OK=播放/切换选中/当前播放行进 FullPlayer，OK 长按=上下文菜单
+    // （页面可经 onContextMenuOverride 重定向）。
     if (kTvBuild) {
       // tv: 遥控菜单键=直接开本行「更多菜单」（与行尾三个点同源
       // [_showMoreMenu]），不走 _tvContextAction 优先级链——那是 OK 长按的
@@ -515,11 +835,40 @@ class SongListItem extends StatelessWidget {
               ? null
               : () {
                   AppHaptics.click(HapticCategory.listItem);
+                  // tv: 焦点在「正在播放的歌」行上时，OK 直接进入
+                  // FullPlayer 而不是重播该行（[openFullPlayer] 自带
+                  // 防重复入栈与车机守卫）；多选模式保持切换选中语义。
+                  if (!isSelectMode && isCurrentSong) {
+                    openFullPlayer(context);
+                    return;
+                  }
                   tapHandler();
                 },
           onLongSelect: _tvContextAction(context),
           child: row,
         ),
+      );
+    }
+    // Windows 鼠标右键：弹出与行尾三点**同一个**菜单（[_showMoreMenu]）。
+    //
+    // 三重门控：TV 无鼠标右键（编译期常量，TV 包里这段进不来）；平台用
+    // isWindowsDesktop（不用 Platform.isWindows —— 后者在 Windows 宿主跑
+    // `flutter test` 时同样为 true，会把宿主平台泄漏进本该跑 Android 语义的测试）；
+    // _hasMoreMenu 保证「看不见三点按钮的行」右键也不凭空给菜单（多选模式 /
+    // 每日推荐 favoriteOnly 档）。
+    //
+    // 为什么用 onSecondaryTap（抬起）而非 onSecondaryTapDown：
+    // 1) DragGestureRecognizer 不做按键过滤（只比 _initialButtons），右键拖动列表
+    //    会被拖拽识别器接管；用 Down 会出现「右键滚一下列表，菜单照弹」。
+    // 2) 与 Windows 资源管理器一致（WM_RBUTTONUP 弹菜单），指针抬起后再 push 模态路由。
+    // 3) InkWell 的 TapGestureRecognizer 按 event.buttons 过滤（次键直接拒绝），
+    //    所以右键不会误触 onTap / onLongPress，多选模式的选中切换同样免疫。
+    // 显式 opaque：只读行（onTap 为 null）也要能右键，别把命中判定托付给子级。
+    if (!kTvBuild && isWindowsDesktop && _hasMoreMenu) {
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onSecondaryTap: () => _showMoreMenu(context),
+        child: row,
       );
     }
     return row;
@@ -714,6 +1063,100 @@ class SongListItem extends StatelessWidget {
                 ),
               ),
       ),
+    );
+  }
+}
+
+/// 副标题「歌手 - 专辑」的可点版本。
+///
+/// 仅在 [SongListItem.onArtistTap] / [SongListItem.onAlbumTap] 非空时使用。
+/// [TapGestureRecognizer] 由 State 持有并在 [dispose] 释放，不能在 build 里新建
+/// （否则每次重建都会漏一个识别器）。
+class _TappableSongMeta extends StatefulWidget {
+  const _TappableSongMeta({
+    required this.artist,
+    required this.album,
+    required this.style,
+    this.onArtistTap,
+    this.onAlbumTap,
+  });
+
+  final String artist;
+  final String album;
+  final TextStyle? style;
+  final VoidCallback? onArtistTap;
+  final VoidCallback? onAlbumTap;
+
+  @override
+  State<_TappableSongMeta> createState() => _TappableSongMetaState();
+}
+
+class _TappableSongMetaState extends State<_TappableSongMeta> {
+  TapGestureRecognizer? _artistRecognizer;
+  TapGestureRecognizer? _albumRecognizer;
+
+  @override
+  void initState() {
+    super.initState();
+    _bindRecognizers();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TappableSongMeta oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.onArtistTap != widget.onArtistTap ||
+        oldWidget.onAlbumTap != widget.onAlbumTap) {
+      _disposeRecognizers();
+      _bindRecognizers();
+    }
+  }
+
+  void _bindRecognizers() {
+    final onArtistTap = widget.onArtistTap;
+    if (onArtistTap != null) {
+      _artistRecognizer = TapGestureRecognizer()
+        ..onTap = () {
+          AppHaptics.click(HapticCategory.listItem);
+          onArtistTap();
+        };
+    }
+    final onAlbumTap = widget.onAlbumTap;
+    if (onAlbumTap != null) {
+      _albumRecognizer = TapGestureRecognizer()
+        ..onTap = () {
+          AppHaptics.click(HapticCategory.listItem);
+          onAlbumTap();
+        };
+    }
+  }
+
+  void _disposeRecognizers() {
+    _artistRecognizer?.dispose();
+    _artistRecognizer = null;
+    _albumRecognizer?.dispose();
+    _albumRecognizer = null;
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 与纯文本分支保持同一串文案（含分隔符），保证行高与省略行为不变。
+    return Text.rich(
+      TextSpan(
+        children: [
+          TextSpan(text: widget.artist, recognizer: _artistRecognizer),
+          const TextSpan(text: ' - '),
+          TextSpan(text: widget.album, recognizer: _albumRecognizer),
+        ],
+      ),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: widget.style,
     );
   }
 }

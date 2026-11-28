@@ -31,7 +31,7 @@ class PlayerTabItem {
   /// 无障碍朗读名（图标按钮在 TalkBack 下的名称；圆点形态的唯一语义）
   final String? label;
 
-  /// 长按动作（如封面段长按下载、歌词段长按桌面歌词）
+  /// 长按动作（如封面段的自定义长按动作、歌词段长按桌面歌词）
   final VoidCallback? onLongPress;
 }
 
@@ -45,7 +45,7 @@ class PlayerTabItem {
 /// 三个布尔量代替 `PlayerTabLayout` 参数是有意的 ——  widget 层不该反向依赖
 /// `modules/player/` 的类型。
 ///
-/// [coverOnLongPress] 必须由宿主注入并且**不在这里读宿主静态字段**：封面段的下载钩子
+/// [coverOnLongPress] 必须由宿主注入并且**不在这里读宿主静态字段**：封面段的长按回调
 /// 挂在 `FullPlayer.coverLongPressCallback` / `AmStyleFullPlayer.coverLongPressCallback`
 /// 两个各自的静态上，共享代码一旦去读其中任意一个，另一版的长按就会静默失灵。
 List<PlayerTabItem> buildPlayerTabItems({
@@ -63,7 +63,7 @@ List<PlayerTabItem> buildPlayerTabItems({
       PlayerTabItem(
         icon: Icons.album,
         label: '封面',
-        // 长按封面段：弹出下载音质选择（本地歌曲由调用侧屏蔽）
+        // 长按封面段：交给宿主注入的回调（本地歌曲由调用侧屏蔽）
         onLongPress: coverOnLongPress,
       ),
     // 控制 tab 只在宽屏出现；宽屏形态随「顶栏页签圆点」开关变（默认 icon），清单不读
@@ -114,6 +114,7 @@ class PlayerTabStrip extends StatelessWidget {
     this.onDragUpdate,
     this.onDragEnd,
     this.onSegmentWidth,
+    this.instantDesktopTap = false,
   });
 
   final TabController controller;
@@ -150,6 +151,9 @@ class PlayerTabStrip extends StatelessWidget {
 
   /// 回传单段宽度，供外部换算拖动位移 → tab offset
   final ValueChanged<double>? onSegmentWidth;
+
+  /// 桌面点击切换直接落页，避免重型播放页内容随整段横向滑动逐帧重排。
+  final bool instantDesktopTap;
 
   /// 指示线宽度
   static const double _indicatorWidth = 18;
@@ -238,7 +242,11 @@ class PlayerTabStrip extends StatelessWidget {
         onTap: () {
           if (controller.index != index) {
             AppHaptics.tick(HapticCategory.navigation);
-            controller.animateTo(index);
+            if (instantDesktopTap) {
+              controller.index = index;
+            } else {
+              controller.animateTo(index);
+            }
           }
         },
         // 不挂 Tooltip：长按只执行长按动作，不弹按钮说明

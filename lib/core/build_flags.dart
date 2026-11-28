@@ -3,8 +3,24 @@
 ///
 /// - MD3_TV：TV 版包体（--flavor tv）。TV 版启用 dpad 遥控导航，
 ///   排除 3D 封面 / USB 独占输出 / 实时歌词推送。正常版不定义此旗标（默认 false）。
+/// - MD3_FULL：全功能包（--flavor full）。同时启用 3D 封面与端侧分离，
+///   两类推理运行时（ORT / tflite）与模型资产都随包；lite 包不定义（默认 false）。
 /// 与既有的 ENABLE_DEPTH_3D（lib/core/services/depth_cover_feature.dart）同一模式。
 const bool kTvBuild = bool.fromEnvironment('MD3_TV');
+
+/// 全功能包（lite 包恒 false）。
+///
+/// lite（默认/对外公开）不含 3D 封面与端侧分离：APK 里没有 onnxruntime / tflite
+/// 运行时，也没有深度模型与分离模型；Dart 侧靠本旗标把两块功能整段树摇剔除
+/// （不只是运行时置灰，连相关 UI 代码都不编进包）。
+const bool kFullBuild = bool.fromEnvironment('MD3_FULL');
+
+/// 端侧人声/伴奏分离是否编入当前构建。
+///
+/// 分离的**运行时**可用性仍由 `StemSeparationService.available` 判定（模型是否
+/// 随包 / 是否为 Android）；本旗标是**编译期**闸门：lite 下相关 UI 与调用点被
+/// const 折叠掉，不会留下「入口看得见但点了没声」的入口。
+const bool kStemSeparationAvailable = kFullBuild;
 
 /// tv: TV overscan 安全边距上限（dp）。
 ///

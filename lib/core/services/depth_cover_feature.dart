@@ -1,10 +1,15 @@
 /// 3D 深度封面功能开关（编译期常量，非运行时配置）。
 ///
-/// 仅 `depth3d` flavor 的构建命令携带
-/// `--dart-define=ENABLE_DEPTH_3D=true`，此时 APK 内含
-/// libonnxruntime.so 与深度模型资产；`standard` flavor 不携带
-/// 任何 3D 相关产物，Dart 侧据此整体隐藏该功能（设置项/生成请求）。
+/// 两个来源：
+/// - `--dart-define=MD3_FULL=true`（Android `full` flavor）：全功能包，3D 封面与
+///   端侧分离一起随包；
+/// - `--dart-define=ENABLE_DEPTH_3D=true`（Windows `scripts\md3.ps1 windows -With3D`
+///   与既有 3D 单测仍用它，保留兼容）。
+///
+/// `lite` flavor（默认/对外公开）两个 define 都不带，APK 里既没有 libonnxruntime.so
+/// 也没有深度模型资产，Dart 侧据此整体隐藏该功能（设置项/生成请求）。
 const bool kDepthCoverAvailable =
+    bool.fromEnvironment('MD3_FULL') ||
     bool.fromEnvironment('ENABLE_DEPTH_3D');
 
 /// 深度推理后端（编译期常量）：

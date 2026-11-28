@@ -1,11 +1,10 @@
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/utils/app_toast.dart';
+import 'github_release_client.dart';
 
-// 上游项目主页（Android/Windows 共用）。iOS 移植版走各自入口
-// （settings_page 的 EPXiaohua/MD3Music-iOS releases / 项目仓库链接），
-// 不引用本常量，故此处保持 const 字面量而非引用 GithubReleaseClient.owner。
-const updateProjectUrl = 'https://github.com/zzyoxml/md3Music';
+const updateProjectUrl =
+    'https://github.com/${GithubReleaseClient.owner}/${GithubReleaseClient.repo}';
 const updateMirrorWebsiteUrl =
     'https://git.hiwiki.org/zh-CN/repo/zzyoxml/md3music';
 

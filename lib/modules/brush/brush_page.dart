@@ -452,6 +452,8 @@ class _BrushPageState extends State<BrushPage> {
               ? CachedNetworkImage(
                   imageUrl: card.coverUrl!,
                   fit: BoxFit.cover,
+                  // P0-A: 56dp 缩略图按 3× 档解码，避免原图全分辨率位图。
+                  memCacheWidth: 168,
                   errorWidget: (_, _, _) => _placeholder(cs),
                 )
               : _placeholder(cs),

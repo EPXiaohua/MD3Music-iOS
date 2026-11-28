@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../../core/build_flags.dart';
-import '../../core/platform_capabilities.dart';
 import '../../core/remote/remote_slider.dart';
 import '../../core/services/desktop_lyric_service.dart';
 import '../../core/theme/app_dimens.dart';
@@ -77,10 +76,6 @@ class _DesktopLyricSettingsPanelState
   void initState() {
     super.initState();
     _svc.addListener(_onServiceChanged);
-    // iOS PiP 路径不经 enable()（Android 才在开启悬浮窗时载入配置），进面板
-    // 时补载持久化设置，避免字号/行式显示字段默认值而非用户上次的选择。
-    // ignore: discarded_futures
-    _svc.ensureConfigLoaded();
   }
 
   @override
@@ -111,12 +106,24 @@ class _DesktopLyricSettingsPanelState
         _buildSurfaceSection(),
       ],
     );
+    // 本文件 import 的是 **flutter/material**，面板却挂在设置页的
+    // material_ui `Scaffold` 之下：后者给 body 包的是 material_ui 自家的
+    // 同名 `Material`（类型不同），子树里的 `InkWell` / `SwitchListTile`
+    // 按**类型**找祖先 Material 找不到 → build 期抛 `No Material widget found`，
+    // 再被全局 `_FallbackErrorWidget` 顶成「此处内容加载出错」。见
+    // docs/agents/troubleshooting.md §4.13。
+    //
+    // 修法就是这层透明 Material。不要改成给 InkWell 外面套别的容器，也不要
+    // 把 import 换成 material_ui —— M3ESlider / M3ECard 等 m3e_core 组件跨在
+    // 两套之间，换 import 会让整片 m3e 组件解析失败。
+    // regression: test/modules/settings/desktop_lyric_panel_material_host_test.dart
+    final surfaces = Material(type: MaterialType.transparency, child: child);
     // tv: 整块面板是一个焦点区，四个色板与两条操作行是区里的停点
-    if (!kTvBuild) return child;
+    if (!kTvBuild) return surfaces;
     return DpadRegion(
       memoryKey: 'settings/desktop-lyric',
       debugLabel: 'desktop-lyric-panel',
-      child: child,
+      child: surfaces,
     );
   }
 
@@ -893,9 +900,7 @@ class _DesktopLyricSettingsPanelState
           ),
         ],
         const SizedBox(height: AppSpacing.xs),
-        // 锁定/点击穿透是 Android 悬浮窗专属（FLAG_NOT_TOUCHABLE）；
-        // iOS PiP 由系统渲染与交互，无此概念，隐藏该行
-        if (!isIOSPlatform) _buildLockRow(),
+        _buildLockRow(),
       ],
     );
   }

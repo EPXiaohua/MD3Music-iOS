@@ -13,8 +13,10 @@ List<McpTool> buildLibraryWriteTools({
     <McpTool>[
       McpTool(
         name: 'md3_add_song_to_playlist',
-        description: '把指定 hash 的歌曲加入指定歌单。listid 为歌单数字 ID'
-            '（用户歌单接口返回的 listid 字段）；成功回执含歌名与歌单 id。',
+        description: '把指定 hash 的歌曲加入指定歌单。listid 为歌单数字 ID，必须是'
+            '当前用户自己的歌单——从 md3_get_my_playlists 获取（md3_create_playlist '
+            '的回执也带 listid）；md3_search_playlists 是全网搜索，其 id 不能用于本工具。'
+            '成功回执含歌名与歌单 id。',
         inputSchema: <String, Object?>{
           'type': 'object',
           'properties': <String, Object?>{
@@ -39,7 +41,9 @@ List<McpTool> buildLibraryWriteTools({
             return McpToolResult.error('未找到 hash 为 $hash 的歌曲，无法加入歌单');
           }
           final song = detail.toSong();
-          await write.addSongToPlaylist(hash, listid);
+          // 透传补齐后的详情：写源不再裸取 /audio，mixsongid 取搜索候选
+          // 回填的正确值（issue #216）。
+          await write.addSongToPlaylist(hash, listid, enriched: detail);
           return McpToolResult(<String, Object?>{
             'added': true,
             'title': song.title,
@@ -51,7 +55,8 @@ List<McpTool> buildLibraryWriteTools({
       ),
       McpTool(
         name: 'md3_create_playlist',
-        description: '创建一个新歌单（需要登录）。',
+        description: '创建一个新歌单（需要登录）。成功回执含新歌单的 listid，'
+            '可直接用于 md3_add_song_to_playlist。',
         inputSchema: <String, Object?>{
           'type': 'object',
           'properties': <String, Object?>{
@@ -64,10 +69,11 @@ List<McpTool> buildLibraryWriteTools({
         requiresConfirmation: true,
         handler: (args) async {
           final name = requireString(args, 'name');
-          await write.createPlaylist(name);
+          final listid = await write.createPlaylist(name);
           return McpToolResult(<String, Object?>{
             'created': true,
             'name': name,
+            'listid': listid,
           });
         },
       ),

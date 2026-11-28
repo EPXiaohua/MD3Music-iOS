@@ -15,6 +15,7 @@ import 'package:flutter/foundation.dart';
 
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
+import 'package:md3music/widgets/apple_lyrics/utils/lyric_credit_filter.dart';
 
 /// 强调辉光状态（逐字符）。
 ///
@@ -24,6 +25,9 @@ import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 @immutable
 class EmphasizeState {
   /// 缩放比例，1.0~1.12（含末尾字加强后可能略高）。
+  ///
+  /// 关闭「辉光字符缩放」时恒为 1.0（见
+  /// [LyricPreferences.useGlowCharScale]）。
   final double scale;
 
   /// 辉光强度 0~1.2（作为辉光层的整体 alpha）。
@@ -39,6 +43,8 @@ class EmphasizeState {
   final double shadowBlurEm;
 
   /// 水平外扩位移（em 单位）：左字向左、右字向右，随凸起涨落。
+  ///
+  /// 关闭「辉光字符缩放」时恒为 0。
   final double offsetXEm;
 
   /// 上浮位移（em 单位，向上为负）：随凸起涨落（放大时上浮，回落时还原）。
@@ -267,7 +273,15 @@ class EmphasizeEffect {
   /// 返回 true 表示该行【不应】有任何辉光。
   /// 在 [WordRenderer.tick] 中先调用此方法，若返回 true 则跳过所有 word 的辉光计算。
   ///
-  /// 判定规则：行文本 trim 后为空，或以元数据关键词开头（作词/作曲/编曲 等）。
+  /// 判定规则：
+  /// 1. 行文本 trim 后为空；
+  /// 2. 以元数据关键词开头（作词/作曲/编曲 等，见 [_metadataLineKeywords]）——
+  ///    覆盖「演唱 / 乐团 / 专辑」等无冒号写法；
+  /// 3. **与「隐藏歌词作者信息」同一套规则**（`LyricCreditFilter`，不看开关）：
+  ///    英文名单（`Lyrics by:`）、【…】包装行、版权声明句，以及在线歌词首行的
+  ///    「作者 - 歌名」形态。头部信息行属于元信息，不该被当成歌词打强调辉光；
+  ///    不共用这套规则就得再维护一份关键词表，必然与过滤正则漂移。
+  ///
   /// 结果仅依赖 [LyricLine.text]（行绑定后不变），可安全缓存。
   static bool shouldSkipEmphasizeForLine(LyricLine line) {
     final lineText = line.text.trim();
@@ -275,6 +289,8 @@ class EmphasizeEffect {
     for (final keyword in _metadataLineKeywords) {
       if (lineText.startsWith(keyword)) return true;
     }
+    if (LyricCreditFilter.matchesCreditText(lineText)) return true;
+    if (LyricCreditFilter.matchesArtistTitleForm(lineText)) return true;
     return false;
   }
 
@@ -330,10 +346,15 @@ class EmphasizeEffect {
   }
 
   /// 由 KRC 逐字歌词统计字长中位数（ms）；无逐字或样本不足返回 null。
+  ///
+  /// **排除头部元信息行**：名单/版权/「作者 - 歌名」行的字时长与歌词节奏无关，
+  /// 混进中位数会把阈值带偏（名单行字短且密集，容易把中位数拉低 → 辉光变密）。
+  /// 与行级跳过 [shouldSkipEmphasizeForLine] 共用同一套规则。
   static int? _lyricsMedianMs(List<LyricLine> lines) {
     final List<int> durations = <int>[];
     for (final line in lines) {
       if (!line.hasWordTiming) continue;
+      if (shouldSkipEmphasizeForLine(line)) continue;
       for (final w in line.words) {
         durations.add(w.duration);
       }
@@ -409,6 +430,9 @@ class EmphasizeEffect {
   ///
   /// [bumpPhase] 凸起进度（0~1 窗口内激活，t<0.5 用 bezIn 渐入、t>=0.5 用 bezOut 渐出）。
   /// [floatPhase] 正弦浮层进度（-sin(π·x)·0.05em，与凸起独立）。
+  /// [charScaleEnabled] 字符放大与水平外扩开关；null 时取
+  /// [LyricPreferences.useGlowCharScale]（供测试显式传入）。关闭时 `scale` 恒 1.0、
+  /// `offsetXEm` 恒 0，上浮 / 浮层 / 辉光亮度不受影响。
   /// 其余参数同 [computeState]。
   ///
   /// 返回 [EmphasizeState]：scale / glowLevel / shadowBlurEm / offsetXEm /
@@ -420,6 +444,7 @@ class EmphasizeEffect {
     required bool isLastWord,
     required int wordIndex,
     required int anchorCharCount,
+    bool? charScaleEnabled,
   }) {
     // 边界保护：duration 为 0 会触发除零，anchorCharCount 为 0 同理
     if (word.duration <= 0) return EmphasizeState.idle;
@@ -479,11 +504,19 @@ class EmphasizeEffect {
     // shadowBlurEm = min(0.3, blur * 0.3)
     // offsetXEm = -transX * 0.03 * amount * (n/2 - i)（左字向左、右字向右外扩）
     // offsetYEm = -transX * 0.025 * amount（上浮）
-    final double scale = 1 + transX * _scaleTransFactor * amount;
+    //
+    // 「辉光字符缩放」关闭时只停掉放大与水平外扩：scale 归 1、offsetXEm 归 0，
+    // 上浮 / 正弦浮层 / 辉光亮度照常，发光仍在但字不再被顶大。
+    final bool scaleOn =
+        charScaleEnabled ?? LyricPreferences.instance.useGlowCharScale;
+    final double scale = scaleOn
+        ? 1 + transX * _scaleTransFactor * amount
+        : 1.0;
     final double glowLevel = transX * amount;
     final double shadowBlurEm = min(_shadowBlurEmCap, blur * 0.3);
-    final double offsetXEm =
-        -transX * _offsetXFactor * amount * (anchorCharCount / 2 - wordIndex);
+    final double offsetXEm = scaleOn
+        ? -transX * _offsetXFactor * amount * (anchorCharCount / 2 - wordIndex)
+        : 0.0;
     final double offsetYEm = -transX * _offsetYFactor * amount;
 
     return EmphasizeState(
@@ -506,6 +539,7 @@ class EmphasizeEffect {
     required bool isLastWord,
     required int wordIndex,
     required int anchorCharCount,
+    bool? charScaleEnabled,
   }) {
     final EmphasizePhases phases = phasesAt(
       word: word,
@@ -520,6 +554,7 @@ class EmphasizeEffect {
       isLastWord: isLastWord,
       wordIndex: wordIndex,
       anchorCharCount: anchorCharCount,
+      charScaleEnabled: charScaleEnabled,
     );
   }
 

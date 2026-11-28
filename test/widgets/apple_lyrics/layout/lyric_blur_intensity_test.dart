@@ -21,30 +21,34 @@ void main() {
       expect(LyricPreferences.instance.blurIntensity, equals(1.0));
     });
 
-    test('setter 生效并 clamp 到 [0.5, 2.0]', () async {
-      await LyricPreferences.instance.setBlurIntensity(1.6);
-      expect(LyricPreferences.instance.blurIntensity, equals(1.6));
+    test('setter 生效并 clamp 到当前平台范围', () async {
+      final lo = LyricPreferences.minBlurIntensityForCurrentPlatform;
+      final hi = LyricPreferences.maxBlurIntensityForCurrentPlatform;
+      await LyricPreferences.instance.setBlurIntensity(hi);
+      expect(LyricPreferences.instance.blurIntensity, equals(hi));
 
       await LyricPreferences.instance.setBlurIntensity(99);
-      expect(LyricPreferences.instance.blurIntensity,
-          equals(LyricPreferences.maxBlurIntensity));
+      expect(LyricPreferences.instance.blurIntensity, equals(hi));
 
       await LyricPreferences.instance.setBlurIntensity(0.1);
-      expect(LyricPreferences.instance.blurIntensity,
-          equals(LyricPreferences.minBlurIntensity));
+      expect(LyricPreferences.instance.blurIntensity, equals(lo));
     });
 
     test('持久化到 lyric_blur_intensity', () async {
-      await LyricPreferences.instance.setBlurIntensity(1.4);
+      await LyricPreferences.instance
+          .setBlurIntensity(LyricPreferences.maxBlurIntensityForCurrentPlatform);
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getDouble('lyric_blur_intensity'), equals(1.4));
+      expect(
+          prefs.getDouble('lyric_blur_intensity'),
+          equals(LyricPreferences.maxBlurIntensityForCurrentPlatform));
     });
 
     test('reset 后回到默认值且 key 被移除', () async {
-      await LyricPreferences.instance.setBlurIntensity(1.8);
+      await LyricPreferences.instance
+          .setBlurIntensity(LyricPreferences.maxBlurIntensityForCurrentPlatform);
       await LyricPreferences.instance.reset();
       expect(LyricPreferences.instance.blurIntensity,
-          equals(LyricPreferences.defaultBlurIntensity));
+          equals(LyricPreferences.defaultBlurIntensityForCurrentPlatform));
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getDouble('lyric_blur_intensity'), isNull);
     });

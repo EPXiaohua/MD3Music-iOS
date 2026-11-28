@@ -41,12 +41,47 @@ const double kCoverFlipPerspective = 0.001;
 /// 模糊峰值 sigma（px）。
 ///
 /// 参考视频中通知栏封面约 96px、视感模糊半径约 8~10px（比例 ≈0.09）；
-/// 播放页封面最大约 380px，按同比例约 34，取保守值 24（真机观感优先，
-/// 成本次之）。只影响过渡中的约 150ms 窗口。
-const double kCoverFlipBlurSigma = 24.0;
+/// 播放页封面最大约 380px，按同比例约 34。早期受「逐帧全尺寸高斯」的
+/// 成本约束取保守值 24（真机反馈模糊偏弱）；改低分辨率快照后卷积成本
+/// 与峰值近乎无关（≤96px 小图一次），回到设计比例值 34，拉焦幅度对齐
+/// 参考视频。只影响过渡中的约 250ms 窗口。
+const double kCoverFlipBlurSigma = 34.0;
 
 /// 低于此 sigma 不过滤镜：省一层合成，且肉眼无差异。
 const double kCoverFlipBlurEpsilon = 0.01;
+
+/// 快照叠层的 alpha 映射（模糊观感曲线）。
+///
+/// 「清晰内容 + 峰值模糊快照 × α」是交叉淡而非真高斯：线性 α=σ/σmax 会把
+/// 清晰残影拖过大半程（真机反馈「模糊度太小、变化不够剧烈」——高 α 才
+/// 压住清晰层，低 α 段画面里封面仍是清晰的）。取 α=√(σ/σmax)：中段更快
+/// 吞掉清晰成分，观感接近逐帧加深的高斯斜坡，端点仍 0→1 单调不过冲。
+double coverFlipBlurAlpha(double sigma) {
+  if (sigma <= kCoverFlipBlurEpsilon) return 0.0;
+  final t = (sigma / kCoverFlipBlurSigma).clamp(0.0, 1.0);
+  return math.sqrt(t);
+}
+
+/// 兜底滤镜路径的模糊等级阶梯（sigma，px）。
+///
+/// 过渡中 sigma 本是逐帧连续值（约 30 个唯一值），每个新值都让 ImageFiltered
+/// 的模糊层整体作废重算——这是翻转窗口里的突发开销。低分辨率模糊快照（见
+/// widgets/low_res_blur.dart）把逐帧卷积换成「单次小图卷积 + alpha 混合」，
+/// 但快照就绪前/构建失败（内嵌封面等探测不了的源）仍要退回全分辨率滤镜：
+/// 此时把 sigma 量化进本阶梯，唯一滤镜值从 ~30 个降到 ≤5 个（含 0=不挂滤镜），
+/// 连续多帧复用同一 ImageFilter 值与同一份模糊层栅格。档距对齐 σmax=34 的
+/// 四等分；顶档等于峰值（超上限钳到峰值）。
+const List<double> kCoverFlipBlurLadder = [8.0, 17.0, 26.0, 34.0];
+
+/// 把连续 sigma 量化进 [kCoverFlipBlurLadder]（取不小于它的最近档，单调不减；
+/// 超上限钳到 [kCoverFlipBlurSigma]；低于 [kCoverFlipBlurEpsilon] 归零）。
+double coverFlipQuantizeSigma(double sigma) {
+  if (sigma <= kCoverFlipBlurEpsilon) return 0.0;
+  for (final step in kCoverFlipBlurLadder) {
+    if (sigma <= step) return step;
+  }
+  return kCoverFlipBlurSigma;
+}
 
 /// 旧封面出场进度 p ∈ [0, 1]（t ∈ [0, kCoverFlipSwap]，easeIn）。
 double coverFlipOldProgress(double t) =>

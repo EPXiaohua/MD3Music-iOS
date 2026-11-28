@@ -25,6 +25,7 @@ class CarModeProvider extends ChangeNotifier {
 
   bool _enabled = false;
   bool _autoScreenEnabled = false;
+  bool _powerOffPauseEnabled = false;
   double _panelRatio = kCarModePanelDefaultRatio;
   CarModePanelSide _panelSide = CarModePanelSide.right;
   double _dockClearanceDp = kCarModeBottomDockClearance;
@@ -45,6 +46,7 @@ class CarModeProvider extends ChangeNotifier {
   // （冷启动后立刻拖滑条 / 开开关的竞态）。
   bool _enabledTouched = false;
   bool _autoScreenTouched = false;
+  bool _powerOffPauseTouched = false;
   bool _ratioTouched = false;
   bool _sideTouched = false;
   bool _dockClearanceTouched = false;
@@ -60,6 +62,11 @@ class CarModeProvider extends ChangeNotifier {
 
   /// 「检测到车机屏幕时自动开启」开关（默认关闭）。独立于 [enabled]。
   bool get autoScreenEnabled => _autoScreenEnabled;
+
+  /// 「熄火 / 关机时自动暂停」开关（默认关闭）。
+  /// 开启后原生在收到车机下电广播或系统关机广播时暂停播放；
+  /// 关闭时信号到达即静默返回，行为与历史版本一致。
+  bool get powerOffPauseEnabled => _powerOffPauseEnabled;
 
   /// 面板宽度占比（0.20~0.50，默认 0.30）。
   double get panelRatio => _panelRatio;
@@ -152,6 +159,7 @@ class CarModeProvider extends ChangeNotifier {
     await settingsReady;
     _enabledTouched = false;
     _autoScreenTouched = false;
+    _powerOffPauseTouched = false;
     _ratioTouched = false;
     _sideTouched = false;
     await _load();
@@ -162,11 +170,13 @@ class CarModeProvider extends ChangeNotifier {
       final repo = SettingsRepository();
       final enabled = await repo.getCarModeEnabled();
       final autoScreen = await repo.getCarModeAutoScreenEnabled();
+      final powerOffPause = await repo.getCarModePowerOffPause();
       final ratio = await repo.getCarModePanelRatio();
       final side = await repo.getCarModePanelSide();
       final clearance = await repo.getCarModeDockClearance();
       if (!_enabledTouched) _enabled = enabled;
       if (!_autoScreenTouched) _autoScreenEnabled = autoScreen;
+      if (!_powerOffPauseTouched) _powerOffPauseEnabled = powerOffPause;
       if (!_ratioTouched) _panelRatio = ratio;
       if (!_sideTouched) _panelSide = side;
       // v34：与上面四个 touched 门同模型——载入窗口里用户拖过 dock 避让
@@ -238,6 +248,20 @@ class CarModeProvider extends ChangeNotifier {
     _notifySafely();
     try {
       await SettingsRepository().setCarModeAutoScreenEnabled(value);
+    } catch (_) {}
+  }
+
+  /// 开关「熄火 / 关机时自动暂停」。
+  ///
+  /// 只落盘，不动任何运行时状态：原生侧在**每次信号到达时**现读该键，
+  /// 因此改完开关下一次信号即生效，不需要重启进程、也不需要 MethodChannel。
+  Future<void> setPowerOffPauseEnabled(bool value) async {
+    if (_powerOffPauseEnabled == value) return;
+    _powerOffPauseTouched = true;
+    _powerOffPauseEnabled = value;
+    _notifySafely();
+    try {
+      await SettingsRepository().setCarModePowerOffPause(value);
     } catch (_) {}
   }
 

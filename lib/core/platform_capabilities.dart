@@ -82,6 +82,11 @@ bool get supportsUsbExclusive => isMobilePlatform && !kTvBuild;
 /// PiP 悬浮窗识别链路 `SongRecognitionPipManager`）。
 bool get supportsSongRecognition => isMobilePlatform;
 
+/// 悬浮窗识曲：Android 依赖悬浮窗权限 + MediaProjection 授权；
+/// iOS 走 PiP SampleBuffer 悬浮窗（`SongRecognitionPipManager`）。
+/// 桌面端页面必须隐藏该入口（点了就是死路）。
+bool get supportsFloatingSongRecognition => isMobilePlatform;
+
 /// 预测性手势（横滑切歌 / 长按识别等，依赖 Android 系统的
 /// `MotionEvent` 手势与振动反馈配合）。
 bool get supportsPredictiveGesture => isAndroidPlatform;
@@ -147,3 +152,13 @@ bool get supportsLoudnessNormalization => isMobilePlatform;
 /// （如用 url_launcher 打开系统浏览器），TV 构建同样视为不支持。
 bool get supportsInAppWebView =>
     (isAndroidPlatform || isIOSPlatform) && !kTvBuild;
+
+/// 小米 CarWith（车机互联）：连接判据（CarWith 虚拟屏 + `ucar_night_mode`）
+/// 全部来自小米/MIUI 原生接口，只有 Android 存在该通道。
+///
+/// **为什么不在这里判 TV**：CarWith 的连接判据在原生侧是「虚拟屏是否存在」，
+/// TV 盒子上永远没有这块屏，读数恒为未连接；把 TV 排除在门外反而会让设置页
+/// 在投屏类设备上少一个入口，交给原生读数说话即可（读数失败一律按未连接，
+/// 行为与不显示该开关等价）。桌面端隐藏入口的原因同 [supportsFloatingSongRecognition]：
+/// 点了就是一个永远不生效的死开关。
+bool get supportsCarWith => isAndroidPlatform;

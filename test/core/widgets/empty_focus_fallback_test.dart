@@ -309,7 +309,7 @@ void main() {
       expect(layerIndex, greaterThanOrEqualTo(0));
       expect(fallbackIndex, greaterThan(layerIndex), reason: '兜底必须在方向键层之内');
       expect(
-        source.contains('child: EmptyFocusFallback(child: child)'),
+        source.contains('child: EmptyFocusFallback(child: widget.child)'),
         isTrue,
         reason: '兜底必须包住 child（放在兄弟位置不进入焦点链）',
       );

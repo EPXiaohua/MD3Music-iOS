@@ -20,12 +20,16 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.view.Display
+import android.view.View
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Log
 import android.util.Rational
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterView
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodCall
@@ -69,7 +73,7 @@ class MainActivity : FlutterActivity() {
     private val PIP_CHANNEL = "com.md3music.md3music/pip"
     private val TASK_CHANNEL = "com.md3music.md3music/task"
     private var pendingDesktopLyricAction: String? = null
-    private var folderPickerResult: MethodChannel.Result? = null
+    private var folderPickerResult: SafeReplyOnceResult? = null
     private var fontPickerResult: MethodChannel.Result? = null
     private var backgroundPickerResult: MethodChannel.Result? = null
     // 悬浮窗识曲 channel：MediaProjection 授权结果等原生→Dart 回调
@@ -78,6 +82,38 @@ class MainActivity : FlutterActivity() {
     private var pipChannel: MethodChannel? = null
     // 首次帧监听只注册一次（引擎复用路径 configureFlutterEngine 会再次执行）
     private var firstFrameListener: io.flutter.embedding.engine.renderer.FlutterUiDisplayListener? = null
+    // IME 代理视图（TV 构建专用；FEATURE_TV=false 时为 null）。1×1 可聚焦 child，
+    // 作为 FlutterView 的文本编辑器语义代理。
+    private var imvProxyView: TvImeProxyView? = null
+
+    /// MethodChannel.Result 只放行首次 reply 的安全包装。
+    ///
+    /// 2026-11-12 TV 真机：点击「选择文件夹」→ SAF 立即返回 RESULT_CANCELED →
+    /// onActivityResult 里 `folderPickerResult?.success(null)` 时该 Result 已被
+    /// reply 过一次，`Reply already submitted`（IllegalStateException）直接闪退
+    /// （诊断包 android.log 4 次 FATAL，混淆栈 androidx.lifecycle.m.l 即 reply）。
+    /// 第一次 reply 的 ROM 时序路径无法静态还原，故统一幂等：重复 reply 静默
+    /// 丢弃并留日志，Dart 端拿到的仍是首次结果。
+    private class SafeReplyOnceResult(
+        private val origin: MethodChannel.Result
+    ) : MethodChannel.Result {
+        private val replied = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        override fun success(result: Any?) {
+            if (replied.compareAndSet(false, true)) origin.success(result)
+            else Log.w("MainActivity", "folder picker 重复 success 已丢弃")
+        }
+
+        override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+            if (replied.compareAndSet(false, true)) origin.error(errorCode, errorMessage, errorDetails)
+            else Log.w("MainActivity", "folder picker 重复 error 已丢弃")
+        }
+
+        override fun notImplemented() {
+            if (replied.compareAndSet(false, true)) origin.notImplemented()
+            else Log.w("MainActivity", "folder picker 重复 notImplemented 已丢弃")
+        }
+    }
 
     companion object {
         private const val FOLDER_PICKER_REQUEST_CODE = 9999
@@ -176,7 +212,7 @@ class MainActivity : FlutterActivity() {
                 Log.w("AudioOffload", "插件注册失败：$it")
             }
             ExternalEditorPlugin(context).register(engine)
-            DiagnosticLogPlugin().register(engine)
+            DiagnosticLogPlugin(context.applicationContext).register(engine)
             AutomixAnalysisPlugin().register(engine)
         }
 
@@ -264,6 +300,8 @@ class MainActivity : FlutterActivity() {
         val createStartedAt = SystemClock.elapsedRealtime()
         Log.i("StartupTiming", "phase=activity_on_create_enter elapsed_realtime_ms=$createStartedAt")
         super.onCreate(savedInstanceState)
+        // 所有安卓手机统一：系统移除最近任务时由独立服务停播并销毁进程。
+        SwipeExitPolicy.startTaskRemovalService(applicationContext)
         Log.i(
             "StartupTiming",
             "phase=activity_on_create_super_complete elapsed_ms=${SystemClock.elapsedRealtime() - createStartedAt}",
@@ -291,6 +329,34 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
             // 个别 ROM 可能不支持，忽略即可
         }
+
+        // IME 代理视图（TV 构建专用）：1×1 可聚焦 child（挂在 FlutterView 之内），
+        // 作为 FlutterView 的文本编辑器语义代理，让低内存 Android TV
+        // （config_preventImeStartupUnlessTextEditor=true）肯绑定 IME 会话。
+        // 形态取自 Flutter PR #193074 正文所述的生产 workaround：1×1 子 View +
+        // onCheckIsTextEditor 由 Dart 标志控制 + onCreateInputConnection 委托
+        // FlutterView + checkInputConnectionProxy(flutterView)=true。
+        if (BuildConfig.FEATURE_TV) {
+            runCatching {
+                val flutterView = findViewById<FlutterView>(FLUTTER_VIEW_ID)
+                if (flutterView == null) {
+                    Log.w("TvImeProxy", "FlutterView not found, IME proxy disabled")
+                } else {
+                    val proxy = TvImeProxyView(this)
+                    proxy.flutterViewRef = flutterView
+                    // 1×1、左上角；alpha=0（视觉不可见但可获焦，GONE 会失去焦点）。
+                    flutterView.addView(
+                        proxy,
+                        ViewGroup.LayoutParams(1, 1),
+                    )
+                    imvProxyView = proxy
+                    Log.i("TvImeProxy", "attached IME proxy view to FlutterView")
+                }
+            }.onFailure { error ->
+                Log.w("TvImeProxy", "proxy view init failed: $error")
+            }
+        }
+
         // 桌面小部件冷启动拉起携带的动作（如登录卡 openLogin → 进登录页）。
         // 引擎尚未就绪时 Flutter 侧导航尚不可用，invokeMethod 静默失败即降级为打开 app。
         dispatchWidgetAction(intent?.getStringExtra("widget_action"))
@@ -463,6 +529,9 @@ class MainActivity : FlutterActivity() {
         if (cached != null && cached.dartExecutor.isExecutingDart() && isFlutterJniAttached(cached)) {
             // 宿主引擎复用路径：configureFlutterEngine 不保证执行，显式补注册 Lyrico 编辑插件
             try { ExternalEditorPlugin(this).register(cached) } catch (_: Throwable) {}
+            // 适配 CarWith：同上先例——复用引擎时补注册 car_with 通道，
+            // 否则 Dart 心跳取原生快照会 missing-plugin 报错（register 内部全程兜底）。
+            registerCarWithChannel(cached)
             return cached
         }
         if (cached != null) {
@@ -485,6 +554,13 @@ class MainActivity : FlutterActivity() {
     } catch (error: Exception) {
         Log.w("MainActivity", "unable to inspect cached FlutterJNI attachment", error)
         false
+    }
+
+    /// 适配 CarWith：car_with 通道注册助手——configureFlutterEngine（前台引擎）、
+    /// provideFlutterEngine（复用 headless 引擎）两处共用。用 applicationContext：
+    /// handler 闭包挂在引擎上跨 Activity 存活，不能捕获 Activity。
+    private fun registerCarWithChannel(engine: FlutterEngine) {
+        CarWithState.register(engine, applicationContext)
     }
 
     // 引擎已交给进程缓存和播放服务持有；首个 Activity 也不能销毁它，
@@ -527,6 +603,17 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        // 适配 CarWith：连接态 + 车机深浅色快照通道（Dart 心跳 / 回前台 / 勾开关当场取用）。
+        registerCarWithChannel(flutterEngine)
+
+        // 系统输出切换（Android 14+ 的输出切换器；小米 HyperOS 上即「妙播」面板）。
+        // 失败只降级该入口：注册异常绝不能影响启动（同类兜底见 MusicHaptics/AudioOffload）。
+        runCatching {
+            MediaOutputPlugin(this).register(flutterEngine)
+        }.onFailure {
+            Log.w("MediaOutput", "插件注册失败：$it")
+        }
+
         // 设置页切换当前启用的 launcher alias；DONT_KILL_APP 保证图标变更不打断播放。
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.md3music.md3music/app_icon")
             .setMethodCallHandler { call, result ->
@@ -565,6 +652,41 @@ class MainActivity : FlutterActivity() {
                     result.notImplemented()
                 }
             }
+
+            // IME 代理视图通道：把 Dart 侧的「输入框持焦」信号转发给原生代理 View，
+            // 让低内存 Android TV（config_preventImeStartupUnlessTextEditor=true）肯绑定
+            // IME 会话（Flutter #177360）。会话修好前遥控器按键一个都到不了软键盘。
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.md3music.md3music/ime_proxy")
+                .setMethodCallHandler { call, result ->
+                    when (call.method) {
+                        "setActive" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val active = args?.get("active") as? Boolean ?: false
+                            runCatching {
+                                val proxy = imvProxyView
+                                if (proxy != null) {
+                                    proxy.imeActive = active
+                                    if (active) {
+                                        // 抢焦点：IMMS 判定「是否文本编辑器」问的就是
+                                        // 持焦视图，不获焦则整个代理不生效。
+                                        proxy.requestFocus()
+                                    } else {
+                                        proxy.clearFocus()
+                                    }
+                                    // 触发系统重新评估 onCheckIsTextEditor 并刷新会话绑定。
+                                    val imm = getSystemService(Context.INPUT_METHOD_SERVICE)
+                                        as? InputMethodManager
+                                    imm?.restartInput(proxy)
+                                    Log.i("TvImeProxy", "setActive=$active")
+                                }
+                            }.onFailure {
+                                Log.e("TvImeProxy", "setActive failed: $it")
+                            }
+                            result.success(null)
+                        }
+                        else -> result.notImplemented()
+                    }
+                }
         }
 
         // 3D 封面：Depth Anything V2 ORT 推理 + 3 层切割（背景/中景/前景，带 alpha）
@@ -584,6 +706,25 @@ class MainActivity : FlutterActivity() {
                 .invoke(pluginInstance, this, flutterEngine.dartExecutor.binaryMessenger)
         }.onFailure {
             android.util.Log.w("DepthCover", "depth3d 插件注册失败：$it")
+        }
+
+        // 端侧人声/伴奏分离（MSS tflite）仅存在于 standard / depth3d flavor：
+        //   - 两个 flavor 的源集都含 src/stemsep/kotlin 与 src/stemsep/assets；
+        //   - tv flavor 不含该源集（类不存在），反射注册失败后静默跳过；
+        //   - 公开树导出时资产被剔除，插件自报 available=false，入口自动隐藏。
+        // 与 DepthCoverPlugin 同一模式（Kotlin object → 先取 INSTANCE 再反射）。
+        runCatching {
+            val pluginClass = Class.forName("com.md3music.md3music.stem.StemSeparationPlugin")
+            val pluginInstance = pluginClass.getDeclaredField("INSTANCE").get(null)
+            pluginInstance.javaClass
+                .getMethod(
+                    "register",
+                    android.content.Context::class.java,
+                    io.flutter.plugin.common.BinaryMessenger::class.java,
+                )
+                .invoke(pluginInstance, this, flutterEngine.dartExecutor.binaryMessenger)
+        }.onFailure {
+            android.util.Log.w("StemSep", "端侧分离插件不可用（flavor 不含或注册失败）：$it")
         }
 
         // MD3Music fork（方向1）：前台 UI 引擎恢复启用媒体3会话（headless 引擎曾关闭），
@@ -877,6 +1018,24 @@ class MainActivity : FlutterActivity() {
                     startService(intent)
                     result.success(true)
                 }
+                // 适配 CarWith：车机投屏逐句歌词推送——与蓝牙歌词同款 Intent 转发，
+                // 落到 AudioPlaybackService.applyCarWithLyricLine（现读连接态刷门控
+                // → 300ms 合并窗口 → vendored 层写 ucar 歌词键）。
+                "updateCarWithLyricLine" -> {
+                    val intent = Intent(this, AudioPlaybackService::class.java).apply {
+                        action = AudioPlaybackService.ACTION_UPDATE_CAR_LYRIC
+                        putExtra(
+                            AudioPlaybackService.EXTRA_CAR_LYRIC_TEXT,
+                            call.argument<String>("lyric") ?: ""
+                        )
+                        putExtra(
+                            AudioPlaybackService.EXTRA_CAR_LYRIC_ENABLED,
+                            call.argument<Boolean>("enabled") ?: false
+                        )
+                    }
+                    startService(intent)
+                    result.success(true)
+                }
                 // 蓝牙歌词：开关切换
                 "setBluetoothLyricEnabled" -> {
                     val intent = Intent(this, AudioPlaybackService::class.java).apply {
@@ -1082,12 +1241,24 @@ class MainActivity : FlutterActivity() {
         folderPickerChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "pickFolder" -> {
-                    folderPickerResult = result
+                    val safe = SafeReplyOnceResult(result)
+                    folderPickerResult = safe
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                     }
-                    startActivityForResult(intent, FOLDER_PICKER_REQUEST_CODE)
+                    try {
+                        startActivityForResult(intent, FOLDER_PICKER_REQUEST_CODE)
+                    } catch (error: Exception) {
+                        // TV 等系统普遍没有 DocumentsUI（ACTION_OPEN_DOCUMENT_TREE
+                        // 无解析目标），未捕获的 ActivityNotFoundException 会直接
+                        // 闪退。这里区分"打不开"（PICKER_UNAVAILABLE，Dart 侧兜底
+                        // 内置目录选择弹层）与"用户取消"（success(null)）。
+                        Log.e("FolderPicker", "打开 SAF 目录选择器失败: ${error.message}")
+                        folderPickerResult = null
+                        // 走安全包装：即使 reply 已被 ROM 时序提交过也不会崩
+                        safe.error("PICKER_UNAVAILABLE", "系统目录选择器不可用: ${error.message}", null)
+                    }
                 }
                 "getPersistedUriPermission" -> {
                     val treeUri = call.argument<String>("uri")

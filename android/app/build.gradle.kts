@@ -19,15 +19,17 @@ android {
     compileSdk = 36
     ndkVersion = "28.2.13676358"
 
-    // 产品 flavor（3D 深度封面）:
-    //   standard - 不含 3D 封面：无 onnxruntime so、无深度模型资产，体积最小
-    //   depth3d  - 3D 全量包：内置 ONNX Runtime so + Depth Anything V2 模型资产
-    //   tv       - TV 版独立包体：dpad 遥控导航 + 排除 3D/USB 独占/歌词推送
-    // 两 flavor 共用同一 applicationId/签名，depth3d 包可直接覆盖安装 standard 包。
+    // 产品 flavor（能力分层）:
+    //   lite - 精简包（默认/对外公开）：无 3D 封面、无端侧分离 —— 不含 onnxruntime so、
+    //          不含深度模型、不含 tflite 运行时、不含分离模型，Dart 侧整块功能被树摇剔除
+    //   full - 全功能包：3D 深度封面（ONNX Runtime so + Depth Anything V2 模型资产）
+    //          + 端侧人声/伴奏分离（MSS tflite 运行时 + 模型资产）
+    //   tv   - TV 版独立包体：dpad 遥控导航 + 排除 3D/USB 独占/歌词推送
+    // 三 flavor 共用同一 applicationId/签名（tv 除外，带 .tv 后缀），full 包可直接覆盖安装 lite 包。
     flavorDimensions += "feature"
     productFlavors {
-        create("standard") {}
-        create("depth3d") {}
+        create("lite") {}
+        create("full") {}
         // TV 版独立包体：dpad 遥控导航 + 排除 3D/USB 独占/歌词推送。
         // 后缀与手机版并存互不覆盖（TV 设备上只装 TV 版）。
         create("tv") {
@@ -42,6 +44,59 @@ android {
             }
         }
     }
+
+    // 能力源集归属（物理目录名保持 src/stemsep、src/depth3d，不随 flavor 改名）：
+    //   lite - 不挂任何推理源集（无 3D、无分离）
+    //   full - 同时挂 3D（src/depth3d）与端侧分离（src/stemsep）的 Kotlin + 资产
+    //   tv   - 不挂（tv 盒子算力普遍不足以跑实时分离，且 tv 包一向不放推理运行时）
+    // Windows 侧 CMake（windows/CMakeLists.txt）按物理路径取深度模型，故目录名不改。
+    //
+    // 分离模型来源：默认取仓库内已入库的 src/stemsep/assets（完整仓库）；
+    // 公开树不带该资产，CI 用 -Pmd3StemModelDir=<外部目录> 在构建期注入，
+    // 注入目录与仓库目录不能同时挂（同含 stem/mss-model.tflite 会触发 AGP 资源重复）。
+    val stemModelDirOverride = providers.gradleProperty("md3StemModelDir").orNull
+    val requireStemModel = providers.gradleProperty("md3RequireStemModel").orNull == "true"
+    val stemAssetDir = if (stemModelDirOverride.isNullOrBlank()) {
+        "src/stemsep/assets"
+    } else {
+        stemModelDirOverride.replace('\\', '/')
+    }
+    sourceSets {
+        getByName("full") {
+            java.srcDirs("src/stemsep/kotlin", "src/depth3d/kotlin")
+            assets.srcDirs(stemAssetDir, "src/depth3d/assets")
+        }
+    }
+
+    // full 包带分离能力，缺模型会产出「UI 有开关、点了没声」的残包：构建前就拦住。
+    // 两级：
+    //   1) -Pmd3RequireStemModel=true（CI 显式要求）→ 配置期直接失败，早于任何 Gradle 任务；
+    //   2) 其余情况 → 挂在 assembleFull/bundleFull 上的独立校验任务。
+    // 之所以默认不用配置期 throw：Gradle 配置阶段对所有变体都会执行，公开树（不带模型资产）
+    // 只构建 lite 时也必须能配置成功。
+    val stemModelFile = file("$stemAssetDir/stem/mss-model.tflite")
+    fun checkStemModel() {
+        if (!stemModelFile.isFile) {
+            throw GradleException(
+                "端侧分离模型缺失：$stemModelFile\n" +
+                    "  a) 完整仓库：git checkout -- android/app/src/stemsep/assets 恢复已入库模型；\n" +
+                    "  b) 公开树/CI：用 --android-project-arg=md3StemModelDir=<外部目录> 注入" +
+                    "（目录内应有 stem/mss-model.tflite，4,902,660 B）；\n" +
+                    "  c) 不需要分离能力：改用 --flavor lite。"
+            )
+        }
+        val modelBytes = stemModelFile.length()
+        if (modelBytes != 4_902_660L) {
+            throw GradleException(
+                "端侧分离模型字节数异常：$stemModelFile 实际 $modelBytes B，" +
+                    "期望 4,902,660 B（与 TfliteMssInterpreter.MODEL_BYTES 必须一致）。"
+            )
+        }
+    }
+    if (requireStemModel) checkStemModel()
+    val verifyFullStemModel by tasks.registering { doLast { checkStemModel() } }
+    tasks.matching { it.name.startsWith("assembleFull") || it.name.startsWith("bundleFull") }
+        .configureEach { dependsOn(verifyFullStemModel) }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -64,7 +119,7 @@ android {
         targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // TV 版 = tv flavor（true）；standard/depth3d 为 false。
+        // TV 版 = tv flavor（true）；lite/full 为 false。
         buildConfigField("boolean", "FEATURE_TV", "false")
         // 渲染引擎 manifest 静态开关，默认 Impeller（true）。Flutter 3.44 只认
         // manifest 静态值；构建 Skia 版用 -Pmd3EnableImpeller=false
@@ -78,11 +133,14 @@ android {
         }
     }
 
-    // 2026-09-12：加入 libflacJNI.so（P0-5 flac 扩展）后 native libs 被改为 Stored
-    // （APK 153.6→191.2MB）。显式恢复未压缩打包默认（extractNativeLibs=false，
-    // 直接从 APK 页对齐加载，安装包最小、加载最快）。
+    // 2026-11-12：发版口径改为下载体积优先，恢复压缩打包（useLegacyPackaging=true）。
+    // 背景：2026-09-12 加入 libflacJNI.so 后曾改为 Stored（extractNativeLibs=false，
+    // APK 153.6→191.2MB，安装体积最小、so 直接页对齐加载）；但 v6.3.0 发版包实测
+    // .so 合计 34.9MB 全部不压缩占 APK 89%，GitHub Releases 下载体积过大。
+    // 改回压缩后 APK 约 -14MB，代价是安装时解压 .so、安装占用 +12~16MB。
+    // 详见 docs/plans/2026-11-12-apk-size-optimization-plan.md。
     packaging {
-        jniLibs.useLegacyPackaging = false
+        jniLibs.useLegacyPackaging = true
     }
 
     // 新 API 用在低于 minSdk 的设备 = 运行时 NoSuchMethodError 必崩。issue #130 的教训：
@@ -159,18 +217,19 @@ dependencies {
     implementation("io.github.proify.lyricon.lyric:model:0.1.70")
     // SuperLyricApi：基于 Binder 的系统级实时歌词 API（jnitpack，settings.gradle.kts 已声明）
     implementation("com.github.HChenX:SuperLyricApi:3.4")
-    // JAudioTagger 社区分叉（支持 MP3/FLAC/Ogg/M4A 等格式的 ID3v2 / VorbisComment 标签读写，
-    // 用于在下载完成后向音频文件嵌入标题/艺术家/专辑/封面/歌词）。
-    // JitPack 上 AdrienPoupa 分叉仅有 2.2.3（无 2.2.5）。
-    implementation("com.github.AdrienPoupa:jaudiotagger:2.2.3")
     // 方案B阶段1：app 侧 Kotlin 引用 androidx.media3.common 类型（UnstableApi、Player 等）。
     // media3-common 为单一 maven 源（fork 同版本 1.4.1），此处显式依赖以便编译期可见
     // （fork 用 implementation 隐藏了传递依赖）。session/exoplayer 仍是 fork 本地源码，勿加 maven。
     implementation("androidx.media3:media3-common:1.4.1")
     // 2×2 封面小部件：从专辑封面位图提取主色（vibrant/dominant swatch）
     implementation("androidx.palette:palette-ktx:1.0.0")
+    // 端侧人声/伴奏分离：MSS 模型走 TFLite 标准运行时（含 XNNPACK，CPU 多线程）。
+    // 只给 full（lite 无分离、tv 不放推理运行时）。arm64 so ≈ 3.4MB / v7a ≈ 2.2MB。
+    // 明确**不用** GPU delegate：实测该模型带 32 个 TRANSPOSE，GPU 上要额外 layout
+    // 转换，性能反而倒退；旧 Java GpuDelegate 在部分驱动上直接 segfault。
+    "fullImplementation"("org.tensorflow:tensorflow-lite:2.16.1")
     // 3D 深度封面：端上 Depth Anything V2 推理（ONNX Runtime Mobile）
-    // 仅 depth3d flavor 打包（standard 包不含此 so，体积 -13.2MB）
+    // 仅 full flavor 打包（lite 包不含此 so，体积 -13.2MB）
     // 自编 reduced-ops AAR：官方 libonnxruntime.so 33.0MB → 13.2MB（13,201,664 B），
     // 只编译两份深度模型实际用到的算子内核；保留 NNAPI EP 符号以匹配官方
     // libonnxruntime4j_jni.so 的符号引用（该 jni 层原样保留，勿动）；仅 arm64-v8a。
@@ -178,7 +237,7 @@ dependencies {
     // android/app/libs/ort-ops/（REBUILD.md + depth_migan_union_v3.config）。
     // ⚠️ 内核裁剪后 strings/差分都判不出算子是否可用，唯一判据是真机 createSession
     //    日志（loadInpaintModel OK）。
-    "depth3dImplementation"(files("libs/onnxruntime-android-1.30.0-custom-v8a.aar"))
+    "fullImplementation"(files("libs/onnxruntime-android-1.30.0-custom-v8a.aar"))
 
     // USB 独占数据路径（UsbDither / UsbAudioStream.writeRaw）的 JVM 单元测试
     testImplementation("junit:junit:4.13.2")

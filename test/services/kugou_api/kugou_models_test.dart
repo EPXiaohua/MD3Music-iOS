@@ -247,6 +247,92 @@ void main() {
     });
   });
 
+  // issue #216：/audio（kmr）响应里的 audio_id 与 MixSongID 是不同 ID 域，
+  // 误当 albumAudioId 会让 /song/url 的 album_audio_id 参数解析到无关音源
+  // （按 hash 播《野心家》实播 48 分钟口播）。候选链只收同域键。
+  group('KugouSongDetail.fromJson albumAudioId 候选链（issue #216）', () {
+    test('/audio 形态仅 audio_id 时不污染 albumAudioId', () {
+      final d = KugouSongDetail.fromJson({
+        'hash': '1789AD88CFDD254910125F22494C0E8B',
+        'audio_name': '张靓颖 - 野心家',
+        'audio_id': 477568288,
+        'timelength': 282592,
+      });
+      expect(d.albumAudioId, isNull);
+    });
+
+    test('Audioid 键同样不作兜底', () {
+      final d = KugouSongDetail.fromJson({
+        'hash': 'ABC',
+        'songname': '某歌',
+        'Audioid': 477568288,
+      });
+      expect(d.albumAudioId, isNull);
+    });
+
+    test('嵌套形态（audio_info.audio_id 浅展开）也不再冒充 albumAudioId', () {
+      final d = KugouSongDetail.fromJson({
+        'hash': 'ABC',
+        'songname': '某歌',
+        'audio_info': {'audio_id': 477568288, 'duration': 282},
+      });
+      expect(d.albumAudioId, isNull);
+    });
+
+    test('album_audio_id / AlbumAudioID / MixSongID / mixsongid 照常命中', () {
+      expect(
+        KugouSongDetail.fromJson(
+                {'hash': 'A', 'songname': 'a', 'album_audio_id': 111})
+            .albumAudioId,
+        '111',
+      );
+      expect(
+        KugouSongDetail.fromJson(
+                {'hash': 'A', 'songname': 'a', 'AlbumAudioID': 222})
+            .albumAudioId,
+        '222',
+      );
+      expect(
+        KugouSongDetail.fromJson(
+                {'hash': 'A', 'songname': 'a', 'MixSongID': 333})
+            .albumAudioId,
+        '333',
+      );
+      expect(
+        KugouSongDetail.fromJson(
+                {'hash': 'A', 'songname': 'a', 'mixsongid': 444})
+            .albumAudioId,
+        '444',
+      );
+      // 同域键优先于 audio_id：混排时取正规键
+      expect(
+        KugouSongDetail.fromJson({
+          'hash': 'A',
+          'songname': 'a',
+          'MixSongID': 776042250,
+          'audio_id': 477568288,
+        }).albumAudioId,
+        '776042250',
+      );
+    });
+
+    test('copyWith 支持覆盖 albumAudioId（MCP 补齐用）', () {
+      final d = KugouSongDetail(
+        hash: 'ABC',
+        songName: '某歌',
+      );
+      expect(d.copyWith(albumAudioId: '776042250').albumAudioId, '776042250');
+      // 不传时保留原值
+      expect(d.copyWith(albumAudioId: null).albumAudioId, isNull);
+      expect(
+        KugouSongDetail(hash: 'ABC', songName: 'x', albumAudioId: '1')
+            .copyWith(albumAudioId: '2')
+            .albumAudioId,
+        '2',
+      );
+    });
+  });
+
   group('KugouComment.fromJson userId 字段名降级', () {
     test('user_id / userid / kugouid 三种字段名都能解析', () {
       expect(KugouComment.fromJson({'id': 'c', 'user_id': '1'}).userId, '1');

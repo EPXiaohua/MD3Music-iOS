@@ -23,6 +23,7 @@ import '../layout/duet_layout.dart';
 import '../layout/lyric_layout.dart';
 import '../layout/lyric_preferences.dart';
 import 'package:md3music/core/utils/lyric_wrap_plan.dart';
+import 'package:md3music/widgets/apple_lyrics/models/aux_text_image.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'emphasize_effect.dart';
 import 'lyric_sweep_fill.dart';
@@ -56,6 +57,12 @@ class WordRenderer {
   /// 行盒高度与字形在盒内的垂直位置都由 `TextStyle.height`（= lineHeight）决定，
   /// 不进绑定键则调行间距后 painter 仍按旧行高绘制，表现为不刷新。
   double _boundLineHeight = -1;
+
+  /// 缓存时的字体柔边开关状态。
+  ///
+  /// 柔边只改绘制 Paint、不改字形度量；但预栅格化的整词/逐字符字形图必须
+  /// 按新开关重新烘焙（图里已带/不带柔边），故纳入绑定键，切换后整体重绑。
+  bool _boundSoftEdge = false;
 
   /// 每个 word 的缓存宽度（在 [_ensureBound] 时一次性测量）。
   ///
@@ -188,6 +195,26 @@ class WordRenderer {
     textDirection: TextDirection.ltr,
   );
 
+  // 副行 layout 缓存：文本/样式/alpha/换行计划都没变时跳过 set text + layout。
+  // 稳态逐字演唱时 translationExpand 恒为 1，旧实现每帧都重排一次副行文字。
+  LyricWrapPlan? _lastAuxPaintPlan;
+  double _lastAuxPaintAlpha = -1;
+  double _lastAuxPaintFontSize = -1;
+  double _lastAuxPaintMaxWidth = -1;
+  double _lastAuxPaintLineHeight = -1;
+  int _lastAuxPaintWeight = -1;
+  String? _lastAuxPaintFamily;
+  int _lastAuxPaintColor = -1;
+  DuetAlignment? _lastAuxPaintAlignment;
+  bool _lastAuxPaintSoftEdge = false;
+
+  /// 翻转期把预栅格化副行图当作纹理绘制（透视投影走 GPU，不再逐帧画字形路径）。
+  final Paint _auxImagePaint = Paint()..filterQuality = FilterQuality.low;
+
+  /// 仅测试：走「图像翻转路径」的绘制次数（验证翻转期不再逐帧画文字）。
+  @visibleForTesting
+  static int debugFlipImageDraws = 0;
+
   /// 渐变路径复用的 Paint 实例（避免每帧新建，减少 GC）。
   /// 渐变路径稳态下每帧只改 shader，0 次 layout。
   final Paint _gradientPaint = Paint();
@@ -260,6 +287,15 @@ class WordRenderer {
   /// 正在异步渲染字符图片的 (wordIndex, charIndex) 集合（避免重复请求）。
   final Set<String> _charImagePending = <String>{};
 
+  /// 每个字符字形图对应的行盒高度倍率（`TextStyle.height`）；-1 = 无图/未请求。
+  ///
+  /// **为什么必须按行盒分别烘焙**：换行行是 0.8× 行盒，字形在行盒内的垂直
+  /// 位置与主行不同，主行的图不能压扁复用（会整字上移）。历史坑：换行行的
+  /// 强调字退回 TextPainter，文本垂直位置被栅格化量化到整 device 像素 →
+  /// 放大/上浮呈 1px 台阶（实测换行行质心 179.47 → 178.50 → 177.54，
+  /// 每级约 0.96px、级间 20 帧不动；主行字形图路径则逐帧平滑）。
+  List<List<double>> _charImageRowHeights = const <List<double>>[];
+
   /// 字符图片绘制复用的 Paint（文字色 + alpha 经 ColorFilter 驱动）。
   ///
   /// 采样模式同 [_glowImagePaint]：字形图按 [_charImageSupersample] 逻辑像素
@@ -293,6 +329,18 @@ class WordRenderer {
   @visibleForTesting
   static bool debugDisableGlyphBlit = false;
 
+  /// 诊断/测试用：某字符字形图当前对应的行盒倍率（-1 = 无图 / 未请求）。
+  ///
+  /// 换行行必须是 0.8× 行盒自己的图；返回主行值就说明绘制侧没按实际行盒烘焙，
+  /// 会退回 TextPainter 出 1px 台阶。
+  @visibleForTesting
+  double debugCharImageRowHeightForTest(int wordIndex, int charIndex) {
+    if (wordIndex < 0 || wordIndex >= _charImageRowHeights.length) return -1;
+    final List<double> rows = _charImageRowHeights[wordIndex];
+    if (charIndex < 0 || charIndex >= rows.length) return -1;
+    return rows[charIndex];
+  }
+
   /// 整词字形图超采样倍数（与 [_charImageSupersample] 同口径）。
   ///
   /// **口径提醒：这是「逻辑像素」倍数，不是「设备像素」倍数。**
@@ -301,6 +349,10 @@ class WordRenderer {
   /// 20.5%，MAE 5.86 vs 6.43），显存还从 9× 降到 4×。改动前须重跑
   /// tmp/probe_glyph_resample.dart 对照。
   static const int _wordGlyphSupersample = 3;
+
+  /// 整词字形图超采样倍数（供测试与柔边 pad 口径断言）。
+  @visibleForTesting
+  static int get wordGlyphSupersampleForTest => _wordGlyphSupersample;
 
   /// 字形图绘制复用的 Paint（均匀路径按 ColorFilter 上色，渐变路径保持纯白）。
   ///
@@ -547,6 +599,15 @@ class WordRenderer {
     rowHeight,
   );
 
+  /// 直接烘焙一张整词字形图（供测试对比柔边开关对图片尺寸/字缘的影响）。
+  @visibleForTesting
+  Future<ui.Image?> debugRenderWordGlyphForTest({
+    required String text,
+    required double fontSize,
+    required double rowHeight,
+    required double wordWidth,
+  }) => _renderWordGlyph(text, fontSize, rowHeight, wordWidth);
+
   /// 转发 [alphaAtX] 供测试断言绘制 alpha 的连续性。
   @visibleForTesting
   double debugAlphaAtX(
@@ -557,25 +618,39 @@ class WordRenderer {
     double dark,
   ) => _alphaAtX(x, start, span, bright, dark);
 
-  /// 当前 scale 对应的 factor（0~1）。
-  ///
-  /// 公式：`factor = clamp01((scale - inactiveScale) / (activeScale - inactiveScale))`
-  double get factor {
-    final raw =
-        (_scale - LyricLayout.inactiveScale) /
-        (LyricLayout.activeScale - LyricLayout.inactiveScale);
-    return raw.clamp(0.0, 1.0).toDouble();
-  }
+  /// 当前 scale 对应的 factor（0~1），口径统一由 [LyricLayout.factorFor] 提供。
+  /// 分母为 0（inactiveScale == activeScale）时退化为 1.0。
+  double get factor => LyricLayout.factorFor(_scale);
 
   /// 动态暗态 alpha（未播字 / 非当前行 SOLID）。
   ///
-  /// 公式：`dynamicDarkAlpha = factor * 0.2 + 0.2`，范围 0.2~0.4。
-  double get dynamicDarkAlpha => factor * 0.2 + 0.2;
+  /// 由「未播歌词透明度」调节；默认值下恒等于原 `factor * 0.2 + 0.2`。
+  /// **注意**：当前行的字内渐变右端（"还没唱到的部分"）不用它，见
+  /// [sweepDarkAlpha]——否则同一句里未唱部分会比下方未播歌词亮一档。
+  double get dynamicDarkAlpha => LyricLayout.darkAlphaFor(factor);
+
+  /// 当前行「未播字」（字内渐变右端）的暗态 alpha。
+  ///
+  /// 与**下方未播行**取同一值：`LineRenderer` 非当前行是
+  /// `darkAlphaFor(factor = 0)`，即 [LyricLayout.alphaBase]（默认
+  /// `unplayedOpacity × 0.5` = 0.2）。
+  ///
+  /// 历史实现让当前行未播字随 factor 插值到 `unplayedOpacity`（默认恰为
+  /// 2 倍亮），于是"一句刚切到当前行"时，整行未唱部分会突然亮半档、与下方
+  /// 未播歌词明显不同色（用户 2026-11-13 反馈）。未播就是未播，不应因为
+  /// 所在行是否当前行而变亮；已播字仍按 `brightAlphaFor(factor)` 走亮档。
+  double get sweepDarkAlpha => LyricLayout.darkAlphaFor(0.0);
+
+  /// 本实例当前状态下的"未播字"暗态 alpha（激活行走 [sweepDarkAlpha]，
+  /// 非激活行 SOLID 走 [dynamicDarkAlpha]）。三处消费必须同源：行绑定初始化
+  /// [_wordAlphas]、每帧 tick 目标、绘制暗端色值。
+  double get _unplayedTextAlpha =>
+      _isActive ? sweepDarkAlpha : dynamicDarkAlpha;
 
   /// 动态亮态 alpha（已播字 / 当前字目标）。
   ///
-  /// 公式：`dynamicBrightAlpha = factor * 0.8 + 0.2`，范围 0.2~1.0。
-  double get dynamicBrightAlpha => factor * 0.8 + 0.2;
+  /// 由「已播歌词透明度」调节；默认值下恒等于原 `factor * 0.8 + 0.2`。
+  double get dynamicBrightAlpha => LyricLayout.brightAlphaFor(factor);
 
   /// 当前是否为当前行。
   bool get isActive => _isActive;
@@ -656,7 +731,7 @@ class WordRenderer {
     if (dt <= 0) return;
     if (_boundLine == null || _boundLine!.words.isEmpty) return;
 
-    final double dark = dynamicDarkAlpha;
+    final double dark = _unplayedTextAlpha;
     final double bright = dynamicBrightAlpha;
     final words = _boundLine!.words;
     final int wordCount = words.length;
@@ -788,7 +863,15 @@ class WordRenderer {
           final List<int> runes = w.text.runes.toList();
           for (int k = 0; k < runes.length; k++) {
             final String charText = String.fromCharCode(runes[k]);
-            _requestCharImage(i, k, charText, _boundFontSize);
+            // 预热按主行行盒烘焙；若该字实际位于换行行，绘制侧会按 0.8× 行盒重烘焙
+            _requestCharImage(
+              i,
+              k,
+              charText,
+              _boundFontSize,
+              LyricLayout.lineHeight,
+              rebuildOnMismatch: false,
+            );
             // 预热阶段尚未布局，默认按整行行盒渲染；
             // 若该字实际位于换行行（0.8x 行盒），绘制时会检测行盒变化并重渲染。
             // rebuildOnMismatch: false —— 预热不干预已建立的正确精灵/进行中的
@@ -989,6 +1072,7 @@ class WordRenderer {
     double viewportWidth = 0,
     LyricWrapPlan? wrapPlan,
     LyricWrapPlan? auxPlan,
+    AuxTextImage? auxImage,
   }) {
     // 断点唯一来源：外部（AppleLyricsView 的行高重算处）注入的计划；
     // 未注入时现场取同一份计划兜底。本方法内**禁止**再自行判断换行条件，
@@ -1066,7 +1150,7 @@ class WordRenderer {
 
     double dx = 0; // 相对 baseX 的水平偏移
     double currentY = offset.dy; // 当前视觉行的 y 坐标
-    final double dark = dynamicDarkAlpha;
+    final double dark = _unplayedTextAlpha;
     final double bright = dynamicBrightAlpha;
     // 主行行高 = 主行高（完整行盒）；换行行盒模型与 measureLineHeight 一致：
     // 主行完整行高，换行行 0.8x 行高、从主行底开始，行盒=行距避免相邻行重叠。
@@ -1262,7 +1346,7 @@ class WordRenderer {
             // 量化值变化或从渐变路径切换过来：重新 set text + layout
             painter.text = TextSpan(
               text: word.text,
-              style: TextStyle(
+              style: LyricLayout.paintStyle(
                 color: Color.fromRGBO(
                   textRed,
                   textGreen,
@@ -1271,8 +1355,6 @@ class WordRenderer {
                 ),
                 fontSize: fontSize,
                 height: rowHeight,
-                fontFamily: LyricLayout.fontFamily,
-                fontWeight: LyricLayout.fontWeight,
               ),
             );
             painter.layout();
@@ -1301,12 +1383,10 @@ class WordRenderer {
           if (_lastSetAlphas[i] != -1) {
             painter.text = TextSpan(
               text: word.text,
-              style: TextStyle(
+              style: LyricLayout.paintStyle(
                 color: const Color.fromRGBO(255, 255, 255, 1.0), // plain white
                 fontSize: fontSize,
                 height: rowHeight,
-                fontFamily: LyricLayout.fontFamily,
-                fontWeight: LyricLayout.fontWeight,
               ),
             );
             painter.layout();
@@ -1318,7 +1398,7 @@ class WordRenderer {
             width,
             fontSize * rowHeight,
           );
-          canvas.saveLayer(wordRect, Paint());
+          canvas.saveLayer(_softLayerRect(wordRect, fontSize), Paint());
           _wordGlyphPaint.colorFilter = null; // 纯白字形，渐变由 modulate 着色
           if (!_blitWordGlyph(
             canvas,
@@ -1354,7 +1434,9 @@ class WordRenderer {
 
     // 辅助副行（翻译或罗马音）：WordRenderer 仅在当前行（KRC）被调用，故无需再判 _isActive。
     // 根据 displayMode 选择显示 translation 还是 roma。
-    // 副行字号为主行 70%；alpha = translationOpacity × translationFade（渐显渐隐），
+    // 副行字号为主行 70%；alpha = 主行亮态 alpha × translationOpacity × 进度。
+    // WordRenderer 只服务当前行，其满亮档位就是 playedOpacity（factor 恒 1），
+    // 乘上去才能让「已播歌词透明度」同时作用于副行（旧实现固定 0.5，副行不跟随）。
     // 位置随 translationExpand 从主行底平滑浮出（占位高度由动画进度动态叠加）。
     // **不读 showTranslation 做立即短路**：关闭翻译时注入进度衰减到 0、
     // alpha 平滑渐隐至消失——若在此短路，关闭瞬间副行直接消失无动画。
@@ -1362,9 +1444,25 @@ class WordRenderer {
         LyricPreferences.instance.displayMode == LyricDisplayMode.roma
         ? line.roma
         : line.translation;
-    final double transAlpha = LyricLayout.translationOpacity * translationFade;
+    final double transAlpha =
+        LyricLayout.playedOpacity *
+        LyricLayout.translationOpacity *
+        translationFade;
     if (transAlpha > 0.001 && auxText != null && auxText.isNotEmpty) {
       final transFontSize = LyricLayout.translationFontSize(fontSize);
+      // 翻转角提前求值：图像路径要免掉下面的逐帧副行重排。
+      // 含透视矩阵的文字绘制会被 Skia 退化成字形路径逐帧渲染（切行掉帧的
+      // 来源），因此翻转期间改用预栅格化图；**过渡中段（角度已归零但进度未就位）**
+      // 同样用图，避免副行收起/出现的每一帧都重排文字。
+      final double flipAngle = LyricLayout.sublineFlipAngle(
+        translationExpand,
+        exiting: translationExiting,
+      );
+      final AuxTextImage? flipImage =
+          (auxImage != null &&
+              (flipAngle != 0 || translationExpand < 0.999))
+          ? auxImage
+          : null;
       // currentY 是循环结束后的最后视觉行 Y。
       // 副行 Y = 最后视觉行底部 + 0.3em 间隙：单行用完整行高，
       // 多行时最后一行是换行行（0.8x 行高），与 measureLineHeight 压缩模型一致，
@@ -1387,19 +1485,48 @@ class WordRenderer {
             maxWidth,
             balanced: balanced,
           );
-      _translationPainter.text = TextSpan(
-        text: resolvedAuxPlan.rowTexts.join('\n'),
-        style: TextStyle(
-          color: Color.fromRGBO(textRed, textGreen, textBlue, transAlpha),
-          fontSize: transFontSize,
-          height: LyricLayout.translationLineHeight,
-          fontFamily: LyricLayout.fontFamily,
-          fontWeight: LyricLayout.fontWeight,
-        ),
-      );
-      _translationPainter.layout(
-        maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
-      );
+      // 图像路径不消费段落（宽高/对齐全取自图像），跳过逐帧重排。
+      // 文本路径同样只在输入变化时重排：稳态（expand=1、无翻转）下
+      // 文本/样式/alpha 全不变，旧实现每帧都做一次 TextPainter.layout。
+      if (flipImage == null) {
+        final bool auxRelayout =
+            !identical(resolvedAuxPlan, _lastAuxPaintPlan) ||
+            (transAlpha - _lastAuxPaintAlpha).abs() > 0.001 ||
+            transFontSize != _lastAuxPaintFontSize ||
+            maxWidth != _lastAuxPaintMaxWidth ||
+            LyricLayout.translationLineHeight != _lastAuxPaintLineHeight ||
+            LyricLayout.fontWeight.value != _lastAuxPaintWeight ||
+            LyricLayout.fontFamily != _lastAuxPaintFamily ||
+            textColorValue != _lastAuxPaintColor ||
+            alignment != _lastAuxPaintAlignment ||
+            LyricLayout.softEdgeAntiAlias != _lastAuxPaintSoftEdge;
+        if (auxRelayout) {
+          _translationPainter.text = TextSpan(
+            text: resolvedAuxPlan.rowTexts.join('\n'),
+            style: LyricLayout.paintStyle(
+              color: Color.fromRGBO(textRed, textGreen, textBlue, transAlpha),
+              fontSize: transFontSize,
+              height: LyricLayout.translationLineHeight,
+            ),
+          );
+          // 对齐必须在 layout 前写入：段落对齐在 layout 时烘焙，
+          // 事后赋值只对单行 paint 偏移生效（多行会保持旧对齐）。
+          _translationPainter.textAlign = _duetToTextAlign(alignment);
+          _translationPainter.layout(
+            maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
+          );
+          _lastAuxPaintPlan = resolvedAuxPlan;
+          _lastAuxPaintAlpha = transAlpha;
+          _lastAuxPaintFontSize = transFontSize;
+          _lastAuxPaintMaxWidth = maxWidth;
+          _lastAuxPaintLineHeight = LyricLayout.translationLineHeight;
+          _lastAuxPaintWeight = LyricLayout.fontWeight.value;
+          _lastAuxPaintFamily = LyricLayout.fontFamily;
+          _lastAuxPaintColor = textColorValue;
+          _lastAuxPaintAlignment = alignment;
+          _lastAuxPaintSoftEdge = LyricLayout.softEdgeAntiAlias;
+        }
+      }
       final int subRows = resolvedAuxPlan.rowCount;
       final double subH = LyricLayout.auxSubHeight(fontSize, subRows);
       final double transY =
@@ -1408,16 +1535,31 @@ class WordRenderer {
           transFontSize * 0.3 +
           subH * (translationExpand - 1.0);
       // 翻译副行对齐跟随原文，按副行自身宽度计算 x
+      final double sublineWidth = flipImage?.width ?? _translationPainter.width;
+      final double sublineHeight =
+          flipImage?.height ?? _translationPainter.height;
       final double transX = _alignX(
         alignment,
         offset.dx,
-        _translationPainter.width,
+        sublineWidth,
         viewportWidth,
       );
       // 多行翻译副行需设置 textAlign 让每条视觉行独立对齐到 transX
       // 单行时 textAlign 不影响，_alignX 已计算正确 x
-      _translationPainter.textAlign = _duetToTextAlign(alignment);
-      _paintTranslation(canvas, Offset(transX, transY));
+      // （图像已在烘焙时按同一 textAlign 排版，无需再设）。
+      if (flipImage == null) {
+        _translationPainter.textAlign = _duetToTextAlign(alignment);
+      }
+      _paintTranslation(
+        canvas,
+        Offset(transX, transY),
+        angle: flipAngle,
+        sublineWidth: sublineWidth,
+        sublineHeight: sublineHeight,
+        colorValue: textColorValue,
+        alpha: transAlpha,
+        image: flipImage,
+      );
     }
   }
 
@@ -1426,30 +1568,73 @@ class WordRenderer {
   /// [at] 为副行文本的绘制原点（左上角）。入场绕副行底边从下翻出、出场绕副行
   /// 顶边向上翻走（见 [LyricLayout.sublineFlipAngle]）。角度为 0 时不施加任何
   /// 画布变换，与改造前逐像素一致。
-  void _paintTranslation(Canvas canvas, Offset at) {
-    final double angle = LyricLayout.sublineFlipAngle(
-      translationExpand,
-      exiting: translationExiting,
-    );
-    if (angle == 0) {
+  ///
+  /// [image] 非空时用预栅格化图代替文字做透视绘制：透视变换作用在纹理四边形上，
+  /// 避免文字走透视矩阵触发字形路径渲染。图内文字烘焙为白色，主题色与 alpha
+  /// 在此用 `srcIn` 着色。
+  void _paintTranslation(
+    Canvas canvas,
+    Offset at, {
+    required double angle,
+    required double sublineWidth,
+    required double sublineHeight,
+    required int colorValue,
+    required double alpha,
+    AuxTextImage? image,
+  }) {
+    if (image == null && angle == 0) {
       _translationPainter.paint(canvas, at);
       return;
     }
-    // 锚点同时给出 x（= 副行水平中点，透视投影中心）与 y（旋转锚线）：
-    // 只平移 y 会让透视除法绕画布左上角进行，翻转时副行整体左漂。
-    final Offset anchor = LyricLayout.sublineFlipAnchor(
-      transX: at.dx,
-      sublineWidth: _translationPainter.width,
-      transY: at.dy,
-      sublineHeight: _translationPainter.height,
-      exiting: translationExiting,
-    );
-    canvas.save();
-    canvas.transform(
-      LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage,
-    );
-    _translationPainter.paint(canvas, at);
-    canvas.restore();
+    final bool transformed = angle != 0;
+    if (transformed) {
+      // 锚点同时给出 x（= 副行水平中点，透视投影中心）与 y（旋转锚线）：
+      // 只平移 y 会让透视除法绕画布左上角进行，翻转时副行整体左漂。
+      final Offset anchor = LyricLayout.sublineFlipAnchor(
+        transX: at.dx,
+        sublineWidth: sublineWidth,
+        transY: at.dy,
+        sublineHeight: sublineHeight,
+        exiting: translationExiting,
+      );
+      canvas.save();
+      canvas.transform(
+        LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage,
+      );
+    }
+    if (image != null) {
+      debugFlipImageDraws++;
+      // 白字烘焙图 + srcIn：一次着色同时给出主题色与淡出 alpha。
+      _auxImagePaint.colorFilter = ColorFilter.mode(
+        Color.fromRGBO(
+          (colorValue >> 16) & 0xFF,
+          (colorValue >> 8) & 0xFF,
+          colorValue & 0xFF,
+          alpha.clamp(0.0, 1.0),
+        ),
+        BlendMode.srcIn,
+      );
+      canvas.drawImageRect(
+        image.image,
+        Rect.fromLTWH(
+          0,
+          0,
+          image.image.width.toDouble(),
+          image.image.height.toDouble(),
+        ),
+        // 柔边图四周含 pad：向左上偏移并放大 2*pad，文字落点与对齐不变。
+        Rect.fromLTWH(
+          at.dx - image.pad,
+          at.dy - image.pad,
+          image.width + image.pad * 2,
+          image.height + image.pad * 2,
+        ),
+        _auxImagePaint,
+      );
+    } else {
+      _translationPainter.paint(canvas, at);
+    }
+    if (transformed) canvas.restore();
   }
 
   /// 该字是否处于强调激活窗口（任一字符状态非 idle）。
@@ -1562,7 +1747,7 @@ class WordRenderer {
       if (_lastSetAlphas[wordIndex] != alphaStep) {
         painter.text = TextSpan(
           text: painter.text?.toPlainText(),
-          style: TextStyle(
+          style: LyricLayout.paintStyle(
             color: Color.fromRGBO(
               textRed,
               textGreen,
@@ -1571,8 +1756,6 @@ class WordRenderer {
             ),
             fontSize: fontSize,
             height: rowHeight,
-            fontFamily: LyricLayout.fontFamily,
-            fontWeight: LyricLayout.fontWeight,
           ),
         );
         painter.layout();
@@ -1602,18 +1785,16 @@ class WordRenderer {
     if (_lastSetAlphas[wordIndex] != -1) {
       painter.text = TextSpan(
         text: painter.text?.toPlainText(),
-        style: TextStyle(
+        style: LyricLayout.paintStyle(
           color: const Color.fromRGBO(255, 255, 255, 1.0),
           fontSize: fontSize,
           height: rowHeight,
-          fontFamily: LyricLayout.fontFamily,
-          fontWeight: LyricLayout.fontWeight,
         ),
       );
       painter.layout();
       _lastSetAlphas[wordIndex] = -1;
     }
-    canvas.saveLayer(wordRect, Paint());
+    canvas.saveLayer(_softLayerRect(wordRect, fontSize), Paint());
     _wordGlyphPaint.colorFilter = null; // 纯白字形，渐变由 modulate 着色
     if (!_blitWordGlyph(
       canvas,
@@ -1888,27 +2069,49 @@ class WordRenderer {
       // drawImageRect 缩放到原生字符尺寸；图片未就绪时降级 TextPainter 均匀
       // alpha 路径（量化缓存），视觉等价。
       //
-      // 换行行（rowHeight < lineHeight，0.8x 行盒）：字形图按 1.5 行盒生成，
-      // 直接缩放到 0.8x 行盒会把字形垂直压扁变形 → 换行行改用 TextPainter
-      // （按 rowHeight 行盒渲染），与整词路径行盒一致，避免激活/idle 切换瞬移。
-      //
-      // **方案 C：辉光字与普通字一致的渐变模型**。普通字整词路径按字左右边缘
-      // 采样行级渐变（maskX 左亮右暗，向右推进）；辉光字此前（P6）改为字符中心
-      // 采样 uniform，单字内无渐变，导致中文单字在 maskX 扫过时"整字变亮"、
-      // 渐变带凭空消失显得硬切。这里对每个字符按左右边缘采样，差异明显时
-      // saveLayer + LinearGradient modulate（与整词路径一致），恢复向右推进感。
-      final bool sameRowBox = (rowHeight - lineHeight).abs() < 1e-6;
-      final ui.Image? charImg = sameRowBox && k < charImages.length
+      // 换行行（rowHeight < lineHeight，0.8x 行盒）：字形图按【当前行盒】烘焙，
+      // 与 TextPainter 落位同源，因此这里不再按行盒退回文本路径——文本路径的
+      // 垂直位置会被栅格化量化到整 device 像素，放大/上浮会呈 1px 台阶
+      // （见 [_charImageRowHeights]）。图未就绪的那一帧仍降级 TextPainter。
+      final double? cachedCharRow = wordIndex < _charImageRowHeights.length &&
+              k < _charImageRowHeights[wordIndex].length
+          ? _charImageRowHeights[wordIndex][k]
+          : null;
+      final bool charImgRowMatches =
+          cachedCharRow != null && (cachedCharRow - rowHeight).abs() < 1e-6;
+      final ui.Image? charImg = charImgRowMatches && k < charImages.length
           ? charImages[k]
           : null;
+      if (charImg == null) {
+        // 行盒不匹配（首次进换行行 / 换行行 ↔ 主行切换）：按当前行盒重烘焙
+        _requestCharImage(
+          wordIndex,
+          k,
+          painter.text?.toPlainText() ?? '',
+          fontSize,
+          rowHeight,
+        );
+      }
       // 渐变参数（charLeftX / charRightX / leftAlpha / rightAlpha /
       // sweepRamp / needGradient）已在辉光层之前统一算好，此处直接复用。
+      // **方案 C：辉光字与普通字一致的渐变模型**。普通字整词路径按字左右边缘
+      // 采样行级渐变（maskX 左亮右暗，向右推进）；辉光字若只按字符中心采样
+      // uniform，单字内无渐变，中文单字在 maskX 扫过时会"整字变亮"显得硬切。
+      // 这里对每个字符按左右边缘采样，差异明显时 saveLayer + LinearGradient
+      // modulate（与整词路径一致），恢复向右推进感。
+      // 柔边字形图四周含 pad：绘制矩形同步偏移+放大，文字落点不变。
+      final double softPad = _softPad(fontSize);
       if (needGradient) {
         // 渐变路径：先画纯白字形，再 LinearGradient modulate（复用 _gradientPaint）。
-        final double charH =
-            fontSize * (charImg != null ? lineHeight : rowHeight);
+        final double charH = fontSize * rowHeight;
         final Rect charRect = Rect.fromLTWH(charX, charY, cw, charH);
-        canvas.saveLayer(charRect, Paint());
+        final Rect charDrawRect = Rect.fromLTWH(
+          charX - softPad,
+          charY - softPad,
+          cw + softPad * 2,
+          charH + softPad * 2,
+        );
+        canvas.saveLayer(_softLayerRect(charRect, fontSize), Paint());
         if (charImg != null) {
           _charImagePaint.colorFilter = const ColorFilter.matrix(<double>[
             1,
@@ -1940,7 +2143,7 @@ class WordRenderer {
               charImg.width.toDouble(),
               charImg.height.toDouble(),
             ),
-            charRect,
+            charDrawRect,
             _charImagePaint,
           );
         } else {
@@ -1948,12 +2151,10 @@ class WordRenderer {
           if (k >= lastSetAlphas.length || lastSetAlphas[k] != -1) {
             painter.text = TextSpan(
               text: painter.text?.toPlainText(),
-              style: TextStyle(
+              style: LyricLayout.paintStyle(
                 color: const Color.fromRGBO(255, 255, 255, 1.0),
                 fontSize: fontSize,
                 height: rowHeight,
-                fontFamily: LyricLayout.fontFamily,
-                fontWeight: LyricLayout.fontWeight,
               ),
             );
             painter.layout();
@@ -2009,7 +2210,12 @@ class WordRenderer {
             charImg.width.toDouble(),
             charImg.height.toDouble(),
           ),
-          Rect.fromLTWH(charX, charY, cw, fontSize * lineHeight),
+          Rect.fromLTWH(
+            charX - softPad,
+            charY - softPad,
+            cw + softPad * 2,
+            fontSize * rowHeight + softPad * 2,
+          ),
           _charImagePaint,
         );
       } else {
@@ -2018,12 +2224,10 @@ class WordRenderer {
         if (k >= lastSetAlphas.length || lastSetAlphas[k] != alphaStep) {
           painter.text = TextSpan(
             text: painter.text?.toPlainText(),
-            style: TextStyle(
+            style: LyricLayout.paintStyle(
               color: Color.fromRGBO(textRed, textGreen, textBlue, charAlpha),
               fontSize: fontSize,
               height: rowHeight,
-              fontFamily: LyricLayout.fontFamily,
-              fontWeight: LyricLayout.fontWeight,
             ),
           );
           painter.layout();
@@ -2131,14 +2335,12 @@ class WordRenderer {
       final bool isFirstRow = i == 0;
       painter.text = TextSpan(
         text: plan.rowTexts[i],
-        style: TextStyle(
+        style: LyricLayout.paintStyle(
           color: Color.fromRGBO(textRed, textGreen, textBlue, alpha),
           fontSize: fontSize,
           height: isFirstRow
               ? LyricLayout.lineHeight
               : LyricLayout.lineHeight * LyricLayout.wrapLineHeightFactor,
-          fontFamily: LyricLayout.fontFamily,
-          fontWeight: LyricLayout.fontWeight,
         ),
       );
       painter.layout(maxWidth: double.infinity);
@@ -2483,30 +2685,58 @@ class WordRenderer {
   /// **按 [_charImageSupersample] 超采样渲染**：绘制时经 drawImageRect 缩放到
   /// 原生尺寸，波浪放大到 1.12× 仍保持清晰，避免低分辨率图片放大出现马赛克。
   /// 幂等保护同 [_requestCharGlowSprite]，异步回调用 [_spriteEpoch] 校验。
+  ///
+  /// [rowHeight] 为该视觉行的行盒倍率（主行 = `LyricLayout.lineHeight`，
+  /// 换行行 = ×0.8）。**图与行盒一一对应**：行盒变化时释放旧图按新行盒重烘焙，
+  /// 否则换行行只能退回 TextPainter，垂直位移被量化成 1px 台阶
+  /// （见 [_charImageRowHeights] 的实测说明）。
   void _requestCharImage(
     int wordIndex,
     int charIndex,
     String text,
     double fontSize,
-  ) {
+    double rowHeight, {
+    bool rebuildOnMismatch = true,
+  }) {
+    if (fontSize <= 0 || rowHeight <= 0 || text.isEmpty) return;
     final String key = '$wordIndex:$charIndex';
-    if (_charImagePending.contains(key)) return;
-    if (wordIndex < _charImages.length &&
-        charIndex < _charImages[wordIndex].length &&
-        _charImages[wordIndex][charIndex] != null) {
-      return;
+    final bool hasCell = wordIndex < _charImages.length &&
+        charIndex < _charImages[wordIndex].length;
+    if (!hasCell) return;
+    final ui.Image? cachedImg = _charImages[wordIndex][charIndex];
+    final double cachedRow = wordIndex < _charImageRowHeights.length &&
+            charIndex < _charImageRowHeights[wordIndex].length
+        ? _charImageRowHeights[wordIndex][charIndex]
+        : -1;
+    final bool pending = _charImagePending.contains(key);
+    if (!rebuildOnMismatch) {
+      // 预热方（tick）不知道该字落在主行还是换行行：只在「无图、无在途请求」时
+      // 发起主行烘焙，绝不覆盖绘制侧已按实际行盒确定的图/请求，否则两边会
+      // 互相作废（预热改回 lineHeight → 绘制再改回 0.8×）形成乒乓，换行行
+      // 永远拿不到图、退回 TextPainter 出 1px 台阶。
+      if (cachedImg != null || pending) return;
+    } else {
+      final bool rowMatches = (cachedRow - rowHeight).abs() < 1e-6;
+      if (cachedImg != null && rowMatches) return;
+      // 行盒变化：旧图作废（异步回包按 [_charImageRowHeights] 的值核对，不会混入）
+      if (cachedImg != null && !rowMatches) {
+        cachedImg.dispose();
+        _charImages[wordIndex][charIndex] = null;
+      }
+      if (pending) return;
     }
     _charImagePending.add(key);
+    // 先登记目标行盒：异步回包只有行盒仍等于该值时才落地
+    _charImageRowHeights[wordIndex][charIndex] = rowHeight;
     final int epoch = _spriteEpoch;
-    final double charH = fontSize * LyricLayout.lineHeight;
-    if (text.isEmpty || charH <= 0) {
-      _charImagePending.remove(key);
-      return;
-    }
-    _renderCharImage(text, fontSize).then((image) {
+    _renderCharImage(text, fontSize, rowHeight).then((image) {
       _charImagePending.remove(key);
       if (image == null) return;
-      if (epoch != _spriteEpoch) {
+      final bool stillWanted = epoch == _spriteEpoch &&
+          wordIndex < _charImageRowHeights.length &&
+          charIndex < _charImageRowHeights[wordIndex].length &&
+          (_charImageRowHeights[wordIndex][charIndex] - rowHeight).abs() < 1e-6;
+      if (!stillWanted) {
         image.dispose();
         return;
       }
@@ -2570,28 +2800,34 @@ class WordRenderer {
   ) async {
     try {
       final double renderFontSize = fontSize * _wordGlyphSupersample;
+      // 柔边：图按超采样字号渲染，sigma 同步放大后再缩回逻辑尺寸，柔边宽度才一致。
+      // pad 预留在图四周，避免模糊衰减被图片边界裁断。
+      final double padRender =
+          _softPad(fontSize) * _wordGlyphSupersample;
       final TextPainter textPainter = TextPainter(textDirection: TextDirection.ltr)
         ..text = TextSpan(
           text: text,
-          style: TextStyle(
+          style: LyricLayout.paintStyle(
             // 纯白字形：绘制时经 ColorFilter 上色为文字色 + alpha
             color: const Color.fromRGBO(255, 255, 255, 1.0),
             fontSize: renderFontSize,
             height: rowHeight,
-            fontFamily: LyricLayout.fontFamily,
-            fontWeight: LyricLayout.fontWeight,
+            softSigma: LyricLayout.softEdgeAntiAlias
+                ? LyricLayout.softEdgeSigma(fontSize) * _wordGlyphSupersample
+                : null,
           ),
         )
         ..layout();
-      final int imgW = (wordWidth * _wordGlyphSupersample).ceil();
-      final int imgH = (renderFontSize * rowHeight).ceil();
+      final int imgW =
+          (wordWidth * _wordGlyphSupersample).ceil() + (padRender * 2).ceil();
+      final int imgH = (renderFontSize * rowHeight).ceil() + (padRender * 2).ceil();
       if (imgW <= 0 || imgH <= 0) {
         textPainter.dispose();
         return null;
       }
       final ui.PictureRecorder recorder = ui.PictureRecorder();
       final Canvas canvas = Canvas(recorder);
-      textPainter.paint(canvas, Offset.zero);
+      textPainter.paint(canvas, Offset(padRender, padRender));
       textPainter.dispose();
       final ui.Picture picture = recorder.endRecording();
       final ui.Image image = await picture.toImage(imgW, imgH);
@@ -2620,13 +2856,34 @@ class WordRenderer {
     final ui.Image? image = _wordGlyphImages[wordIndex];
     if (image == null) return false;
     if ((_wordGlyphRowHeights[wordIndex] - rowHeight).abs() > 1e-6) return false;
+    // 柔边图四周含 pad：目标矩形同步向左上偏移并放大 2*pad，字形落点不变。
+    final double pad = _softPad(fontSize);
     canvas.drawImageRect(
       image,
       Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-      Rect.fromLTWH(wordX, wordY, width, fontSize * rowHeight),
+      Rect.fromLTWH(
+        wordX - pad,
+        wordY - pad,
+        width + pad * 2,
+        fontSize * rowHeight + pad * 2,
+      ),
       _wordGlyphPaint,
     );
     return true;
+  }
+
+  /// 柔边外扩（逻辑 px）；关闭柔边时为 0。
+  ///
+  /// 柔边会让字形覆盖超出字宽 / 行盒边界，凡把它裁进图层的绘制路径都要先扩。
+  double _softPad(double fontSize) =>
+      LyricLayout.softEdgeAntiAlias ? LyricLayout.softEdgePad(fontSize) : 0;
+
+  /// 柔边外扩后的图层矩形（仅用于 `saveLayer` 边界）。
+  ///
+  /// **渐变 shader 仍用原 rect**：扩的是图层，不是渐变锚点，否则扫光位置整体偏移。
+  Rect _softLayerRect(Rect rect, double fontSize) {
+    final double pad = _softPad(fontSize);
+    return pad > 0 ? rect.inflate(pad) : rect;
   }
 
   /// 字形图上色（文字色 + alpha），用于均匀性绘制路径。
@@ -2654,32 +2911,43 @@ class WordRenderer {
         0,
       ]);
 
-  /// 渲染单个字符的纯白字形图（异步，尺寸 = 字符宽 × 行高 × 超采样倍数）。
-  Future<ui.Image?> _renderCharImage(String text, double fontSize) async {
+  /// 渲染单个字符的纯白字形图（异步，尺寸 = 字符宽 × 行盒高 × 超采样倍数）。
+  ///
+  /// [rowHeight] 与绘制侧 `fontSize * rowHeight` 的行盒严格同源，保证主行 /
+  /// 换行行（0.8×）两套行盒各自对齐、激活与 idle 切换不产生垂直位移。
+  Future<ui.Image?> _renderCharImage(
+    String text,
+    double fontSize,
+    double rowHeight,
+  ) async {
     try {
       final double renderFontSize = fontSize * _charImageSupersample;
+      // 柔边：sigma 随超采样放大，pad 预留四周避免裁断（口径同整词字形图）。
+      final double padRender = _softPad(fontSize) * _charImageSupersample;
       final textPainter = TextPainter(textDirection: TextDirection.ltr)
         ..text = TextSpan(
           text: text,
-          style: TextStyle(
+          style: LyricLayout.paintStyle(
             // 纯白字形：绘制时经 ColorFilter 上色为文字色 + mask alpha
             color: const Color.fromRGBO(255, 255, 255, 1.0),
             fontSize: renderFontSize,
-            height: LyricLayout.lineHeight,
-            fontFamily: LyricLayout.fontFamily,
-            fontWeight: LyricLayout.fontWeight,
+            height: rowHeight,
+            softSigma: LyricLayout.softEdgeAntiAlias
+                ? LyricLayout.softEdgeSigma(fontSize) * _charImageSupersample
+                : null,
           ),
         )
         ..layout();
-      final int imgW = textPainter.width.ceil();
-      final int imgH = (renderFontSize * LyricLayout.lineHeight).ceil();
+      final int imgW = textPainter.width.ceil() + (padRender * 2).ceil();
+      final int imgH =
+          (renderFontSize * rowHeight).ceil() + (padRender * 2).ceil();
       if (imgW <= 0 || imgH <= 0) {
         textPainter.dispose();
         return null;
       }
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
-      textPainter.paint(canvas, Offset.zero);
+      textPainter.paint(canvas, Offset(padRender, padRender));
       textPainter.dispose();
       final picture = recorder.endRecording();
       final image = await picture.toImage(imgW, imgH);
@@ -2736,6 +3004,21 @@ class WordRenderer {
     if (kDebugMode) print(sb.toString());
   }
 
+  /// 预绑定：在行成为当前行之前完成逐字测量与 painter 初始化。
+  ///
+  /// 把 [_ensureBound] 的同步开销（逐字 TextPainter 测量、旧列表/精灵释放）
+  /// 从切行帧前移到预启动窗口或切行后的空闲帧。幂等：已绑定同一行时直接返回。
+  void prepareFor(LyricLine line, double fontSize) {
+    if (identical(_boundLine, line) &&
+        _boundFontSize == fontSize &&
+        _boundFontWeight == LyricPreferences.instance.fontWeightValue &&
+        _boundLineHeight == LyricLayout.lineHeight &&
+        _boundSoftEdge == LyricLayout.softEdgeAntiAlias) {
+      return;
+    }
+    _ensureBound(line, fontSize);
+  }
+
   /// 检测 line 切换并重置 alpha map，同时测量并缓存所有 word 宽度。
   ///
   /// 若传入的 line 与当前绑定不是同一对象引用（[identical] 失败），
@@ -2752,10 +3035,12 @@ class WordRenderer {
     final sameFontWeight =
         _boundFontWeight == LyricPreferences.instance.fontWeightValue;
     final sameLineHeight = _boundLineHeight == LyricLayout.lineHeight;
+    final bool sameSoftEdge = _boundSoftEdge == LyricLayout.softEdgeAntiAlias;
     if (sameLine &&
         sameFontSize &&
         sameFontWeight &&
         sameLineHeight &&
+        sameSoftEdge &&
         _wordPainters.length == line.words.length) {
       return; // 缓存命中
     }
@@ -2763,6 +3048,7 @@ class WordRenderer {
     _boundFontSize = fontSize;
     _boundFontWeight = LyricPreferences.instance.fontWeightValue;
     _boundLineHeight = LyricLayout.lineHeight;
+    _boundSoftEdge = LyricLayout.softEdgeAntiAlias;
     // 注意：_wordAlphas/_wordYOffsets/_lastSetAlphas 不能用 .clear()，
     // 因为它们可能被 const <T>[] 初始化（不可修改）。后面会直接重新赋值，无需 clear。
 
@@ -2780,7 +3066,7 @@ class WordRenderer {
       }
     }
 
-    final double dark = dynamicDarkAlpha;
+    final double dark = _unplayedTextAlpha;
     // P1-5：行绑定切换（切行/字号变化）时失效辉光精灵缓存——
     // 旧行的 word 文本/字号不同，精灵图不再匹配；异步渲染中的结果也丢弃。
     _spriteEpoch++;
@@ -2798,6 +3084,7 @@ class WordRenderer {
       }
     }
     _charImagePending.clear();
+    _charImageRowHeights = const <List<double>>[];
     // 整词字形图（Windows 上浮平滑）：行绑定切换即整体失效，代次 +1 丢弃在途结果
     _wordGlyphEpoch++;
     for (final ui.Image? img in _wordGlyphImages) {
@@ -2834,6 +3121,11 @@ class WordRenderer {
     );
     // v7：逐字符纯白字形图缓存（仅强调字有内容）
     _charImages = List.generate(line.words.length, (_) => const <ui.Image?>[]);
+    // 逐字符字形图的行盒倍率（-1 = 无图），与图一一对应，行盒变化即重烘焙
+    _charImageRowHeights = List.generate(
+      line.words.length,
+      (_) => const <double>[],
+    );
     _charImagePending.clear();
     // 整词字形图：仅 Windows + 开启上浮时启用（见 [_glyphBlitActive] 说明）。
     // 平台用 defaultTargetPlatform 判定：flutter test 下为 android，测试保持
@@ -2890,7 +3182,6 @@ class WordRenderer {
         );
         final List<double> widths = List<double>.filled(n, 0);
         final List<double> starts = List<double>.filled(n, 0);
-        double charAccum = 0;
         for (int k = 0; k < n; k++) {
           final String charText = String.fromCharCode(runes[k]);
           chars[k].text = TextSpan(
@@ -2906,8 +3197,23 @@ class WordRenderer {
           );
           chars[k].layout();
           widths[k] = chars[k].width;
-          starts[k] = charAccum;
-          charAccum += chars[k].width;
+        }
+        // 字符起点：优先整词 shaped caret（与本词行内占位同源，保留 kerning），
+        // 避免辉光触发瞬间整词被"摊宽"（见 [shapedCharStarts] 的实测说明）。
+        // 不可用时回退逐字符 advance 累加，行为与改造前一致。
+        final List<double>? shapedStarts = shapedCharStarts(
+          wordPainter: _wordPainters[i]!,
+          text: line.words[i].text,
+          runes: runes,
+        );
+        if (shapedStarts != null) {
+          starts.setAll(0, shapedStarts);
+        } else {
+          double charAccum = 0;
+          for (int k = 0; k < n; k++) {
+            starts[k] = charAccum;
+            charAccum += widths[k];
+          }
         }
         _charPainters[i] = chars;
         _charWidths[i] = widths;
@@ -2920,6 +3226,8 @@ class WordRenderer {
         _charGlowSprites[i] = List<ui.Image?>.filled(n, null);
         // v7：逐字符纯白字形图缓存（激活窗口内用图片变换绘制，避免文字重栅格化闪烁）
         _charImages[i] = List<ui.Image?>.filled(n, null);
+        // 行盒倍率：-1 = 无图，绘制侧按实际视觉行（主行 / 0.8× 换行行）填值
+        _charImageRowHeights[i] = List<double>.filled(n, -1);
         // v8：每字符波浪相位分配，初始 1.0（已完成=idle），字成为当前字时再锚定
         _waveBumpPhases[i] = List<double>.filled(n, 1.0);
         _waveFloatPhases[i] = List<double>.filled(n, 1.0);
@@ -2993,6 +3301,64 @@ class WordRenderer {
     return spans;
   }
 
+  /// 用【整词 shaped 布局】的逐字符 caret 位置求字符起点（逐字符绘制路径用）。
+  ///
+  /// **为什么不能用逐字符 advance 累加**：强调字拆成独立 painter 后，每个字符的
+  /// advance 是"孤立整形"的结果，不含整词整形时的 kerning（字偶距）。累加值系统性
+  /// 大于整词宽度（实测 @fs=40：`STAY` +5.9px、`To` +4.4px、`WAVE` +4.5px），而
+  /// 该词在行内的占位用的正是整词宽度 [TextPainter.width] → 辉光一触发（绘制从
+  /// 整词切到逐字符）整词就被"摊宽"，波浪尾巴走完又缩回，观感即"字距变大"。
+  /// 中文单字/词无 kerning，差值恒 0，所以只有英文暴露。
+  ///
+  /// 这里改为对每个字符取整词 painter 的 selection 框左沿（= 该字符在 shaped 布局
+  /// 中的 caret x），位置与整词占位严格自洽（末框右沿 == [TextPainter.width]）。
+  /// 字宽仍由调用方用独立 advance 填充（缩放中心 / 辉光矩形需要真实字宽）。
+  ///
+  /// 返回 null 表示 shaped 度量不可用（框为空/框宽非正/caret 非单调/首尾与整词
+  /// 宽度不符、或组合符等字素簇异常），调用方须回退到 advance 累加。
+  @visibleForTesting
+  static List<double>? shapedCharStarts({
+    required TextPainter wordPainter,
+    required String text,
+    required List<int> runes,
+  }) {
+    final int n = runes.length;
+    if (n == 0 || text.isEmpty) return null;
+    final List<double> starts = List<double>.filled(n, 0);
+    int cuOffset = 0;
+    double lastRight = 0;
+    for (int k = 0; k < n; k++) {
+      // TextSelection 用 UTF-16 code unit 偏移，rune 索引不能直接用（增补平面 2 单元）
+      final int cuLength = runes[k] > 0xFFFF ? 2 : 1;
+      final int start = cuOffset;
+      final int end = cuOffset + cuLength;
+      cuOffset = end;
+      if (end > text.length) return null;
+      final List<TextBox> boxes;
+      try {
+        boxes = wordPainter.getBoxesForSelection(
+          TextSelection(baseOffset: start, extentOffset: end),
+        );
+      } catch (_) {
+        return null;
+      }
+      if (boxes.isEmpty) return null;
+      final TextBox box = boxes.last;
+      if (!box.left.isFinite ||
+          !box.right.isFinite ||
+          box.right <= box.left) {
+        return null;
+      }
+      if (k > 0 && box.left < starts[k - 1] - 0.01) return null;
+      starts[k] = box.left;
+      lastRight = box.right;
+    }
+    // 自洽校验：首字符贴左、末字符右沿与整词宽度一致（±1.5px 容差，含 hinting 抖动）
+    if (starts[0].abs() > 1.0) return null;
+    if ((lastRight - wordPainter.width).abs() > 1.5) return null;
+    return starts;
+  }
+
   /// 重置状态：清空 alpha map、Y 偏移、归零 progress、scale 回到 inactive、isActive=false、解绑 line。
   ///
   /// **v4 优化**：dispose 所有 per-word TextPainter 实例避免内存泄漏。
@@ -3004,6 +3370,7 @@ class WordRenderer {
     _boundFontSize = -1;
     _boundFontWeight = -1;
     _boundLineHeight = -1;
+    _boundSoftEdge = false;
     _wordWidths = const <double>[];
     _wordStartXs = const <double>[];
     _currentWordIdx = -1;
@@ -3053,6 +3420,7 @@ class WordRenderer {
       }
     }
     _charImages = const <List<ui.Image?>>[];
+    _charImageRowHeights = const <List<double>>[];
     _charImagePending.clear();
     // 整词字形图缓存（Windows 上浮平滑）
     for (final ui.Image? img in _wordGlyphImages) {
@@ -3061,6 +3429,9 @@ class WordRenderer {
     _wordGlyphImages = const <ui.Image?>[];
     _wordGlyphRowHeights = const <double>[];
     _wordGlyphPending.clear();
+    // 副行 layout 缓存失效：下一次文本路径必须重新排版。
+    _lastAuxPaintPlan = null;
+    _lastAuxPaintAlpha = -1;
     // v8：复位逐字波浪状态
     _waveAnchorPosMs = const <double>[];
     _waveAdvanceMs = const <double>[];

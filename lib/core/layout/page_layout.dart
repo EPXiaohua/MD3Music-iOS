@@ -161,7 +161,7 @@ bool usesLargeScreenContentLayout(BuildContext context) {
   };
 }
 
-/// 大屏按局部可用宽度扩展到 85%，手机保持原限宽；不改文字或全局缩放。
+/// 大屏按局部可用宽度扩展到 92%，手机保持原限宽；不改文字或全局缩放。
 class ContentWidth extends StatelessWidget {
   const ContentWidth({
     super.key,

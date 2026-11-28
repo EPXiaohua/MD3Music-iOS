@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
+import '../../utils/playlist_song_sort.dart';
 import '../../providers/listen_together_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../widgets/m3e_sort_sheet.dart';
@@ -119,12 +120,16 @@ class _SongsPageState extends State<SongsPage> {
 
     switch (_sortBy) {
       case SongSortBy.title:
-        songs.sort(
-            (a, b) => compare(a.title, b.title, (x, y) => x.compareTo(y)));
+        // 按拼音键比较（与歌单详情页同一实现）：直接用 compareTo 中文会按
+        // Unicode 码位序排，与 A→Z 预期不符；用 displayName 剥离 .mp3 等
+        // 后缀，排序结果与列表显示文本一致。
+        songs.sort((a, b) => compare(a.displayName, b.displayName,
+            (x, y) => pinyinSortKey(x).compareTo(pinyinSortKey(y))));
         break;
       case SongSortBy.artist:
-        songs.sort(
-            (a, b) => compare(a.artist, b.artist, (x, y) => x.compareTo(y)));
+        songs.sort((a, b) =>
+            compare(a.artist, b.artist,
+                (x, y) => pinyinSortKey(x).compareTo(pinyinSortKey(y))));
         break;
       case SongSortBy.dateAdded:
         // 添加时间排序：原列表顺序视为添加顺序，倒序时整体反转

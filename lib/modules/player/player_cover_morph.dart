@@ -482,8 +482,12 @@ class PlayerCoverMorphBus {
   /// 空洞），转场退化为纯交叉淡入淡出；`playerExpansion` 仍照常被路由写成端点值。
   bool reducedMotion = false;
 
+  /// 轻量桌面转场由真实页面绘制封面和文字，不再额外飞行一份。
+  bool simplePageTransition = false;
+
   /// 形变层本帧是否画文字块。
   bool get textWillDraw {
+    if (simplePageTransition) return false;
     if (reducedMotion) return false;
     if (!playerCoverVisible.value) return false;
     if (!textEligible) return false;
@@ -510,6 +514,7 @@ class PlayerCoverMorphBus {
   /// 构建，判断就永远不会被求值、`eligible` 会停在过期值。本判据在**绘制那一刻**
   /// 由常驻的形变层 / MiniPlayer 读取，才真正拦得住。
   bool willDraw({required bool eligible}) {
+    if (simplePageTransition) return false;
     if (reducedMotion) return false;
     if (!playerCoverVisible.value) return false;
     if (!eligible) return false;

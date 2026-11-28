@@ -25,6 +25,7 @@ import '../../providers/theme_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/song_list_item.dart';
+import '../../widgets/playlist_track_order_list.dart';
 import '../../utils/playlist_song_sort.dart';
 import '../../utils/playlist_write_payload.dart' show buildTrackAddBatches;
 import '../../widgets/m3e_sort_sheet.dart';
@@ -33,20 +34,21 @@ import '../../widgets/playlist_cover_hero.dart';
 import '../../widgets/keyboard_expand_sheet.dart';
 import '../player/secondary_mini_player.dart';
 import 'playlist_songs_loader.dart';
+import '../../services/kugou_api/playlist_track_order.dart';
 
 class PlaylistPage extends StatefulWidget {
-  /// 可选扩展：对显示列表应用变换（默认关闭，由私有构建注入，用于筛选等）。
-  /// [pageKey] 为页面标识（'playlist'），供私有状态按页隔离。
+  /// 可选扩展：对显示列表应用变换（默认关闭，由宿主注入，用于筛选等）。
+  /// [pageKey] 为页面标识（'playlist'），供扩展状态按页隔离。
   static List<Song> Function(String pageKey, List<Song> songs)? songFilterHook;
 
-  /// 可选扩展：筛选状态变更的监听信号（默认关闭，由私有构建注入，
+  /// 可选扩展：筛选状态变更的监听信号（默认关闭，由宿主注入，
   /// 用于筛选按钮切换后触发本页重建）。
   static Listenable? songFilterListenable;
 
-  /// 可选扩展：顶栏额外操作按钮（默认关闭，由私有构建注入）。
+  /// 可选扩展：顶栏额外操作按钮（默认关闭，由宿主注入）。
   static List<Widget> Function(BuildContext context)? extraAppBarActionsBuilder;
 
-  /// 可选扩展：多选栏的额外操作按钮（默认关闭，由私有构建注入，用于批量下载等）。
+  /// 可选扩展：多选栏的额外操作按钮（默认关闭，由宿主注入，用于多选批量操作）。
   static List<Widget> Function(
     BuildContext context,
     ColorScheme colorScheme,
@@ -86,6 +88,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
   bool _isLoading = true;
   List<Song> _songs = [];
   String? _error;
+  /// 分页中途失败导致列表不完整（部分数据已展示，提示可重试）。
+  bool _songsIncomplete = false;
   // 普通歌单（发现/热门/排行榜）的红心收藏状态
   bool _isCollected = false;
   String? _collectedListId;
@@ -93,6 +97,62 @@ class _PlaylistPageState extends State<PlaylistPage> {
   // 排序
   PlaylistSongSort _sortBy = PlaylistSongSort.time;
   bool _sortAscending = false; // 默认降序（最新在前 / Z→A / 长→短）
+  PlaylistTrackOrder? _trackOrder;
+  List<Song> _orderSongs = [];
+  bool _orderSaving = false;
+
+  void _editTrackOrder() {
+    if (_sortBy != PlaylistSongSort.time) return;
+    final listId = widget.playlist.subscribedListId ?? widget.playlist.listCreateListid;
+    if (listId == null || listId.isEmpty) return;
+    if (_undoRequest.value != null) {
+      showToast('请等待删除操作完成后再调整顺序');
+      return;
+    }
+    try {
+      final songs = sortSongsByPlaylistPosition(List<Song>.of(_songs));
+      // 本地检查条目标识，进入排序不发请求；完整性及云端变化在保存时核对。
+      validatePlaylistTrackIds(songs);
+      setState(() {
+        _trackOrder = PlaylistTrackOrder(
+          listId, null, songs, accountId: KugouApiClient().userid,
+        );
+        _orderSongs = _sortAscending ? [...songs] : songs.reversed.toList();
+      });
+    } catch (error) {
+      showToast(error is StateError ? error.message : '加载失败，请稍后重新打开排序', long: true);
+    }
+  }
+
+  void _cancelTrackOrder() {
+    if (!_orderSaving) setState(() => _trackOrder = null);
+  }
+
+  Future<void> _finishTrackOrder() async {
+    final original = _trackOrder!;
+    // 云端保存正序位置；倒序展示的拖动结果先还原为正序。
+    final reordered = _sortAscending ? _orderSongs : _orderSongs.reversed.toList();
+    if (samePlaylistTrackOrder(original.songs, reordered)) {
+      _cancelTrackOrder();
+      return;
+    }
+    setState(() => _orderSaving = true);
+    try {
+      final order = await KugouApiClient().savePlaylistTrackOrder(original, reordered);
+      if (!mounted) return;
+      setState(() {
+        _songs = order.songs;
+        _trackOrder = null;
+        _invalidateDisplaySongs();
+      });
+      final key = _cacheKey();
+      if (key != null) await FavoriteListsCache.savePlaylistSongs(key, order.songs);
+    } catch (error) {
+      showToast(error is StateError ? error.message : '保存未确认成功，请刷新后重试', long: true);
+    } finally {
+      if (mounted) setState(() => _orderSaving = false);
+    }
+  }
 
   /// 切到新维度时的默认方向表：其余维度默认升序。
   static const Set<PlaylistSongSort> _descendingByDefault = {
@@ -166,7 +226,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   @override
   void initState() {
     super.initState();
-    _sortAscending = widget.isDefaultFavorite;
+    _sortAscending = widget.isAlbum || widget.isDefaultFavorite;
     // ignore: avoid_print
     print('[FlashTrace] PlaylistPage initState id=${widget.playlist.id} '
         'name=${widget.playlist.name} hash=$hashCode');
@@ -376,8 +436,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   static const String _kFavoriteSortAscKey = 'favorite_song_sort_asc';
 
   String get _sortByKey =>
+      widget.isAlbum ? 'album_song_sort_by' :
       widget.isDefaultFavorite ? _kFavoriteSortByKey : _kSortByKey;
   String get _sortAscKey =>
+      widget.isAlbum ? 'album_song_sort_asc' :
       widget.isDefaultFavorite ? _kFavoriteSortAscKey : _kSortAscKey;
 
   Future<void> _loadSortPreference() async {
@@ -389,7 +451,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
     setState(() {
       _sortBy = restored;
-      _sortAscending = prefs.getBool(_sortAscKey) ?? widget.isDefaultFavorite;
+      _sortAscending = prefs.getBool(_sortAscKey) ??
+          (widget.isAlbum || widget.isDefaultFavorite);
       _invalidateDisplaySongs();
     });
     // 恢复的维度若依赖播放数据，立即补加载
@@ -449,8 +512,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
       }
     });
   }
-
-  // ==================== 批量下载（未移植：公开库不包含下载功能） ====================
 
   // tv: TV 构建下歌曲行的 OK 键激活（播放 / 多选切换选中）。与触屏
   // SliverM3ESegmentedList.onTap 完全同一逻辑，供 TV SliverList 分支复用。
@@ -1107,6 +1168,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       if (!mounted) return;
       final all = result.songs;
       setState(() {
+        _songsIncomplete = !result.isComplete;
         // 网络拿到数据时正常覆盖；网络空但本地已有 cache 时保留 cache，
         // 避免断网重进歌单时被空响应覆盖掉本地缓存的歌曲
         if (all.isNotEmpty || _songs.isEmpty) {
@@ -1196,9 +1258,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
         // 本 builder 只负责「筛选切换时重建」；缓存失效在 _onFilterChanged
         // （initState 注册）。在此处失效会让每次页面重建都重排整个歌单。
         return PopScope(
-          canPop: !_isMultiSelectMode,
+          canPop: !_isMultiSelectMode && _trackOrder == null && !_orderSaving,
           onPopInvokedWithResult: (didPop, _) {
             if (!didPop && _isMultiSelectMode) _exitMultiSelectMode();
+            if (!didPop && _trackOrder != null) _cancelTrackOrder();
           },
           child: Scaffold(
             body: Stack(
@@ -1210,8 +1273,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 // 歌单的元数据/封面/描述仍可见）
                 if (_error != null)
                   _buildErrorBanner(context, colorScheme, textTheme),
+                // 分页中途失败、列表不完整：次级提示条（区别于整页加载失败）
+                if (_error == null && _songsIncomplete)
+                  _buildIncompleteBanner(colorScheme, textTheme),
                 if (_isMultiSelectMode)
                   _buildMultiSelectBar(colorScheme, textTheme),
+                if (_orderSaving) const LinearProgressIndicator(),
                 Expanded(
                   child: CustomScrollView(
                       controller: _scrollController,
@@ -1324,7 +1391,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                             ),
                           ),
                         // 歌单内搜索栏（点击搜索图标后展开）
-                        if (!_isMultiSelectMode && _isSearching)
+                        if (!_isMultiSelectMode && _isSearching && _trackOrder == null)
                           SliverToBoxAdapter(
                             child: Padding(
                               padding: const EdgeInsets.fromLTRB(
@@ -1395,7 +1462,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                 children: [
                                   Expanded(
                                     child: FilledButton.icon(
-                                      onPressed: () {
+                                      onPressed: _trackOrder != null ? null : () {
                                         final songs = _displaySongs;
                                         if (songs.isNotEmpty) {
                                           context
@@ -1412,7 +1479,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                                   const Gap(AppSpacing.md),
                                   Expanded(
                                     child: OutlinedButton.icon(
-                                      onPressed: () {
+                                      onPressed: _trackOrder != null ? null : () {
                                         final songs = _displaySongs;
                                         if (songs.isNotEmpty) {
                                           final shuffled = List<Song>.from(
@@ -1456,7 +1523,15 @@ class _PlaylistPageState extends State<PlaylistPage> {
                         // SongListItem 的整行 DpadFocusable 形成双重停点；
                         // 退回后单停点由 SongListItem 承担（OK=播放/切换选中，
                         // OK 长按=进多选），触屏路径不变。
-                        if (kTvBuild)
+                        if (_trackOrder != null)
+                          PlaylistTrackOrderList(
+                            songs: _orderSongs,
+                            enabled: !_orderSaving,
+                            onReorder: (from, to) => setState(() {
+                              _orderSongs.insert(to, _orderSongs.removeAt(from));
+                            }),
+                          )
+                        else if (kTvBuild)
                           SliverList(
                             delegate: SliverChildBuilderDelegate(
                               _buildSongRow,
@@ -1515,6 +1590,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                         ),
                         // 搜索无结果提示
                         if (!_isLoading &&
+                            _trackOrder == null &&
                             !_isMultiSelectMode &&
                             _isSearching &&
                             _displaySongs.isEmpty &&
@@ -1577,6 +1653,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
     bool useBackgroundImage,
     bool collapsed,
   ) {
+    final showTrackOrder = !widget.isAlbum &&
+        (widget.isUserCreated || widget.isDefaultFavorite) &&
+        KugouApiClient().isLoggedIn && _songs.isNotEmpty;
     return SliverAppBar(
       expandedHeight: DetailPaneContent.headerHeight(context, 280),
       pinned: true,
@@ -1589,42 +1668,61 @@ class _PlaylistPageState extends State<PlaylistPage> {
       surfaceTintColor: Colors.transparent,
       scrolledUnderElevation: 0,
       actions: [
-        // 可选扩展：私有构建注入的额外操作按钮（默认无）
+        // 可选扩展：宿主注入的额外操作按钮（默认无）
         ...?PlaylistPage.extraAppBarActionsBuilder?.call(context),
-        if (_songs.isNotEmpty)
+        if (showTrackOrder)
+          IconButton(
+            tooltip: _sortBy != PlaylistSongSort.time
+                ? '请先切换为歌单顺序'
+                : _trackOrder == null ? '自由排序' : '完成排序',
+            icon: Icon(
+              _trackOrder == null ? Icons.sort : Icons.check,
+              size: 20,
+              color: _trackOrder == null ? null : colorScheme.primary,
+            ),
+            onPressed: _isLoading || _isMultiSelectMode || _orderSaving ||
+                _sortBy != PlaylistSongSort.time
+                ? null : _trackOrder == null ? _editTrackOrder : _finishTrackOrder,
+          ),
+        if (_songs.isNotEmpty && _trackOrder == null)
           IconButton(
             icon: Icon(_isSearching ? Icons.close : Icons.search),
             onPressed: _toggleSearch,
           ),
-        if (_songs.isNotEmpty)
+        if (_songs.isNotEmpty && _trackOrder == null)
           IconButton(
             icon: const Icon(Icons.comment_outlined),
             onPressed: () => _showCommentsSheet(context),
             tooltip: '评论',
           ),
-        if (_songs.isNotEmpty)
+        if (_songs.isNotEmpty && _trackOrder == null)
           IconButton(
             icon: const Icon(Icons.my_location),
             onPressed: _scrollToPlayingSong,
             tooltip: '定位正在播放',
           ),
-        // 专辑详情（isAlbum）不展示相似歌单
-        if (_songs.isNotEmpty && !widget.isAlbum)
+        // 专辑详情（isAlbum）与用户自建歌单（isUserCreated）不展示相似歌单
+        if (_songs.isNotEmpty &&
+            !widget.isAlbum &&
+            !widget.isUserCreated &&
+            _trackOrder == null)
           IconButton(
             icon: const Icon(Icons.auto_awesome),
             onPressed: () => _showSimilarPlaylists(context),
             tooltip: '相似歌单',
           ),
-        if (_songs.isNotEmpty)
+        if (_songs.isNotEmpty && _trackOrder == null)
           M3ESortButton<PlaylistSongSort>(
             tooltip: '排序',
+            // 新增自由排序时，高亮范围向左扩展一个按钮位。
+            panelWidth: showTrackOrder ? 268 : 220,
             // 图标随升/降序切换（与本地音乐页一致）
             icon: _sortAscending
                 ? Icons.arrow_upward_rounded
                 : Icons.arrow_downward_rounded,
             current: _sortBy,
-            options: const [
-              (value: PlaylistSongSort.time, label: '添加时间'),
+            options: [
+              (value: PlaylistSongSort.time, label: widget.isAlbum ? '专辑顺序' : '歌单顺序'),
               (value: PlaylistSongSort.title, label: '歌曲名称'),
               (value: PlaylistSongSort.artist, label: '歌手名'),
               (value: PlaylistSongSort.duration, label: '时长'),
@@ -1634,7 +1732,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onPicked: (value) {
               setState(() {
                 _sortBy = value;
-                _sortAscending = !_descendingByDefault.contains(value);
+                _sortAscending = (widget.isAlbum && value == PlaylistSongSort.time) ||
+                    !_descendingByDefault.contains(value);
                 _invalidateDisplaySongs();
               });
               _saveSortPreference();
@@ -1966,6 +2065,44 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 列表不完整提示条：分页中途失败，当前展示的是部分歌曲，
+  /// 排序结果也只覆盖已载部分；提供重新加载入口。
+  Widget _buildIncompleteBanner(
+    ColorScheme colorScheme,
+    TextTheme textTheme,
+  ) {
+    return Material(
+      color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.9),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              Icons.warning_amber_outlined,
+              size: 16,
+              color: colorScheme.onSurfaceVariant,
+            ),
+            const Gap(AppSpacing.sm),
+            Expanded(
+              child: Text(
+                '歌单未加载完整，当前排序仅覆盖已载歌曲',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: _fetchSongs,
+              child: const Text('重新加载'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// 多选模式顶栏：关闭 / 已选 N 首 / 全选 / 删除
   Widget _buildMultiSelectBar(ColorScheme colorScheme, TextTheme textTheme) {
     final selectedCount = _selectedSongIds.length;
@@ -2006,7 +2143,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 onPressed: _toggleSelectAll,
                 tooltip: allSelected ? '取消全选' : '全选',
               ),
-              // 可选扩展：私有构建注入的额外操作按钮（默认无）
+              // 可选扩展：宿主注入的额外操作按钮（默认无）
               ...?PlaylistPage.extraMultiSelectActions?.call(
                 context,
                 colorScheme,

@@ -64,7 +64,7 @@ class LyricEffectPreview extends StatelessWidget {
         return SettingsPreviewFrame(
           title: '歌词效果预览',
           subtitle: isAmStyle ? '当前：Apple Music 风格' : '当前：Material 风格',
-          footnote: '对唱 / 模糊 / 辉光 / 换行 等开关与滑块即时生效',
+          footnote: '对唱 / 位置 / 模糊 / 辉光 / 换行 等开关与滑块即时生效',
           height: 190,
           background: colorScheme.surfaceContainerHighest,
           child: Padding(
@@ -99,7 +99,11 @@ class LyricEffectPreview extends StatelessWidget {
             isCurrent: i == _currentLineIndex,
             isAbove: i < _currentLineIndex,
             amPrefs: amPrefs,
-            alignment: CrossAxisAlignment.start,
+            // 仅 AM 风格读「歌词位置」（MD3 播放页没有该设置）；对唱开启时
+            // 走 _buildDuet，不会进这里。
+            alignment: isAmStyle
+                ? _crossAlignFromPosition(amPrefs.lyricPosition)
+                : CrossAxisAlignment.start,
           ),
         ],
       ],
@@ -287,6 +291,18 @@ class LyricEffectPreview extends StatelessWidget {
   static Color _liftLightness(Color color) {
     final hsl = HSLColor.fromColor(color);
     return hsl.withLightness(hsl.lightness < 0.78 ? 0.78 : hsl.lightness).toColor();
+  }
+
+  /// 全局水平位置 → 演示卡行内对齐（与播放页 DuetAlignment 同口径）。
+  static CrossAxisAlignment _crossAlignFromPosition(LyricPosition position) {
+    switch (position) {
+      case LyricPosition.center:
+        return CrossAxisAlignment.center;
+      case LyricPosition.right:
+        return CrossAxisAlignment.end;
+      case LyricPosition.left:
+        return CrossAxisAlignment.start;
+    }
   }
 
   /// 性别 → 行内对齐方式。口径同 `DuetLayout._genderToAlign`：

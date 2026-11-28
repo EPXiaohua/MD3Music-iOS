@@ -9,7 +9,7 @@ class _ScanRepository extends LocalMusicRepository {
   final result = Completer<List<Song>>();
   int calls = 0;
   @override
-  Future<List<Song>> scanSongs({List<String>? customFolders, List<String>? excludedFolders}) {
+  Future<List<Song>> scanSongs({List<String>? customFolders, List<String>? excludedFolders, bool scanOnlySelectedFolders = false}) {
     calls++;
     return result.future;
   }

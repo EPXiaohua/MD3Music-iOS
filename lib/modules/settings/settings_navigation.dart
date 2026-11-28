@@ -57,7 +57,7 @@ class SettingsCategory {
   /// 有子页时这里放 1–2 项的内联短分组；无子页时这里就是二级页的全部内容。
   final Widget Function(ColorScheme colorScheme)? body;
 
-  /// 三级子页列表；为空表示该分类不下钻（私有构建注入的分类走此路径）。
+  /// 三级子页列表；为空表示该分类不下钻（宿主注入的分类走此路径）。
   final List<SettingsSubpage> subpages;
 
   bool get hasSubpages => subpages.isNotEmpty;
@@ -74,7 +74,7 @@ class SettingsCategory {
 }
 
 /// 旧扩展点 `SettingsPage.extraCategories` 的 record 转新模型。
-/// 私有构建注入的分类没有子页，二级页直接渲染其内容（行为与改造前一致）。
+/// 宿主注入的分类没有子页，二级页直接渲染其内容（行为与改造前一致）。
 SettingsCategory settingsCategoryFromLegacy(
   (String, IconData, Widget Function(ColorScheme)) record,
 ) {

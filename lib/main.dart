@@ -10,13 +10,17 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app.dart';
 import 'core/build_flags.dart';
+import 'core/platform_capabilities.dart';
 import 'core/remote/tv_focus_debug.dart';
 import 'core/layout/responsive_layout.dart';
 import 'core/utils/app_haptics.dart';
+import 'core/services/accompany/accompany_source.dart';
+import 'core/services/car_with_service.dart';
 import 'core/services/desktop_lyric_service.dart';
 import 'core/services/diagnostic_logger.dart';
 import 'core/services/windows_default_font.dart';
 import 'core/services/windows_app_lifecycle.dart' as windows_lifecycle;
+import 'core/services/windows_window_controls.dart';
 import 'modules/recognition/floating_recognition_service.dart';
 import 'core/services/equalizer_service.dart';
 import 'core/services/viper_master_service.dart';
@@ -97,8 +101,7 @@ Future<void> _main() async {
 
 /// 启动引导：并行初始化无依赖服务、恢复偏好、预取 SharedPreferences。
 /// 返回 onboarding / 用户协议状态，以及首帧使用的背景图开关值。
-/// 公开入口（main）与私有入口（lib/private/main_private）复用同一流程，
-/// 私有入口在此基础上安装扩展钩子后 runApp。
+/// 各入口（main 与其它入口）复用同一流程，其它入口在此基础上安装扩展钩子后 runApp。
 /// 返回 (是否首次引导, 是否需用户协议, 背景图开关, 主题模式播种值)。
 /// 主题模式为 null 时表示从未持久化，由 ThemeProvider 保持初值 ThemeMode.system。
 Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
@@ -106,6 +109,8 @@ Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
   final windowsFontFuture = WindowsDefaultFont.load();
   if (Platform.isWindows) {
     _windowsTrayChannel.setMethodCallHandler((call) async {
+      // snap layouts 的悬停/按压状态回传（标题栏三键高亮驱动）。
+      if (WindowsWindowControls.handleNativeCall(call)) return;
       if (call.method != 'requestQuit' || _windowsExitInProgress) return;
       _windowsExitInProgress = true;
       try {
@@ -134,7 +139,7 @@ Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
   // 内部自带失败兜底，不会中断启动。
   await DiagnosticLogger.instance.init();
   markStartup('diagnostics_ready');
-  // 在runBootstrap注册，公开与私有入口都可记录真正的首帧时间。
+  // 在 runBootstrap 注册，所有入口都可记录真正的首帧时间。
   WidgetsBinding.instance.addPostFrameCallback((_) {
     markStartup('first_frame');
   });
@@ -142,7 +147,7 @@ Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
   // 全局 ErrorWidget 兜底：release 版默认 ErrorWidget 是纯灰块，横竖屏切换时
   // 某个 widget 构建异常会让整屏变纯灰且无任何线索（问题③）。改为可读占位
   // （非灰、带图标与提示），并把异常写入诊断日志，便于 adb logcat / 导出定位。
-  // 双入口（main / main_private）共用 runBootstrap，一处生效两端。
+  // 各入口共用 runBootstrap，一处生效两端。
   ErrorWidget.builder = (FlutterErrorDetails details) {
     DiagnosticLogger.instance.e(
       'ErrorWidget: ${details.exceptionAsString()}\n${details.stack}',
@@ -246,11 +251,9 @@ Future<(bool, bool, bool, ThemeMode?)> runBootstrap() async {
     );
   }
 
-  // 注册长按应用图标 Shortcut 回调（Android App Shortcut / iOS Quick Actions）。
+  // 注册 Android 长按应用图标 Shortcut 回调。
   // initialize 必须在 runApp 之前调用，以便冷启动时能接收到 shortcut 触发。
-  // iOS 侧为 quick_actions 1.2.x 的 UIScene 链路（FlutterSceneDelegate 自动
-  // 转发到插件），不注册回调则点快捷菜单会静默失效。
-  if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+  if (!kIsWeb && Platform.isAndroid) {
     const quickActions = QuickActions();
     quickActions.initialize((shortcutType) {
       // 应用已就绪时直接处理；否则暂存，由 _AppView 在首帧处理
@@ -359,14 +362,19 @@ Future<void> _restoreLyricPushPref() async {
     final settings = SettingsRepository();
     // 逐字歌词时间偏移：加载到内存缓存（播放页每帧读取），默认 0
     await settings.getLyricTimeOffset();
+    // 伴唱伴奏来源：加载到内存镜像（默认在线伴奏）
+    // lite 包不含端侧分离，且设置页的来源单选块已随之树摇；若存量偏好仍是
+    // on_device，播放页伴唱入口会永久不可见且无法改回，故启动时自愈为在线伴奏。
+    final source = await settings.getAccompanySource();
+    if (!kStemSeparationAvailable && source == AccompanySource.onDevice) {
+      await settings.setAccompanySource(AccompanySource.online);
+    }
+    // 伴唱功能开关：默认关闭，关闭时播放页不显示伴唱入口
+    await settings.getAccompanyFeatureEnabled();
 
     // 蓝牙歌词（独立开关）
     final btLyricEnabled = await settings.getBluetoothLyricEnabled();
     await DesktopLyricService.instance.setBluetoothLyricEnabled(btLyricEnabled);
-    // 原生侧开关同步恢复（设置页行为一致）：iOS 由 NowPlayingService 在
-    // init 前暂存、会话就绪后补发；Android 走原生通道覆盖共享开关。
-    // 缺了这步，冷启动后原生端仍是默认关闭，锁屏/控制中心看不到歌词替换。
-    await MediaNotificationService.setBluetoothLyricEnabled(btLyricEnabled);
 
     // 锁屏歌词（独立开关）：开启后歌词服务定时器运行以推送整首歌词
     // （样式全部跟随 AM 歌词偏好，与播放页 Zen 沉浸模式一致）
@@ -392,6 +400,37 @@ Future<void> _restoreLyricPushPref() async {
     final flymeLyricEnabled = await settings.getFlymeStatusBarLyricEnabled();
     // ignore: discarded_futures
     DesktopLyricService.instance.setFlymeStatusBarLyricEnabled(flymeLyricEnabled);
+
+    // 小米 CarWith / Jovi InCar 车机投屏逐句歌词（独立开关）：与上面魅族段同理，
+    // 冷启动/后台唤醒后要无需进设置页即可继续往车机推词。
+    // 顺序讲究：先 `start()` 把持久化读进内存，再拿 `lyricEnabled` 灌给歌词服务——
+    // 车机两个开关的持久化都在 CarWithService 内部（settings_follow_carwith_dark /
+    // settings_carwith_lyric_enabled），这里不另开一份 prefs 读取，避免双份真值；
+    // 反过来若不 await 就取值，读到的会是尚未回灌的默认 false（开关静默失效）。
+    // 故本文件只在这一个调用点启动它，不重复 start。
+    // TV 构建不编入（`kTvBuild` 为 const，与下方歌词推送协议段同一树摇口径：
+    // 电视没有 CarWith 手机投屏场景）；桌面端由 `supportsCarWith` 运行时挡住。
+    // 门控与设置页那两项入口必须一致（那边的同名表达式见
+    // `settings_page.dart` 顶层 `_carWithUiSupported`）：服务不在这里启动，
+    // 设置页就不该把开关渲染出来。
+    // 自带 try/catch：外层那个 catch 会一并吞掉异常，但**也会跳过后面的歌词
+    // 推送协议恢复**——CarWith 的原生通道在旧 ROM 上取不到属正常，不该连累
+    // 无关通道。
+    if (!kTvBuild && supportsCarWith) {
+      try {
+        await CarWithService.instance.start();
+        // ignore: discarded_futures
+        DesktopLyricService.instance.setCarWithLyricEnabled(
+          CarWithService.instance.lyricEnabled,
+        );
+        // 车机链路的开机恢复痕迹。服务内部只在「覆盖值真的翻转」时打日志，
+        // 静态恢复（值没变）不留记录，真机排障「车机不出词」时容易误判成
+        // 链路没起。这里只补通道标识本身，**不重复** 连接= / 车机深浅= 这两项
+        // 读数（那是 `car_with_service.dart` 主题日志的字段，别处再打一份会
+        // 变成两个真值源）。
+        debugPrint('[MD3Music][carwith] 开机恢复完成');
+      } catch (_) {}
+    }
 
     // 实时歌词推送协议（TV 版不编入：无蓝牙歌词屏/系统歌词桥/车机歌词场景）
     if (!kTvBuild) {

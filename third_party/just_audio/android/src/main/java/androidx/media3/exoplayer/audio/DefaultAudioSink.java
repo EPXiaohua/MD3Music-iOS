@@ -69,6 +69,7 @@ import androidx.media3.extractor.MpegAudioUtil;
 import androidx.media3.extractor.OpusUtil;
 // MD3Music fork: 32bit 播放开关的实时标志（DefaultAudioSink 每 configure 读取，切歌即生效）。
 import com.ryanheise.just_audio.UsbAudioSinkController;
+import com.ryanheise.just_audio.StemSeparateProcessor;
 // MD3Music fork: 系统 Direct PCM 档的实时标志（float 强制 / 低延迟 / 缓冲），
 // 以及 @hide API（setPerformanceMode / getLatency）的反射封装。
 import com.ryanheise.just_audio.DirectPcmController;
@@ -693,6 +694,17 @@ public final class DefaultAudioSink implements AudioSink {
       ImmutableList.Builder<AudioProcessor> pipelineProcessors = new ImmutableList.Builder<>();
       if (shouldUseFloatOutput(inputFormat.pcmEncoding)) {
         pipelineProcessors.addAll(toFloatPcmAvailableAudioProcessors);
+        // MD3Music fork: 端侧分离必须也挂在 float 管线上。
+        //
+        // 原版只有 int 分支挂 audioProcessorChain，float 分支不挂任何用户处理器
+        // → 开启「32bit 播放支持」或 Direct PCM 高规格档后，24/32bit 源被判为
+        // 高规格走 float，StemSeparateProcessor 根本不在链上、queueInput 永不
+        // 调用，表现为「端侧分离没效果」且完全没有日志。实测设备正是如此。
+        //
+        // 只补分离这一个：ViperMasterProcessor 只接受 16bit（onConfigure 对非
+        // 16bit 直接抛 UnhandledAudioFormatException），挂到 float 会让整条管线
+        // configure 失败、播放中断。分离侧已显式支持 PCM_FLOAT。
+        pipelineProcessors.add(new StemSeparateProcessor());
       } else {
         pipelineProcessors.addAll(toIntPcmAvailableAudioProcessors);
         pipelineProcessors.add(audioProcessorChain.getAudioProcessors());
@@ -1542,8 +1554,9 @@ public final class DefaultAudioSink implements AudioSink {
         onRoutingChangedListener = null;
       }
       releaseAudioTrackAsync(audioTrack, releasingConditionVariable, listener, oldAudioTrackConfig);
-      // MD3Music fork: 轨道释放前先摘探针，避免旧轨道的尾巴写入被计入新轨道
-      OutputLatencyProbe.detach();
+      // MD3Music fork: 轨道释放前先摘探针，避免旧轨道的尾巴写入被计入新轨道。
+      // 必须传具体轨道：多实例下按实例摘除，否则释放伴奏轨会把主曲的状态一起清掉。
+      OutputLatencyProbe.detach(audioTrack);
       audioTrack = null;
     }
     // MD3Music fork: pending inputBuffer 的清理必须与「AudioTrack 是否已初始化」解耦。
@@ -1561,6 +1574,23 @@ public final class DefaultAudioSink implements AudioSink {
     accumulatedSkippedSilenceDurationUs = 0;
     if (reportSkippedSilenceHandler != null) {
       checkNotNull(reportSkippedSilenceHandler).removeCallbacksAndMessages(null);
+    }
+    // MD3Music fork: seek 必须通知音频处理器链。
+    //
+    // 上游的 flush() 只清 sink 自身状态，**从不调用**
+    // audioProcessingPipeline.flush()——只有 reset()（由 onDisabled 触发，
+    // 即切歌/换源）才调 pipeline.reset()。于是单纯拖动进度条时，链上的
+    // StemSeparateProcessor.onFlush() 根本不会被调用：
+    //   - 端侧分离的 FIFO/块队列/模型 28 路流式状态全部保留 seek 之前的旧音频；
+    //   - 新位置音频被接在旧内容后面继续推理 → 输出是两段不相干音频混出来的，
+    //     听感就是「拖动进度后分离失效/串音」。
+    //
+    // 放在 flush 末尾（sink 自身状态已清）而不是开头，保证处理器看到的是
+    // 一致的「已 flush」上下文。处理器侧的 hook.flush() 只置一个 volatile
+    // 标志、绝不在渲染线程碰模型字段（MssEngine 不是线程安全的，只能由
+    // 它自己的 worker 线程访问），因此这里不会阻塞、也不会与渲染竞争。
+    if (audioProcessingPipeline != null) {
+      audioProcessingPipeline.flush();
     }
   }
 

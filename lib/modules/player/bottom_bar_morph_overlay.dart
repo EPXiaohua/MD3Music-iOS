@@ -799,9 +799,18 @@ Future<void> toggleDesktopLyricFromBar(BuildContext context) async {
     artUrl: song?.artworkUri,
     isPlaying: player.isPlaying,
     position: player.position,
-    duration: player.duration ?? Duration.zero,
+    // 时长兜底：_duration 为空时用曲目元数据自带的总时长（见
+    // PlayerProvider._pushNotification 的同口径注释）。
+    duration: player.duration ?? song?.duration ?? Duration.zero,
     desktopLyricEnabled: DesktopLyricService.instance.enabled,
     isFavorited: isFavorited,
+    // 与 PlayerProvider._pushNotification 同口径：Windows 侧发布到 SMTC，
+    // 供第三方任务栏歌词工具做身份/匹配/时间轴外推。
+    album: song?.album ?? '',
+    albumArtist: song?.artist ?? '',
+    playbackRate: player.speed,
+    loopMode: player.loopMode.name,
+    shuffleEnabled: player.shuffleEnabled,
   );
 }
 

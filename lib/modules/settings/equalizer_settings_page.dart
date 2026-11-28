@@ -68,9 +68,8 @@ class _EqualizerSettingsPageState extends State<EqualizerSettingsPage> {
           ),
         ],
       ),
-      // iOS 走软件 EQ（MTAudioProcessingTap），Android 走系统 audiofx
       body: ContentWidth(
-        child: (kIsWeb || (!Platform.isAndroid && !Platform.isIOS))
+        child: (kIsWeb || !Platform.isAndroid)
           ? _buildUnsupportedPlatform(colorScheme)
           : ListenableBuilder(
               listenable: _eq,

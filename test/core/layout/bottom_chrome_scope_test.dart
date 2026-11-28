@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/layout/bottom_chrome_scope.dart';
+import 'package:md3music/core/layout/bottom_chrome_dimens.dart';
 
 void main() {
   group('BottomChromeScope', () {
@@ -147,6 +148,37 @@ void main() {
           ),
         ),
         isTrue,
+      );
+    });
+
+    testWidgets('播放器内容避让同时包含播放器、导航栏和系统手势区', (tester) async {
+      late double inset;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MediaQuery(
+            data: const MediaQueryData(
+              viewPadding: EdgeInsets.only(bottom: 24),
+            ),
+            child: BottomChromeScope(
+              hasBottomChrome: true,
+              child: Builder(
+                builder: (context) {
+                  inset = BottomChromeScope.playerContentBottomInsetOf(
+                    context,
+                    hasPlayer: true,
+                  );
+                  return const SizedBox();
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(
+        inset,
+        BottomChromeDimens.discReservedBottom +
+            BottomChromeDimens.navBarWithLabelHeight +
+            24,
       );
     });
   });

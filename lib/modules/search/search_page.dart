@@ -155,13 +155,63 @@ class _SearchPageState extends State<SearchPage>
     setState(() {});
   }
 
-  Future<void> _clearSearchHistory() async {
+  Future<void> _clearSearchHistory({required bool confirmed}) async {
+    if (!confirmed) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_historyKey);
     setState(() {
       _searchHistory = [];
     });
     showToast('已清空搜索历史');
+  }
+
+  /// 清空入口:先弹窗二次确认,确认后才执行清空。
+  Future<void> _confirmClearSearchHistory() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        final colorScheme = Theme.of(dialogContext).colorScheme;
+        return AlertDialog(
+          backgroundColor: colorScheme.surface,
+          surfaceTintColor: colorScheme.surfaceTint,
+          title: Text(
+            '清空搜索历史',
+            style: TextStyle(color: colorScheme.onSurface),
+          ),
+          content: Text(
+            '将删除全部 ${_searchHistory.length} 条搜索记录，此操作不可恢复。',
+            style: TextStyle(color: colorScheme.onSurfaceVariant),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: Text(
+                '取消',
+                style: TextStyle(color: colorScheme.onSurfaceVariant),
+              ),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: Text('清空', style: TextStyle(color: colorScheme.error)),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed == true) {
+      await _clearSearchHistory(confirmed: true);
+    }
+  }
+
+  /// 长按单条历史词条:仅删除该条并持久化。
+  /// 删空后整段(含清空按钮)由 _buildHistoryAndHotSearch 的非空派生自动隐藏。
+  Future<void> _removeSearchHistoryItem(String query) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _searchHistory = _searchHistory.where((h) => h != query).toList();
+    });
+    await prefs.setStringList(_historyKey, _searchHistory);
+    showToast('已删除该搜索记录');
   }
 
   /// 输入框 × 按钮:清空输入,回空态(历史+热搜)。三态派生见 build。
@@ -352,12 +402,13 @@ class _SearchPageState extends State<SearchPage>
           title: '搜索历史',
           actions: [
             // tv: 清空按钮单停点;同形状仅换 error 色提示破坏性。
+            // 点击先弹二次确认,确认后才真正清空。
             TvCardFocus(
-              onSelect: _clearSearchHistory,
+              onSelect: _confirmClearSearchHistory,
               debugLabel: 'search-clear-history',
               child: SearchSectionAction(
                 label: '清空',
-                onTap: _clearSearchHistory,
+                onTap: _confirmClearSearchHistory,
                 destructive: true,
               ),
             ),
@@ -371,12 +422,17 @@ class _SearchPageState extends State<SearchPage>
             children: [
               for (final history in _searchHistory)
                 // tv: 历史词条单停点(OK = 以该词发起搜索)。
+                // 长按删除单条:非 TV 触屏走 GestureDetector;
+                // TV 遥控无长按手势,单条删除暂不覆盖 TV 端。
                 TvCardFocus(
                   onSelect: () => _searchFromKeyword(history),
                   debugLabel: 'search-history-$history',
-                  child: ActionChip(
-                    label: Text(history),
-                    onPressed: () => _searchFromKeyword(history),
+                  child: GestureDetector(
+                    onLongPress: () => _removeSearchHistoryItem(history),
+                    child: ActionChip(
+                      label: Text(history),
+                      onPressed: () => _searchFromKeyword(history),
+                    ),
                   ),
                 ),
             ],

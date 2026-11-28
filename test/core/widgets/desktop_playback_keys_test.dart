@@ -57,26 +57,56 @@ class _FakePlayer extends PlayerProvider {
   Duration positionValue = const Duration(seconds: 30);
   double volumeValue = 0.5;
 
+  bool playing = true;
+  double speedValue = 1.0;
+
   int volumeCalls = 0;
   int seekCalls = 0;
   Duration? lastSeek;
   bool lastForceNotify = false;
+  bool? lastPersist;
+
+  /// setSpeed 的调用序列（长按 → 进入 2x、松手恢复各一次）。
+  final List<double> speedCalls = <double>[];
+  int pauseForSeekCalls = 0;
+  int resumeCalls = 0;
 
   @override
   Song? get currentSong => song;
   @override
-  bool get isPlaying => true;
+  bool get isPlaying => playing;
   @override
   Duration? get duration => durationValue;
   @override
   Duration get position => positionValue;
   @override
   double get volume => volumeValue;
+  @override
+  double get speed => speedValue;
 
   @override
   Future<void> setVolume(double volume, {bool persist = true}) async {
     volumeCalls++;
     volumeValue = volume;
+    lastPersist = persist;
+  }
+
+  @override
+  Future<void> setSpeed(double speed) async {
+    speedCalls.add(speed);
+    speedValue = speed;
+  }
+
+  @override
+  Future<void> pauseForSeek() async {
+    pauseForSeekCalls++;
+    playing = false;
+  }
+
+  @override
+  Future<void> resume({bool notifyRoom = true}) async {
+    resumeCalls++;
+    playing = true;
   }
 
   @override
@@ -157,6 +187,19 @@ void main() {
     await tester.sendKeyEvent(key);
     await tester.pump();
   }
+
+  /// 按下并推进过长按阈值：定时器到点后才进入连续模式。
+  Future<void> startHold(WidgetTester tester, LogicalKeyboardKey key) async {
+    await tester.sendKeyDownEvent(key);
+    await tester.pump();
+    await tester.pump(
+      DesktopPlaybackKeys.holdThreshold + const Duration(milliseconds: 1),
+    );
+  }
+
+  /// 长按中的一拍。
+  Future<void> holdTick(WidgetTester tester) =>
+      tester.pump(DesktopPlaybackKeys.holdTick);
 
   testWidgets('↑/↓ 逐击 ±5%：夹取 0..1，到边界仍消费', (tester) async {
     await pump(tester, const Placeholder());
@@ -292,8 +335,153 @@ void main() {
     expect(
       player.volumeCalls,
       1,
-      reason: '连发会把音量几帧内拉满，只认首个 KeyDownEvent',
+      reason: '连发不执行动作；短按只在抬起时落定一步',
     );
+  }, variant: _windows);
+
+  testWidgets('长按 ↑ 连续调音量：每拍 5%，松手才落盘', (tester) async {
+    await pump(tester, const Placeholder());
+
+    await startHold(tester, LogicalKeyboardKey.arrowUp);
+    expect(
+      player.volumeCalls,
+      1,
+      reason: '阈值到点先落一步，避免 400~500ms 松手的死区',
+    );
+    expect(player.volumeValue, closeTo(0.55, 1e-9));
+    expect(player.lastPersist, isFalse, reason: '连调期间不写盘（W5.8）');
+
+    await holdTick(tester);
+    expect(player.volumeValue, closeTo(0.60, 1e-9));
+    await holdTick(tester);
+    expect(player.volumeValue, closeTo(0.65, 1e-9));
+    await holdTick(tester);
+    expect(player.volumeValue, closeTo(0.70, 1e-9));
+
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pump();
+    expect(player.lastPersist, isTrue, reason: '松手一次性落盘');
+
+    final int callsAfterRelease = player.volumeCalls;
+    await tester.pump(const Duration(seconds: 1));
+    expect(
+      player.volumeCalls,
+      callsAfterRelease,
+      reason: '松手后节拍定时器必须停',
+    );
+  }, variant: _windows);
+
+  testWidgets('短按 ↑ 仍只落定一次，不进入连续模式', (tester) async {
+    await pump(tester, const Placeholder());
+
+    await press(tester, LogicalKeyboardKey.arrowUp);
+    expect(player.volumeValue, closeTo(0.55, 1e-9));
+    expect(player.volumeCalls, 1);
+    expect(player.lastPersist, isTrue);
+
+    await tester.pump(const Duration(seconds: 1));
+    expect(player.volumeCalls, 1, reason: '短按不得留下节拍定时器');
+  }, variant: _windows);
+
+  testWidgets('长按 → 临时 2 倍速，松手恢复长按前的倍速', (tester) async {
+    await pump(tester, const Placeholder());
+
+    player.speedValue = 1.5;
+    await startHold(tester, LogicalKeyboardKey.arrowRight);
+
+    expect(player.speedValue, DesktopPlaybackKeys.holdPlaybackSpeed);
+    expect(
+      player.seekCalls,
+      0,
+      reason: '长按 → 不再先跳 5 秒，直接加速',
+    );
+
+    await holdTick(tester);
+    await holdTick(tester);
+    expect(player.speedValue, DesktopPlaybackKeys.holdPlaybackSpeed);
+    expect(player.seekCalls, 0, reason: '2 倍速由播放器推进，不重复 seek');
+
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+    await tester.pump();
+    expect(player.speedValue, 1.5, reason: '恢复到长按前的倍速，不是固定 1.0');
+  }, variant: _windows);
+
+  testWidgets('长按 ← 暂停后以 2 倍速连续回退，松手 seek 落定并续播', (tester) async {
+    await pump(tester, const Placeholder());
+
+    player.playing = true;
+    player.positionValue = const Duration(seconds: 30);
+    await startHold(tester, LogicalKeyboardKey.arrowLeft);
+
+    expect(player.pauseForSeekCalls, 1, reason: '回退期间暂停，避免连续 seek 断音');
+    expect(player.playing, isFalse);
+    expect(
+      player.lastSeek,
+      const Duration(seconds: 29, milliseconds: 800),
+      reason: '阈值到点立即回退第一拍（每 100ms 退 200ms = 2x）',
+    );
+    expect(player.lastForceNotify, isFalse, reason: '回退过程不逐拍通告房间');
+
+    await holdTick(tester);
+    expect(player.lastSeek, const Duration(seconds: 29, milliseconds: 600));
+    await holdTick(tester);
+    expect(player.lastSeek, const Duration(seconds: 29, milliseconds: 400));
+
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowLeft);
+    await tester.pump();
+    expect(
+      player.lastSeek,
+      const Duration(seconds: 29, milliseconds: 400),
+      reason: '松手落定在最后一次回退位置',
+    );
+    expect(player.lastForceNotify, isTrue, reason: '落点属用户显式操作');
+    expect(player.resumeCalls, 1, reason: '原本在播则续播');
+    expect(player.playing, isTrue);
+  }, variant: _windows);
+
+  testWidgets('长按 ← 回退夹到 0，原本暂停则松手不续播', (tester) async {
+    await pump(tester, const Placeholder());
+
+    player.playing = false;
+    player.positionValue = const Duration(milliseconds: 300);
+    await startHold(tester, LogicalKeyboardKey.arrowLeft);
+    expect(player.pauseForSeekCalls, 0, reason: '本来就暂停，不需要再暂停');
+    expect(player.lastSeek, const Duration(milliseconds: 100));
+
+    await holdTick(tester);
+    expect(player.lastSeek, Duration.zero, reason: '不得退到负时间');
+    await holdTick(tester);
+    expect(player.lastSeek, Duration.zero);
+
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowLeft);
+    await tester.pump();
+    expect(player.resumeCalls, 0, reason: '原本暂停就不该被方向键续播');
+    expect(player.playing, isFalse);
+  }, variant: _windows);
+
+  testWidgets('窗口失焦（收不到 KeyUp）时连续模式自动收尾', (tester) async {
+    await pump(tester, const Placeholder());
+
+    await startHold(tester, LogicalKeyboardKey.arrowRight);
+    expect(player.speedValue, DesktopPlaybackKeys.holdPlaybackSpeed);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    expect(player.speedValue, 1.0, reason: '切窗口后不得残留临时 2 倍速');
+
+    await tester.pump(const Duration(seconds: 1));
+    expect(player.speedCalls, <double>[DesktopPlaybackKeys.holdPlaybackSpeed, 1.0]);
+  }, variant: _windows);
+
+  testWidgets('长按中途起播视频页：立即收尾并恢复原倍速', (tester) async {
+    await pump(tester, const Placeholder());
+
+    await startHold(tester, LogicalKeyboardKey.arrowRight);
+    expect(player.speedValue, DesktopPlaybackKeys.holdPlaybackSpeed);
+
+    enterVideoPlayback();
+    await holdTick(tester);
+    expect(player.speedValue, 1.0, reason: '视频页接管方向键后必须退出连续模式');
   }, variant: _windows);
 
   testWidgets('页内自带方向键语义的控件优先（滑块/排序字段类）', (tester) async {
@@ -467,6 +655,15 @@ void main() {
           forward: true,
         ),
         duration,
+      );
+    });
+
+    test('长按回退速率与右键临时倍速一致（2x）', () {
+      expect(
+        DesktopPlaybackKeys.rewindHoldStep.inMilliseconds /
+            DesktopPlaybackKeys.holdTick.inMilliseconds,
+        DesktopPlaybackKeys.holdPlaybackSpeed,
+        reason: '需求：左键回退速度与右键临时倍速一致',
       );
     });
 

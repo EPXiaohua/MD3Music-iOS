@@ -3,8 +3,10 @@ import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
 import 'package:provider/provider.dart';
 
+import '../../core/services/windows_fullscreen.dart';
 import '../../core/theme/motion_constants.dart';
 import '../../providers/theme_provider.dart';
 import '../../providers/car_mode_provider.dart';
@@ -48,8 +50,8 @@ const double kPlayerTapEntryOffsetRatio = 0.15;
 /// 位移铺满全程（旧 300ms + expressive 实际前 150ms 就走完了）。
 const Duration kPlayerExpandDuration = Duration(milliseconds: 400);
 
-/// 收起（退出）时长：展开的 65%（退出比进入快）。
-const Duration kPlayerCollapseDuration = Duration(milliseconds: 260);
+/// 收起（退出）时长：展开的 65% + 用户要求的 +200ms 放慢（返回观感太仓促）。
+const Duration kPlayerCollapseDuration = Duration(milliseconds: 460);
 
 /// 上拉未达阈值时的**回弹**时长。
 ///
@@ -447,6 +449,7 @@ DraggablePlayerRoute<void> fullPlayerRoute(
   double? dragOriginBottom,
 }) {
   return DraggablePlayerRoute<void>(
+    lightweightDesktopEntry: context.read<ThemeProvider>().useAmStylePlayer,
     builder: (_) => Consumer<ThemeProvider>(
       builder: (context, theme, _) => theme.useAmStylePlayer
           ? const AmStyleFullPlayer()
@@ -519,6 +522,7 @@ class PlayerSystemUiScope extends StatelessWidget {
 class DraggablePlayerRoute<T> extends PageRoute<T> {
   DraggablePlayerRoute({
     required this.builder,
+    this.lightweightDesktopEntry = false,
     this.scene,
     this.dragOriginTop,
     this.screenHeight,
@@ -526,6 +530,13 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   });
 
   final WidgetBuilder builder;
+
+  /// Windows AM 点击入口使用固定布局合成，不参与迷你条到全屏的轮廓形变。
+  /// 显式拖拽或顶栏下拉接管时仍走原来的跟手路径。
+  final bool lightweightDesktopEntry;
+  bool get usesLightweightDesktopEntry => lightweightDesktopEntry &&
+      defaultTargetPlatform == TargetPlatform.windows && !isDragMode &&
+      topBarDragTotal == null;
 
   /// 进栈那一刻的底部形态快照（含展开起点矩形），见 [PlayerMorphScene]。
   ///
@@ -673,6 +684,14 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   void dismiss() {
     if (_isDismissing) return;
     _isDismissing = true;
+    // 窗口全屏恢复必须抢在收起动画起跑之前（2026-11-12 实测）：
+    // 原先兜底在 dispose()（reverse 播完 + removeRoute 之后）才退全屏，
+    // 主页已经露出，标题栏重新出现、客户区从整屏缩回 rcWork 的那一帧
+    // 整页内容下跳约一个标题栏高度 —— 用户看到「退出播放页时背景抖一下」。
+    // 提前到 dismiss：resize 的跳变帧被仍不透明的播放页盖住，主页在
+    // 露出瞬间就已按最终几何布局完成，reveal 无跳变。
+    // 非 Zen 关页时快照为 null，exitZen 是 no-op，不影响普通路径。
+    WindowsFullscreen.exitZen();
     _animStartValue = controller.value;
     _animDirection = -1;
     controller.reverse().then((_) {
@@ -723,8 +742,8 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   AnimationController createAnimationController() {
     controller = AnimationController(
       vsync: navigator!,
-      duration: kPlayerExpandDuration,
-      reverseDuration: kPlayerCollapseDuration,
+      duration: transitionDuration,
+      reverseDuration: reverseTransitionDuration,
       lowerBound: 0.0,
       upperBound: 1.0,
     );
@@ -749,6 +768,7 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   @override
   void dispose() {
     if (identical(activePlayerRoute, this)) {
+      PlayerCoverMorphBus.instance.simplePageTransition = false;
       activePlayerRoute = null;
       // 播放器关闭 → 信号复位。
       //
@@ -829,6 +849,29 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
     // 目标端点（playerExpansion 仍被写成端点值，迷你条不会停在半透明）。
     // 松手前的 1:1 跟手拖拽属于用户直接操纵，不在此列，保持原样。
     final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    final simpleEntry = usesLightweightDesktopEntry;
+    PlayerCoverMorphBus.instance.simplePageTransition = simpleEntry;
+    if (simpleEntry) {
+      // 页面只布局一次，逐帧仅合成平移/透明度，不再改变整屏裁剪轮廓。
+      return AnimatedBuilder(
+        animation: animation,
+        child: RepaintBoundary(child: child),
+        builder: (context, content) {
+          final progress = reduceMotion
+              ? (_animDirection > 0 ? 1.0 : 0.0)
+              : _easedPosition(animation.value);
+          if (progress != playerExpansion.value) {
+            scheduleMicrotask(() {
+              if (identical(activePlayerRoute, this)) playerExpansion.value = progress;
+            });
+          }
+          final offset = Offset(0, 16 * (1 - progress));
+          PlayerCoverMorphBus.instance.pageOffset = offset;
+          return Opacity(opacity: progress, child: Transform.translate(
+            offset: offset, child: content));
+        },
+      );
+    }
     return AnimatedBuilder(
       animation: animation,
       builder: (context, _) {
@@ -958,10 +1001,18 @@ class DraggablePlayerRoute<T> extends PageRoute<T> {
   bool get maintainState => true;
 
   @override
-  Duration get transitionDuration => kPlayerExpandDuration;
+  Duration get transitionDuration =>
+      usesLightweightDesktopEntry ? const Duration(milliseconds: 180) :
+      defaultTargetPlatform == TargetPlatform.windows && !isDragMode
+          ? const Duration(milliseconds: 220)
+          : kPlayerExpandDuration;
 
   @override
-  Duration get reverseTransitionDuration => kPlayerCollapseDuration;
+  Duration get reverseTransitionDuration =>
+      usesLightweightDesktopEntry ? const Duration(milliseconds: 360) :
+      defaultTargetPlatform == TargetPlatform.windows && !isDragMode
+          ? const Duration(milliseconds: 380)
+          : kPlayerCollapseDuration;
 
   @override
   bool didPop(T? result) {

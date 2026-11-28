@@ -161,6 +161,15 @@ class MusicHapticsPlugin(context: Context) {
             // 或时间戳取失败）—— Dart 侧据此保持手动值不动。
             "outputLatency" -> result.success(OutputLatencyProbe.queuedLatencyMs())
 
+            // 诊断：所有已登记 AudioTrack 的排队深度快照（"sessionId:latencyMs,..."）。
+            // 伴唱场景下主曲与伴奏各有自己的 AudioTrack，两路排队深度不同正是
+            // 用户听到的错位来源；这个接口让两路分别可见，不再只有"最后一条"。
+            "outputLatencyTracks" -> result.success(OutputLatencyProbe.allQueuedLatency())
+
+            // 原始快照：sessionId:framePos:nanoTimeUs:writtenFrames:latencyMs。
+            // 用于判定"排队深度"是真值还是累计误差（后者常表现成 975ms 这类伪值）。
+            "outputLatencyRaw" -> result.success(OutputLatencyProbe.rawSnapshot())
+
             "configure" -> {
                 enabled = call.argument<Boolean>("enabled") ?: false
                 waveform = call.argument<String>("waveform") ?: "auto"

@@ -560,3 +560,24 @@ Future<bool> isPlayerArtworkReady({
   final image = await _resolveCoverImage(provider);
   return image != null;
 }
+
+/// 解析封面为 `ui.Image` 位图句柄（与渲染/预热**同键**，见
+/// [coverPrewarmProviderFor]），供低分辨率模糊快照等二次加工使用。
+///
+/// 返回的位图属于图片缓存（[ImageStreamCompleter] 持有），调用方**不得**
+/// `dispose`；用完 `image.dispose()` 会破坏缓存中其他消费者的引用计数。
+/// 探测不了的源（内嵌封面 / file:// 缺失 / 解析失败）返回 null，
+/// 调用方退回既有渲染路径。
+Future<ui.Image?> resolvePlayerArtworkImage({
+  required String? artworkUri,
+  required double settledLogicalWidth,
+  required double devicePixelRatio,
+}) async {
+  final provider = coverPrewarmProviderFor(
+    artworkUri: artworkUri,
+    settledLogicalWidth: settledLogicalWidth,
+    devicePixelRatio: devicePixelRatio,
+  );
+  if (provider == null) return null;
+  return _resolveCoverImage(provider);
+}

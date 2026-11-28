@@ -11,7 +11,8 @@ import 'media_notification_service.dart';
 /// vivo 原子随身听（vivomusicmix）列表快照推送与点播回调。
 ///
 /// 岛（com.vivo.musicwidgetmix）在能力位放行后，会经 MediaBrowserServiceCompat
-/// 绑定取三棵列表树（播放列表 / 收藏列表 / 下载列表）。原生侧只读内存快照，
+/// 绑定取三棵列表树（岛面板标签为「播放列表 / 收藏列表 / 下载列表」；
+/// 本 App 对应「当前队列 / 云端收藏 / 本地音乐」）。原生侧只读内存快照，
 /// 由本类把 Dart 侧三份列表（去抖 + 内容指纹去重 + 条数上限）推送过去；
 /// 同时承接岛端点播回调，按 `<来源>:<songId>` 稳定寻址回播。
 ///
@@ -43,6 +44,8 @@ class VivoMixSync {
   /// v50：状态回显去重（循环模式 / 当前曲红心）。
   int? _lastLoopMode;
   bool? _lastIsFav;
+  // MD3Music fork v64: 当前曲 id 也进去重闸门（换曲要重推红心态）。
+  String? _lastSongId;
 
   /// App 首帧后调用（provider 均已创建）；重复调用为换绑（引擎重建场景）。
   void attach({
@@ -59,11 +62,17 @@ class VivoMixSync {
     library.addListener(_schedule);
     MediaNotificationService.onVivoMixPlay = _handleVivoMixPlay;
     MediaNotificationService.onVivoMixPlayMode = _handleVivoMixPlayMode;
+    // MD3Music fork v64：岛 ❤️ 收藏（目标态）回调。
+    MediaNotificationService.onVivoMixRating = _handleVivoMixRating;
     debugPrint('[VivoMixSync] attach: player=${player.hashCode} '
         'fav=${favorites.hashCode} lib=${library.hashCode}');
     // 本地库默认懒加载（只有进"本地音乐"页才读）——主动补一次缓存读取，
-    // 让"下载列表"树在冷启动后也有内容。
+    // 让岛上的本地列表树（面板标签「下载列表」）在冷启动后也有内容。
     unawaited(library.loadSavedSongs());
+    // MD3Music fork v65：收藏树同样主动拉云端「我喜欢」整表——FavoritesProvider
+    // 的 _favorites 只装 App 内点过红心的歌（云端收藏仅同步 id 集合），不主动拉
+    // 就会表现为岛上"收藏列表"只有测试收藏的那几首（真机 21 首只显示 1 首）。
+    unawaited(favorites.loadCloudFavoriteSongs());
     _schedule();
   }
 
@@ -80,6 +89,10 @@ class VivoMixSync {
     }
     if (MediaNotificationService.onVivoMixPlayMode == _handleVivoMixPlayMode) {
       MediaNotificationService.onVivoMixPlayMode = null;
+    }
+    // MD3Music fork v64: 收藏回调同样要摘干净（换绑/引擎重建不留旧闭包）。
+    if (MediaNotificationService.onVivoMixRating == _handleVivoMixRating) {
+      MediaNotificationService.onVivoMixRating = null;
     }
   }
 
@@ -101,7 +114,9 @@ class VivoMixSync {
     if (player == null || favorites == null || library == null) return;
 
     final currentSongs = player.playlist;
-    final favoriteSongs = favorites.favorites;
+    // MD3Music fork v65：收藏树 = 云端「我喜欢」整表 + App 内红心（按 id 去重），
+    // 不能直接用 favorites.favorites（那只有 App 内点过红心的歌）。
+    final favoriteSongs = favorites.favoritesForBridge;
     final localSongs = library.allSongs.take(_localCap).toList(growable: false);
 
     // 内容指纹：三棵树的 id 串未变就不推（高频 notify 下免重复编码/IPC）。
@@ -139,10 +154,18 @@ class VivoMixSync {
     final loopMode = player.roomPlayModeValue;
     final song = player.currentSong;
     final isFav = song == null ? null : favorites.favoriteIds.contains(song.id);
-    if (loopMode == _lastLoopMode && isFav == _lastIsFav) return;
+    // MD3Music fork v64: 曲目 id 进闸门——A->B 两首都已收藏时 isFav 不变，但 B 的
+    // metadata 不带 RATING（红心写在上一首的 item 上），岛上红心会停在旧曲。
+    final songId = song?.id;
+    if (loopMode == _lastLoopMode &&
+        isFav == _lastIsFav &&
+        songId == _lastSongId) {
+      return;
+    }
     _lastLoopMode = loopMode;
     _lastIsFav = isFav;
-    debugPrint('[VivoMixSync] pushState: loop=$loopMode isFav=$isFav');
+    _lastSongId = songId;
+    debugPrint('[VivoMixSync] pushState: loop=$loopMode isFav=$isFav song=$songId');
     // ignore: discarded_futures
     MediaNotificationService.updateVivoMixState(
         loopMode: loopMode, isFav: isFav);
@@ -190,7 +213,11 @@ class VivoMixSync {
           song = player.playlist.where((s) => s.id == songId).firstOrNull;
           fromCurrentTree = true;
         case 'fav':
-          song = favorites.favorites.where((s) => s.id == songId).firstOrNull;
+          // v65：收藏树含云端整表，必须在同一份合并视图里反查，否则云端收藏的歌
+          // 点播必然"找不到"（favorites.favorites 里没有它们）。
+          song = favorites.favoritesForBridge
+              .where((s) => s.id == songId)
+              .firstOrNull;
         case 'local':
           song = library.allSongs.where((s) => s.id == songId).firstOrNull;
       }
@@ -222,9 +249,27 @@ class VivoMixSync {
       }
       // 队列定位失败（快照与队列漂移）：退回单播保证"至少能播"。
     }
-    await player.playSong(song!);
+    await player.playSong(song);
     // v63：同上（收藏/本地树点播也把岛列表刷新到最新高亮状态）。
     unawaited(MediaNotificationService.refreshVivoMixChildren());
+  }
+
+  /// MD3Music fork v64: 岛 heart 收藏（目标态）。
+  ///
+  /// 直接用 provider，不经 navigator 上下文：App 未起界面时（只有后台引擎）
+  /// 走 UI 上下文那条链取不到 provider，表现为岛上点红心毫无反应。
+  /// 用 toggleFavorite（而不是 removeFavorite）：toggle 会同步酷狗云端
+  /// 「我喜欢」歌单，取消收藏也要删云端记录，removeFavorite 只动本地库。
+  Future<void> _handleVivoMixRating(bool favorite) async {
+    final player = _player;
+    final favorites = _favorites;
+    if (player == null || favorites == null) return;
+    final song = player.currentSong;
+    if (song == null) return;
+    final isFav = favorites.favoriteIds.contains(song.id);
+    if (isFav == favorite) return; // 已是目标态，无需变更
+    debugPrint('[VivoMixSync] vivoMixRating: favorite=$favorite song=${song.id}');
+    await favorites.toggleFavorite(song);
   }
 
   /// v45：岛循环模式切换（1=列表 / 2=单曲 / 3=随机）→ setLoopMode/setShuffle。

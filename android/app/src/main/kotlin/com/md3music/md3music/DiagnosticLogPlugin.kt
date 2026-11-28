@@ -1,5 +1,7 @@
 package com.md3music.md3music
 
+import android.app.ActivityManager
+import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -9,7 +11,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 /** 导出当前应用进程的 Android 原生日志，供诊断报告收集。 */
-class DiagnosticLogPlugin {
+class DiagnosticLogPlugin(private val context: Context) {
     companion object {
         private const val TAG = "DiagnosticLog"
         private const val CHANNEL = "com.md3music.md3music/diagnostic_log"
@@ -41,6 +43,10 @@ class DiagnosticLogPlugin {
                             append(NativeLogBuffer.DEFAULT_CAPACITY)
                             append("） =====\n")
                             append(ringText)
+                            append("\n\n===== 历史进程退出记录 =====\n")
+                            append(readProcessExitHistory())
+                            append("\n\n===== UID 可见的 crash 缓冲（不按当前 PID 过滤） =====\n")
+                            append(runCatching { readLogcat(crashBuffer = true) }.getOrElse { "crash 日志不可用: ${it.javaClass.simpleName}" })
                             if (logcatText.isNotEmpty()) {
                                 append("\n\n===== logcat（尽力而为） =====\n")
                                 append(logcatText)
@@ -61,9 +67,26 @@ class DiagnosticLogPlugin {
             }
     }
 
-    private fun readLogcat(): String {
+    private fun readProcessExitHistory(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return "系统低于 Android 11，无历史退出 API"
+        return runCatching {
+            val manager = context.getSystemService(ActivityManager::class.java)
+                ?: return@runCatching "ActivityManager 不可用"
+            val records = manager.getHistoricalProcessExitReasons(context.packageName, 0, 8)
+            if (records.isEmpty()) return@runCatching "系统未返回本应用的历史退出记录"
+            records.joinToString("\n") { record ->
+                "timestamp=${record.timestamp} pid=${record.pid} process=${record.processName} " +
+                    "reason=${record.reason} status=${record.status} importance=${record.importance} " +
+                    "pssKb=${record.pss} rssKb=${record.rss} description=${record.description}"
+            }
+        }.getOrElse { "历史退出记录不可用: ${it.javaClass.simpleName}: ${it.message}" }
+    }
+
+    private fun readLogcat(crashBuffer: Boolean = false): String {
         val command = mutableListOf("logcat", "-d", "-v", "threadtime", "-t", "4000")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        if (crashBuffer) {
+            command.addAll(listOf("-b", "crash"))
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             command.add("--pid=${Process.myPid()}")
         }
         val process = ProcessBuilder(command)

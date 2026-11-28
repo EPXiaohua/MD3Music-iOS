@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'music_haptics_service.dart';
 import 'dart:math' as math;
 
 import 'package:just_audio/just_audio.dart';
@@ -7,8 +8,11 @@ import 'package:audio_session/audio_session.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'diagnostic_logger.dart';
+import '../../data/repositories/settings_repository.dart';
 import '../../services/kugou_api/kugou_models.dart'
     show loudnessForUrl, warmLoudnessCache;
+import 'accompany_mix.dart';
+import 'stem_separation_service.dart';
 import 'playback_command_dispatcher.dart';
 import 'volume_normalization_service.dart';
 
@@ -258,10 +262,9 @@ class AudioService {
     // 因此辅播放器**不请求音频焦点**：否则同一个 app 的第二次焦点请求会让
     // 主播放器收到 AUDIOFOCUS_LOSS，淡出的那一路会被 Media3 直接掐掉。
     androidApplyAudioAttributes: !aux,
-    // MD3Music fork: 辅播放器与主播放器共享同一个 audioSessionId（均衡器/频谱在
-    // 淡化全程对两路音频同时生效）。原生侧所有播放器（含辅播放器）都会建 Media3
-    // 会话，会话归属由 AudioPlayer.play() 收敛：只有真正开始播放的播放器，
-    // 其会话才被归入 host（其余会话被释放），系统任意时刻只暴露一个活跃会话。
+    // MD3Music fork: 辅播放器与主播放器由同一个 MediaSession host 收敛；原生侧
+    // 每个播放器各自生成 audioSessionId（伴唱轨需要时由 Dart 侧显式共享，
+    // 见 setSharedAudioSessionId）。
     androidAuxPlayer: aux,
     // 音量均衡：挂一个 LoudnessEnhancer 用于放大安静歌（跨引擎、Dart 侧可靠）。
     audioPipeline: enhancer != null
@@ -292,6 +295,49 @@ class AudioService {
 
   /// 辅播放器：首次交叉淡化时才创建（未开启该功能的用户零开销）。
   AudioPlayer? _auxPlayer;
+
+  /// 伴唱播放器：开启伴唱模式时才创建（未开启的用户零开销）。
+  ///
+  /// 与 [_auxPlayer] 是**不同的角色**：辅播放器用于交叉淡化（会接管
+  /// 「当前歌曲」），伴唱播放器只作为一路并行出声的背景轨——它不抢系统
+  /// 媒体会话（native 侧置静默会话角色），因此通知栏/媒体卡片/锁屏始终
+  /// 跟随原曲。
+  AudioPlayer? _accompanyPlayer;
+
+  /// 伴唱混音状态（null = 在线伴唱未开启）。
+  ///
+  /// 伴唱固定为**纯伴奏**：非 null 时主播放器静音、伴奏轨按用户音量出声。
+  /// 不再有比例调节（两路同时出声必然错位，见 [AccompanyMix] 的说明）。
+  AccompanyMix? _accompanyMix;
+
+  /// 端侧分离是否已开启（**只有一条输出管线**，没有第二路播放器）。
+  ///
+  /// 与 [_accompanyMix] 互斥：同一时刻只有一种伴奏来源。之所以分开存，是因为
+  /// 端侧模式下主播放器**不能被折减音量**（它就是那条唯一的输出），若复用
+  /// [_accompanyMix] 的 `originalVolumeScale = 0` 就会把原曲压成静音、
+  /// 却又没有人补上伴奏。
+  bool _stemActive = false;
+
+  /// 端侧分离是否已开启。
+  bool get stemSeparationActive => _stemActive;
+
+  /// 伴唱模式是否已开启（在线伴奏轨 或 端侧分离）。
+  bool get accompanyActive => _accompanyMix != null || _stemActive;
+
+  /// 当前伴唱混音比例（在线伴奏未开启时返回 null）。
+  AccompanyMix? get accompanyMix => _accompanyMix;
+
+  /// 原曲在伴唱模式下的音量占比。
+  ///
+  /// - 未开启伴唱：1.0
+  /// - 在线伴唱（纯伴奏）：0.0（原曲静音，让位给独立的伴奏轨）
+  /// - 端侧分离：1.0 —— 分离发生在同一条输出管线里，混音由处理器完成，
+  ///   上层**不能再折减**原曲音量。
+  ///
+  /// 上层（PlayerProvider 的淡入淡出收尾）直写播放器音量时必须乘上这个值，
+  /// 否则暂停淡出收尾会把原曲音量拉回满值，纯伴奏就破了。
+  double get originalVolumeScale =>
+      _accompanyMix == null ? 1.0 : 0.0;
 
   /// 当前承担"当前歌曲"的播放器，对外 stream / position / duration 的来源。
   late AudioPlayer _activePlayer;
@@ -409,6 +455,11 @@ class AudioService {
 
   Future<void> _applyNormalizationGainActive() async {
     await _applyGain(_currentNormalizationGainDb());
+    // 伴唱开启时由 _applyVolumes 统一下发两路（音量要按比例折减）。
+    if (_accompanyMix != null) {
+      await _applyVolumes();
+      return;
+    }
     // 非淡化中才落音量衰减，避免打断跨 fade 的斜坡
     if (!_crossfading) {
       await _activePlayer.setVolume(_userVolume * _vnAttenLinear);
@@ -447,6 +498,13 @@ class AudioService {
     void ignoreError(Object _) {}
     _activeSubs.addAll(<StreamSubscription<dynamic>>[
       p.positionStream.listen(_positionCtl.add, onError: ignoreError),
+      // 主播放器位置前进时也校正伴唱轨：伴唱轨自身在 loading / paused 时
+      // positionStream 不发事件，只靠伴唱侧回调会漏掉「原曲走了、伴奏没走」
+      // 这一类静默错位。
+      p.positionStream.listen(
+        (_) => _resyncAccompany(),
+        onError: ignoreError,
+      ),
       p.durationStream.listen(_durationCtl.add, onError: ignoreError),
       p.playingStream.listen(_forwardPlaying, onError: ignoreError),
       p.playerStateStream.listen(_playerStateCtl.add, onError: ignoreError),
@@ -528,9 +586,10 @@ class AudioService {
   bool get ignoreAudioFocus => _ignoreAudioFocus;
   void setIgnoreAudioFocus(bool value) {
     _ignoreAudioFocus = value;
-    // native：忽略模式跳过 Media3 内置焦点处理（不 duck/不暂停/不 abandon），
-    // 播放与音量完全保持——否则独占型中断（如 B 站视频 GAIN → 本端 LOSS）
-    // 会被 Media3 强制暂停，忽略开关形同虚设。
+    // native：忽略模式彻底退出焦点体系——Media3 AudioFocusManager 入口拦截，
+    // 不 request / 不持有 / 不 duck / 不暂停 / 不 abandon。此前仅跳过内置响应，
+    // 切歌的 IDLE abandon + play request(GAIN) 照发，把 B 站等其它持有者踢成
+    // LOSS 并暂停（issue #229）。播放与音量完全由 Dart 层保持。
     // ignore: discarded_futures
     _mainPlayer.setIgnoreAudioFocus(value);
     // 同步 forced / keepPlaying 标志（忽略时强制不自动 duck）
@@ -659,12 +718,11 @@ class AudioService {
     try {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
-      // MD3Music fork: Android 上停用 audio_session 的音频焦点请求
-      // （setActive(false)）。焦点由 Media3 的 AudioFocusManager 唯一持有
-      // （handleAudioFocus=true），原始事件经 just_audio fork 转发到
-      // audioFocusChangeStream；避免双焦点内斗（Media3 与 audio_session 交替
-      // request/abandon 导致播放反复暂停）。拔耳机由 Media3 的 becomingNoisy
-      // 自动暂停（不标记可自动恢复）。
+      // MD3Music fork: 停用 audio_session 的音频焦点请求（setActive(false)）。
+      // 焦点由 Media3 的 AudioFocusManager 唯一持有（handleAudioFocus=true），
+      // 原始事件经 just_audio fork 转发到 audioFocusChangeStream；避免双焦点
+      // 内斗（Media3 与 audio_session 交替 request/abandon 导致播放反复暂停）。
+      // 拔耳机由 Media3 的 becomingNoisy 自动暂停（不标记可自动恢复）。
       //
       // iOS 没有 Media3，不能照搬：AVAudioSession 不激活（setActive(true)）
       // 时 AVPlayer 起播只能依赖系统的隐式激活，冷启动首播、其他 app 中断
@@ -686,6 +744,7 @@ class AudioService {
     // 用户主动播放：清除中断暂停标记（避免后续无关 GAIN 误恢复）
     _pausedByInterruption = false;
     await _activePlayer.play();
+    await _playAccompany();
   }
 
   /// 派发播放命令后立即返回；底层Future会持续到暂停/曲目结束，不能阻塞切歌流程。
@@ -710,6 +769,8 @@ class AudioService {
         }
       },
     );
+    // 伴唱轨同步恢复：原曲起播后伴奏也必须跟上，否则两路时轴分叉。
+    await _playAccompany();
   }
 
   /// iOS：销毁重建主播放器实例——挂起后 AVPlayer 媒体通道死亡的确定性修复。
@@ -757,6 +818,20 @@ class AudioService {
     print('[AudioFocus] rebuildMainPlayer: done');
   }
 
+  /// 伴唱轨跟随原曲起播（伴唱未开启时是空操作）。
+  Future<void> _playAccompany() async {
+    final player = _accompanyPlayer;
+    if (player == null || _accompanyMix == null) return;
+    // 起播前再对齐一次 session id：输出通路重建后活动播放器可能换了 session。
+    await _shareActiveAudioSession(player);
+    try {
+      if (!player.playing) {
+        // ignore: discarded_futures
+        player.play();
+      }
+    } catch (_) {}
+  }
+
   Future<void> pause() async {
     // 用户主动暂停：清除中断暂停标记（中断引起的暂停不在 GAIN 时自动恢复）
     _pausedByInterruption = false;
@@ -765,6 +840,13 @@ class AudioService {
     // （用户实测报的「点暂停时音量突然变大」）。
     abortCrossfade(keepVolume: true);
     await _activePlayer.pause();
+    // 伴唱轨同步暂停：否则伴奏继续响，表现为「暂停后还有伴奏声」。
+    final accompany = _accompanyPlayer;
+    if (accompany != null && _accompanyMix != null) {
+      try {
+        await accompany.pause();
+      } catch (_) {}
+    }
   }
 
   Future<void> stop() async {
@@ -772,12 +854,574 @@ class AudioService {
     await _mainPlayer.stop();
     final aux = _auxPlayer;
     if (aux != null) await aux.stop();
+    // 停止播放即结束伴唱会话（伴唱状态由上层另行清理）。
+    final accompany = _accompanyPlayer;
+    if (accompany != null) {
+      _accompanyMix = null;
+      try {
+        await accompany.stop();
+      } catch (_) {}
+    }
+    // 端侧分离也要一起关掉，否则下次起播会带着旧的流式状态
+    if (_stemActive) {
+      _stemActive = false;
+      await StemSeparationService.instance.setEnabled(false);
+    }
   }
 
   Future<void> seek(Duration position) async {
     abortCrossfade();
     await _activePlayer.seek(position);
+    // 伴唱轨同步定位：两路必须指向同一时刻，否则歌词与伴奏错位。
+    await _seekAccompany(position);
+    // 端侧分离：seek 后必须让模型丢弃旧音频的流式状态。
+    //
+    // 主路径已经在原生侧做了（`DefaultAudioSink.flush()` 补调
+    // `audioProcessingPipeline.flush()` → `StemSeparateProcessor.onFlush()`
+    // → `session.flush()` 置重置标志）。这里再显式调一次是**兜底**：
+    // 个别 ROM / 低版本上 `onPositionReset` 未必走同一条路径，而残留旧状态
+    // 的后果是「拖动进度后分离失效 + 串音」，很难让用户自行恢复。
+    // 该调用幂等且极廉价（原生只置一个 volatile 标志），重复调用无副作用。
+    if (_stemActive) {
+      await StemSeparationService.instance.reset();
+    }
   }
+
+  // ==== 伴唱（伴奏轨）====
+
+  /// 伴唱播放器（懒创建）。
+  ///
+  /// 用 `_createPlayer(aux: true)` 的同款配置：`androidApplyAudioAttributes: false`
+  /// → 不请求音频焦点（否则同 app 的第二次焦点请求会让主播放器收到
+  /// AUDIOFOCUS_LOSS，把正在播的原曲掐掉）。
+  ///
+  /// 额外在 native 侧置「静默会话」角色（[AudioPlayer.setSilentSession]）：
+  /// 伴唱只出声、不进系统媒体会话，通知栏/媒体卡片/锁屏始终跟随原曲。
+  /// 同时通过 setSharedAudioSessionId 共享活动播放器的 audioSessionId：没有自己的
+  /// MediaSession 时，小米/HyperOS 会在原曲出声时把伴奏轨自动 duck 到无声；挂到
+  /// 主播放器已关联 MediaSession 的 session 上（hasUid=true）即可避免。
+  AudioPlayer _accompanyInstance() {
+    final existing = _accompanyPlayer;
+    if (existing != null) return existing;
+    final player = _createPlayer(aux: true);
+    _accompanyPlayer = player;
+    _watchSessionIds(player);
+    // 静默会话标志必须在第一次 play() 之前下发，否则 native 的 play() 已经
+    // 把本实例设为系统活跃会话（通知栏会跳到伴奏）。
+    // ignore: discarded_futures
+    player.setSilentSession(true);
+    // 伴唱轨位置漂移校正：两路各自解码会缓慢错开，超阈值即重新对齐。
+    _accompanyDriftSub = player.positionStream.listen(
+      _onAccompanyPosition,
+      onError: (Object _) {},
+    );
+    // 伴唱轨 ready 后补发被 loading 吞掉的 seek（just_audio 在 loading 态
+    // 静默丢弃 seek），并立即做一次对齐校正。
+    _accompanyStateSub = player.playerStateStream.listen(
+      _onAccompanyState,
+      onError: (Object _) {},
+    );
+    return player;
+  }
+
+  StreamSubscription<Duration>? _accompanyDriftSub;
+
+  StreamSubscription<PlayerState>? _accompanyStateSub;
+
+  /// 让伴唱轨共享当前活动播放器的 audioSessionId。
+  ///
+  /// 伴唱轨是「静默会话」（不建 MediaSession）；小米/HyperOS 会在原曲出声时把
+  /// 这条没有 MediaSession 关联的 AudioTrack 直接 duck 到无声 —— 表现正是
+  /// 「原曲暂停时伴奏正常、原曲一播放就听不见伴奏」。挂到活动播放器已与
+  /// MediaSession 关联的 session 上（hasUid=true）即可避免；同时均衡器/音量
+  /// 均衡对两路继续共用同一条 effect 链。
+  ///
+  /// 必须在 AudioTrack 创建前（setUrl / play 之前）下发。
+  Future<void> _shareActiveAudioSession(AudioPlayer player) async {
+    final id = _activePlayer.androidAudioSessionId;
+    if (id == null || id == 0) return;
+    try {
+      await player.setSharedAudioSessionId(id);
+    } catch (_) {}
+  }
+
+  /// 伴唱轨装载期间被丢弃的 seek 目标（loading 态 seek 不生效）。
+  ///
+  /// ready 后补发，避免「拖动进度条后伴奏停在旧位置」。
+  Duration? _pendingAccompanySeek;
+
+  /// 伴唱轨装载后是否还需要一次「就绪对齐」。
+  ///
+  /// 只在首次 ready 时消费一次；**不能**每次 ready 都强制 seek —— seek 会让
+  /// 播放器回到 buffering（isPlaying=false → 重新 startRenderers），ready 后又
+  /// 强制 seek，形成 seek→buffering→ready→seek 风暴（实测 14s 内 7000+ 次
+  /// isPlaying 抖动、AudioSink 反复 pause/play，伴奏听起来就是没声）。
+  bool _accompanyNeedsInitialAlign = false;
+
+  /// 最近一次下发伴唱 seek 的时间，用于抑制 seek 风暴。
+  DateTime? _accompanyLastSeekAt;
+
+  /// 诊断日志节流（排查「伴奏总比原曲慢」）。
+  DateTime? _lastAccompanySyncLogAt;
+
+  /// 伴唱轨播放倍速基准（用户倍速，不含同步校正）。
+  double _accompanyBaseSpeed = 1.0;
+
+  /// 已下发给伴唱轨的倍速（用于去重，避免每个位置事件都发通道）。
+  double _accompanyAppliedSpeed = 1.0;
+
+  /// 由主播放器位置推算伴唱目标位置（夹在 0..伴奏时长 内）。
+  ///
+  /// 注意这里必须夹到**伴奏轨**的时长，不是主曲时长：伴奏常常比原曲短
+  /// （纯伴奏少掉片头/片尾），用主曲时长上界会让 seek 目标定到伴奏末尾之外
+  /// ——seek 被平台丢弃或跳到结尾，表现就是「怎么调都不准」。
+  ///
+  /// 不再叠加任何「同步偏移」：两路各自 AudioTrack 的排队深度不同，这层物理
+  /// 延迟差无法用媒体位置修正；偏移与自动对齐体系已整体移除，只保留媒体位置
+  /// 对齐 + 倍速追赶的漂移校正。
+  Duration _accompanyTarget(Duration mainPos) {
+    var target = mainPos;
+    if (target < Duration.zero) target = Duration.zero;
+    final dur = _accompanyPlayer?.duration;
+    if (dur != null && target > dur) target = dur;
+    return target;
+  }
+
+  /// 触发一次「跳转对齐」的最小偏差。
+  ///
+  /// 不能按 50ms 持续追：每次 seek 本身要停顿 300~400ms，追 50ms 会变成
+  /// 「跳→落后→再跳」的无限切进度。阈值必须明显高于 seek 停顿，这里取
+  /// 800ms：阈值以下的残差交给倍速追赶（无停顿），更大的偏差（拖进度条、
+  /// 长时间卡顿/暂停恢复）才值得付一次 seek 的代价。
+  static const int _kAccompanyJumpThresholdMs = 800;
+
+  /// 向前跳转的提前量（伴奏落后时）。
+  ///
+  /// seek 会让伴唱轨停顿约 350~400ms（MediaCodec flush + 重新预滚）；真机日志
+  /// 实测「跳转前 drift=1504、跳转后 drift=90」，说明停顿约 390ms。取 400ms，
+  /// 跳完的残差接近 0，剩下的交给倍速追赶抹平。
+  static const int _kAccompanyJumpLeadMs = 400;
+
+  /// 两次跳转的最小间隔，避免 seek 后位置尚未刷新时连续再跳。
+  static const Duration _kAccompanySeekCooldown = Duration(seconds: 2);
+
+  /// 倍速追赶的死区（毫秒）：残差小于该值视为已对齐，立刻恢复原速。
+  ///
+  /// 取 10ms：真机日志里位置取样非常稳定（残差长期恒定在同一个整数），说明
+  /// 读数噪声远小于此；旧值 40ms 会把残差钉在 39ms 不再收敛，正是「总是差
+  /// 一点、伴奏偏后」的来源。
+  static const int _kAccompanySpeedDeadbandMs = 10;
+
+  /// 倍速追赶的期望追平时间（毫秒）：按「残差 / 该时间」换算追赶比例。
+  ///
+  /// 越小的值追得越猛。600ms 让 100ms 的残差直接顶到 [_kAccompanyCatchUpMaxRatio]，
+  /// 几十毫秒的残差则只轻微加速，从而在 1~2 秒内收敛且不产生可闻的持续变速。
+  static const int _kAccompanyCatchUpWindowMs = 600;
+
+  /// 倍速追赶的最大比例（相对用户倍速）。
+  ///
+  /// just_audio 在 Android 侧用 Sonic 做时间拉伸（音高不变），但仍取 12% 上限：
+  /// 过大的比率会让伴奏音色发闷；12% 已能把 800ms 内的残差在数秒内抹平。
+  static const double _kAccompanyCatchUpMaxRatio = 0.12;
+
+  /// 倍速追赶的最小比例：越过死区后至少加速/减速这么多，避免边缘抖动。
+  static const double _kAccompanyCatchUpMinRatio = 0.01;
+
+  /// 诊断：每秒最多打印一次两路位置/漂移/倍速（定位固定滞后还是逐渐变慢）。
+  void _logAccompanySync(AudioPlayer main, AudioPlayer player, Duration accompanyPos) {
+    final now = DateTime.now();
+    final last = _lastAccompanySyncLogAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 1)) return;
+    _lastAccompanySyncLogAt = now;
+    final drift = main.position.inMilliseconds - accompanyPos.inMilliseconds;
+    // ignore: avoid_print
+    print('[AccompanySync] main=${main.position.inMilliseconds} '
+        'acc=${accompanyPos.inMilliseconds} drift=$drift '
+        'speed(main=${main.speed},acc=${player.speed}) '
+        'ready=${player.processingState} pwr=${player.playing}');
+  }
+
+  /// 每 5 秒最多打印一次各路 AudioTrack 排队深度（诊断）。
+  DateTime? _lastOutputLatencyLogAt;
+
+  Future<void> _logAccompanyOutputLatency() async {
+    final now = DateTime.now();
+    final last = _lastOutputLatencyLogAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 5)) return;
+    _lastOutputLatencyLogAt = now;
+    try {
+      final snapshot =
+          await MusicHapticsService.instance.queryOutputLatencyTracks();
+      final raw = await MusicHapticsService.instance.queryOutputLatencyRaw();
+      // ignore: avoid_print
+      print('[AccompanyLatency] tracks=${snapshot ?? "unavailable"}');
+      // ignore: avoid_print
+      print('[AccompanyLatencyRaw] ${raw ?? "unavailable"}');
+    } catch (_) {
+      // 诊断失败不影响播放
+    }
+  }
+
+  /// 下发伴唱倍速（去重）。
+  void _applyAccompanySpeed(AudioPlayer player, double speed) {
+    final target = speed.clamp(0.25, 4.0);
+    if ((target - _accompanyAppliedSpeed).abs() < 1e-3) return;
+    _accompanyAppliedSpeed = target;
+    // ignore: discarded_futures
+    player.setSpeed(target).catchError((Object _) {});
+  }
+
+  /// 用倍速把残差追平（无 seek 停顿）。
+  ///
+  /// [driftMs] 为「目标位置 − 伴奏当前位置」：正值 = 伴奏落后 → 加速追赶；
+  /// 负值 = 伴奏超前 → 减速等待。比例按残差线性换算并夹在
+  /// [minRatio] ~ [_kAccompanyCatchUpMaxRatio] 之间，落入
+  /// [_kAccompanySpeedDeadbandMs] 死区即恢复原速。
+  ///
+  /// 相比 seek：不打断解码、不产生 300~400ms 的停顿，因此可以反复微调；
+  /// 相比固定小比例（旧版 ±6%）：残差越大追得越快，收敛时间更短。
+  void _applyAccompanyCatchUp(AudioPlayer player, int driftMs) {
+    final abs = driftMs.abs();
+    if (abs <= _kAccompanySpeedDeadbandMs) {
+      _applyAccompanySpeed(player, _accompanyBaseSpeed);
+      return;
+    }
+    // 量化到 1% 步进：位置流每 ~100ms 来一次，不量化会让每个事件都重新下发
+    // setSpeed，反复重建 Sonic 处理器反而制造抖动。
+    final rawRatio = (abs / _kAccompanyCatchUpWindowMs)
+        .clamp(_kAccompanyCatchUpMinRatio, _kAccompanyCatchUpMaxRatio);
+    final ratio = (rawRatio * 100).round() / 100.0;
+    final target = driftMs > 0
+        ? _accompanyBaseSpeed * (1 + ratio)
+        : _accompanyBaseSpeed * (1 - ratio);
+    _applyAccompanySpeed(player, target);
+  }
+
+  /// 计算跳转目标：伴奏落后（drift > 0）时向前多推 [_kAccompanyJumpLeadMs]，
+  /// 补偿 seek 后的停顿；向后跳不额外推。
+  ///
+  /// 上界同样必须用**伴奏轨**时长（理由见 [_accompanyTarget]）：这里已经叠加了
+  /// 400ms 提前量，再用主曲时长裁剪更容易把目标顶到伴奏范围之外。
+  Duration _accompanyJumpTarget(Duration target, int driftMs) {
+    var t = driftMs > 0
+        ? target + const Duration(milliseconds: _kAccompanyJumpLeadMs)
+        : target;
+    if (t < Duration.zero) t = Duration.zero;
+    final dur = _accompanyPlayer?.duration;
+    if (dur != null && t > dur) t = dur;
+    return t;
+  }
+
+  /// 偏差超过阈值时安排一次跳转（带冷却）。返回 true 表示已发起 seek。
+  bool _jumpAccompanyIfNeeded(AudioPlayer player, int driftMs) {
+    if (driftMs.abs() <= _kAccompanyJumpThresholdMs) return false;
+    final now = DateTime.now();
+    final last = _accompanyLastSeekAt;
+    if (last != null && now.difference(last) < _kAccompanySeekCooldown) {
+      return false;
+    }
+    _accompanyLastSeekAt = now;
+    _applyAccompanySpeed(player, _accompanyBaseSpeed);
+    return true;
+  }
+
+  /// 伴唱轨 ready：补发挂起的 seek；装载后的首次 ready 再做一次对齐。
+  void _onAccompanyState(PlayerState state) {
+    if (state.processingState != ProcessingState.ready) return;
+    final pending = _pendingAccompanySeek;
+    if (pending != null) {
+      _pendingAccompanySeek = null;
+      final player = _accompanyPlayer;
+      if (player != null) {
+        // ignore: discarded_futures
+        player.seek(pending).catchError((Object _) {});
+      }
+    }
+    // 装载后的首次对齐：偏差大时用一次 seek（装载期主曲已经走了近 1s），
+    // 否则直接交给倍速校正。
+    if (_accompanyNeedsInitialAlign) {
+      _accompanyNeedsInitialAlign = false;
+      _alignAccompanyAfterLoad();
+    }
+  }
+
+  /// 装载完成后的首次对齐（只执行一次）。
+  void _alignAccompanyAfterLoad() {
+    final player = _accompanyPlayer;
+    final main = _activePlayer;
+    if (player == null) return;
+    if (!accompanyCanResync(
+      ready: player.processingState == ProcessingState.ready,
+    )) {
+      return;
+    }
+    if (!main.playing) return;
+    final mainPos = main.position;
+    final accPos = player.position;
+    _logAccompanySync(main, player, accPos);
+    final target = _accompanyTarget(mainPos);
+    final driftMs = (target - accPos).inMilliseconds;
+    if (_jumpAccompanyIfNeeded(player, driftMs)) {
+      final jump = _accompanyJumpTarget(target, driftMs);
+      // ignore: avoid_print
+      print('[AccompanySync] initial jump → target=${jump.inMilliseconds} '
+          'acc=${accPos.inMilliseconds} drift=$driftMs');
+      // ignore: discarded_futures
+      player.seek(jump).catchError((Object _) {});
+      return;
+    }
+    // 未超跳转阈值：交给倍速追赶，不再做固定 ±6% 变速。
+    _applyAccompanyCatchUp(player, driftMs);
+  }
+
+  /// 伴唱轨位置漂移校正。
+  ///
+  /// 两路各自解码、各自推进，位置会缓慢错开（起播点不同、缓冲时机不同）。
+  /// 普通漂移用倍速微调追赶（无停顿）；只有偏差极大（拖进度条/长时间卡顿）
+  /// 才做一次 seek。主播放器是基准，绝不动它。
+  void _onAccompanyPosition(Duration _) {
+    // 不要用事件里携带的位置：positionStream 有 ~100ms 的投递间隔，拿旧位置
+    // 跟主播放器当前位置比会平白多算出 ~100ms 且永远达不到「不算漂移」的稳态。
+    // 直接读两路的 player.position（同一时刻取样）才是真实偏差。
+    _resyncAccompany();
+  }
+
+  /// 实际执行漂移校正。
+  ///
+  /// 伴唱轨未 ready 时**跳过**：just_audio 的 seek 在 loading 态被静默丢弃，
+  /// 由 [_onAccompanyState] 在 ready 后补做。
+  void _resyncAccompany() {
+    final mix = _accompanyMix;
+    if (mix == null) return;
+    final player = _accompanyPlayer;
+    if (player == null) return;
+    if (!accompanyCanResync(
+      ready: player.processingState == ProcessingState.ready,
+    )) {
+      return;
+    }
+    final main = _activePlayer;
+    if (!main.playing) return;
+    // 两路都在同一时刻取样，避免用事件里的旧位置制造假漂移。
+    final mainPos = main.position;
+    final accompanyPos = player.position;
+    _logAccompanySync(main, player, accompanyPos);
+    final target = _accompanyTarget(mainPos);
+    final driftMs = (target - accompanyPos).inMilliseconds;
+    if (_jumpAccompanyIfNeeded(player, driftMs)) {
+      final jump = _accompanyJumpTarget(target, driftMs);
+      // ignore: avoid_print
+      print('[AccompanySync] jump → target=${jump.inMilliseconds} '
+          'acc=${accompanyPos.inMilliseconds} drift=$driftMs');
+      // ignore: discarded_futures
+      player.seek(jump).catchError((Object _) {});
+      return;
+    }
+    // 阈值内：用倍速追赶剩余残差（无 seek 停顿），追平后自动恢复原速。
+    _applyAccompanyCatchUp(player, driftMs);
+  }
+
+  /// 开启伴唱：装载伴奏 URL 并从 [position] 起播，与原曲并行出声。
+  ///
+  /// [mix] 为伴奏占比（0 = 纯原曲，1 = 纯伴奏）。
+  /// 返回 false 表示装载失败（调用方据此 toast 并保持原状）。
+  Future<bool> startAccompany(
+    String url, {
+    required AccompanyMix mix,
+    required Duration position,
+    double speed = 1.0,
+  }) async {
+    try {
+      final player = _accompanyInstance();
+      // 复用伴唱轨时也要重新对齐活动播放器的 session id（输出通路重建后会变）。
+      await _shareActiveAudioSession(player);
+      // 伴唱轨不参与响度归一（另一首歌，响度不同），但倍速要跟原曲一致，
+      // 否则两路的时间轴会逐渐分叉。这里同时记下同步校正用的基准倍速。
+      final baseSpeed = speed.clamp(0.25, 4.0);
+      await player.setSpeed(baseSpeed);
+      _accompanyBaseSpeed = baseSpeed;
+      _accompanyAppliedSpeed = baseSpeed;
+      // 复用伴唱轨时先清掉上一首的挂起 seek（否则会 seek 到旧位置）。
+      _pendingAccompanySeek = null;
+      // 装载后只做一次阈值对齐；seek 冷却清零（新会话允许一次校正）。
+      _accompanyNeedsInitialAlign = true;
+      _accompanyLastSeekAt = null;
+      _lastAccompanySyncLogAt = null;
+      var initialPos = position;
+      if (initialPos < Duration.zero) initialPos = Duration.zero;
+      final loadStart = DateTime.now();
+      await player.setUrl(
+        url,
+        headers: const {},
+        // 定位交给平台层 prepare 阶段一次性生效，避免 seek 竞态（同 setUrl）。
+        initialPosition: initialPos,
+      );
+      // ignore: avoid_print
+      print('[AccompanySync] load=${DateTime.now().difference(loadStart).inMilliseconds}ms '
+          'target=${initialPos.inMilliseconds} '
+          'mainNow=${_activePlayer.position.inMilliseconds}');
+      _accompanyMix = mix;
+      await _applyVolumes();
+      // 只有原曲正在播放时才让伴奏轨起播：暂停态下点击开启伴唱，伴奏必须
+      // 保持静音就位，等用户恢复播放时由 `play()` / `_playAccompany()` 一起启动。
+      if (_activePlayer.playing) {
+        // 不 await play()：它的 Future 直到播放结束/暂停才完成。
+        // ignore: discarded_futures
+        player.play();
+      }
+      // 不要在这里再强制 seek：seek 会把刚起播的伴奏打回 buffering，
+      // 若与「ready 后强制对齐」叠加会形成反复 seek 的风暴（伴奏始终没声）。
+      // 首次 ready 由 _onAccompanyState 按漂移阈值做一次对齐即可。
+      return true;
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Accompany] 装载失败: $e');
+      await stopAccompany();
+      return false;
+    }
+  }
+
+  /// 开启端侧分离（只有一条输出管线，不需要第二路播放器）。
+  ///
+  /// 与 [startAccompany] 互斥：先确保在线伴奏轨已停掉，避免两条伴奏来源叠加。
+  ///
+  /// 返回 false 表示原生侧没接受（模型缺失 / 未就绪 / 算力不足），调用方据此
+  /// toast 并保持原状。
+  Future<bool> startStemSeparation({required double mix}) async {
+    // 同一条输出不允许两种伴奏来源并存
+    if (_accompanyMix != null) await stopAccompany();
+    await StemSeparationService.instance.setMix(mix);
+    final ok = await StemSeparationService.instance.setEnabled(true);
+    if (!ok) return false;
+    _stemActive = true;
+    _ensureStemStatsPoller();
+    await _applyVolumes();
+    return true;
+  }
+
+  /// 分离期间每 2s 拉一次原生统计。
+  ///
+  /// 存在的意义：卡音是**间歇性**的，事后问「刚才卡了没」无法定位；而
+  /// `skippedFrames` / `droppedBlocks` 的增长是欠载的硬指标。只有把这两个
+  /// 量在播放中持续记录下来，真机上出了问题才有据可查（这正是上一轮
+  /// 「一卡一卡」排查时最缺的东西）。
+  void _ensureStemStatsPoller() {
+    _stemStatsTimer?.cancel();
+    _stemStatsTimer = Timer.periodic(const Duration(seconds: 2), (t) async {
+      if (!_stemActive) {
+        t.cancel();
+        _stemStatsTimer = null;
+        return;
+      }
+      await StemSeparationService.instance.refreshStats();
+    });
+  }
+
+  Timer? _stemStatsTimer;
+
+  /// 关闭端侧分离。
+  Future<void> stopStemSeparation() async {
+    _stemStatsTimer?.cancel();
+    _stemStatsTimer = null;
+    if (!_stemActive) {
+      // 幂等：即便状态没置上也要把原生侧关掉（防止异常退出后残留）
+      await StemSeparationService.instance.setEnabled(false);
+      return;
+    }
+    _stemActive = false;
+    await StemSeparationService.instance.setEnabled(false);
+    await _applyVolumes();
+  }
+
+  /// 端侧分离的伴奏占比（0 = 纯原曲，1 = 纯伴奏）。
+  Future<void> setStemMix(double mix) async {
+    if (!_stemActive) return;
+    await StemSeparationService.instance.setMix(mix);
+  }
+
+  /// 关闭伴唱：停掉伴奏轨，原曲音量恢复满值。
+  Future<void> stopAccompany() async {
+    _accompanyMix = null;
+    _pendingAccompanySeek = null;
+    _accompanyNeedsInitialAlign = false;
+    _accompanyLastSeekAt = null;
+    _lastAccompanySyncLogAt = null;
+    final player = _accompanyPlayer;
+    if (player != null) {
+      try {
+        await player.pause();
+      } catch (_) {}
+    }
+    await _applyVolumes();
+  }
+
+  /// 伴唱轨与主播放器同步 seek。
+  ///
+  /// 伴唱轨未 ready（loading / idle）时**挂起**目标位置而不是直接 seek：
+  /// `just_audio.seek()` 在 loading 态被静默丢弃（fork `just_audio.dart`
+  /// 的 `case ProcessingState.loading: return;`），发过去也是白发。挂起后由
+  /// [_onAccompanyState] 在 ready 时补发。
+  Future<void> _seekAccompany(Duration position) async {
+    final player = _accompanyPlayer;
+    if (player == null || _accompanyMix == null) return;
+    final target = _accompanyTarget(position);
+    if (!accompanyCanResync(
+      ready: player.processingState == ProcessingState.ready,
+    )) {
+      _pendingAccompanySeek = target;
+      return;
+    }
+    _pendingAccompanySeek = null;
+    // 用户主动 seek 已经完成两路对齐，取消装载后的首次对齐，并记一次冷却，
+    // 避免位置上报尚未刷新时又被判定为漂移、立刻再 seek 一次。
+    _accompanyNeedsInitialAlign = false;
+    _accompanyLastSeekAt = DateTime.now();
+    try {
+      await player.seek(target);
+    } catch (_) {}
+  }
+
+  /// 按当前音量下发两路的音量（在线伴唱固定纯伴奏：原曲静音、伴奏满音量）。
+  ///
+  /// 端侧分离走单条输出，原曲音量保持正常（混音在处理器里做，这里不折减）。
+  /// 未开启任何伴唱时退化为改动前的单路行为（`_userVolume × 响度衰减`）。
+  Future<void> _applyVolumes() async {
+    final mix = _accompanyMix;
+    final originalTarget = mix == null
+        ? _userVolume * _vnAttenLinear
+        : mix.volumes(
+            userVolume: _userVolume,
+            attenuation: _vnAttenLinear,
+          ).original;
+    final accompanyTarget = mix == null
+        ? 0.0
+        : mix.volumes(
+            userVolume: _userVolume,
+            attenuation: 1.0,
+          ).accompany;
+    try {
+      if (!_crossfading) {
+        await _activePlayer.setVolume(originalTarget);
+      }
+    } catch (_) {}
+    final player = _accompanyPlayer;
+    if (player != null && mix != null) {
+      try {
+        await player.setVolume(accompanyTarget);
+      } catch (_) {}
+    }
+  }
+
+  /// 伴唱模式下活动播放器的目标音量（供上层淡入淡出收尾使用）。
+  double get _activePlayerVolumeTarget =>
+      _accompanyMix == null
+      ? _userVolume * _vnAttenLinear
+      : (_accompanyMix!
+            .volumes(
+              userVolume: _userVolume,
+              attenuation: _vnAttenLinear,
+            )
+            .original);
 
   /// 加载单源 URL。
   ///
@@ -820,6 +1464,11 @@ class AudioService {
       // 与「外部绕开这里直接写播放器」。这条日志是前者的判据。
       // ignore: avoid_print
       print('[VolAudit] setVolume(${_userVolume.toStringAsFixed(3)}) 淡化中被忽略');
+      return;
+    }
+    // 伴唱开启时原曲音量要按比例折减（_applyVolumes 统一下发两路）。
+    if (_accompanyMix != null) {
+      await _applyVolumes();
       return;
     }
     await _activePlayer.setVolume(_userVolume * _vnAttenLinear);
@@ -872,6 +1521,17 @@ class AudioService {
     if (aux != null && aux != _activePlayer) {
       try {
         await aux.setSpeed(speed);
+      } catch (_) {}
+    }
+    // 伴唱轨同步倍速：两路时间轴必须同速，否则越播越错位。
+    final accompany = _accompanyPlayer;
+    if (accompany != null && _accompanyMix != null) {
+      final base = speed.clamp(0.25, 4.0);
+      // 用户改倍速时重置同步校正基准（避免把 ±6% 的追赶倍速当成新基准）。
+      _accompanyBaseSpeed = base;
+      _accompanyAppliedSpeed = base;
+      try {
+        await accompany.setSpeed(base);
       } catch (_) {}
     }
   }
@@ -1194,7 +1854,7 @@ class AudioService {
       // 活动播放器即将换给 incoming：此刻把新歌的衰减升格为「当前」，
       // 这样后续 setVolume / abort / 归一化重算都按新歌的衰减走。
       _vnAttenLinear = _vnAttenLinearStandby;
-      await incoming.setVolume(_userVolume * _vnAttenLinear);
+      await incoming.setVolume(_activePlayerVolumeTarget);
       await _retireFadedPlayer(outgoing);
       // ignore: avoid_print
       print(
@@ -1310,7 +1970,7 @@ class AudioService {
     // 「点暂停/切歌时音量突然变大」。改为 150ms 的补偿斜坡 —— 快速但连续。
     final rampToken = _crossfadeToken;
     // ignore: discarded_futures
-    _rampVolumeTo(_activePlayer, _userVolume * _vnAttenLinear, rampToken);
+    _rampVolumeTo(_activePlayer, _activePlayerVolumeTarget, rampToken);
   }
 
   /// 把播放器音量从**当前值**平滑升降到 [target]（默认 150ms / 6 步）。
@@ -1362,13 +2022,22 @@ class AudioService {
     } catch (_) {}
     // 恢复音量，供它下次作为淡入方使用
     try {
-      await p.setVolume(_userVolume * _vnAttenLinear);
+      await p.setVolume(_activePlayerVolumeTarget);
     } catch (_) {}
   }
 
   Future<void> dispose() async {
     abortCrossfade();
+    // 释放前先关分离，避免原生侧还挂着 processor 的 hook
+    if (_stemActive) {
+      _stemActive = false;
+      await StemSeparationService.instance.setEnabled(false);
+    }
     await _media3FocusSub?.cancel();
+    await _accompanyDriftSub?.cancel();
+    _accompanyDriftSub = null;
+    await _accompanyStateSub?.cancel();
+    _accompanyStateSub = null;
     for (final sub in _activeSubs) {
       await sub.cancel();
     }
@@ -1380,6 +2049,7 @@ class AudioService {
     await _sessionIdsCtl.close();
     await _crossfadingCtl.close();
     await _auxPlayer?.dispose();
+    await _accompanyPlayer?.dispose();
     await _mainPlayer.dispose();
   }
 }

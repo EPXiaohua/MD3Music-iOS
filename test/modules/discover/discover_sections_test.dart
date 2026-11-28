@@ -28,13 +28,13 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
-  test('默认五区块全部可见，新歌与新碟相邻；与 Tab 配置隔离', () async {
+  test('默认前三项开启，新歌与新碟关闭；与 Tab 配置隔离', () async {
     final config = await DiscoverSectionConfig.load();
-    expect(config.visible, DiscoverSection.values);
-    expect(config.order.last, DiscoverSection.newAlbums);
+    expect(config.visible, DiscoverSection.values.take(3).toList());
+    expect(config.order, DiscoverSection.values);
     await config.toggle(DiscoverSection.newSongs).save();
     final restored = await DiscoverSectionConfig.load();
-    expect(restored.hidden, {DiscoverSection.newSongs});
+    expect(restored.hidden, {DiscoverSection.newAlbums});
     expect((await SharedPreferences.getInstance()).getKeys(), {DiscoverSectionConfig.preferenceKey});
   });
 
@@ -56,7 +56,7 @@ void main() {
   });
 
   test('上下拖动语义正确，顺序与开关作为同一快照跨重载保留', () async {
-    var config = const DiscoverSectionConfig();
+    var config = const DiscoverSectionConfig(hidden: {});
     config = config.reorder(4, 1).toggle(DiscoverSection.daily);
     await config.save();
     final loaded = await DiscoverSectionConfig.load();
@@ -80,7 +80,7 @@ void main() {
     expect(config.order.length, 5);
     expect(config.hidden, {DiscoverSection.daily});
     await prefs.setString(DiscoverSectionConfig.preferenceKey, '{bad json');
-    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values);
+    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values.take(3).toList());
   });
 
   test('还原所有设置清除发现页配置但保留登录状态', () async {
@@ -91,7 +91,7 @@ void main() {
     await SettingsRepository().resetAllSettingsToDefaults();
     expect(prefs.containsKey(DiscoverSectionConfig.preferenceKey), isFalse);
     expect(prefs.getString('kugou_current_userid'), 'fixture-user');
-    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values);
+    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values.take(3).toList());
   });
 
   testWidgets('宽屏保持 FM 整行，四块内容左右等宽配对；编辑只在页尾出现', (tester) async {
@@ -99,7 +99,7 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     var edits = 0;
-    await tester.pumpWidget(_layout(const DiscoverSectionConfig(), () => edits++));
+    await tester.pumpWidget(_layout(const DiscoverSectionConfig(hidden: {}), () => edits++));
     await tester.pumpAndSettle();
     final daily = tester.getRect(_cell(DiscoverSection.daily));
     final home = tester.getRect(_cell(DiscoverSection.homeDiscover));
@@ -126,7 +126,7 @@ void main() {
     tester.view.physicalSize = const Size(390, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
-    final config = const DiscoverSectionConfig().reorder(0, 4).toggle(DiscoverSection.homeDiscover);
+    final config = const DiscoverSectionConfig(hidden: {}).reorder(0, 4).toggle(DiscoverSection.homeDiscover);
     await tester.pumpWidget(_layout(config, () {}));
     await tester.pumpAndSettle();
     expect(_cell(DiscoverSection.homeDiscover), findsNothing);
@@ -151,8 +151,8 @@ void main() {
     expect(find.byKey(const ValueKey('discover-edit')).hitTestable(), findsOneWidget);
   });
 
-  testWidgets('管理面板沿用 M3E 排序与开关，立即保存；重置恢复全部默认区块', (tester) async {
-    var config = const DiscoverSectionConfig();
+  testWidgets('管理面板沿用 M3E 排序与开关，立即保存；重置恢复截图默认开关', (tester) async {
+    var config = const DiscoverSectionConfig(hidden: {});
     await tester.pumpWidget(MaterialApp(home: Scaffold(body: DiscoverSectionManager(
       config: config,
       onChanged: (next) async { config = next; await next.save(); },
@@ -170,8 +170,8 @@ void main() {
     expect(config.hidden, {DiscoverSection.newAlbums});
     await tester.tap(find.text('重置'));
     await tester.pumpAndSettle();
-    expect(config.visible, DiscoverSection.values);
-    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values);
+    expect(config.visible, DiscoverSection.values.take(3).toList());
+    expect((await DiscoverSectionConfig.load()).visible, DiscoverSection.values.take(3).toList());
     expect(tester.takeException(), isNull);
   });
 }

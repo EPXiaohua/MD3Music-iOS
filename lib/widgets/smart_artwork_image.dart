@@ -13,7 +13,7 @@ import 'local_artwork_image.dart';
 /// - **local://<filePath>** 本地文件：使用 [LocalArtworkCache] 懒加载
 /// - **null** 或未知：显示占位符
 class SmartArtworkImage extends StatefulWidget {
-  /// 可选扩展：按 songId 读取本地已持久化的封面字节（默认关闭，由私有构建注入）。
+  /// 可选扩展：按 songId 读取本地已持久化的封面字节（默认关闭，由宿主注入）。
   static Future<Uint8List?> Function(String songId)? localArtworkReader;
 
   final String? artworkUri;

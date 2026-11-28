@@ -243,6 +243,11 @@ class _TvMainShellState extends State<TvMainShell> {
   // ── 第二层 ────────────────────────────────────────────────
 
   Widget _buildTabLayer(ColorScheme colorScheme) {
+    // 壁纸档整条 tab 栏透明，让自定义背景图直接透出；非壁纸档保持
+    // surfaceContainer 实色，与内容区分层（口径同 scroll_aware_app_bar：
+    // 开启背景图时顶栏为完全透明，不再画 20% surface 半透明色带）。
+    final bool useBackgroundImage =
+        context.watch<ThemeProvider>().useBackgroundImage;
     return DpadRegion(
       memoryKey: 'tv/main-nav',
       debugLabel: 'tv-main-nav',
@@ -263,7 +268,9 @@ class _TvMainShellState extends State<TvMainShell> {
         }
       },
       child: Container(
-        color: colorScheme.surfaceContainer,
+        color: useBackgroundImage
+            ? Colors.transparent
+            : colorScheme.surfaceContainer,
         height: 56,
         child: ListView.builder(
           scrollDirection: Axis.horizontal,

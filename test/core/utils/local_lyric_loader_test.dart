@@ -112,14 +112,25 @@ void main() {
     expect(lines.last.text, '怀着冷却了的心窝漂远方');
   });
 
-  test('快速切换歌曲时不并发启动内嵌歌词解析 isolate', () async {
+  test('SAF content URI 优先使用 Song 缓存歌词', () async {
+    final lyrics = await LocalLyricLoader.loadForSongAsync(
+      localPath: 'content://media/audio/42',
+      cachedLyrics: '[00:03.00]cached',
+    );
+
+    expect(lyrics, '[00:03.00]cached');
+  });
+
+  test('快速切换歌曲时串行排队读取下一首歌词', () async {
     final first = _write('first.mp3', 'not a real mp3');
     final next = _write('next.mp3', 'not a real mp3');
+    _write('first.lrc', '[00:01.00]first');
+    _write('next.lrc', '[00:02.00]next');
     final firstRead = LocalLyricLoader.loadForAudioAsync(first.path);
     final nextRead = LocalLyricLoader.loadForAudioAsync(next.path);
 
-    expect(await nextRead, isNull);
-    expect(await firstRead, isNull);
+    expect(await firstRead, '[00:01.00]first');
+    expect(await nextRead, '[00:02.00]next');
   });
 }
 

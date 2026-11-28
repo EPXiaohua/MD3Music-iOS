@@ -20,15 +20,15 @@ import '../player/secondary_mini_player.dart';
 /// - **本地歌曲**：本机 HistoryRepository 中「无云端身份」的本地文件歌曲
 ///   播放记录（在线歌曲的记录已统一走云端，这里不再重复展示）。
 ///
-/// 私有构建注入的筛选/扩展钩子仅作用于本地 Tab（云端列表是只读的服务端记录）。
+/// 宿主注入的筛选/扩展钩子仅作用于本地 Tab（云端列表是只读的服务端记录）。
 class PlayHistoryPage extends StatefulWidget {
-  /// 可选扩展：对本地显示列表应用变换（默认关闭，由私有构建注入，用于筛选等）。
-  /// [pageKey] 为页面标识（'history'），供私有状态按页隔离。
+  /// 可选扩展：对本地显示列表应用变换（默认关闭，由宿主注入，用于筛选等）。
+  /// [pageKey] 为页面标识（'history'），供扩展状态按页隔离。
   static List<Song> Function(String pageKey, List<Song> songs)? songFilterHook;
-  /// 可选扩展：筛选状态变更的监听信号（默认关闭，由私有构建注入，
+  /// 可选扩展：筛选状态变更的监听信号（默认关闭，由宿主注入，
   /// 用于筛选按钮切换后触发本页重建）。
   static Listenable? songFilterListenable;
-  /// 可选扩展：顶栏额外操作按钮（默认关闭，由私有构建注入；仅本地 Tab 显示）。
+  /// 可选扩展：顶栏额外操作按钮（默认关闭，由宿主注入；仅本地 Tab 显示）。
   static List<Widget> Function(BuildContext context)? extraAppBarActionsBuilder;
 
   const PlayHistoryPage({super.key});
@@ -227,7 +227,7 @@ class _PlayHistoryPageState extends State<PlayHistoryPage> {
               ]
             : _source == 1
             ? [
-                // 可选扩展：私有构建注入的额外操作按钮（仅本地 Tab，默认无）
+                // 可选扩展：宿主注入的额外操作按钮（仅本地 Tab，默认无）
                 ...?PlayHistoryPage.extraAppBarActionsBuilder?.call(context),
                 // 批量删除入口：进入多选编辑模式（保留「全选→删除」即清空全部）
                 if (_localSongs.isNotEmpty)

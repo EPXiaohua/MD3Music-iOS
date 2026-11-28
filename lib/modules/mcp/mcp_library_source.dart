@@ -26,6 +26,9 @@ abstract interface class KugouLibraryGateway {
   Future<KugouPlaylistSongs?> getPlaylistSongs(String globalCollectionId,
       {int pagesize = 30});
 
+  /// 当前账号的歌单列表原始响应（`/user/playlist`；条目含可写的 `listid`）。
+  Future<Map<String, dynamic>?> userPlaylist(int pagesize);
+
   Future<List<KugouSongDetail>?> getRecommendDaily();
 
   Future<List<KugouSongDetail>?> getPersonalFm();
@@ -59,13 +62,25 @@ class KugouApiClientLibrarySource implements McpLibrarySource {
 
   @override
   Future<KugouSongDetail?> getSongDetail(String hash) async {
-    final detail = await _gateway.songDetail(hash);
+    var detail = await _gateway.songDetail(hash);
     if (detail == null) return null;
     // /audio 完全不返回封面字段（项目铁律 17：实测 0 个 img/pic/cover 键），
     // 封面 100% 依赖 /search 命中同 hash 的候选（与一起听富化同构）。
-    // 因此封面缺失时用「歌名 歌手」搜一次，按 hash 精确匹配候选回填；
-    // 搜不到或网络异常就原样返回（不影响播放本体），不做重试风暴。
-    if ((detail.artworkUri ?? '').isNotEmpty) return detail;
+    // 同时 /audio（kmr）响应里的 audio_id 与 MixSongID 是不同 ID 域，
+    // fromJson 已不再把它误当 albumAudioId（issue #216：错 ID 传给
+    // /song/url 会解析到无关音源），正确的 albumAudioId/albumId 同样
+    // 依赖搜索候选补齐。
+    // 因此封面、albumAudioId、专辑名任一缺失时用「歌名 歌手」搜一次，
+    // 按 hash 精确匹配候选回填；搜不到或网络异常就原样返回（不影响播放本体），
+    // 不做重试风暴。专辑名同为 /audio 缺失字段（实测 md3_get_song_detail 的
+    // album 为空），一并列入补齐项。
+    bool missing(String? v) => v == null || v.isEmpty || v == '0';
+    final needAlbumName = (detail.albumName ?? '').trim().isEmpty;
+    if (!missing(detail.artworkUri) &&
+        !missing(detail.albumAudioId) &&
+        !needAlbumName) {
+      return detail;
+    }
     final keyword = <String>[
       if (detail.songName.trim().isNotEmpty) detail.songName,
       if ((detail.artistName ?? '').trim().isNotEmpty) detail.artistName!,
@@ -73,14 +88,41 @@ class KugouApiClientLibrarySource implements McpLibrarySource {
     if (keyword.isEmpty) return detail;
     try {
       final result = await _gateway.search(keyword, pagesize: 30);
+      String? cover;
+      String? albumAudioId;
+      String? albumId;
+      String? albumName;
       for (final candidate in result?.songs ?? const <KugouSongDetail>[]) {
-        if (candidate.hash.toLowerCase() == hash.toLowerCase() &&
-            (candidate.artworkUri ?? '').isNotEmpty) {
-          return detail.copyWith(artworkUri: candidate.artworkUri);
+        if (candidate.hash.toLowerCase() != hash.toLowerCase()) continue;
+        cover ??= (candidate.artworkUri ?? '').isEmpty
+            ? null
+            : candidate.artworkUri;
+        albumAudioId ??= missing(candidate.albumAudioId)
+            ? null
+            : candidate.albumAudioId;
+        albumId ??= missing(candidate.albumId) ? null : candidate.albumId;
+        if (needAlbumName) {
+          albumName ??= (candidate.albumName ?? '').trim().isEmpty
+              ? null
+              : candidate.albumName;
+        }
+        // 需要的字段全部拿到首个候选值后停止扫描；任一字段此前落空时
+        // 继续查找后续同 hash 候选，避免遗漏封面或关联 ID（issue #216 本地修复第 3 条）。
+        if (cover != null &&
+            albumAudioId != null &&
+            albumId != null &&
+            (!needAlbumName || albumName != null)) {
+          break;
         }
       }
+      detail = detail.copyWith(
+        artworkUri: cover,
+        albumAudioId: albumAudioId,
+        albumId: albumId,
+        albumName: albumName,
+      );
     } catch (_) {
-      // 封面补齐失败不阻断播放
+      // 补齐失败不阻断播放
     }
     return detail;
   }
@@ -115,6 +157,34 @@ class KugouApiClientLibrarySource implements McpLibrarySource {
     final clamped = limit.clamp(1, 20);
     final r = await _gateway.searchPlaylists(keyword, pagesize: clamped);
     return r?.take(clamped).toList(growable: false);
+  }
+
+  @override
+  Future<List<KugouPlaylistBrief>> getUserPlaylists({int limit = 30}) async {
+    // /user/playlist 原始结构（信封 data 下 info/list/special_list 三候选）
+    // 与「添加到歌单」对话框 loadUserPlaylistsSorted 同一口径解析。
+    final raw = await _gateway.userPlaylist(limit.clamp(1, 50));
+    if (raw == null) return const <KugouPlaylistBrief>[];
+    final data = raw['data'];
+    List<dynamic> rows = const [];
+    if (data is List) {
+      rows = data;
+    } else if (data is Map) {
+      rows = data['info'] ?? data['list'] ?? data['special_list'] ?? const [];
+    }
+    final out = <KugouPlaylistBrief>[];
+    for (final item in rows) {
+      if (item is! Map) continue;
+      final brief =
+          KugouPlaylistBrief.fromJson(Map<String, dynamic>.from(item));
+      // 只暴露当前账号自己创建的歌单：收藏页里 type=1 的订阅歌单不可写，
+      // 拿它的 id 去 add_song 必然失败（实测「上游无响应」就是这种 id）。
+      if (brief.type != 0) continue;
+      // 系统「我喜欢」歌单走红心机制而非歌单加歌（与对话框同判定）。
+      if (brief.name == '我喜欢' || item['is_def'] == 2) continue;
+      if (out.length < limit) out.add(brief);
+    }
+    return out;
   }
 
   @override
@@ -184,6 +254,10 @@ class _KugouApiClientGateway implements KugouLibraryGateway {
       client.getPlaylistSongs(globalCollectionId, page: 1, pagesize: pagesize);
 
   @override
+  Future<Map<String, dynamic>?> userPlaylist(int pagesize) =>
+      client.getUserPlaylist(page: 1, pagesize: pagesize);
+
+  @override
   Future<List<KugouSongDetail>?> getRecommendDaily() =>
       client.getRecommendDaily();
 
@@ -249,12 +323,15 @@ class KugouApiClientLibraryWriteSource implements McpLibraryWriteSource {
   final KugouLibraryWriteGateway _gateway;
 
   @override
-  Future<void> addSongToPlaylist(String hash, String listid) async {
+  Future<void> addSongToPlaylist(String hash, String listid,
+      {KugouSongDetail? enriched}) async {
     // data 契约：`名称|hash|专辑id|mixsongid`（Rust 端 playlist.rs
     // handle_tracks_add 按竖线切分，专辑 id/mixsongid 缺省 0）。
     // 歌名走 toSong() 的清洗结果，与播放/搜索回执口径一致；格式与既有调用方
     // add_to_playlist_dialog / favorites_provider 完全相同。
-    final detail = await _gateway.songDetail(hash);
+    // 优先复用工具层传入的补齐详情（含正确 mixsongid）；未传时再裸取一次，
+    // 缺 albumAudioId 就按 0 入库（上游可容），不再依赖 /audio 的 audio_id。
+    final detail = enriched ?? await _gateway.songDetail(hash);
     if (detail == null) {
       throw StateError('未找到 hash 为 $hash 的歌曲，无法加入歌单');
     }
@@ -266,9 +343,19 @@ class KugouApiClientLibraryWriteSource implements McpLibraryWriteSource {
   }
 
   @override
-  Future<void> createPlaylist(String name) async {
+  Future<String?> createPlaylist(String name) async {
     final r = await _gateway.createPlaylist(name);
     _ensureSuccess(r, '创建歌单失败');
+    // 上游 /cloudlist.service/v5/add_list 成功响应在 data 里回新 listid
+    // （favorites_page 建档后同样从响应取）。取不到只说明回执缺 ID，
+    // 不代表创建失败，故返回 null 而不是报错。
+    final data = r?['data'];
+    if (data is Map) {
+      final listid = data['listid'] ?? data['list_id'] ?? data['listId'];
+      final s = listid?.toString() ?? '';
+      if (s.isNotEmpty && s != '0') return s;
+    }
+    return null;
   }
 
   void _ensureSuccess(Map<String, dynamic>? r, String action) {

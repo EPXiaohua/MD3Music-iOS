@@ -315,6 +315,47 @@ public abstract class MediaSessionService extends Service {
   @Nullable
   public static volatile PlayFromMediaIdHook playFromMediaIdHook;
 
+  /**
+   * MD3Music fork v66：playFromSearch 消费钩子（车机语音点歌）。
+   *
+   * <p>media3 1.4.1 的 {@link MediaSession.Callback} 没有 onPlayFromSearch，框架
+   * {@code MediaController.TransportControls.playFromSearch()} 只能经 legacy
+   * stub 到达本类。App 注入钩子后由 App 自己按关键词搜索并起播（App 队列由 Dart
+   * 自维护，默认实现会把「只有 searchQuery、没有 URI」的 item 塞进 ExoPlayer，
+   * 播不出且污染 media3 时间线）。钩子返回 true 表示已消费。
+   */
+  public interface PlayFromSearchHook {
+    boolean onPlayFromSearch(@Nullable String query, @Nullable Bundle extras);
+  }
+
+  /** MD3Music fork v66：全局钩子（单会话宿主应用，恒单实例）。 */
+  @Nullable
+  public static volatile PlayFromSearchHook playFromSearchHook;
+
+  /**
+   * MD3Music fork v67：legacy browse 搜索提供者（{@code MediaBrowserCompat.search()}）。
+   *
+   * <p>与 browse 子节点同理，接口声明在本类（public）里：{@link
+   * MediaSessionServiceLegacyStub} 是包内可见，App 侧无法引用它的嵌套类型。
+   *
+   * <p>实现方**必须**在返回前对 {@code result} 调用 {@code detach()} 或直接
+   * {@code sendResult(...)}：基类 {@code performSearch} 会在本方法返回后立刻断言
+   * 「必须 detach 或 sendResult」，否则抛 IllegalStateException。空结果必须回
+   * {@code emptyList()}——回 {@code null} 会被转成 RESULT_ERROR。
+   */
+  public interface SearchProvider {
+    boolean onSearch(
+        @Nullable String query,
+        @Nullable Bundle extras,
+        MediaBrowserServiceCompat.Result<
+                List<androidx.media3.session.legacy.MediaBrowserCompat.MediaItem>>
+            result);
+  }
+
+  /** MD3Music fork v67：全局搜索提供者（单会话宿主应用，恒单实例）。 */
+  @Nullable
+  public static volatile SearchProvider searchProvider;
+
   /** MD3Music fork v39：browse 子节点提供者（App 侧注入）。 */
   @GuardedBy("lock")
   @Nullable

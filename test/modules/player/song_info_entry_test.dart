@@ -10,7 +10,10 @@ import 'package:flutter_test/flutter_test.dart';
 /// 这类"整块注释"在编译期不报错，只能靠 UI 截图或读代码发现，故这里用源码
 /// 扫描钉住两件事（与 `platform_capabilities_test.dart` 的门控存在性测试同风格）：
 ///
-/// 1. 两份播放页的更多菜单里确实有**未注释**的「歌曲信息」导航；
+/// 1. 两份播放页的更多菜单里「歌曲信息」导航仍存在（Windows/TV 用），且被
+///    `!supportsUsbExclusive` 门控 —— 安卓手机入口已移进「播放与输出」面板
+///    输出页的「USB 独占」行（见 `playback_center_sheet.dart` 的
+///    `UsbExclusiveTrayRow`），门控缺失或方向写反都会让安卓出现第二个入口；
 /// 2. 歌曲信息页的 USB 独占区块与 USB 遥测行都挂在 `supportsUsbExclusive` 上
 ///    —— 该能力已排除桌面端与 TV 构建（TV 不注册原生插件），删掉门控就会在
 ///    TV/桌面端露出死 UI。
@@ -24,13 +27,21 @@ void main() {
       .where((line) => !line.trimLeft().startsWith('//'))
       .join('\n');
 
-  group('播放页更多菜单：歌曲信息入口', () {
+  group('播放页更多菜单：歌曲信息入口（安卓移入面板，桌面/TV 保留）', () {
     for (final path in const [
       'lib/modules/player/full_player.dart',
       'lib/modules/player/full_player_am.dart',
     ]) {
-      test('$path 含生效的「歌曲信息」入口', () {
+      test('$path 歌曲信息入口被 !supportsUsbExclusive 门控且仍可导航', () {
         final source = activeSource(path);
+        // 门控存在且方向正确：安卓手机不显示，Windows/TV 保留
+        expect(
+          RegExp(r'if \(!supportsUsbExclusive\)\s*\n\s*ListTile\(')
+              .hasMatch(source),
+          isTrue,
+          reason: '歌曲信息入口必须挂在 !supportsUsbExclusive 上'
+              '（安卓入口已移进「播放与输出」面板的「USB 独占」行）',
+        );
         expect(
           source.contains("title: const Text('歌曲信息')"),
           isTrue,
@@ -48,6 +59,20 @@ void main() {
         );
       });
     }
+
+    test('面板输出页有「USB 独占」托盘行承接安卓入口', () {
+      final source = activeSource('lib/modules/player/playback_center_sheet.dart');
+      expect(
+        source.contains('UsbExclusiveTrayRow'),
+        isTrue,
+        reason: '安卓「歌曲信息」入口的新家（输出页托盘行）不能缺失',
+      );
+      expect(
+        source.contains("import 'song_info_page.dart';"),
+        isTrue,
+        reason: '托盘行必须能导航到歌曲信息页',
+      );
+    });
   });
 
   group('歌曲信息页：USB 独占内容按平台能力门控', () {

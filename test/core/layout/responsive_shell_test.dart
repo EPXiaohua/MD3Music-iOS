@@ -459,7 +459,7 @@ void main() {
     );
     expect(
       tester.getSize(find.byKey(const Key('content'))).width,
-      1280 * 0.85,
+      1280 * 0.92,
     );
     tester.view.physicalSize = const Size(400, 800);
     await tester.pump();

@@ -1,17 +1,11 @@
-# JAudioTagger 依赖反射创建标签对象副本，必须保留所有类名和构造函数
-# 否则 R8 混淆后反射调用 NoSuchMethodException: Error finding constructor to create copy
--keep class org.jaudiotagger.** { *; }
--keep class org.jaudiotagger.tag.id3.** { *; }
--keep class org.jaudiotagger.tag.flac.** { *; }
--keep class org.jaudiotagger.tag.mp4.** { *; }
--keep class org.jaudiotagger.tag.vorbiscomment.** { *; }
--keep class org.jaudiotagger.audio.** { *; }
--keep class org.jaudiotagger.tag.datatype.** { *; }
--keep class org.jaudiotagger.tag.reference.** { *; }
--keep class org.jaudiotagger.tag.images.** { *; }
--keep class org.jaudiotagger.tag.lyrics.** { *; }
--keep class org.jaudiotagger.tag.id3.framebody.** { *; }
--keep class org.jaudiotagger.tag.id3.valuepair.** { *; }
+# ── 端侧人声/伴奏分离（TFLite + 反射注册的原生插件）──
+# 插件通过 Class.forName 反射注册，R8 剥掉类名就会「注册失败但功能静默消失」。
+-keep class com.md3music.md3music.stem.** { *; }
+# TFLite 的 Interpreter / 委托层大量走 JNI 反射，官方规则随 AAR 提供，这里再兜一层。
+-keep class org.tensorflow.lite.** { *; }
+-keep class org.tensorflow.lite.nnapi.** { *; }
+
+
 
 # ── SuperLyricApi（R8 必须保留所有 API 类，避免 Binder/AIDL 反射失败） ──
 -keep class com.hchen.superlyricapi.* {*;}

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -38,8 +39,29 @@ extension DiscoverSectionInfo on DiscoverSection {
 class DiscoverSectionConfig {
   const DiscoverSectionConfig({
     this.order = DiscoverSection.values,
-    this.hidden = const {},
+    this.hidden = defaultMobileHidden,
   });
+
+  /// 移动端默认隐藏的区块（Windows 桌面默认全显示，见 [platformDefaults]）。
+  static const Set<DiscoverSection> defaultMobileHidden = {
+    DiscoverSection.newSongs,
+    DiscoverSection.newAlbums,
+  };
+
+  /// 按平台取默认配置：Windows 桌面（含便携版）五个区块默认全部显示；
+  /// Android / TV 维持原默认（新歌速递、新碟上架隐藏）。
+  /// 仅影响未持久化过配置的新档案与「重置」；已保存过配置的用户不受影响。
+  ///
+  /// 用 `defaultTargetPlatform` 而非 `Platform.isWindows`：后者在 Windows
+  /// 宿主跑 `flutter test` 时也为 true，会把宿主平台泄漏进测试（与
+  /// `windows_fullscreen.dart` 同一口径）。
+  static DiscoverSectionConfig platformDefaults() {
+    final bool windowsDesktop =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+    return DiscoverSectionConfig(
+      hidden: windowsDesktop ? const {} : defaultMobileHidden,
+    );
+  }
 
   // settings_ 前缀确保「还原所有设置」会清除布局，但不涉及账号数据。
   static const preferenceKey = 'settings_discover_sections';
@@ -52,10 +74,10 @@ class DiscoverSectionConfig {
   static Future<DiscoverSectionConfig> load() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(preferenceKey);
-    if (saved == null) return const DiscoverSectionConfig();
+    if (saved == null) return platformDefaults();
     try {
       final data = jsonDecode(saved);
-      if (data is! Map<String, dynamic>) return const DiscoverSectionConfig();
+      if (data is! Map<String, dynamic>) return platformDefaults();
       final byId = {for (final section in DiscoverSection.values) section.name: section};
       final order = <DiscoverSection>[];
       for (final id in (data['order'] is List ? data['order'] as List : const [])) {
@@ -71,7 +93,7 @@ class DiscoverSectionConfig {
       return DiscoverSectionConfig(
         order: List.unmodifiable(order), hidden: Set.unmodifiable(hidden));
     } catch (_) {
-      return const DiscoverSectionConfig();
+      return platformDefaults();
     }
   }
 
@@ -211,9 +233,12 @@ class _DiscoverSectionManagerState extends State<DiscoverSectionManager> {
         child: Row(children: [
           Expanded(child: Text('发现页管理', style: Theme.of(context).textTheme.titleMedium)),
           TvCardFocus(
-            onSelect: () => _apply(const DiscoverSectionConfig()),
+            onSelect: () => _apply(DiscoverSectionConfig.platformDefaults()),
             debugLabel: 'discover-reset',
-            child: M3ETextButton(onPressed: () => _apply(const DiscoverSectionConfig()), child: const Text('重置')),
+            child: M3ETextButton(
+              onPressed: () => _apply(DiscoverSectionConfig.platformDefaults()),
+              child: const Text('重置'),
+            ),
           ),
         ]),
       ),

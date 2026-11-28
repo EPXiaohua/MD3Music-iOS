@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'package:m3e_core/m3e_core.dart';
 
 import '../../core/build_flags.dart';
+import '../../core/utils/song_detail_nav.dart';
 import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
@@ -45,7 +46,10 @@ int kCoverFlowIndex = 0;
 /// 队列播到末尾自动接新歌；每日推荐是固定日列表，无翻页接口。
 /// 横竖屏自适应：竖屏单卡约占屏宽 62%，横屏约 34%。
 class CoverFlowPage extends StatefulWidget {
-  const CoverFlowPage({super.key});
+  const CoverFlowPage({super.key, this.onBack});
+
+  /// 与主页面的系统返回路径保持一致。
+  final VoidCallback? onBack;
 
   @override
   State<CoverFlowPage> createState() => _CoverFlowPageState();
@@ -198,45 +202,67 @@ class _CoverFlowPageState extends State<CoverFlowPage> {
       appBar: isLandscape
           ? null
           : ScrollAwareAppBar(title: '封面流', opaque: true),
-      body: Consumer<KugouProvider>(
-        builder: (context, kugou, _) {
-          final songs = switch (source) {
-            CoverFlowSource.daily => kugou.recommendSongs,
-            CoverFlowSource.fmHeart ||
-            CoverFlowSource.fmExplore ||
-            CoverFlowSource.fmNiche ||
-            CoverFlowSource.fmRadio => kugou.personalFmSongs,
-            CoverFlowSource.homeDiscover => kugou.homeDiscoverSongs,
-          };
-          if (songs.isEmpty && kugou.isLoading) {
-            return const Center(child: M3ELoadingIndicator());
-          }
-          if (songs.isEmpty) {
-            return _buildEmpty(source);
-          }
-          return Column(
-            children: [
-              Expanded(
-                child: _CoverFlowView(
-                  // 源切换必然换歌单列表：用 source 作 key 强制重建视图，
-                  // 内部 _pageNotifier / _lastReported 等状态随之归零，
-                  // 避免旧 page 越过新列表边界。
-                  key: ValueKey<CoverFlowSource>(source),
-                  songs: songs,
-                  initialIndex: _currentIndex,
-                  onPageChanged: (index) {
-                    // 同步回模块级变量，供横竖屏切换重建页面时恢复位置
-                    kCoverFlowIndex = index;
-                    setState(() => _currentIndex = index);
-                    // 接近末尾自动补货（私人FM / 刷歌推荐）
-                    unawaited(_maybeLoadMore(index));
-                  },
-                  onRefresh: _refresh,
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: Consumer<KugouProvider>(
+              builder: (context, kugou, _) {
+                final songs = switch (source) {
+                  CoverFlowSource.daily => kugou.recommendSongs,
+                  CoverFlowSource.fmHeart ||
+                  CoverFlowSource.fmExplore ||
+                  CoverFlowSource.fmNiche ||
+                  CoverFlowSource.fmRadio => kugou.personalFmSongs,
+                  CoverFlowSource.homeDiscover => kugou.homeDiscoverSongs,
+                };
+                if (songs.isEmpty && kugou.isLoading) {
+                  return const Center(child: M3ELoadingIndicator());
+                }
+                if (songs.isEmpty) {
+                  return _buildEmpty(source);
+                }
+                return Column(
+                  children: [
+                    Expanded(
+                      child: _CoverFlowView(
+                        // 源切换必然换歌单列表：用 source 作 key 强制重建视图，
+                        // 内部 _pageNotifier / _lastReported 等状态随之归零，
+                        // 避免旧 page 越过新列表边界。
+                        key: ValueKey<CoverFlowSource>(source),
+                        songs: songs,
+                        initialIndex: _currentIndex,
+                        onPageChanged: (index) {
+                          // 同步回模块级变量，供横竖屏切换重建页面时恢复位置
+                          kCoverFlowIndex = index;
+                          setState(() => _currentIndex = index);
+                          // 接近末尾自动补货（私人FM / 刷歌推荐）
+                          unawaited(_maybeLoadMore(index));
+                        },
+                        onRefresh: _refresh,
+                      ),
+                    ),
+                  ],
+                );
+            },
+            ),
+          ),
+          if (isLandscape)
+            Positioned(
+              top: 0,
+              left: 0,
+              child: SafeArea(
+                bottom: false,
+                right: false,
+                child: IconButton(
+                  key: const ValueKey('coverflow-back'),
+                  tooltip: '返回',
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: widget.onBack ??
+                      () => Navigator.of(context).maybePop(),
                 ),
               ),
-            ],
-          );
-        },
+            ),
+        ],
       ),
     );
   }
@@ -835,7 +861,8 @@ class _CoverFlowViewState extends State<_CoverFlowView>
         return SafeArea(
           top: false,
           child: SizedBox(
-            height: 64,
+            // 歌名 + 歌手 + 专辑三行：默认字号下共 62px，留 10px 余量。
+            height: 72,
             child: Stack(
               alignment: Alignment.center,
               children: [
@@ -868,31 +895,56 @@ class _CoverFlowViewState extends State<_CoverFlowView>
     ColorScheme colorScheme,
     TextTheme textTheme,
   ) {
-    return Opacity(
-      opacity: opacity,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            song.songName,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w600,
+    return IgnorePointer(
+      // 翻页过渡期两层文案叠在同一位置：只让更可见的一层接收点击，
+      // 避免点到已淡出的那一层、进错歌的详情。
+      ignoring: opacity < 0.5,
+      child: Opacity(
+        opacity: opacity,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              song.songName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
             ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            song.artistName ?? '未知歌手',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: textTheme.bodySmall?.copyWith(
-              color: colorScheme.onSurfaceVariant,
+            const SizedBox(height: 4),
+            // 歌手 / 专辑分段可点：信息条在 Stack 顶层先于卡片命中，
+            // 点文字只会进详情页，不会连带触发卡片的播放/吸附。
+            GestureDetector(
+              onTap: () => openSongArtist(context, song.toSong()),
+              child: Text(
+                song.artistName ?? '未知歌手',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
             ),
-          ),
-        ],
+            if (song.albumName != null && song.albumName!.trim().isNotEmpty) ...[
+              const SizedBox(height: 2),
+              GestureDetector(
+                onTap: () => openSongAlbum(context, song.toSong()),
+                child: Text(
+                  song.albumName!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

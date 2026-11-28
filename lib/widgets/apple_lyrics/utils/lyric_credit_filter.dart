@@ -14,6 +14,18 @@
 ///    （EchoMusic `catch { return false }` 的改良：宁可漏滤也不整屏空白）；
 /// 4. 空行不滤——空行去留由各解析器/视图既有行为决定，本过滤器不越权。
 ///
+/// ## 在线歌词头部信息块（本仓库扩展，2026-11）
+///
+/// 在线歌词的元信息固定为：第一行「作者 - 歌曲名」（如 `周杰伦 - 晴天`），
+/// 第二行起为「x：xxx」名单行。行级正则只覆盖后者，因此 [filterLines]
+/// 额外做**结构性头部块判定**：
+///
+/// - 首个非空行呈「作者 - 歌名」形态（含连字符、长度受限），
+///   **且**下一非空行是名单行（泛化「x：xxx」键或命中过滤正则）→
+///   认定头部块，整块移除直到首个非名单行（含不在默认正则名单内的键）；
+/// - 下一行是正常歌词则不删（守卫防误伤首行恰好含连字符的歌词）；
+/// - 该规则是列表上下文判定，[isFilteredLine] 行级 API 不参与。
+///
 /// ## 性能约定
 ///
 /// RegExp 按 pattern 字符串缓存，偏好未变化时每次匹配只付正则成本；
@@ -49,6 +61,12 @@ class LyricCreditFilter {
       '|未经著作权人许可|不得翻唱|翻录或使用|听歌就在';
 
   // ============== 正则缓存 ==============
+
+  /// 头部「作者 - 歌名」形态行（连字符两侧空格可选，长度受限防误伤长句）。
+  static final RegExp _artistTitleLine = RegExp(r'^\S.{0,60}\s*-\s*\S');
+
+  /// 泛化「x：xxx」名单行（仅用于头部信息块判定，键长受限）。
+  static final RegExp _genericCreditLine = RegExp(r'^[^：:]{1,16}\s*[：:]\s*\S');
 
   /// 缓存的 pattern 来源（含空串 = 默认）。
   static String? _cachedPatternSource;
@@ -89,35 +107,96 @@ class LyricCreditFilter {
   ///
   /// 开关未开启时恒为 false（零成本短路），调用方可放心常驻调用。
   static bool isFilteredLine(String text) {
-    if (!enabled || text.isEmpty) return false;
-    return _regexFor(LyricPreferences.instance.creditPattern)
-        .hasMatch(text.trim());
+    if (!enabled) return false;
+    return matchesCreditText(text);
+  }
+
+  /// 判断一行文本是否命中「作者/制作信息」规则（**不看过滤开关**）。
+  ///
+  /// [isFilteredLine] 是"开关 + 规则"的显示口径；需要「无论开关如何都排除名单行」
+  /// 的场景（如辉光判定：头部信息行不该被当成歌词打强调效果）走本入口，
+  /// 保证两边用的是同一套规则 —— 不要再各维护一份关键词表，否则必然漂移
+  /// （如英文名单 / 【…】包装行 / 版权声明句只在本规则里覆盖）。
+  static bool matchesCreditText(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return false;
+    return _regexFor(LyricPreferences.instance.creditPattern).hasMatch(trimmed);
+  }
+
+  /// 判断一行文本是否呈「作者 - 歌名」头部形态（**不看过滤开关**）。
+  ///
+  /// 在线歌词首行固定为该形态（如 `周杰伦 - 晴天`），行级正则覆盖不到：
+  /// 过滤列表时由 [_headCreditBlockEnd] 结合上下文整块移除，而「只能看单行」
+  /// 的场景（辉光判定）只能按形态近似——误伤面仅限整行恰似 `作者 - 歌名`
+  /// 的歌词行（带 ` - ` 分隔、且总长受限，实际罕见）。
+  static bool matchesArtistTitleForm(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return false;
+    return _artistTitleLine.hasMatch(trimmed);
   }
 
   /// 按当前偏好过滤歌词行列表。
+  ///
+  /// 两层口径：
+  /// 1. 行级正则：默认/自定义 pattern 命中的名单行（各位置生效）；
+  /// 2. 头部信息块：见文件头「在线歌词头部信息块」——第一行「作者 - 歌曲名」
+  ///    及其后的「x：xxx」名单行整块移除。
   ///
   /// 开关关闭、列表为空、或无任何命中时返回**原列表引用**（恒等），
   /// 保证播放页视图的行高/模糊缓存不因引用变化被无谓打穿。
   static List<LyricLine> filterLines(List<LyricLine> lines) {
     if (!enabled || lines.isEmpty) return lines;
     final regex = _regexFor(LyricPreferences.instance.creditPattern);
-    // 单趟扫描：命中前只记索引，命中后才开始拷贝，前面的行直接复用。
-    int? firstHit;
-    for (var i = 0; i < lines.length; i++) {
-      final trimmed = lines[i].text.trim();
-      if (trimmed.isNotEmpty && regex.hasMatch(trimmed)) {
-        firstHit = i;
+    final headEnd = _headCreditBlockEnd(lines, regex);
+    for (var i = headEnd; i < lines.length; i++) {
+      if (_matches(lines[i], regex)) {
+        return [
+          ...lines.sublist(0, headEnd),
+          for (var i = headEnd; i < lines.length; i++)
+            if (!_matches(lines[i], regex)) lines[i],
+        ];
+      }
+    }
+    // 行级无命中：仅有头部块命中时按块移除，否则返回原列表引用。
+    if (headEnd == 0) return lines;
+    return lines.sublist(headEnd);
+  }
+
+  /// 计算在线歌词头部信息块的结束索引（0 = 无头部块需移除）。
+  ///
+  /// 仅当首个非空行呈「作者 - 歌名」形态、且下一非空行确为名单行时才认定
+  /// 头部块，避免误删首行恰好含连字符的正常歌词；块内空行随下一名单行一并剔除。
+  static int _headCreditBlockEnd(List<LyricLine> lines, RegExp regex) {
+    var first = 0;
+    while (first < lines.length && lines[first].text.trim().isEmpty) {
+      first++;
+    }
+    if (first >= lines.length) return 0;
+    if (!_artistTitleLine.hasMatch(lines[first].text.trim())) return 0;
+    // 下一非空行必须是名单行，确认这是头部信息块而非正常歌词。
+    var next = first + 1;
+    while (next < lines.length && lines[next].text.trim().isEmpty) {
+      next++;
+    }
+    if (next >= lines.length) return 0;
+    final nextText = lines[next].text.trim();
+    if (!_genericCreditLine.hasMatch(nextText) && !regex.hasMatch(nextText)) {
+      return 0;
+    }
+    // 头部块延伸到首个既非「作者 - 歌名」、非「x：xxx」、也未命中名单正则的行。
+    var end = first;
+    for (var k = first; k < lines.length; k++) {
+      final t = lines[k].text.trim();
+      if (t.isEmpty) continue;
+      if (_artistTitleLine.hasMatch(t) ||
+          _genericCreditLine.hasMatch(t) ||
+          regex.hasMatch(t)) {
+        end = k + 1;
+      } else {
         break;
       }
     }
-    // 无命中：返回原列表引用（保住上层 identical 缓存判定）
-    final hit = firstHit;
-    if (hit == null) return lines;
-    return [
-      ...lines.sublist(0, hit),
-      for (var i = hit; i < lines.length; i++)
-        if (!_matches(lines[i], regex)) lines[i],
-    ];
+    return end;
   }
 
   /// 该行是否命中过滤规则（空行恒为 false：去留由解析器/视图既有行为决定）。

@@ -41,6 +41,9 @@ class ControlledAudioService {
   /// 硬解（audio offload）让路判定要读：测试替身固定视为「音量均衡未开启」。
   bool get volumeNormalizationEnabled => false;
 
+  /// 恢复播放淡入时读取的原始音量倍数（生产实现按音量均衡返回），替身固定 1.0。
+  double get originalVolumeScale => 1.0;
+
   Future<void> init() async {}
   Future<void> setLoopMode(just_audio.LoopMode _) async {}
   Future<void> setShuffleModeEnabled(bool _) async {}

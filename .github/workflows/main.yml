@@ -44,31 +44,31 @@ jobs:
       # 1. 准备代码
       # ============================================================
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0   # 需要完整 git 历史来生成 changelog
 
       # ============================================================
-      # 1.1 公开树校验：禁止私有代码触发发版
+      # 1.1 公开树校验：禁止非导出源树触发发版
       #     标签必须来自导出的公开树（md3.ps1 full-export -Tag）。
-      #     私有仓库直接推送的标签含 lib/private、私有权限或敏感配置，直接终止。
+      #     直接推送的标签含 lib/private、受限权限或本地配置，直接终止。
       # ============================================================
       - name: Verify public tree (reject private code)
         run: |
           set -e
           if [ -d "lib/private" ]; then
-            echo "::error::检测到 lib/private 私有目录：该标签包含私有代码，禁止发版。请使用 .\scripts\md3.ps1 full-export -Tag <版本> 从导出的公开树打标签"
+            echo "::error::检测到 lib/private 非公开目录：该标签包含非公开代码，禁止发版。请使用 .\scripts\md3.ps1 full-export -Tag <版本> 从导出的公开树打标签"
             exit 1
           fi
           if grep -q "MANAGE_EXTERNAL_STORAGE" android/app/src/main/AndroidManifest.xml 2>/dev/null; then
-            echo "::error::AndroidManifest.xml 含 MANAGE_EXTERNAL_STORAGE 私有权限：该标签来自私有仓库，禁止发版。请使用 .\scripts\md3.ps1 full-export -Tag <版本> 从导出的公开树打标签"
+            echo "::error::AndroidManifest.xml 含 MANAGE_EXTERNAL_STORAGE 受限权限：该标签来自非导出源树，禁止发版。请使用 .\scripts\md3.ps1 full-export -Tag <版本> 从导出的公开树打标签"
             exit 1
           fi
           if [ -f "networkapi/.env" ]; then
-            echo "::error::检测到 networkapi/.env 私有配置：该标签包含私有内容，禁止发版"
+            echo "::error::检测到 networkapi/.env 本地配置：该标签包含非公开内容，禁止发版"
             exit 1
           fi
-          echo "公开树校验通过：无私有目录/私有权限/敏感配置"
+          echo "公开树校验通过：无非公开目录/受限权限/本地配置"
 
       # ============================================================
       # 2. 解析版本号（从 git tag 派生，自动递增 versionCode）
@@ -148,13 +148,13 @@ jobs:
       #    不需要 NDK/cmake/Node.js 等旧架构依赖。
       # ============================================================
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           # setup-android@v3 默认还会安装已从 SDK 仓库移除的 tools 包。
           # 这里只需要 platform-tools，其他版本化 SDK 包在下一步显式安装。
@@ -168,7 +168,7 @@ jobs:
             "build-tools;36.0.0"
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -177,7 +177,7 @@ jobs:
       # 4. 缓存 Gradle（加速依赖下载）
       # ============================================================
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.gradle/caches
@@ -248,37 +248,30 @@ jobs:
       # ============================================================
       - name: Flutter pub get
         run: flutter pub get
-
-      # flavor 化之后必须显式 --flavor：定义 productFlavors 后 AGP 不再生成 assembleRelease，
-      # 缺少该参数会直接报 "You must specify a --flavor option to select one of them"。
-      # 标准版使用 Skia 渲染引擎（-Pmd3EnableImpeller=false → manifest enableImpeller=false）
-      - name: Flutter build APK (standard, arm64-v8a, Skia)
+      - name: Flutter build APK (lite, arm64-v8a, Skia)
         run: |
-          flutter build apk --release --flavor standard --split-per-abi --target-platform android-arm64 \
+          flutter build apk --release --flavor lite --split-per-abi --target-platform android-arm64 \
             --android-project-arg=md3EnableImpeller=false \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
             --build-name=${{ steps.version.outputs.version }} \
-            --build-number=${{ steps.version.outputs.versionCode }}
-
-      # 原子随身听按包名识别合作应用：额外构建一个 arm64-v8a 兼容包。
-      # 只覆盖 applicationId，namespace / Kotlin 包路径 / MethodChannel 均保持原样。
-      # 兼容包固定用 standard flavor —— 不含 3D 封面（无 ORT so / 深度模型）。
-      # 渲染引擎：全项目仅此包启用 Impeller（其余 standard/tv 一律 Skia）。
-      - name: Flutter build Apple Music package APK (standard flavor, arm64-v8a, Impeller)
+            --build-number=${{ steps.version.outputs.versionCode }} \
+            --obfuscate --split-debug-info=build/symbols/std-arm64
+      - name: Flutter build Apple Music package APK (lite flavor, arm64-v8a, Impeller)
         run: |
           set -euo pipefail
           apk_dir="build/app/outputs/flutter-apk"
-          standard_apk="$apk_dir/app-arm64-v8a-standard-release.apk"
-          standard_backup="$RUNNER_TEMP/app-arm64-v8a-standard-release.apk"
-          cp "$standard_apk" "$standard_backup"
-          flutter build apk --release --flavor standard --split-per-abi --target-platform android-arm64 \
+          lite_apk="$apk_dir/app-arm64-v8a-lite-release.apk"
+          lite_backup="$RUNNER_TEMP/app-arm64-v8a-lite-release.apk"
+          cp "$lite_apk" "$lite_backup"
+          flutter build apk --release --flavor lite --split-per-abi --target-platform android-arm64 \
             --android-project-arg=md3ApplicationId=com.apple.android.music \
             --android-project-arg=md3EnableImpeller=true \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
             --build-name=${{ steps.version.outputs.version }} \
-            --build-number=${{ steps.version.outputs.versionCode }}
-          mv "$standard_apk" "$apk_dir/app-apple-music-arm64-v8a-release.apk"
-          mv "$standard_backup" "$standard_apk"
+            --build-number=${{ steps.version.outputs.versionCode }} \
+            --obfuscate --split-debug-info=build/symbols/am-arm64
+          mv "$lite_apk" "$apk_dir/app-apple-music-arm64-v8a-release.apk"
+          mv "$lite_backup" "$lite_apk"
 
       # TV 版：MD3_TV 旗标启用 dpad 遥控导航；不含 3D / USB 独占 / 歌词推送。
       # TV 全部使用 Skia 渲染引擎，并产出 arm64 + armv7(32位) 两个 ABI。
@@ -289,7 +282,8 @@ jobs:
             --dart-define=MD3_TV=true \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
             --build-name=${{ steps.version.outputs.version }} \
-            --build-number=${{ steps.version.outputs.versionCode }}
+            --build-number=${{ steps.version.outputs.versionCode }} \
+            --obfuscate --split-debug-info=build/symbols/tv-arm64
 
       - name: Flutter build TV APK (tv flavor, armeabi-v7a, Skia)
         run: |
@@ -298,7 +292,8 @@ jobs:
             --dart-define=MD3_TV=true \
             --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
             --build-name=${{ steps.version.outputs.version }} \
-            --build-number=${{ steps.version.outputs.versionCode }}
+            --build-number=${{ steps.version.outputs.versionCode }} \
+            --obfuscate --split-debug-info=build/symbols/tv-arm32
 
       # ============================================================
       # 6.5 产物改名为发布名（ASCII）
@@ -320,7 +315,7 @@ jobs:
             test -f "$src"
             mv "$src" "$apk_dir/MD3Music-${ver}-$2-$3.apk"
           }
-          rename_apk app-arm64-v8a-standard-release.apk    standard    arm64-v8a
+          rename_apk app-arm64-v8a-lite-release.apk       standard    arm64-v8a
           rename_apk app-apple-music-arm64-v8a-release.apk apple-music arm64-v8a
           rename_apk app-arm64-v8a-tv-release.apk          tv          arm64-v8a
           rename_apk app-armeabi-v7a-tv-release.apk        tv          armeabi-v7a
@@ -372,7 +367,7 @@ jobs:
 
           ver="${{ steps.version.outputs.version }}"
           # 产物已在上一步改为 ASCII 发布名（规则与本文件 Rename 步骤同步）
-          std_apk="$apk_dir/MD3Music-${ver}-standard-arm64-v8a.apk"
+          lite_apk="$apk_dir/MD3Music-${ver}-standard-arm64-v8a.apk"
           am_apk="$apk_dir/MD3Music-${ver}-apple-music-arm64-v8a.apk"
           tv64_apk="$apk_dir/MD3Music-${ver}-tv-arm64-v8a.apk"
           tv32_apk="$apk_dir/MD3Music-${ver}-tv-armeabi-v7a.apk"
@@ -381,40 +376,42 @@ jobs:
           native_code() { "$aapt2" dump badging "$1" | sed -n "s/^native-code: //p"; }
           impeller_val() {
             "$aapt2" dump xmltree "$1" --file AndroidManifest.xml > "$RUNNER_TEMP/manifest.txt"
-            # 原实现用 `sed -n "/EnableImpeller/,+1p"` 只取 name 行的**下一行**，
-            # 假设 android:value 紧随其后。但 aapt2 的属性输出顺序不保证，
-            # value 可能排在 name 之前或夹在别的属性中间 ⇒ 抓不到就fallback 成 false，
-            # 表现为「构建参数明明传了 Impeller=true，校验却报 false」
-            # （2026-10-12 v6.0.0 实测：apple-music 包实际是 Impeller，校验报 false）。
-            #
-            # 改为：从 name 行一直取到**下一个 E: (元素开始)** 为止，
-            # 在这段范围内找 android:value 的原始值。
-            local block
+            # 从 name 行一直取到**下一个 E: (元素开始)** 为止，在这段范围内找
+            # android:value（aapt2 的属性输出顺序不保证，不能只看下一行）。
+            local block raw
             block=$(sed -n '/io\.flutter\.embedding\.android\.EnableImpeller/,/^ *E: /p' \
                     "$RUNNER_TEMP/manifest.txt" | grep -m1 'android:value' || true)
-            if echo "$block" | grep -q '0xffffffff'; then
-              echo "true"
-            elif echo "$block" | grep -qE '0x0|\(type 3\).*0x0'; then
-              echo "false"
-            elif echo "$block" | grep -q '\(type 3\)'; then
-              #字符串型布尔：raw=false 才是关闭
-              if echo "$block" | grep -qi '=false'; then echo "false"; else echo "true"; fi
-            else
-              # 没抓到 android:value：不要静默当成 false（会把真问题掩盖成"通过"），
-              # 打印原始片段便于排查，并按 true 处理以免误报警告。
-              echo "  (impeller_val: 未在 manifest 中定位到 EnableImpeller 的 android:value)" >&2
-              sed -n '/io\.flutter\.embedding\.android\.EnableImpeller/,+4p' \
-                "$RUNNER_TEMP/manifest.txt" >&2 || true
-              echo "unknown"
-            fi
+            # 只取等号之后的值，避免把属性自带的资源 ID（0x01010024 里含子串
+            # "0x0"）误当成取值——2026-11-15 实测：这会让任何 =true 都判成 false。
+            raw=$(printf '%s\n' "$block" | sed -n 's/.*android:value(0x[0-9a-fA-F]*)//p')
+            # 字符串型会带引号（="true"），去掉引号后统一比较
+            raw=${raw//\"/}
+            # 不同 aapt2 版本打印形式不同，全部兼容：
+            #   =true / ="true" / =false / ="false"
+            #   =(type 0x12)0xffffffff / =(type 0x12)0x0 / =0xffffffff / =0x0
+            case "$raw" in
+              *=true*|*0xffffffff*) echo "true" ;;
+              *=false*|*0x12\)0x0*|*=0x0) echo "false" ;;
+              *)
+                # 认不出就报 unknown，不要静默当成 false（会把真问题掩盖成"通过"），
+                # 也打印原始片段便于排查。
+                echo "  (impeller_val: 无法识别的 EnableImpeller 值: [$raw])" >&2
+                sed -n '/io\.flutter\.embedding\.android\.EnableImpeller/,+2p' \
+                  "$RUNNER_TEMP/manifest.txt" >&2 || true
+                echo "unknown" ;;
+            esac
           }
 
-          # 完整性校验 + 任一包不得含 3D 资产（体积会暴涨约 200MB）
-          for f in "$apk_dir"/*.apk; do
-            if unzip -l "$f" | grep -E 'libonnxruntime|assets/models/' > /dev/null; then
-              note_fail "包内混入 3D 资产: $(basename "$f")"
-              unzip -l "$f" | grep -E 'libonnxruntime|assets/models/' | head -5
+          # 完整性校验：发布包不得含任何推理资产（3D / 分离）
+          no_infer_assets() {
+            local f="$1" name
+            name=$(basename "$f")
+            if unzip -l "$f" | grep -E 'libonnxruntime|libtensorflowlite|assets/models/|assets/stem/' > /dev/null; then
+              note_fail "精简包混入推理资产: $name"
+              unzip -l "$f" | grep -E 'libonnxruntime|libtensorflowlite|assets/models/|assets/stem/' | head -5
             fi
+          }
+          for f in "$apk_dir"/*.apk; do
             echo ""
             echo "=== $f ==="
             # APK 损坏 = 用户根本装不上，**始终阻断**（即便 warn 模式）
@@ -425,39 +422,46 @@ jobs:
               exit 1
             fi
           done
+          no_infer_assets "$lite_apk"
+          no_infer_assets "$am_apk"
+          no_infer_assets "$tv64_apk"
+          no_infer_assets "$tv32_apk"
 
           # 包名校验
-          assert_eq "$(apk_id "$std_apk")" "com.md3music.md3music" "standard 包名"
+          assert_eq "$(apk_id "$lite_apk")" "com.md3music.md3music" "lite 包名"
           assert_eq "$(apk_id "$am_apk")" "com.apple.android.music" "apple-music 包名"
           assert_eq "$(apk_id "$tv64_apk")" "com.md3music.md3music.tv" "tv-arm64 包名"
           assert_eq "$(apk_id "$tv32_apk")" "com.md3music.md3music.tv" "tv-arm32 包名"
 
           # ABI 校验：arm64 包只含 arm64-v8a，arm32 包只含 armeabi-v7a
           # aapt2 输出自带单引号（native-code: 'arm64-v8a'），故期望值含引号
-          assert_eq "$(native_code "$std_apk")"   "'arm64-v8a'"     "standard ABI"
+          assert_eq "$(native_code "$lite_apk")"  "'arm64-v8a'"     "lite ABI"
           assert_eq "$(native_code "$am_apk")"     "'arm64-v8a'"     "apple-music ABI"
           assert_eq "$(native_code "$tv64_apk")"   "'arm64-v8a'"     "tv-arm64 ABI"
           assert_eq "$(native_code "$tv32_apk")"   "'armeabi-v7a'"   "tv-arm32 ABI"
 
-          # 引擎校验：standard / tv → Skia（false），仅 apple-music → Impeller（true）
-          assert_eq "$(impeller_val "$std_apk")" "false" "standard 引擎(Skia)"
+          # 引擎校验：lite / tv → Skia（false），仅 apple-music → Impeller（true）
+          assert_eq "$(impeller_val "$lite_apk")" "false" "lite 引擎(Skia)"
           assert_eq "$(impeller_val "$am_apk")"  "true"  "apple-music 引擎(Impeller)"
           assert_eq "$(impeller_val "$tv64_apk")" "false" "tv-arm64 引擎(Skia)"
           assert_eq "$(impeller_val "$tv32_apk")" "false" "tv-arm32 引擎(Skia)"
-          echo "引擎校验完成：standard/tv=Skia, apple-music=Impeller"
+          echo "引擎校验完成：lite/tv=Skia, apple-music=Impeller"
 
           # TV 包专项校验（与 ci.yml 同口径）：不含 USB 独占驱动，且 MD3_TV 旗标生效
           # 注意：函数内必须 return 而非 exit —— exit 只会退出子 shell，
           # 父脚本会继续往下跑，导致"报了错但仍然上传 Release"。
+          # 开启 --obfuscate 后 libapp.so 内无明文 Dart 符号，MD3_TV 旗标校验
+          # 改查 --split-debug-info 产出的符号表（JSON，保留原始函数/类名，
+          # 与 APK 一一对应：tv-arm64/tv-arm32 目录即本次 TV 构建产物）。
           check_tv() {
-            local f="$1" libdir="$2" name
+            local f="$1" symbols="$2" name
             name=$(basename "$f")
             if unzip -l "$f" | grep -E 'libusb_audio_driver' > /dev/null; then
               note_fail "TV 包混入 USB 独占驱动: $name"
               return 1
             fi
-            # libapp.so 内检索 Dart AOT 符号（未开 --obfuscate，ASCII 标识符可检索）
-            if unzip -p "$f" "$libdir/libapp.so" | grep -aq DpadFocusable; then
+            # 符号表内检索 Dart AOT 符号（等价于旧 libapp.so 明文检索）
+            if grep -aq DpadFocusable "$symbols"; then
               echo "  ✓ TV dpad 焦点符号: $name"
             else
               note_fail "TV 包缺少 dpad 焦点符号（MD3_TV 旗标未生效）: $name"
@@ -469,9 +473,9 @@ jobs:
           # bash 的 `A || B && C` 是**左结合** = `(A || B) && C`：
           # check_tv 成功(0) → `||` 短路 → `&& exit 1` **照样执行** ⇒
           # 校验全部通过反而中止构建（2026-10-12 v6.0.0 连续失败的真凶）。
-          for tv_pair in "$tv64_apk:lib/arm64-v8a" "$tv32_apk:lib/armeabi-v7a"; do
-            f="${tv_pair%%:*}"; libdir="${tv_pair##*:}"
-            if ! check_tv "$f" "$libdir"; then
+          for tv_pair in "$tv64_apk:build/symbols/tv-arm64/app.android-arm64.symbols" "$tv32_apk:build/symbols/tv-arm32/app.android-arm.symbols"; do
+            f="${tv_pair%%:*}"; symbols="${tv_pair##*:}"
+            if ! check_tv "$f" "$symbols"; then
               if [ "$VERIFY_MODE" = "strict" ]; then exit 1; fi
             fi
           done
@@ -588,6 +592,7 @@ jobs:
             echo "- **MD3Music-${VERSION}-tv-arm64-v8a.apk** — TV版-64位：Android TV 专用包（D-pad 遥控导航，包名后缀 \`.tv\`，Skia）"
             echo "- **MD3Music-${VERSION}-tv-armeabi-v7a.apk** — TV版-32位：Android TV 专用包（D-pad 遥控导航，包名后缀 \`.tv\`，Skia）"
             echo "- **md3music-windows-${VERSION}.zip** — Windows 便携版：解压后运行 \`md3music.exe\` 即可（自带 VC++ 运行库）"
+            echo "- **MD3Music-${VERSION}-symbols.zip** — （普通用户无需下载）混淆符号表：仅供开发者用 \`flutter symbolize\` 还原崩溃堆栈，需与同版本 APK 配套"
             echo ""
             echo "### 更新内容 (${RANGE:-最近 20 条})"
             echo ""
@@ -617,12 +622,28 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # ============================================================
+      # 7.5 打包混淆符号表 + R8 mapping（崩溃栈还原唯一依据，随 Release 永久归档）
+      # ============================================================
+      - name: Pack obfuscation symbols
+        run: |
+          set -euo pipefail
+          test -d build/symbols
+          mkdir -p build/symbols-pack/symbols
+          cp -r build/symbols/. build/symbols-pack/symbols/
+          # R8 mapping.txt（Kotlin/Java 反混淆）；找不到不致命（混淆在 Dart 侧为主）
+          find android/app/build/outputs/mapping -name 'mapping.txt' \
+            -exec cp --parents {} build/symbols-pack/ \; || true
+          cd build
+          zip -qr "MD3Music-${{ steps.version.outputs.version }}-symbols.zip" symbols-pack
+          ls -lh "MD3Music-${{ steps.version.outputs.version }}-symbols.zip"
+
+      # ============================================================
       # 8. 创建/更新 GitHub Release（仅在 tag 真实存在时执行）
       #    append=true 保留历史资产，不会删除旧版本
       # ============================================================
       - name: Upload APKs to Release
         if: steps.version.outputs.tag_exists == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: MD3Music v${{ steps.version.outputs.version }}
@@ -632,14 +653,17 @@ jobs:
           append_body: false  # 默认行为：用自动生成的 changelog 替换 release 描述
           files: |
             build/app/outputs/flutter-apk/*MD3Music-*.apk
+            build/MD3Music-*-symbols.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: md3music-apk-${{ steps.version.outputs.version }}
-          path: build/app/outputs/flutter-apk/*.apk
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/MD3Music-*-symbols.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -655,15 +679,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -720,7 +744,7 @@ jobs:
             -PackageVersion '${{ needs.build-android.outputs.version }}'
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: md3music-windows-${{ needs.build-android.outputs.version }}
           path: md3music-windows-*.zip

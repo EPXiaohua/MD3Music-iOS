@@ -99,9 +99,9 @@ void main() {
 
     test('旧扩展点 record 转换后无子页、无置顶内容', () {
       final category = settingsCategoryFromLegacy(
-        ('边听边存', Icons.download_outlined, (_) => const SizedBox.shrink()),
+        ('示例分类', Icons.download_outlined, (_) => const SizedBox.shrink()),
       );
-      expect(category.title, '边听边存');
+      expect(category.title, '示例分类');
       expect(category.hasSubpages, isFalse);
       expect(category.leading, isNull);
       expect(category.subpageNamed('任意'), isNull);

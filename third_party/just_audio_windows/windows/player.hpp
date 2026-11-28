@@ -14,6 +14,7 @@
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Media.Audio.h>
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.MediaProperties.h>
@@ -247,6 +248,13 @@ public:
 
       event_sink_->Error(code, message);
     });
+  }
+
+  void SetAudioDevice(
+      winrt::Windows::Devices::Enumeration::DeviceInformation const& device) {
+    if (!disposed_) {
+      mediaPlayer.AudioDevice(device);
+    }
   }
 
   AudioPlayer::~AudioPlayer() {

@@ -115,16 +115,15 @@ class M3ExpressiveMotion {
   /// 形变弹簧：稳、沉、收敛干净的连续运动弹簧，用于「界面自身在变形」的连续
   /// 位移（悬浮条胶囊↔圆盘的 `_morph`）。
   ///
-  /// 角色语义：**形变=沉稳连续**。刚度/阻尼调得偏「沉」（stiffness 180 / 阻尼比
-  /// 0.825 / mass 1.0），过冲轻微、收敛干净，避免整条 bar 在形变中弹跳。
-  /// 数值与旧 [defaultSpring] 完全一致（本批只赋予角色语义并作为悬浮条 `_morph`
-  /// 的唯一引用来源，不改任何物理参数）；收敛判据另见 [kMorphSpringTolerance]，
+  /// 角色语义：**形变=沉稳连续**。采用临界阻尼（stiffness 500 / 阻尼比 1.0 /
+  /// mass 1.0），避免欠阻尼过冲后被几何 clamp 反向折返，导致整条 bar 轻微抖动。
+  /// 收敛判据见 [kMorphSpringTolerance]，
   /// 末端由调用方的 `snapToEnd` 精确落位。
   static final SpringDescription kMorphSpring =
       SpringDescription.withDampingRatio(
     mass: 1.0,
-    stiffness: 180,
-    ratio: 0.825,
+    stiffness: 500,
+    ratio: 1.0,
   );
 
   /// 形变弹簧专用收敛判据（配合 [kMorphSpring] 用于悬浮条 `_morph`）。

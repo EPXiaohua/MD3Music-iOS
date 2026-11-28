@@ -61,6 +61,16 @@ void main() {
       isTrue,
     );
   });
+
+  test('total 异常为 0 且持续满页时，按兜底上限 50 页停止（防请求风暴）', () async {
+    final result = await client.getAlbumSongsAll('album-nototal');
+
+    // 50 页 × 30 = 1500 条后停止，而不是打满 maxPages=1000（3 万次请求）
+    expect(result, isNotNull);
+    expect(result!.total, 0);
+    expect(result.songs, hasLength(1500));
+    expect(captured, hasLength(50));
+  });
 }
 
 class _AlbumSongsAdapter implements HttpClientAdapter {
@@ -75,13 +85,16 @@ class _AlbumSongsAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     captured.add(options);
+    final albumId = options.queryParameters['album_id'].toString();
     final page = int.parse(options.queryParameters['page'].toString());
     final start = (page - 1) * 30;
-    final count = (125 - start).clamp(0, 30);
+    // album-nototal：total 恒为 0，每页固定返回满 30 条（模拟服务端 total 缺失）
+    final total = albumId == 'album-nototal' ? 0 : 125;
+    final count = albumId == 'album-nototal' ? 30 : (125 - start).clamp(0, 30);
     return ResponseBody.fromString(
       jsonEncode({
         'data': {
-          'total': 125,
+          'total': total,
           'songs': List.generate(
             count,
             (index) => {

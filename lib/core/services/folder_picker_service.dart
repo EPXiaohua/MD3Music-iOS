@@ -9,12 +9,21 @@ import 'package:flutter/services.dart';
 class FolderPickerService {
   static const _channel = MethodChannel('com.md3music.md3music/folder_picker');
 
+  /// 最近一次 [pickFolder] 是否因系统选择器打不开而失败
+  /// （原生 ActivityNotFoundException 等回传 PICKER_UNAVAILABLE）。
+  ///
+  /// TV 上先试系统 SAF 选择器，打不开才兜底内置目录选择弹层；调用方读此
+  /// 标志判断是否兜底。每次调用 pickFolder 时重置。
+  static bool safUnavailable = false;
+
   /// 打开系统文件夹选择器。Windows 返回路径，Android 返回 SAF tree URI。
   ///
-  /// 返回 `null` 表示用户取消选择。
+  /// 返回 `null` 表示用户取消；若 [safUnavailable] 为 true 则表示系统选择器
+  /// 根本没打开（非用户取消），调用方可用内置选择器兜底。
   /// Android 返回的 content:// URI 只可经 ContentResolver 读取。
   static Future<String?> pickFolder() async {
     try {
+      safUnavailable = false;
       // 按**目标平台**判断，不用 Platform.isWindows：后者在 Windows 宿主上跑
       // `flutter test` 时也为 true（测试目标其实是 android），会把测试里的选择器
       // 短路成桌面实现，MethodChannel 一次都不走。
@@ -23,6 +32,15 @@ class FolderPickerService {
         return path;
       }
       return await _channel.invokeMethod<String>('pickFolder');
+    } on PlatformException catch (error) {
+      if (error.code == 'PICKER_UNAVAILABLE') {
+        // 系统目录选择器打不开（TV 无 DocumentsUI 等）：标记供兜底，非用户取消
+        safUnavailable = true;
+        debugPrint('[FolderPickerService] 系统目录选择器不可用: ${error.message}');
+        return null;
+      }
+      debugPrint('[FolderPickerService] 选择文件夹失败: ${error.message}');
+      return null;
     } catch (error) {
       // 静默失败会让用户只看到"点了没反应"，这里留日志便于定位
       // （Windows 上 fluttertoast 无实现，弹窗提示走不通）。

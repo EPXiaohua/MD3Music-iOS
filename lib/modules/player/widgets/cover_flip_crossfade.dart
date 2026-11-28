@@ -1,12 +1,17 @@
 import 'dart:async';
 
 import 'dart:ui' show ImageFilter, TileMode;
+import 'dart:ui' as ui show Image;
 
 import 'package:material_ui/material_ui.dart';
 
 import '../cover_flip_physics.dart';
 import '../../../widgets/player_artwork_image.dart'
-    show PlayerArtworkImage, prewarmPlayerArtworkTexture;
+    show
+        PlayerArtworkImage,
+        prewarmPlayerArtworkTexture,
+        resolvePlayerArtworkImage;
+import 'low_res_blur.dart';
 
 /// 就绪等待上限：超过则放弃翻转、直接换图（有界，不无限压旧封面）。
 ///
@@ -38,6 +43,18 @@ const Duration kCoverFlipReadyTimeout = Duration(milliseconds: 1000);
 ///   下游，形变探针量的是代理盒自身矩形，不受下游变换影响。
 /// - 模糊必须 `TileMode.clamp`：Impeller 下不指定时默认 decal，图层外透明黑
 ///   会卷进卷积核形成暗晕（同 _buildCrossfadeBlurredBackground 的既有坑）。
+/// - **逐帧 sigma 不再逐帧做高斯**：每层在**翻转启动前**构建一张低分辨率
+///   模糊快照（[buildLowResBlurProxy]，≤96px 边长，一次卷积；就绪探测命中后
+///   的 resolve 是同键缓存命中、同步补发，不额外推迟动画），动画期间
+///   「清晰内容 + [coverFlipBlurAlpha](sigma(t)) 的快照叠层」用 alpha 混合
+///   近似逐渐变糊/变清——500ms 里约 30 次全尺寸高斯收敛为每层 1 次小图
+///   卷积。α 走 √ 曲线而非线性 σ/峰值：线性交叉淡会把清晰残影拖过大半程
+///   （真机反馈「模糊度太小、变化不够剧烈」），√ 中段更快吞掉清晰成分。
+///   **形态必须整段一致**：曾把快照构建推迟到启动后，动画中途从量化高斯
+///   滤镜切换成叠层、两种形态模糊量不等价，真机看到「先变高斯、再被替换」
+///   的跳变（本条存在理由）。源解析不了（内嵌封面等）则整段退回全分辨率
+///   [ImageFiltered]，但 sigma 先量化进 [kCoverFlipBlurLadder]（唯一滤镜值
+///   ~30 → ≤5 档，多帧复用同一份模糊层栅格），避免等级逐帧漂移的重算突发。
 class CoverFlipCrossfade extends StatefulWidget {
   const CoverFlipCrossfade({
     super.key,
@@ -121,6 +138,25 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
   /// （fallback 等参数在锁存时一次性定型，见 didUpdateWidget）。
   Widget? _oldArtworkWidget;
 
+  // ── 低分辨率模糊快照（见类文档；替代逐帧全尺寸高斯） ──────────────────
+  //
+  // 每个代理都带「所属封面 URI」标签：绘制时标签与当前层 URI 不一致就视为
+  // 不可用（退回滤镜兜底）。连切歌时旧层锁存为新的 URI 而快照还是上一张的，
+  // 没有这层校验会把上一张封面的模糊叠在当前张上（错图鬼影）。
+
+  /// 旧层模糊快照 + 归属 URI（null = 未构建/构建失败，走滤镜兜底）。
+  ui.Image? _oldBlurProxy;
+  String? _oldBlurProxyUri;
+
+  /// 新层模糊快照 + 归属 URI。新层是活 widget（3D 深度/动态封面），快照
+  /// 取其**静态封面源**的等价近似：只在去模糊窗口以 α 权重叠加，α 随
+  /// easeOut 快速衰减，视频层/视差层被静态模糊遮盖的时间极短。
+  ui.Image? _newBlurProxy;
+  String? _newBlurProxyUri;
+
+  /// 最近一次布局测得的封面盒尺寸（构建快照的 cover-crop 目标比例）。
+  double _settledHeight = 0;
+
   /// 就绪等待中的新版本（null = 不在等待）。用于丢弃过期的探测结果：
   /// 等待途中又切歌时，旧探测完成也不能再翻。
   String? _pendingVersion;
@@ -131,10 +167,102 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
   double _settledWidth = 0;
   double _dpr = 1;
 
+  /// 快照构建的代次号（快速连切时旧回调按它作废自己，见 _prepareBlurProbes）。
+  int _prepareSeq = 0;
+
   @override
   void initState() {
     super.initState();
     _flip.addStatusListener(_onFlipStatus);
+  }
+
+  /// 翻转启动**前**构建两层的低分辨率模糊快照（每层每次过渡至多一次）。
+  ///
+  /// 为什么必须在启动前：中途替换会跳变——快照在动画里就绪的那一帧，叠层
+  /// 形态（清晰 + α=σ/σmax 的峰值模糊）与刚撤掉的全分辨率量化高斯**不是
+  /// 同一个模糊量**（真机反馈「先变成高斯模糊、然后被替换成 alpha，效果
+  /// 很差」）。挪到启动前后：第 0 帧起就是叠层形态，整段过渡只有一种形态；
+  /// 构建失败（内嵌封面等）则整段都用滤镜兜底，同样不切换。
+  ///
+  /// 开销可控：`resolvePlayerArtworkImage` 与就绪探测/纹理预热同键，是缓存
+  /// 命中的纯 Dart 工作；卷积只在 ≤96px 小图上（每层一次，亚毫秒级），
+  /// 与原来「翻转窗口内约 30 帧全尺寸高斯」相比仍是数量级更小的开销，
+  /// 且这笔开销落在**动画开始前**的等待帧，不占用任何过渡帧。
+  ///
+  /// 旧层源就是锁存 URI 的静态封面；新层是活 widget（DepthCoverHost/
+  /// 动态视频），取其**静态封面源**做等价近似（见字段注释）。
+  Future<void> _prepareBlurProbes(String? oldUri, String? newUri) async {
+    // 代次守卫：快速连切时旧 prepare 的 await 回调不得再动快照——否则会把
+    // 新一轮刚建好的位图误清（最坏整段退化为滤镜兜底，形态仍一致不跳变,
+    // 但没必要白白多算一次）。
+    final seq = ++_prepareSeq;
+    // 同标签的旧层快照可复用：
+    //  - 常规切换：上一轮的旧层快照若恰好就是本轮要退场的那张（极少见）；
+    //  - 翻转途中连切：本轮旧层取「此刻正在显示的那张」= 上一轮的新层，
+    //    其快照在 _newBlurProxy 上——直接搬过来省一次小卷积与一次 resolve。
+    // 复用仅限「内容确为同一封面」：URI 标签相符才搬，不符一律回收。
+    if (oldUri != null) {
+      if (_oldBlurProxy != null && _oldBlurProxyUri != oldUri) {
+        _oldBlurProxy!.dispose();
+        _oldBlurProxy = null;
+        _oldBlurProxyUri = null;
+      }
+      if (_oldBlurProxy == null && _newBlurProxy != null) {
+        if (_newBlurProxyUri == oldUri) {
+          // 搬运所有权：本轮旧层快照沿用上一轮新层的（随后 _newBlurProxy
+          // 重建）。必须摘除新层引用，否则下面的统一回收会把同一位图 dispose 两次。
+          _oldBlurProxy = _newBlurProxy;
+          _oldBlurProxyUri = oldUri;
+          _newBlurProxy = null;
+          _newBlurProxyUri = null;
+        } else {
+          _newBlurProxy!.dispose();
+        }
+      }
+    }
+    _newBlurProxy?.dispose();
+    _newBlurProxy = null;
+    _newBlurProxyUri = null;
+    final box = Size(_settledWidth, _settledHeight);
+    if (!box.isFinite || box.width <= 0 || box.height <= 0) return;
+    final dpr = _dpr;
+    if (oldUri != null && _oldBlurProxy == null && _oldArtworkUri == oldUri) {
+      final src = await resolvePlayerArtworkImage(
+        artworkUri: oldUri,
+        settledLogicalWidth: box.width,
+        devicePixelRatio: dpr,
+      );
+      // src 是缓存借用（与 prewarmPlayerArtworkTexture 同口径），**不 dispose**。
+      if (!mounted || seq != _prepareSeq || _oldArtworkUri != oldUri) return;
+      _oldBlurProxy = buildLowResBlurProxy(src, kCoverFlipBlurSigma, box);
+      _oldBlurProxyUri = _oldBlurProxy == null ? null : oldUri;
+    }
+    if (newUri != null && widget.version == newUri) {
+      final src = await resolvePlayerArtworkImage(
+        artworkUri: newUri,
+        settledLogicalWidth: box.width,
+        devicePixelRatio: dpr,
+      );
+      // 又切歌：本轮快照作废（新一轮 prepare 会重建），不启动本轮翻转。
+      if (!mounted || seq != _prepareSeq || widget.version != newUri) {
+        _oldBlurProxy?.dispose();
+        _oldBlurProxy = null;
+        _oldBlurProxyUri = null;
+        return;
+      }
+      _newBlurProxy = buildLowResBlurProxy(src, kCoverFlipBlurSigma, box);
+      _newBlurProxyUri = _newBlurProxy == null ? null : newUri;
+    }
+  }
+
+  /// 释放两层快照（过渡结束 / 撤销 / 卸载 / 重建前）。
+  void _dropBlurProbes() {
+    _oldBlurProxy?.dispose();
+    _oldBlurProxy = null;
+    _oldBlurProxyUri = null;
+    _newBlurProxy?.dispose();
+    _newBlurProxy = null;
+    _newBlurProxyUri = null;
   }
 
   @override
@@ -191,7 +319,12 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
         if (!mounted) return;
         debugPrint('[CoverFlip] 旁路纹理预热 uri=$newV $status');
       });
-      _startFlip();
+      // 快照在启动**前**备齐（同键缓存命中，几乎同步完成）；探测不了
+      // 内嵌封面（resolve 返回 null），留 null 走滤镜兜底整段一致。
+      // ignore: discarded_futures
+      _prepareBlurProbes(oldV, newV).then((_) {
+        if (mounted && widget.version == newV) _startFlip();
+      });
       return;
     }
     // 等新封面就绪再翻：等待期间只显示旧封面。
@@ -217,6 +350,12 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
         );
         debugPrint('[CoverFlip] 纹理预热 uri=$newV $status');
         if (!mounted || _pendingVersion != newV) return;
+        // 快照也在启动**前**备齐（探测命中后 resolve 为同键缓存命中，
+        // 同步补发，不引入额外帧延迟）：翻转第 0 帧起就是叠层形态，
+        // 全程不出现「滤镜→叠层」中途替换跳变（真机反馈的观感问题）。
+        final oldUri = _oldArtworkUri;
+        await _prepareBlurProbes(oldUri, newV);
+        if (!mounted || _pendingVersion != newV) return;
         _pendingVersion = null;
         _startFlip();
       } else {
@@ -229,6 +368,8 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
 
   void _startFlip() {
     if (!mounted) return;
+    // 快照已由 _prepareBlurProbes 在启动前备齐，这里**不再清理**——
+    // 第 0 帧起两层各自整段用同一种形态（叠层，或构建失败的整段滤镜）。
     // 先启动控制器再 setState：ticker 必须在本帧的 transient 回调前注册，
     // 否则首帧 tick 赶不上——setState 闭包里 forward() 会让动画「晚一帧才动」
     // （本帧只完成 build，tick 落到下一帧，测试与真机都表现为换图后停一拍）。
@@ -254,6 +395,7 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
     final had = _oldArtworkUri != null;
     _oldArtworkUri = null;
     _oldArtworkWidget = null;
+    _dropBlurProbes();
     if (had && mounted) setState(() {});
   }
 
@@ -263,6 +405,7 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
     setState(() {
       _oldArtworkUri = null;
       _oldArtworkWidget = null;
+      _dropBlurProbes();
     });
   }
 
@@ -281,6 +424,7 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
   @override
   void dispose() {
     _clearReadyTimer();
+    _dropBlurProbes();
     _flip
       ..removeStatusListener(_onFlipStatus)
       ..dispose();
@@ -291,25 +435,70 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
 
   /// 每层内容的 RepaintBoundary 包装（新旧两层共用）。
   ///
-  /// 翻转期间每帧只有外层 Transform/ClipRRect/ImageFiltered 重录；
+  /// 翻转期间每帧只有外层 Transform/ClipRRect 与模糊叠层重录；
   /// boundary 内的封面 picture（含 DepthCoverHost、动态封面视频层）
   /// 已栅格化的部分被直接引用，markNeedsPaint 不再沿祖先链上溯把
   /// 播放页其余部分（背景、歌词）连坐重绘。结构与 player_cover_morph_layer
-  /// 的 _artworkFor 同款：boundary 只圈内容本体，逐帧变化的模糊滤镜与
+  /// 的 _artworkFor 同款：boundary 只圈内容本体，逐帧变化的模糊与
   /// 旋转变换留在边界之外。
   Widget _artworkWithBoundary(Widget child) => RepaintBoundary(child: child);
 
   @override
   Widget build(BuildContext context) {
-    // 量一次布局：就绪探测要用与渲染同键的解码档位（逻辑宽 × dpr → 档位）。
+    // 量一次布局：就绪探测要用与渲染同键的解码档位（逻辑宽 × dpr → 档位），
+    // 模糊快照要按封面盒的宽高比 cover-crop。
     return LayoutBuilder(
       builder: (context, constraints) {
         if (constraints.maxWidth.isFinite && constraints.maxWidth > 0) {
           _settledWidth = constraints.maxWidth;
         }
+        if (constraints.maxHeight.isFinite && constraints.maxHeight > 0) {
+          _settledHeight = constraints.maxHeight;
+        }
         _dpr = MediaQuery.devicePixelRatioOf(context);
         return _buildBody();
       },
+    );
+  }
+
+  /// 一层的模糊包装：优先「清晰内容 + 低分辨率快照 α 叠层」，
+  /// 快照不可用（源解析不了 / 内嵌封面 / 构建失败）退回阶梯滤镜——
+  /// 形态在**启动前**定死，整段过渡只用一种（见类文档「逐帧 sigma」条）。
+  ///
+  /// α = [coverFlipBlurAlpha](sigma(t))（√ 曲线）：清晰与全模糊的交叉淡
+  /// 近似「逐渐变糊 / 逐渐变清」的拉焦观感，动画期间零逐帧卷积（快照只在
+  /// 构建时卷积一次）；√ 而非线性，避免清晰残影拖满全程（见类文档）。
+  /// 叠层走 [LowResBlurPainter] 的 `colorAlpha`，不用 Opacity 合成层。
+  Widget _blurLayer({
+    required Widget content,
+    required double sigma,
+    required ui.Image? proxy,
+  }) {
+    if (proxy == null) {
+      final quantized = coverFlipQuantizeSigma(sigma);
+      return quantized > 0
+          ? ImageFiltered(
+              imageFilter: ImageFilter.blur(
+                sigmaX: quantized,
+                sigmaY: quantized,
+                // clamp 防 Impeller decal 边缘暗晕
+                tileMode: TileMode.clamp,
+              ),
+              child: _artworkWithBoundary(content),
+            )
+          : _artworkWithBoundary(content);
+    }
+    final alpha = coverFlipBlurAlpha(sigma);
+    return Stack(
+      fit: StackFit.expand,
+      clipBehavior: Clip.none,
+      children: [
+        _artworkWithBoundary(content),
+        if (alpha > 0.01)
+          Positioned.fill(
+            child: CustomPaint(painter: LowResBlurPainter(proxy, alpha)),
+          ),
+      ],
     );
   }
 
@@ -330,6 +519,15 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
         final t = _flip.value;
         final oldSigma = coverFlipOldBlur(t);
         final newSigma = coverFlipNewBlur(t);
+        // 快照必须归属当前层的 URI 才可用（连切歌时防错图鬼影，见字段注释）。
+        final oldProxy =
+            (_oldBlurProxy != null && _oldBlurProxyUri == oldUri)
+            ? _oldBlurProxy
+            : null;
+        final newProxy =
+            (_newBlurProxy != null && _newBlurProxyUri == widget.version)
+            ? _newBlurProxy
+            : null;
         return Stack(
           // 不裁到布局盒：旋转中的封面（透视近端放大）要能探出静止边界，
           // 否则上下边缘被裁（本类的存在理由之一）。
@@ -337,7 +535,7 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
           fit: StackFit.expand,
           children: [
             // 旧封面：模糊加剧 + 绕纵轴翻倒。到 90° 那一刻投影宽度归零，
-            // 即刻退场——不留在树上白烧一层高斯模糊。
+            // 即刻退场——不留在树上白烧一层模糊。
             if (t < kCoverFlipSwap)
               Positioned.fill(
                 // 先裁圆角再旋转：整张圆角卡片作为刚体翻，探出边界也不被裁。
@@ -348,17 +546,11 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
                   ),
                   child: ClipRRect(
                     borderRadius: radius,
-                    child: oldSigma > kCoverFlipBlurEpsilon
-                        ? ImageFiltered(
-                            imageFilter: ImageFilter.blur(
-                              sigmaX: oldSigma,
-                              sigmaY: oldSigma,
-                              // clamp 防 Impeller decal 边缘暗晕
-                              tileMode: TileMode.clamp,
-                            ),
-                            child: _artworkWithBoundary(_oldArtwork()),
-                          )
-                        : _artworkWithBoundary(_oldArtwork()),
+                    child: _blurLayer(
+                      content: _oldArtwork(),
+                      sigma: oldSigma,
+                      proxy: oldProxy,
+                    ),
                   ),
                 ),
               ),
@@ -372,16 +564,11 @@ class _CoverFlipCrossfadeState extends State<CoverFlipCrossfade>
                 ),
                 child: ClipRRect(
                   borderRadius: radius,
-                  child: newSigma > kCoverFlipBlurEpsilon
-                      ? ImageFiltered(
-                          imageFilter: ImageFilter.blur(
-                            sigmaX: newSigma,
-                            sigmaY: newSigma,
-                            tileMode: TileMode.clamp,
-                          ),
-                          child: _artworkWithBoundary(widget.child),
-                        )
-                      : _artworkWithBoundary(widget.child),
+                  child: _blurLayer(
+                    content: widget.child,
+                    sigma: newSigma,
+                    proxy: newProxy,
+                  ),
                 ),
               ),
             ),

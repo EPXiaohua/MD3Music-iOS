@@ -12,7 +12,9 @@ add_executable(${BINARY_NAME} WIN32
   "floating_lyric_window.cpp"
   "media_controls.cpp"
   "spectrum_capture.cpp"
+  "audio_input_devices.cpp"
   "taskbar_controls.cpp"
+  "window_placement.cpp"
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
@@ -42,6 +44,9 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 # Windows.Media 运行库，需要 windowsapp.lib。
 target_link_libraries(${BINARY_NAME} PRIVATE "windowsapp.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+# 无边框窗口：Flutter 视图子窗口的命中钩子用 SetWindowSubclass/DefSubclassProc，
+# 需要 comctl32。
+target_link_libraries(${BINARY_NAME} PRIVATE "comctl32.lib")
 # 桌面歌词用 AlphaBlend 混合半透明背板（0% 纯透明 → 100% 纯黑）
 target_link_libraries(${BINARY_NAME} PRIVATE "msimg32.lib")
 # 音乐频谱（spectrum_capture.cpp）用 ActivateAudioInterfaceAsync / IAudioClient

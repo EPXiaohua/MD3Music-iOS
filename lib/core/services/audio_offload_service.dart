@@ -18,7 +18,7 @@ import 'viper_master_service.dart';
 /// ## 决策模型
 /// - **用户开关** [userEnabled]：持久化在 [keyEnabled]，唯一由用户设置页控制；
 /// - **让路原因** [yieldReason]：由 PlayerProvider 注入的若干判定器算出。只要
-///   有任何一条成立，硬解就不该开（DSP / 频谱 / 变速 / 独占输出都与 offload 互斥）；
+///   有任何一条成立，硬解就不该开（划掉退出 / DSP / 频谱 / 变速 / 独占输出都与 offload 互斥）；
 /// - **平台支持** [platformSupported]：原生报告 `apiLevel >= 29` 才成立；
 /// - **生效值** [effective] = 三者同时满足。
 ///
@@ -72,6 +72,12 @@ class AudioOffloadService extends ChangeNotifier {
   /// 音乐频谱原生采集是否在进行。
   bool Function()? spectrumCapturing;
 
+  /// 端侧人声/伴奏分离是否在进行。
+  ///
+  /// offload 的样本不经过应用进程，分离的 AudioProcessor 根本收不到 PCM，
+  /// 两者天然互斥（与 [spectrumCapturing] 同一模式）。
+  bool Function()? stemSeparationActive;
+
   /// USB 独占 / 系统 Direct PCM 是否生效。
   bool Function()? usbOrDirectPcmActive;
 
@@ -87,6 +93,9 @@ class AudioOffloadService extends ChangeNotifier {
   bool _disposed = false;
 
   bool _userEnabled = false;
+
+  /// 划掉退出开启时禁用 offload，避免进程死亡后 DSP 仍继续输出尾音。
+  bool _swipeExitEnabled = true;
 
   /// 是否已向原生下发过至少一次（区分「默认关闭」与「确认关闭」）。
   bool _hasPushed = false;
@@ -186,11 +195,17 @@ class AudioOffloadService extends ChangeNotifier {
 
   /// 幂等初始化：读开关 → 读能力缓存 → 注册监听与原生回调 → 首次下发。
   ///
-  /// 首次没有可用缓存时后台重探测（`reloadCapabilities(reprobe: true)`），
-  /// 失败静默 —— 能力探测只影响「预测显示」，绝不能拖慢启动。
+  /// 仅用户已开启且缓存缺失/过期时后台重探测；关闭时不触碰厂商解码器。
+  /// 能力探测只影响「预测显示」，不阻塞启动。
   Future<void> init() async {
     if (_inited) return;
     _inited = true;
+
+    // 桌面端 / Web 没有 offload 通路（supportsAudioOffload 仅 Android）：
+    // 整个决策器不启动 —— 不读 pref、不注册通道与监听、不下发、不产生
+    // 「已让路/已恢复」提示。否则 Windows 上会因本地残留 pref 或划掉退出
+    // 默认值弹出「硬件解码播放已让路」这类无意义 Toast。
+    if (!supportsAudioOffload) return;
 
     try {
       // 开关持久化统一走 SettingsRepository（键与 [keyEnabled] 是同一字面量），
@@ -198,6 +213,13 @@ class AudioOffloadService extends ChangeNotifier {
       _userEnabled = await SettingsRepository().getAudioOffloadEnabled();
     } catch (e) {
       debugPrint('[$_tag] 读取 $keyEnabled 失败: $e');
+    }
+
+    try {
+      _swipeExitEnabled =
+          await SettingsRepository().getSwipeExitOnTaskRemoved();
+    } catch (e) {
+      debugPrint('[$_tag] 读取划掉退出开关失败: $e');
     }
 
     try {
@@ -242,10 +264,16 @@ class AudioOffloadService extends ChangeNotifier {
 
     await refresh();
 
+    _probeMissingCapabilities();
+  }
+
+  void _probeMissingCapabilities() {
+    // 探测会触碰厂商解码器，关闭硬解时只读缓存，不能在后台偷偷实配。
+    if (!_userEnabled) return;
     if (_capabilities == null || _cacheStale) {
       unawaited(reloadCapabilities(reprobe: true));
     }
-    // 解码器能力探测同样只影响「预测 / 展示」，一律后台跑，失败静默。
+    // 用户已明确开启后，才允许后台探测缺失或过期的能力快照。
     if (_decoderCapabilities == null || _decoderStore.stale) {
       unawaited(reloadDecoderCapabilities(reprobe: true));
     }
@@ -271,6 +299,7 @@ class AudioOffloadService extends ChangeNotifier {
 
   /// 用户切换「硬件解码播放」。写 pref 后立即重算（恢复时播放中会挂起到下一首）。
   Future<void> setEnabled(bool value) async {
+    final wasEnabled = _userEnabled;
     if (_userEnabled != value) {
       _userEnabled = value;
       debugPrint('[$_tag] 用户开关 → $value');
@@ -281,6 +310,14 @@ class AudioOffloadService extends ChangeNotifier {
       }
     }
     await refresh();
+    if (!wasEnabled && _userEnabled) _probeMissingCapabilities();
+  }
+
+  /// 同步「划掉后台自动退出」状态。持久化由设置页负责，这里只重算输出通路。
+  Future<void> setSwipeExitEnabled(bool value) async {
+    if (_swipeExitEnabled == value) return;
+    _swipeExitEnabled = value;
+    await refresh();
   }
 
   /// 重算让路原因并按时机下发。
@@ -288,6 +325,8 @@ class AudioOffloadService extends ChangeNotifier {
   /// [immediate] 为 true 时即使「正在播放」也立刻下发（用于必须马上让路的场景，
   /// 例如变速切到非 1.0 倍）。恢复路径默认不 immediate，等下一次起播。
   Future<void> refresh({bool immediate = false}) async {
+    // 非 Android 平台整个决策器未启动（见 [init]），任何刷新都不产生副作用。
+    if (!supportsAudioOffload) return;
     final String? previousReason = _yieldReason;
     final bool previousEffective = effective;
 
@@ -374,6 +413,7 @@ class AudioOffloadService extends ChangeNotifier {
   /// 一次真探测（原生在后台线程跑，失败会退回缓存快照）。失败静默，保持旧值。
   Future<void> reloadCapabilities({bool reprobe = false}) async {
     if (!supportsAudioOffload) return;
+    if (reprobe && !_userEnabled) return;
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         reprobe ? 'probeCapabilities' : 'getCachedCapabilities',
@@ -416,6 +456,7 @@ class AudioOffloadService extends ChangeNotifier {
   /// 不能因为它失败而影响播放决策。
   Future<void> reloadDecoderCapabilities({bool reprobe = false}) async {
     if (!supportsAudioOffload) return;
+    if (reprobe && !_userEnabled) return;
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         reprobe ? 'probeDecoderCapabilities' : 'getCachedDecoderCapabilities',
@@ -489,6 +530,8 @@ class AudioOffloadService extends ChangeNotifier {
   ///
   /// 只记提示 + 标记本轮兜底已用，不擅自关用户开关 —— 是否继续尝试由用户决定。
   void notePlatformFallback() {
+    // 非 Android 平台没有硬解通路，不存在「回退到软解」一说。
+    if (!supportsAudioOffload) return;
     if (_fallbackApplied) return;
     _fallbackApplied = true;
     _notice = '硬件解码不可用，已回退到软件解码';
@@ -593,10 +636,12 @@ class AudioOffloadService extends ChangeNotifier {
   }
 
   String? _computeNaturalReason() {
+    if (_swipeExitEnabled) return '划掉后台自动退出已开启';
     if (_hit(dspActive)) return '蝰蛇母带已开启';
     if (_hit(equalizerActive)) return '均衡器已开启';
     if (_hit(volumeNormalizationActive)) return '音量均衡已开启';
     if (_hit(spectrumCapturing)) return '音乐频谱采集中';
+    if (_hit(stemSeparationActive)) return '端侧分离中';
     if (!(speedIsNormal?.call() ?? true)) return '当前不在 1.0 倍速';
     if (_hit(usbOrDirectPcmActive)) return 'USB 独占输出已开启';
     if (_hit(crossfadeEnabled)) return '交叉淡化已开启';

@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:md3music/core/layout/bottom_chrome_dimens.dart';
 import 'package:md3music/core/theme/motion_constants.dart';
 import 'package:md3music/modules/player/full_player_route.dart';
 import 'package:md3music/modules/player/player_panel_frame.dart';
+import 'package:md3music/modules/player/player_cover_morph.dart';
 import 'package:md3music/providers/theme_provider.dart';
 
 /// [DraggablePlayerRoute] 转场层回归测试。
@@ -19,8 +21,26 @@ import 'package:md3music/providers/theme_provider.dart';
 ///    归零收口在 [DraggablePlayerRoute.dispose]。
 /// 2. 进入 / 退出时长只有 [kPlayerExpandDuration] / [kPlayerCollapseDuration] 一个
 ///    来源：`transitionDuration` / `reverseTransitionDuration` 与
-///    `createAnimationController` 都不得再各写一份数字，且退出必须快于进入。
+///    `createAnimationController` 都不得再各写一份数字（退出已放慢至慢于进入，
+///    见用户拍板的 +200ms）。
 void main() {
+  test('Windows 点击节奏加快，手机与拖拽保持原时长', () {
+    final tap = DraggablePlayerRoute<void>(builder: (_) => const SizedBox());
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      expect(tap.transitionDuration, const Duration(milliseconds: 220));
+      expect(tap.reverseTransitionDuration, const Duration(milliseconds: 380));
+      final drag = DraggablePlayerRoute<void>(builder: (_) => const SizedBox(),
+          dragOriginTop: 700, screenHeight: 800);
+      expect(drag.transitionDuration, kPlayerExpandDuration);
+      expect(drag.reverseTransitionDuration, kPlayerCollapseDuration);
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      expect(tap.transitionDuration, kPlayerExpandDuration);
+      expect(tap.reverseTransitionDuration, kPlayerCollapseDuration);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
   const Key pageKey = Key('player-route-page');
 
   /// 生产环境里 ThemeProvider 是 MaterialApp 的祖先（`MaterialApp.providers`），
@@ -34,6 +54,49 @@ void main() {
           home: const Scaffold(body: Center(child: Text('首页'))),
         ),
       );
+
+  testWidgets('Windows AM 点击只合成固定页面，返回后释放形变抑制', (tester) async {
+    final nav = GlobalKey<NavigatorState>();
+    await tester.pumpWidget(hostApp(navigatorKey: nav));
+    await tester.pumpAndSettle();
+    var builds = 0;
+    final route = DraggablePlayerRoute<void>(
+      lightweightDesktopEntry: true,
+      builder: (_) { builds++; return const SizedBox.expand(); },
+    );
+    nav.currentState!.push(route);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 60));
+    expect(route.controller.duration, const Duration(milliseconds: 180));
+    expect(find.byType(PlayerPanelFrame), findsNothing);
+    expect(PlayerCoverMorphBus.instance.simplePageTransition, isTrue);
+    expect(PlayerCoverMorphBus.instance.willDraw(eligible: true), isFalse);
+    expect(PlayerCoverMorphBus.instance.textWillDraw, isFalse);
+    final initialBuilds = builds;
+    await tester.pump(const Duration(milliseconds: 60));
+    expect(builds, initialBuilds);
+    await tester.pumpAndSettle();
+    nav.currentState!.pop();
+    await tester.pumpAndSettle();
+    expect(PlayerCoverMorphBus.instance.simplePageTransition, isFalse);
+    expect(playerExpansion.value, 0);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+  test('Windows AM 显式拖拽和顶栏下拉仍采用跟手形变', () {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final drag = DraggablePlayerRoute<void>(builder: (_) => const SizedBox(),
+        lightweightDesktopEntry: true, dragOriginTop: 700, screenHeight: 800);
+      expect(drag.usesLightweightDesktopEntry, isFalse);
+      final tap = DraggablePlayerRoute<void>(builder: (_) => const SizedBox(),
+        lightweightDesktopEntry: true);
+      expect(tap.usesLightweightDesktopEntry, isTrue);
+      tap.topBarDragTotal = 600;
+      expect(tap.usesLightweightDesktopEntry, isFalse);
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      expect(tap.usesLightweightDesktopEntry, isFalse);
+    } finally { debugDefaultTargetPlatformOverride = null; }
+  });
 
   setUp(() {
     // playerExpansion / activePlayerRoute 是跨用例共享的全局信号，必须复位。
@@ -141,19 +204,17 @@ void main() {
     expect(find.byKey(pageKey), findsNothing);
   });
 
-  test('退出快于进入：时长比 0.55~0.75，且路由 getter 与常量同源', () {
-    expect(
-      kPlayerCollapseDuration < kPlayerExpandDuration,
-      isTrue,
-      reason: '动效准则：退出应快于进入',
-    );
+  test('返回放慢（用户拍板 +200ms）：时长比约 1.15，且路由 getter 与常量同源', () {
+    // 旧动效准则是「退出快于进入」；用户实测反馈返回太仓促，拍板收起 +200ms
+    // 放慢，退出可以慢于进入。这里锁住新比例防止无意漂移。
     final double ratio =
         kPlayerCollapseDuration.inMilliseconds /
         kPlayerExpandDuration.inMilliseconds;
+    expect(ratio, 460 / 400);
     expect(
       ratio,
-      inInclusiveRange(0.55, 0.75),
-      reason: '退出/进入时长比应停在约 0.65，偏离过多即观感退化',
+      inInclusiveRange(1.0, 1.3),
+      reason: '收起应停在放慢后的一档（~1.15），再慢就拖沓了',
     );
 
     final DraggablePlayerRoute<void> route = DraggablePlayerRoute<void>(
@@ -303,7 +364,7 @@ void main() {
 
     navigatorKey.currentState!.pop();
     await tester.pump(); // 启动 reverse
-    await tester.pump(const Duration(milliseconds: 130)); // 半程（260ms）
+    await tester.pump(const Duration(milliseconds: 230)); // 半程（460ms，收起已放慢 +200ms）
     expect(
       playerExpansion.value,
       lessThan(0.5),

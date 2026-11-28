@@ -161,8 +161,10 @@ List<McpTool> buildLibraryTools({
       ),
       McpTool(
         name: 'md3_search_playlists',
-        description: '按关键词搜索歌单，返回 id/name/song_count/global_collection_id。'
-            'global_collection_id 可用于 md3_get_playlist_songs / md3_play_playlist。',
+        description: '按关键词搜索酷狗全网歌单，返回 id/name/song_count/global_collection_id。'
+            'global_collection_id 可用于 md3_get_playlist_songs / md3_play_playlist。'
+            '注意：这是全网搜索，结果不是当前用户的歌单，其 id 不能用于 '
+            'md3_add_song_to_playlist；要操作用户自己的歌单，用 md3_get_my_playlists。',
         inputSchema: <String, Object?>{
           'type': 'object',
           'properties': <String, Object?>{
@@ -181,6 +183,40 @@ List<McpTool> buildLibraryTools({
             'keyword': keyword,
             'count': playlists.length,
             'items': playlists.map(_projectPlaylist).toList(growable: false),
+          });
+        },
+      ),
+      McpTool(
+        name: 'md3_get_my_playlists',
+        description: '获取当前登录用户自己创建的歌单（需要登录），返回 name/song_count/'
+            'listid/global_collection_id。listid 是 md3_add_song_to_playlist 的 listid 入参'
+            '（全网搜索的歌单结果不含可用的 listid，加歌到自己的歌单必须先调本工具）。',
+        inputSchema: <String, Object?>{
+          'type': 'object',
+          'properties': <String, Object?>{
+            'limit': <String, Object?>{'type': 'integer', 'description': '返回条数，1-30，默认 30'},
+          },
+        },
+        group: kMcpGroupDiscovery,
+        handler: (args) async {
+          final limit = optionalInt(args, 'limit', fallback: 30, min: 1, max: 30);
+          final playlists = await library.getUserPlaylists(limit: limit);
+          if (playlists.isEmpty) {
+            return const McpToolResult.error(
+                '没有取到用户歌单（可能未登录或还没有自建歌单；'
+                '可先用 md3_create_playlist 创建）');
+          }
+          return McpToolResult(<String, Object?>{
+            'count': playlists.length,
+            'items': playlists
+                .map((p) => <String, Object?>{
+                      'name': p.name,
+                      'song_count': p.songCount,
+                      // add_song 要的是可写 listid；异常条目兜底 id
+                      'listid': p.listId.isEmpty ? p.id : p.listId,
+                      'global_collection_id': p.globalCollectionId,
+                    })
+                .toList(growable: false),
           });
         },
       ),

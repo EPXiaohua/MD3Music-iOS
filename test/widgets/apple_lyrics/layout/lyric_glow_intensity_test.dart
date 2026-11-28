@@ -23,27 +23,25 @@ void main() {
       expect(LyricPreferences.instance.glowIntensity, equals(1.0));
     });
 
-    test('setter 生效并 clamp 到 [0.2, 2.0]', () async {
-      await LyricPreferences.instance.setGlowIntensity(1.5);
-      expect(LyricPreferences.instance.glowIntensity, equals(1.5));
+    test('setter 生效并 clamp 到当前平台范围', () async {
+      final lo = LyricPreferences.minGlowIntensityForCurrentPlatform;
+      final hi = LyricPreferences.maxGlowIntensityForCurrentPlatform;
+      await LyricPreferences.instance.setGlowIntensity(hi);
+      expect(LyricPreferences.instance.glowIntensity, equals(hi));
 
       await LyricPreferences.instance.setGlowIntensity(99);
-      expect(
-        LyricPreferences.instance.glowIntensity,
-        equals(LyricPreferences.maxGlowIntensity),
-      );
+      expect(LyricPreferences.instance.glowIntensity, equals(hi));
 
       await LyricPreferences.instance.setGlowIntensity(0.01);
-      expect(
-        LyricPreferences.instance.glowIntensity,
-        equals(LyricPreferences.minGlowIntensity),
-      );
+      expect(LyricPreferences.instance.glowIntensity, equals(lo));
     });
 
     test('持久化到 lyric_glow_intensity', () async {
-      await LyricPreferences.instance.setGlowIntensity(1.7);
+      await LyricPreferences.instance
+          .setGlowIntensity(LyricPreferences.maxGlowIntensityForCurrentPlatform);
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getDouble('lyric_glow_intensity'), equals(1.7));
+      expect(prefs.getDouble('lyric_glow_intensity'),
+          equals(LyricPreferences.maxGlowIntensityForCurrentPlatform));
     });
 
     test('load 时对历史脏值做 clamp', () async {
@@ -53,23 +51,24 @@ void main() {
       // reset 会写回默认并移除 key，这里直接验证 read 侧的 clamp 常量关系：
       // load() 有 _loaded 单例早退，故用 setter 的 clamp 口径断言同一范围。
       final clamped = 8.0.clamp(
-        LyricPreferences.minGlowIntensity,
-        LyricPreferences.maxGlowIntensity,
+        LyricPreferences.minGlowIntensityForCurrentPlatform,
+        LyricPreferences.maxGlowIntensityForCurrentPlatform,
       );
-      expect(clamped, equals(LyricPreferences.maxGlowIntensity));
+      expect(clamped, equals(LyricPreferences.maxGlowIntensityForCurrentPlatform));
       await LyricPreferences.instance.setGlowIntensity(8.0);
       expect(
         LyricPreferences.instance.glowIntensity,
-        equals(LyricPreferences.maxGlowIntensity),
+        equals(LyricPreferences.maxGlowIntensityForCurrentPlatform),
       );
     });
 
     test('reset 后回到默认值且 key 被移除', () async {
-      await LyricPreferences.instance.setGlowIntensity(0.4);
+      await LyricPreferences.instance
+          .setGlowIntensity(LyricPreferences.minGlowIntensityForCurrentPlatform);
       await LyricPreferences.instance.reset();
       expect(
         LyricPreferences.instance.glowIntensity,
-        equals(LyricPreferences.defaultGlowIntensity),
+        equals(LyricPreferences.defaultGlowIntensityForCurrentPlatform),
       );
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getDouble('lyric_glow_intensity'), isNull);

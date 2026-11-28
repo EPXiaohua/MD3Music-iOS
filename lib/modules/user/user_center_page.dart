@@ -33,7 +33,7 @@ import 'sign_in_calendar_page.dart';
 import 'vip_status.dart';
 
 class UserCenterPage extends StatefulWidget {
-  /// 可选扩展：用户中心快捷操作网格的额外条目（默认关闭，由私有构建注入）。
+  /// 可选扩展：用户中心快捷操作网格的额外条目（默认关闭，由宿主注入）。
   /// 返回的 Widget 追加在操作网格 Row 末尾。
   static List<Widget> Function(BuildContext context, ColorScheme cs)?
       extraActionItemsBuilder;
@@ -50,6 +50,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
 
   /// 「同步云端时长」按钮的进行中状态（防重复点击）。
   bool _syncingGrade = false;
+  bool _accountActionInProgress = false;
 
   /// 上次感知到的登录态：用于侦测「未登录 → 已登录」跃迁。
   ///
@@ -974,40 +975,70 @@ class _UserCenterPageState extends State<UserCenterPage> {
     KugouAccount account,
     KugouProvider kugou,
   ) async {
-    final navigator = Navigator.of(context, rootNavigator: true);
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('切换账号'),
-        content: Text('切换到「${account.nickname ?? account.userid}」？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('切换'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !context.mounted) return;
+    if (_accountActionInProgress) return;
+    _accountActionInProgress = true;
+    final pageContext = this.context;
+    final sheetNavigator = Navigator.of(context);
+    final sheetRoute = ModalRoute.of(context);
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('切换账号'),
+          content: Text('切换到「${account.nickname ?? account.userid}」？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('切换'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !context.mounted) return;
 
-    final result = await kugou.switchAccount(account.userid);
-    if (!context.mounted) return;
-    switch (result) {
-      case SwitchAccountResult.success:
-        navigator.pop(); // 关闭账号管理面板
-        context.read<FavoritesProvider>().loadFavorites();
-        showToast('已切换到 ${account.nickname ?? account.userid}', long: true);
-      case SwitchAccountResult.tokenExpired:
-        // 凭证已切换但登录态过期：引导重新登录或删除该账号
-        navigator.pop();
-        await _handleExpiredAccount(context, account, kugou);
-      case SwitchAccountResult.noCredentials:
-        showToast('切换失败，该账号凭证已失效', long: true);
+      final result = await kugou.switchAccount(account.userid);
+      switch (result) {
+        case SwitchAccountResult.success:
+          if (pageContext.mounted) {
+            pageContext.read<FavoritesProvider>().loadFavorites();
+          }
+          if (context.mounted) {
+            _closeAccountSheet(context, sheetNavigator, sheetRoute);
+          }
+          showToast('已切换到 ${account.nickname ?? account.userid}', long: true);
+        case SwitchAccountResult.tokenExpired:
+          // 关闭面板后只用仍有效的用户中心 context 显示过期引导。
+          if (context.mounted) {
+            _closeAccountSheet(context, sheetNavigator, sheetRoute);
+          }
+          if (pageContext.mounted) {
+            await _handleExpiredAccount(pageContext, account, kugou);
+          }
+        case SwitchAccountResult.noCredentials:
+          showToast('切换失败，该账号凭证已失效', long: true);
+      }
+    } finally {
+      _accountActionInProgress = false;
     }
+  }
+
+  bool _closeAccountSheet(
+    BuildContext context,
+    NavigatorState navigator,
+    ModalRoute<dynamic>? route,
+  ) {
+    if (!context.mounted ||
+        route == null ||
+        !route.isActive ||
+        !route.isCurrent) {
+      return false;
+    }
+    navigator.pop();
+    return true;
   }
 
   /// 账号登录态已过期：提示并引导重新登录 / 删除该账号。
@@ -1060,37 +1091,48 @@ class _UserCenterPageState extends State<UserCenterPage> {
     KugouAccount account,
     KugouProvider kugou,
   ) async {
-    final isCurrent = account.userid == kugou.userid;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('删除账号'),
-        content: Text(
-          isCurrent
-              ? '将删除当前账号并退出登录（若有其他账号会自动切换）。确定？'
-              : '确定删除该账号？其登录态将被清除。',
+    if (_accountActionInProgress) return;
+    _accountActionInProgress = true;
+    final pageContext = this.context;
+    final sheetNavigator = Navigator.of(context);
+    final sheetRoute = ModalRoute.of(context);
+    try {
+      final isCurrent = account.userid == kugou.userid;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('删除账号'),
+          content: Text(
+            isCurrent
+                ? '将删除当前账号并退出登录（若有其他账号会自动切换）。确定？'
+                : '确定删除该账号？其登录态将被清除。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !context.mounted) return;
+      );
+      if (confirmed != true || !context.mounted) return;
 
-    await kugou.removeAccount(account.userid);
-    if (!context.mounted) return;
-    if (isCurrent) {
-      context.read<FavoritesProvider>().loadFavorites();
+      await kugou.removeAccount(account.userid);
+      if (!context.mounted) return;
+      if (isCurrent) {
+        if (pageContext.mounted) {
+          pageContext.read<FavoritesProvider>().loadFavorites();
+        }
+      }
+      _closeAccountSheet(context, sheetNavigator, sheetRoute);
+      showToast('已删除账号 ${account.nickname ?? account.userid}', long: true);
+    } finally {
+      _accountActionInProgress = false;
     }
-    Navigator.of(context).pop(); // 关闭账号管理面板
-    showToast('已删除账号 ${account.nickname ?? account.userid}', long: true);
   }
 
   /// 会员卡片：左侧签到日历入口 + 右侧两种会员紧凑排布。
@@ -1273,7 +1315,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
             _actionItem(cs, Icons.shopping_bag_outlined, '已购', () {
               AdaptiveNav.openDetail(context, (_) => const PurchasedPage());
             }),
-            // 可选扩展：私有构建注入的额外操作项（默认无）
+            // 可选扩展：宿主注入的额外操作项（默认无）
             ...?UserCenterPage.extraActionItemsBuilder?.call(context, cs),
           ],
         ),

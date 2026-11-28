@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <shobjidl.h>
+#include <shlobj.h>
 #include <propsys.h>
 #include <propkey.h>
 
@@ -22,7 +23,7 @@ constexpr wchar_t kAppUserModelId[] = L"com.md3music.md3music";
 // SMTC 解析 AUMID → 应用名/图标时，需要在开始菜单里存在一条携带
 // System.AppUserModel.ID 属性的快捷方式（名称即应用显示名，图标默认
 // 取 exe 内嵌图标）。便携分发没有安装器，这里运行时幂等补建：
-// 已存在且 target 指向当前 exe 时直接跳过；exe 位置变化（debug↔release、
+// 已存在且 target、图标、AUMID 均正确时跳过；exe 位置变化（debug↔release、
 // 移动目录）后下次启动自动改写。任何失败静默降级 —— 只影响播控中心的
 // 名称/图标显示，不影响 SMTC 功能本身（与 media_controls 的容错口径一致）。
 void EnsureStartMenuAumidShortcut() {
@@ -52,13 +53,27 @@ void EnsureStartMenuAumidShortcut() {
   }
 
   do {
-    // 已存在且仍指向当前 exe：无需改写（避免每次启动重写触发 Shell 重索引）。
-    // Load 失败（首启/损坏）走下方完整创建路径。
+    // 不能只比对 target：同路径的旧快捷方式也可能缺图标或应用身份。
+    // 配置完整时不改写，避免每次启动都触发 Shell 重索引。
+    hr = link->QueryInterface(IID_PPV_ARGS(&store));
+    if (FAILED(hr) || store == nullptr) break;
+    // 更新已有 .lnk 的属性需要可写加载；STGM_READ 会使 Commit 失败。
     WCHAR existing[MAX_PATH] = {};
-    if (SUCCEEDED(file->Load(shortcut_path.c_str(), STGM_READ)) &&
+    WCHAR existing_icon[MAX_PATH] = {};
+    int icon_index = -1;
+    if (SUCCEEDED(file->Load(shortcut_path.c_str(), STGM_READWRITE)) &&
         SUCCEEDED(link->GetPath(existing, MAX_PATH, nullptr, 0)) &&
-        _wcsicmp(existing, exe_path) == 0) {
-      break;
+        _wcsicmp(existing, exe_path) == 0 &&
+        SUCCEEDED(link->GetIconLocation(existing_icon, MAX_PATH, &icon_index)) &&
+        _wcsicmp(existing_icon, exe_path) == 0 && icon_index == 0) {
+      PROPVARIANT existing_id;
+      ::PropVariantInit(&existing_id);
+      const HRESULT id_hr = store->GetValue(PKEY_AppUserModel_ID, &existing_id);
+      const bool identity_matches = SUCCEEDED(id_hr) &&
+          existing_id.vt == VT_LPWSTR && existing_id.pwszVal != nullptr &&
+          wcscmp(existing_id.pwszVal, kAppUserModelId) == 0;
+      ::PropVariantClear(&existing_id);
+      if (identity_matches) break;
     }
 
     hr = link->SetPath(exe_path);
@@ -70,8 +85,9 @@ void EnsureStartMenuAumidShortcut() {
         slash == std::wstring::npos ? exe_path : dir.substr(0, slash).c_str());
     if (FAILED(hr)) break;
 
-    hr = link->QueryInterface(IID_PPV_ARGS(&store));
-    if (FAILED(hr) || store == nullptr) break;
+    // 显式写当前 exe 的图标，防止旧 IconLocation 随目录迁移继续指向失效文件。
+    hr = link->SetIconLocation(exe_path, 0);
+    if (FAILED(hr)) break;
     PROPVARIANT value;
     ::PropVariantInit(&value);
     value.vt = VT_LPWSTR;
@@ -86,6 +102,10 @@ void EnsureStartMenuAumidShortcut() {
     if (FAILED(hr)) break;
 
     hr = file->Save(shortcut_path.c_str(), TRUE);
+    if (SUCCEEDED(hr)) {
+      // 仅通知本快捷方式更新，不清系统图标缓存、不改用户固定列表。
+      ::SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, shortcut_path.c_str(), nullptr);
+    }
   } while (false);
 
   if (store) store->Release();

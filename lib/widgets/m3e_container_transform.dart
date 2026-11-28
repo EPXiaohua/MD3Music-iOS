@@ -1,5 +1,11 @@
 import 'package:material_ui/material_ui.dart';
 
+/// 自定义背景开启时，避免容器变换转场用实色 surface 覆盖全局壁纸。
+Color wallpaperAwareTransitionColor(BuildContext context, Color fallback) =>
+    Theme.of(context).scaffoldBackgroundColor == Colors.transparent
+        ? Colors.transparent
+        : fallback;
+
 // M3E 容器变换转场（m3_expressive openContainerTransform 的适配版）。
 //
 // 为什么不直接用包内 openContainerTransform：它把 openColor 硬编码为
@@ -75,10 +81,10 @@ class _M3EContainerTransformRoute<T> extends PageRoute<T> {
   bool get opaque => true;
 
   @override
-  Duration get transitionDuration => const Duration(milliseconds: 500);
+  Duration get transitionDuration => const Duration(milliseconds: 220);
 
   @override
-  Duration get reverseTransitionDuration => const Duration(milliseconds: 420);
+  Duration get reverseTransitionDuration => const Duration(milliseconds: 180);
 
   @override
   Widget buildPage(
@@ -95,54 +101,15 @@ class _M3EContainerTransformRoute<T> extends PageRoute<T> {
     Animation<double> secondaryAnimation,
     Widget child,
   ) {
-    return AnimatedBuilder(
-      animation: animation,
-      builder: (context, _) {
-        final isOpen = animation.status != AnimationStatus.reverse;
-        final curve = isOpen
-            ? Curves.easeInOutCubicEmphasized
-            : Curves.easeInCubic;
-        final t = curve.transform(animation.value);
-
-        final targetRect = Rect.fromLTWH(
-          0,
-          0,
-          screenSize.width,
-          screenSize.height,
-        );
-        final currentRect = Rect.lerp(sourceRect, targetRect, t)!;
-        final br = BorderRadius.lerp(closedRadius, BorderRadius.zero, t)!;
-        final color = Color.lerp(closedColor, openColor, t)!;
-        final contentT = ((t - 0.25) / 0.75).clamp(0.0, 1.0);
-        final scrimT = (t * 2).clamp(0.0, 1.0);
-
-        return Stack(
-          children: [
-            if (scrimT > 0)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: Opacity(
-                    opacity: scrimT * 0.6,
-                    child: ColoredBox(color: scrimColor),
-                  ),
-                ),
-              ),
-            Positioned(
-              left: currentRect.left,
-              top: currentRect.top,
-              width: currentRect.width,
-              height: currentRect.height,
-              child: ClipRRect(
-                borderRadius: br,
-                child: ColoredBox(
-                  color: color,
-                  child: Opacity(opacity: contentT, child: child),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
+    return FadeTransition(
+      opacity: CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+      child: SlideTransition(
+        position: Tween<Offset>(
+          begin: const Offset(0, 0.025),
+          end: Offset.zero,
+        ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
+        child: RepaintBoundary(child: child),
+      ),
     );
   }
 }

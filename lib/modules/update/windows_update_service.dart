@@ -96,8 +96,7 @@ class WindowsUpdateService {
           cancelToken: cancelToken,
           onReceiveProgress: onProgress,
           options: Options(
-            // 本服务仅 Windows 使用；UA 固定为上游常量（GitHub 只要求非空）
-            headers: const {'User-Agent': 'MD3Music'},
+            headers: const {'User-Agent': GithubReleaseClient.userAgent},
             receiveTimeout: const Duration(minutes: 10),
           ),
         );

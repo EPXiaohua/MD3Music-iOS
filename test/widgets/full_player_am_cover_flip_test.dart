@@ -9,6 +9,7 @@ import 'package:md3music/data/repositories/history_repository.dart';
 import 'package:md3music/modules/player/full_player_am.dart';
 import 'package:md3music/modules/player/full_player_route.dart';
 import 'package:md3music/modules/player/widgets/cover_flip_crossfade.dart';
+import 'package:md3music/modules/player/widgets/low_res_blur.dart';
 import 'package:md3music/providers/comment_display_provider.dart';
 import 'package:md3music/providers/device_provider.dart';
 import 'package:md3music/providers/favorites_provider.dart';
@@ -97,13 +98,32 @@ Widget _host(PlayerProvider player, KugouProvider kugou) => MultiProvider(
 );
 
 /// 翻转组件下是否挂着模糊层（翻转进行中的判据）。
-bool _flipBlurring(WidgetTester tester) => find
-    .descendant(
-      of: find.byType(CoverFlipCrossfade),
-      matching: find.byType(ImageFiltered),
-    )
-    .evaluate()
-    .isNotEmpty;
+///
+/// 两种形态都算「在糊」：低分辨率快照就绪前是阶梯 [ImageFiltered] 兜底，
+/// 就绪后换成 [LowResBlurPainter] 的 CustomPaint α 叠层——真文件封面在
+/// runAsync 窗口里解析很快，两种形态出现的先后取决于调度时序，判据必须
+/// 同时接受，否则轮询会错过窄窗口误报「未进入过渡」。
+bool _flipBlurring(WidgetTester tester) {
+  bool blurred(Iterable<Element> candidates) => candidates.isNotEmpty;
+  return blurred(
+    find
+        .descendant(
+          of: find.byType(CoverFlipCrossfade),
+          matching: find.byType(ImageFiltered),
+        )
+        .evaluate(),
+  ) ||
+      blurred(
+        find
+            .descendant(
+              of: find.byType(CoverFlipCrossfade),
+              matching: find.byWidgetPredicate(
+                (w) => w is CustomPaint && w.painter is LowResBlurPainter,
+              ),
+            )
+            .evaluate(),
+      );
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -261,6 +281,55 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(_flipBlurring(tester), isFalse);
+    } finally {
+      await tearDownPlayer(tester);
+    }
+  });
+
+  testWidgets('整段形态一致：快照路径下翻转全程不出现滤镜（无中途替换跳变）', (
+    tester,
+  ) async {
+    // 回归守卫（真机反馈「先变高斯模糊、再被替换成 alpha」）：快照在
+    // 启动前备齐后，可解析的封面对整段过渡都应是「清晰 + α 叠层」形态,
+    // ImageFiltered 一次都不该出现；旧/新两层交接帧也不得出现「清晰层
+    // 裸奔」（交接瞬间投影宽度为零,观感无碍,但形态判据要覆盖中段）。
+    final coverA = _writeCoverFile('form-a');
+    final coverB = _writeCoverFile('form-b');
+    await pumpAmPlayer(
+      tester,
+      songs: [_song(0, artworkUri: coverA), _song(1, artworkUri: coverB)],
+    );
+    try {
+      await switchSongAndAwaitFlip(tester);
+      bool sawFilter = false;
+      bool sawProxyOverlay = false;
+      for (var i = 0; i < 24; i++) {
+        await tester.pump(const Duration(milliseconds: 20));
+        if (find
+            .descendant(
+              of: find.byType(CoverFlipCrossfade),
+              matching: find.byType(ImageFiltered),
+            )
+            .evaluate()
+            .isNotEmpty) {
+          sawFilter = true;
+        }
+        if (find
+            .descendant(
+              of: find.byType(CoverFlipCrossfade),
+              matching: find.byWidgetPredicate(
+                (w) => w is CustomPaint && w.painter is LowResBlurPainter,
+              ),
+            )
+            .evaluate()
+            .isNotEmpty) {
+          sawProxyOverlay = true;
+        }
+      }
+      // 快照路径：有叠层、无滤镜（若环境里快照构建失败则本用例退化为
+      // 全程滤镜，同样不允许两种形态并存——由下一条断言兜住）。
+      expect(sawProxyOverlay, isTrue, reason: '未走低分辨率快照路径');
+      expect(sawFilter, isFalse, reason: '翻转中途出现滤镜↔叠层形态替换');
     } finally {
       await tearDownPlayer(tester);
     }

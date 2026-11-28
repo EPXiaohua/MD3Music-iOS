@@ -769,7 +769,8 @@ class ResponsiveShellState extends State<ResponsiveShell> {
       ),
     ];
     return ColoredBox(
-      color: Theme.of(context).colorScheme.surface,
+      // 壁纸模式沿用透明 Scaffold 底色，不能再用 surface 挡住主列表与详情。
+      color: Theme.of(context).scaffoldBackgroundColor,
       child: DesktopTwoPane(
         responsive: true,
         detailKey: _detailKeys.putIfAbsent(

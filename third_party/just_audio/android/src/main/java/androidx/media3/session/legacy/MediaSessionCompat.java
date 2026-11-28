@@ -349,7 +349,12 @@ public class MediaSessionCompat {
   // 改值必须同步）——31 + 收藏 64 + 循环 128 + 三类列表 256|512|1024 = 2015，
   // 每一位都有对应实现（v45 起循环/收藏已接通）；不随歌词有无增删。
   static final String VMM_SUPPORT_EVENT = "vivomusicmix.media.metadata.support_event";
-  static final long VMM_SUPPORT_EVENT_VALUE = 2015L;
+  // MD3Music fork v64：与 LegacyConversions.VMM_SUPPORT_EVENT_VALUE 同值（两包私有
+  // 互不可见，改值必须同步）。给满 4095（bit0~11 全开）：原子的三类列表按钮读的是
+  // 包名白名单能力值，非白名单包回退到 support_event 本身，2015 缺 32/2048 且
+  // 白名单口径为 4095 —— 统一给满，收藏❤️(64)/循环(128)/播放列表(256)/喜欢列表(512)/
+  // 本地列表(1024) 全部点亮。
+  static final long VMM_SUPPORT_EVENT_VALUE = 4095L;
   static final String VMM_ACTION_KEY = "vivomusicmix.meida.extra.key.action";
   static final String VMM_MEDIA_ID_KEY = "vivomusicmix.extra.key.meidia_id";
   static final String VMM_LYRIC_KEY = "vivomusicmix.extra.key.lyric";

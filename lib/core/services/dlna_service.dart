@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:dlna_dart/dlna.dart';
 import 'package:dlna_dart/xmlParser.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 /// DLNA 媒体类型，映射到 dlna_dart 的 PlayType MIME 枚举。
 enum DlnaMediaType { audio, video }
@@ -178,7 +179,45 @@ class DlnaService {
 
   /// 连接到指定设备（在选择设备时调用）。
   void connectDevice(DLNADevice device) {
+    normalizeControlUrls(device);
     _connectedDevice = device;
+  }
+
+  /// 兼容非标准 `controlURL`（乐播 / 乐视等接收端）。
+  ///
+  /// 这类设备把服务控制路径写成
+  /// `_urn:schemas-upnp-org:service:AVTransport_control` 这种
+  /// 「首段含冒号」的相对引用。RFC 3986 不允许相对引用的首段出现冒号，
+  /// Dart 的 `Uri.resolve` 因此抛 FormatException：
+  /// `Scheme not starting with alphabetic character (at character 1)`
+  /// （投屏报错见 2026-11-10 用户反馈）。
+  ///
+  /// 处理方式是**只兜底、不改原逻辑**：先按 dlna_dart 内部同样的
+  /// `Uri.parse(URLBase).resolve(controlURL)` 解析，能解析的服务原样保留；
+  /// 只有解析抛异常时才把该值按字面拼成绝对地址（设备本身收
+  /// `POST /_urn:..._control` 这类路径）。
+  @visibleForTesting
+  static void normalizeControlUrls(DLNADevice device) {
+    final info = device.info;
+    if (info.URLBase.isEmpty) return;
+    final base = info.URLBase.endsWith('/')
+        ? info.URLBase
+        : '${info.URLBase}/';
+    for (final service in info.serviceList) {
+      if (service is! Map) continue;
+      final path = service['controlURL']?.toString() ?? '';
+      if (path.isEmpty) continue;
+      if (path.startsWith('http://') || path.startsWith('https://')) continue;
+      // 原逻辑优先：与 dlna_dart 内部一致的 resolve，能走通就保持原值
+      try {
+        if (Uri.parse(base).resolve(path).hasScheme) continue;
+      } on FormatException {
+        // 落到下面的兼容兜底
+      }
+      service['controlURL'] = path.startsWith('/')
+          ? '${base.substring(0, base.length - 1)}$path'
+          : '$base$path';
+    }
   }
 
   Future<void> play() async {

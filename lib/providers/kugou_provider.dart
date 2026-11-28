@@ -81,8 +81,8 @@ class HotSearchState {
 
 class KugouProvider extends ChangeNotifier {
   // —— 歌词持久化可选扩展点（默认关闭）——
-  // 由私有构建（lib/private）注入实现：歌词的读取/存储旁路。
-  // 公开构建不注入，均为空操作。
+  // 由宿主注入实现：歌词的读取/存储旁路。
+  // 默认不注入，均为空操作。
   static Future<KugouLyric?> Function(String hash)? restoreLyric;
   static void Function(String hash, KugouLyric lyric)? storeLyric;
 
@@ -212,6 +212,8 @@ class KugouProvider extends ChangeNotifier {
   bool _isLoggedIn = false;
   KugouUserDetail? _userInfo;
   List<KugouSongDetail> _rankSongs = [];
+  String? _rankSongsKey;
+  int _rankSongsRequestGeneration = 0;
   List<KugouSongDetail> _currentPlaylistSongs = [];
 
   /// 手机验证码登录时，手机号绑定多个账号的待选择候选列表。
@@ -1060,7 +1062,7 @@ class KugouProvider extends ChangeNotifier {
       // getter 暴露，调用方通过 KugouLyric.displayKrcLyric / displayLrcLyric
       // 显式分别取两种文本。
       final result = await _lyricRequests.run(requestKey, () async {
-        // 私有构建可注入持久化歌词恢复；失败不缓存，继续在线查询。
+        // 宿主可注入持久化歌词恢复；失败不缓存，继续在线查询。
         KugouLyric? restored;
         if (hash.isNotEmpty) {
           try {
@@ -1482,7 +1484,7 @@ class KugouProvider extends ChangeNotifier {
     try {
       final qrKey = await _apiClient.getLoginQrKey();
       if (qrKey == null || qrKey.qrcode == null) {
-        print('[LOGIN] getLoginQrKey returned null');
+        debugPrint('[LOGIN] getLoginQrKey returned null');
         return;
       }
       _qrKey = qrKey;
@@ -1492,10 +1494,10 @@ class KugouProvider extends ChangeNotifier {
         _qrData = qrData;
         notifyListeners();
       } else {
-        print('[LOGIN] createLoginQr returned null');
+        debugPrint('[LOGIN] createLoginQr returned null');
       }
     } catch (e) {
-      print('[LOGIN] generateQrCode error: $e');
+      debugPrint('[LOGIN] generateQrCode error: $e');
     }
   }
 
@@ -1546,7 +1548,7 @@ class KugouProvider extends ChangeNotifier {
     } catch (e) {
       _error = '生成微信二维码失败';
       notifyListeners();
-      print('[LOGIN] createWxLoginQr error: $e');
+      debugPrint('[LOGIN] createWxLoginQr error: $e');
       return null;
     }
   }
@@ -1604,7 +1606,7 @@ class KugouProvider extends ChangeNotifier {
     } catch (e) {
       _error = '生成 QQ 二维码失败';
       notifyListeners();
-      print('[LOGIN] createQqLoginQr error: $e');
+      debugPrint('[LOGIN] createQqLoginQr error: $e');
       return null;
     }
   }
@@ -1702,7 +1704,7 @@ class KugouProvider extends ChangeNotifier {
     _qrData = null;
     notifyListeners();
     await _fetchUserInfo();
-    print('✅ [Account] 第三方扫码登录成功: $userid');
+    debugPrint('✅ [Account] 第三方扫码登录成功: $userid');
     notifyListeners();
     return true;
   }
@@ -1855,7 +1857,7 @@ class KugouProvider extends ChangeNotifier {
       vipToken: vipToken,
     );
     if (ok) {
-      print('✅ [Account] 登录新账号: $userid, userInfo=${_userInfo?.nickname}');
+      debugPrint('✅ [Account] 登录新账号: $userid, userInfo=${_userInfo?.nickname}');
     }
   }
 
@@ -2041,7 +2043,7 @@ class KugouProvider extends ChangeNotifier {
       final valid = await _apiClient.checkTokenValid();
       if (!valid) {
         await _apiClient.markAccountExpired(userid);
-        print('⚠️ [Account] 账号 $userid 登录已过期');
+        debugPrint('⚠️ [Account] 账号 $userid 登录已过期');
         notifyListeners();
         return SwitchAccountResult.tokenExpired;
       }
@@ -2053,7 +2055,7 @@ class KugouProvider extends ChangeNotifier {
       await _loadLocalSignedDays();
     }
 
-    print('✅ [Account] 已切换到账号: $userid');
+    debugPrint('✅ [Account] 已切换到账号: $userid');
     notifyListeners();
     return SwitchAccountResult.success;
   }
@@ -2091,7 +2093,7 @@ class KugouProvider extends ChangeNotifier {
       _clearAvatarCache();
     }
 
-    print('✅ [Account] 已删除账号: $userid');
+    debugPrint('✅ [Account] 已删除账号: $userid');
     notifyListeners();
   }
 
@@ -2259,17 +2261,17 @@ class KugouProvider extends ChangeNotifier {
           ts = serverTs;
         } else {
           ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-          print('[SIGN_IN] getServerNow 返回无效，降级使用本地时间');
+          debugPrint('[SIGN_IN] getServerNow 返回无效，降级使用本地时间');
         }
       } catch (e) {
         ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-        print('[SIGN_IN] getServerNow 异常，降级使用本地时间: $e');
+        debugPrint('[SIGN_IN] getServerNow 异常，降级使用本地时间: $e');
       }
 
       final date = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
       final receiveDay =
           '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
-      print('[SIGN_IN] receiveDay: $receiveDay');
+      debugPrint('[SIGN_IN] receiveDay: $receiveDay');
 
       // 手动签到：始终发送请求，不做本地已签拦截
       // （服务端会正确返回"今日已领取"，由前端统一提示）
@@ -2289,7 +2291,7 @@ class KugouProvider extends ChangeNotifier {
         return (false, msg);
       }
     } catch (e) {
-      print('[SIGN_IN] 异常: $e');
+      debugPrint('[SIGN_IN] 异常: $e');
       return (false, _friendlyNetworkError(e));
     } finally {
       _manualSignInRunning = false;
@@ -2304,7 +2306,7 @@ class KugouProvider extends ChangeNotifier {
     // 1. 领取畅听VIP（基础签到）
     //    与 EchoMusic 一致：必传 receive_day，否则后端可能判定为无效签到。
     final claim = await _apiClient.claimDayVip(receiveDay);
-    print('[SIGN_IN] claim 完整响应: $claim');
+    debugPrint('[SIGN_IN] claim 完整响应: $claim');
 
     if (claim == null) {
       return (false, '签到请求无响应，请稍后重试', null);
@@ -2337,9 +2339,9 @@ class KugouProvider extends ChangeNotifier {
     Map<String, dynamic>? upgrade;
     try {
       upgrade = await _apiClient.upgradeDayVip();
-      print('[SIGN_IN] upgrade 响应: $upgrade');
+      debugPrint('[SIGN_IN] upgrade 响应: $upgrade');
     } catch (e) {
-      print('[SIGN_IN] upgrade 异常: $e');
+      debugPrint('[SIGN_IN] upgrade 异常: $e');
       // 网络层异常：不标记成功，等下统一走升级失败分支
     }
 
@@ -2384,12 +2386,12 @@ class KugouProvider extends ChangeNotifier {
     try {
       await _fetchUserInfo();
     } catch (e) {
-      print('[SIGN_IN] 刷新用户信息异常: $e');
+      debugPrint('[SIGN_IN] 刷新用户信息异常: $e');
     }
     try {
       await getVipMonthRecord();
     } catch (e) {
-      print('[SIGN_IN] 刷新打卡记录异常: $e');
+      debugPrint('[SIGN_IN] 刷新打卡记录异常: $e');
     }
 
     await _markSignedToday();
@@ -2629,8 +2631,23 @@ class KugouProvider extends ChangeNotifier {
     int pagesize = 30,
     bool forceRefresh = false,
   }) async {
-    final freshnessKey = 'rankSongs_$rankId';
-    if (!forceRefresh && page == 1 && _isDataFresh(freshnessKey)) return;
+    final rankKey = '$rankId:$rankCid';
+    final freshnessKey = 'rankSongs_$rankKey';
+    if (!forceRefresh &&
+        page == 1 &&
+        _rankSongsKey == rankKey &&
+        _isDataFresh(freshnessKey)) {
+      return;
+    }
+    final requestGeneration = ++_rankSongsRequestGeneration;
+    _dataTimestamps.remove(freshnessKey);
+    if (page == 1) {
+      _rankSongs = [];
+      _rankSongsKey = rankKey;
+    } else if (_rankSongsKey != rankKey) {
+      _rankSongs = [];
+      _rankSongsKey = rankKey;
+    }
     _beginLoading();
     _error = null;
     try {
@@ -2639,6 +2656,7 @@ class KugouProvider extends ChangeNotifier {
         const batchSize = 30;
         const maxPages = 100;
         final all = <KugouSongDetail>[];
+        var failed = false;
         for (int p = 1; p <= maxPages; p++) {
           final songs = await _apiClient.getRankAudio(
             rankId: rankId,
@@ -2646,15 +2664,21 @@ class KugouProvider extends ChangeNotifier {
             page: p,
             pagesize: batchSize,
           );
+          if (requestGeneration != _rankSongsRequestGeneration) break;
           if (songs == null) {
-            if (all.isEmpty) _error = '获取排行榜歌曲失败';
+            failed = true;
+            if (all.isEmpty && requestGeneration == _rankSongsRequestGeneration) {
+              _error = '获取排行榜歌曲失败';
+            }
             break;
           }
           all.addAll(songs);
           if (songs.length < batchSize) break;
         }
-        _rankSongs = all;
-        _dataTimestamps[freshnessKey] = DateTime.now();
+        if (requestGeneration == _rankSongsRequestGeneration) {
+          _rankSongs = all;
+          if (!failed) _dataTimestamps[freshnessKey] = DateTime.now();
+        }
       } else {
         final songs = await _apiClient.getRankAudio(
           rankId: rankId,
@@ -2662,16 +2686,22 @@ class KugouProvider extends ChangeNotifier {
           page: page,
           pagesize: pagesize,
         );
-        if (songs != null) {
-          _rankSongs = songs;
-        } else {
-          _error = '获取排行榜歌曲失败';
+        if (requestGeneration != _rankSongsRequestGeneration) return;
+        if (requestGeneration == _rankSongsRequestGeneration) {
+          if (songs != null) {
+            _rankSongs = songs;
+          } else {
+            _error = '获取排行榜歌曲失败';
+          }
         }
       }
     } catch (e) {
-      _error = e.toString();
+      if (requestGeneration == _rankSongsRequestGeneration) {
+        _error = e.toString();
+      }
+    } finally {
+      _endLoading();
     }
-    _endLoading();
   }
 
   Future<void> getPlaylistTrackAll({
@@ -3004,7 +3034,7 @@ class KugouProvider extends ChangeNotifier {
       _gradeInfo = KugouGradeInfo.fromJson(r);
       // 打印服务器实际返回的 d_sec，用于确认服务器是否记账（排查用）
       // ignore: avoid_print
-      print(
+      debugPrint(
         '[GradeQuery] server d_sec=${_gradeInfo?.dSec} grade=${_gradeInfo?.pGrade} point=${_gradeInfo?.pCurrentPoint}/${_gradeInfo?.pNextGradePoint}',
       );
       final serverDsec = _gradeInfo?.dSec;
@@ -3219,14 +3249,14 @@ class KugouProvider extends ChangeNotifier {
         final isEnd = data is Map<String, dynamic> ? data['is_end'] : 0;
         _longAudioFreeHasMore = isEnd != 1;
         // ignore: avoid_print
-        print(
+        debugPrint(
           '[AudiobookFree] tag_id=$tagId sort=$sort gender=$gender status=$status page=$page items=${items.length} isEnd=$isEnd',
         );
         notifyListeners();
       }
     } catch (e) {
       // ignore: avoid_print
-      print('[AudiobookFree] exception: $e');
+      debugPrint('[AudiobookFree] exception: $e');
     } finally {
       _longAudioFreeLoading = false;
       notifyListeners();
@@ -3255,13 +3285,13 @@ class KugouProvider extends ChangeNotifier {
           // 保持上游 son[] 原顺序（即酷狗 App 的分类展示顺序）
           _longAudioTags = tags;
           // ignore: avoid_print
-          print('[AudiobookTags] son=${tags.length}');
+          debugPrint('[AudiobookTags] son=${tags.length}');
           notifyListeners();
         }
       }
     } catch (e) {
       // ignore: avoid_print
-      print('[AudiobookTags] exception: $e');
+      debugPrint('[AudiobookTags] exception: $e');
     }
   }
 
@@ -3272,14 +3302,14 @@ class KugouProvider extends ChangeNotifier {
       final r = await _apiClient.getLongaudioSearch(keyword);
       if (r == null) {
         // ignore: avoid_print
-        print('[AudiobookSearch] getLongaudioSearch 返回 null, keyword=$keyword');
+        debugPrint('[AudiobookSearch] getLongaudioSearch 返回 null, keyword=$keyword');
         return const [];
       }
       final data = r['data'];
       final lists = data is Map<String, dynamic> ? data['lists'] : null;
       if (lists is! List || lists.isEmpty) {
         // ignore: avoid_print
-        print(
+        debugPrint(
           '[AudiobookSearch] data 无 lists, keyword=$keyword status=${r['status']} err=${r['error_code']}',
         );
         return const [];
@@ -3308,13 +3338,13 @@ class KugouProvider extends ChangeNotifier {
         );
       }
       // ignore: avoid_print
-      print(
+      debugPrint(
         '[AudiobookSearch] chapters=${lists.length} albums=${titleMap.length}, keyword=$keyword',
       );
       return titleMap.values.toList();
     } catch (e) {
       // ignore: avoid_print
-      print('[AudiobookSearch] parse exception: $e');
+      debugPrint('[AudiobookSearch] parse exception: $e');
       return const [];
     }
   }

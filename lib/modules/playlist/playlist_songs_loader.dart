@@ -8,11 +8,18 @@ import '../../providers/kugou_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../utils/playlist_song_sort.dart';
 
-/// 歌单歌曲加载结果。[apiSucceeded] 用于区分「空歌单」与「网络失败」。
+/// 歌单歌曲加载结果。[apiSucceeded] 用于区分「空歌单」与「网络失败」；
+/// [isComplete] 为 false 表示分页中途失败、[songs] 只是部分数据
+/// （此时不应覆盖本地缓存，详情页应提示重试）。
 class PlaylistSongsResult {
   final List<Song> songs;
   final bool apiSucceeded;
-  const PlaylistSongsResult(this.songs, this.apiSucceeded);
+  final bool isComplete;
+  const PlaylistSongsResult(
+    this.songs,
+    this.apiSucceeded, {
+    this.isComplete = true,
+  });
 }
 
 /// 歌单歌曲加载器：歌单详情页与收藏页「封面一键播放」共用同一套
@@ -61,6 +68,7 @@ class PlaylistSongsLoader {
 
     List<Song> all = [];
     bool apiSucceeded = false;
+    bool isComplete = true;
 
     if (isAlbum) {
       if (albumId != null && albumId.isNotEmpty) {
@@ -81,7 +89,11 @@ class PlaylistSongsLoader {
           pagesize: pageSize,
           noCache: true,
         );
-        if (r == null) break;
+        if (r == null) {
+          // 中途某页失败：已有部分数据时标记不完整（而非静默当完整结果）
+          if (page > 1) isComplete = false;
+          break;
+        }
         apiSucceeded = true;
         final batch = r.songs.map((s) => s.toSong()).toList();
         all.addAll(batch);
@@ -118,12 +130,17 @@ class PlaylistSongsLoader {
         .where((song) => song.title.isNotEmpty && song.title != '-')
         .toList());
 
-    if (apiSucceeded && filtered.isNotEmpty) {
+    // 部分数据不写缓存：避免残缺列表覆盖旧的全量缓存（断网重进会更残缺）。
+    if (apiSucceeded && isComplete && filtered.isNotEmpty) {
       final key = cacheKey(playlist, isInMyFavorites: isInMyFavorites);
       if (key != null) {
         FavoriteListsCache.savePlaylistSongs(key, filtered);
       }
     }
-    return PlaylistSongsResult(filtered, apiSucceeded);
+    return PlaylistSongsResult(
+      filtered,
+      apiSucceeded,
+      isComplete: isComplete,
+    );
   }
 }

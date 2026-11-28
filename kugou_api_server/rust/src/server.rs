@@ -11,7 +11,7 @@ use crate::cache::{CacheEntry, CACHE};
 use crate::device::DeviceConfig;
 use crate::modules::{Ctx, ModuleFn};
 use crate::request::{BodyValue, ModuleResponse};
-use crate::util::{json_stringify, percent_decode_preserve_plus};
+use crate::util::{json_stringify, percent_decode, percent_decode_preserve_plus};
 use serde_json::{json, Map, Value};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -525,7 +525,13 @@ fn handle_request(mut request: Request, _data_dir: &str) -> Result<(), String> {
         || matches!(
             path.as_str(),
             "/login/qr/check" | "/login/wx/check" | "/login/qq/qr/check"
-        );
+        )
+        // 伴奏对齐：结果完全取决于请求体里的两路 PCM，但 apicache 的 key 只有
+        // `host + url`（不含 body），URL 又是恒定的 → 第一次算出的偏移会被复用
+        // 给之后所有歌曲。真机实测：四首不同的歌返回完全相同的
+        // offset/conf/bpm 四元组（-79/0.777/131.8/131.8 重复出现），
+        // 表现为"有的歌永远对不齐"。这类"输入在 body 里"的接口必须绕过缓存。
+        || matches!(path.as_str(), "/accompaniment/align");
 
     if !bypass {
         if let Some(entry) = CACHE.get_or_init(crate::cache::Cache::new).get(&cache_key) {
@@ -846,7 +852,8 @@ fn parse_query(s: &str) -> Value {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        let val = percent_decode_preserve_plus(raw_val);
+        // 查询参数中的 + 表示空格；真实加号由 %2B 编码，解码后仍保留。
+        let val = percent_decode(raw_val);
         if raw_key.ends_with(']') {
             // cookie[token] / cookie[] / cookie[token][x]
             let open = raw_key.find('[');

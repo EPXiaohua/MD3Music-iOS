@@ -630,6 +630,26 @@ class AudioPlayer {
       MethodChannel('com.ryanheise.just_audio.methods.$id')
           .invokeMethod('setForceKeepPlaying', {'keepPlaying': pendingKeep});
     }
+    // MD3Music fork（伴唱·静默会话）：补发缓存的静默会话标志（与 forced 同理）
+    final pendingSilent = _pendingSilentSession;
+    if (pendingSilent != null) {
+      _pendingSilentSession = null;
+      // ignore: avoid_print
+      print('[AudioFocusFork] flush pending silent=$pendingSilent id=$id');
+      // ignore: discarded_futures
+      MethodChannel('com.ryanheise.just_audio.methods.$id')
+          .invokeMethod('setSilentSession', {'silent': pendingSilent});
+    }
+    // MD3Music fork（伴唱·共享 audioSessionId）：补发缓存的 session id（同理）
+    final pendingSharedSession = _pendingSharedAudioSessionId;
+    if (pendingSharedSession != null) {
+      _pendingSharedAudioSessionId = null;
+      // ignore: avoid_print
+      print('[AudioFocusFork] flush pending sharedSession=$pendingSharedSession id=$id');
+      // ignore: discarded_futures
+      MethodChannel('com.ryanheise.just_audio.methods.$id').invokeMethod(
+          'setSharedAudioSessionId', {'sessionId': pendingSharedSession});
+    }
   }
 
   /// The current sequence of indexed audio sources.
@@ -1395,6 +1415,66 @@ class AudioPlayer {
 
   /// MD3Music fork: 播放器未初始化时缓存的 keepPlaying 标志，_ensureAudioFocusSubscription 补发。
   bool? _pendingForceKeepPlaying;
+
+  /// MD3Music fork（伴唱·静默会话）：把本播放器标记为「背景伴唱」角色。
+  ///
+  /// true → native 的 `play()` 不把本实例设为系统媒体会话的活跃者（不抢
+  /// MediaSession、不改写 active player），因此通知栏 / 媒体卡片 / 锁屏 /
+  /// 桌面歌词始终跟随**原曲**，伴唱只作为一路并行出声的音频。
+  ///
+  /// 仅 Android 有效。播放器未初始化（_id 为 null）时缓存，就绪后自动补发。
+  Future<void> setSilentSession(bool silent) async {
+    if (_disposed) return;
+    if (!_isAndroid()) return;
+    // ignore: avoid_print
+    print('[AudioFocusFork] setSilentSession silent=$silent id=$_id');
+    _pendingSilentSession = silent;
+    if (_id == null ||
+        _platformValue == null ||
+        _platformValue is _IdleAudioPlayer) return;
+    try {
+      final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
+      await channel.invokeMethod('setSilentSession', {'silent': silent});
+    } catch (e) {
+      // ignore: avoid_print
+      print('[AudioFocusFork] setSilentSession failed: $e');
+    }
+  }
+
+  /// MD3Music fork（伴唱·静默会话）：播放器未初始化时缓存的静默标志，
+  /// _ensureAudioFocusSubscription 补发。
+  bool? _pendingSilentSession;
+
+  /// MD3Music fork（伴唱·共享 audioSessionId）：让本播放器的 AudioTrack 使用指定
+  /// 的 audio session id（Dart 侧传主播放器的 id）。
+  ///
+  /// 背景：伴唱轨走「静默会话」不建 MediaSession，小米等系统会在主播放器出声时
+  /// 把这条没有 MediaSession 关联的 AudioTrack 直接 duck 到无声。把伴唱轨挂到
+  /// 主播放器已与 MediaSession 关联的 session 上（hasUid=true）即可避免。
+  ///
+  /// 仅 Android 有效。播放器未初始化（_id 为 null / idle）时缓存，就绪后自动补发。
+  Future<void> setSharedAudioSessionId(int sessionId) async {
+    if (_disposed) return;
+    if (!_isAndroid()) return;
+    // ignore: avoid_print
+    print('[AudioFocusFork] setSharedAudioSessionId id=$sessionId player=$_id');
+    _pendingSharedAudioSessionId = sessionId;
+    if (_id == null ||
+        _platformValue == null ||
+        _platformValue is _IdleAudioPlayer) return;
+    try {
+      final channel = MethodChannel('com.ryanheise.just_audio.methods.$_id');
+      await channel.invokeMethod('setSharedAudioSessionId', {
+        'sessionId': sessionId,
+      });
+    } catch (e) {
+      // ignore: avoid_print
+      print('[AudioFocusFork] setSharedAudioSessionId failed: $e');
+    }
+  }
+
+  /// MD3Music fork（伴唱·共享 audioSessionId）：播放器未初始化时缓存的 session id。
+  int? _pendingSharedAudioSessionId;
 
   /// 读取本曲累计传输字节与播放位置（歌曲信息页实时码率用）。仅 Android 有效。
   Future<Map<String, dynamic>?> getTransferStats() async {    if (_disposed) return null;

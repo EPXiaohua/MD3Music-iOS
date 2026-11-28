@@ -3,12 +3,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:md3music/modules/player/lyrics_view.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_aux_scope.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:md3music/widgets/md3_lyric_preferences.dart';
 
 Future<void> _resetMd3Preferences() async {
   SharedPreferences.setMockInitialValues({});
   await Md3LyricPreferences.instance.reset();
+  await LyricPreferences.instance.reset();
+  // 本文件各用例钉的是「副行内容 / 槽位归属」这类契约，需要所有行都显示副行
+  // 才能逐行断言。副行显示范围引入后默认是「仅当前行」，故显式声明为「所有行」；
+  // 「仅当前行 / 已播行除外」的行为由 lyric_aux_scope_md3_test.dart 单独覆盖。
+  await LyricPreferences.instance.setAuxScope(LyricAuxScope.allLines);
 }
 
 Widget _buildLyricsView(List<LyricLine> lines) {

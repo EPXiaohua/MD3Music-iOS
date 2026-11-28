@@ -369,20 +369,9 @@ class DiagnosticExporter {
         renderEngine = v == 'impeller' ? 'impeller' : 'skia';
       } catch (_) {}
     } else if (!kIsWeb) {
-      // Windows 桌面（私有版）等非 Android 平台
+      // Windows 桌面等非 Android 平台
       osVersion = Platform.operatingSystemVersion;
       deviceModel = Platform.operatingSystem;
-      // iOS 端 Skia 渲染器已移除，Impeller 是唯一引擎（设置页同款判定）
-      if (Platform.isIOS) {
-        renderEngine = 'impeller';
-        // 真实机型：Platform.operatingSystem 只给 "ios"，机型由 AppDelegate 的
-        // device_info channel 返回（utsname.machine → 营销名），失败回退 "ios"。
-        try {
-          const channel = MethodChannel('com.md3music.md3music/device_info');
-          final model = await channel.invokeMethod<String>('getModel');
-          if (model != null && model.isNotEmpty) deviceModel = model;
-        } catch (_) {}
-      }
     }
 
     bool serverRunning = false;

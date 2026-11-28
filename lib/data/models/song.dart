@@ -26,6 +26,19 @@ bool isUnknownArtist(String? artist) {
       v == kUnknownArtistPlaceholderLocal;
 }
 
+/// 专辑占位值（本地扫描与部分在线接口在专辑缺失时写入）。
+const String kUnknownAlbumPlaceholder = '未知专辑';
+
+/// 判断专辑名是否为占位值（空串、`未知专辑`）。
+///
+/// 与 [isUnknownArtist] 同口径：复制文本、信息展示等场景判空一律走这里，
+/// 不要散写字面量比较。
+bool isUnknownAlbum(String? album) {
+  if (album == null) return true;
+  final v = album.trim();
+  return v.isEmpty || v == kUnknownAlbumPlaceholder;
+}
+
 /// 拆分「多位歌手连写」的 artist 字段。
 ///
 /// 酷狗 API 的歌手字段多位歌手用「、」「;」「/」「&」「，」等分隔符连接（与
@@ -41,6 +54,31 @@ List<String> splitSongArtistNames(String? artist) {
       .map((s) => s.trim())
       .where((s) => s.isNotEmpty)
       .toList();
+}
+
+/// 播放页长按复制的完整信息文本（格式：`歌名 歌手-专辑`，如 `晴天 周杰伦-叶惠美`）。
+///
+/// 与列表菜单的 `formatSongCopyText`（仅 `歌名 - 歌手`）区分：这里带上专辑。
+/// - 歌名取 [Song.displayName]（已剥离 `.mp3`/`.flac` 等扩展名后缀）；
+/// - 歌手经 [isUnknownArtist]、专辑经 [isUnknownAlbum] 判占位，缺失时省略对应段，
+///   避免拼出孤立 `-` 或「未知歌手/未知专辑」；
+/// - 三段全缺时返回空串，调用方据此不写剪贴板。
+String formatSongFullCopyText(Song song) {
+  final title = song.displayName.trim();
+  final artist = isUnknownArtist(song.artist) ? '' : song.artist.trim();
+  final album = isUnknownAlbum(song.album) ? '' : song.album.trim();
+  if (title.isEmpty) {
+    // 歌名缺失的极端兜底：能拼什么拼什么。
+    if (artist.isNotEmpty && album.isNotEmpty) return '$artist-$album';
+    return artist.isNotEmpty ? artist : album;
+  }
+  final buffer = StringBuffer(title);
+  if (artist.isNotEmpty && album.isNotEmpty) {
+    buffer.write(' $artist-$album');
+  } else if (artist.isNotEmpty || album.isNotEmpty) {
+    buffer.write(' ${artist.isNotEmpty ? artist : album}');
+  }
+  return buffer.toString();
 }
 
 class Song {

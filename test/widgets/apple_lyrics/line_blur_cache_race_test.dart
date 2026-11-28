@@ -136,18 +136,27 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('失败的请求不阻止再次渲染', (tester) async {
-    final state = await mount(tester);
-    var count = 0;
+  testWidgets('切换歌词位置后同一 blurLevel 必须按新对齐重烘焙', (tester) async {
+    final state = await mount(tester, text: '很长的一句歌词用来观察对齐是否重烘焙');
+    final calls = <DuetAlignment>[];
     state.lineBlurRendererForTest = (int i, int level, DuetAlignment align) async {
-      count++;
+      calls.add(align);
       return null;
     };
     state.updateLineBlurCacheForTest(<int, int>{0: 1});
     await tester.pump();
+    expect(calls, <DuetAlignment>[DuetAlignment.defaultAlign]);
+
+    await LyricPreferences.instance.setLyricPosition(LyricPosition.center);
+    await tester.pump();
+
+    // 同一 blurLevel 下，仅对齐变化也必须重新请求，否则模糊层会停在旧锚点。
     state.updateLineBlurCacheForTest(<int, int>{0: 1});
     await tester.pump();
-    expect(count, 2);
+    expect(calls.length, 2, reason: '对齐变化必须让旧模糊图签名失效');
+    expect(calls.last, DuetAlignment.center);
+
     await tester.pumpWidget(const SizedBox.shrink());
+    await LyricPreferences.instance.setLyricPosition(LyricPosition.left);
   });
 }

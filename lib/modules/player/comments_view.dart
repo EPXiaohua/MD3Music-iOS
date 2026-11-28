@@ -129,6 +129,10 @@ class CommentsView extends StatefulWidget {
   /// 封面 URL（保留参数兼容性，不再用于智能反色）。
   final String? artworkUri;
 
+  /// 当前歌曲（可选）。云盘歌曲（`isCloud`，songHash 为云盘文件 hash）
+  /// 传入后可解析匹配记忆，把生效 hash 改写为官方曲库 hash，评论才能定位。
+  final Song? song;
+
   /// 是否为 AM 风格播放器。true 时使用白色文字方案，false 时跟随主题色。
   final bool isAmStyle;
 
@@ -152,6 +156,7 @@ class CommentsView extends StatefulWidget {
     required this.songHash,
     this.albumAudioId,
     this.artworkUri,
+    this.song,
     this.isAmStyle = false,
     this.scrollController,
     this.showComposer = true,
@@ -265,27 +270,34 @@ class _CommentsViewState extends State<CommentsView> {
   /// 避免多个收起操作并发时滚动互相干扰。
   int _collapseScrollSeq = 0;
 
-  // ---- 本地歌曲匹配解析 ----
-  // 本地歌曲的 songHash 是 `local_<路径>`，不是在线 hash，直接拉评论必然
-  // 查不到。命中匹配记忆后改用在线 hash/albumAudioId/artworkUri 拉取。
+  // ---- 本地/云盘歌曲匹配解析 ----
+  // 本地歌曲的 songHash 是 `local_<路径>`，云盘歌曲的 songHash 是云盘文件
+  // hash，都不是官方曲库 hash，直接拉评论必然查不到。命中匹配记忆后改用
+  // 在线 hash/albumAudioId/artworkUri 拉取。
   String? _resolvedHash;
   String? _resolvedAlbumAudioId;
 
-  /// 实际用于拉取/发送评论的 hash（本地未匹配时仍是原始 local_ 值）。
+  /// 实际用于拉取/发送评论的 hash（本地/云盘未匹配时仍是原始值）。
   String get _effectiveHash => _resolvedHash ?? widget.songHash;
 
   String? get _effectiveAlbumAudioId =>
       _resolvedAlbumAudioId ?? widget.albumAudioId;
 
-  /// 本地歌曲是否未匹配在线歌曲（空态提示文案用）。
+  /// 本地/云盘歌曲是否未匹配在线歌曲（空态提示文案用）。
   bool get _isUnmatchedLocal =>
-      widget.songHash.startsWith('local_') && _resolvedHash == null;
+      (widget.songHash.startsWith('local_') ||
+          (widget.song?.isCloud ?? false)) &&
+      _resolvedHash == null;
 
-  /// 在 initState / songHash 变化时解析：本地歌曲查匹配记忆，改写生效身份。
+  /// 在 initState / songHash 变化时解析：本地/云盘歌曲查匹配记忆，改写生效身份。
   void _resolveLocalMatch() {
     _resolvedHash = null;
     _resolvedAlbumAudioId = null;
-    if (!widget.songHash.startsWith('local_')) return;
+    // 本地歌曲（songHash 带 local_ 前缀）或云盘歌曲（widget.song.isCloud）
+    // 都可能持有匹配记忆；纯在线歌曲跳过
+    final isLocal = widget.songHash.startsWith('local_');
+    final isCloud = widget.song?.isCloud ?? false;
+    if (!isLocal && !isCloud) return;
     // 用可空读取：测试等无 Provider 环境下静默跳过，保持原行为
     final matchProvider = context.read<SongMatchProvider?>();
     if (matchProvider == null) return;

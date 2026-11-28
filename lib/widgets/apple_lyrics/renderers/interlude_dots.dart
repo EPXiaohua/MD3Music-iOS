@@ -90,8 +90,8 @@ class InterludeDots {
   int? get startTime => _startTime;
   int? get endTime => _endTime;
 
-  /// 当前动画时钟（毫秒）。仅测试断言用，非热路径。
-  @visibleForTesting
+  /// 当前动画时钟（毫秒）。供调用方做诊断/测试断言（如验证收起阶段逐帧推进），
+  /// 不在绘制热路径上使用。
   double get animationTimeMs => _animationTimeMs;
 
   /// 当前是否需要绘制（间奏激活时）。
@@ -151,6 +151,64 @@ class InterludeDots {
     _endTime = null;
     _animationTimeMs = 0;
     _isActive = false;
+  }
+
+  /// 把动画时钟**只前进**地抬到消失段起点（已在消失段则不动）。
+  ///
+  /// 为什么需要它：间奏点时钟由帧 dt 累积，而省电模式的驱动按名义 16ms 步进
+  /// （真实 vsync 是 16.7~17.5ms），时钟会**系统性慢于播放时钟**，长间奏累积
+  /// 可超过消失段时长 750ms。于是播放进度自然跨过间奏窗口终点时，[isInExitPhase]
+  /// 仍为 false，调用方会把它误判成"跳转离开"而立即 [clear] → 圆点没有缩小
+  /// 过程直接消失（观感"啪一下没了"）。
+  ///
+  /// 调用方确认是**连续推进**跨过终点（自然结束）时使用本方法：消失动画从
+  /// 当前尺寸连续播完。**绝不后退**（已在消失段/已超时则原样返回）。
+  void snapToExitPhase() {
+    final start = _startTime;
+    final end = _endTime;
+    if (!_isActive || start == null || end == null) return;
+    final double exitStartMs = ((end - start) - _exitScaleMs).toDouble();
+    if (_animationTimeMs < exitStartMs) {
+      _animationTimeMs = exitStartMs;
+    }
+  }
+
+  /// 温和地把动画时钟**单向追前**到真实窗口偏移（按比例小步，上限 [maxStepMs]）。
+  ///
+  /// 替代一次性 [alignToRealTime] 硬对齐：硬跳会让圆点 scale 突跳一档（收起前段
+  /// "啪地跳一下"）。这里每次权威位置更新（约 200ms 一次）只补掉残差的
+  /// 约 [ratio]（单次至多 [maxStepMs]），稳态漂移被压到数十毫秒内。
+  ///
+  /// 两条约束保证不可见：
+  /// - **只追前不回拽**：时钟略微超前真实值时不动。否则权威值的 200ms 粒度与
+  ///   帧推进的量化差会让时钟锯齿式来回跳（呼吸/亮起动画抽搐）。
+  /// - **消失段不修正**（[isInExitPhase]）：收起动画的时长本身就是这段时钟，
+  ///    中途挪动时钟会直接改变可见的缩小进度；收尾统一由 [snapToExitPhase] 处理。
+  ///
+  /// 返回是否发生修正。
+  bool correctDriftGently(
+    int currentTimeMs, {
+    double maxStepMs = 100,
+    double ratio = 0.5,
+  }) {
+    // 消失段不修正：这段时钟本身就是可见的缩小进度，中途挪动等于改动画。
+    if (isInExitPhase) return false;
+    final start = _startTime;
+    final end = _endTime;
+    if (!_isActive || start == null || end == null) return false;
+    final double realOffset =
+        ((currentTimeMs - start).clamp(0, end - start)).toDouble();
+    final double delta = realOffset - _animationTimeMs;
+    // 只追前、不回拽：时钟略微超前真实值时不动。否则权威值的 200ms 粒度与
+    // 帧推进的量化差会让时钟锯齿式来回跳（呼吸/亮起动画抽搐）。
+    if (delta <= 0) return false;
+    // **纯比例、不设下限**：设下限会让"每次至少挪 X"在 delta 很小时反而快于
+    // 真实进度、引起来回跳；纯比例下稳态残差 ≈ 每拍新增漂移 / ratio
+    // （漂移约 4% × 200ms = 8ms → 残差 ~16ms），远低于可见阈值。
+    // 上限 [maxStepMs] 兜住页面重建等中等残差，避免单次大跳。
+    final double step = math.min(delta * ratio, maxStepMs);
+    _animationTimeMs += step;
+    return true;
   }
 
   // ============== 时间推进 ==============

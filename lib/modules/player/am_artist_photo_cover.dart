@@ -346,7 +346,8 @@ class AmArtistPhotoCover extends StatelessWidget {
   /// 部分不会被染色 —— 若改成在外部叠一层带色遮罩，会连页面背景一起压暗。
   final double opacity;
 
-  static Widget _photo(String url, String role) => CachedNetworkImage(
+  static Widget _photo(String url, String role, int cacheWidth) =>
+      CachedNetworkImage(
     // 同 Stack 两枚图必须不同 key：重复 ValueKey(url) 在转场位移的
     // 重建期会元素复用错乱（真机白线闪烁根因之一）。
     key: ValueKey('$url#$role'),
@@ -354,6 +355,8 @@ class AmArtistPhotoCover extends StatelessWidget {
     fit: BoxFit.cover,
     width: double.infinity,
     height: double.infinity,
+    // P0-A: 同 Stack 两枚写真各按显示物理宽解码，避免两枚全分辨率位图并存。
+    memCacheWidth: cacheWidth,
     // 单下划线通配符（Dart 3），避免 unnecessary_underscores lint
     placeholder: (_, _) => const SizedBox.shrink(),
     errorWidget: (_, _, _) => const SizedBox.shrink(),
@@ -385,17 +388,23 @@ class AmArtistPhotoCover extends StatelessWidget {
                 builder: (context, constraints) {
                   final h = constraints.maxHeight;
                   final w = constraints.maxWidth * photoWidthFraction;
+                  // P0-A: 按写真显示宽度 × DPR 限制解码尺寸（上限 1920px）。
+                  final dpr = MediaQuery.of(context).devicePixelRatio;
+                  final physicalWidth = (w * dpr).round();
+                  final cacheWidth = physicalWidth > 1920
+                      ? 1920
+                      : (physicalWidth < 1 ? 1 : physicalWidth);
                   Rect photoShaderRect(Rect rect) => Rect.fromLTWH(
                     rect.left, rect.top, w, rect.height,
                   );
                   Widget photoLayer(String role) => photoWidthFraction == 1.0
-                      ? _photo(url, role)
+                      ? _photo(url, role, cacheWidth)
                       : Align(
                           alignment: Alignment.centerLeft,
                           child: SizedBox(
                             width: w,
                             height: h,
-                            child: _photo(url, role),
+                            child: _photo(url, role, cacheWidth),
                           ),
                         );
                   // 按方向选出两枚罩、模糊参考边与 key：竖屏用高度（上下缘），

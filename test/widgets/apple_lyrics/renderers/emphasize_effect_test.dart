@@ -316,6 +316,63 @@ void main() {
         isTrue,
       );
     });
+
+    // 以下与「隐藏歌词作者信息」（LyricCreditFilter）共用同一套规则：
+    // 头部元信息行不该被当成歌词打强调辉光。开关状态不影响本判定。
+    test('英文名单行 → true（Lyrics by / Composed by）', () {
+      for (final text in <String>[
+        'Lyrics by: John Lennon',
+        'Composed by：某作曲家',
+        'Arranged by: Someone',
+      ]) {
+        expect(
+          EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine(text)),
+          isTrue,
+          reason: '「$text」是名单行，不应参与辉光判定',
+        );
+      }
+    });
+
+    test('【…】包装行 → true', () {
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine('【某某工作室】')),
+        isTrue,
+      );
+    });
+
+    test('版权声明句 → true', () {
+      expect(
+        EmphasizeEffect.shouldSkipEmphasizeForLine(
+          makeLine('未经著作权人许可，不得翻唱或使用'),
+        ),
+        isTrue,
+      );
+    });
+
+    test('在线歌词首行「作者 - 歌名」形态 → true', () {
+      for (final text in <String>['周杰伦 - 晴天', 'A-Lin-给我一个理由忘记']) {
+        expect(
+          EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine(text)),
+          isTrue,
+          reason: '「$text」是头部信息行形态，不应参与辉光判定',
+        );
+      }
+    });
+
+    test('共用规则不误伤正常歌词（冒号歌词/英文歌词/对唱行）', () {
+      for (final text in <String>[
+        '他说：我们走吧',
+        'I love you',
+        '男：你好',
+        '月亮代表我的心',
+      ]) {
+        expect(
+          EmphasizeEffect.shouldSkipEmphasizeForLine(makeLine(text)),
+          isFalse,
+          reason: '「$text」是正常歌词，不得被辉光判定排除',
+        );
+      }
+    });
   });
 
   group('computeState - 字内进度 t', () {
@@ -401,6 +458,74 @@ void main() {
         isLastWord: false,
         wordIndex: 0,
         anchorCharCount: 1,
+      );
+      expect(state, equals(EmphasizeState.idle));
+    });
+  });
+
+  group('computeState - 辉光字符缩放开关', () {
+    // duration=10000ms、t=5000ms（凸起峰值）：
+    //   amount = 1.2（封顶）、transX = 1.0
+    //   开启：scale = 1 + 1*0.1*1.2 = 1.12，offsetXEm 随字符位置外扩
+    //   关闭：scale = 1.0，offsetXEm = 0，其余（上浮 / 浮层 / 辉光）不变
+    EmphasizeState stateAt({
+      required bool? charScaleEnabled,
+      int wordIndex = 0,
+      int anchorCharCount = 1,
+    }) {
+      return effect.computeState(
+        word: makeWord(duration: 10000, text: '运'),
+        currentTimeMs: 5000,
+        isLastWord: false,
+        wordIndex: wordIndex,
+        anchorCharCount: anchorCharCount,
+        charScaleEnabled: charScaleEnabled,
+      );
+    }
+
+    test('关闭后 scale 恒 1.0、offsetXEm 恒 0', () {
+      final state = stateAt(charScaleEnabled: false);
+      expect(state.scale, closeTo(1.0, 1e-9));
+      expect(state.offsetXEm, closeTo(0.0, 1e-9));
+    });
+
+    test('关闭后上浮与辉光亮度不受影响', () {
+      final on = stateAt(charScaleEnabled: true);
+      final off = stateAt(charScaleEnabled: false);
+      // 上浮 / 正弦浮层 / 辉光亮度 / 阴影相对强度全部保持一致
+      expect(off.offsetYEm, closeTo(on.offsetYEm, 1e-9));
+      expect(off.floatYEm, closeTo(on.floatYEm, 1e-9));
+      expect(off.glowLevel, closeTo(on.glowLevel, 1e-9));
+      expect(off.shadowBlurEm, closeTo(on.shadowBlurEm, 1e-9));
+      // 确实仍有上浮与发光（不是整体退回 idle）
+      expect(off.offsetYEm, lessThan(0.0));
+      expect(off.glowLevel, greaterThan(0.0));
+    });
+
+    test('开启时沿用历史公式（scale 1.12、offsetXEm 非 0）', () {
+      // anchorCharCount=2、wordIndex=1：offsetX = -1*0.03*1.2*(1-1) = 0，
+      // 故取 wordIndex=0 才能观察到非零外扩。
+      final state = stateAt(charScaleEnabled: true, anchorCharCount: 2);
+      expect(state.scale, closeTo(1.12, 1e-9));
+      // offsetXEm = -1 * 0.03 * 1.2 * (2/2 - 0) = -0.036
+      expect(state.offsetXEm, closeTo(-0.036, 1e-9));
+    });
+
+    test('不传参数时回退到偏好（默认开启 = 历史行为）', () {
+      final state = stateAt(charScaleEnabled: null, anchorCharCount: 2);
+      expect(state.scale, closeTo(1.12, 1e-9));
+      expect(state.offsetXEm, closeTo(-0.036, 1e-9));
+    });
+
+    test('窗口外（idle）分支不受开关影响', () {
+      final word = makeWord(startTime: 1000, duration: 1000, text: '运');
+      final state = effect.computeState(
+        word: word,
+        currentTimeMs: 500,
+        isLastWord: false,
+        wordIndex: 0,
+        anchorCharCount: 1,
+        charScaleEnabled: false,
       );
       expect(state, equals(EmphasizeState.idle));
     });
@@ -862,6 +987,28 @@ void main() {
     LyricLine makeLrcLine(String text) =>
         LyricLine(startTime: 0, duration: 1000, text: text);
 
+    test('自适应统计排除头部信息行：名单行字长不进中位数', () {
+      // 20 个字 × 800ms 的歌词行 + 25 个字 × 100ms 的「作词：…」名单行。
+      // 名单行若参与统计，45 个字的中位数落在 100ms → 阈值 100；
+      // 排除后中位数 = 800ms（thresholdFactor 显式 1.0）→ 阈值 800。
+      final creditWords = List<LyricWord>.generate(
+        25,
+        (i) => LyricWord(startTime: i * 100, duration: 100, text: '某'),
+      );
+      final lines = <LyricLine>[
+        makeKrcLine(List.filled(20, 800)),
+        LyricLine(
+          startTime: 0,
+          duration: 2500,
+          text: '作词：某某某某某某',
+          words: creditWords,
+        ),
+      ];
+      expect(adaptive(lines: lines, thresholdFactor: 1.0), 800,
+          reason: '头部信息行属于元信息，不得参与「单位字长」统计'
+              '（否则阈值被拉低、辉光变密）');
+    });
+
     test('songBpm=120 → 阈值 600（一字一拍 500ms × 默认系数 1.2）', () {
       expect(adaptive(songBpm: 120), 600);
     });
@@ -960,11 +1107,15 @@ void main() {
       );
     });
 
-    test('fixed 模式未显式传阈值 → 取偏好默认 1000', () {
+    test('fixed 模式未显式传阈值 → 取当前偏好字段初值（平台默认）', () {
+      // resolveThresholdMs 读取 instance.glowFixedThresholdMs；字段初值已是
+      // defaultGlowFixedThresholdMsForCurrentPlatform，无需 load/reset。
       expect(
         EmphasizeEffect.resolveThresholdMs(mode: GlowThresholdMode.fixed),
-        LyricPreferences.defaultGlowFixedThresholdMs,
+        LyricPreferences.instance.glowFixedThresholdMs.round(),
       );
+      // 全局基线常量保持 1000；Windows 便携版当前平台默认单独用
+      // defaultGlowFixedThresholdMsForCurrentPlatform（500）。
       expect(LyricPreferences.defaultGlowFixedThresholdMs, 1000);
     });
 

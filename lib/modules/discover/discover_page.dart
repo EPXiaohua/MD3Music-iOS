@@ -5,7 +5,6 @@ import '../../core/platform_capabilities.dart';
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,7 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:dpad/dpad.dart';
 import '../../core/build_flags.dart';
-import '../../core/layout/bottom_chrome_dimens.dart';
+import '../../core/layout/bottom_chrome_scope.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/layout/responsive_layout.dart';
 import '../../core/utils/reveal_label.dart';
@@ -26,6 +25,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
 import 'home_discover_refill.dart';
+import 'discover_skeleton.dart';
 import '../personal_fm/personal_fm_core.dart';
 import '../personal_fm/personal_fm_section.dart';
 import '../player/secondary_mini_player.dart';
@@ -57,7 +57,10 @@ class _DiscoverPageState extends State<DiscoverPage>
     with SingleTickerProviderStateMixin {
   static const String _kDiscoverLastDateKey = 'discover_last_date';
 
-  DiscoverSectionConfig _sectionConfig = const DiscoverSectionConfig();
+  // 首帧临时值：load() 会立刻覆写为持久化/平台默认；这里也走平台口径，
+  // 避免 Windows 上首帧闪现「新歌速递/新碟上架被隐藏」的旧默认布局。
+  DiscoverSectionConfig _sectionConfig =
+      DiscoverSectionConfig.platformDefaults();
 
   bool _isLoading = true;
   String? _error;
@@ -76,28 +79,14 @@ class _DiscoverPageState extends State<DiscoverPage>
   final GlobalKey _recognitionActionKey = GlobalKey();
 
   /// 「›」详情入口统一分派：双栏（横屏/平板 B 类页面）与 TV 构建走
-  /// [AdaptiveNav.openDetail]（面板内嵌/原路由）；手机单栏走 M3E 容器变换
-  /// 转场——详情从「›」按钮矩形 morph 展开到全屏。
+  /// [AdaptiveNav.openDetail]：双栏留在详情面板，单栏进入内容栈。
+  /// 统一使用固定布局的轻量位移，避免宽屏整页展开造成列表重排与串影。
   void _openSectionDetail(
     BuildContext context,
     GlobalKey sourceKey,
     WidgetBuilder builder,
   ) {
-    // Windows 主列表在 DetailPaneScope 下，不在右栏的 DetailPaneContent 下。
-    final windowsTwoPane = defaultTargetPlatform == TargetPlatform.windows &&
-        DetailPaneScope.isTwoPaneOf(context);
-    if (windowsTwoPane || DetailPaneContent.isTwoPaneOf(context) || kTvBuild) {
-      AdaptiveNav.openDetail(context, builder);
-      return;
-    }
-    m3eOpenContainerTransform(
-      context: context,
-      sourceKey: sourceKey,
-      closedColor: Theme.of(context).colorScheme.surfaceContainerLow,
-      openColor: Theme.of(context).colorScheme.surface,
-      closedRadius: BorderRadius.circular(20),
-      pageBuilder: builder,
-    );
+    AdaptiveNav.openDetail(context, builder, lightweightTransition: true);
   }
 
   /// appbar「搜索」入口：保持原 MaterialPageRoute。
@@ -133,8 +122,15 @@ class _DiscoverPageState extends State<DiscoverPage>
     m3eOpenContainerTransform(
       context: context,
       sourceKey: _recognitionActionKey,
-      closedColor: Theme.of(context).colorScheme.surfaceContainerLow,
-      openColor: Theme.of(context).colorScheme.surface,
+      closedColor: wallpaperAwareTransitionColor(
+        context,
+        Theme.of(context).colorScheme.surfaceContainerLow,
+      ),
+      openColor: wallpaperAwareTransitionColor(
+        context,
+        Theme.of(context).colorScheme.surface,
+      ),
+      scrimColor: wallpaperAwareTransitionColor(context, Colors.black),
       closedRadius: BorderRadius.circular(20),
       pageBuilder: (_) => const SongRecognitionPage(),
     );
@@ -286,6 +282,9 @@ class _DiscoverPageState extends State<DiscoverPage>
 
       retryCount++;
       if (retryCount < 3 && mounted) {
+        // _loadAllData 收尾会把 _isLoading 置 false；还要重试就把骨架撑住，
+        // 否则每轮之间骨架塌 2 秒再重现，视觉上闪烁。
+        setState(() => _isLoading = true);
         await Future.delayed(const Duration(seconds: 2));
       }
     }
@@ -428,17 +427,21 @@ class _DiscoverPageState extends State<DiscoverPage>
       body: ContentWidth(
         child: Md3PullToRefresh(
         onRefresh: _loadAllData,
-        // 渐进加载：任一分区数据就绪即退出整页转圈，先显示已获取的分区；
-        // 未就绪分区由各自 Selector 在数据到达时自动补出（空数据返回占位）。
+        // 冷启动骨架：加载期不再用整页转圈顶替区块，而是每个区块各自渲染
+        // 同构骨架（带倾斜扫光），数据到达后各自淡入替换（见 _buildXxxSection）。
+        // 渐进加载语义不变：任一分区就绪即退出 _isLoading，其余分区由各自
+        // Selector 在数据到达时补齐。
         child: CustomScrollView(
           controller: _scrollController,
           slivers: [
             DiscoverSectionsSliver(
               config: _sectionConfig,
               onEdit: _showSectionEditor,
-              status: _isLoading && !_hasAnySectionData
-                  ? const Padding(padding: EdgeInsets.all(32), child: Center(child: M3ELoadingIndicator()))
-                  : _error != null && !_hasAnySectionData ? _buildError(colorScheme) : null,
+              // 只在「全部拉完仍一首都没有」时整页兜底；加载中（含三轮重试
+              // 间隙）由骨架占位，不让错误态在重试间隙抢显示。
+              status: _error != null && !_isLoading && !_hasAnySectionData
+                  ? _buildError(colorScheme)
+                  : null,
               sectionBuilder: (section) => switch (section) {
                 DiscoverSection.personalFm => _buildPersonalFmSection(),
                 DiscoverSection.daily => _buildDailySection(colorScheme),
@@ -476,6 +479,10 @@ class _DiscoverPageState extends State<DiscoverPage>
     );
   }
 
+  /// 区块「骨架 → 真实内容」的淡入替换见 [DiscoverSectionFadeSwap]
+  /// （discover_skeleton.dart）：冷启动首刷期间空数据区块渲染同构骨架
+  /// （带倾斜扫光），数据到达后整块淡入换成真实内容。
+
   /// 新碟与新歌速递默认并排，复用原来的小封面列表、浏览页和 Hero ID。
   Widget _buildNewAlbumSection() => Selector<KugouProvider, List<KugouAlbumBrief>>(
         selector: (_, provider) => provider.topAlbums,
@@ -483,30 +490,35 @@ class _DiscoverPageState extends State<DiscoverPage>
           final albums = briefs.map((brief) => brief.toAlbum()).toList();
           final firstId = firstIndexById([for (final album in albums) album.id]);
           return SliverToBoxAdapter(
-            child: _SectionBlock(
+            child: DiscoverSectionFadeSwap(
               title: '新碟上架',
-              trailing: KeyedSubtree(
-                key: _newAlbumMoreKey,
-                child: IconButton(
-                  onPressed: () => _openSectionDetail(
-                    context,
-                    _newAlbumMoreKey,
-                    (_) => const NewAlbumBrowsePage(),
-                  ),
-                  icon: const Icon(Icons.chevron_right),
-                ),
-              ),
-              child: albums.isEmpty
-                  ? const Padding(padding: EdgeInsets.all(16), child: Text('暂无新碟'))
-                  : CompactAlbumGrid(
-                      albums: albums,
-                      maxItems: 8,
-                      heroTags: [for (var i = 0; i < albums.length; i++)
-                        firstId[albums[i].id] == i ? albumCoverHeroTag(albums[i].id) : null],
-                      regionKey: 'tv/discover-new-albums',
-                      onTap: (index) => AdaptiveNav.openDetail(context,
-                          (_) => AlbumDetailPage(album: albums[index])),
+              loading: _isLoading && albums.isEmpty,
+              skeleton: const DiscoverAlbumGridSkeleton(),
+              content: _SectionBlock(
+                title: '新碟上架',
+                trailing: KeyedSubtree(
+                  key: _newAlbumMoreKey,
+                  child: IconButton(
+                    onPressed: () => _openSectionDetail(
+                      context,
+                      _newAlbumMoreKey,
+                      (_) => const NewAlbumBrowsePage(),
                     ),
+                    icon: const Icon(Icons.chevron_right),
+                  ),
+                ),
+                child: albums.isEmpty
+                    ? const Padding(padding: EdgeInsets.all(16), child: Text('暂无新碟'))
+                    : CompactAlbumGrid(
+                        albums: albums,
+                        maxItems: 8,
+                        heroTags: [for (var i = 0; i < albums.length; i++)
+                          firstId[albums[i].id] == i ? albumCoverHeroTag(albums[i].id) : null],
+                        regionKey: 'tv/discover-new-albums',
+                        onTap: (index) => AdaptiveNav.openDetail(context,
+                            (_) => AlbumDetailPage(album: albums[index])),
+                      ),
+              ),
             ),
           );
         },
@@ -700,42 +712,49 @@ class _DiscoverPageState extends State<DiscoverPage>
     return Selector<KugouProvider, List<KugouSongDetail>>(
       selector: (_, kugou) => kugou.recommendSongs,
       builder: (context, songs, _) {
-        if (songs.isEmpty) return const SliverToBoxAdapter(child: SizedBox());
         final all = songs.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _SectionBlock(
+          child: DiscoverSectionFadeSwap(
             title: '每日推荐',
-            trailing: KeyedSubtree(
-              key: _dailyMoreKey,
-              child: IconButton(
-                onPressed: () => _openSectionDetail(
-                  context,
-                  _dailyMoreKey,
-                  (_) => const _DailyRecommendDetailPage(),
-                ),
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ),
-            child: Padding(
-              // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
-              // 与其他区块一致的 16dp 页边距。
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: Column(
-                children: [
-                  for (var i = 0; i < top.length; i++)
-                    SongListItem(
-                      song: top[i],
-                      showDuration: false,
-                      // 每日推荐：右侧仅收藏按钮（见改版计划二）。
-                      trailingActions: SongTrailingActions.favoriteOnly,
-                      onTap: () => context
-                          .read<PlayerProvider>()
-                          .playOnlinePlaylist(all, i),
+            loading: _isLoading && songs.isEmpty,
+            skeleton: const DiscoverSongRowsSkeleton(),
+            content: songs.isEmpty
+                // 加载结束仍一首都没有：保持原隐身行为（淡出后塌成 0 高）。
+                ? const SizedBox.shrink()
+                : _SectionBlock(
+                    title: '每日推荐',
+                    trailing: KeyedSubtree(
+                      key: _dailyMoreKey,
+                      child: IconButton(
+                        onPressed: () => _openSectionDetail(
+                          context,
+                          _dailyMoreKey,
+                          (_) => const _DailyRecommendDetailPage(),
+                        ),
+                        icon: const Icon(Icons.chevron_right),
+                      ),
                     ),
-                ],
-              ),
-            ),
+                    child: Padding(
+                      // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
+                      // 与其他区块一致的 16dp 页边距。
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      child: Column(
+                        children: [
+                          for (var i = 0; i < top.length; i++)
+                            SongListItem(
+                              song: top[i],
+                              showDuration: false,
+                              // 每日推荐：右侧仅收藏按钮（见改版计划二）。
+                              trailingActions: SongTrailingActions.favoriteOnly,
+                              onTap: () => context
+                                  .read<PlayerProvider>()
+                                  .playOnlinePlaylist(all, i),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
           ),
         );
       },
@@ -754,41 +773,50 @@ class _DiscoverPageState extends State<DiscoverPage>
     return Selector<KugouProvider, List<KugouSongDetail>>(
       selector: (_, kugou) => kugou.homeDiscoverSongs,
       builder: (context, details, _) {
-        if (details.isEmpty) return const SliverToBoxAdapter(child: SizedBox());
         final all = details.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _SectionBlock(
+          child: DiscoverSectionFadeSwap(
             title: '刷歌推荐',
-            trailing: KeyedSubtree(
-              key: _homeDiscoverMoreKey,
-              child: IconButton(
-                onPressed: () => _openSectionDetail(
-                  context,
-                  _homeDiscoverMoreKey,
-                  (_) => const _HomeDiscoverDetailPage(),
-                ),
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ),
-            child: Padding(
-              // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
-              // 与其他区块一致的 16dp 页边距。
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: Column(
-                children: [
-                  for (var i = 0; i < top.length; i++)
-                    SongListItem(
-                      song: top[i],
-                      showDuration: false,
-                      // 与每日推荐一致：右侧仅收藏按钮，时长对"刷"没有参考价值。
-                      trailingActions: SongTrailingActions.favoriteOnly,
-                      // 走统一的 _play，卡片上点歌同样要装填补货器
-                      onTap: () => _play(i),
+            loading: _isLoading && details.isEmpty,
+            skeleton: const DiscoverSongRowsSkeleton(),
+            content: details.isEmpty
+                // 加载结束仍一首都没有：保持原隐身行为（淡出后塌成 0 高）。
+                ? const SizedBox.shrink()
+                : _SectionBlock(
+                    title: '刷歌推荐',
+                    trailing: KeyedSubtree(
+                      key: _homeDiscoverMoreKey,
+                      child: IconButton(
+                        onPressed: () => _openSectionDetail(
+                          context,
+                          _homeDiscoverMoreKey,
+                          (_) => const _HomeDiscoverDetailPage(),
+                        ),
+                        icon: const Icon(Icons.chevron_right),
+                      ),
                     ),
-                ],
-              ),
-            ),
+                    child: Padding(
+                      // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
+                      // 与其他区块一致的 16dp 页边距。
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      child: Column(
+                        children: [
+                          for (var i = 0; i < top.length; i++)
+                            SongListItem(
+                              song: top[i],
+                              showDuration: false,
+                              // 与每日推荐一致：右侧仅收藏按钮，时长对"刷"没有参考价值。
+                              trailingActions: SongTrailingActions.favoriteOnly,
+                              // 走统一的 _play，卡片上点歌同样要装填补货器
+                              onTap: () => _play(i),
+                              // 刻意不接 onArtistTap / onAlbumTap：刷歌定位是"划走就换"，
+                              // 点歌手/专辑跳出发现页会打断刷的节奏，副标题保持纯文本。
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
           ),
         );
       },
@@ -803,44 +831,51 @@ class _DiscoverPageState extends State<DiscoverPage>
     return Selector<KugouProvider, List<KugouSongDetail>>(
       selector: (_, kugou) => kugou.newSongs,
       builder: (context, details, _) {
-        if (details.isEmpty) return const SliverToBoxAdapter(child: SizedBox());
         final all = details.map((e) => e.toSong()).toList();
         final top = all.take(4).toList();
         return SliverToBoxAdapter(
-          child: _SectionBlock(
+          child: DiscoverSectionFadeSwap(
             title: '新歌速递',
-            trailing: KeyedSubtree(
-              key: _newSongMoreKey,
-              child: IconButton(
-                onPressed: () => _openSectionDetail(
-                  context,
-                  _newSongMoreKey,
-                  (_) => const _NewSongDetailPage(),
-                ),
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ),
-            child: Padding(
-              // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
-              // 与其他区块一致的 16dp 页边距。
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: Column(
-                children: [
-                  for (var i = 0; i < top.length; i++)
-                    SongListItem(
-                      song: top[i],
-                      showDuration: false,
-                      // 与每日推荐/刷歌一致：右侧仅收藏按钮。
-                      trailingActions: SongTrailingActions.favoriteOnly,
-                      // 不接 HomeDiscoverRefill / _play：这是固定榜单，点第 4 首
-                      // 之后接的是榜单第 5 首，不是「再刷一批」，续播器对它没有意义。
-                      onTap: () => context
-                          .read<PlayerProvider>()
-                          .playOnlinePlaylist(all, i),
+            loading: _isLoading && details.isEmpty,
+            skeleton: const DiscoverSongRowsSkeleton(),
+            content: details.isEmpty
+                // 榜单挂了：保持原隐身行为（淡出后塌成 0 高）。
+                ? const SizedBox.shrink()
+                : _SectionBlock(
+                    title: '新歌速递',
+                    trailing: KeyedSubtree(
+                      key: _newSongMoreKey,
+                      child: IconButton(
+                        onPressed: () => _openSectionDetail(
+                          context,
+                          _newSongMoreKey,
+                          (_) => const _NewSongDetailPage(),
+                        ),
+                        icon: const Icon(Icons.chevron_right),
+                      ),
                     ),
-                ],
-              ),
-            ),
+                    child: Padding(
+                      // SongListItem 自带 horizontal 10 的内边距，补 6 凑成
+                      // 与其他区块一致的 16dp 页边距。
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      child: Column(
+                        children: [
+                          for (var i = 0; i < top.length; i++)
+                            SongListItem(
+                              song: top[i],
+                              showDuration: false,
+                              // 与每日推荐/刷歌一致：右侧仅收藏按钮。
+                              trailingActions: SongTrailingActions.favoriteOnly,
+                              // 不接 HomeDiscoverRefill / _play：这是固定榜单，点第 4 首
+                              // 之后接的是榜单第 5 首，不是「再刷一批」，续播器对它没有意义。
+                              onTap: () => context
+                                  .read<PlayerProvider>()
+                                  .playOnlinePlaylist(all, i),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
           ),
         );
       },
@@ -909,6 +944,16 @@ class _DailyRecommendDetailPageState extends State<_DailyRecommendDetailPage> {
               builder: (context, recommendSongs, _) {
                 final songs = recommendSongs.map((e) => e.toSong()).toList();
                 if (songs.isEmpty) return const Center(child: Text('暂无数据'));
+                final hasCurrentSong = context.select<PlayerProvider, bool>(
+                  (player) => player.currentSong != null,
+                );
+                final miniPlayerInset =
+                    BottomChromeScope.playerContentBottomInsetOf(
+                      context,
+                      hasPlayer: hasCurrentSong &&
+                          !kTvBuild &&
+                          !isDesktopLayout(context),
+                    );
                 return Column(
                   children: [
                     // 播放全部：把当日的 30 首当一张歌单从头连播。
@@ -941,7 +986,11 @@ class _DailyRecommendDetailPageState extends State<_DailyRecommendDetailPage> {
                           AppSpacing.lg,
                           AppSpacing.sm,
                           AppSpacing.lg,
-                          AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                          AppSpacing.lg +
+                              math.max(
+                                MediaQuery.paddingOf(context).bottom,
+                                miniPlayerInset,
+                              ),
                         ),
                         itemCount: songs.length,
                         itemBuilder: (context, index) {
@@ -1209,11 +1258,12 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
                     (player) => player.currentSong != null,
                   );
                   final miniPlayerInset =
-                      hasCurrentSong &&
-                      kSecondaryPlayerEnabled.value &&
-                      !isDesktopLayout(context)
-                          ? BottomChromeDimens.discReservedBottom
-                          : 0.0;
+                      BottomChromeScope.playerContentBottomInsetOf(
+                        context,
+                        hasPlayer: hasCurrentSong &&
+                            !kTvBuild &&
+                            !isDesktopLayout(context),
+                      );
                   final listBottomPadding =
                       AppSpacing.lg +
                       math.max(
@@ -1262,12 +1312,15 @@ class _HomeDiscoverDetailPageState extends State<_HomeDiscoverDetailPage> {
                                 if (index == songs.length) {
                                   return _buildListFooter(context);
                                 }
+                                final song = songs[index];
                                 return SongListItem(
-                                  song: songs[index],
+                                  song: song,
                                   // 与每日推荐详情页一致：收藏 + 三点，无时长。
                                   trailingActions:
                                       SongTrailingActions.favoriteAndMore,
                                   onTap: () => _play(index),
+                                  // 与发现页卡片一致：刷歌区块不接歌手/专辑跳转，
+                                  // 副标题保持纯文本，避免点击跳出刷歌流程。
                                 );
                               },
                             ),
@@ -1479,6 +1532,16 @@ class _NewSongDetailPageState extends State<_NewSongDetailPage> {
                         ),
                       );
                     }
+                    final hasCurrentSong = context.select<PlayerProvider, bool>(
+                      (player) => player.currentSong != null,
+                    );
+                    final miniPlayerInset =
+                        BottomChromeScope.playerContentBottomInsetOf(
+                          context,
+                          hasPlayer: hasCurrentSong &&
+                              !kTvBuild &&
+                              !isDesktopLayout(context),
+                        );
                     return Column(
                       children: [
                         // 播放全部：与每日推荐详情页同形态（FilledButton.icon +
@@ -1533,7 +1596,10 @@ class _NewSongDetailPageState extends State<_NewSongDetailPage> {
                                 AppSpacing.sm,
                                 AppSpacing.lg,
                                 AppSpacing.lg +
-                                    MediaQuery.paddingOf(context).bottom,
+                                    math.max(
+                                      MediaQuery.paddingOf(context).bottom,
+                                      miniPlayerInset,
+                                    ),
                               ),
                               // +1 是底部哨兵行，兼作翻页指示与「没有更多」的落点。
                               itemCount: songs.length + 1,

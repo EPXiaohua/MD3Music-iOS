@@ -5,12 +5,17 @@ import 'dart:typed_data';
 import 'package:audio_session/audio_session.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dpad/dpad.dart';
+import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import '../../core/build_flags.dart';
+import '../../core/platform_capabilities.dart';
+import '../../core/services/windows_audio_input_device_service.dart';
+import '../../core/services/windows_system_audio_capture_service.dart';
+import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_toast.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../player/secondary_mini_player.dart';
@@ -19,11 +24,11 @@ import 'pip_recognition_controller.dart';
 import 'recognition_utils.dart';
 
 class SongRecognitionPage extends StatefulWidget {
-  /// 悬浮窗识别出的待展示结果（回前台/冷启动自动打开页面时传入，
-  /// 与 _processAndRecognize 保存的 _result 同构：完整 audioMatch 响应）。
-  final Map<String, dynamic>? initialResult;
-
+  /// 悬浮窗识别出的结果：自动打开页面时经 [initialResult] 传入直接展示
+  /// （iOS PiP 链路：PipRecognitionController.push 新页面时携带）。
   const SongRecognitionPage({super.key, this.initialResult});
+
+  final Map<String, dynamic>? initialResult;
 
   @override
   State<SongRecognitionPage> createState() => _SongRecognitionPageState();
@@ -38,6 +43,21 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   int _attemptCount = 0;
   String? _error;
   Map<String, dynamic>? _result;
+
+  /// Windows 端枚举到的录音端点；未加载时为空（只显示「跟随系统默认」）。
+  final List<WindowsAudioInputDevice> _inputDevices =
+      <WindowsAudioInputDevice>[];
+
+  /// 当前选中的录音端点；null = 跟随系统默认。
+  WindowsAudioInputDevice? _selectedInputDevice;
+
+  /// 当前音源（Windows 可切「麦克风 / 系统声音」，其它平台恒为麦克风）。
+  RecognitionAudioSource _source = RecognitionAudioSource.microphone;
+
+  /// 麦克风下拉条目。**稳定实例**，只在设备列表或选中项变化时整体重建
+  /// （M3EDropdownMenu 以列表同一性判断是否 setItems）。
+  List<M3EDropdownItem<String>> _inputDeviceItems =
+      _buildInputDeviceItems(const <WindowsAudioInputDevice>[], null);
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
 
@@ -76,10 +96,10 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
         if (r != null && mounted) setState(() => _result = r);
       });
     }
-  }
-
-  void _onFloatingRecognitionChanged() {
-    if (mounted) setState(() {});
+    if (isWindowsDesktop) {
+      unawaited(_refreshInputDevices());
+      unawaited(_restoreAudioSource());
+    }
   }
 
   /// 悬浮窗识别出结果的回调：本页在栈顶则直接展示并返回 true（防重复弹页）；
@@ -93,6 +113,62 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
       _error = null;
     });
     return true;
+  }
+
+  Future<void> _restoreAudioSource() async {
+    final source = await loadRecognitionAudioSource();
+    if (!mounted) return;
+    setState(() => _source = source);
+  }
+
+  /// 系统声音内录只在 Windows 成立（WASAPI 设备环回）。
+  bool get _usesSystemAudio =>
+      isWindowsDesktop && _source == RecognitionAudioSource.system;
+
+  /// 拉取持久化选择 + 当前设备列表；保存的设备已失效时静默回落系统默认。
+  Future<void> _refreshInputDevices() async {
+    final selectedId = await WindowsAudioInputDeviceService.selectedDeviceId();
+    final devices = await WindowsAudioInputDeviceService.listDevices();
+    if (!mounted) return;
+    setState(() {
+      _inputDevices
+        ..clear()
+        ..addAll(devices);
+      _selectedInputDevice = resolveInputDevice(devices, selectedId);
+      _rebuildInputDeviceItems();
+    });
+  }
+
+  /// 生成下拉条目：首项是「跟随系统默认」（值为空串）。
+  static List<M3EDropdownItem<String>> _buildInputDeviceItems(
+    List<WindowsAudioInputDevice> devices,
+    WindowsAudioInputDevice? selected,
+  ) {
+    final selectedId = selected?.id ?? '';
+    return [
+      M3EDropdownItem(
+        label: '跟随系统默认',
+        value: '',
+        selected: selectedId.isEmpty,
+      ),
+      for (final device in devices)
+        M3EDropdownItem(
+          label: device.isSystemDefault
+              ? '${device.name}（系统默认）'
+              : device.name,
+          value: device.id,
+          selected: device.id == selectedId,
+        ),
+    ];
+  }
+
+  void _rebuildInputDeviceItems() {
+    _inputDeviceItems =
+        _buildInputDeviceItems(_inputDevices, _selectedInputDevice);
+  }
+
+  void _onFloatingRecognitionChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -120,18 +196,10 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   }
 
   Future<void> _startRecognitionLoop() async {
-    if (!await _recorder.hasPermission()) {
-      try {
-        final status = await Permission.microphone.request();
-        if (!status.isGranted) {
-          setState(() => _error = '需要麦克风权限才能使用听歌识曲');
-          return;
-        }
-      } catch (_) {
-        setState(() => _error = '需要麦克风权限才能使用听歌识曲');
-        return;
-      }
-    }
+    // Windows 不走 Android 那套：record_windows 的 hasPermission 恒为 true，
+    // 真正的授权失败在 start() 时以 PlatformException（0x80070005）抛回，
+    // 由 describeRecordingStartError 翻成隐私设置指引。
+    if (!isWindowsDesktop && !await _ensureMicPermission()) return;
 
     setState(() {
       _error = null;
@@ -140,21 +208,34 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
       _attemptCount = 0;
     });
 
-    // 切换音频会话为录音模式
-    try {
-      final session = await AudioSession.instance;
-      await session.configure(const AudioSessionConfiguration(
-        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-        avAudioSessionMode: AVAudioSessionMode.defaultMode,
-        androidAudioAttributes: AndroidAudioAttributes(
-          contentType: AndroidAudioContentType.music,
-          usage: AndroidAudioUsage.media,
-        ),
-        androidWillPauseWhenDucked: false,
-      ));
-    } catch (_) {}
+    // 切换音频会话为录音模式（Android/iOS 概念，Windows 无对应实现）
+    if (!isWindowsDesktop) {
+      try {
+        final session = await AudioSession.instance;
+        await session.configure(const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+          avAudioSessionMode: AVAudioSessionMode.defaultMode,
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.music,
+            usage: AndroidAudioUsage.media,
+          ),
+          androidWillPauseWhenDucked: false,
+        ));
+      } catch (_) {}
+    }
 
     await _recordAndRecognizeSegment();
+  }
+
+  /// Android 侧麦克风权限：先问 record，再走 permission_handler 兜底。
+  Future<bool> _ensureMicPermission() async {
+    if (await _recorder.hasPermission()) return true;
+    try {
+      final status = await Permission.microphone.request();
+      if (status.isGranted) return true;
+    } catch (_) {}
+    if (mounted) setState(() => _error = '需要麦克风权限才能使用听歌识曲');
+    return false;
   }
 
   Future<void> _recordAndRecognizeSegment() async {
@@ -164,7 +245,9 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     if (elapsed >= _maxTotalDuration) {
       await _stopLoop();
       if (_result == null && _error == null) {
-        setState(() => _error = '未能识别出歌曲，请换个环境重试');
+        setState(() => _error = _usesSystemAudio
+            ? '未识别出系统声音：请确认有音乐正在播放（DRM 保护音轨与独占模式播放无法内录）'
+            : '未能识别出歌曲，请换个环境重试');
       }
       return;
     }
@@ -172,51 +255,14 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     _attemptCount++;
     print('[SongRecognition] === 第 $_attemptCount 轮，已用 ${elapsed}s / ${_maxTotalDuration}s ===');
 
+    if (_usesSystemAudio) {
+      await _systemAudioSegment();
+      return;
+    }
+
     final dir = await getTemporaryDirectory();
     final filePath = '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.wav';
-    try {
-      await _recorder.start(
-        RecordConfig(
-          encoder: AudioEncoder.wav,
-          sampleRate: _recordSampleRate,
-          numChannels: 1,
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
-          androidConfig: const AndroidRecordConfig(
-            // 使用 unprocessed 源获取原始麦克风信号，不经过系统降噪/增益处理
-            audioSource: AndroidAudioSource.unprocessed,
-            audioManagerMode: AudioManagerMode.modeNormal,
-          ),
-        ),
-        path: filePath,
-      );
-    } catch (e) {
-      // unprocessed 可能在部分设备不支持，回退到 mic
-      try {
-        await _recorder.start(
-          RecordConfig(
-            encoder: AudioEncoder.wav,
-            sampleRate: _recordSampleRate,
-            numChannels: 1,
-            autoGain: false,
-            echoCancel: false,
-            noiseSuppress: false,
-            androidConfig: const AndroidRecordConfig(
-              audioSource: AndroidAudioSource.mic,
-              audioManagerMode: AudioManagerMode.modeNormal,
-            ),
-          ),
-          path: filePath,
-        );
-      } catch (e2) {
-        setState(() {
-          _isLooping = false;
-          _error = '录音启动失败: $e2';
-        });
-        return;
-      }
-    }
+    if (!await _startRecorder(filePath)) return;
 
     setState(() {
       _isRecording = true;
@@ -258,6 +304,147 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
     }
   }
 
+  /// 启动录音。Android 保持 unprocessed → mic 的两级回退；
+  /// Windows 按 [kWindowsCaptureFormats] 逐个试设备原生格式
+  /// （MediaFoundation 不做重采样，不支持请求格式时 start 直接抛异常）。
+  Future<bool> _startRecorder(String filePath) async {
+    if (!isWindowsDesktop) {
+      try {
+        await _recorder.start(
+          RecordConfig(
+            encoder: AudioEncoder.wav,
+            sampleRate: _recordSampleRate,
+            numChannels: 1,
+            autoGain: false,
+            echoCancel: false,
+            noiseSuppress: false,
+            androidConfig: const AndroidRecordConfig(
+              // 使用 unprocessed 源获取原始麦克风信号，不经过系统降噪/增益处理
+              audioSource: AndroidAudioSource.unprocessed,
+              audioManagerMode: AudioManagerMode.modeNormal,
+            ),
+          ),
+          path: filePath,
+        );
+        return true;
+      } catch (_) {
+        // unprocessed 可能在部分设备不支持，回退到 mic
+        try {
+          await _recorder.start(
+            RecordConfig(
+              encoder: AudioEncoder.wav,
+              sampleRate: _recordSampleRate,
+              numChannels: 1,
+              autoGain: false,
+              echoCancel: false,
+              noiseSuppress: false,
+              androidConfig: const AndroidRecordConfig(
+                audioSource: AndroidAudioSource.mic,
+                audioManagerMode: AudioManagerMode.modeNormal,
+              ),
+            ),
+            path: filePath,
+          );
+          return true;
+        } catch (e) {
+          if (mounted) {
+            setState(() {
+              _isLooping = false;
+              _error = '录音启动失败: $e';
+            });
+          }
+          return false;
+        }
+      }
+    }
+
+    Object? lastError;
+    final selected = _selectedInputDevice;
+    for (final format in kWindowsCaptureFormats) {
+      try {
+        await _recorder.start(
+          RecordConfig(
+            encoder: AudioEncoder.wav,
+            sampleRate: format.sampleRate,
+            numChannels: format.channels,
+            autoGain: false,
+            echoCancel: false,
+            noiseSuppress: false,
+            device: selected == null
+                ? null
+                : InputDevice(id: selected.id, label: selected.name),
+          ),
+          path: filePath,
+        );
+        print('[SongRecognition] windows capture '
+            '${format.sampleRate}Hz/${format.channels}ch '
+            'device=${selected?.name ?? 'system-default'}');
+        return true;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _isLooping = false;
+        _error = describeRecordingStartError(lastError, windows: true);
+      });
+    }
+    return false;
+  }
+
+  /// 系统声音的一轮：内录 8s → 直接送指纹（无文件、无 WAV 头）。
+  Future<void> _systemAudioSegment() async {
+    if (!await WindowsSystemAudioCaptureService.start()) {
+      if (mounted) {
+        setState(() {
+          _isLooping = false;
+          _error = '无法开始内录：未找到默认播放设备；'
+              'DRM 保护音轨或独占模式播放同样无法采集';
+        });
+      }
+      return;
+    }
+
+    setState(() {
+      _isRecording = true;
+      _isRecognizing = false;
+      _error = null;
+    });
+    _pulseController.repeat(reverse: true);
+
+    await Future.delayed(const Duration(seconds: _segmentDuration));
+
+    final segment = await WindowsSystemAudioCaptureService.stop();
+    _pulseController.stop();
+
+    if (!_isLooping) return;
+
+    setState(() {
+      _isRecording = false;
+      _isRecognizing = true;
+    });
+
+    if (segment == null) {
+      await _recordAndRecognizeSegment();
+      return;
+    }
+
+    final recognized = await _recognizeBytes(
+      segment.pcm,
+      fallbackSampleRate: segment.sampleRate,
+    );
+
+    if (!_isLooping) return;
+
+    if (recognized) {
+      await _stopLoop();
+    } else {
+      await _recordAndRecognizeSegment();
+    }
+  }
+
   Future<bool> _processAndRecognize(String path) async {
     try {
       final file = File(path);
@@ -269,11 +456,36 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
 
       if (fileBytes.isEmpty) return false;
 
+      return await _recognizeBytes(
+        fileBytes,
+        fallbackSampleRate: _recordSampleRate,
+        isWavContainer: true,
+      );
+    } catch (e) {
+      print('[SongRecognition] 识别出错: $e');
+      return false;
+    }
+  }
+
+  /// 把一段音频（WAV 容器或裸 PCM16 单声道）交给指纹链路。
+  ///
+  /// - [fallbackSampleRate]：读不到 WAV 头时（裸 PCM）用的采样率；
+  /// - [isWavContainer]：true 才尝试解析 WAV 头拿真实采样率/声道数
+  ///   （Windows 录音生效格式由设备决定，只有文件头能确认）。
+  Future<bool> _recognizeBytes(
+    Uint8List bytes, {
+    required int fallbackSampleRate,
+    bool isWavContainer = false,
+  }) async {
+    try {
+      final wavInfo = isWavContainer ? parseWavInfo(bytes) : null;
+      final fromHz = wavInfo?.sampleRate ?? fallbackSampleRate;
+
       // 优先用本地 Rust 服务器做 PCM 前处理（WAV 解析 + 降采样 + 增益归一化），
       // 全程网络 IO + Rust 计算，不占用 UI isolate；服务器不可用时降级回 Dart 实现。
       final rustResult = await processPcmWithRust(
-        input: fileBytes,
-        fromHz: _recordSampleRate,
+        input: bytes,
+        fromHz: fromHz,
         toHz: _targetSampleRate,
       );
       Uint8List pcmData;
@@ -284,9 +496,12 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
         print('[SongRecognition] rust pcm: len=${pcmData.length} (${_targetSampleRate}Hz) maxAmp=$maxAmplitude');
       } else {
         // 降级：Dart 实现（原逻辑）
-        final rawPcm = _extractPcmFromWav(fileBytes);
-        print('[SongRecognition] fileBytes=${fileBytes.length}, rawPcm=${rawPcm.length} (${_recordSampleRate}Hz)');
-        pcmData = downsamplePcm(rawPcm, _recordSampleRate, _targetSampleRate);
+        var rawPcm = isWavContainer ? _extractPcmFromWav(bytes) : bytes;
+        final channels = wavInfo?.channels ?? 1;
+        if (channels > 1) rawPcm = downmixToMono(rawPcm, channels);
+        print('[SongRecognition] bytes=${bytes.length}, '
+            'rawPcm=${rawPcm.length} (${fromHz}Hz/${channels}ch)');
+        pcmData = downsamplePcm(rawPcm, fromHz, _targetSampleRate);
         print('[SongRecognition] dart pcm fallback: ${pcmData.length} bytes (${_targetSampleRate}Hz)');
         maxAmplitude = computeMaxAmplitude(pcmData);
         if (maxAmplitude >= kSilenceAmplitudeThreshold) {
@@ -331,10 +546,20 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
       await _recorder.stop();
     } catch (_) {}
 
-    try {
-      final session = await AudioSession.instance;
-      await session.configure(const AudioSessionConfiguration.music());
-    } catch (_) {}
+    // 麦克风走 record.stop()，内录必须单独收口：不停采集线程会一直跑到
+    // maxDurationMs 上限，用户点了停止却还在采。
+    if (_usesSystemAudio) {
+      try {
+        await WindowsSystemAudioCaptureService.stop();
+      } catch (_) {}
+    }
+
+    if (!isWindowsDesktop) {
+      try {
+        final session = await AudioSession.instance;
+        await session.configure(const AudioSessionConfiguration.music());
+      } catch (_) {}
+    }
 
     if (mounted) {
       setState(() {
@@ -381,7 +606,13 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
   Widget _buildRecognitionBody(ColorScheme colorScheme, TextTheme textTheme) {
     return Column(
         children: [
-          _buildFloatingEntry(colorScheme, textTheme),
+          // 悬浮窗识曲依赖 Android 悬浮窗权限 + MediaProjection，桌面端不出现
+          if (supportsFloatingSongRecognition)
+            _buildFloatingEntry(colorScheme, textTheme),
+          if (isWindowsDesktop) _buildAudioSourceSelector(),
+          // 设备选择只对麦克风有意义；内录固定跟随默认播放设备
+          if (isWindowsDesktop && !_usesSystemAudio)
+            _buildInputDeviceSelector(),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -487,6 +718,108 @@ class _SongRecognitionPageState extends State<SongRecognitionPage>
       case FloatingStartResult.failed:
         showToast('启动失败，请重试', long: true);
     }
+  }
+
+  /// Windows：音源二选一（与设置页「主题模式」同款 M3EToggleButtonGroup）。
+  /// 识别中禁用，避免一轮中途换源。
+  Widget _buildAudioSourceSelector() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      // 与设置页「主题模式」同宽：外层 Column 是居中对齐（松约束），
+      // 这里显式给满宽，组内两段才会像设置页那样铺开。
+      child: SizedBox(
+        width: double.infinity,
+        child: M3EToggleButtonGroup(
+          actions: [
+            M3EToggleButtonGroupAction(
+              label: const Text('麦克风'),
+              icon: const Icon(Icons.mic),
+              enabled: !_isLooping,
+            ),
+            M3EToggleButtonGroupAction(
+              label: const Text('系统声音'),
+              icon: const Icon(Icons.computer),
+              enabled: !_isLooping,
+            ),
+          ],
+          selectedIndex: _source == RecognitionAudioSource.system ? 1 : 0,
+          onSelectedIndexChanged: (index) {
+            if (index == null) return;
+            unawaited(_selectAudioSource(
+              index == 1
+                  ? RecognitionAudioSource.system
+                  : RecognitionAudioSource.microphone,
+            ));
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _selectAudioSource(RecognitionAudioSource source) async {
+    await saveRecognitionAudioSource(source);
+    if (!mounted) return;
+    setState(() => _source = source);
+  }
+
+  /// Windows：麦克风设备下拉（M3E 字段式下拉，单选）。
+  ///
+  /// `items` 必须是**稳定实例**：M3EDropdownMenu 以列表同一性判断是否 setItems，
+  /// 每次 build 新建列表会触发 build 期间回调互递归（真机 ANR）。故只在设备
+  /// 列表或选中项真正变化时整体重建（见 [_rebuildInputDeviceItems]）。
+  Widget _buildInputDeviceSelector() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: SizedBox(
+        width: double.infinity,
+        child: M3EDropdownMenu<String>(
+          items: _inputDeviceItems,
+          singleSelect: true,
+          // 单选下关闭 chip 动画，当前值才渲染为可省略的纯文本
+          showChipAnimation: false,
+          // 外层 20 = 条目外角 12 + 列表内边距 8，同心圆（默认 28 过大）
+          containerRadius: AppRadius.dropdownPanel,
+          enabled: !_isLooping,
+          fieldStyle: const M3EDropdownFieldStyle(
+            hintText: '选择麦克风设备',
+            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          ),
+          onSelectionChanged: _onInputDeviceSelected,
+        ),
+      ),
+    );
+  }
+
+  /// 下拉选中回调。
+  ///
+  /// 两个守卫缺一不可：
+  /// - 空选（单选下再点已选中项会取消选中）只重建条目，恢复原值；
+  /// - 同值守卫读**实时字段**而非闭包参数：setItems 会在 build 期间同步回调，
+  ///   闭包里的旧值会让守卫失效（见 comments_view 的同源教训）。
+  void _onInputDeviceSelected(List<M3EDropdownItem<String>> selected) {
+    if (selected.isEmpty) {
+      setState(_rebuildInputDeviceItems);
+      return;
+    }
+    final id = selected.first.value;
+    if (id == (_selectedInputDevice?.id ?? '')) return;
+    WindowsAudioInputDevice? device;
+    for (final candidate in _inputDevices) {
+      if (candidate.id == id) {
+        device = candidate;
+        break;
+      }
+    }
+    unawaited(_applyInputDevice(device));
+  }
+
+  Future<void> _applyInputDevice(WindowsAudioInputDevice? device) async {
+    await WindowsAudioInputDeviceService.selectDevice(device?.id);
+    if (!mounted) return;
+    setState(() {
+      _selectedInputDevice = device;
+      _rebuildInputDeviceItems();
+    });
   }
 
   Widget _buildPulseCircle(ColorScheme colorScheme) {

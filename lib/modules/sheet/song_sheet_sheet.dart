@@ -10,6 +10,7 @@ import '../../core/utils/app_toast.dart';
 import '../../data/models/song.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
+import '../../widgets/md3e_loading_indicator.dart';
 
 /// 曲谱类型：1 吉他 / 2 尤克里里 / 3 钢琴 / 4 简谱。
 const _kInstruments = <int, String>{1: '吉他', 2: '尤克里里', 3: '钢琴', 4: '简谱'};
@@ -206,7 +207,7 @@ class _SongSheetViewState extends State<SongSheetView> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const CircularProgressIndicator(),
+            const MD3ELoadingIndicator(),
             const SizedBox(height: 12),
             Text('曲谱加载中…',
                 style: textTheme.bodySmall
@@ -532,7 +533,7 @@ class _SheetRenderPageState extends State<SheetRenderPage> {
         children: [
           WebViewWidget(controller: _controller),
           if (_loading)
-            const Center(child: CircularProgressIndicator()),
+            const Center(child: MD3ELoadingIndicator()),
         ],
       ),
     );

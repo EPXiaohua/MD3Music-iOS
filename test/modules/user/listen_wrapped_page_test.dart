@@ -2,6 +2,7 @@ import 'dart:io';
 
 // 页面用 material_ui 的 Scaffold/AppBar（其本地化检查认自家类型），测试宿主
 // 必须同样用 material_ui 的 MaterialApp（不 import flutter/material）。
+import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -158,6 +159,35 @@ void main() {
       MaterialApp(home: ListenWrappedPage(db: db)),
     );
     await tester.pump(); // postFrameCallback 触发 _load
+  }
+
+  /// 派发一次鼠标滚轮事件并推过 320ms 翻页动画
+  /// （照 coverflow_wheel_test.scroll 先例：TestPointer.mouse + scroll）。
+  ///
+  /// 必须先 pump() 一次再 pump(settle)：AnimationController 驱动的翻页
+  /// Ticker 要先有一帧注册，单帧大跳时动画首帧都不推进。
+  Future<void> scrollWheel(WidgetTester tester, double dy,
+      {Duration settle = const Duration(milliseconds: 400)}) async {
+    final pointer = TestPointer(1, PointerDeviceKind.mouse)
+      ..hover(tester.getCenter(find.byType(PageView)));
+    // sendEventToBinding 是 guarded API，必须 await
+    await tester.sendEventToBinding(pointer.scroll(Offset(0, dy)));
+    await tester.pump();
+    await tester.pump(settle);
+  }
+
+  /// 快速连滚：间隔 50ms（Windows 连滚真实节奏），不打断翻页动画。
+  /// 事件间隔 < 120ms（滚轮空闲阈值）→ 基址不清，步数一路累加。
+  Future<void> scrollWheelFast(WidgetTester tester, List<double> dys) async {
+    for (final dy in dys) {
+      final pointer = TestPointer(1, PointerDeviceKind.mouse)
+        ..hover(tester.getCenter(find.byType(PageView)));
+      await tester.sendEventToBinding(pointer.scroll(Offset(0, dy)));
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    // 滚轮停后：推过空闲阈值（120ms）+ 翻页动画（320ms）
+    await tester.pump(const Duration(milliseconds: 150));
+    await tester.pump(const Duration(milliseconds: 400));
   }
 
   testWidgets('预置当年流水：7 张卡片、顺序正确、封面数值渲染', (tester) async {
@@ -323,5 +353,90 @@ void main() {
     // 年份胶囊展示的是去年而非当年
     expect(find.text('$lastYear'), findsOneWidget);
     expect(find.byType(PageView), findsOneWidget);
+  });
+
+  group('鼠标滚轮翻页（Windows 桌面，W8）', () {
+    testWidgets('滚轮向下翻到下一页', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+      expect(find.text('1 / 7'), findsOneWidget);
+
+      await scrollWheel(tester, 100);
+      expect(find.text('2 / 7'), findsOneWidget);
+    });
+
+    testWidgets('滚轮向上翻回封面页', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      await scrollWheel(tester, 100);
+      expect(find.text('2 / 7'), findsOneWidget);
+      await scrollWheel(tester, -100);
+      expect(find.text('1 / 7'), findsOneWidget);
+    });
+
+    testWidgets('封面页再向上滚：边界夹住不越界', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      await scrollWheel(tester, -100);
+      expect(find.text('1 / 7'), findsOneWidget);
+    });
+
+    testWidgets('触控板小步长增量累积到一格才翻页', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      // 30px × 4 次在第 4 次凑满一格（100px）翻页
+      await scrollWheel(tester, 30);
+      expect(find.text('1 / 7'), findsOneWidget);
+      await scrollWheel(tester, 30);
+      expect(find.text('1 / 7'), findsOneWidget);
+      await scrollWheel(tester, 30);
+      expect(find.text('1 / 7'), findsOneWidget);
+      await scrollWheel(tester, 30);
+      expect(find.text('2 / 7'), findsOneWidget);
+    });
+
+    testWidgets('快速连滚 4 格：目标基址累加不丢步', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      // 50ms 间隔连滚 4 格：事件间隔 < 120ms 空闲阈值，基址一路累加，
+      // 翻页动画（320ms）尚在中途也不丢步
+      await scrollWheelFast(tester, [100, 100, 100, 100]);
+      expect(find.text('5 / 7'), findsOneWidget);
+    });
+
+    testWidgets('滚轮停止 120ms 后基址作废：下次从静止位置重新计步', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      // 滚 2 格，scrollWheel 已推 400ms > 120ms，基址已清
+      await scrollWheel(tester, 100);
+      await scrollWheel(tester, 100);
+      expect(find.text('3 / 7'), findsOneWidget);
+
+      // 再滚 1 格：基址若未清会从 2 跳到 3+1=4；清了则从 3 起步到 4
+      await scrollWheel(tester, 100);
+      expect(find.text('4 / 7'), findsOneWidget);
+    });
+
+    testWidgets('结尾页再向下滚：边界夹住不越界', (tester) async {
+      await tester.runAsync(seedCurrentYear);
+      await pumpPage(tester);
+      await pumpUntil(tester, find.byKey(const ValueKey('wrapped_page_cover')));
+
+      // 先滚到结尾页（6 格），再多滚 2 格验证钳位
+      await scrollWheelFast(
+          tester, [for (var i = 0; i < 8; i++) 100.0]);
+      expect(find.text('7 / 7'), findsOneWidget);
+    });
   });
 }

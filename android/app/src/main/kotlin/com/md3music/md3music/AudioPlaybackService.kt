@@ -22,6 +22,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
@@ -29,6 +30,8 @@ import android.provider.Settings
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.media3.session.legacy.MediaBrowserCompat
+import androidx.media3.session.legacy.MediaDescriptionCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.embedding.engine.dart.DartExecutor
@@ -86,6 +89,11 @@ class AudioPlaybackService : Service() {
         const val EXTRA_IS_FAVORITED = "isFavorited"
         const val EXTRA_BT_LYRIC_TEXT = "btLyricText"
         const val EXTRA_BT_LYRIC_ENABLED = "btLyricEnabled"
+        // 适配 CarWith：车机投屏逐句歌词通道（小米 CarWith / Jovi InCar）。
+        // 名字逐字锁定：成品验收按字符串常量在 classes.dex 里回读这些串。
+        const val ACTION_UPDATE_CAR_LYRIC = "com.md3music.md3music.ACTION_UPDATE_CAR_LYRIC"
+        const val EXTRA_CAR_LYRIC_TEXT = "carLyricText"
+        const val EXTRA_CAR_LYRIC_ENABLED = "carLyricEnabled"
         // LyricInfo 歌词转发：通过 MediaSession 元数据 extras.lyricInfo 发布整首歌词
         const val ACTION_UPDATE_LYRIC_INFO = "com.md3music.md3music.ACTION_UPDATE_LYRIC_INFO"
         const val EXTRA_LYRIC_INFO = "lyricInfo"
@@ -117,6 +125,23 @@ class AudioPlaybackService : Service() {
         // MD3Music fork v45：原子随身听循环模式切换（MSS PLAY_MODE intent 转发进来）
         const val ACTION_VIVO_MIX_PLAY_MODE = "com.md3music.md3music.ACTION_VIVO_MIX_PLAY_MODE"
         const val EXTRA_VIVO_MIX_PLAY_MODE = "vivoMixPlayMode"
+        // MD3Music fork v66：车机语音点歌（MSS 的 playFromSearch 钩子转发进来）
+        const val ACTION_PLAY_FROM_SEARCH = "com.md3music.md3music.ACTION_PLAY_FROM_SEARCH"
+        const val EXTRA_SEARCH_QUERY = "searchQuery"
+        // MD3Music fork v67：legacy browse 搜索（候选列表）与候选项回播
+        const val ACTION_BROWSE_SEARCH = "com.md3music.md3music.ACTION_BROWSE_SEARCH"
+        const val EXTRA_SEARCH_REQUEST_ID = "searchRequestId"
+        const val ACTION_SEARCH_ITEM_PLAY = "com.md3music.md3music.ACTION_SEARCH_ITEM_PLAY"
+        const val EXTRA_SEARCH_ITEM_PAYLOAD = "searchItemPayload"
+        const val EXTRA_SEARCH_ITEM_EXPIRED = "searchItemExpired"
+
+        /**
+         * 车机下电暂停开关的 SharedPreferences key。
+         * Dart 侧对应 SettingsRepository._keyCarModePowerOffPause
+         * （settings_car_mode_power_off_pause），Flutter 插件写入时自动加 `flutter.` 前缀。
+         */
+        private const val PREF_CAR_POWER_OFF_PAUSE =
+            "flutter.settings_car_mode_power_off_pause"
 
         private const val TAG = "AudioPlaybackService"
 
@@ -516,6 +541,19 @@ class AudioPlaybackService : Service() {
                     Intent(context, AudioPlaybackService::class.java).apply { this.action = action }
                 )
             } catch (_: Exception) {}
+        }
+
+        /// 是否开启「熄火 / 关机时自动暂停」。默认 **false**（读不到、类型不符、
+        /// 取 SP 异常一律按关闭处理）——保证与历史版本行为完全一致。
+        ///
+        /// 每次信号到达时现读，所以设置页改开关**不需要**任何 MethodChannel 通知原生，
+        /// 也不需要重启进程（见 CarPowerSignal 的开关门）。
+        @JvmStatic
+        fun isCarPowerOffPauseEnabled(context: Context): Boolean = try {
+            context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                .getBoolean(PREF_CAR_POWER_OFF_PAUSE, false)
+        } catch (_: Exception) {
+            false
         }
 
         fun acquireWakeLock(context: Context) {
@@ -1175,11 +1213,25 @@ class AudioPlaybackService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** 「划掉后台自动退出」：支持该回调的 ROM 立即销毁，其余由任务移除监听服务兜底。 */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (SwipeExitPolicy.shouldSwipeExit(applicationContext)) {
+            RingLog.i("SwipeExit", "AudioPlaybackService.onTaskRemoved entered")
+            SwipeExitPolicy.executeExit(applicationContext)
+            return
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onCreate() {
         super.onCreate()
+        // 「划掉后台自动退出」：独立 stopWithTask 服务监听系统任务移除。
+        SwipeExitPolicy.startTaskRemovalService(applicationContext)
         createNotificationChannel()
         notificationManager = getSystemService(NotificationManager::class.java)
         registerReceiver()
+        // 车机下电暂停：无条件注册，开关在信号到达时判（保证开关即时生效）
+        registerCarPowerReceiver()
         // 锁屏歌词：动态注册 SCREEN_OFF/SCREEN_ON 广播（前台服务存活期间注册，
         // 比 manifest 静态广播在 MIUI 等 ROM 上更可靠）
         try {
@@ -1266,6 +1318,13 @@ class AudioPlaybackService : Service() {
                 override fun onToggleFavorite() {
                     handleAction(ACTION_TOGGLE_FAVORITE)
                 }
+                // MD3Music fork v64：原子随身听 ❤️ 收藏（岛经 setRating 发 HeartRating，
+                // 带的是"目标态"而不是 toggle 意图）。不走通知栏 toggleFavorite 那条链
+                // —— 它依赖 navigator 上下文，后台引擎（App 未起界面）下取不到就静默
+                // 失败，表现为岛上点红心毫无反应。
+                override fun onSetFavorite(favorite: Boolean) {
+                    dispatchVivoMixRating(favorite)
+                }
                 // MD3Music fork v45：原子随身听循环模式切换（岛 PLAY_MODE 命令）。
                 override fun onPlayMode(mode: Int) {
                     dispatchVivoMixPlayMode(mode)
@@ -1277,6 +1336,12 @@ class AudioPlaybackService : Service() {
                 override fun onPause() {
                     Log.i(TAG, "Media3 user pause intent forwarded to Flutter")
                     handleAction(ACTION_PAUSE)
+                }
+                // Issue #190：Dart 暂停会作废播放请求；Media3 恢复播放必须让 Dart
+                // 重新走 resume()。复用媒体键队列，保留 commandId、重试与 headless 唤醒。
+                override fun onPlay() {
+                    Log.i(TAG, "Media3 user play intent forwarded to Flutter")
+                    handleMediaButtonCommand("play")
                 }
             })
         } catch (_: Throwable) {}
@@ -1372,6 +1437,30 @@ class AudioPlaybackService : Service() {
                     intent?.getIntExtra(EXTRA_VIVO_MIX_PLAY_MODE, 1) ?: 1)
                 return START_NOT_STICKY
             }
+            // MD3Music fork v66：车机语音点歌——转 Dart 按关键词搜索并起播。
+            ACTION_PLAY_FROM_SEARCH -> {
+                dispatchPlayFromSearch(intent?.getStringExtra(EXTRA_SEARCH_QUERY))
+                return START_NOT_STICKY
+            }
+            // MD3Music fork v67：legacy browse 搜索——Dart 回包后由本服务结算 legacy Result。
+            ACTION_BROWSE_SEARCH -> {
+                dispatchBrowseSearch(
+                    intent?.getStringExtra(EXTRA_SEARCH_QUERY),
+                    intent?.getStringExtra(EXTRA_SEARCH_REQUEST_ID),
+                )
+                return START_NOT_STICKY
+            }
+            // MD3Music fork v67：桥接端点回候选条目（mediaId = md3srch:<n>）。
+            ACTION_SEARCH_ITEM_PLAY -> {
+                if (intent?.getBooleanExtra(EXTRA_SEARCH_ITEM_EXPIRED, false) == true) {
+                    dispatchSearchItemExpired()
+                } else {
+                    dispatchSearchItemPlay(
+                        intent?.getBundleExtra(EXTRA_SEARCH_ITEM_PAYLOAD),
+                    )
+                }
+                return START_NOT_STICKY
+            }
             ACTION_MEDIA_BUTTON -> {
                 // 线控耳机唤醒播放：先保证前台服务状态（startForegroundService 必须尽快
                 // 调用 startForeground，否则 Android 12+ 会抛 ForegroundServiceDidNotStartInTimeException）
@@ -1391,6 +1480,14 @@ class AudioPlaybackService : Service() {
             ACTION_SET_BT_LYRIC_ENABLED -> {
                 bluetoothLyricEnabled = intent?.getBooleanExtra(EXTRA_BT_LYRIC_ENABLED, false) ?: false
                 refreshMetadata()
+                return START_STICKY
+            }
+            // 适配 CarWith：车机投屏逐句歌词（前台 MainActivity / headless 通道都汇到这里）。
+            ACTION_UPDATE_CAR_LYRIC -> {
+                applyCarWithLyricLine(
+                    intent?.getStringExtra(EXTRA_CAR_LYRIC_TEXT) ?: "",
+                    intent?.getBooleanExtra(EXTRA_CAR_LYRIC_ENABLED, false) ?: false,
+                )
                 return START_STICKY
             }
             ACTION_UPDATE_LYRIC_INFO -> {
@@ -1566,6 +1663,158 @@ class AudioPlaybackService : Service() {
         }
     }
 
+    // MD3Music fork v64：岛 ❤️ 收藏目标态 → 转发 Dart（Dart 按目标态收藏/取消）。
+    // 与 dispatchVivoMixPlayMode 同链路：MethodChannel 打到 Flutter 引擎。
+    private fun dispatchVivoMixRating(favorite: Boolean) {
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null) {
+            return
+        }
+        runOnMainThread {
+            MethodChannel(
+                engine.dartExecutor.binaryMessenger,
+                "com.md3music.md3music/floating_lyric",
+            ).invokeMethod("vivoMixRating", mapOf("favorite" to favorite))
+        }
+    }
+
+    /// MD3Music fork v66：车机语音点歌——把关键词转给 Dart（搜索 + 打分择优 + 整批入队）。
+    /// 与 vivo 点播同口径：引擎不可用直接丢弃（会话由该引擎创建，引擎在则会话在）。
+    /// `playFromSearch` 没有标准失败回调，成败反馈只能靠 Dart 侧 toast。
+    private fun dispatchPlayFromSearch(query: String?) {
+        if (query.isNullOrBlank()) return
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null) {
+            Log.w(TAG, "playFromSearch dropped: no engine, q=$query")
+            return
+        }
+        runOnMainThread {
+            MethodChannel(engine.dartExecutor.binaryMessenger, "com.md3music.md3music/floating_lyric")
+                .invokeMethod("playFromSearch", mapOf("query" to query))
+        }
+    }
+
+    /// MD3Music fork v67：legacy browse 搜索——Dart 返回候选列表后转成 legacy
+    /// MediaItem 并结算 Result。空结果必须回 emptyList()：回 null 会被框架转成
+    /// RESULT_ERROR，桥接端会当成"搜索未实现"而关闭入口。
+    private fun dispatchBrowseSearch(query: String?, requestId: String?) {
+        if (requestId.isNullOrEmpty()) return
+        if (query.isNullOrBlank()) {
+            BrowseSearchRegistry.settleEmpty(requestId)
+            return
+        }
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null) {
+            Log.w(TAG, "browseSearch dropped: no engine, q=$query")
+            BrowseSearchRegistry.settleEmpty(requestId)
+            return
+        }
+        runOnMainThread {
+            try {
+                MethodChannel(
+                    engine.dartExecutor.binaryMessenger,
+                    "com.md3music.md3music/floating_lyric",
+                ).invokeMethod(
+                    "browseSearch",
+                    mapOf("query" to query, "requestId" to requestId),
+                    object : MethodChannel.Result {
+                        override fun success(result: Any?) {
+                            BrowseSearchRegistry.settle(requestId, buildSearchItems(result))
+                        }
+
+                        override fun error(
+                            errorCode: String,
+                            errorMessage: String?,
+                            errorDetails: Any?,
+                        ) {
+                            Log.w(TAG, "browseSearch error: $errorCode $errorMessage")
+                            BrowseSearchRegistry.settleEmpty(requestId)
+                        }
+
+                        override fun notImplemented() {
+                            Log.w(TAG, "browseSearch notImplemented")
+                            BrowseSearchRegistry.settleEmpty(requestId)
+                        }
+                    },
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "browseSearch invoke failed", t)
+                BrowseSearchRegistry.settleEmpty(requestId)
+            }
+        }
+    }
+
+    /// 把 Dart 回传的 `List<Map>` 转成 legacy 候选条目。
+    /// mediaId 用不透明序号 `md3srch:<n>`，完整 payload 存进 BrowseSearchRegistry，
+    /// 供后续 playFromMediaId 回播时精确还原（hash/albumId/albumAudioId 缺一不可）。
+    private fun buildSearchItems(raw: Any?): List<MediaBrowserCompat.MediaItem> {
+        val list = raw as? List<*> ?: return emptyList()
+        val items = ArrayList<MediaBrowserCompat.MediaItem>(list.size)
+        for (entry in list) {
+            val map = entry as? Map<*, *> ?: continue
+            val hash = map["id"] as? String
+            if (hash.isNullOrEmpty()) continue
+            val payload = hashMapOf<String, Any?>(
+                "id" to hash,
+                "title" to map["title"],
+                "artist" to map["artist"],
+                "album" to map["album"],
+                "albumId" to map["albumId"],
+                "albumAudioId" to map["albumAudioId"],
+                "artworkUri" to map["artworkUri"],
+                "durationMs" to map["durationMs"],
+            )
+            val mediaId = BrowseSearchRegistry.putPayload(payload)
+            val builder = MediaDescriptionCompat.Builder().setMediaId(mediaId)
+            (map["title"] as? String)?.let { builder.setTitle(it) }
+            (map["artist"] as? String)?.let { builder.setSubtitle(it) }
+            (map["artworkUri"] as? String)?.let { builder.setIconUri(Uri.parse(it)) }
+            val extras = Bundle()
+            (map["durationMs"] as? Number)?.let { extras.putLong("duration_ms", it.toLong()) }
+            builder.setExtras(extras)
+            items.add(
+                MediaBrowserCompat.MediaItem(
+                    builder.build(),
+                    MediaBrowserCompat.MediaItem.FLAG_PLAYABLE,
+                )
+            )
+        }
+        return items
+    }
+
+    /// MD3Music fork v67：桥接端点回候选条目——payload 原样回传 Dart 起播。
+    private fun dispatchSearchItemPlay(payload: Bundle?) {
+        val engine = flutterEngine ?: staticFlutterEngine
+        if (engine == null || payload == null) {
+            dispatchSearchItemExpired()
+            return
+        }
+        val args = HashMap<String, Any?>()
+        for (key in payload.keySet()) {
+            when (val value = payload.get(key)) {
+                is String -> args[key] = value
+                is Int -> args[key] = value
+                is Long -> args[key] = value
+                is Double -> args[key] = value
+                is Boolean -> args[key] = value
+                else -> Unit
+            }
+        }
+        runOnMainThread {
+            MethodChannel(engine.dartExecutor.binaryMessenger, "com.md3music.md3music/floating_lyric")
+                .invokeMethod("searchResultPlay", args)
+        }
+    }
+
+    /// MD3Music fork v67：候选条目已失效（进程重启 / TTL 过期 / 无引擎）——提示重搜。
+    private fun dispatchSearchItemExpired() {
+        val engine = flutterEngine ?: staticFlutterEngine ?: return
+        runOnMainThread {
+            MethodChannel(engine.dartExecutor.binaryMessenger, "com.md3music.md3music/floating_lyric")
+                .invokeMethod("searchItemExpired", null)
+        }
+    }
+
     /// 解决方案B阶段5：前台服务保活通知。
     /// 展示层已由媒体3 now-playing 通知（MD3MusicMediaSessionService）承载，本服务仍需保持前台
     /// （后台 Flutter 引擎/WakeLock 保活）。
@@ -1688,6 +1937,14 @@ class AudioPlaybackService : Service() {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "media command dispatch failed: $e")
+                // 此前只进 logcat，环形与落盘双盲（2026-11-05 报告问题 #3）：
+                // 信号到了但派发炸掉时，诊断包同样无从判断，这里补齐。
+                // 罕见事件（派发重试全失败才走到），不违反 RingLog 低频约束。
+                RingLog.e("MediaCmd", "media command dispatch failed", e)
+                CarPowerLogFile.write(
+                    this@AudioPlaybackService,
+                    "dispatch failed (cmd queue): ${e.message}"
+                )
                 mediaCommandQueue.discardPending()
             } finally {
                 if (mediaCommandQueue.finishDispatch()) launchMediaCommandDispatcher()
@@ -1742,6 +1999,12 @@ class AudioPlaybackService : Service() {
             if (!delivered) {
                 mediaCommandQueue.dropIfPending(command.id)
                 Log.e(TAG, "media command ${command.method} exhausted retries")
+                // 罕见事件（重试全失败），走 RingLog 合规；落盘供断电后取证。
+                RingLog.e("MediaCmd", "media command ${command.method} exhausted retries")
+                CarPowerLogFile.write(
+                    this@AudioPlaybackService,
+                    "dispatch exhausted retries: ${command.method}"
+                )
             }
         }
     }
@@ -2018,6 +2281,15 @@ class AudioPlaybackService : Service() {
                         refreshMetadata()
                         result.success(true)
                     }
+                    // 适配 CarWith：车机投屏逐句歌词——headless 无 Activity，不过 Intent，
+                    // 直接进程内调同一落点（与前台 MainActivity→ACTION 路径行为一致）。
+                    "updateCarWithLyricLine" -> {
+                        applyCarWithLyricLine(
+                            call.argument<String>("lyric") ?: "",
+                            call.argument<Boolean>("enabled") ?: false,
+                        )
+                        result.success(true)
+                    }
                     // 锁屏歌词：开关 / 数据推送（正常启动走 MainActivity，headless 在此兜底）
                     "showLockScreenLyric" -> {
                         result.success(true)
@@ -2167,6 +2439,9 @@ class AudioPlaybackService : Service() {
             registerLyriconChannel(engine)
             // SuperLyric channel 原生 handler 同样只能在 headless 场景下在此注册
             registerSuperLyricChannel(engine)
+            // 适配 CarWith：headless 引擎同样要能读连接态/车机深浅色（主题跟随、
+            // 歌词心跳都靠 Dart 侧这条通道取快照），与 MainActivity 用同一注册函数。
+            CarWithState.register(engine, applicationContext)
             // 魅族状态栏歌词：headless 引擎同样需要，否则后台切歌时收不到歌词行推送
             FlymeLyricBridge.registerChannel(engine, applicationContext)
             restoreLyriconStateIfNeeded()
@@ -2201,6 +2476,95 @@ class AudioPlaybackService : Service() {
 
     fun setFlutterEngine(engine: FlutterEngine) {
         flutterEngine = engine
+    }
+
+    /**
+     * 车机下电 / 息屏信号接收器。
+     *
+     * 为什么单独注册、不复用下面那个 widget 动作接收器：那个是
+     * RECEIVER_NOT_EXPORTED（只认同包广播），车机系统应用发不过来；
+     * 若把本组 action 塞进去，只能整组放开导出，等于让任意应用都能触发切歌。
+     */
+    private var carPowerReceiver: CarPowerReceiver? = null
+
+    /**
+     * 注册车机信号接收器（**无条件**注册，开关在信号到达时才判）。
+     *
+     * 为什么不在注册时按开关决定：那样开关变成"冷配置"，用户打开开关后必须重启进程
+     * 才生效——上车一试没反应，看起来就是坏了。无条件注册的代价只是一个常驻 filter
+     * （无唤醒、无 IPC），换来开关**即时生效**，值。
+     */
+    private fun registerCarPowerReceiver() {
+        if (carPowerReceiver != null) return
+        val enabled = isCarPowerOffPauseEnabled(this)
+        RingLog.i(
+            "CarPower",
+            "receiver init: pauseEnabled=$enabled"
+        )
+        // 落盘留证：环形缓冲随进程死亡灭失，熄火前的注册状态必须留到下次上电
+        CarPowerLogFile.write(this, "receiver init: pauseEnabled=$enabled")
+        val candidate = CarPowerReceiver { action -> handleCarPowerSignal(action) }
+        val filter = IntentFilter().apply {
+            CarPowerSignal.ALL_ACTIONS.forEach { addAction(it) }
+        }
+        try {
+            // 必须 EXPORTED：车机厂商广播来自别的应用（不同 uid）。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(candidate, filter, RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(candidate, filter)
+            }
+            carPowerReceiver = candidate
+            RingLog.i("CarPower", "receiver registered: ${CarPowerSignal.ALL_ACTIONS}")
+            CarPowerLogFile.write(this, "receiver registered: ${CarPowerSignal.ALL_ACTIONS}")
+        } catch (t: Throwable) {
+            RingLog.e("CarPower", "receiver register failed", t)
+            CarPowerLogFile.write(this, "receiver register failed: ${t.message}")
+        }
+    }
+
+    private fun unregisterCarPowerReceiver() {
+        carPowerReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {}
+        }
+        carPowerReceiver = null
+    }
+
+    /**
+     * 车机信号总入口：判开关 → 写诊断日志 → 判播放态 → 派发。
+     *
+     * 开关关闭时**内存/Logcat 保持静默**（RingLog 不写，保证"关闭 = 与旧版本无差别"），
+     * 但落盘文件 [CarPowerLogFile] 仍记一行到达：否则下次拿诊断包无法区分
+     * "开关没开所以没动作" 与 "车机压根没发广播"——这正是 2026-11-05 报告的问题 #2 盲区。
+     * 频度=厂商广播到达次数（熄火一次 ≤3 行），成本可忽略。
+     *
+     * 开关开启时的日志走 [RingLog]（Log.i + 进程内环形缓冲双写）+ 落盘双通道：
+     * 环形给"当场看"，落盘给"断电后看"。
+     */
+    private fun handleCarPowerSignal(action: String) {
+        if (!isCarPowerOffPauseEnabled(this)) {
+            CarPowerLogFile.write(this, "signal arrived (switch off): action=$action")
+            return
+        }
+        // 仅观测类（SCREEN_OFF/ON）：只留时序证据，绝不动作
+        if (CarPowerSignal.shouldObserve(action)) {
+            RingLog.i("CarPower", "observe $action playing=$isNowPlaying")
+            CarPowerLogFile.write(this, "observe $action playing=$isNowPlaying")
+            return
+        }
+        val command = CarPowerSignal.commandFor(action, enabled = true) ?: return
+        if (!isNowPlaying) {
+            RingLog.i("CarPower", "signal ignored (not playing): action=$action")
+            CarPowerLogFile.write(this, "signal ignored (not playing): action=$action")
+            return
+        }
+        RingLog.i("CarPower", "power-down -> dispatch $command (action=$action)")
+        CarPowerLogFile.write(this, "power-down -> dispatch $command (action=$action)")
+        // 复用线控同一条 Dart 派发链：Dart 侧 pause 会同步通知、媒体会话与播放状态，
+        // 直接在原生层 pause 播放器会造成「通知栏还在播 / 进度条不动」的状态撕裂。
+        handleMediaButtonCommand(command)
     }
 
     private fun registerReceiver() {
@@ -2425,7 +2789,7 @@ class AudioPlaybackService : Service() {
             }
             else -> artUri
         }
-        // 边听边存兜底：如果是图片文件（jpg/png/webp），直接 decodeFile；
+        // 封面兜底：如果是图片文件（jpg/png/webp），直接 decodeFile；
         // 否则当作音频文件用 MediaMetadataRetriever 读内嵌封面
         val lower = filePath.lowercase()
         if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
@@ -2572,10 +2936,13 @@ class AudioPlaybackService : Service() {
         // 二次 updateActiveSessionMetadata 补全 bitmap——两发合并，仍满足 P0 的
         // "首帧即封面"口径（第一发只到 title/artist，封面位空）。若 SystemUI 出现
         // "控制中心封面闪空后不再补全"的老病，回滚本段即可。
+        // v67：改走 prewrite 变体——切歌瞬间 item 还是上一首，常规严格身份校验会
+        // 把新歌标题当"不匹配数据"丢弃（车机"很久才切换、一直显示上一首"的根因），
+        // prewrite 仅保留 generation 守卫。
         if (!isMetadataRequestCurrent(requestMediaId, requestGeneration)) {
             // 已是旧请求：连轻量首帧都不必发。
         } else {
-            AudioPlayer.updateActiveSessionTitleArtist(
+            AudioPlayer.prewriteActiveSessionTitleArtist(
                 requestMediaId, requestGeneration, displayTitle, displayArtist)
         }
         if (!effectiveArtUrl.isNullOrEmpty()) {
@@ -2718,6 +3085,30 @@ class AudioPlaybackService : Service() {
         if (btLyricRewriteActive())
             (if (originalArtist.isNotEmpty()) "$originalArtist - $originalTitle" else originalTitle)
         else originalArtist
+
+    /// 适配 CarWith：车机投屏逐句歌词的原生落点（前台 Intent 与 headless 通道共用）。
+    ///
+    /// 三步：
+    ///   1) **现读**一次连接态并刷新 vendored 门控位 AudioPlayer.sCarWithConnected——
+    ///      Dart 心跳有 2 秒窗口，连/断瞬间歌词推送必须以自己的读数为准；
+    ///   2) 把歌词行交给 vendored 层（ucar 三条歌词键的写入/清除都在里面）；
+    ///   3) 复用既有 300ms 合并窗口排期一次元数据刷新。
+    ///
+    /// 关开关（enabled=false）同样走完三步、text 传空串：车机歌词要**收掉**
+    /// 而不是停在最后一句；连接态已翻转时 vendored 层会按门控清掉连着时写过的键。
+    /// 不判 connected 再转发：车机侧行为全部由门控位在 vendored 层把关，
+    /// 这里再判一次反而会在「读数滞后翻转」时漏掉那次必须发出的清除提交。
+    private fun applyCarWithLyricLine(text: String, enabled: Boolean) {
+        // 1) 门控刷新（snapshot 内部全程兜底，失败即 connected=false）
+        CarWithState.snapshot(applicationContext)
+        // 2) 歌词行交给 vendored 层——必须在排期之前：合并窗口到期执行
+        //    performMetadataRefresh 时读的就是这里刚写入的静态位。
+        //    关开关时不采信 Dart 随句推来的文本，原生侧强制空串，保证车机收到的是
+        //    「清除」而不是「最后一句挂成整首」。
+        runCatching { AudioPlayer.updateCarLyricLine(enabled, if (enabled) text else "") }
+        // 3) 复用蓝牙歌词同款合并窗口，窗口内多次推句只刷一次元数据
+        scheduleMetadataRefresh()
+    }
 
     /// 蓝牙歌词轻量刷新：歌词行变化或开关切换时，复用缓存的 bitmap 和播放状态
     /// 重建通知和 MediaSession 元数据，不重新下载封面。
@@ -2865,6 +3256,7 @@ class AudioPlaybackService : Service() {
             generation == metadataGeneration
 
     override fun onDestroy() {
+        unregisterCarPowerReceiver()
         receiver?.let {
             try {
                 unregisterReceiver(it)

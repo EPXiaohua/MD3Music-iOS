@@ -136,6 +136,13 @@ abstract interface class McpLibrarySource {
   /// 按关键词搜索歌单。
   Future<List<KugouPlaylistBrief>?> searchPlaylists(String keyword, {int limit = 10});
 
+  /// 当前登录账号自己的歌单（`/user/playlist`，含 `listId` 数字 ID）。
+  ///
+  /// 存在的理由：`md3_search_playlists` 是**全局**搜索，条目里没有可用的
+  /// listid，AI 无法据此调 `md3_add_song_to_playlist`（实测缺口）。本方法
+  /// 只返回当前账号名下可写的歌单，投影口径与「添加到歌单」对话框一致。
+  Future<List<KugouPlaylistBrief>> getUserPlaylists({int limit = 30});
+
   /// 按歌单 global_collection_id 取第 1 页歌曲（最多 [limit] 首）。
   Future<KugouPlaylistSongs?> getPlaylistSongs(String globalCollectionId,
       {int limit = 30});
@@ -174,10 +181,15 @@ abstract interface class McpLibraryWriteSource {
   ///
   /// 上游 data 契约为 `名称|hash|专辑id|mixsongid`，歌名/专辑信息由实现方
   /// 经歌曲详情补齐；detail 拿不到或上游拒绝时抛异常（工具层转为可读错误）。
-  Future<void> addSongToPlaylist(String hash, String listid);
+  /// [enriched] 为调用方（工具层）经 `McpLibrarySource.getSongDetail` 补齐
+  /// 封面/albumAudioId/albumId 后的详情；传入时实现方直接复用，不再裸取
+  /// /audio（裸取的 audio_id 与 MixSongID 不同域，issue #216）。
+  Future<void> addSongToPlaylist(String hash, String listid,
+      {KugouSongDetail? enriched});
 
-  /// 新建名为 [name] 的歌单（需要登录）。
-  Future<void> createPlaylist(String name);
+  /// 新建名为 [name] 的歌单（需要登录）。返回新歌单的 listid（上游
+  /// `add_list` 响应 data.listid；解析失败返回 null，不影响创建结果）。
+  Future<String?> createPlaylist(String name);
 }
 
 /// App 功能快照（睡眠定时/均衡器/桌面歌词/输出模式）。

@@ -2,6 +2,7 @@ import 'dart:html' as html;
 
 import 'package:just_audio/just_audio.dart';
 
+import 'accompany_mix.dart';
 import 'diagnostic_logger.dart';
 import 'playback_command_dispatcher.dart';
 
@@ -55,6 +56,44 @@ class AudioService {
   List<int> get androidAudioSessionIds => const [];
 
   Stream<List<int>> get androidAudioSessionIdsStream => const Stream.empty();
+
+  // ==== 伴唱（伴奏轨）====
+  //
+  // Web 端不实现伴唱：浏览器同页多路音频的混音与音量比例无法在此层可靠控制
+  // （且 Web 端整体功能可用性有限）。API 保持与 io 端同名同签名，
+  // 使上层（PlayerProvider / UI）无需按平台分支。
+
+  /// 伴唱模式是否已开启（Web 端恒为 false）。
+  bool get accompanyActive => false;
+
+  /// 端侧分离是否已开启（Web 端恒为 false）。
+  bool get stemSeparationActive => false;
+
+  /// 当前伴唱混音比例（Web 端恒为 null）。
+  AccompanyMix? get accompanyMix => null;
+
+  /// 原曲音量占比（Web 端恒为 1.0）。
+  double get originalVolumeScale => 1.0;
+
+  /// 开启伴唱（Web 端不支持，直接返回 false）。
+  Future<bool> startAccompany(
+    String url, {
+    required AccompanyMix mix,
+    required Duration position,
+    double speed = 1.0,
+  }) async => false;
+
+  /// 关闭伴唱（Web 端无伴唱，空操作）。
+  Future<void> stopAccompany() async {}
+
+  /// 开启端侧分离（Web 端不支持，直接返回 false）。
+  Future<bool> startStemSeparation({required double mix}) async => false;
+
+  /// 关闭端侧分离（Web 端无分离，空操作）。
+  Future<void> stopStemSeparation() async {}
+
+  /// 设置端侧分离的伴奏占比（Web 端无分离，空操作）。
+  Future<void> setStemMix(double mix) async {}
 
   Future<void> init() async {
     await _player.setLoopMode(LoopMode.off);

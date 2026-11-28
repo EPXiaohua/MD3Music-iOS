@@ -12,8 +12,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../update/release_version.dart';
 import '../update/update_web_links.dart';
 import '../../core/services/usb_audio_service.dart';
+import '../../core/services/accompany/accompany_source.dart';
+import '../../core/services/stem_separation_service.dart';
 import '../../core/services/windows_app_lifecycle.dart';
 
 import '../../core/build_flags.dart';
@@ -23,8 +26,10 @@ import '../../core/layout/page_layout.dart';
 import '../../core/layout/ui_density.dart';
 import '../../core/remote/remote_slider.dart';
 import '../../core/services/audio_service_io.dart';
+import '../../core/services/audio_offload_service.dart';
 import '../../core/services/volume_normalization_service.dart';
 import '../../core/services/background_image_loader.dart';
+import '../../core/services/car_with_service.dart';
 import '../../core/widgets/app_background.dart' show kDefaultWallpaperAsset;
 import '../../core/services/custom_font_loader.dart';
 import '../../core/utils/app_toast.dart';
@@ -67,6 +72,7 @@ import '../../core/services/depth_cover_feature.dart';
 import '../../utils/landscape_immersive.dart';
 import '../../widgets/player_top_bar_actions.dart';
 import '../../widgets/player_top_bar_tab_dots.dart';
+import '../../widgets/apple_lyrics/layout/lyric_aux_scope.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/utils/lyric_credit_filter.dart';
 import '../../widgets/md3_lyric_preferences.dart';
@@ -129,14 +135,51 @@ const M3ESliderDecoration kFreeSliderDecoration = M3ESliderDecoration(
   ),
 );
 
+/// 只在支持小米 CarWith 的平台（`supportsCarWith` = Android）才存在的搜索条目。
+///
+/// **为什么不进生成器**：`scripts/tools/gen_settings_search_index.dart` 是开发期
+/// 静态工具，只认 `kTvBuild` 一类编译期 const 旗标，看不穿运行时平台判定，
+/// 产物（索引）因此是全构建共用的编译期常量 —— CarWith 两条必须始终留在索引里
+/// 供 Android 用，只能由消费端 `_searchResults` 在非 CarWith 平台过滤掉，
+/// 否则桌面端搜「CarWith」会跳到一个根本不渲染的设置项。
+/// 名单与 `test/modules/settings/carwith_search_index_test.dart` 双向往返核对。
+const Set<String> kCarWithOnlySearchLabels = {
+  '显示CarWith / Jovi InCar歌词',
+  '跟随CarWith',
+};
+
+/// 车机两项 UI 入口（主题第二排那枚芯片 + 设备歌词开关）是否渲染。
+///
+/// **为什么在 `supportsCarWith` 之外还要 `!kTvBuild`**：TV 也是 Android，
+/// 只判平台会让电视上露出一个永远不生效的开关 —— `lib/main.dart` 的
+/// `CarWithService.start()` 本身就带 `!kTvBuild` 门控（电视没有手机投屏场景），
+/// 服务在 TV 上从没启动过，既没有心跳也没回填过持久化，开关点了不会有任何后果。
+/// `kTvBuild` 是编译期 const，非 TV 包里本表达式折叠为 `supportsCarWith`，
+/// 手机侧行为与树摇语义都和改动前一致（同 `main.dart` 的歌词通道口径）。
+bool get _carWithUiSupported => !kTvBuild && supportsCarWith;
+
+/// 一条索引在当前平台是否应进搜索结果。
+///
+/// 抽成独立函数的原因：`supportsCarWith` 是运行时平台 getter，测试里改不了
+/// 宿主平台，所以平台位由调用方注入 —— 这样真/假两种平台都能双向断言
+/// （见 `test/modules/settings/carwith_search_index_test.dart`），而消费端
+/// `_searchResults` 只有这一个过滤入口，不会出现第二份判断逻辑。
+bool carWithEntryAllowed(
+  ({String label, String category, String subpage, String aliases}) entry, {
+  required bool carWithSupported,
+}) {
+  if (carWithSupported) return true;
+  return !kCarWithOnlySearchLabels.contains(entry.label);
+}
+
 class SettingsPage extends StatefulWidget {
-  /// 可选扩展：设置页分类列表的额外分类（默认关闭，由私有构建注入，
-  /// 用于补充私有功能设置项）。
+  /// 可选扩展：设置页分类列表的额外分类（默认关闭，由宿主注入，
+  /// 用于补充可选功能设置项）。
   static List<(String, IconData, Widget Function(ColorScheme))>?
   extraCategories;
 
-  /// 可选扩展：设置搜索索引的额外条目（默认关闭，由私有构建注入，
-  /// 与 [extraCategories] 配套，保证私有分类可被搜索命中）。
+  /// 可选扩展：设置搜索索引的额外条目（默认关闭，由宿主注入，
+  /// 与 [extraCategories] 配套，保证额外分类可被搜索命中）。
   static List<({String label, String category, String aliases})>?
   extraSearchIndexEntries;
 
@@ -191,8 +234,14 @@ class _SettingsPageState extends State<SettingsPage>
   int _artistPhotoInterval = 15;
   double _artistPhotoOpacity = 0.55;
   bool _useGlowEffect = false;
+  // 辉光字符缩放：关闭后强调字不再放大与左右外扩，只留上浮与辉光呼吸
+  bool _lyricGlowCharScale = true;
+  // 歌词字体柔边抗锯齿（默认关闭）
+  bool _lyricSoftEdge = false;
   bool _useFlowingBackground = false;
   bool _useDuetLayout = false;
+  // AM 歌词整体水平位置（默认置左）；与 _useDuetLayout 互斥。
+  LyricPosition _lyricPosition = LyricPosition.left;
   bool _lyricEcoMode = false;
   bool _lyricDynamicColor = false;
   // 当前行以上的行是否跟随已播颜色（独立开关，默认关闭）
@@ -200,8 +249,11 @@ class _SettingsPageState extends State<SettingsPage>
   // 平衡行换行：AM / MD 各一套独立偏好（key 不同，互不影响）
   bool _lyricLineBalanceAm = false;
   bool _lyricLineBalanceMd3 = false;
+  // 副行（翻译 / 罗马音）显示范围：AM 与 MD3 两张播放页共用同一份偏好
+  LyricAuxScope _lyricAuxScope = LyricAuxScope.currentLine;
   // 屏蔽歌词作者信息（参考 EchoMusic 歌词过滤）：开启后播放页/桌面歌词等
-  // 显示面剔除作词/作曲/编曲等制作名单与版权声明行，只显示纯歌词。
+  // 显示面剔除在线歌词头部的「作者 - 歌名」首行、作词/作曲等制作名单与
+  // 版权声明行，只显示纯歌词。
   bool _hideLyricCredits = false;
   // 自定义过滤正则（空串 = 内置默认规则）
   String _lyricCreditPattern = '';
@@ -260,6 +312,9 @@ class _SettingsPageState extends State<SettingsPage>
   bool _mvAudioFallbackEnabled = false;
   // 记忆播放状态开关（默认开启）：冷启动恢复上次播放的歌曲与进度
   bool _restoreMemoryEnabled = true;
+  // 划掉后台自动退出开关（默认开启）：仅 Android 非 TV 显示；
+  // 所有手机划掉后台 = 停播并退出进程（不依赖 ROM 杀进程时机）
+  bool _swipeExitOnTaskRemoved = true;
   int _idleKeepaliveStopMinutes = 10;
   // 启动时自动播放（默认关闭）。后两项仅在它打开时才有意义，故一并收在这里。
   // 音源下拉直接用 StartupAutoPlaySource.values，保证与启动流程的解析口径
@@ -330,6 +385,10 @@ class _SettingsPageState extends State<SettingsPage>
   bool _disableSystemAudioEffects = false;
   // 暂停淡入淡出开关
   bool _pauseFadeEnabled = false;
+  // 伴唱功能总开关（默认关闭；关闭时播放页不显示伴唱入口）
+  bool _accompanyFeatureEnabled = false;
+  // 伴唱伴奏来源（在线伴奏 / 端侧分离；默认在线）
+  AccompanySource _accompanySource = AccompanySource.online;
   // 交叉淡化（自动切歌时上一首渐出与下一首渐入叠加）
   bool _crossfadeEnabled = false;
   int _crossfadeSeconds = SettingsRepository.kCrossfadeDefaultSeconds;
@@ -711,6 +770,9 @@ class _SettingsPageState extends State<SettingsPage>
     if (mounted) setState(() {});
   }
 
+  // 松手才保存的滑块须保留本地预览；仅在 Provider 真正改变时接收外部值。
+  ({double background, double player, double shadow})? _windowsSliderSnapshot;
+
   // Windows 控件与实际渲染读取同一个 Provider，不能显示旧的异步快照。
   void _syncWindowsThemeSettings(ThemeProvider theme) {
     _useDynamicColor = theme.useDynamicColor;
@@ -722,12 +784,23 @@ class _SettingsPageState extends State<SettingsPage>
     _artistPhotoOpacity = theme.artistPhotoOpacity;
     _useBackgroundImage = theme.useBackgroundImage;
     _backgroundImagePath = theme.backgroundImagePath;
-    _backgroundBlur = theme.backgroundBlur;
-    _amPlayerBlur = theme.amPlayerBlur;
+    if (_windowsSliderSnapshot?.background != theme.backgroundBlur) {
+      _backgroundBlur = theme.backgroundBlur;
+    }
+    if (_windowsSliderSnapshot?.player != theme.amPlayerBlur) {
+      _amPlayerBlur = theme.amPlayerBlur;
+    }
     _backgroundOpacity = theme.backgroundOpacity;
     _useBackgroundMonet = theme.useBackgroundMonet;
     _useTextShadow = theme.useTextShadow;
-    _textShadowBlur = theme.textShadowBlur;
+    if (_windowsSliderSnapshot?.shadow != theme.textShadowBlur) {
+      _textShadowBlur = theme.textShadowBlur;
+    }
+    _windowsSliderSnapshot = (
+      background: theme.backgroundBlur,
+      player: theme.amPlayerBlur,
+      shadow: theme.textShadowBlur,
+    );
   }
 
   Future<void> _loadSettings() async {
@@ -822,6 +895,9 @@ class _SettingsPageState extends State<SettingsPage>
     final disableSystemAudioEffects = await _settingsRepository
         .getDisableSystemAudioEffects();
     final pauseFadeEnabled = await _settingsRepository.getPauseFadeEnabled();
+    final accompanyFeatureEnabled = await _settingsRepository
+        .getAccompanyFeatureEnabled();
+    final accompanySource = await _settingsRepository.getAccompanySource();
     final crossfadeEnabled = await _settingsRepository.getCrossfadeEnabled();
     final crossfadeSeconds = await _settingsRepository.getCrossfadeSeconds();
     final automixEnabled = await _settingsRepository.getAutomixEnabled();
@@ -891,6 +967,8 @@ class _SettingsPageState extends State<SettingsPage>
         .getMvAudioFallbackEnabled();
     final restoreMemoryEnabled = await _settingsRepository
         .getRestoreMemoryEnabled();
+    final swipeExitOnTaskRemoved = await _settingsRepository
+        .getSwipeExitOnTaskRemoved();
     final idleKeepaliveStopMinutes = await _settingsRepository
         .getIdleKeepaliveStopMinutes();
     final startupAutoPlayEnabled = await _settingsRepository
@@ -983,8 +1061,11 @@ class _SettingsPageState extends State<SettingsPage>
       _textShadowBlur = textShadowBlur;
       _useGaussianBlur = LyricPreferences.instance.useGaussianBlur;
       _useGlowEffect = LyricPreferences.instance.useGlowEffect;
+      _lyricGlowCharScale = LyricPreferences.instance.useGlowCharScale;
+      _lyricSoftEdge = LyricPreferences.instance.softEdgeAntiAlias;
       _useFlowingBackground = LyricPreferences.instance.useFlowingBackground;
       _useDuetLayout = LyricPreferences.instance.useDuetLayout;
+      _lyricPosition = LyricPreferences.instance.lyricPosition;
       _lyricEcoMode = LyricPreferences.instance.ecoMode;
       _lyricDynamicColor = LyricPreferences.instance.useDynamicLyricColor;
       _lyricAboveLinesPlayedColor =
@@ -993,6 +1074,7 @@ class _SettingsPageState extends State<SettingsPage>
       _lyricLineBalanceMd3 = Md3LyricPreferences.instance.lineBalance;
       _hideLyricCredits = LyricPreferences.instance.hideLyricCredits;
       _lyricCreditPattern = LyricPreferences.instance.creditPattern;
+      _lyricAuxScope = LyricPreferences.instance.auxScope;
       _bluetoothLyricEnabled = bluetoothLyricEnabled;
       _bluetoothLyricCompressArt = bluetoothLyricCompressArt;
       _depthCoverEnabled = depthCoverEnabled;
@@ -1005,6 +1087,8 @@ class _SettingsPageState extends State<SettingsPage>
       _lockScreenLyricEnabled = lockScreenLyricEnabled;
       _disableSystemAudioEffects = disableSystemAudioEffects;
       _pauseFadeEnabled = pauseFadeEnabled;
+      _accompanyFeatureEnabled = accompanyFeatureEnabled;
+      _accompanySource = accompanySource;
       _crossfadeEnabled = crossfadeEnabled;
       _crossfadeSeconds = crossfadeSeconds;
       _automixEnabled = automixEnabled;
@@ -1032,6 +1116,7 @@ class _SettingsPageState extends State<SettingsPage>
       _showQualityDowngradeToast = showQualityDowngradeToast;
       _mvAudioFallbackEnabled = mvAudioFallbackEnabled;
       _restoreMemoryEnabled = restoreMemoryEnabled;
+      _swipeExitOnTaskRemoved = swipeExitOnTaskRemoved;
       _idleKeepaliveStopMinutes = idleKeepaliveStopMinutes;
       _startupAutoPlayEnabled = startupAutoPlayEnabled;
       _startupAutoPlaySource = startupAutoPlaySource;
@@ -1267,10 +1352,11 @@ class _SettingsPageState extends State<SettingsPage>
                   children: [
                     // 桌面布局：设置页以分类树导航为主，搜索框在此布局下
                     // 既冗余又会把整页背景切成两块（用户反馈"背景不一致"），
-                    // 故隐藏。
-                    if (!kDesktopModeEnabled.value)
+                    // 故隐藏。TV 同理：无文本输入路径，搜索框不可用。
+                    if (!kDesktopModeEnabled.value && !kTvBuild)
                       _buildSearchField(colorScheme),
                     if (!kDesktopModeEnabled.value &&
+                        !kTvBuild &&
                         _searchQuery.trim().isNotEmpty)
                       ..._buildSearchResults(colorScheme)
                     else
@@ -1312,9 +1398,13 @@ class _SettingsPageState extends State<SettingsPage>
     return SettingsTwoPaneBody(
       master: ListView(
         children: [
-          // 同单栏：桌面布局下不显示搜索框（见 _buildPaneBody 内的说明）
-          if (!kDesktopModeEnabled.value) _buildSearchField(colorScheme),
-          if (!kDesktopModeEnabled.value && _searchQuery.trim().isNotEmpty)
+          // 同单栏：桌面布局下不显示搜索框（见 _buildPaneBody 内的说明）；
+          // TV 版无文本输入路径，同样不显示。
+          if (!kDesktopModeEnabled.value && !kTvBuild)
+            _buildSearchField(colorScheme),
+          if (!kDesktopModeEnabled.value &&
+              !kTvBuild &&
+              _searchQuery.trim().isNotEmpty)
             ..._buildSearchResults(colorScheme)
           else
             ..._buildCategoryEntries(colorScheme),
@@ -1523,7 +1613,7 @@ class _SettingsPageState extends State<SettingsPage>
         SettingsSubpage(
           title: '歌词效果',
           icon: Icons.auto_awesome_outlined,
-          description: '对唱优化、动态颜色、模糊、辉光与省电模式',
+          description: '对唱优化、歌词位置、动态颜色、模糊、辉光与省电模式',
           builder: _buildLyricEffectSubpage,
         ),
         // 音乐频谱：Android 走 PCM 截取 / Visualizer，Windows 走 WASAPI 环回采集
@@ -1583,8 +1673,8 @@ class _SettingsPageState extends State<SettingsPage>
           builder: _buildAudioQualitySubpage,
         ),
         // search-sub: 硬解 offload 硬件解码 省电 直通 解码能力 矩阵
-        // 仅 Android：iOS 无 AudioTrack offload 通路（系统播放本身即硬解），
-        // 桌面/Web 同样无此能力，见 platform_capabilities.supportsAudioOffload。
+        // 硬件解码播放：依赖 Media3 audio offload + MediaCodec（API≥29 协商），
+        // 仅 Android 存在该通路，桌面端隐藏（详见 supportsAudioOffload）。
         if (supportsAudioOffload)
           SettingsSubpage(
             title: '硬件解码播放',
@@ -1683,7 +1773,7 @@ class _SettingsPageState extends State<SettingsPage>
       description: '版本、帮助与许可',
       body: _buildAboutSection,
     ),
-    // 可选扩展：私有构建注入的额外分类（默认无）。扩展点类型与语义保持不变，
+    // 可选扩展：宿主注入的额外分类（默认无）。扩展点类型与语义保持不变，
     // 转换后无三级子页，二级页直接渲染其内容。
     ...?(SettingsPage.extraCategories?.map(settingsCategoryFromLegacy)),
   ];
@@ -1858,11 +1948,12 @@ class _SettingsPageState extends State<SettingsPage>
   _searchResults(String query) {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return const [];
-    // 合并私有构建注入的额外索引条目（默认无）：老三元组没有三级页，补空串
+    // 合并宿主注入的额外索引条目（默认无）：老三元组没有三级页，补空串
     final entries =
         <({String label, String category, String subpage, String aliases})>[
-          // 过滤掉当前平台**不存在对应 UI** 的条目，否则搜索会跳到空分类：
-          //  · 3D 封面：标准包不带深度模型（kDepthCoverAvailable）
+          // 过滤掉当前构建/平台**不存在对应 UI** 的条目，否则搜索会跳到空分类：
+          //  · 3D 封面：lite 包不带深度模型（kDepthCoverAvailable）
+          //  · 伴奏来源：lite 包无端侧分离，整个来源单选块不渲染（kStemSeparationAvailable）
           //  · USB 独占：桌面端整块隐藏（依赖 Android USB Host + native cpp）
           //  · 音效链：桌面端隐藏（依赖 Android AudioSession 绑定音效）
           //
@@ -1876,12 +1967,19 @@ class _SettingsPageState extends State<SettingsPage>
                       'AI 背景修补',
                       '清理深度图缓存',
                     }.contains(e.label)) &&
+                (kStemSeparationAvailable ||
+                    !const {
+                      '在线伴奏',
+                      '端侧分离',
+                    }.contains(e.label)) &&
                 (supportsUsbExclusive || e.category != 'USB 独占') &&
-                (supportsAudioOffload || e.subpage != '硬件解码播放') &&
                 (supportsSystemAudioEffects ||
                     !_kAndroidOnlyAudioLabels.contains(e.label)) &&
+                // 硬件解码播放：offload/MediaCodec 为 Android 专属，桌面端整页隐藏
+                (supportsAudioOffload || e.subpage != '硬件解码播放') &&
                 (isAndroidPlatform ||
                     !_kAndroidOnlySpectrumLabels.contains(e.label)) &&
+                carWithEntryAllowed(e, carWithSupported: _carWithUiSupported) &&
                 (!Platform.isWindows || e.label != '歌词推送'))
               e,
           for (final e in SettingsPage.extraSearchIndexEntries ?? const [])
@@ -2257,7 +2355,8 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  /// 「设备歌词」三级子页：桌面悬浮歌词、蓝牙歌词、锁屏歌词与魅族状态栏歌词。
+  /// 「设备歌词」三级子页：桌面悬浮歌词、蓝牙歌词、锁屏歌词、魅族状态栏歌词
+  /// 与车机投屏逐句歌词（末项只在 `_carWithUiSupported` 的平台出现）。
   Widget _buildDeviceLyricSubpage(ColorScheme colorScheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2364,6 +2463,33 @@ class _SettingsPageState extends State<SettingsPage>
           // search: 状态栏 提前 提前量 快 慢
           if (_flymeStatusBarLyricEnabled) const _FlymeLyricAdvanceTile(),
         ],
+        // 车机投屏逐句歌词：只在支持 CarWith 的平台渲染（同上面魅族项
+        // 「非支持机型整项隐藏」的做法）——桌面端点了是一辈子不生效的死路。
+        if (_carWithUiSupported) ...[
+          _buildGroupLabel('车机投屏歌词', colorScheme),
+          // search: carwith jovi 车机 投屏 逐句 车机屏 虚拟屏 小米
+          // 值绑 CarWithService 单例（持久化在服务内部完成，UI 不碰 prefs），
+          // 用 ListenableBuilder 订阅同一实例：开关从别处（心跳/回前台）翻转时
+          // 这行跟着刷新，不需要本地 setState 副本（避免双份真值）。
+          ListenableBuilder(
+            listenable: CarWithService.instance,
+            builder: (context, _) => SwitchListTile(
+              title: const Text('显示CarWith / Jovi InCar歌词'),
+              subtitle: const Text(
+                '车机投屏时逐句显示歌词，手机熄屏后车机侧继续走词',
+              ),
+              value: CarWithService.instance.lyricEnabled,
+              onChanged: (value) async {
+                AppHaptics.lightImpact(HapticCategory.control);
+                // 顺序讲究：先把开关值灌进服务（连接态采样、整首歌词发布等
+                // 都按它走），再让歌词服务生效。反过来会让启用瞬间先推旧格式，
+                // 同 _applyLyricPushProtocol 里「先同步 ColorOS 模式再启用推送」。
+                await CarWithService.instance.setLyricEnabled(value);
+                await DesktopLyricService.instance.setCarWithLyricEnabled(value);
+              },
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -2375,11 +2501,61 @@ class _SettingsPageState extends State<SettingsPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // 副行显示范围三选一（翻译 / 罗马音共用）。AM 与经典播放页都读这一项，
+        // 故不加 `_useAmStylePlayer` 门控。
+        // M3E 字段式下拉（TV 走 TvDropdownMenu 包装，触屏直出 M3EDropdownMenu）：
+        // 初始选中值由 M3EDropdownItem.selected 表达（无 initialSelection 参数），
+        // 每次 build 按当前值重建 items 是本仓既定手法；onSelectionChanged 必须
+        // 同值早退，否则「setItems 回调 → setState → 重建 → setItems」无限回环。
+        // 下拉框不能放 trailing：字段式控件会撑出近整行宽度，把 title 挤到
+        // 竖排（见「暂停后自动停止保活」处的同款注释），控件下沉到 subtitle。
+        // search: 副行 翻译 罗马音 音译 双语 所有行 全部显示 已播 已唱 只显示当前 显示范围
+        ListTile(
+          title: const Text('副行显示范围'),
+          subtitle: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('翻译 / 罗马音在哪些歌词行上显示'),
+              const Gap(AppSpacing.sm),
+              TvDropdownMenu<LyricAuxScope>(
+                items: [
+                  for (final scope in LyricAuxScope.values)
+                    M3EDropdownItem(
+                      label: auxScopeLabel(scope),
+                      value: scope,
+                      selected: _lyricAuxScope == scope,
+                    ),
+                ],
+                singleSelect: true,
+                showChipAnimation: false,
+                fieldStyle: M3EDropdownFieldStyle(
+                  hintText: '选择副行显示范围',
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.md,
+                    vertical: AppSpacing.sm,
+                  ),
+                  selectedTextStyle: Theme.of(context).textTheme.bodyMedium,
+                ),
+                onSelectionChanged: (selected) {
+                  // 单选下再次点击已选中项会被取消选中：强制重建恢复原值
+                  if (selected.isEmpty) {
+                    setState(() {});
+                    return;
+                  }
+                  final scope = selected.first.value;
+                  if (scope == _lyricAuxScope) return;
+                  _selectAuxScope(scope);
+                },
+              ),
+            ],
+          ),
+        ),
         // 屏蔽歌词作者信息（参考 EchoMusic 歌词过滤）
         // search: 屏蔽 隐藏 过滤 制作名单 版权声明 作词 作曲 纯歌词
         SwitchListTile(
           title: const Text('隐藏歌词作者信息'),
-          subtitle: const Text('隐藏作词/作曲/编曲等制作名单与版权声明行，只显示纯歌词'),
+          subtitle: const Text('隐藏「作者 - 歌名」首行与作词/作曲等制作名单、版权声明行，只显示纯歌词'),
           value: _hideLyricCredits,
           onChanged: (v) {
             AppHaptics.lightImpact(HapticCategory.control);
@@ -2412,6 +2588,24 @@ class _SettingsPageState extends State<SettingsPage>
         const _LyricTimeOffsetTile(),
       ],
     );
+  }
+
+  /// 选中副行显示范围：写偏好并轻反馈（值未变则不动）。
+  ///
+  /// 偏好是 AM / MD3 两张播放页共享的单值，写入后各页监听即时生效。
+  void _selectAuxScope(LyricAuxScope scope) {
+    if (_lyricAuxScope == scope) return;
+    AppHaptics.lightImpact(HapticCategory.control);
+    setState(() => _lyricAuxScope = scope);
+    LyricPreferences.instance.setAuxScope(scope);
+  }
+
+  /// 写入 AM 歌词水平位置。对唱开启时下拉已禁用，这里只保留同值守卫。
+  void _selectLyricPosition(LyricPosition position) {
+    if (_lyricPosition == position) return;
+    AppHaptics.lightImpact(HapticCategory.control);
+    setState(() => _lyricPosition = position);
+    LyricPreferences.instance.setLyricPosition(position);
   }
 
   /// 自定义「歌词作者信息」过滤正则的弹层（参考 EchoMusic 过滤表达式设置）。
@@ -2590,6 +2784,19 @@ class _SettingsPageState extends State<SettingsPage>
           onChanged: (value) {
             AppHaptics.lightImpact(HapticCategory.control);
             context.read<CarModeProvider>().setAutoScreenEnabled(value);
+          },
+        ),
+        // 熄火 / 关机自动暂停：默认关闭。开启后原生在收到车机下电广播
+        // （厂商 pause 广播 / ACTION_SHUTDOWN）时暂停播放。收不到信号的车机
+        // 不会产生任何行为变化，因此做成独立开关而非默认行为。
+        // search: 车机 车载 熄火 关机 下电 ACC 断电 自动暂停 停止播放 关机暂停
+        SwitchListTile(
+          title: const Text('熄火 / 关机时自动暂停'),
+          subtitle: const Text('收到车机下电信号时暂停播放；部分车机支持，默认关闭'),
+          value: carMode.powerOffPauseEnabled,
+          onChanged: (value) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            context.read<CarModeProvider>().setPowerOffPauseEnabled(value);
           },
         ),
         _buildGroupLabel(
@@ -2802,19 +3009,19 @@ class _SettingsPageState extends State<SettingsPage>
   /// 「主题与配色」三级子页：明暗模式 + 主题色来源。
   Widget _buildThemeSubpage(ColorScheme colorScheme) {
     final themeProvider = context.read<ThemeProvider>();
-    // 仅 ThemeMode.light 时禁用 OLED 开关；dark 与 system 均可勾选。
-    // system 模式下勾选后，等系统切到深色时 darkTheme 自动应用纯黑（MaterialApp 机制）。
-    // 以 ThemeProvider 为准（单一数据源），避免与本地 _themeMode 双份不同步
-    final canToggleOled =
-        context.watch<ThemeProvider>().themeMode != ThemeMode.light;
+    // 当前档位（watch 订阅：主题模式一变，两排切换器都要跟着刷选中态）
+    final currentMode = context.watch<ThemeProvider>().themeMode;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildGroupLabel('主题模式', colorScheme, first: true),
+        // ⚠️ 既有坑（改造前后都成立）：按钮顺序与 ThemeMode.index
+        // （system=0 / light=1 / dark=2）不一致，必须显式映射，
+        // 不能 ThemeMode.values[index]，否则切换错位。
+        // 第一排：浅色 / 深色 一组互斥单选。停在「跟随系统 / 跟随CarWith」
+        // 这类自动档时这一排两枚都不亮（selectedIndex = null）。
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
-          // 注意：按钮顺序(浅色/深色/跟随系统)与 ThemeMode.index(system=0,light=1,dark=2)
-          // 不一致，必须用显式映射，不能直接 ThemeMode.values[index]，否则切换错位。
           child: M3EToggleButtonGroup(
             actions: const [
               M3EToggleButtonGroupAction(
@@ -2825,36 +3032,120 @@ class _SettingsPageState extends State<SettingsPage>
                 label: Text('深色'),
                 icon: Icon(Icons.dark_mode),
               ),
-              M3EToggleButtonGroupAction(
-                label: Text('跟随系统'),
-                icon: Icon(Icons.brightness_auto),
-              ),
             ],
-            selectedIndex: const [
-              ThemeMode.light,
-              ThemeMode.dark,
-              ThemeMode.system,
-            ].indexOf(context.watch<ThemeProvider>().themeMode),
+            selectedIndex: switch (currentMode) {
+              ThemeMode.light => 0,
+              ThemeMode.dark => 1,
+              _ => null,
+            },
             onSelectedIndexChanged: (index) {
               if (index == null) return;
-              const modes = [ThemeMode.light, ThemeMode.dark, ThemeMode.system];
+              const modes = [ThemeMode.light, ThemeMode.dark];
               // 单源：以 ThemeProvider 为准（即时生效 + 自行持久化）
-              context.read<ThemeProvider>().setThemeMode(modes[index]);
+              themeProvider.setThemeMode(modes[index]);
             },
           ),
         ),
-        // OLED 纯黑开关：light 模式禁用；dark 与 system 可勾选。
-        // system 模式下勾选后，系统切深色时自动生效，切浅色时不影响 lightTheme。
+        // 第二排：「跟随系统」与「跟随CarWith」两个各含一枚芯片的组并排 ——
+        // 分成两组（而不是塞进同一组）才允许两枚同时亮：车机连着且系统也深色时，
+        // 两个来源同时成立，同一组互斥就只能显示一个。
+        // 芯片宽度必须由 M3EToggleButtonGroup 量自然宽度：单独拿出来的
+        // M3EToggleButton 会把自己拉满整行，故这里一律用「组」包装。
+        // 外面套 Wrap：车机/窄面板/TV 上放不下就换行，不断版。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            0,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: AppSpacing.xs,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  // 一档组：点亮即切到跟随系统；已是该档时再点为 null（忽略，
+                  // 自动档之间没有「都不选」的语义）。
+                  M3EToggleButtonGroup(
+                    actions: const [
+                      M3EToggleButtonGroupAction(
+                        label: Text('跟随系统'),
+                        icon: Icon(Icons.brightness_auto),
+                      ),
+                    ],
+                    selectedIndex: currentMode == ThemeMode.system ? 0 : null,
+                    onSelectedIndexChanged: (index) {
+                      if (index == null) return;
+                      themeProvider.setThemeMode(ThemeMode.system);
+                    },
+                  ),
+                  // 桌面端 / TV 都不渲染这一组（见 _carWithUiSupported），
+                  // 第二排自然只剩「跟随系统」。分支内才取单例：桌面路径连单例
+                  // 都不碰，既有桌面端设置页测试因此完全不受影响。
+                  // 值绑 CarWithService 单例（持久化在服务内部完成，UI 不碰 prefs），
+                  // 用 ListenableBuilder 订阅同一实例：翻转（含心跳/回前台）即时生效，
+                  // 不留本地 setState 副本，避免双份真值。
+                  if (_carWithUiSupported)
+                    // search-item: 跟随CarWith | 主题模式 车机 亮暗 深浅 切换 跟随 小米 carwith 虚拟屏
+                    ListenableBuilder(
+                      listenable: CarWithService.instance,
+                      builder: (context, _) => M3EToggleButtonGroup(
+                        actions: const [
+                          M3EToggleButtonGroupAction(
+                            label: Text('跟随CarWith'),
+                            icon: Icon(Icons.wifi_tethering),
+                          ),
+                        ],
+                        selectedIndex:
+                            CarWithService.instance.followDarkEnabled
+                            ? 0
+                            : null,
+                        onSelectedIndexChanged: (index) {
+                          AppHaptics.lightImpact(HapticCategory.control);
+                          // index == null 即取消勾选（该芯片只有 0 一档）
+                          // ignore: discarded_futures
+                          CarWithService.instance.setFollowDarkEnabled(
+                            index != null,
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
+              // 说明文字：两排各自独立，所以「跟随系统」与「跟随CarWith」能同时亮。
+              // 措辞刻意带「车机」，方便设置搜索命中（旧实现那套天文位置文案已删净，
+              // 不再复用）。
+              Padding(
+                padding: const EdgeInsets.only(
+                  top: AppSpacing.xs,
+                  bottom: AppSpacing.xs,
+                ),
+                child: Text(
+                  _carWithUiSupported
+                      ? '跟随CarWith：连接小米 CarWith 时跟随车机深浅色'
+                      : '跟随系统：随系统深浅色自动切换',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // OLED 纯黑深色：**任何时候可勾**（上游在浅色档会把这行禁掉，这里去掉了
+        // 那个判据）。与主题档解耦的理由：纯黑只在 darkTheme 里生效，light 档
+        // 勾着什么都不会变，用户因此可以先勾上、切到深色时自动应用，
+        // 不必来回切档。system 模式同理：系统切深色时 darkTheme 自动应用纯黑。
         // search: oled 纯黑 深色 黑色
         SwitchListTile(
           title: const Text('OLED 纯黑深色'),
           value: themeProvider.useOledBlack,
-          onChanged: canToggleOled
-              ? (v) {
-                  AppHaptics.lightImpact(HapticCategory.control);
-                  themeProvider.setUseOledBlack(v);
-                }
-              : null,
+          onChanged: (v) {
+            AppHaptics.lightImpact(HapticCategory.control);
+            themeProvider.setUseOledBlack(v);
+          },
         ),
         // ② 配色来源：自动取色（系统壁纸 / 封面）优先，两者都关闭时才用手动
         // 种子色，因此「主题色」排在两个自动来源之后，作为兜底项。
@@ -3635,16 +3926,26 @@ class _SettingsPageState extends State<SettingsPage>
         // 必须挂在非 tile 节点上：生成器遇到 search-item 注释所在的 tile 会
         // 走手写分支、跳过该 tile 的标题自动收集（丢「歌词动画」自身条目）。
         // search-item: 歌词模糊强度 | 歌词 模糊 强度 程度 高斯模糊
+        // search-item: 模糊等级渐变切换 | 模糊 等级 渐变 切换 交叉淡入 淡出 透明度 硬切 过渡 crossfade
+        // search-item: 模糊等级渐变时长 | 模糊 等级 渐变 时长 过渡时间 毫秒 ms 交叉淡入 淡出 1000
+        // search-item: 提前换行 | 提前 换行 预换行 逐字完成 延迟 等待 字内渐变 缩放 模糊
+        // search-item: 模糊褪去时长 | 模糊 褪去 时长 淡出 消失 模糊图 开唱 交接 毫秒 ms 1000
         // search-item: 动态颜色混色比例 | 动态颜色 混色 比例 取色 封面 高亮 已播
         // search-item: 辉光强度 | 辉光 发光 强度 亮度
         // search-item: 辉光触发阈值 | 辉光 发光 阈值 灵敏度
         // search-item: 辉光判定方式 | 辉光 判定 触发方式 固定时长 自适应 灵敏度
         // search-item: 辉光固定时长 | 辉光 固定 阈值 时长 毫秒
         // search-item: 字内渐变样式 | 字内渐变 渐变 扫光 扫光模式 经典 classic sweep 歌词
+        // search-item: 间奏点水平位置 | 间奏 间奏点 节奏点 水平 位置 起点 左右
+        // search-item: 间奏点圆点大小 | 间奏 间奏点 节奏点 圆点 大小 半径 点
+        // search-item: 间奏点间距 | 间奏 间奏点 节奏点 间距 距离
+        // search-item: 动画预设 | 预设 动画预设 保存预设 切换预设 删除预设 导入 导出 json 剪贴板
+        // search-item: 已播歌词透明度 | 已播 歌词 透明度 不透明度 亮态 alpha 亮度
+        // search-item: 未播歌词透明度 | 未播 歌词 透明度 不透明度 暗态 alpha 暗度
         _buildGroupLabel('歌词动效调节', colorScheme),
         // 歌词动画入口：动画参数、歌词模糊强度、辉光触发阈值统一在独立子页无极调节，
         // 排在歌词省电模式（特效兜底开关）之后、音乐频谱分组之前。
-        // search: 歌词 动画 当前行 上浮 非当前行 缩放 位置 错峰 步长 衰减
+        // search: 歌词 动画 当前行 上浮 非当前行 缩放 位置 错峰 步长 衰减 预设 导入 导出 json 剪贴板
         ListTile(
           leading: const Icon(Icons.animation),
           title: const Text('歌词动画'),
@@ -4152,6 +4453,56 @@ class _SettingsPageState extends State<SettingsPage>
                 }
               : null,
         ),
+        // 歌词整体水平位置（仅 AM 播放页）。与「男女对唱歌词优化」互斥：
+        // 对唱开启时逐行对齐接管，下拉灰显禁用但保留已选值；关闭后恢复可用。
+        // M3E 字段式下拉：初始选中值由 M3EDropdownItem.selected 表达，
+        // 每次 build 按当前值重建 items；同值必须早退，避免
+        // setItems 回调 → setState → 重建 → setItems 无限回环。
+        // search: 歌词位置 对齐 置左 居中 置右 左对齐 右对齐 居中对齐 水平位置
+        ListTile(
+          title: const Text('歌词位置'),
+          subtitle: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _useDuetLayout
+                    ? '男女对唱优化已接管对齐（男左 / 女右 / 合居中）'
+                    : 'AM 歌词行的水平对齐方式',
+              ),
+              const Gap(AppSpacing.sm),
+              TvDropdownMenu<LyricPosition>(
+                enabled: _useAmStylePlayer && !_useDuetLayout,
+                items: [
+                  for (final position in LyricPosition.values)
+                    M3EDropdownItem(
+                      label: lyricPositionLabel(position),
+                      value: position,
+                      selected: _lyricPosition == position,
+                    ),
+                ],
+                singleSelect: true,
+                showChipAnimation: false,
+                fieldStyle: M3EDropdownFieldStyle(
+                  hintText: '选择歌词位置',
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.md,
+                    vertical: AppSpacing.sm,
+                  ),
+                  selectedTextStyle: Theme.of(context).textTheme.bodyMedium,
+                ),
+                onSelectionChanged: (selected) {
+                  // 单选下再次点击已选中项会被取消选中：强制重建恢复原值
+                  if (selected.isEmpty) {
+                    setState(() {});
+                    return;
+                  }
+                  _selectLyricPosition(selected.first.value);
+                },
+              ),
+            ],
+          ),
+        ),
         // 歌词动态字体颜色：当前行按「(1-比例) 白 + 比例 封面提取色」混色
         // （仅 AM 播放器；比例在「歌词动画」页调节）
         // search: 动态颜色 混色
@@ -4208,6 +4559,41 @@ class _SettingsPageState extends State<SettingsPage>
                   AppHaptics.lightImpact(HapticCategory.control);
                   setState(() => _useGlowEffect = v);
                   LyricPreferences.instance.setUseGlowEffect(v);
+                }
+              : null,
+        ),
+        // 辉光字符缩放：辉光的配套子开关。关闭后强调字只上浮 + 发光，
+        // 不再放大与左右外扩（不随辉光总开关隐藏，避免开关列表跳动；
+        // 依赖关系写在副标题里）。
+        // search: 辉光 放大 缩放 字符 外扩 波浪 弹跳
+        SwitchListTile(
+          title: const Text('辉光字符缩放'),
+          subtitle: const Text(
+            '关闭后字符不再放大与左右外扩，只保留上浮与辉光呼吸'
+            '（需开启歌词辉光效果）',
+          ),
+          value: _lyricGlowCharScale,
+          onChanged: _useAmStylePlayer
+              ? (v) {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  setState(() => _lyricGlowCharScale = v);
+                  LyricPreferences.instance.setUseGlowCharScale(v);
+                }
+              : null,
+        ),
+        // search: 字幕 柔边 抗锯齿 字体 边缘 柔滑 平滑 锯齿 font smooth antialias
+        SwitchListTile(
+          title: const Text('歌词字体柔边'),
+          subtitle: const Text(
+            '给歌词与翻译的字形边缘做轻微柔化，观感更柔滑'
+            '（默认关闭，开启后轻微增加绘制开销）',
+          ),
+          value: _lyricSoftEdge,
+          onChanged: _useAmStylePlayer
+              ? (v) {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  setState(() => _lyricSoftEdge = v);
+                  LyricPreferences.instance.setSoftEdgeAntiAlias(v);
                 }
               : null,
         ),
@@ -5273,6 +5659,25 @@ class _SettingsPageState extends State<SettingsPage>
             context.read<PlayerProvider>().setRestoreMemoryEnabled(value);
           },
         ),
+        // 划掉后台自动退出：仅 Android 手机（非 TV）显示，默认开启。
+        // 开启时所有手机从最近任务划掉 = 停止播放并退出进程（由原生
+        // stopWithTask 任务移除监听与 onTaskRemoved 双路径执行，不依赖 ROM
+        // 的杀进程时机）。关闭后走现状逻辑（划掉不停播）。
+        // search: 划掉 后台 清后台 上滑 退出 进程 三星 小米 OneUI MIUI 原生 停止播放 关闭应用
+        if (!kTvBuild && Platform.isAndroid)
+          SwitchListTile(
+            title: const Text('划掉后台自动退出'),
+            subtitle: const Text(
+              '立即停止播放并退出进程；开启时硬件解码自动让路',
+            ),
+            value: _swipeExitOnTaskRemoved,
+            onChanged: (value) async {
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _swipeExitOnTaskRemoved = value);
+              await _settingsRepository.setSwipeExitOnTaskRemoved(value);
+              await AudioOffloadService.instance.setSwipeExitEnabled(value);
+            },
+          ),
         // search: 暂停 保活 后台 耗电 省电 停止通知 恢复播放
         // 下拉框不能放 trailing：TvDropdownMenu 是字段式控件，会给自身撑出
         // 接近整行的宽度，把 ListTile 的 title 挤到只剩一两字宽（真机表现为
@@ -5611,7 +6016,95 @@ class _SettingsPageState extends State<SettingsPage>
             }
           },
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.md,
+            AppSpacing.lg,
+            0,
+          ),
+          child: const SettingsSubGroupLabel('伴唱'),
+        ),
+        // search: 伴唱 伴奏 开关 功能 KTV 显示 隐藏 按钮
+        SwitchListTile(
+          title: const Text('伴唱功能'),
+          subtitle: const Text('默认关闭；开启后播放页显示伴唱按钮（纯伴奏，原曲静音）'),
+          value: _accompanyFeatureEnabled,
+          onChanged: (value) async {
+            AppHaptics.lightImpact(HapticCategory.control);
+            setState(() => _accompanyFeatureEnabled = value);
+            // 先取 provider：await 之后再用 context 会触发
+            // use_build_context_synchronously。
+            final player = context.read<PlayerProvider>();
+            await _settingsRepository.setAccompanyFeatureEnabled(value);
+            if (!value) {
+              // 关闭即停掉正在播放的伴奏轨，避免「入口已隐藏但伴奏还在响」。
+              unawaited(player.stopAccompany());
+            }
+          },
+        ),
+        // 伴奏来源二选一：在线伴奏（酷狗匹配另一条轨） / 端侧分离（本机实时分离）。
+        // 端侧分离只有 full 包才有（编译期 kStemSeparationAvailable）：lite 包里分离
+        // 代码整块被树摇剔除，来源单选留着只剩「在线伴奏」一项、没有意义，故整块隐藏。
+        if (kStemSeparationAvailable && _accompanyFeatureEnabled) ...[
+          // search: 伴奏来源 在线 端侧 分离 人声 tflite 模型 本机 离线
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.md,
+              AppSpacing.lg,
+              AppSpacing.xs,
+            ),
+            child: Text(
+              '伴奏来源',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+          ),
+          for (final source in AccompanySource.values)
+            _buildAccompanySourceTile(source),
+        ],
       ],
+    );
+  }
+
+  /// 伴奏来源单选行。
+  ///
+  /// 只有 full 包才会调用到这里（调用点用 `kStemSeparationAvailable` 门控）。
+  /// full 包里端侧分离仍可能运行时不可用（模型没随包 / 非 Android），此时
+  /// **置灰但保留可见**：用户需要知道这个能力存在、为什么用不了，直接隐藏
+  /// 反而像功能消失。
+  ///
+  /// 标题是动态的（[AccompanySource.label]），搜索索引生成器只收字符串字面量，
+  /// 故在此手写两条索引项（见下方 `// search-item:`）。
+  Widget _buildAccompanySourceTile(AccompanySource source) {
+    final onDevice = source == AccompanySource.onDevice;
+    final unavailable = onDevice && !StemSeparationService.instance.available;
+    final subtitle = unavailable
+        ? '不可用：当前安装包不含分离模型，或不是 Android 设备'
+        : source.description;
+    return RadioListTile<AccompanySource>(
+      // search-item: 在线伴奏 | 伴奏来源 在线 酷狗匹配 另一条轨 原唱
+      // search-item: 端侧分离 | 伴奏来源 端侧 分离 人声 本机 离线 实时 tflite 模型
+      title: Text(source.label),
+      subtitle: Text(subtitle),
+      value: source,
+      groupValue: _accompanySource,
+      onChanged: unavailable
+          ? null
+          : (v) async {
+              if (v == null) return;
+              AppHaptics.lightImpact(HapticCategory.control);
+              setState(() => _accompanySource = v);
+              final player = context.read<PlayerProvider>();
+              await _settingsRepository.setAccompanySource(v);
+              // 切换来源时当前会话必然失效（两条途径的播放结构不同），
+              // 先退出再按需重开，避免留下「在线轨还在响但来源已切到端侧」的错位状态。
+              final wasActive = player.accompanyActive;
+              await player.stopAccompany();
+              if (wasActive && mounted) {
+                await player.toggleAccompany();
+              }
+            },
     );
   }
 
@@ -5774,112 +6267,113 @@ class _SettingsPageState extends State<SettingsPage>
               ),
             ),
           ),
-        // 歌曲弹幕：控制是否在播放页叠加弹幕层（TV 无文本输入能力，不编入 TV 包）
+        // 歌曲弹幕：控制是否在播放页叠加弹幕层。
+        // 本组只有开关 / 滑条 / 色板，无需文本输入，TV 同样可用（TV 播放页
+        // 也接了 SongDanmakuHost，见 full_player_am.dart）。
         // search: 歌曲 弹幕 播放页 封面 滚动
         // v46：改 ValueListenableBuilder（同一静态镜像）——本地 setState +
         // 异步初始化回填存在覆盖用户点击的竞态（审查实测"设置里打开弹幕不生效"）。
         // 开启时下方追加速度滑条与颜色选择。
-        if (!kTvBuild)
-          ValueListenableBuilder<bool>(
-            valueListenable: SettingsRepository.songDanmakuEnabled,
-            builder: (context, enabled, _) => Column(
-              children: [
-                SwitchListTile(
-                  secondary: Icon(
-                    Icons.subtitles_outlined,
-                    color: colorScheme.primary,
-                  ),
-                  title: const Text('显示歌曲弹幕'),
-                  subtitle: const Text('在播放页叠加歌曲弹幕'),
-                  value: enabled,
-                  onChanged: (v) {
-                    AppHaptics.lightImpact(HapticCategory.control);
-                    _settingsRepository.setSongDanmakuEnabled(v);
-                  },
+        ValueListenableBuilder<bool>(
+          valueListenable: SettingsRepository.songDanmakuEnabled,
+          builder: (context, enabled, _) => Column(
+            children: [
+              SwitchListTile(
+                secondary: Icon(
+                  Icons.subtitles_outlined,
+                  color: colorScheme.primary,
                 ),
-                if (enabled)
-                  // search: 弹幕 速度 快慢 滚动 倍率
-                  ValueListenableBuilder<double>(
-                    valueListenable: SettingsRepository.songDanmakuSpeed,
-                    builder: (context, speed, _) => ListTile(
-                      leading: Icon(Icons.speed_outlined,
-                          color: colorScheme.primary),
-                      title: const Text('弹幕速度'),
-                      subtitle: M3ESlider(
-                        decoration: const M3ESliderDecoration(
-                          haptic: M3EHapticFeedback.medium,
-                        ),
-                        value: speed,
-                        min: 0.5,
-                        max: 2.0,
-                        divisions: 15,
-                        label: '×${speed.toStringAsFixed(2)}',
-                        // 拖动只刷内存镜像（宿主即时生效），松手才落盘（本仓滑条惯例）。
-                        onChanged: (v) =>
-                            SettingsRepository.songDanmakuSpeed.value = v,
-                        onChangeEnd: (v) =>
-                            _settingsRepository.setSongDanmakuSpeed(v),
+                title: const Text('显示歌曲弹幕'),
+                subtitle: const Text('在播放页叠加歌曲弹幕'),
+                value: enabled,
+                onChanged: (v) {
+                  AppHaptics.lightImpact(HapticCategory.control);
+                  _settingsRepository.setSongDanmakuEnabled(v);
+                },
+              ),
+              if (enabled)
+                // search: 弹幕 速度 快慢 滚动 倍率
+                ValueListenableBuilder<double>(
+                  valueListenable: SettingsRepository.songDanmakuSpeed,
+                  builder: (context, speed, _) => ListTile(
+                    leading: Icon(Icons.speed_outlined,
+                        color: colorScheme.primary),
+                    title: const Text('弹幕速度'),
+                    subtitle: M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        haptic: M3EHapticFeedback.medium,
                       ),
+                      value: speed,
+                      min: 0.5,
+                      max: 2.0,
+                      divisions: 15,
+                      label: '×${speed.toStringAsFixed(2)}',
+                      // 拖动只刷内存镜像（宿主即时生效），松手才落盘（本仓滑条惯例）。
+                      onChanged: (v) =>
+                          SettingsRepository.songDanmakuSpeed.value = v,
+                      onChangeEnd: (v) =>
+                          _settingsRepository.setSongDanmakuSpeed(v),
                     ),
                   ),
-                if (enabled)
-                  // search: 弹幕 透明度 浓度
-                  ValueListenableBuilder<double>(
-                    valueListenable: SettingsRepository.songDanmakuOpacity,
-                    builder: (context, opacity, _) => ListTile(
-                      leading: Icon(Icons.opacity_outlined,
-                          color: colorScheme.primary),
-                      title: const Text('弹幕透明度'),
-                      subtitle: M3ESlider(
-                        decoration: const M3ESliderDecoration(
-                          haptic: M3EHapticFeedback.medium,
-                        ),
-                        value: opacity,
-                        min: 0.1,
-                        max: 1.0,
-                        divisions: 18,
-                        label: '${(opacity * 100).round()}%',
-                        // 拖动只刷内存镜像（宿主即时生效），松手才落盘（本仓滑条惯例）。
-                        onChanged: (v) =>
-                            SettingsRepository.songDanmakuOpacity.value = v,
-                        onChangeEnd: (v) =>
-                            _settingsRepository.setSongDanmakuOpacity(v),
+                ),
+              if (enabled)
+                // search: 弹幕 透明度 浓度
+                ValueListenableBuilder<double>(
+                  valueListenable: SettingsRepository.songDanmakuOpacity,
+                  builder: (context, opacity, _) => ListTile(
+                    leading: Icon(Icons.opacity_outlined,
+                        color: colorScheme.primary),
+                    title: const Text('弹幕透明度'),
+                    subtitle: M3ESlider(
+                      decoration: const M3ESliderDecoration(
+                        haptic: M3EHapticFeedback.medium,
                       ),
+                      value: opacity,
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 18,
+                      label: '${(opacity * 100).round()}%',
+                      // 拖动只刷内存镜像（宿主即时生效），松手才落盘（本仓滑条惯例）。
+                      onChanged: (v) =>
+                          SettingsRepository.songDanmakuOpacity.value = v,
+                      onChangeEnd: (v) =>
+                          _settingsRepository.setSongDanmakuOpacity(v),
                     ),
                   ),
-                if (enabled)
-                  // search: 弹幕 颜色 随机 彩色
-                  ValueListenableBuilder<int?>(
-                    valueListenable: SettingsRepository.songDanmakuColor,
-                    builder: (context, colorValue, _) => ListTile(
-                      leading: Icon(Icons.palette_outlined,
-                          color: colorScheme.primary),
-                      title: const Text('弹幕颜色'),
-                      subtitle: _DanmakuColorRow(
-                        current: colorValue,
-                        onSelected: (c) =>
-                            _settingsRepository.setSongDanmakuColor(c),
-                      ),
+                ),
+              if (enabled)
+                // search: 弹幕 颜色 随机 彩色
+                ValueListenableBuilder<int?>(
+                  valueListenable: SettingsRepository.songDanmakuColor,
+                  builder: (context, colorValue, _) => ListTile(
+                    leading: Icon(Icons.palette_outlined,
+                        color: colorScheme.primary),
+                    title: const Text('弹幕颜色'),
+                    subtitle: _DanmakuColorRow(
+                      current: colorValue,
+                      onSelected: (c) =>
+                          _settingsRepository.setSongDanmakuColor(c),
                     ),
                   ),
-                // MD3Music fork v47：只看弹幕——隐藏播放页右下角"发弹幕"按钮。
-                if (enabled)
-                  // search: 弹幕 只读 隐藏 发送 按钮
-                  ValueListenableBuilder<bool>(
-                    valueListenable: SettingsRepository.songDanmakuReadOnly,
-                    builder: (context, readOnly, _) => SwitchListTile(
-                      title: const Text('只看弹幕'),
-                      subtitle: const Text('隐藏播放页的发弹幕按钮，仅浏览弹幕'),
-                      value: readOnly,
-                      onChanged: (v) {
-                        AppHaptics.lightImpact(HapticCategory.control);
-                        _settingsRepository.setSongDanmakuReadOnly(v);
-                      },
-                    ),
+                ),
+              // MD3Music fork v47：只看弹幕——隐藏播放页右下角"发弹幕"按钮。
+              if (enabled)
+                // search: 弹幕 只读 隐藏 发送 按钮
+                ValueListenableBuilder<bool>(
+                  valueListenable: SettingsRepository.songDanmakuReadOnly,
+                  builder: (context, readOnly, _) => SwitchListTile(
+                    title: const Text('只看弹幕'),
+                    subtitle: const Text('隐藏播放页的发弹幕按钮，仅浏览弹幕'),
+                    value: readOnly,
+                    onChanged: (v) {
+                      AppHaptics.lightImpact(HapticCategory.control);
+                      _settingsRepository.setSongDanmakuReadOnly(v);
+                    },
                   ),
-              ],
-            ),
+                ),
+            ],
           ),
+        ),
       ],
     );
   }
@@ -5907,11 +6401,11 @@ class _SettingsPageState extends State<SettingsPage>
             context.read<PlayerProvider>().setCloseLocalMusicComments(value);
           },
         ),
-        // 本地歌曲在线信息匹配：自动匹配开关（关闭时终止进行中的轮次）
+        // 本地/云盘歌曲在线信息匹配：自动匹配开关（关闭时终止进行中的轮次）
         // search: 自动匹配 在线信息 匹配 封面 歌词 评论 本地歌曲
         SwitchListTile(
           title: const Text('自动匹配在线信息'),
-          subtitle: const Text('为本地歌曲搜索匹配在线歌曲，补充封面、歌词与评论区'),
+          subtitle: const Text('为本地与云盘歌曲搜索匹配在线歌曲，补充封面、歌词与评论区'),
           value: _autoMatchOnlineInfo,
           onChanged: (value) {
             AppHaptics.lightImpact(HapticCategory.control);
@@ -6489,8 +6983,6 @@ class _SettingsPageState extends State<SettingsPage>
     return const McpAgentSection();
   }
 
-  /// 本地持久化音频管理 section 未包含在公开版本中。
-
   /// 恢复 32bit 播放开关并同步到字段（从 UsbAudioService 缓存读取，已持久化+下发原生）。
   Future<void> _initEnable32bit() async {
     await UsbAudioService.instance.initEnable32bit();
@@ -6733,6 +7225,13 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 关于 section：版本（含构建期渲染引擎）→ 帮助 → 法律与许可。
   Widget _buildAboutSection(ColorScheme colorScheme) {
+    // _pendingUpdateVersion 存的是「上次提醒过的版本号」，是历史记录而非实时状态：
+    // 升级到更高版本后该值不会被清空，直接展示会一直谎报旧版本（如已装 6.3.0
+    // 却提示有 6.1.0 可用）。故展示前与当前版本比对，不比当前新即视为无更新。
+    final currentVersion = _appVersion.isEmpty ? kBuildAppVersion : _appVersion;
+    final pendingVersion = isNewerRelease(_pendingUpdateVersion, currentVersion)
+        ? _pendingUpdateVersion
+        : '';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -6777,14 +7276,14 @@ class _SettingsPageState extends State<SettingsPage>
             Platform.isWindows
                 ? (_isCheckingWindowsUpdate
                       ? '正在检查 GitHub Release…'
-                      : (_pendingUpdateVersion.isEmpty
+                      : (pendingVersion.isEmpty
                             ? '检查并下载 Windows 更新'
-                            : '有新版 v$_pendingUpdateVersion 可用，点击更新'))
-                : _pendingUpdateVersion.isEmpty
+                            : '有新版 v$pendingVersion 可用，点击更新'))
+                : pendingVersion.isEmpty
                 ? (Platform.isIOS
                       ? 'https://github.com/EPXiaohua/MD3Music-iOS/releases'
                       : 'https://github.com/zzyoxml/md3Music/releases')
-                : '有新版 v$_pendingUpdateVersion 可用，点击前往下载',
+                : '有新版 v$pendingVersion 可用，点击前往下载',
           ),
           leading: const Icon(Icons.system_update_outlined),
           trailing: Platform.isWindows
@@ -6818,16 +7317,16 @@ class _SettingsPageState extends State<SettingsPage>
             trailing: const Icon(Icons.open_in_new, size: 18),
             onTap: () => openUpdateWebPage(updateMirrorWebsiteUrl),
           ),
+          // iOS 移植版仓库入口：指向上游仓库（Android 用户直接看上游发布页即可）
+          if (Platform.isIOS)
+            ListTile(
+              title: const Text('GitHub 仓库'),
+              subtitle: const Text('github.com/zzyoxml/md3Music · 上游仓库'),
+              leading: const Icon(Icons.code_outlined),
+              trailing: const Icon(Icons.open_in_new, size: 18),
+              onTap: () => _openProjectRepoUrl(),
+            ),
         ],
-        // iOS 移植版仓库入口：指向上游仓库（Android 用户直接看上游发布页即可）
-        if (Platform.isIOS)
-          ListTile(
-            title: const Text('GitHub 仓库'),
-            subtitle: const Text('github.com/zzyoxml/md3Music · 上游仓库'),
-            leading: const Icon(Icons.code_outlined),
-            trailing: const Icon(Icons.open_in_new, size: 18),
-            onTap: () => _openProjectRepoUrl(),
-          ),
         // 渲染引擎与版本号同属"当前构建的事实"，故并入版本组：
         // 由构建期 flavor 决定（skia / impeller），运行时不可切换，只读展示。
         // search: 渲染引擎 渲染 引擎 图形 兼容 skia impeller 构建
@@ -7295,7 +7794,7 @@ IconData _tabIconForId(String tabId) {
       return Icons.landscape;
     case 'channel':
       // 与主页 tab 图标保持一致（见 app.dart 的 channel case）
-      return Icons.dynamic_feed;
+      return Icons.podcasts;
     case 'brush':
       // 与主页 tab 图标保持一致（见 app.dart 的 brush case）
       return Icons.swipe;

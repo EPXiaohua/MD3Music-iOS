@@ -12,7 +12,8 @@ import androidx.media3.session.legacy.MediaDescriptionCompat
  *   `vivomusicmix.media.metadata.support_event`：不含列表位时岛把"播放列表"按钮置灰
  *   且**连请求都不发**；声明后经 MediaBrowserServiceCompat 绑定来取列表。
  * - 三个父节点：vivomusicmix_current_list / favorite_list / local_list
- *   （对应面板"播放列表 / 收藏列表 / 下载列表"三个 tab）。
+ *   （对应面板"播放列表 / 收藏列表 / 下载列表"三个 tab；实际数据分别是
+ *   当前队列 / 云端收藏 / 本地音乐，第二个 tab 的标签是岛侧固定文案）。
  * - 分页：请求 options 带 `vivomusicmix_key_media_page`；返回项的 description
  *   extras 带 `vivomusicmix_key_has_more` 与 `vivomusicmix_key_media_page`（下一页）。
  * - 空列表必须回一条约定 media id（否则岛一直加载并报网络错误）。

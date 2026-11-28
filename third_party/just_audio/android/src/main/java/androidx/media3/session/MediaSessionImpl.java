@@ -788,6 +788,13 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     return sessionLegacyStub.getSessionCompat();
   }
 
+  /// MD3Music fork（CarWith）：强制 legacy 控制器重读一次当前 metadata（每换一句
+  /// 逐句歌词必须重发，extras-only 变化不会触发 onMediaMetadataChanged）。转发到
+  /// legacy stub 落实现；断开时调用方门控保证永不走到这里。
+  public void forceLegacyMetadataBroadcast() {
+    sessionLegacyStub.forceLegacyMetadataBroadcast();
+  }
+
   public void setLegacyControllerConnectionTimeoutMs(long timeoutMs) {
     sessionLegacyStub.setLegacyControllerDisconnectTimeoutMs(timeoutMs);
   }

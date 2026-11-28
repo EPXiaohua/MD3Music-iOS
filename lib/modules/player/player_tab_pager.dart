@@ -29,6 +29,7 @@ class PlayerTabPager extends StatefulWidget {
     required this.tabController,
     required this.children,
     this.physics,
+    this.lightweightDesktopSwitch = false,
   });
 
   /// 仅用于指示线与外部点击切页；本组件不把它当作页面位置的输入。
@@ -39,14 +40,27 @@ class PlayerTabPager extends StatefulWidget {
   /// 透传给 PageView。控制页用手势锁在拖动滑条期间传 NeverScrollableScrollPhysics，防滑条与横滑切页抢竞技场。
   final ScrollPhysics? physics;
 
+  /// Windows 点击页签跳过横向搬移，仅对目标页轻淡入；PageView 拖拽不受影响。
+  final bool lightweightDesktopSwitch;
+
   @override
   State<PlayerTabPager> createState() => PlayerTabPagerState();
 }
 
-class PlayerTabPagerState extends State<PlayerTabPager> {
+class PlayerTabPagerState extends State<PlayerTabPager>
+    with SingleTickerProviderStateMixin {
   late final PageController _pageController = PageController(
     initialPage: widget.tabController.index,
   );
+  late final AnimationController _desktopFadeController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 160),
+    value: 1,
+  );
+  late final Animation<double> _desktopFade = _desktopFadeController
+      .drive(CurveTween(curve: Curves.easeOut))
+      .drive(Tween<double>(begin: 0.8, end: 1));
+  bool _reduceMotion = false;
 
   /// 写 TabController 时置位，避免把自己的镜像当成外部改动再同步回去。
   bool _mirroring = false;
@@ -67,6 +81,12 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
     widget.tabController.addListener(_onTabControllerChanged);
     // PageController 本身就是滚动通知源：attach 后任意滚动都会回调。
     _pageController.addListener(_onPageMoved);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _reduceMotion = MediaQuery.disableAnimationsOf(context);
   }
 
   @override
@@ -91,6 +111,7 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
   @override
   void dispose() {
     widget.tabController.removeListener(_onTabControllerChanged);
+    _desktopFadeController.dispose();
     _pageController
       ..removeListener(_onPageMoved)
       ..dispose();
@@ -233,6 +254,18 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
     }
     final target = controller.index + controller.offset;
     if ((target - page).abs() < 0.001) return;
+    if (widget.lightweightDesktopSwitch && !controller.indexIsChanging) {
+      if (_reduceMotion) {
+        _desktopFadeController.value = 1;
+      } else {
+        _desktopFadeController
+          ..stop()
+          ..value = 0
+          ..forward();
+      }
+      _pageController.jumpTo(target * viewportWidth);
+      return;
+    }
     jumpToPage(target);
   }
 
@@ -257,7 +290,14 @@ class PlayerTabPagerState extends State<PlayerTabPager> {
     // tv: 标出「tab 内容区」作用域——播放页返回键靠它区分「焦点在内容里」
     // 与「焦点已在控制区」，前者先退回播放键、后者才退出播放页
     // （见 `tv_player_back_focus.dart`）。非 TV 构建原样返回，零变化。
-    if (!kTvBuild) return pageView;
-    return TvPlayerTabContentScope(child: pageView);
+    final content = widget.lightweightDesktopSwitch
+        ? FadeTransition(
+            key: const ValueKey('desktop-player-tab-fade'),
+            opacity: _desktopFade,
+            child: RepaintBoundary(child: pageView),
+          )
+        : pageView;
+    if (!kTvBuild) return content;
+    return TvPlayerTabContentScope(child: content);
   }
 }

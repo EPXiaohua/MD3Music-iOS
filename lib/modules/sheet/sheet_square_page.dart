@@ -7,6 +7,7 @@ import '../../core/remote/tv_scroll_region.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/md3_pull_to_refresh.dart';
+import '../../widgets/md3e_loading_indicator.dart';
 import '../../widgets/tv_dropdown_menu.dart';
 import 'song_sheet_sheet.dart';
 
@@ -368,7 +369,7 @@ class _SheetSquarePageState extends State<SheetSquarePage>
 
     Widget body;
     if (items.isEmpty && loading) {
-      body = const Center(child: CircularProgressIndicator());
+      body = const Center(child: MD3ELoadingIndicator());
     } else if (items.isEmpty && _errors[tab] != null) {
       body = Center(
         child: Column(
@@ -419,7 +420,7 @@ class _SheetSquarePageState extends State<SheetSquarePage>
                     child: SizedBox(
                       width: 20,
                       height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                      child: MD3ELoadingIndicator(size: 20),
                     ),
                   ),
                 );

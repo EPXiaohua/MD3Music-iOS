@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/build_flags.dart';
 import '../../data/models/song.dart';
+import '../../data/repositories/settings_repository.dart';
 import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_models.dart';
@@ -17,6 +18,8 @@ import '../../services/kugou_api/kugou_models.dart';
 /// 数据来自 /audio/accompany/matching（最佳伴奏匹配，匿名可用）；
 /// K 歌数量来自 /audio/ktv/total（入参取自伴奏返回，拉取失败静默隐藏该行）。
 void showSongAccompanySheet(BuildContext context, Song song) {
+  // 伴唱功能总开关关闭时，任何入口都不再打开伴奏面板（兜底防漏）。
+  if (!SettingsRepository.accompanyFeatureEnabled.value) return;
   showModalBottomSheet(
     context: context,
     isScrollControlled: true,

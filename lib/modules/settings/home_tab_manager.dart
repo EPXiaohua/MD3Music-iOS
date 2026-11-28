@@ -39,7 +39,7 @@ IconData homeTabIcon(String tabId) {
     case 'scene':
       return Icons.landscape;
     case 'channel':
-      return Icons.dynamic_feed;
+      return Icons.podcasts;
     case 'sheet':
       return Icons.queue_music;
     case 'brush':

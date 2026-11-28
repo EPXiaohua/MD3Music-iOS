@@ -8,23 +8,47 @@ import '../../core/services/dlna_service.dart';
 import '../../providers/dlna_provider.dart';
 import '../../providers/player_provider.dart';
 
-/// 投屏二级菜单 BottomSheet。
+/// 投屏面板的**内容**：设备列表 / 投屏中的传输控制。
+///
+/// 抽成公开组件是为了被「播放与输出」面板内嵌（同一份设备发现与传输控制，
+/// 不复制第二套 UI）。[showHeader] = false 时省掉自己的标题行 —— 宿主面板
+/// 已经有「播放与输出」和页签，再叠一层「投屏到设备」就是两层标题。
 ///
 /// 支持两种模式：
 /// - 歌曲投屏（默认）：从 PlayerProvider 获取当前歌曲 URL
 /// - MV 投屏：通过 [mvUrl] 参数传入已解析的播放地址
-class DlnaCastSheet extends StatefulWidget {
+class DlnaCastView extends StatefulWidget {
   /// MV 投屏时传入播放地址，null 表示歌曲投屏。
+  final String? mvUrl;
+  final String? mvTitle;
+
+  /// 是否画自己的标题行（嵌入宿主面板时传 false）。
+  final bool showHeader;
+
+  const DlnaCastView({
+    super.key,
+    this.mvUrl,
+    this.mvTitle,
+    this.showHeader = true,
+  });
+
+  @override
+  State<DlnaCastView> createState() => _DlnaCastViewState();
+}
+
+/// 投屏 BottomSheet：锁屏深链、MV 页、AM 页的原调用点仍然走这里。
+class DlnaCastSheet extends StatelessWidget {
   final String? mvUrl;
   final String? mvTitle;
 
   const DlnaCastSheet({super.key, this.mvUrl, this.mvTitle});
 
   @override
-  State<DlnaCastSheet> createState() => _DlnaCastSheetState();
+  Widget build(BuildContext context) =>
+      DlnaCastView(mvUrl: mvUrl, mvTitle: mvTitle);
 }
 
-class _DlnaCastSheetState extends State<DlnaCastSheet> {
+class _DlnaCastViewState extends State<DlnaCastView> {
   @override
   void initState() {
     super.initState();
@@ -75,27 +99,37 @@ class _DlnaCastSheetState extends State<DlnaCastSheet> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 标题栏
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Icon(Icons.cast, color: theme.colorScheme.primary),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    widget.mvUrl != null ? '投屏 MV 到设备' : '投屏到设备',
-                    style: theme.textTheme.titleMedium,
+          // 标题栏（嵌入宿主面板时让位：面板自己已经有头）
+          if (widget.showHeader) ...[
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  Icon(Icons.cast, color: theme.colorScheme.primary),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      widget.mvUrl != null ? '投屏 MV 到设备' : '投屏到设备',
+                      style: theme.textTheme.titleMedium,
+                    ),
                   ),
-                ),
-                if (dlna.state == DlnaCastState.searching)
-                  const M3ELoadingIndicator(
-                    constraints: BoxConstraints.tightFor(width: 20, height: 20),
-                  ),
-              ],
+                ],
+              ),
             ),
-          ),
-          const Divider(height: 1),
+            const Divider(height: 1),
+          ],
+          // 搜索中指示器：**不挂在标题行里**。嵌入「播放与输出」面板时标题行整块
+          // 隐藏（showHeader=false），spinner 若只在标题右侧就会跟着消失，用户对着
+          // 「未发现设备」干等。所以它自己占一行，两种宿主形态下都在场。
+          if (dlna.state == DlnaCastState.searching)
+            const Padding(
+              padding: EdgeInsets.only(top: 12, bottom: 4),
+              child: Center(
+                child: M3ELoadingIndicator(
+                  constraints: BoxConstraints.tightFor(width: 20, height: 20),
+                ),
+              ),
+            ),
           // 错误提示
           if (dlna.state == DlnaCastState.error && dlna.errorMessage != null)
             Padding(

@@ -151,14 +151,14 @@ class AppLayout {
   /// 手机原有单栏宽度上限；大屏以此为基准，通过 contentWidthFor 扩展。
   static const double maxContentWidth = 840;
 
-  /// 大屏内容占局部可用宽度的 85%；窄面板不缩窄，手机沿用原限宽。
+  /// 大屏内容占局部可用宽度的 92%；窄面板不缩窄，手机沿用原限宽。
   static double contentWidthFor(double width, {
     double compactWidth = maxContentWidth, bool adaptive = true,
   }) {
     if (!width.isFinite) return compactWidth;
     if (width <= compactWidth) return width;
     if (!adaptive) return compactWidth;
-    return (width * 0.85).clamp(compactWidth, width);
+    return (width * 0.92).clamp(compactWidth, width);
   }
 
   /// 正文文本的舒适阅读宽度上限（歌词、长段描述），约 60–75 字符行长。

@@ -49,7 +49,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
   // 排序
   _SortBy _sortBy = _SortBy.time;
-  bool _sortAscending = false;
+  bool _sortAscending = true;
 
   // 专辑内搜索
   bool _isSearching = false;
@@ -101,11 +101,17 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
             (s.album?.toLowerCase().contains(q) ?? false);
       }).toList();
     }
+    // 预建 id→下标 map：「时间」排序用原列表位置做键，
+    // 避免 indexOf 在比较器里 O(N²) 扫描（与 playlist_song_sort 同一做法）。
+    final rank = <String, int>{
+      for (var i = 0; i < _songs.length; i++) _songs[i].id: i,
+    };
+    int indexRank(Song song) => rank[song.id] ?? _songs.length;
     list.sort((a, b) {
       int cmp;
       switch (_sortBy) {
         case _SortBy.time:
-          cmp = _songs.indexOf(a).compareTo(_songs.indexOf(b));
+          cmp = indexRank(a).compareTo(indexRank(b));
           break;
         case _SortBy.title:
           cmp = a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
@@ -553,14 +559,14 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                       : Icons.arrow_downward_rounded,
                                   current: _sortBy,
                                   options: const [
-                                    (value: _SortBy.time, label: '添加时间'),
+                                    (value: _SortBy.time, label: '专辑顺序'),
                                     (value: _SortBy.title, label: '歌曲名称'),
                                     (value: _SortBy.duration, label: '时长'),
                                   ],
                                   onPicked: (value) {
                                     setState(() {
                                       _sortBy = value;
-                                      _sortAscending = value == _SortBy.time ? false : true;
+                                      _sortAscending = true;
                                       _invalidateDisplaySongs();
                                     });
                                   },

@@ -21,17 +21,17 @@ jobs:
     steps:
       # 1. 拉取代码（含已入库的 windows/ 平台目录 与 third_party/just_audio）
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       # 2. Rust 工具链（windows-latest 上用 MSVC，无需 NDK / GNU toolchain）
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # 3. Flutter（与现有 CI 一致）
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -94,7 +94,7 @@ jobs:
 
       # 9. 上传 artifact（可在 Actions 页下载）
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: md3music-windows
           path: md3music-windows-*.zip
@@ -104,7 +104,7 @@ jobs:
       # 10. 创建 CI Release（已禁用自动触发，此步骤不再执行）
       # - name: Create CI Release
       #   if: github.event_name == 'push'
-      #   uses: softprops/action-gh-release@v2
+      #   uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
       #   with:
       #     tag_name: win-${{ github.sha }}
       #     name: Windows Build ${{ github.sha }}

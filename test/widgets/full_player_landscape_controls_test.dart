@@ -9,10 +9,13 @@
 //（ControlledAudioService + AudioServiceLoader 注入与同一套清理顺序）。
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' as services;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/services/output_mode_coordinator.dart';
+import 'package:md3music/core/services/windows_fullscreen.dart';
 import 'package:md3music/data/models/song.dart';
 import 'package:md3music/data/repositories/history_repository.dart';
 import 'package:md3music/modules/player/am_transport_controls.dart';
@@ -59,9 +62,20 @@ Song _song() => Song(
   isOnline: true,
 );
 
-void _mockPlatformChannels() {
+void _mockPlatformChannels({List<String>? windowTrayCalls}) {
   final messenger =
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  // Windows 窗口通道：右键沉浸的核心判据就是「有没有 setFullscreen(true)」。
+  // 返回值按入参回显（模拟原生真值），否则 WindowsFullscreen.active 镜像永远 false。
+  messenger.setMockMethodCallHandler(
+    const services.MethodChannel('md3music/window_tray'),
+    (call) async {
+      final args = call.arguments;
+      final value = args is Map ? args['value'] : null;
+      windowTrayCalls?.add('${call.method}($value)');
+      return call.method == 'setFullscreen' ? value == true : false;
+    },
+  );
   messenger.setMockStreamHandler(
     const services.EventChannel(
       'dev.fluttercommunity.plus/connectivity_status',
@@ -163,6 +177,24 @@ Future<void> _longPressArtworkIntoZen(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
+/// 只取「窗口全屏」调用：同一条通道上还有 `isMaximized` /
+/// `setCaptionMaxButtonRect` 等无关调用（Windows 标题栏三键），
+/// 「有没有把窗口切成全屏」的判据必须按方法名过滤。
+List<String> _fullscreenCalls(List<String> calls) =>
+    calls.where((c) => c.startsWith('setFullscreen')).toList();
+
+/// 右键封面：flutter_test 里必须显式给 `kind: mouse` + `buttons`。
+/// 默认的 touch + 主键指针根本不会进 `SecondaryTapGestureRecognizer`。
+Future<void> _secondaryClickArtwork(WidgetTester tester) async {
+  final gesture = await tester.startGesture(
+    tester.getCenter(find.byType(PlayerCoverSlot).first),
+    kind: PointerDeviceKind.mouse,
+    buttons: kSecondaryMouseButton,
+  );
+  await gesture.up();
+  await tester.pumpAndSettle();
+}
+
 /// 受控 harness：按 [viewport] 装载播放器并跑 [body]，结束后按
 /// full_player_narrow_layout_test 的顺序清理（先缩起、再逐层 dispose）。
 Future<void> _runPlayerTest(
@@ -172,8 +204,16 @@ Future<void> _runPlayerTest(
   bool detachedControlsEnabled = true,
   bool tabDotsInTopBar = false,
   bool emitPlaying = true,
+  bool windowsDesktop = false,
+  List<String>? windowTrayCalls,
+  Map<String, Object> initialPrefs = const <String, Object>{},
   required Future<void> Function(PlayerProvider player) body,
 }) async {
+  // 平台覆盖必须在测试体内设置、测试体内复位：框架在测试体结束时校验 foundation
+  // 的 debug 覆盖变量，放 setUp/tearDown 会变成「用例通过但框架判定失败」。
+  if (windowsDesktop) {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+  }
   final originalTabIndex = playerTabIndex.value;
   addTearDown(() => playerTabIndex.value = originalTabIndex);
   // 进程级开关用完复位到默认（控制带常驻 = false、圆点在底部页签条 = false），
@@ -184,8 +224,8 @@ Future<void> _runPlayerTest(
   final originalDevicePixelRatio = tester.view.devicePixelRatio;
   tester.view.physicalSize = viewport;
   tester.view.devicePixelRatio = 1;
-  SharedPreferences.setMockInitialValues({});
-  _mockPlatformChannels();
+  SharedPreferences.setMockInitialValues(initialPrefs);
+  _mockPlatformChannels(windowTrayCalls: windowTrayCalls);
   KugouProvider.restoreLyric = (_) async => const KugouLyric(
     content: '[00:00.00]test lyric',
     decodedContent: '[00:00.00]test lyric',
@@ -232,6 +272,11 @@ Future<void> _runPlayerTest(
     KugouProvider.restoreLyric = null;
     tester.view.physicalSize = originalPhysicalSize;
     tester.view.devicePixelRatio = originalDevicePixelRatio;
+    // 清掉可能残留的 Zen 全屏快照与镜像，避免污染同文件后续用例
+    // （快照是 WindowsFullscreen 的静态状态，跨用例存活）。
+    WindowsFullscreen.exitZen();
+    WindowsFullscreen.active.value = false;
+    debugDefaultTargetPlatformOverride = null;
   }
 }
 
@@ -1344,6 +1389,173 @@ void main() {
         PlayerZenBridge.instance.hasHandlers,
         isFalse,
         reason: '播放页卸载后必须注销，否则 F11 会打到已 dispose 的 State',
+      );
+    });
+
+    // ── Windows 右键封面：沉浸但不切窗口全屏 ──
+    //
+    // 需求是「右键进沉浸、保留原窗口大小」，所以判据不是「Zen 是否生效」
+    // （长按那条路径本来就连带全屏），而是**窗口通道有没有收到 setFullscreen(true)**。
+    // 平台必须显式覆盖成 windows：播放页的右键层挂 `isWindowsDesktop` 门控。
+    testWidgets('$name Windows 右键封面：进 Zen 但不切窗口全屏', (tester) async {
+      final calls = <String>[];
+      await _runPlayerTest(
+        tester,
+        viewport: const Size(1280, 800),
+        page: page,
+        windowsDesktop: true,
+        windowTrayCalls: calls,
+        body: (player) async {
+          kPlayerZenImmersiveActive.value = false;
+          await _secondaryClickArtwork(tester);
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isTrue,
+            reason: 'Windows 上右键封面应进入沉浸',
+          );
+          expect(
+            _fullscreenCalls(calls),
+            isEmpty,
+            reason: '右键沉浸不得把窗口切成全屏（要求保留原窗口大小）',
+          );
+
+          await _secondaryClickArtwork(tester);
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isFalse,
+            reason: '再次右键退出沉浸',
+          );
+          expect(
+            _fullscreenCalls(calls),
+            isEmpty,
+            reason: '进出沉浸全程都不该碰窗口形态',
+          );
+        },
+      );
+    });
+
+    testWidgets('$name Windows 右键进 Zen 后 peek，4s 回 Zen 仍不切全屏', (tester) async {
+      final calls = <String>[];
+      await _runPlayerTest(
+        tester,
+        // 800×360 走 medium（横屏）布局：那里的封面 onTap 才是 `_onWideArtworkTap`
+        // → peek。expanded（1280 宽）的封面 onTap 是刻意的空操作（只吞长按后的点按），
+        // 单击不唤出 chrome，peek 在该布局下压根不可达。
+        viewport: const Size(800, 360),
+        page: page,
+        windowsDesktop: true,
+        windowTrayCalls: calls,
+        body: (player) async {
+          kPlayerZenImmersiveActive.value = false;
+          await _secondaryClickArtwork(tester);
+          expect(kPlayerZenImmersiveActive.value, isTrue, reason: '先右键进沉浸');
+
+          // 单击封面唤出 chrome（peek）：按住一帧再松手，走真机「短按」路径。
+          final press = await tester.startGesture(
+            tester.getCenter(find.byType(PlayerCoverSlot).first),
+          );
+          await tester.pump(const Duration(milliseconds: 60));
+          await press.up();
+          await tester.pump();
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isFalse,
+            reason: 'peek 期间是退出态',
+          );
+
+          // 4s 倒计时逐档 pump：pumpAndSettle 等不到常驻定时器 idle。
+          for (var i = 0; i < 45; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isTrue,
+            reason: '倒计时结束后自动回 Zen',
+          );
+          expect(
+            _fullscreenCalls(calls),
+            isEmpty,
+            reason: 'peek 回 Zen 必须沿用本趟「不持窗口全屏」的取值，否则会突然全屏',
+          );
+        },
+      );
+    });
+
+    testWidgets('$name Windows 右键按住 2.4s 只切一次 Zen', (tester) async {
+      final calls = <String>[];
+      await _runPlayerTest(
+        tester,
+        viewport: const Size(1280, 800),
+        page: page,
+        windowsDesktop: true,
+        windowTrayCalls: calls,
+        body: (player) async {
+          kPlayerZenImmersiveActive.value = false;
+          final gesture = await tester.startGesture(
+            tester.getCenter(find.byType(PlayerCoverSlot).first),
+            kind: PointerDeviceKind.mouse,
+            buttons: kSecondaryMouseButton,
+          );
+          for (var i = 0; i < 24; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+          await gesture.up();
+          await tester.pumpAndSettle();
+          // 若 _onArtworkPointerDown 没过滤次键：2000ms 长按先在按住期间进 Zen，
+          // 松手再触发一次右键 → 又退出，最终是 false。
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isTrue,
+            reason: '右键按住只算一次切换（长按计时器不得被次键启动）',
+          );
+          expect(_fullscreenCalls(calls), isEmpty, reason: '仍然是「不持窗口全屏」的沉浸');
+        },
+      );
+    });
+
+    testWidgets('$name Windows 关闭「长按封面进 Zen」后右键仍生效', (tester) async {
+      final calls = <String>[];
+      await _runPlayerTest(
+        tester,
+        viewport: const Size(1280, 800),
+        page: page,
+        windowsDesktop: true,
+        windowTrayCalls: calls,
+        // 该设置描述的是「长按」这条手势，右键是独立入口，必须不受它约束。
+        initialPrefs: const <String, Object>{
+          'settings_zen_cover_long_press': false,
+        },
+        body: (player) async {
+          kPlayerZenImmersiveActive.value = false;
+          await _secondaryClickArtwork(tester);
+          expect(
+            kPlayerZenImmersiveActive.value,
+            isTrue,
+            reason: '设置关掉的是长按，右键入口必须仍在',
+          );
+          expect(_fullscreenCalls(calls), isEmpty);
+        },
+      );
+    });
+
+    testWidgets('$name Windows 长按封面进 Zen 仍切窗口全屏（对照）', (tester) async {
+      final calls = <String>[];
+      await _runPlayerTest(
+        tester,
+        viewport: const Size(1280, 800),
+        page: page,
+        windowsDesktop: true,
+        windowTrayCalls: calls,
+        body: (player) async {
+          kPlayerZenImmersiveActive.value = false;
+          await _longPressArtworkIntoZen(tester);
+          expect(kPlayerZenImmersiveActive.value, isTrue, reason: '长按进 Zen');
+          expect(
+            _fullscreenCalls(calls),
+            contains('setFullscreen(true)'),
+            reason: '长按入口保持历史语义：连带给窗口全屏',
+          );
+        },
       );
     });
 

@@ -450,8 +450,13 @@ void SpectrumCapture::SetFrameCallback(FrameCallback callback) {
   callback_ = std::move(callback);
 }
 
-bool SpectrumCapture::Start() {
+bool SpectrumCapture::Start(LoopbackMode mode) {
   Stop();
+
+  {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    loopback_mode_ = mode;
+  }
 
   init_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -539,27 +544,34 @@ void SpectrumCapture::ThreadMain() {
   bool initialized = false;
   HRESULT hr = E_FAIL;
 
-  // ── 1) 进程环回（首选）────────────────────────────────────────────
-  hr = TryProcessLoopback(&client);
-  if (SUCCEEDED(hr) && client != nullptr) {
-    // 微软 ApplicationLoopback 示例同款：进程环回必须自己指定格式，
-    // AUTOCONVERTPCM 让音频引擎把任意混音格式转成 PCM16。
-    WAVEFORMATEX process_format = {};
-    process_format.wFormatTag = WAVE_FORMAT_PCM;
-    process_format.nChannels = 2;
-    process_format.nSamplesPerSec = kProcessCaptureRate;
-    process_format.wBitsPerSample = 16;
-    process_format.nBlockAlign = 4;
-    process_format.nAvgBytesPerSec = kProcessCaptureRate * 4;
-    process_format.cbSize = 0;
-    hr = InitializeLoopbackClient(client, &process_format,
-                                  AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM);
-    if (SUCCEEDED(hr) && DescribeFormat(process_format, &format)) {
-      mode = "process";
-    } else {
-      client->Release();
-      client = nullptr;
-      hr = E_FAIL;
+  // ── 1) 进程环回（仅频谱；识曲要整个系统混音，见 LoopbackMode）──────
+  LoopbackMode mode_hint = LoopbackMode::kProcessPreferred;
+  {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    mode_hint = loopback_mode_;
+  }
+  if (mode_hint == LoopbackMode::kProcessPreferred) {
+    hr = TryProcessLoopback(&client);
+    if (SUCCEEDED(hr) && client != nullptr) {
+      // 微软 ApplicationLoopback 示例同款：进程环回必须自己指定格式，
+      // AUTOCONVERTPCM 让音频引擎把任意混音格式转成 PCM16。
+      WAVEFORMATEX process_format = {};
+      process_format.wFormatTag = WAVE_FORMAT_PCM;
+      process_format.nChannels = 2;
+      process_format.nSamplesPerSec = kProcessCaptureRate;
+      process_format.wBitsPerSample = 16;
+      process_format.nBlockAlign = 4;
+      process_format.nAvgBytesPerSec = kProcessCaptureRate * 4;
+      process_format.cbSize = 0;
+      hr = InitializeLoopbackClient(client, &process_format,
+                                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM);
+      if (SUCCEEDED(hr) && DescribeFormat(process_format, &format)) {
+        mode = "process";
+      } else {
+        client->Release();
+        client = nullptr;
+        hr = E_FAIL;
+      }
     }
   }
 
@@ -632,11 +644,20 @@ void SpectrumCapture::ThreadMain() {
           break;
         }
         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr) {
-          analyzer.AppendSilence(frames);
+          if (pcm_tap_enabled_) {
+            AppendPcmSilence(frames);
+          } else {
+            analyzer.AppendSilence(frames);
+          }
+        } else if (pcm_tap_enabled_) {
+          AppendPcm(data, frames, format.is_float, format.channels);
         } else {
           analyzer.AppendInterleaved(data, frames, format);
         }
         capture_client->ReleaseBuffer(frames);
+        // 频谱路径逐包喂 MaybeEmit（含静音包，静音也要出零能量帧，
+        // 否则界面会卡住上一次的柱形）；PCM 旁路下 analyzer 从未被喂，
+        // 这里自然是空操作。
         analyzer.MaybeEmit(
             [this](const std::vector<double>& bands) { EmitFrame(bands); });
       }
@@ -655,4 +676,72 @@ void SpectrumCapture::ThreadMain() {
   if (sample_event != nullptr) CloseHandle(sample_event);
   if (mix_format != nullptr) CoTaskMemFree(mix_format);
   if (SUCCEEDED(com_result)) CoUninitialize();
+}
+
+// ── PCM 旁路（识曲用）──────────────────────────────────────────────────
+
+void SpectrumCapture::EnablePcmTap(int max_duration_ms) {
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  pcm_samples_.clear();
+  pcm_truncated_ = false;
+  const bool enabled = max_duration_ms > 0;
+  // 上限只能按 48kHz 估：EnablePcmTap 发生在 Start 之前，采集格式（44.1/48k）
+  // 要到激活后才确定。按 48k 估对 44.1k 端点相当于多留 8% 余量，无副作用。
+  pcm_max_samples_ = enabled ? static_cast<size_t>(max_duration_ms) * 48 : 0;
+  pcm_tap_enabled_.store(enabled);
+}
+
+void SpectrumCapture::DisablePcmTap() { pcm_tap_enabled_.store(false); }
+
+SpectrumCapture::PcmSegment SpectrumCapture::TakePcm() {
+  PcmSegment segment;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    segment.sample_rate_hz = sample_rate_hz_;
+  }
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  segment.samples.swap(pcm_samples_);
+  segment.truncated = pcm_truncated_;
+  pcm_truncated_ = false;
+  return segment;
+}
+
+void SpectrumCapture::AppendPcmSilence(UINT32 frames) {
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  if (!pcm_tap_enabled_.load()) return;
+  for (UINT32 i = 0; i < frames; ++i) {
+    if (pcm_samples_.size() >= pcm_max_samples_) {
+      pcm_truncated_ = true;
+      return;
+    }
+    pcm_samples_.push_back(0);
+  }
+}
+
+void SpectrumCapture::AppendPcm(const BYTE* data, UINT32 frames, bool is_float,
+                                int channels) {
+  if (data == nullptr || channels <= 0) return;
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  if (!pcm_tap_enabled_.load()) return;
+
+  const auto* as_float = reinterpret_cast<const float*>(data);
+  const auto* as_int16 = reinterpret_cast<const int16_t*>(data);
+
+  for (UINT32 frame = 0; frame < frames; ++frame) {
+    if (pcm_samples_.size() >= pcm_max_samples_) {
+      pcm_truncated_ = true;
+      return;
+    }
+    double mixed = 0.0;
+    for (int channel = 0; channel < channels; ++channel) {
+      const size_t index =
+          static_cast<size_t>(frame) * static_cast<size_t>(channels) +
+          static_cast<size_t>(channel);
+      mixed += is_float ? static_cast<double>(as_float[index])
+                        : static_cast<double>(as_int16[index]) / 32768.0;
+    }
+    mixed /= channels;
+    mixed = mixed > 1.0 ? 1.0 : (mixed < -1.0 ? -1.0 : mixed);
+    pcm_samples_.push_back(static_cast<int16_t>(mixed * 32767.0));
+  }
 }

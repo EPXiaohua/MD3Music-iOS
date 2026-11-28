@@ -1,11 +1,17 @@
+import 'dart:math' as math;
+
 import 'package:dpad/dpad.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
+import '../../core/build_flags.dart';
 import '../../core/layout/adaptive_navigator.dart';
+import '../../core/layout/bottom_chrome_scope.dart';
+import '../../core/layout/responsive_layout.dart';
 import '../../core/remote/tv_scroll_region.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../providers/kugou_provider.dart';
+import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/album_card.dart';
 import '../../widgets/pinchable_grid_view.dart';
@@ -47,6 +53,16 @@ class _NewAlbumBrowsePageState extends State<NewAlbumBrowsePage> {
               selector: (_, kugou) => kugou.topAlbums,
               builder: (context, list, _) {
                 if (list.isEmpty) return const Center(child: Text('暂无数据'));
+                final hasCurrentSong = context.select<PlayerProvider, bool>(
+                  (player) => player.currentSong != null,
+                );
+                final miniPlayerInset =
+                    BottomChromeScope.playerContentBottomInsetOf(
+                      context,
+                      hasPlayer: hasCurrentSong &&
+                          !kTvBuild &&
+                          !isDesktopLayout(context),
+                    );
                 // 一次构造喂给卡片、tag、详情页三处：id 口径必须与 AlbumDetailPage
                 // 收到的 widget.album.id 逐字一致，对不上就是静默不飞。
                 final albums = [for (final a in list) a.toAlbum()];
@@ -61,8 +77,14 @@ class _NewAlbumBrowsePageState extends State<NewAlbumBrowsePage> {
                   horizontalEdge: DpadEdgeBehavior.leave,
                   child: PinchableGridView(
                     padding: EdgeInsets.fromLTRB(
-                      AppSpacing.lg, AppSpacing.lg, AppSpacing.lg,
-                      AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
+                      AppSpacing.lg,
+                      AppSpacing.lg,
+                      AppSpacing.lg,
+                      AppSpacing.lg +
+                          math.max(
+                            MediaQuery.paddingOf(context).bottom,
+                            miniPlayerInset,
+                          ),
                     ),
                     childAspectRatio: 0.8,
                     spacing: 12,

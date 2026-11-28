@@ -19,13 +19,15 @@ pluginManagement {
 
 plugins {
     id("dev.flutter.flutter-plugin-loader") version "1.0.0"
-    id("com.android.application") version "9.0.1" apply false
+    // AGP 9.1.1：Flutter 3.50（stable）要求 AGP >= 9.1.1，CI 用 stable 浮动渠道会
+    // 浮动升级；配合 Gradle wrapper 9.3.1 使用。
+    id("com.android.application") version "9.1.1" apply false
     id("org.jetbrains.kotlin.android") version "2.3.20" apply false
     // Kotlin 2.x 内置的 Compose 编译器插件（版本与 Kotlin 一致）
     id("org.jetbrains.kotlin.plugin.compose") version "2.3.20" apply false
 }
 
-// JAudioTagger 社区分叉（com.github.AdrienPoupa:jaudiotagger）托管在 JitPack，
+// SuperLyricApi / lyricon 等依赖托管在 JitPack，
 // 国内镜像源（aliyun）不代理 JitPack，必须显式在 settings 中声明。
 dependencyResolutionManagement {
     repositoriesMode.set(org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT)

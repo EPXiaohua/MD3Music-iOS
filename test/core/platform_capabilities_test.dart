@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/core/platform_capabilities.dart';
 import 'package:md3music/providers/tab_config_provider.dart';
@@ -12,7 +13,6 @@ import 'package:md3music/modules/settings/settings_search_index.g.dart';
 ///（截图证据：点"USB 独占"只得到"未检测到 USB 音频设备"）。
 /// 这些功能依赖 Android 专属能力：
 ///   - USB 独占：USB Host + native cpp（UAC1 DAC 直写 usbdevfs）
-///   - 听歌识曲：麦克风采集 + RMS 分析
 ///   - 预测性返回：Android 14+ 系统手势导航
 ///   - 震动反馈：Vibrator 硬件
 ///   - 桌面快捷方式：quick_actions_android
@@ -20,6 +20,10 @@ import 'package:md3music/modules/settings/settings_search_index.g.dart';
 /// **音乐频谱已不再是 Android 专属**（2026-10）：Windows runner 用 WASAPI 环回
 /// 采集本进程音频并做同款 FFT，与 Android 共用 `onFft` 协议，因此该能力在
 /// 两个平台都为 true，只保留"其它桌面平台为 false"的口径。
+///
+/// **听歌识曲也放行 Windows**（2026-11）：Windows 走 `record_windows`
+/// （MediaFoundation）麦克风采集 + 本地 Rust PCM 前处理，设备枚举由 runner 的
+/// WASAPI 通道提供；只有悬浮窗识曲仍是 Android 专属。
 ///
 /// 本测试锁两件事：
 /// 1. 平台判定本身正确（非 Windows / 非 Android 的桌面端为 false，Windows 自己的
@@ -33,7 +37,9 @@ void main() {
       // 这里不断言具体平台，只断言"非 Android 时 Android 专属能力全部为 false"。
       if (!isAndroidPlatform) {
         expect(supportsUsbExclusive, isFalse);
-        expect(supportsSongRecognition, isFalse);
+        // 听歌识曲：Windows 用麦克风 + 本地 Rust 前处理，桌面端可用；
+        // 其它桌面平台（mac/Linux）没有对应采集分支，仍为 false。
+        expect(supportsSongRecognition, isWindowsDesktop);
         expect(supportsPredictiveGesture, isFalse);
         expect(supportsHaptics, isFalse);
         expect(supportsDesktopShortcut, isFalse);
@@ -52,12 +58,27 @@ void main() {
   });
 
   group('主页 tab：听歌识曲', () {
-    test('非 Android 时 kAllAvailableTabs 不含recognition', () {
-      if (isAndroidPlatform) return;
+    test('非 Android 且非 Windows 时 kAllAvailableTabs 不含 recognition', () {
+      if (isAndroidPlatform || isWindowsDesktop) return;
       expect(
         kAllAvailableTabs.any((t) => t.id == 'recognition'),
         isFalse,
-        reason: '桌面端不应提供听歌识曲 tab',
+        reason: 'mac/Linux 桌面端不应提供听歌识曲 tab',
+      );
+    });
+
+    test('Windows 桌面端提供听歌识曲 tab', () {
+      // flutter test 默认把 defaultTargetPlatform 覆盖成 android，
+      // 不显式改回 windows 的话本用例会空转（一律走 Android 分支）。
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      expect(isWindowsDesktop, isTrue);
+      expect(supportsSongRecognition, isTrue);
+      expect(
+        kAllAvailableTabs.any((t) => t.id == 'recognition'),
+        isTrue,
+        reason: 'Windows 已支持麦克风采集，tab 必须可见',
       );
     });
 
@@ -162,6 +183,26 @@ void main() {
         songInfo.contains('UsbExclusiveSection('),
         isTrue,
         reason: 'USB 独占区块应与设置页共用 UsbExclusiveSection',
+      );
+    });
+
+    test('悬浮窗识曲仍为 Android 专属（源码扫描）', () {
+      final source = File(
+        'lib/core/platform_capabilities.dart',
+      ).readAsStringSync();
+      expect(
+        RegExp(r'supportsFloatingSongRecognition\s*=>\s*isAndroidPlatform')
+            .hasMatch(source),
+        isTrue,
+        reason: '悬浮窗走 Android 悬浮窗权限与 MediaProjection，桌面端不得露出',
+      );
+      final page = File(
+        'lib/modules/recognition/song_recognition_page.dart',
+      ).readAsStringSync();
+      expect(
+        page.contains('if (supportsFloatingSongRecognition)'),
+        isTrue,
+        reason: '识曲页的悬浮窗入口必须按能力门控',
       );
     });
   });

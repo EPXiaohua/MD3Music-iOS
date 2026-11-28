@@ -74,7 +74,7 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  testWidgets('竖屏分类居中且横屏加号位于右上', (tester) async {
+  testWidgets('竖屏分类居中且横屏加号位于分类行右侧', (tester) async {
     await pump(tester, const Size(400, 900));
     final search = tester.getRect(find.byType(TextField));
     final left = tester.getRect(find.text('曲目')).left;
@@ -84,7 +84,7 @@ void main() {
     tester.view.physicalSize = const Size(900, 420);
     await tester.pumpAndSettle();
     final add = tester.getRect(find.byIcon(Icons.add));
-    final landscapeSearch = tester.getRect(find.byType(TextField));
+    final category = tester.getRect(find.byType(TabBar));
     final inAppBar = find
         .ancestor(of: find.byIcon(Icons.add), matching: find.byType(AppBar))
         .evaluate()
@@ -95,7 +95,7 @@ void main() {
         'portraitTabsCenterDelta': delta,
         'portraitFab': portraitFab,
         'landscapeAddY': add.center.dy,
-        'landscapeSearchTop': landscapeSearch.top,
+        'landscapeCategoryCenterY': category.center.dy,
         'landscapeAddInAppBar': inAppBar,
         'landscapeFab': landscapeFab,
       }),
@@ -104,7 +104,8 @@ void main() {
     expect(portraitFab, 1);
     expect(inAppBar, isTrue);
     expect(landscapeFab, 0);
-    expect(add.bottom, lessThanOrEqualTo(landscapeSearch.top));
+    expect(add.center.dy, closeTo(category.center.dy, 1));
+    expect(add.center.dx, greaterThan(category.right));
     expect(tester.testTextInput.hasAnyClients, isFalse);
     expect(tester.takeException(), isNull);
   });
@@ -119,6 +120,9 @@ void main() {
           size.width - 24 - (width > 840 ? (width - 840) / 2 : 0) - 16;
       expect(rect.right, closeTo(expectedRight, .1));
       expect(rect.height, greaterThanOrEqualTo(48));
+      final tabsRect = tester.getRect(find.byType(TabBar));
+      expect(rect.center.dy, closeTo(tabsRect.center.dy, 1));
+      expect(rect.left, greaterThan(tabsRect.right));
       final field = tester.widget<TextField>(find.byType(TextField));
       await tester.tap(find.byType(TextField));
       await tester.pumpAndSettle();

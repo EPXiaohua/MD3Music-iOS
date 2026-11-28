@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Verify command dispatch and public-surface gate
         if: ${{ hashFiles('scripts/md3.ps1') != '' }}
@@ -40,6 +40,11 @@ jobs:
         if: ${{ hashFiles('scripts/lib/public_export_surface.tests.ps1') != '' }}
         shell: pwsh
         run: ./scripts/lib/public_export_surface.tests.ps1
+
+      - name: Run build variant and stem-model injection regressions
+        if: ${{ hashFiles('scripts/lib/flavor_variant.tests.ps1') != '' }}
+        shell: pwsh
+        run: ./scripts/lib/flavor_variant.tests.ps1
 
       - name: Verify exported build scripts
         if: ${{ hashFiles('scripts/md3.ps1') == '' }}
@@ -61,10 +66,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -109,11 +114,11 @@ jobs:
           test/widgets/local_server_down_banner_test.dart
           test/core/services/local_artwork_cache_test.dart
 
-      - name: Run custom download directory permission regression
-        if: ${{ hashFiles('test/private/custom_download_directory_access_test.dart') != '' }}
+      - name: Run non-public regression under test/private
+        if: ${{ hashFiles('test/private/*.dart') != '' }}
         run: >-
           flutter test --reporter expanded --concurrency=1
-          test/private/custom_download_directory_access_test.dart
+          test/private/
 
       - name: Run playback URL deadline regression
         run: >-
@@ -190,7 +195,7 @@ jobs:
         working-directory: kugou_api_server/rust
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run server and API tests
         run: cargo test --locked
@@ -201,16 +206,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: platform-tools
 
@@ -223,7 +228,7 @@ jobs:
             "cmake;3.22.1"
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -232,7 +237,7 @@ jobs:
         run: flutter pub get
 
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.gradle/caches
@@ -243,7 +248,7 @@ jobs:
 
       - name: Run Android JVM unit tests
         run: >-
-          bash ./android/gradlew -p android :app:testStandardDebugUnitTest
+          bash ./android/gradlew -p android :app:testLiteDebugUnitTest
           --tests 'com.md3music.md3music.ArtworkCacheKeyTest'
           --tests 'com.md3music.md3music.ArtworkDiskCacheTest'
           --tests 'com.md3music.md3music.BoundedArtworkExecutorTest'
@@ -261,8 +266,8 @@ jobs:
           import xml.etree.ElementTree as ET
 
           report_dirs = [
-              Path("build/app/test-results/testStandardDebugUnitTest"),
-              Path("android/app/build/test-results/testStandardDebugUnitTest"),
+              Path("build/app/test-results/testLiteDebugUnitTest"),
+              Path("android/app/build/test-results/testLiteDebugUnitTest"),
           ]
           paths = [
               path

@@ -6,10 +6,12 @@
 /// - hasWordTiming=true 的非当前行（KRC）：用本类降级渲染（性能优化）
 ///
 /// 渲染规则：
-/// - 当前行（isActive）：整行 alpha = dynamicBrightAlpha（随 scale 0.2~1.0）
-/// - 非当前行：整行 alpha = dynamicDarkAlpha（随 scale 0.2~0.4，SOLID 模式）
+/// - 当前行（isActive）：整行 alpha = dynamicBrightAlpha（默认随 scale 0.2~1.0）
+/// - 非当前行：整行 alpha = dynamicDarkAlpha（默认随 scale 0.2~0.4，SOLID 模式）
 /// - 行内无 mask 渐变，整行使用同一 alpha
 /// - 行切换通过指数衰减实现淡入淡出过渡（变亮 ATTACK_SPEED=50，变暗 RELEASE_SPEED=7）
+///
+/// 两档满 factor 目标分别由「已播歌词透明度」/「未播歌词透明度」调节。
 ///
 /// 与 [WordRenderer] 的关系：
 /// - [WordRenderer] 处理当前行 + hasWordTiming=true 的逐字模式（有 mask 渐变 + 上浮）
@@ -21,7 +23,9 @@
 /// 动画驱动由外部 AnimationController + Ticker 调用 [tick] 实现。
 library;
 
+import 'dart:async';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show kDebugMode, visibleForTesting;
 import 'package:flutter/widgets.dart';
@@ -30,6 +34,7 @@ import '../layout/duet_layout.dart';
 import '../layout/lyric_layout.dart';
 import '../layout/lyric_preferences.dart';
 import 'package:md3music/core/utils/lyric_wrap_plan.dart';
+import 'package:md3music/widgets/apple_lyrics/models/aux_text_image.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 
 /// 整行降级渲染器。
@@ -44,11 +49,22 @@ class LineRenderer {
   /// 当前是否为当前行（高亮）。默认 false（SOLID 暗态）。
   bool _isActive = false;
 
-  /// 当前整行 alpha 值。初始 [LyricLayout.currentDarkAlpha]=0.2（SOLID 非当前行暗态）。
-  double _currentAlpha = LyricLayout.currentDarkAlpha;
+  /// 当前整行 alpha 值。初始为暗态渐隐基线（默认 0.2，随偏好变化）。
+  double _currentAlpha = LyricLayout.darkAlphaFor(0.0);
 
-  /// 目标 alpha 值。isActive=true 时 1.0，false 时 0.2。
-  double _targetAlpha = LyricLayout.currentDarkAlpha;
+  /// 目标 alpha 值。默认 isActive=true 时 1.0，false 时 0.2。
+  double _targetAlpha = LyricLayout.darkAlphaFor(0.0);
+
+  /// 该行的**档位 alpha**（不含模糊淡出、不含退场淡出）。
+  ///
+  /// 由「当前行亮态 / 未播暗态 / 上方已播行」三个档位之一决定，反映用户在
+  /// 「已播 / 未播歌词透明度」里的设置。副行 alpha 以它为基准（乘
+  /// [LyricLayout.translationOpacity]），于是调透明度滑块时副行跟着变。
+  ///
+  /// 刻意不用 [_currentAlpha]：那个值含 `(1 - blurFade)`，而副行模糊图是异步
+  /// 烘焙的，就绪前需要清晰层单独撑住副行；若副行也乘模糊淡出，切行瞬间会
+  /// 「整行闪空」。
+  double _auxBaseAlpha = LyricLayout.darkAlphaFor(0.0);
 
   /// v3 优化：alpha 是否已收敛到 target（最近一次 tick 中 alpha 变化 < 1e-6）。
   /// 用于 AppleLyricsView 判断是否可以停止 Ticker。
@@ -97,6 +113,18 @@ class LineRenderer {
   // 时跳过重排，直接复用上一帧段落。键**不含** translationExpand/translationExiting
   // ——副行翻转只是 _paintTranslation 的 canvas.transform，与排版正交。
   LyricWrapPlan? _lastAuxPlan;
+
+  /// 翻转期间跳过副行重排后置位：下一帧一旦回到文字路径就强制重排，
+  /// 避免用翻转前残留的段落画出旧文本 / 旧字重。
+  bool _auxLayoutStale = false;
+
+  /// 翻转期把预栅格化副行图当作纹理绘制（透视投影走 GPU，不再逐帧画字形路径）。
+  final Paint _auxImagePaint = Paint()..filterQuality = FilterQuality.low;
+
+  /// 仅测试：走「图像翻转路径」的绘制次数（验证翻转期不再逐帧画文字）。
+  @visibleForTesting
+  static int debugFlipImageDraws = 0;
+
   double _lastAuxTextAlpha = -1;
   double _lastAuxFontSize = -1;
   double _lastAuxMaxWidth = -1;
@@ -105,27 +133,29 @@ class LineRenderer {
   String? _lastAuxFamily;
   int _lastAuxColorValue = -1;
   DuetAlignment _lastAuxAlignment = DuetAlignment.defaultAlign;
+  bool _lastAuxSoftEdge = false;
 
   /// 翻译副行展开进度（0→1 副行"长出"，1→0 收回）。由 AppleLyricsView 注入。
   ///
-  /// - 当前行（LRC/纯文本整行模式）：跟随全局展开进度，与 WordRenderer
-  ///   （KRC 当前行）一致的长出动画；
-  /// - 收起中的退场行：注入 1 - 收起进度，副行从当前位置平滑缩回主行底。
-  /// 默认 0：非当前行且未注入时副行位于隐藏位（配合 fade=0 不绘制）。
+  /// 逐行注入：无论当前行、未播行还是退场的已播行，都取该行自己的进度
+  /// （`AppleLyricsView._auxProgress[i]`）。「副行显示范围」为「所有行」时，
+  /// 视口内每一行都会拿到非 0 值；「已播行除外」时已播行的进度会平滑回落到 0。
+  /// 默认 0：未注入时副行位于隐藏位（配合 fade=0 不绘制）。
   double translationExpand = 0.0;
 
   /// 翻译副行显隐 alpha 进度（0→1 渐显，1→0 渐隐）。由 AppleLyricsView 注入。
   ///
-  /// 当前实现与 [translationExpand] 同值注入（alpha 与位置同进度，
-  /// 淡入淡出贯穿整个过渡时长，速率随行时长自适应）。
+  /// 与 [translationExpand] 同值注入（alpha 与位置同进度，淡入淡出贯穿整个
+  /// 过渡时长，速率随行时长自适应）。
   double translationFade = 0.0;
 
-  /// 副行是否处于**出场**阶段（收起中的退场行）。由 AppleLyricsView 注入。
+  /// 副行是否处于**出场**阶段（进度正在下降的行）。由 AppleLyricsView 注入。
   ///
   /// 决定翻转绕哪条锚线、往哪个方向转（见 [LyricLayout.sublineFlipAngle]）：
-  /// - false（当前行 / 入场）：绕副行底边，从下翻转出现；
-  /// - true（收起中的退场行 / 出场）：绕副行顶边，向上翻转消失。
-  /// 默认 false：非当前行且未注入时副行 alpha 为 0，方向无意义。
+  /// - false（进度上升 / 静止）：绕副行底边，从下翻转出现；
+  /// - true（进度下降）：绕副行顶边，向上翻转消失。
+  /// 判据是「该行目标 < 当前进度」，因此「已播行除外」下每切一句，上一行的
+  /// 副行都会走一次出场翻转。
   bool translationExiting = false;
 
   /// v4 优化：上次 set text + layout 时的 alpha。
@@ -150,6 +180,10 @@ class LineRenderer {
 
   /// 上次 set text 时使用的字重。字重变化时需强制重建 TextSpan。
   FontWeight _lastFontWeight = FontWeight.normal;
+
+  /// 上次 set text 时的字体柔边开关。切换时需强制重建 TextSpan（样式带/不带
+  /// MaskFilter 是两份不同的 Span）。
+  bool _lastSoftEdge = false;
 
   /// 行级文字颜色覆盖（ARGB int）；null 表示回退 [LyricLayout.textColorValue]。
   ///
@@ -191,6 +225,226 @@ class LineRenderer {
   double _lastBlurFade = double.nan;
   bool _lastBlurActive = false;
   int? _lastActiveColorValue;
+  // 透明度偏好也参与早退判定：稳态下拖滑块改变偏好时必须重算 targetAlpha，
+  // 否则 5 个原始输入全等会持续早退，用户看不到任何变化。
+  double _lastPlayedOpacity = -1;
+  double _lastUnplayedOpacity = -1;
+  // 上方已播行使用独立 alpha（见 LyricLayout.aboveLineAlpha），同样参与早退判定
+  bool _lastIsAboveCurrent = false;
+
+  // ============== 非当前行整行预栅格图（P1-2） ==============
+  //
+  // 逐字播放时整个歌词层每帧重绘，非当前行内容不变，但 canvas.scale(0.85)
+  // 会让字形在本帧重新栅格化（raster 线程的主要成本）。稳态（alpha 收敛、
+  // 无副行、单行）时改用整行图 blit：光栅化从「每帧」降为「切行/样式变化一次」。
+  ui.Image? _staticImage;
+  String? _staticSig;
+  bool _staticBaking = false;
+  bool _staticUnavailable = false;
+  double _staticLogicalW = 0;
+  double _staticLogicalH = 0;
+  double _staticPadX = 0;
+  double _staticPadY = 0;
+  /// 整行图在视口中的绘制左上角 x（含对齐，不含 pad）。
+  ///
+  /// 烘焙图只截取文字本身（textW + 2pad），居中/置右时文字起点不在 0，
+  /// 必须把对齐后的 x 一并记下，绘制时用 `_staticX - pad` 定位；
+  /// 旧实现固定用 `offset.dx - pad`，导致居中/置右的整行图被图片右缘裁掉。
+  double _staticX = 0;
+  final Paint _staticPaint = Paint();
+
+  /// 屏幕像素比，由上层在创建 renderer 时注入（用于整行图分辨率）。
+  double devicePixelRatio = 1.0;
+
+  /// 整行图烘焙完成回调：上层用它触发一次歌词层重绘。
+  VoidCallback? onStaticImageReady;
+
+  /// 释放整行图缓存（切歌/不可见时调用）。
+  void invalidateStaticImage() {
+    _staticImage?.dispose();
+    _staticImage = null;
+    _staticSig = null;
+    _staticUnavailable = false;
+    _staticBaking = false;
+  }
+
+  /// 尝试用整行预栅格图绘制主文本。
+  ///
+  /// 仅适用于 **非当前行 + 无副行 + 单行 + 稳态**：当前行有逐字渐变，副行有
+  /// 翻转/展开动画，多行有逐行对齐，都不走图片路径。
+  ///
+  /// 返回 true 表示已绘制（调用方跳过文字路径）；false 表示需要回退。
+  bool tryPaintLineStatic(
+    Canvas canvas,
+    Offset offset,
+    LyricLine line,
+    double fontSize, {
+    double maxWidth = double.infinity,
+    DuetAlignment alignment = DuetAlignment.defaultAlign,
+    double viewportWidth = 0,
+    LyricWrapPlan? wrapPlan,
+    int? colorValue,
+  }) {
+    if (line.text.isEmpty || !_isConverged) return false;
+    final LyricWrapPlan plan =
+        wrapPlan ??
+        LyricWrapPlanner.forLine(
+          line,
+          LyricLayout.mainStyle(fontSize),
+          maxWidth,
+          balanced: LyricPreferences.instance.lineBalance,
+        );
+    if (plan.isMultiLine) return false;
+    final int textColorValue = colorValue ?? LyricLayout.textColorValue;
+    final String sig =
+        '${line.text}|$fontSize|$maxWidth|$viewportWidth|${alignment.index}'
+        '|${LyricLayout.fontWeight.value}|${LyricLayout.lineHeight}'
+        '|${LyricLayout.fontFamily}|${LyricLayout.softEdgeAntiAlias}'
+        '|${plan.rowCount}';
+    final ui.Image? image = _staticImage;
+    if (image == null || sig != _staticSig) {
+      _maybeBakeStaticImage(
+        line,
+        fontSize,
+        maxWidth: maxWidth,
+        alignment: alignment,
+        viewportWidth: viewportWidth,
+        plan: plan,
+        sig: sig,
+        leftPadding: offset.dx,
+      );
+      return false;
+    }
+    _staticPaint.colorFilter = ColorFilter.mode(
+      Color.fromRGBO(
+        (textColorValue >> 16) & 0xFF,
+        (textColorValue >> 8) & 0xFF,
+        textColorValue & 0xFF,
+        _currentAlpha.clamp(0.0, 1.0),
+      ),
+      BlendMode.srcIn,
+    );
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+      Rect.fromLTWH(
+        _staticX - _staticPadX,
+        offset.dy - _staticPadY,
+        _staticLogicalW,
+        _staticLogicalH,
+      ),
+      _staticPaint,
+    );
+    return true;
+  }
+
+  void _maybeBakeStaticImage(
+    LyricLine line,
+    double fontSize, {
+    required double maxWidth,
+    required DuetAlignment alignment,
+    required double viewportWidth,
+    required LyricWrapPlan plan,
+    required String sig,
+    required double leftPadding,
+  }) {
+    if (_staticBaking || _staticUnavailable) return;
+    if (devicePixelRatio <= 0 || viewportWidth <= 0) return;
+    if (_staticImage != null) {
+      _staticImage!.dispose();
+      _staticImage = null;
+    }
+    _staticSig = sig;
+    _staticBaking = true;
+    unawaited(
+      _bakeStaticImage(
+        line,
+        fontSize,
+        maxWidth: maxWidth,
+        alignment: alignment,
+        viewportWidth: viewportWidth,
+        plan: plan,
+        sig: sig,
+        leftPadding: leftPadding,
+      ),
+    );
+  }
+
+  Future<void> _bakeStaticImage(
+    LyricLine line,
+    double fontSize, {
+    required double maxWidth,
+    required DuetAlignment alignment,
+    required double viewportWidth,
+    required LyricWrapPlan plan,
+    required String sig,
+    required double leftPadding,
+  }) async {
+    try {
+      final double rowH = LyricLayout.lineHeightForRows(
+        fontSize * LyricLayout.lineHeight,
+        plan.rowCount,
+      );
+      // 柔边/描边会超出字形盒，四周留一点余量。
+      final double pad = fontSize * 0.25;
+      final TextPainter painter = TextPainter(
+        text: TextSpan(
+          text: line.text,
+          style: LyricLayout.paintStyle(
+            color: const Color(0xFFFFFFFF),
+            fontSize: fontSize,
+            height: LyricLayout.lineHeight,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      );
+      // 已是单行计划（isMultiLine 提前返回），按自然宽度排版：若让 TextPainter
+      // 再按 maxWidth 自行折行，多出的行会落到 rowH 之外被图片裁掉。
+      painter.layout(maxWidth: double.infinity);
+      final double textW = painter.width;
+      final double logicalW = textW + pad * 2;
+      final double logicalH = rowH + pad * 2;
+      final double dpr = _staticBakeRatio(logicalW, logicalH);
+      final ui.PictureRecorder recorder = ui.PictureRecorder();
+      final Canvas bakeCanvas = Canvas(recorder);
+      bakeCanvas.scale(dpr);
+      // 图内文字固定从 pad 开始（图片只截文字本身）；对齐后的视口 x 单独记录，
+      // 绘制时用 `_staticX - pad` 定位。旧实现把视口 x 直接画进小图，
+      // 居中/置右时文字大半落在图外 → 真机「只显示一半」。
+      _staticX = _alignX(alignment, leftPadding, textW, viewportWidth);
+      painter.paint(bakeCanvas, Offset(pad, pad));
+      painter.dispose();
+      final ui.Image image = await recorder.endRecording().toImage(
+        (logicalW * dpr).ceil().clamp(1, 8192),
+        (logicalH * dpr).ceil().clamp(1, 8192),
+      );
+      if (!_staticBaking || _staticSig != sig) {
+        image.dispose();
+        return;
+      }
+      _staticImage?.dispose();
+      _staticImage = image;
+      _staticLogicalW = logicalW;
+      _staticLogicalH = logicalH;
+      _staticPadX = pad;
+      _staticPadY = pad;
+      onStaticImageReady?.call();
+    } catch (_) {
+      // 烘焙失败（极端尺寸/内存不足）时永久回退文字路径，避免每帧重试。
+      _staticUnavailable = true;
+    } finally {
+      _staticBaking = false;
+    }
+  }
+
+  /// 烘焙分辨率：按屏幕像素比，但限制单边像素不超过引擎纹理上限，
+  /// 避免超宽行（平板横屏）被截断或分配失败。
+  double _staticBakeRatio(double logicalW, double logicalH) {
+    final double dpr = devicePixelRatio.clamp(1.0, 3.0);
+    final double longest = max(logicalW, logicalH);
+    if (longest <= 0) return dpr;
+    return min(dpr, 8192.0 / longest);
+  }
 
   // ============== 状态查询 ==============
 
@@ -213,6 +467,12 @@ class LineRenderer {
   /// 目标 alpha（用于测试断言）。
   @visibleForTesting
   double get targetAlpha => _targetAlpha;
+
+  /// 该行的档位 alpha（不含模糊淡出 / 退场淡出）。
+  ///
+  /// 副行 alpha = 本值 × `translationOpacity` × 副行进度。用于断言
+  /// 「拖动已播 / 未播歌词透明度时副行跟随」（旧实现固定 0.5，不跟随）。
+  double get auxBaseAlpha => _auxBaseAlpha;
 
   /// 最近一次绘制实际解析出的文字颜色 ARGB（用于颜色回归断言）。
   ///
@@ -239,13 +499,19 @@ class LineRenderer {
     double blurFade = 1.0,
     bool blurActive = true,
     int? activeColorValue,
+    bool isAboveCurrent = false,
   }) {
-    // 输入缓存早退：稳态下 5 个输入全相等 → 跳过 dynamic 公式重算与 target 比较
+    // 输入缓存早退：稳态下 8 个输入全相等 → 跳过 alpha 公式重算与 target 比较
+    final double playedOpacity = LyricPreferences.instance.playedOpacity;
+    final double unplayedOpacity = LyricPreferences.instance.unplayedOpacity;
     if (isActive == _lastIsActive &&
         scale == _lastScale &&
         blurFade == _lastBlurFade &&
         blurActive == _lastBlurActive &&
-        activeColorValue == _lastActiveColorValue) {
+        activeColorValue == _lastActiveColorValue &&
+        playedOpacity == _lastPlayedOpacity &&
+        unplayedOpacity == _lastUnplayedOpacity &&
+        isAboveCurrent == _lastIsAboveCurrent) {
       return;
     }
     _lastIsActive = isActive;
@@ -253,16 +519,22 @@ class LineRenderer {
     _lastBlurFade = blurFade;
     _lastBlurActive = blurActive;
     _lastActiveColorValue = activeColorValue;
+    _lastPlayedOpacity = playedOpacity;
+    _lastUnplayedOpacity = unplayedOpacity;
+    _lastIsAboveCurrent = isAboveCurrent;
 
     _isActive = isActive;
     _activeColorValue = activeColorValue;
-    final double factor =
-        ((scale - LyricLayout.inactiveScale) /
-                (LyricLayout.activeScale - LyricLayout.inactiveScale))
-            .clamp(0.0, 1.0)
-            .toDouble();
-    final double dynamicDark = factor * 0.2 + 0.2;
-    final double dynamicBright = factor * 0.8 + 0.2;
+    final double factor = LyricLayout.factorFor(scale);
+    // 上方已播行（开关开启时）用更高一档的暗态 alpha：非当前行 factor 恒 0，
+    // 若沿用渐隐基线（0.2）会让已播色在细笔画上不可见，且与模糊层（有效 ~0.5）
+    // 亮度断层，关闭模糊/滚动淡出时突兀。
+    final double dynamicDark = isAboveCurrent
+        ? LyricLayout.aboveLineAlpha
+        : LyricLayout.darkAlphaFor(factor);
+    final double dynamicBright = LyricLayout.brightAlphaFor(factor);
+    // 副行基准：档位 alpha（不含下面的模糊淡出）
+    _auxBaseAlpha = isActive ? dynamicBright : dynamicDark;
     // 非当前行 alpha = dynamicDark * (1 - blurFade)，blurActive=false 时不降低
     final double effectiveFade = blurActive ? blurFade : 0.0;
     final double newTargetAlpha = isActive
@@ -309,12 +581,17 @@ class LineRenderer {
   void tick(double dt) {
     if (dt <= 0) return;
     if (_isConverged) return; // v4 优化：已收敛的行跳过 tick
-    // 退场淡出走专用速率（可按行时长动态设置）；其余变亮用 ATTACK（快）、变暗用 RELEASE（慢）
+    // 退场淡出走专用速率（可按行时长动态设置）；其余变亮用 ATTACK（快）、变暗用 RELEASE（慢）。
+    //
+    // 高斯模糊开启时清晰字「变暗」的实质是模糊层接管，必须比模糊层淡入更快：
+    // RELEASE(7/s) 的长尾会让白字在模糊层已出现后仍残留数百毫秒，观感即
+    // 「模糊层先发白、过一会儿才落到透明度偏好对应的正常色」。
+    // 约 24/s（时间常数 ~42ms）与 [_clearLayerBlurFade] 的整形曲线配合。
     final double speed = _isExitFading
         ? _exitRate
         : (_targetAlpha >= _currentAlpha
               ? LyricLayout.attackSpeed
-              : LyricLayout.releaseSpeed);
+              : (_lastBlurActive ? 24.0 : LyricLayout.releaseSpeed));
     final double decay = 1.0 - exp(-speed * dt);
     double next = _currentAlpha + (_targetAlpha - _currentAlpha) * decay;
     // 阈值收敛：差值小于 alphaEpsilon 直接吸附到目标
@@ -357,6 +634,7 @@ class LineRenderer {
     double viewportWidth = 0,
     LyricWrapPlan? wrapPlan,
     LyricWrapPlan? auxPlan,
+    AuxTextImage? auxImage,
   }) {
     if (line.text.isEmpty) return;
     // 断点唯一来源：外部注入的计划；未注入时现场取同一份计划兜底。
@@ -391,28 +669,34 @@ class LineRenderer {
     final bool fontWeightChanged = LyricLayout.fontWeight != _lastFontWeight;
     // 行间距变化时同样强制重建（行盒高度与字形垂直位置都依赖它）
     final bool lineHeightChanged = LyricLayout.lineHeight != _lastSetLineHeight;
+    // 字体柔边开关变化时强制重建（样式带/不带 MaskFilter 是两份不同 Span）
+    final bool softEdgeChanged =
+        LyricLayout.softEdgeAntiAlias != _lastSoftEdge;
     if (lineChanged ||
         (_currentAlpha - _lastSetAlpha).abs() > 0.001 ||
         maxWidth != _lastSetMaxWidth ||
         colorChanged ||
         alignChanged ||
         fontWeightChanged ||
-        lineHeightChanged) {
+        lineHeightChanged ||
+        softEdgeChanged) {
       _painter.text = TextSpan(
         text: line.text,
-        style: TextStyle(
+        style: LyricLayout.paintStyle(
           // 文字颜色从 LyricLayout 获取，支持主题动态切换；
           // 当前行动态字体颜色时用混色后的 RGB
           color: Color.fromRGBO(textRed, textGreen, textBlue, _currentAlpha),
           fontSize: fontSize,
           height: LyricLayout.lineHeight,
-          // 显式注入歌词 fontFamily（system 模式为 null，走系统字体链）
-          fontFamily: LyricLayout.fontFamily,
-          fontWeight: LyricLayout.fontWeight,
         ),
       );
+      // 单行的断点由计划决定：按自然宽度排版，避免 TextPainter 因字距/字形
+      // 比计划略宽而自行折出第二行（该行会被行盒与模糊图裁掉，表现为半行）。
+      // 多行由 _paintMultiLineAligned 按计划逐行绘制，这里保留约束不影响结果。
       _painter.layout(
-        maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
+        maxWidth: plan.isMultiLine
+            ? (maxWidth == double.infinity ? double.infinity : maxWidth)
+            : double.infinity,
       );
       _lastSetAlpha = _currentAlpha;
       _lastSetMaxWidth = maxWidth;
@@ -421,6 +705,7 @@ class LineRenderer {
       _lastAlignment = alignment;
       _lastFontWeight = LyricLayout.fontWeight;
       _lastSetLineHeight = LyricLayout.lineHeight;
+      _lastSoftEdge = LyricLayout.softEdgeAntiAlias;
     }
     // 用 _alignX 计算文本起始 x，与 WordRenderer 一致。
     // 单行：直接用 _painter.width（layout 后的整体宽度）计算 x。
@@ -454,21 +739,39 @@ class LineRenderer {
 
     // 辅助副行（翻译或罗马音）：有内容 + 渐显进度 > 0 时绘制。
     // 根据 displayMode 选择显示 translation 还是 roma。
-    // - 当前行：expand/fade 由 AppleLyricsView 注入全局进度，与 WordRenderer
-    //   （KRC 当前行）同一长出/渐显动画（此前固定位置固定 alpha，行切换瞬间出现）；
-    // - 收起中的退场行：注入收起进度（expand = 1-c、fade = 1-c），副行从当前
-    //   位置平滑缩回主行底并渐隐，消除切行时副行瞬间消失的硬切；
-    // - 其余非当前行：两值默认 0 → alpha=0 不绘制，行为与旧版一致。
+    // expand / fade 都是**该行自己的**逐行进度（由 AppleLyricsView 按绘制行号
+    // 注入）：「所有行」下每行都有各自的副行，切范围 / 切行时逐行平滑过渡；
+    // 方向（入场 / 出场）由该行目标是否低于当前进度决定。
     // **不读 showTranslation 做立即短路**：关闭翻译时注入进度衰减到 0、
     // alpha 平滑渐隐至消失——若在此短路，关闭瞬间副行直接消失无动画。
-    // 副行字号为主行 70%，alpha = translationOpacity × translationFade。
+    // 副行字号为主行 70%，alpha = 该行**档位 alpha** × translationOpacity × 进度。
+    // 档位 alpha（[_auxBaseAlpha]）是 played / unplayed 透明度与「上方行已播色」
+    // 决定的满亮值，于是拖「已播 / 未播歌词透明度」滑块时副行同步变化
+    // （旧实现固定 `translationOpacity × 进度`，主行变了副行不动）。
+    // 刻意**不用 [_currentAlpha]**：它含 `(1 - blurFade)`，而副行模糊图是异步
+    // 烘焙的，就绪前清晰层要单独撑住副行；乘上去会让副行跟着主行一起被压到 0，
+    // 表现为切行时「整行闪空」。档位 alpha 不含模糊淡出，正好只跟随用户偏好。
     final auxText =
         LyricPreferences.instance.displayMode == LyricDisplayMode.roma
         ? line.roma
         : line.translation;
-    final double transAlpha = LyricLayout.translationOpacity * translationFade;
+    final double transAlpha =
+        _auxBaseAlpha * LyricLayout.translationOpacity * translationFade;
     if (transAlpha > 0.001 && auxText != null && auxText.isNotEmpty) {
       final transFontSize = LyricLayout.translationFontSize(fontSize);
+      // 翻转角提前求值：图像路径必须在「是否重排」之前定下来。
+      // 含透视矩阵的文字绘制会被 Skia 退化成字形路径逐帧渲染（切行掉帧的
+      // 来源），因此翻转期间改用预栅格化图；**过渡中段（角度已归零但进度未就位）**
+      // 同样用图，避免副行收起/出现的每一帧都重排文字。图为空时退回文字路径。
+      final double flipAngle = LyricLayout.sublineFlipAngle(
+        translationExpand,
+        exiting: translationExiting,
+      );
+      final AuxTextImage? flipImage =
+          (auxImage != null &&
+              (flipAngle != 0 || translationExpand < 0.999))
+          ? auxImage
+          : null;
       // 主文本实际高度（含换行）：与 measureLineHeight 的压缩模型一致。
       // TextPainter 整行高度是完整行高（每行 ≈ mainLineHeight），而
       // _lineHeights 对换行行按 0.8x 压缩，两者不一致会使翻译副行向下偏移
@@ -492,6 +795,7 @@ class LineRenderer {
             balanced: balanced,
           );
       final bool auxRelayout =
+          _auxLayoutStale ||
           !identical(resolvedAuxPlan, _lastAuxPlan) ||
           (transAlpha - _lastAuxTextAlpha).abs() > 0.001 ||
           transFontSize != _lastAuxFontSize ||
@@ -500,21 +804,22 @@ class LineRenderer {
           LyricLayout.fontWeight != _lastAuxWeight ||
           LyricLayout.fontFamily != _lastAuxFamily ||
           textColorValue != _lastAuxColorValue ||
-          alignment != _lastAuxAlignment;
-      if (auxRelayout) {
+          alignment != _lastAuxAlignment ||
+          LyricLayout.softEdgeAntiAlias != _lastAuxSoftEdge;
+      // 图像路径不消费段落（宽度/高度/对齐全取自图像），无需逐帧重排。
+      if (flipImage == null && auxRelayout) {
         _translationPainter.text = TextSpan(
           text: resolvedAuxPlan.rowTexts.join('\n'),
-          style: TextStyle(
+          style: LyricLayout.paintStyle(
             color: Color.fromRGBO(textRed, textGreen, textBlue, transAlpha),
             fontSize: transFontSize,
             height: LyricLayout.translationLineHeight,
-            fontFamily: LyricLayout.fontFamily,
-            fontWeight: LyricLayout.fontWeight,
           ),
         );
         _translationPainter.layout(
           maxWidth: maxWidth == double.infinity ? double.infinity : maxWidth,
         );
+        _auxLayoutStale = false;
         _lastAuxPlan = resolvedAuxPlan;
         _lastAuxTextAlpha = transAlpha;
         _lastAuxFontSize = transFontSize;
@@ -524,6 +829,9 @@ class LineRenderer {
         _lastAuxFamily = LyricLayout.fontFamily;
         _lastAuxColorValue = textColorValue;
         _lastAuxAlignment = alignment;
+        _lastAuxSoftEdge = LyricLayout.softEdgeAntiAlias;
+      } else if (flipImage != null) {
+        _auxLayoutStale = true;
       }
       final double subH = LyricLayout.auxSubHeight(
         fontSize,
@@ -534,16 +842,32 @@ class LineRenderer {
           mainHeight +
           transFontSize * 0.3 +
           subH * (translationExpand - 1.0);
-      // 翻译副行对齐跟随原文，用 _alignX 计算起始 x
+      // 翻译副行对齐跟随原文，用 _alignX 计算起始 x（图像路径取图像逻辑宽度，
+      // 与文字路径的 TextPainter.width 同口径，落点一致）。
+      final double sublineWidth = flipImage?.width ?? _translationPainter.width;
+      final double sublineHeight =
+          flipImage?.height ?? _translationPainter.height;
       final double transX = _alignX(
         alignment,
         offset.dx,
-        _translationPainter.width,
+        sublineWidth,
         viewportWidth,
       );
       // 多行翻译副行需设置 textAlign 让每条视觉行独立对齐到 transX
-      _translationPainter.textAlign = _duetToTextAlign(alignment);
-      _paintTranslation(canvas, Offset(transX, transY));
+      // （仅文字路径消费；图像已在烘焙时按同一 textAlign 排版）。
+      if (flipImage == null) {
+        _translationPainter.textAlign = _duetToTextAlign(alignment);
+      }
+      _paintTranslation(
+        canvas,
+        Offset(transX, transY),
+        angle: flipAngle,
+        sublineWidth: sublineWidth,
+        sublineHeight: sublineHeight,
+        colorValue: textColorValue,
+        alpha: transAlpha,
+        image: flipImage,
+      );
     }
   }
 
@@ -553,30 +877,73 @@ class LineRenderer {
   /// 给出的锚线进行：入场绕底边从下翻出、出场绕顶边向上翻走。角度恰为 0
   /// （已就位）时不施加任何画布变换，走与改造前完全一致的直绘路径——稳态每帧
   /// 只做一次浮点比较，无额外 save/transform/restore 开销。
-  void _paintTranslation(Canvas canvas, Offset at) {
-    final double angle = LyricLayout.sublineFlipAngle(
-      translationExpand,
-      exiting: translationExiting,
-    );
-    if (angle == 0) {
+  ///
+  /// [image] 非空时用预栅格化图代替文字做透视绘制：透视变换作用在纹理四边形上，
+  /// 避免文字走透视矩阵触发字形路径渲染。图内文字烘焙为白色，主题色与 alpha
+  /// 在此用 `srcIn` 着色。
+  void _paintTranslation(
+    Canvas canvas,
+    Offset at, {
+    required double angle,
+    required double sublineWidth,
+    required double sublineHeight,
+    required int colorValue,
+    required double alpha,
+    AuxTextImage? image,
+  }) {
+    if (image == null && angle == 0) {
       _translationPainter.paint(canvas, at);
       return;
     }
-    // 锚点同时给出 x（= 副行水平中点，透视投影中心）与 y（旋转锚线）：
-    // 只平移 y 会让透视除法绕画布左上角进行，翻转时副行整体左漂。
-    final Offset anchor = LyricLayout.sublineFlipAnchor(
-      transX: at.dx,
-      sublineWidth: _translationPainter.width,
-      transY: at.dy,
-      sublineHeight: _translationPainter.height,
-      exiting: translationExiting,
-    );
-    canvas.save();
-    canvas.transform(
-      LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage,
-    );
-    _translationPainter.paint(canvas, at);
-    canvas.restore();
+    final bool transformed = angle != 0;
+    if (transformed) {
+      // 锚点同时给出 x（= 副行水平中点，透视投影中心）与 y（旋转锚线）：
+      // 只平移 y 会让透视除法绕画布左上角进行，翻转时副行整体左漂。
+      final Offset anchor = LyricLayout.sublineFlipAnchor(
+        transX: at.dx,
+        sublineWidth: sublineWidth,
+        transY: at.dy,
+        sublineHeight: sublineHeight,
+        exiting: translationExiting,
+      );
+      canvas.save();
+      canvas.transform(
+        LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage,
+      );
+    }
+    if (image != null) {
+      debugFlipImageDraws++;
+      // 白字烘焙图 + srcIn：一次着色同时给出主题色与淡出 alpha。
+      _auxImagePaint.colorFilter = ColorFilter.mode(
+        Color.fromRGBO(
+          (colorValue >> 16) & 0xFF,
+          (colorValue >> 8) & 0xFF,
+          colorValue & 0xFF,
+          alpha.clamp(0.0, 1.0),
+        ),
+        BlendMode.srcIn,
+      );
+      canvas.drawImageRect(
+        image.image,
+        Rect.fromLTWH(
+          0,
+          0,
+          image.image.width.toDouble(),
+          image.image.height.toDouble(),
+        ),
+        // 柔边图四周含 pad：向左上偏移并放大 2*pad，文字落点与对齐不变。
+        Rect.fromLTWH(
+          at.dx - image.pad,
+          at.dy - image.pad,
+          image.width + image.pad * 2,
+          image.height + image.pad * 2,
+        ),
+        _auxImagePaint,
+      );
+    } else {
+      _translationPainter.paint(canvas, at);
+    }
+    if (transformed) canvas.restore();
   }
 
   /// 临时调试：打印行换行分析（换行计划 vs TextPainter 行数），定位歌词重叠。
@@ -648,6 +1015,7 @@ class LineRenderer {
     final int rgb = (textRed << 16) | (textGreen << 8) | textBlue;
     final FontWeight weight = LyricLayout.fontWeight;
     final String? family = LyricLayout.fontFamily;
+    final bool softEdge = LyricLayout.softEdgeAntiAlias;
     // 槽位数按本行视觉行数补齐（历史最长行决定上限，个位数，无需淘汰）。
     while (_rowSlots.length < rowTexts.length) {
       _rowSlots.add(_RowSlot());
@@ -669,16 +1037,15 @@ class LineRenderer {
           slot.weight != weight ||
           slot.family != family ||
           slot.rgb != rgb ||
+          slot.softEdge != softEdge ||
           (slot.alpha - _currentAlpha).abs() > 0.001;
       if (needLayout) {
         slot.painter.text = TextSpan(
           text: rowTexts[i],
-          style: TextStyle(
+          style: LyricLayout.paintStyle(
             color: Color.fromRGBO(textRed, textGreen, textBlue, _currentAlpha),
             fontSize: fontSize,
             height: rowHeight,
-            fontFamily: family,
-            fontWeight: weight,
           ),
         );
         slot.painter.layout(maxWidth: double.infinity);
@@ -690,6 +1057,7 @@ class LineRenderer {
           ..weight = weight
           ..family = family
           ..rgb = rgb
+          ..softEdge = softEdge
           ..alpha = _currentAlpha;
       }
       // 对齐继续用被绘制 painter 自身的 .width（不换用 plan.rowWidths：真实
@@ -742,13 +1110,13 @@ class LineRenderer {
     }
   }
 
-  /// 重置状态：alpha 回到初始值（0.2），isActive=false。
+  /// 重置状态：alpha 回到暗态渐隐基线（默认 0.2），isActive=false。
   ///
   /// **v4 优化**：重置 alpha 缓存字段，下次 paintLine 会重新 set text + layout。
   void reset() {
     _isActive = false;
-    _currentAlpha = LyricLayout.currentDarkAlpha;
-    _targetAlpha = LyricLayout.currentDarkAlpha;
+    _currentAlpha = LyricLayout.darkAlphaFor(0.0);
+    _targetAlpha = LyricLayout.darkAlphaFor(0.0);
     _isConverged = true;
     _isExitFading = false;
     _exitRate = _exitFadeSpeed;
@@ -756,6 +1124,7 @@ class LineRenderer {
     _lastSetMaxWidth = -1;
     _lastTextColorValue = -1;
     _lastFontWeight = FontWeight.normal;
+    _lastSoftEdge = false;
     _lastSetLineHeight = -1;
     _boundLine = null;
     _activeColorValue = null;
@@ -766,17 +1135,23 @@ class LineRenderer {
     _lastBlurFade = double.nan;
     _lastBlurActive = false;
     _lastActiveColorValue = null;
+    _lastPlayedOpacity = -1;
+    _lastUnplayedOpacity = -1;
+    _lastIsAboveCurrent = false;
     // 折行槽位失效：清文本令下次绘制必重排（painter 实例保留复用）
     for (final slot in _rowSlots) {
       slot.text = null;
     }
     // 副行布局缓存失效（计划引用置空 → 下次必重排）
     _lastAuxPlan = null;
+    _lastAuxSoftEdge = false;
   }
 
   /// 最终释放渲染器持有的测量与绘制器。
   void dispose() {
     reset();
+    _staticImage?.dispose();
+    _staticImage = null;
     _painter.dispose();
     _translationPainter.dispose();
     for (final slot in _rowSlots) {
@@ -797,4 +1172,5 @@ class _RowSlot {
   FontWeight weight = FontWeight.normal;
   String? family;
   int rgb = -1;
+  bool softEdge = false;
 }

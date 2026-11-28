@@ -39,6 +39,10 @@ class TvDropdownMenu<T> extends StatelessWidget {
   final M3EDropdownFieldStyle fieldStyle;
   final ValueChanged<List<M3EDropdownItem<T>>>? onSelectionChanged;
 
+  /// 是否可用。false 时触屏透传给 [M3EDropdownMenu.enabled]，TV 分支不挂
+  /// 焦点节点、不响应 OK，只保留灰显字段外观。默认 true，既有调用零变化。
+  final bool enabled;
+
   const TvDropdownMenu({
     super.key,
     required this.items,
@@ -46,26 +50,33 @@ class TvDropdownMenu<T> extends StatelessWidget {
     this.showChipAnimation = true,
     this.fieldStyle = const M3EDropdownFieldStyle(),
     this.onSelectionChanged,
+    this.enabled = true,
   });
 
   @override
   Widget build(BuildContext context) {
+    final Widget child;
     if (!kTvBuild) {
-      return M3EDropdownMenu<T>(
+      child = M3EDropdownMenu<T>(
         items: items,
         singleSelect: singleSelect,
         showChipAnimation: showChipAnimation,
         // 外层 20 = 条目外角 12 + 列表内边距 8，同心圆（默认 28 过大）
         containerRadius: AppRadius.dropdownPanel,
         fieldStyle: fieldStyle,
-        onSelectionChanged: onSelectionChanged,
+        enabled: enabled,
+        onSelectionChanged: enabled ? onSelectionChanged : null,
+      );
+    } else {
+      child = _TvDropdownField<T>(
+        items: items,
+        fieldStyle: fieldStyle,
+        enabled: enabled,
+        onSelectionChanged: enabled ? onSelectionChanged : null,
       );
     }
-    return _TvDropdownField<T>(
-      items: items,
-      fieldStyle: fieldStyle,
-      onSelectionChanged: onSelectionChanged,
-    );
+    // M3EDropdownMenu.enabled 只拦交互、不改外观，禁用态统一在这里灰显。
+    return enabled ? child : Opacity(opacity: 0.38, child: child);
   }
 }
 
@@ -75,11 +86,13 @@ class _TvDropdownField<T> extends StatelessWidget {
   final List<M3EDropdownItem<T>> items;
   final M3EDropdownFieldStyle fieldStyle;
   final ValueChanged<List<M3EDropdownItem<T>>>? onSelectionChanged;
+  final bool enabled;
 
   const _TvDropdownField({
     required this.items,
     required this.fieldStyle,
     required this.onSelectionChanged,
+    this.enabled = true,
   });
 
   M3EDropdownItem<T>? get _current {
@@ -106,41 +119,45 @@ class _TvDropdownField<T> extends StatelessWidget {
         : fieldStyle.border?.color ?? cs.outlineVariant;
     final borderWidth = fieldStyle.border?.width ?? 1.0;
 
+    final Widget field = Container(
+      decoration: BoxDecoration(
+        color: fieldStyle.backgroundColor ?? cs.surfaceContainerHighest,
+        borderRadius: fieldStyle.borderRadius ??
+            const BorderRadius.all(Radius.circular(8)),
+        border: borderColor == null
+            ? null
+            : Border.all(color: borderColor, width: borderWidth),
+      ),
+      padding: fieldStyle.padding,
+      margin: fieldStyle.margin,
+      child: Row(
+        children: [
+          if (fieldStyle.prefixIcon != null) ...[
+            fieldStyle.prefixIcon!,
+            const SizedBox(width: 8),
+          ],
+          Expanded(
+            child: Text(
+              current?.label ?? fieldStyle.hintText ?? '',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: textStyle.copyWith(color: contentColor),
+            ),
+          ),
+          if (fieldStyle.suffixIcon != null)
+            fieldStyle.suffixIcon!
+          else if (fieldStyle.showArrow)
+            Icon(Icons.arrow_drop_down, color: contentColor, size: 20),
+        ],
+      ),
+    );
+
+    // 禁用时不挂焦点节点：TV 下 dpad 不应把 OK 送进一个不可用的选择器。
+    if (!enabled) return field;
     return DpadFocusable(
       debugLabel: 'tv-dropdown',
       onSelect: () => _openPicker(context),
-      child: Container(
-        decoration: BoxDecoration(
-          color: fieldStyle.backgroundColor ?? cs.surfaceContainerHighest,
-          borderRadius: fieldStyle.borderRadius ??
-              const BorderRadius.all(Radius.circular(8)),
-          border: borderColor == null
-              ? null
-              : Border.all(color: borderColor, width: borderWidth),
-        ),
-        padding: fieldStyle.padding,
-        margin: fieldStyle.margin,
-        child: Row(
-          children: [
-            if (fieldStyle.prefixIcon != null) ...[
-              fieldStyle.prefixIcon!,
-              const SizedBox(width: 8),
-            ],
-            Expanded(
-              child: Text(
-                current?.label ?? fieldStyle.hintText ?? '',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: textStyle.copyWith(color: contentColor),
-              ),
-            ),
-            if (fieldStyle.suffixIcon != null)
-              fieldStyle.suffixIcon!
-            else if (fieldStyle.showArrow)
-              Icon(Icons.arrow_drop_down, color: contentColor, size: 20),
-          ],
-        ),
-      ),
+      child: field,
     );
   }
 

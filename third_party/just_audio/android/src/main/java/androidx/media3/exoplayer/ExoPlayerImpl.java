@@ -2080,7 +2080,9 @@ import java.util.concurrent.TimeoutException;
               .build();
     }
     MediaMetadata newMediaMetadata = buildUpdatedMediaMetadata();
-    boolean metadataChanged = !newMediaMetadata.equals(mediaMetadata);
+    boolean metadataChanged =
+        !newMediaMetadata.equals(mediaMetadata)
+            || !Util.areEqual(lyricInfo(newMediaMetadata), lyricInfo(mediaMetadata));
     mediaMetadata = newMediaMetadata;
     boolean playWhenReadyChanged =
         previousPlaybackInfo.playWhenReady != newPlaybackInfo.playWhenReady;
@@ -2672,6 +2674,12 @@ import java.util.concurrent.TimeoutException;
         internalPlayer.getPlaybackLooper());
   }
 
+  @Nullable
+  private static String lyricInfo(MediaMetadata metadata) {
+    // MediaMetadata.equals does not compare the contents of extras.
+    return metadata.extras == null ? null : metadata.extras.getString("lyricInfo");
+  }
+
   /**
    * Builds a {@link MediaMetadata} from the main sources.
    *
@@ -3217,7 +3225,8 @@ import java.util.concurrent.TimeoutException;
       staticAndDynamicMediaMetadata =
           staticAndDynamicMediaMetadata.buildUpon().populateFromMetadata(metadata).build();
       MediaMetadata newMediaMetadata = buildUpdatedMediaMetadata();
-      if (!newMediaMetadata.equals(mediaMetadata)) {
+      if (!newMediaMetadata.equals(mediaMetadata)
+          || !Util.areEqual(lyricInfo(newMediaMetadata), lyricInfo(mediaMetadata))) {
         mediaMetadata = newMediaMetadata;
         listeners.queueEvent(
             EVENT_MEDIA_METADATA_CHANGED,

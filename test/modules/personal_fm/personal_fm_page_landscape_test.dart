@@ -1,4 +1,4 @@
-// 私人 FM 横屏：FM 卡片和即将播放在左列，推荐选项卡片在右列。
+// 私人 FM 横屏：歌曲、推荐选项和队列依次纵向排列。
 // 验证真实几何位置，动作按钮继续留在 FM 卡片中，竖屏保持单栏。
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -159,35 +159,22 @@ void main() {
     (w) => w is ClipRRect && w.borderRadius == BorderRadius.circular(24),
   );
 
-  Finder stationSwitcher() => find.byKey(const ValueKey('fm-mode-normal'));
-
-  testWidgets('横屏两栏：队列在 FM 卡片左下，推荐选项在右列，动作按钮留在卡片内', (tester) async {
+  testWidgets('桌面横屏三行等宽对齐，歌曲操作留在卡片内', (tester) async {
     SharedPreferences.setMockInitialValues({});
-    await pumpPage(tester, size: const Size(900, 420));
-
-    final cover = tester.getRect(heroCover());
-    final play = tester.getCenter(find.byIcon(Icons.play_arrow));
-    final heart = tester.getCenter(find.byIcon(Icons.favorite_border));
-    final station = tester.getCenter(stationSwitcher());
-    final queue = tester.getCenter(find.text('即将播放'));
-
+    await pumpPage(tester, size: const Size(1920, 1080));
     final hero = tester.getRect(find.byKey(const ValueKey('fm-hero-card')));
-    final controls = tester.getRect(
-      find.byKey(const ValueKey('fm-recommendation-controls')),
-    );
-    final upcoming = tester.getRect(
-      find.byKey(const ValueKey('fm-upcoming-queue')),
-    );
-    expect(controls.left, greaterThan(hero.right));
-    expect(controls.top, closeTo(hero.top, .1));
-    expect(upcoming.left, closeTo(hero.left, .1));
-    expect(upcoming.right, closeTo(hero.right, .1));
-    expect(upcoming.top, closeTo(hero.bottom + 16, .1));
-    expect(queue.dy, greaterThan(play.dy));
-    expect(play.dy, greaterThan(cover.bottom));
-    expect(heart.dy, greaterThan(cover.bottom));
-    expect(play.dx, lessThan(station.dx));
-
+    final controls = tester.getRect(find.byKey(const ValueKey('fm-recommendation-controls')));
+    final queue = tester.getRect(find.byKey(const ValueKey('fm-upcoming-queue')));
+    expect(controls.left, closeTo(hero.left, .1));
+    expect(controls.right, closeTo(hero.right, .1));
+    expect(queue.left, closeTo(hero.left, .1));
+    expect(queue.right, closeTo(hero.right, .1));
+    expect(controls.top, closeTo(hero.bottom + 16, .1));
+    expect(queue.top, closeTo(controls.bottom + 16, .1));
+    expect(hero.width, lessThanOrEqualTo(900));
+    expect(tester.getCenter(find.byIcon(Icons.play_arrow)).dy, lessThan(hero.bottom));
+    expect(find.byKey(const ValueKey('fm-recommendation-summary')), findsNothing);
+    expect(tester.takeException(), isNull);
     await drainProviderStartup(tester);
   });
 
@@ -209,55 +196,20 @@ void main() {
     await drainProviderStartup(tester);
   });
 
-  testWidgets('横屏封面按视口高度收缩，右列选项与左侧队列标题落进首屏', (tester) async {
-    SharedPreferences.setMockInitialValues({});
-    await pumpPage(tester, size: const Size(900, 420));
-
-    final cover = tester.getRect(heroCover());
-    // 竖屏走的是「按宽度封顶 320」；横屏左列只有 ~457dp 宽，若不引入高度约束，
-    // 封面会取到宽度预算，把动作行整块顶出首屏。
-    expect(cover.height, lessThan(300), reason: '横屏封面要受视口高度约束，不能沿用竖屏的 320 上限');
-    expect(cover.height, greaterThan(100), reason: '不能缩到不可辨');
-
-    // 用户要的是「按钮留在卡片里」，那它就必须真的还在首屏内摸得到——这是
-    // 卡片内部改横排 + 封面让出高度共同保证的结果。
-    expect(
-      tester.getCenter(find.byIcon(Icons.play_arrow)).dy,
-      lessThan(420),
-      reason: '动作按钮留在卡内，且必须落在首屏内',
-    );
-
-    // 右列选项和左列队列标题在首屏内，队列剩余内容可通过整页滚动访问。
-    expect(
-      tester.getCenter(stationSwitcher()).dy,
-      lessThan(420),
-      reason: '档位切换必须在首屏内',
-    );
-    expect(
-      tester.getCenter(find.text('即将播放')).dy,
-      lessThan(420),
-      reason: '「即将播放」标题必须在首屏内',
-    );
-
-    await drainProviderStartup(tester);
-  });
-
-  // 常见的横屏手机尺寸。封面预算取 0.40 * 高，左列内宽约 (总宽-间距)/2 - 48，
-  // 两列都装得下，且不该有任何 RenderFlex 溢出（溢出会以 FlutterError 抛出）。
-  for (final size in const [Size(800, 400), Size(720, 360)]) {
-    testWidgets('窄横屏 $size 两栏不溢出且右列仍在右侧', (tester) async {
+  for (final size in const [Size(900, 420), Size(800, 400), Size(720, 360)]) {
+    testWidgets('横屏 $size 单列等宽且无溢出', (tester) async {
       SharedPreferences.setMockInitialValues({});
       await pumpPage(tester, size: size);
-
-      final cover = tester.getRect(heroCover());
-      final station = tester.getCenter(stationSwitcher());
-      expect(
-        station.dx,
-        greaterThan(cover.right),
-        reason: '窄横屏下档位/歌池也必须留在右列（这才是腾出高度的手段）',
-      );
-      expect(find.text('即将播放'), findsOneWidget);
-
+      final hero = tester.getRect(find.byKey(const ValueKey('fm-hero-card')));
+      final controls = tester.getRect(find.byKey(const ValueKey('fm-recommendation-controls')));
+      final queue = tester.getRect(find.byKey(const ValueKey('fm-upcoming-queue')));
+      expect(controls.left, closeTo(hero.left, .1));
+      expect(controls.right, closeTo(hero.right, .1));
+      expect(queue.left, closeTo(hero.left, .1));
+      expect(queue.right, closeTo(hero.right, .1));
+      expect(controls.top, greaterThanOrEqualTo(hero.bottom));
+      expect(queue.top, greaterThan(controls.bottom));
+      expect(tester.takeException(), isNull);
       await drainProviderStartup(tester);
     });
   }

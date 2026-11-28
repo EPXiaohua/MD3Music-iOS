@@ -1,3 +1,6 @@
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
 import 'package:material_ui/material_ui.dart';
 
 import '../core/services/player_frame_driver.dart';
@@ -176,11 +179,16 @@ class ShimmerLoading extends StatefulWidget {
   final double height;
   final double radius;
 
+  /// 倾斜扫光：亮带与扫描方向垂直、整体呈斜向条纹掠过（骨架屏用）。
+  /// false 为原来的水平扫过。
+  final bool diagonal;
+
   const ShimmerLoading({
     super.key,
     this.width = double.infinity,
     this.height = 16,
     this.radius = 8,
+    this.diagonal = false,
   });
 
   @override
@@ -272,29 +280,89 @@ class _ShimmerLoadingState extends State<ShimmerLoading>
     final colorScheme = Theme.of(context).colorScheme;
     return AnimatedBuilder(
       animation: _controller,
-      builder: (context, child) {
-        return Container(
-          width: widget.width,
-          height: widget.height,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(widget.radius),
-            gradient: LinearGradient(
-              colors: [
-                colorScheme.surfaceContainerHighest,
-                colorScheme.surfaceContainerLow,
-                colorScheme.surfaceContainerHighest,
-              ],
-              stops: [
-                _controller.value - 0.3,
-                _controller.value,
-                _controller.value + 0.3,
-              ],
-            ),
+      // 每拍都要用最新 progress 重建 painter，不能走 child 缓存优化。
+      builder: (context, _) => RepaintBoundary(
+        child: CustomPaint(
+          painter: _ShimmerPainter(
+            _controller.value,
+            diagonal: widget.diagonal,
+            base: colorScheme.surfaceContainerHighest,
+            highlight: colorScheme.surfaceContainerLow,
+            radius: widget.radius,
           ),
-        );
-      },
+          child: SizedBox(
+            width: widget.width,
+            height: widget.height,
+          ),
+        ),
+      ),
     );
   }
+}
+
+/// 扫光骨架块画笔：底色铺满 + 一条亮带沿轴平移。
+///
+/// 刻意在**像素空间**自建渐变（[ui.Gradient.linear]）：LinearGradient 的
+/// begin/end 用 Alignment，被 [-1,1] 断言限死，亮带无法完整移出容器、
+/// 回卷瞬间会看到跳变；旧的"移动 stops"写法同样会在 t<0.3 / t>0.7 时
+/// 越出 [0,1] 触发断言。像素轴上亮带从容器完全出画再回卷，起止都不可见。
+/// [diagonal] 把轴从水平抬起 30°：亮带与轴垂直，呈倾斜条纹掠过，
+/// 倾斜角与容器宽高比解耦。
+class _ShimmerPainter extends CustomPainter {
+  const _ShimmerPainter(
+    this.progress, {
+    required this.diagonal,
+    required this.base,
+    required this.highlight,
+    required this.radius,
+  });
+
+  /// 0 → 1 一轮扫光进度。
+  final double progress;
+  final bool diagonal;
+  final Color base;
+  final Color highlight;
+  final double radius;
+
+  static const double _bandHalf = 0.25; // 亮带半宽 = 容器轴投影的 25%
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final angle = diagonal ? math.pi / 6 : 0.0;
+    final unit = Offset(math.cos(angle), math.sin(angle));
+    // 容器在轴方向上的投影长度（宽、高分量绝对值之和）。
+    final span = size.width * unit.dx.abs() + size.height * unit.dy.abs();
+    if (span <= 0) {
+      canvas.drawRect(rect, Paint()..color = base);
+      return;
+    }
+    canvas.clipRRect(
+      RRect.fromRectAndRadius(rect, Radius.circular(radius)),
+    );
+    final center = Offset(size.width / 2, size.height / 2);
+    // 亮带中心沿轴从「完全出左」扫到「完全出右」，两端都在画外。
+    final travel =
+        -span * (0.5 + _bandHalf) + span * (1 + 2 * _bandHalf) * progress;
+    final mid = center + unit * travel;
+    final p0 = mid - unit * (span * _bandHalf);
+    final p1 = mid + unit * (span * _bandHalf);
+    final shader = ui.Gradient.linear(
+      p0,
+      p1,
+      [base, highlight, base],
+      const [0.0, 0.5, 1.0],
+    );
+    canvas.drawRect(rect, Paint()..shader = shader);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ShimmerPainter oldDelegate) =>
+      oldDelegate.progress != progress ||
+      oldDelegate.diagonal != diagonal ||
+      oldDelegate.base != base ||
+      oldDelegate.highlight != highlight ||
+      oldDelegate.radius != radius;
 }
 
 class HoverScale extends StatefulWidget {

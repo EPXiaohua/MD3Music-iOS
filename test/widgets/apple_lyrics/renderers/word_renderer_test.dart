@@ -82,29 +82,33 @@ void main() {
   }
 
   group('初始状态', () {
-    test('非当前行（scale=0.97）：所有 word alpha 初始为 dynamicDarkAlpha=0.2', () {
-      renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
+    test('非当前行（inactiveScale）：所有 word alpha 初始为 dynamicDarkAlpha', () {
+      renderer.setLineState(
+          isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       final alphas = renderer.wordAlphas;
       expect(alphas.length, 4);
       for (final a in alphas.values) {
-        expect(a, closeTo(0.2, 1e-9));
+        expect(a, closeTo(renderer.dynamicDarkAlpha, 1e-9));
       }
     });
 
-    test('当前行（scale=1.0）：所有 word alpha 初始为 dynamicDarkAlpha=0.4', () {
+    test('当前行（scale=1.0）：所有 word alpha 初始为 sweepDarkAlpha', () {
+      // 当前行未播字与下方未播行同值（darkAlphaFor(0) = alphaBase = 0.2），
+      // 不再随 factor 放大到 unplayedOpacity（用户 2026-11-13 反馈"字内渐变
+      // 未播部分比下方未播歌词亮"）。
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       final alphas = renderer.wordAlphas;
       expect(alphas.length, 4);
       for (final a in alphas.values) {
-        expect(a, closeTo(0.4, 1e-9));
+        expect(a, closeTo(renderer.sweepDarkAlpha, 1e-9));
       }
     });
   });
 
   group('tick 后状态推进', () {
-    test('progress=0.25：word 0 已播趋向 1.0，word 1/2/3 未播趋向 0.4', () {
+    test('progress=0.25：word 0 已播趋向 1.0，word 1/2/3 未播趋向 sweepDarkAlpha', () {
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
 
@@ -113,9 +117,9 @@ void main() {
         renderer.tick(0.016, 1000);
       }
       expect(renderer.wordAlphas[0]!, closeTo(1.0, 0.01));
-      expect(renderer.wordAlphas[1]!, closeTo(0.4, 0.01));
-      expect(renderer.wordAlphas[2]!, closeTo(0.4, 0.01));
-      expect(renderer.wordAlphas[3]!, closeTo(0.4, 0.01));
+      expect(renderer.wordAlphas[1]!, closeTo(renderer.sweepDarkAlpha, 0.01));
+      expect(renderer.wordAlphas[2]!, closeTo(renderer.sweepDarkAlpha, 0.01));
+      expect(renderer.wordAlphas[3]!, closeTo(renderer.sweepDarkAlpha, 0.01));
     });
 
     test('progress 推进到 1.0：所有 word 已播，alpha 趋向 1.0', () {
@@ -141,81 +145,94 @@ void main() {
   });
 
   group('isActive 切换', () {
-    test('从非当前行切到当前行，alpha 从 0.2 渐变到 0.4', () {
-      // 初始非当前行：scale=0.97, factor=0, dynamicDarkAlpha=0.2
+    test('从非当前行切到当前行，alpha 从动态暗色渐变到当前行目标', () {
+      // 初始非当前行：factor=0，dynamicDarkAlpha=0.2
       renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.2, 1e-9));
+        expect(a, closeTo(renderer.dynamicDarkAlpha, 1e-9));
       }
 
-      // 切到当前行：scale=1.0, factor=1, dynamicDarkAlpha=0.4
-      // progress=0 时所有字未播，目标 = dynamicDarkAlpha = 0.4
+      // 切到当前行：progress=0 时所有字未播，目标 = sweepDarkAlpha
+      // （与切行前同为 0.2：切行不再让整行未唱部分突然亮半档）
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       for (int i = 0; i < 100; i++) {
         renderer.tick(0.016, 0);
       }
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.4, 0.01));
+        expect(a, closeTo(renderer.sweepDarkAlpha, 0.01));
       }
     });
 
-    test('从当前行切到非当前行，alpha 从 0.4 渐变回 0.2', () {
-      // 初始当前行：所有字 alpha=0.4
+    test('从当前行切到非当前行，alpha 渐变回非当前行目标', () {
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.4, 1e-9));
+        expect(a, closeTo(renderer.sweepDarkAlpha, 1e-9));
       }
 
-      // 切到非当前行：scale=0.97, factor=0, dynamicDarkAlpha=0.2
-      // 非当前行 SOLID 模式，所有字目标 = 0.2
+      // 切到非当前行：非当前行 SOLID 模式，所有字目标 = dynamicDarkAlpha
       renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
+      final target = renderer.dynamicDarkAlpha;
       for (int i = 0; i < 200; i++) {
         renderer.tick(0.016, 2000);
       }
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.2, 0.01));
+        expect(a, closeTo(target, 0.01));
       }
     });
   });
 
   group('scale 联动', () {
-    test(
-      'scale=0.97 时 factor=0，dynamicDarkAlpha=0.2，dynamicBrightAlpha=0.2',
-      () {
-        renderer.setLineState(
-          isActive: false,
-          scale: LyricLayout.inactiveScale,
-        );
-        expect(renderer.factor, closeTo(0.0, 1e-9));
-        expect(renderer.dynamicDarkAlpha, closeTo(0.2, 1e-9));
-        expect(renderer.dynamicBrightAlpha, closeTo(0.2, 1e-9));
-      },
-    );
+    test('inactiveScale → factor 退化正确（缩放关闭时=1.0，否则=0）', () {
+      renderer.setLineState(
+        isActive: false,
+        scale: LyricLayout.inactiveScale,
+      );
+      final noScale = (LyricLayout.activeScale - LyricLayout.inactiveScale)
+              .abs() <
+          1e-9;
+      final expectedFactor = noScale ? 1.0 : 0.0;
+      expect(renderer.factor, closeTo(expectedFactor, 1e-9));
+      expect(renderer.dynamicDarkAlpha,
+          closeTo(expectedFactor * 0.2 + 0.2, 1e-9));
+      expect(renderer.dynamicBrightAlpha,
+          closeTo(expectedFactor * 0.8 + 0.2, 1e-9));
+    });
 
-    test(
-      'scale=1.0 时 factor=1，dynamicDarkAlpha=0.4，dynamicBrightAlpha=1.0',
-      () {
-        renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
-        expect(renderer.factor, closeTo(1.0, 1e-9));
-        expect(renderer.dynamicDarkAlpha, closeTo(0.4, 1e-9));
-        expect(renderer.dynamicBrightAlpha, closeTo(1.0, 1e-9));
-      },
-    );
+    test('activeScale → factor=1，动态暗 alpha=0.4，亮 alpha=1.0', () {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      expect(renderer.factor, closeTo(1.0, 1e-9));
+      expect(renderer.dynamicDarkAlpha, closeTo(0.4, 1e-9));
+      expect(renderer.dynamicBrightAlpha, closeTo(1.0, 1e-9));
+    });
 
-    test('scale 为活动/非活动档位中点时 factor=0.5，alpha 取中间值', () {
+    test('scale 为活动/非活动档位中点时 factor/alpha 正确（缩放关闭时退化=1.0）', () {
       final midScale =
           (LyricLayout.inactiveScale + LyricLayout.activeScale) / 2;
       renderer.setLineState(isActive: true, scale: midScale);
-      expect(renderer.factor, closeTo(0.5, 1e-9));
-      expect(renderer.dynamicDarkAlpha, closeTo(0.3, 1e-9));
-      expect(renderer.dynamicBrightAlpha, closeTo(0.6, 1e-9));
+      final noScale = (LyricLayout.activeScale - LyricLayout.inactiveScale)
+              .abs() <
+          1e-9;
+      final expectedFactor = noScale ? 1.0 : 0.5;
+      expect(renderer.factor, closeTo(expectedFactor, 1e-9));
+      expect(renderer.dynamicDarkAlpha,
+          closeTo(expectedFactor * 0.2 + 0.2, 1e-9));
+      expect(renderer.dynamicBrightAlpha,
+          closeTo(expectedFactor * 0.8 + 0.2, 1e-9));
     });
 
-    test('scale 越界保护：< 0.97 时 factor 钳制为 0', () {
+    test('scale 越界保护：远低于 inactiveScale 时 factor 钳制为 0', () {
+      final noScale = (LyricLayout.activeScale - LyricLayout.inactiveScale)
+              .abs() <
+          1e-9;
       renderer.setLineState(isActive: false, scale: 0.5);
-      expect(renderer.factor, closeTo(0.0, 1e-9));
+      if (noScale) {
+        // inactive==active 时缩放维度退化，factor 恒为 1.0
+        expect(renderer.factor, closeTo(1.0, 1e-9));
+      } else {
+        expect(renderer.factor, closeTo(0.0, 1e-9));
+      }
     });
 
     test('scale 越界保护：> 1.0 时 factor 钳制为 1', () {
@@ -235,8 +252,8 @@ void main() {
       }
       expect(renderer.wordAlphas[0]!, closeTo(1.0, 0.01));
       expect(renderer.wordAlphas[1]!, closeTo(1.0, 0.01));
-      expect(renderer.wordAlphas[2]!, closeTo(0.4, 0.01));
-      expect(renderer.wordAlphas[3]!, closeTo(0.4, 0.01));
+      expect(renderer.wordAlphas[2]!, closeTo(renderer.sweepDarkAlpha, 0.01));
+      expect(renderer.wordAlphas[3]!, closeTo(renderer.sweepDarkAlpha, 0.01));
     });
 
     test('ATTACK 速度比 RELEASE 快：相同帧数下变亮幅度大于变暗幅度', () {
@@ -347,8 +364,11 @@ void main() {
       renderer.reset();
       expect(renderer.wordAlphas, isEmpty);
       expect(renderer.isActive, isFalse);
-      // factor 也应回到 inactive (0)
-      expect(renderer.factor, closeTo(0.0, 1e-9));
+      // reset 后 scale 回落到 inactive；缩放关闭时 factor 退化为 1.0
+      final noScale = (LyricLayout.activeScale - LyricLayout.inactiveScale)
+              .abs() <
+          1e-9;
+      expect(renderer.factor, closeTo(noScale ? 1.0 : 0.0, 1e-9));
     });
 
     test('reset 后重新 paintLine 应重新绑定并初始化', () {
@@ -362,8 +382,9 @@ void main() {
       // 重新设置并绑定
       renderer.setLineState(isActive: false, scale: LyricLayout.inactiveScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
+      final target = renderer.dynamicDarkAlpha;
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.2, 1e-9));
+        expect(a, closeTo(target, 1e-9));
       }
     });
   });
@@ -442,10 +463,11 @@ void main() {
         ],
       );
       renderer.paintLine(makeCanvas(), ui.Offset.zero, newLine, 24);
-      // alpha map 应重新初始化为新 line 的 word 数量，值为 dynamicDarkAlpha=0.4
+      // alpha map 应重新初始化为新 line 的 word 数量，值为 sweepDarkAlpha=0.2
+      // （当前行未播字与下方未播行同值）
       expect(renderer.wordAlphas.length, 2);
       for (final a in renderer.wordAlphas.values) {
-        expect(a, closeTo(0.4, 1e-9));
+        expect(a, closeTo(renderer.sweepDarkAlpha, 1e-9));
       }
     });
   });
@@ -493,6 +515,71 @@ void main() {
         done.every((s) => s == EmphasizeState.idle),
         isTrue,
         reason: '尾巴走完后字0应回到 idle',
+      );
+    });
+  });
+
+  // ==================== 辉光字符缩放开关 ====================
+  group('强调波浪 - 辉光字符缩放开关', () {
+    // 单字强调字 '运'（时长 4000ms）：tick 到凸起峰值附近，
+    // 逐字符状态应反映"放大 + 外扩"是否被开关关掉。
+    const scaleLine = LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '运',
+      words: [
+        LyricWord(startTime: 0, duration: 4000, text: '运'),
+      ],
+    );
+
+    /// 推进到凸起峰值（t≈2000ms，du=max(1000,4000)=4000 → phase≈0.5）。
+    Future<List<EmphasizeState>> statesAtPeak() async {
+      renderer.emphasizeEffect = EmphasizeEffect();
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.paintLine(makeCanvas(), ui.Offset.zero, scaleLine, 24);
+      for (int t = 0; t <= 2000; t += 16) {
+        renderer.tick(0.016, t, isPlaying: true);
+      }
+      return renderer.debugCharStatesRef(0);
+    }
+
+    test('开启时字符被放大（历史行为）', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => LyricPreferences.instance.reset());
+      await LyricPreferences.instance.setUseGlowEffect(true);
+      await LyricPreferences.instance.setUseGlowCharScale(true);
+
+      final states = await statesAtPeak();
+      expect(states, isNotEmpty);
+      expect(
+        states.any((s) => s.scale > 1.0),
+        isTrue,
+        reason: '开关开启时凸起应放大字符',
+      );
+    });
+
+    test('关闭时不再放大，但仍保留辉光与上浮', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => LyricPreferences.instance.reset());
+      await LyricPreferences.instance.setUseGlowEffect(true);
+      await LyricPreferences.instance.setUseGlowCharScale(false);
+
+      final states = await statesAtPeak();
+      expect(states, isNotEmpty);
+      for (final s in states) {
+        expect(s.scale, closeTo(1.0, 1e-9), reason: '关闭后不应放大');
+        expect(s.offsetXEm, closeTo(0.0, 1e-9), reason: '关闭后不应左右外扩');
+      }
+      // 仍处于逐字符辉光路径：光晕与上浮还在
+      expect(
+        states.any((s) => s.glowLevel > 0),
+        isTrue,
+        reason: '关闭缩放不应关掉辉光',
+      );
+      expect(
+        states.any((s) => s.offsetYEm != 0),
+        isTrue,
+        reason: '关闭缩放不应关掉上浮',
       );
     });
   });
@@ -585,26 +672,29 @@ void main() {
       addTearDown(() => LyricPreferences.instance.reset());
     });
 
-    test('默认 3.0px：已播字 Y 偏移收敛到 -3.0，未播字保持 0', () async {
+    test('默认上浮高度（按平台）：已播字 Y 偏移收敛，未播字保持 0', () async {
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       // 固定在第 3 个字（index=2）的演唱中：index 0/1 为已播字，index 3 为未播字
       for (int i = 0; i < 300; i++) {
         renderer.tick(0.016, 2500);
       }
-      expect(renderer.wordYOffsetsRef[0], closeTo(-3.0, 0.01));
-      expect(renderer.wordYOffsetsRef[1], closeTo(-3.0, 0.01));
+      final expected =
+          -LyricPreferences.defaultLiftHeightPxForCurrentPlatform;
+      expect(renderer.wordYOffsetsRef[0], closeTo(expected, 0.01));
+      expect(renderer.wordYOffsetsRef[1], closeTo(expected, 0.01));
       expect(renderer.wordYOffsetsRef[3], closeTo(0.0, 0.01));
     });
 
-    test('改到 8.0px 后已播字 Y 偏移收敛到 -8.0', () async {
-      await LyricPreferences.instance.setLiftHeightPx(8.0);
+    test('改到当前平台最大上浮后已播字 Y 偏移收敛', () async {
+      final maxLift = LyricPreferences.maxLiftHeightPxForCurrentPlatform;
+      await LyricPreferences.instance.setLiftHeightPx(maxLift);
       renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
       renderer.paintLine(makeCanvas(), ui.Offset.zero, line, 24);
       for (int i = 0; i < 300; i++) {
         renderer.tick(0.016, 2500);
       }
-      expect(renderer.wordYOffsetsRef[0], closeTo(-8.0, 0.01));
+      expect(renderer.wordYOffsetsRef[0], closeTo(-maxLift, 0.01));
     });
 
     test('设为 0 时已播字不再上浮', () async {
@@ -885,19 +975,20 @@ void main() {
       expect(a.base, closeTo(0.25, 1e-9));
       expect(a.extra, equals(0.0));
 
-      // 2.0 倍 → 峰值处常规层饱和 1.0，超出部分走加法叠加
-      await prefs.setGlowIntensity(2.0);
+      // 强度上限 → 峰值处超出部分走加法叠加（按当前平台上限，Windows 便携版为 1.8）
+      final maxIntensity = LyricPreferences.maxGlowIntensityForCurrentPlatform;
+      await prefs.setGlowIntensity(maxIntensity);
       a = renderer.debugGlowDrawAlphaForTest(0.6);
       expect(a.base, equals(1.0));
-      expect(a.extra, closeTo(0.2, 1e-9));
+      expect(a.extra, closeTo(0.6 * maxIntensity - 1.0, 1e-9));
       a = renderer.debugGlowDrawAlphaForTest(0.2);
-      expect(a.base, closeTo(0.4, 1e-9));
+      expect(a.base, closeTo(0.2 * maxIntensity, 1e-9));
       expect(a.extra, equals(0.0));
 
-      // 强度上限下最亮处 = 常规 1.0 + 加法 1.0
+      // 强度上限下最亮处 = 常规 1.0 + 加法 (maxIntensity - 1.0)
       a = renderer.debugGlowDrawAlphaForTest(1.0);
       expect(a.base, equals(1.0));
-      expect(a.extra, equals(1.0));
+      expect(a.extra, closeTo(maxIntensity - 1.0, 1e-9));
 
       // 剖面半径不随强度变化（贴笔画的光形稳定）
       expect(WordRenderer.glowSigmaProfileEmForTest, equals(sigmasBefore));

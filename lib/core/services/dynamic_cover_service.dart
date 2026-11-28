@@ -55,9 +55,9 @@ String dyCoverStatusText({
 ///
 /// 职责边界（刻意保持很窄）：
 /// - **只管「该不该加载」与「有没有动态封面」**，不管字节怎么传；
-/// - 媒体字节由回环代理流式转发，`video_player` 直接消费（公开构建 = 每次流式；
-///   私有构建命中本地文件时改播本地文件，见 `dynamic_cover_view.dart` 的扩展点）；
-/// - 因此本服务**不落盘、不缓存文件**，公开树里不存在任何缓存代码路径。
+/// - 媒体字节由回环代理流式转发，`video_player` 直接消费（默认每次流式；
+///   宿主注入了本地路径解析时改播本地文件，见 `dynamic_cover_view.dart` 的扩展点）；
+/// - 因此本服务**不落盘、不缓存文件**。
 class DynamicCoverService {
   DynamicCoverService._();
   static final DynamicCoverService instance = DynamicCoverService._();

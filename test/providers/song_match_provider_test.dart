@@ -263,4 +263,112 @@ void main() {
       expect(repo.get(dismissed.id)!.preferOnlineLyrics, isFalse);
     });
   });
+
+  group('云盘歌曲匹配', () {
+    Song _cloud({
+      String id = 'cloudhash_001',
+      String title = '晴天.mp3',
+      String artist = '周杰伦',
+      int seconds = 182,
+    }) {
+      return Song(
+        id: id,
+        title: title,
+        artist: artist,
+        album: '',
+        duration: Duration(seconds: seconds),
+        isOnline: true,
+        isCloud: true,
+      );
+    }
+
+    test('matchInfoForSong 三态：本地可查 / 纯在线恒 null / 云盘可查', () async {
+      final repo = SongMatchRepository();
+      await repo.ensureLoaded();
+      final local = _local();
+      final cloud = _cloud();
+      await repo.put(SongMatchProvider.infoFromCandidate(
+          local.id, _candidate(hash: 'h_local'), SongMatchSource.manual));
+      await repo.put(SongMatchProvider.infoFromCandidate(
+          cloud.id, _candidate(hash: 'h_cloud'), SongMatchSource.manual));
+
+      // 本地：isOnline=false → 查记忆
+      expect(matchInfoForSong(local)!.hash, 'h_local');
+      // 纯在线：isOnline=true 且非云盘 → 恒 null
+      final online = local.copyWith(isOnline: true, id: 'officialhash');
+      expect(matchInfoForSong(online), isNull);
+      // 云盘：isOnline=true 但 isCloud=true → 查记忆
+      expect(matchInfoForSong(cloud)!.hash, 'h_cloud');
+    });
+
+    test('matchedSongFor 对云盘返回匹配结果，对纯在线返回 null', () async {
+      final provider = SongMatchProvider(autoStartOnCreate: false);
+      final repo = SongMatchRepository();
+      await repo.ensureLoaded();
+      final cloud = _cloud();
+      await repo.put(SongMatchProvider.infoFromCandidate(
+          cloud.id, _candidate(hash: 'h_cloud'), SongMatchSource.manual));
+
+      final matched = provider.matchedSongFor(cloud);
+      expect(matched, isNotNull);
+      expect(matched!.id, 'h_cloud');
+      // 纯在线歌曲不产生匹配
+      expect(
+        provider.matchedSongFor(cloud.copyWith(isCloud: false)),
+        isNull,
+      );
+    });
+
+    test('onCloudListLoaded：云盘歌曲命中后以云盘 id 落库', () async {
+      final provider = SongMatchProvider(autoStartOnCreate: false);
+      var calls = 0;
+      SongMatchProvider.debugSearchOverride = (keywords) async {
+        calls++;
+        expect(keywords, contains('晴天'));
+        return KugouSearchResult(songs: [_candidate(hash: 'h_cloud_auto')], total: 1);
+      };
+      final cloud = _cloud();
+
+      await provider.onCloudListLoaded([cloud]);
+
+      expect(calls, 1);
+      final repo = SongMatchRepository();
+      // 键为云盘歌曲 id（云盘 hash），非官方 hash
+      expect(repo.isMatched(cloud.id), isTrue);
+      expect(repo.get(cloud.id)!.hash, 'h_cloud_auto');
+      expect(repo.get(cloud.id)!.source, SongMatchSource.auto);
+    });
+
+    test('onCloudListLoaded：dismissed / 已匹配 / 冷却的云盘歌曲跳过', () async {
+      final provider = SongMatchProvider(autoStartOnCreate: false);
+      final repo = SongMatchRepository();
+      await repo.ensureLoaded();
+      final dismissed = _cloud(id: 'cloudhash_d', title: '已否决.mp3');
+      final matched = _cloud(id: 'cloudhash_m', title: '已有匹配.mp3');
+      await repo.dismiss(dismissed.id);
+      await repo.put(SongMatchProvider.infoFromCandidate(
+          matched.id, _candidate(hash: 'h_m'), SongMatchSource.manual));
+
+      var calls = 0;
+      SongMatchProvider.debugSearchOverride = (keywords) async {
+        calls++;
+        return null;
+      };
+      await provider.onCloudListLoaded([dismissed, matched]);
+      expect(calls, 0);
+    });
+
+    test('onCloudListLoaded：设置开关关闭时不搜索', () async {
+      await SettingsRepository().setAutoMatchOnlineInfo(false);
+      final provider = SongMatchProvider(autoStartOnCreate: false);
+      var calls = 0;
+      SongMatchProvider.debugSearchOverride = (keywords) async {
+        calls++;
+        return null;
+      };
+
+      await provider.onCloudListLoaded([_cloud()]);
+      expect(calls, 0);
+    });
+  });
 }

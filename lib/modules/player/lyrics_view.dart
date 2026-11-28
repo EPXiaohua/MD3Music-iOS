@@ -6,6 +6,8 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_aux_scope.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/md3_lyric_preferences.dart';
 import '../../providers/theme_provider.dart';
 import '../../core/build_flags.dart';
@@ -65,9 +67,26 @@ class LyricsViewState extends State<LyricsView> {
   // 长歌词行（如英文整句）换行后行高自适应缓存：
   // 每行高度按实际换行数测量，滚动用累计偏移；避免每帧 TextPainter 重测。
   bool _layoutDirty = true;
+  /// 只需按当前「副行显示范围」重排行高（文本测量结果未变）。
+  ///
+  /// 与 [_layoutDirty] 分开是为了避免每次切行都重跑 N 次 `TextPainter.layout`：
+  /// 行高 = 主行块高 + (该行是否显示副行 ? 副行块高 : 0) + 行间留白，
+  /// 三项里只有中间那项随范围/当前行变化，合并只是 O(N) 加法。
+  bool _heightsDirty = true;
   double _lastLayoutWidth = -1;
   List<double> _lineHeights = [];
   List<double> _lineTopOffsets = [];
+
+  /// 逐行纯主行块高 / 纯副行块高（含副行顶部 0.25em 间隙），索引与
+  /// [_parsedLyrics] 对齐。行高按「副行显示范围」由两者合成，见 [_recomposeHeights]。
+  List<double> _mainHeights = const <double>[];
+  List<double> _auxHeights = const <double>[];
+
+  /// 行间留白（把单行行距补足到 `fontSize × lineSpacing`），测量时算一次。
+  double _lineSpacingExtra = 0;
+
+  /// 上次参与行高合成的副行范围，用于识别「只有范围变了」的变化。
+  LyricAuxScope _cachedAuxScope = LyricAuxScope.currentLine;
 
   /// 换行计划落成的展示文本（含硬断点 \n），索引与 [_parsedLyrics] 对齐。
   ///
@@ -159,12 +178,19 @@ class LyricsViewState extends State<LyricsView> {
     _parseLyrics();
     // 若外层提供 positionListenable（性能优化：内部仅当前行变化才重建），订阅它
     _effPosition = widget.position;
+    // 首帧即定位当前行。此前 `_currentLineIndex` 保持 -1 直到下一次
+    // didUpdateWidget，导致首帧整页都按「非当前行」渲染——引入「副行显示范围」
+    // 后这个中间态更明显（默认「仅当前行」时首帧一条副行都不显示）。
+    _currentLineIndex = _findLineIndex(_effPosition);
     if (widget.positionListenable != null) {
       _onExternalPos();
       widget.positionListenable!.addListener(_onExternalPos);
     }
     // 监听 MD3 歌词偏好变化（字号/行间距/字体），实时刷新视图
     _prefs.addListener(_onPrefsChanged);
+    // 「副行显示范围」与 AM 播放页共用同一份偏好（LyricPreferences）
+    _cachedAuxScope = LyricPreferences.instance.auxScope;
+    LyricPreferences.instance.addListener(_onAuxScopeChanged);
   }
 
   @override
@@ -193,6 +219,7 @@ class LyricsViewState extends State<LyricsView> {
   void dispose() {
     widget.positionListenable?.removeListener(_onExternalPos);
     _prefs.removeListener(_onPrefsChanged);
+    LyricPreferences.instance.removeListener(_onAuxScopeChanged);
     _cancelResumeTimer();
     // tv: 状态机只持有 4s 恢复跟随的 Timer，页面销毁时必须取消
     // （AGENTS §10.4 第 7 条）；逐行 FocusNode 由各行 State 自行释放。
@@ -213,6 +240,19 @@ class LyricsViewState extends State<LyricsView> {
 
   void _onPrefsChanged() {
     _layoutDirty = true;
+    _heightsDirty = true;
+    if (mounted) setState(() {});
+  }
+
+  /// 副行显示范围变化：只需重排行高（文本测量结果不变），不重跑 TextPainter。
+  ///
+  /// 与 [_onPrefsChanged] 分开是因为 LyricPreferences 还承载几十项其它偏好
+  /// （模糊强度、辉光、级联延迟…），那些与 MD3 页无关，逐次全量重测没有意义。
+  void _onAuxScopeChanged() {
+    final LyricAuxScope scope = LyricPreferences.instance.auxScope;
+    if (scope == _cachedAuxScope) return;
+    _cachedAuxScope = scope;
+    _heightsDirty = true;
     if (mounted) setState(() {});
   }
 
@@ -438,6 +478,11 @@ class LyricsViewState extends State<LyricsView> {
     // 行未变化时跳过 setState，避免播放中每 200ms 重建 ListView 可见行；
     // 仅在行切换或显式强制滚动（切歌定位/松手回弹）时才刷新。
     if (!lineChanged && !_forceScroll) return;
+    if (lineChanged) {
+      // 当前行变化 → 「仅当前行 / 已播行除外」下行高要跟着变（副行显隐）。
+      // 只置脏标记，真正合成发生在下一次 build 的 [_ensureLayout]。
+      _heightsDirty = true;
+    }
     _currentLineIndex = newIndex;
 
     if (mounted) {
@@ -499,15 +544,23 @@ class LyricsViewState extends State<LyricsView> {
   /// 否则长英文行换行后字形会被上下行重叠/截断；lineSpacing 可低至 0.8，
   /// 以 1.4 为下限保证容器高度不低于文本块。
   void _ensureLayout(double width, double fontSize, String? fontFamily) {
-    if (!_layoutDirty && _lastLayoutWidth == width) return;
-    _layoutDirty = false;
-    _lastLayoutWidth = width;
+    final bool needMeasure = _layoutDirty || _lastLayoutWidth != width;
+    if (!needMeasure && !_heightsDirty) return;
+    if (needMeasure) {
+      _layoutDirty = false;
+      _lastLayoutWidth = width;
+      _measureLayout(width, fontSize, fontFamily);
+    }
+    _recomposeHeights();
+  }
 
+  /// 全量重测：换行文本 + 逐行主行块高 + 逐行副行块高（不含范围判定）。
+  void _measureLayout(double width, double fontSize, String? fontFamily) {
     final n = _parsedLyrics.length;
     final wrapHeight = _wrapLineHeight;
     // 行间留白：把单行行距补足到 fontSize * lineSpacing（不足则为 0）
     final spacingExtra = fontSize * (_prefs.lineSpacing - wrapHeight);
-    final safeSpacing = spacingExtra > 0 ? spacingExtra : 0.0;
+    _lineSpacingExtra = spacingExtra > 0 ? spacingExtra : 0.0;
     final bool balanced = _prefs.lineBalance;
     final TextStyle mainStyle = TextStyle(
       fontSize: fontSize,
@@ -546,43 +599,75 @@ class LyricsViewState extends State<LyricsView> {
         balanced: true,
       ).rowTexts.join('\n');
     });
-    _lineHeights = List<double>.generate(n, (i) {
-      final text = _displayTexts[i];
+    // 主行 / 副行块高分开存：行高按「副行显示范围」合成（[_recomposeHeights]），
+    // 于是切行 / 切范围时无需重跑 TextPainter，只做 O(N) 加法。
+    final List<double> mainHeights = List<double>.filled(n, 0);
+    final List<double> auxHeights = List<double>.filled(n, 0);
+    for (var i = 0; i < n; i++) {
       final painter = TextPainter(
-        text: TextSpan(
-          text: text,
-          style: mainStyle,
-        ),
+        text: TextSpan(text: _displayTexts[i], style: mainStyle),
         textDirection: TextDirection.ltr,
       )..layout(maxWidth: width);
-      final blockHeight = painter.computeLineMetrics().fold<double>(
+      mainHeights[i] = painter.computeLineMetrics().fold<double>(
         0,
         (sum, m) => sum + m.height,
       );
       final auxiliaryText = _auxDisplayTexts[i];
-      var auxiliaryHeight = 0.0;
-      if (auxiliaryText != null) {
-        final auxiliaryPainter = TextPainter(
-          text: TextSpan(
-            text: auxiliaryText,
-            style: auxStyle,
-          ),
-          textDirection: TextDirection.ltr,
-        )..layout(maxWidth: width);
-        auxiliaryHeight =
-            auxiliaryPainter.computeLineMetrics().fold<double>(
-              0,
-              (sum, m) => sum + m.height,
-            ) +
-            _auxiliaryFontSize(fontSize) * 0.25;
-      }
-      return blockHeight + auxiliaryHeight + safeSpacing;
-    });
-
-    _lineTopOffsets = List<double>.filled(n, 0);
-    for (var i = 1; i < n; i++) {
-      _lineTopOffsets[i] = _lineTopOffsets[i - 1] + _lineHeights[i - 1];
+      if (auxiliaryText == null) continue;
+      final auxiliaryPainter = TextPainter(
+        text: TextSpan(text: auxiliaryText, style: auxStyle),
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: width);
+      auxHeights[i] =
+          auxiliaryPainter.computeLineMetrics().fold<double>(
+            0,
+            (sum, m) => sum + m.height,
+          ) +
+          _auxiliaryFontSize(fontSize) * 0.25;
     }
+    _mainHeights = mainHeights;
+    _auxHeights = auxHeights;
+    _heightsDirty = true;
+  }
+
+  /// 该行此刻是否应当显示副行（按「副行显示范围」+ 副行开关 + 副行文本）。
+  bool _shouldShowAux(int index) {
+    if (index < 0 || index >= _parsedLyrics.length) return false;
+    if (index >= _auxDisplayTexts.length) return false;
+    if (_auxDisplayTexts[index] == null) return false;
+    final double target = resolveAuxTarget(
+      scope: LyricPreferences.instance.auxScope,
+      enabled: _prefs.showAuxiliary,
+      hasAuxText: true,
+      lineIndex: index,
+      currentLineIndex: _currentLineIndex,
+    );
+    return target > 0.5;
+  }
+
+  /// 按当前副行显示范围合成每行高度与累计偏移（O(N) 加法）。
+  ///
+  /// MD3 播放页是滚动视图而非自定义绘制，行高必须与渲染一致（否则点击跳行 /
+  /// 自动滚动会命中错行），所以这里不做过渡动画——切行瞬间的高度变化由紧随
+  /// 其后的 300ms 滚动动画覆盖，比引入逐帧重排（ListView 每帧重建可见行）更稳。
+  void _recomposeHeights() {
+    _heightsDirty = false;
+    final n = _parsedLyrics.length;
+    if (_mainHeights.length != n || _auxHeights.length != n) return;
+    _cachedAuxScope = LyricPreferences.instance.auxScope;
+    final List<double> heights = List<double>.filled(n, 0);
+    for (var i = 0; i < n; i++) {
+      heights[i] =
+          _mainHeights[i] +
+          (_shouldShowAux(i) ? _auxHeights[i] : 0.0) +
+          _lineSpacingExtra;
+    }
+    _lineHeights = heights;
+    final List<double> tops = List<double>.filled(n, 0);
+    for (var i = 1; i < n; i++) {
+      tops[i] = tops[i - 1] + heights[i - 1];
+    }
+    _lineTopOffsets = tops;
   }
 
   /// 换行后的内部视觉行距系数：行间距设置的 0.8×，下限 1.4。
@@ -766,7 +851,13 @@ class LyricsViewState extends State<LyricsView> {
                 final isCurrent =
                     index == _currentLineIndex || index == tvFocusedIndex;
                 final line = _parsedLyrics[index];
-                final auxiliaryText = _selectedAuxiliaryText(line);
+                // 副行按「副行显示范围」显隐。行高已在 [_recomposeHeights] 里
+                // 用同一判定合成，两处必须一致——否则会出现「预留了高度但
+                // 不显示副行」的空白，或副行压到下一行。
+                final bool showAux = _shouldShowAux(index);
+                final auxiliaryText = showAux
+                    ? _selectedAuxiliaryText(line)
+                    : null;
                 final auxiliaryFontSize = _auxiliaryFontSize(fontSize);
 
                 final Widget row = GestureDetector(

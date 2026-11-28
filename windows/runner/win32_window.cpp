@@ -37,6 +37,20 @@ int Scale(int source, double scale_factor) {
   return static_cast<int>(source * scale_factor);
 }
 
+// 显式提供窗口大小图标，不只依赖窗口类的单一 hIcon；任务栏和 Alt+Tab
+// 可各自取得合适尺寸。LR_SHARED 的资源图标由系统管理，不调用 DestroyIcon。
+void SetWindowIcons(HWND window) {
+  const HINSTANCE instance = GetModuleHandle(nullptr);
+  const HICON large_icon = static_cast<HICON>(LoadImage(
+      instance, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED));
+  const HICON small_icon = static_cast<HICON>(LoadImage(
+      instance, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+  if (large_icon) SendMessage(window, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(large_icon));
+  if (small_icon) SendMessage(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
+}
+
 // Dynamically loads the |EnableNonClientDpiScaling| from the User32 module.
 // This API is only needed for PerMonitor V1 awareness mode.
 void EnableFullDpiSupportIfAvailable(HWND hwnd) {
@@ -144,6 +158,7 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  SetWindowIcons(window);
   UpdateTheme(window);
 
   return OnCreate();

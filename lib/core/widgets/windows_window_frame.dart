@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'package:md3music/core/layout/bottom_chrome_sink.dart';
-import 'package:md3music/core/services/windows_fullscreen.dart';
+import 'package:md3music/core/widgets/windows_caption_buttons.dart';
 
 /// 仅 Windows：20% 主题底色叠在全局背景上，正文不透明度不变。
 class WindowsWindowFrame extends StatefulWidget {
@@ -16,49 +16,12 @@ class WindowsWindowFrame extends StatefulWidget {
   State<WindowsWindowFrame> createState() => _WindowsWindowFrameState();
 }
 
-class _WindowsWindowFrameState extends State<WindowsWindowFrame>
-    with WidgetsBindingObserver {
+class _WindowsWindowFrameState extends State<WindowsWindowFrame> {
   static const _channel = MethodChannel('md3music/window_tray');
-  bool _maximized = false;
-
-  /// 当前是否处于原生全屏（F11 / Zen）。仅用于把「最大化」键的语义换成
-  /// 「退出全屏」：原生侧全屏时去掉了窗口边框，没有系统按钮可点，标题栏里的
-  /// 这一枚就是鼠标用户唯一的退出入口。
-  bool _fullscreen = WindowsFullscreen.active.value;
-
-  @override
-  void initState() {
-    super.initState();
-    if (Platform.isWindows) {
-      WidgetsBinding.instance.addObserver(this);
-      WindowsFullscreen.active.addListener(_onFullscreenChanged);
-      _invoke('isMaximized');
-    }
-  }
-
-  void _onFullscreenChanged() {
-    if (!mounted || _fullscreen == WindowsFullscreen.active.value) return;
-    setState(() => _fullscreen = WindowsFullscreen.active.value);
-  }
-
-  @override
-  void dispose() {
-    WindowsFullscreen.active.removeListener(_onFullscreenChanged);
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
-  void didChangeMetrics() => _invoke('isMaximized');
 
   Future<void> _invoke(String method) async {
     try {
-      final value = await _channel.invokeMethod<bool>(method);
-      if (mounted &&
-          value != null &&
-          (method == 'isMaximized' || method == 'toggleMaximize')) {
-        setState(() => _maximized = value);
-      }
+      await _channel.invokeMethod<void>(method);
     } on MissingPluginException {
       // Widget 测试没有原生 runner；实际运行须使用同一构建中的 Dart 与 runner。
     } on PlatformException catch (error) {
@@ -105,10 +68,15 @@ class _WindowsWindowFrameState extends State<WindowsWindowFrame>
                               ),
                               child: Row(
                                 children: [
-                                  Icon(
-                                    Icons.music_note,
-                                    size: 16,
-                                    color: colors.onSurface,
+                                  // 应用图标（与 exe / 托盘同一吉祥物），替代原先的
+                                  // 通用 Material 音符字形。cacheWidth 限制解码尺寸
+                                  // （16dp × 最高 4x DPI）；webp 128px 版仅 23KB
+                                  // （原 1254px PNG 297KB 会打进所有平台安装包）。
+                                  Image.asset(
+                                    'assets/images/app_icon.webp',
+                                    width: 16,
+                                    height: 16,
+                                    cacheWidth: 64,
                                   ),
                                   const SizedBox(width: 8),
                                   Expanded(
@@ -127,16 +95,8 @@ class _WindowsWindowFrameState extends State<WindowsWindowFrame>
                             ),
                           ),
                         ),
-                        _button('minimize', '最小化', 0, colors),
-                        _button(
-                          'toggleMaximize',
-                          _fullscreen
-                              ? '退出全屏'
-                              : (_maximized ? '还原' : '最大化'),
-                          _maximized || _fullscreen ? 2 : 1,
-                          colors,
-                        ),
-                        _button('closeWindow', '关闭', 3, colors),
+                        // 三键与播放页顶栏共用同一组件（视觉、命中区、全屏语义一致）。
+                        const WindowsCaptionButtonRow(),
                       ],
                     ),
                   ),
@@ -155,143 +115,4 @@ class _WindowsWindowFrameState extends State<WindowsWindowFrame>
       ),
     );
   }
-
-  Widget _button(String method, String label, int glyph, ColorScheme colors) {
-    // 窗口系统按钮使用 Windows 平直命中区域，不用圆角 M3E 按钮。
-    return _CaptionButton(
-      key: ValueKey('windows_$method'),
-      label: label,
-      glyph: glyph,
-      colors: colors,
-      onPressed: () => _invoke(method),
-    );
-  }
-}
-
-class _CaptionButton extends StatefulWidget {
-  const _CaptionButton({
-    super.key,
-    required this.label,
-    required this.glyph,
-    required this.colors,
-    required this.onPressed,
-  });
-  final String label;
-  final int glyph;
-  final ColorScheme colors;
-  final VoidCallback onPressed;
-
-  @override
-  State<_CaptionButton> createState() => _CaptionButtonState();
-}
-
-class _CaptionButtonState extends State<_CaptionButton> {
-  bool _hovered = false;
-  bool _focused = false;
-  bool _pressed = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final active = _hovered || _focused || _pressed;
-    final tone = widget.glyph == 3
-        ? widget.colors.error
-        : widget.colors.onSurface;
-    return Tooltip(
-      message: widget.label,
-      excludeFromSemantics: true,
-      child: SizedBox(
-        width: 46,
-        height: 32,
-        child: MouseRegion(
-          onEnter: (_) => setState(() => _hovered = true),
-          onExit: (_) => setState(() => _hovered = false),
-          child: FocusableActionDetector(
-            mouseCursor: SystemMouseCursors.basic,
-            onShowFocusHighlight: (value) => setState(() => _focused = value),
-            shortcuts: const {
-              SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
-              SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
-            },
-            actions: {
-              ActivateIntent: CallbackAction<ActivateIntent>(
-                onInvoke: (_) {
-                  widget.onPressed();
-                  return null;
-                },
-              ),
-            },
-            child: Semantics(
-              button: true,
-              label: widget.label,
-              onTap: widget.onPressed,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                excludeFromSemantics: true,
-                onTap: widget.onPressed,
-                onTapDown: (_) => setState(() => _pressed = true),
-                onTapUp: (_) => setState(() => _pressed = false),
-                onTapCancel: () => setState(() => _pressed = false),
-                // 不把反馈绘制到共用 Material 墨水层，避免透明/缩放下越界。
-                child: RepaintBoundary(
-                  child: ClipRect(
-                    child: ColoredBox(
-                      color: tone.withValues(
-                        alpha: active ? (_pressed ? .18 : .12) : 0,
-                      ),
-                      child: Center(
-                        child: CustomPaint(
-                          size: const Size(12, 12),
-                          painter: _CaptionGlyph(
-                            widget.glyph,
-                            widget.colors.onSurface,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _CaptionGlyph extends CustomPainter {
-  const _CaptionGlyph(this.glyph, this.color);
-  final int glyph;
-  final Color color;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final pen = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
-    if (glyph == 0) {
-      canvas.drawLine(const Offset(1, 6), const Offset(11, 6), pen);
-    } else if (glyph == 1) {
-      canvas.drawRect(const Rect.fromLTWH(1, 1, 10, 10), pen);
-    } else if (glyph == 2) {
-      canvas.drawPath(
-        Path()
-          ..moveTo(3, 3)
-          ..lineTo(3, 1)
-          ..lineTo(11, 1)
-          ..lineTo(11, 9)
-          ..lineTo(9, 9),
-        pen,
-      );
-      canvas.drawRect(const Rect.fromLTWH(1, 3, 8, 8), pen);
-    } else {
-      canvas.drawLine(const Offset(1, 1), const Offset(11, 11), pen);
-      canvas.drawLine(const Offset(11, 1), const Offset(1, 11), pen);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _CaptionGlyph oldDelegate) =>
-      oldDelegate.glyph != glyph || oldDelegate.color != color;
 }

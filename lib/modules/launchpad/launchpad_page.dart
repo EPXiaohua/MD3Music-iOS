@@ -6,6 +6,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/build_flags.dart';
+import '../../core/layout/page_layout.dart';
 import '../../providers/tab_config_provider.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../settings/home_tab_manager.dart';
@@ -125,19 +126,22 @@ class _LaunchPadPageState extends State<LaunchPadPage> {
           ),
         ],
       ),
-      body: CustomScrollView(
-        slivers: [
-          // 未固定在前，已固定分区置底
-          if (unpinned.isNotEmpty) ...[
-            _buildSectionHeader('未固定', unpinned.length),
-            _buildGrid(tabConfig, unpinned, columns),
+      // 大屏自适应限宽：与其它页面同走 ContentWidth（92% 居中），避免占满整窗
+      body: ContentWidth(
+        child: CustomScrollView(
+          slivers: [
+            // 未固定在前，已固定分区置底
+            if (unpinned.isNotEmpty) ...[
+              _buildSectionHeader('未固定', unpinned.length),
+              _buildGrid(tabConfig, unpinned, columns),
+            ],
+            if (pinned.isNotEmpty) ...[
+              _buildSectionHeader('已固定', pinned.length),
+              _buildGrid(tabConfig, pinned, columns),
+            ],
+            const SliverToBoxAdapter(child: SizedBox(height: 88)),
           ],
-          if (pinned.isNotEmpty) ...[
-            _buildSectionHeader('已固定', pinned.length),
-            _buildGrid(tabConfig, pinned, columns),
-          ],
-          const SliverToBoxAdapter(child: SizedBox(height: 88)),
-        ],
+        ),
       ),
     );
   }
@@ -280,7 +284,10 @@ class _LaunchPadCard extends StatelessWidget {
     final content = ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: Material(
-        color: cs.surfaceContainerLow,
+        // 壁纸模式：60% 透明（40% 不透明），普通背景保持原有纯色。
+        color: Theme.of(context).scaffoldBackgroundColor == Colors.transparent
+            ? cs.surfaceContainerLow.withValues(alpha: 0.4)
+            : cs.surfaceContainerLow,
         child: InkWell(
           onTap: hidden ? null : onTap,
           child: Column(

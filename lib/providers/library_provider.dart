@@ -2,10 +2,7 @@ import 'dart:async' show unawaited;
 import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
 
-import '../core/platform_capabilities.dart';
 import '../core/services/folder_picker_service.dart';
 import '../core/services/local_artwork_cache.dart';
 import '../core/utils/permissions.dart';
@@ -30,6 +27,7 @@ class LibraryProvider extends ChangeNotifier {
   List<Song> _songs = [];
   List<Song> _indexedSongs = [];
   bool _filterShortAudio = false;
+  bool _scanOnlySelectedFolders = false;
   List<Album> _albums = [];
   List<Artist> _artists = [];
   List<MusicFolder> _folders = [];
@@ -56,16 +54,26 @@ class LibraryProvider extends ChangeNotifier {
   String get searchQuery => _searchQuery;
   bool get hasMusic => _songs.isNotEmpty;
   bool get filterShortAudio => _filterShortAudio;
+  bool get scanOnlySelectedFolders => _scanOnlySelectedFolders;
 
   void _rebuildCategories() {
     _songs = _repository.filterSongs(
       _indexedSongs,
       excludedFolders: _excludedFolders,
       filterShortAudio: _filterShortAudio,
+      includedFolders: _scanOnlySelectedFolders ? _scanFolders : null,
     );
     _albums = _repository.buildAlbums(_songs);
     _artists = _repository.buildArtists(_songs);
     _folders = _repository.buildFolders(_songs);
+  }
+
+  Future<void> setScanOnlySelectedFolders(bool enabled) async {
+    await _repository.setScanOnlySelectedFolders(enabled);
+    _scanOnlySelectedFolders = enabled;
+    _scanFolders = await _repository.getSavedFolders();
+    _rebuildCategories();
+    notifyListeners();
   }
 
   Future<void> setFilterShortAudio(bool enabled) async {
@@ -141,10 +149,12 @@ class LibraryProvider extends ChangeNotifier {
     final folders = await _repository.getSavedFolders();
     final excluded = await _repository.getExcludedFolders();
     final filterShortAudio = await _repository.getFilterShortAudio();
+    final scanOnlySelectedFolders = await _repository.getScanOnlySelectedFolders();
     if (Platform.isWindows && generation != _settingsLoadGeneration) return;
     _scanFolders = folders;
     _excludedFolders = excluded;
     _filterShortAudio = filterShortAudio;
+    _scanOnlySelectedFolders = scanOnlySelectedFolders;
     _rebuildCategories();
     notifyListeners();
   }
@@ -171,11 +181,13 @@ class LibraryProvider extends ChangeNotifier {
     final folders = await _repository.getSavedFolders();
     final excluded = await _repository.getExcludedFolders();
     final filterShortAudio = await _repository.getFilterShortAudio();
+    final scanOnlySelectedFolders = await _repository.getScanOnlySelectedFolders();
     if (Platform.isWindows && generation != _settingsLoadGeneration) return;
     _indexedSongs = cached;
     _scanFolders = folders;
     _excludedFolders = excluded;
     _filterShortAudio = filterShortAudio;
+    _scanOnlySelectedFolders = scanOnlySelectedFolders;
     _rebuildCategories();
     notifyListeners();
     _log('[LibraryProvider] 已恢复 ${cached.length} 首缓存歌曲');
@@ -201,30 +213,26 @@ class LibraryProvider extends ChangeNotifier {
       _scanFolders = await _repository.getSavedFolders();
       _excludedFolders = await _repository.getExcludedFolders();
       _filterShortAudio = await _repository.getFilterShortAudio();
-
-      // 请求存储权限（iOS：应用 Documents 沙箱内无需权限，授权目录由
-      // 安全作用域书签授予访问权，同样不触发系统权限弹窗）
-      if (!isIOSPlatform) {
-        // 请求系统媒体库权限
-        final hasPermission = await requestStoragePermission();
-        if (!hasPermission &&
-            !_scanFolders.any(FolderPickerService.isTreeUri)) {
-          _error = '需要存储权限才能扫描本地音乐';
-          return;
-        }
+      _scanOnlySelectedFolders = await _repository.getScanOnlySelectedFolders();
+      if (_scanOnlySelectedFolders && _scanFolders.isEmpty) {
+        _error = '请先添加要扫描的文件夹';
+        return;
       }
 
-      // iOS 扫描源 = 应用 Documents（文件 App 可见，用户可直接投递音频）
-      // + 已授权文件夹（安全作用域书签，原位扫描原位播放，不拷贝）。
-      // Android 目录天然不存在返回空，行为无害
-      final scanDirs = isIOSPlatform
-          ? [await _documentsDirectory(), ...await _resolveAuthorizedFolders()]
-          : _scanFolders;
+      // 请求系统媒体库权限
+      final onlySaf = _scanOnlySelectedFolders &&
+          _scanFolders.every(FolderPickerService.isTreeUri);
+      final hasPermission = onlySaf || await requestStoragePermission();
+      if (!hasPermission && !_scanFolders.any(FolderPickerService.isTreeUri)) {
+        _error = '需要存储权限才能扫描本地音乐';
+        return;
+      }
 
       // 扫描（传入排除文件夹）
       final songs = await _repository.scanSongs(
-        customFolders: scanDirs,
+        customFolders: _scanFolders,
         excludedFolders: _excludedFolders,
+        scanOnlySelectedFolders: _scanOnlySelectedFolders,
       );
 
       // 清除封面缓存（重新扫描后旧缓存失效）
@@ -259,20 +267,15 @@ class LibraryProvider extends ChangeNotifier {
 
   /// 通过文件夹选择器添加扫描目录。
   ///
-  /// 与安卓同一套「扫描文件夹」UI，仅底层不同：iOS 走文件夹授权
-  /// （Files 选择器 + 安全作用域书签，添加后自动重扫），安卓走 SAF
-  /// （持久化 URI 权限，手动点扫描生效）。
-  Future<bool> addScanFolder() async {
-    if (isIOSPlatform) {
-      final path = await authorizeMusicFolder();
-      return path != null;
-    }
-    final path = await FolderPickerService.pickFolder();
-    if (path == null) return false;
+  /// [path] 由调用方预先取得（TV 内置目录选择器等）；为空时走系统选择器。
+  Future<bool> addScanFolder({String? path}) async {
+    final resolved = path ?? await FolderPickerService.pickFolder();
+    if (resolved == null) return false;
 
-    await _repository.addFolder(path);
+    await _repository.addFolder(resolved);
     _scanFolders = await _repository.getSavedFolders();
     _excludedFolders = await _repository.getExcludedFolders();
+    _rebuildCategories();
     notifyListeners();
     return true;
   }
@@ -280,74 +283,19 @@ class LibraryProvider extends ChangeNotifier {
   /// 移除扫描目录。
   Future<void> removeScanFolder(String path) async {
     await _repository.removeFolder(path);
-    // iOS：同步清除原生的安全作用域书签，结束对该目录的授权访问
-    if (isIOSPlatform) {
-      try {
-        const channel = MethodChannel('com.md3music.md3music/audio_import');
-        await channel.invokeMethod<void>('removeMusicFolder', {'path': path});
-      } catch (e) {
-        _log('[LibraryProvider] remove native bookmark failed: $e');
-      }
-    }
     _scanFolders = await _repository.getSavedFolders();
+    _rebuildCategories();
     notifyListeners();
-  }
-
-  /// iOS 音乐扫描根目录：应用 Documents（文件 App 可见，用户可直接投递）。
-  Future<String> _documentsDirectory() async {
-    final docs = await getApplicationDocumentsDirectory();
-    return docs.path;
-  }
-
-  /// iOS：恢复已授权文件夹的访问（原生解析安全作用域书签并保持激活）。
-  /// 返回当前可访问的授权目录路径列表。
-  Future<List<String>> _resolveAuthorizedFolders() async {
-    try {
-      const channel = MethodChannel('com.md3music.md3music/audio_import');
-      final paths = await channel.invokeMethod<List<dynamic>>(
-        'resolveMusicFolders',
-      );
-      return paths?.cast<String>() ?? const [];
-    } catch (e) {
-      _log('[LibraryProvider] resolve authorized folders failed: $e');
-      return const [];
-    }
-  }
-
-  /// iOS：授权音乐文件夹（Files 文件夹选择器 + 安全作用域书签）→ 重扫。
-  ///
-  /// 授权目录原位扫描、原位播放，不再拷贝进沙箱（旧「导入」已移除）。书签
-  /// 持久化在原生侧（UserDefaults），冷启动由 [_resolveAuthorizedFolders]
-  /// 恢复访问。返回授权的路径；null = 用户取消或通道失败。
-  Future<String?> authorizeMusicFolder() async {
-    if (!isIOSPlatform) return null;
-    try {
-      const channel = MethodChannel('com.md3music.md3music/audio_import');
-      final path = await channel.invokeMethod<String>('pickMusicFolder');
-      if (path == null || path.isEmpty) return null;
-      await _repository.addFolder(path);
-      _scanFolders = await _repository.getSavedFolders();
-      notifyListeners();
-      await loadLocalMusic();
-      return path;
-    } catch (e) {
-      // 直出（不经 kDebugMode 过滤）：诊断包需要采集到失败原因
-      debugPrint('[LibraryImport] authorize folder failed: $e');
-      return null;
-    }
   }
 
   /// 通过文件夹选择器添加排除目录。
   ///
-  /// 排除只做路径过滤匹配：iOS 仅取路径（不建授权书签、不激活访问权），
-  /// 安卓走 SAF。
-  Future<bool> addExcludedFolder() async {
-    final path = isIOSPlatform
-        ? await _pickIosFolderPath()
-        : await FolderPickerService.pickFolder();
-    if (path == null) return false;
+  /// [path] 由调用方预先取得（TV 内置目录选择器等）；为空时走系统选择器。
+  Future<bool> addExcludedFolder({String? path}) async {
+    final resolved = path ?? await FolderPickerService.pickFolder();
+    if (resolved == null) return false;
 
-    await _repository.addExcludedFolder(path);
+    await _repository.addExcludedFolder(resolved);
     _excludedFolders = await _repository.getExcludedFolders();
     _indexedSongs = _repository.filterSongs(
       _indexedSongs,
@@ -357,17 +305,6 @@ class LibraryProvider extends ChangeNotifier {
     _rebuildCategories();
     notifyListeners();
     return true;
-  }
-
-  /// iOS：文件夹选择器只取路径（排除目录用，不建授权书签）。
-  Future<String?> _pickIosFolderPath() async {
-    try {
-      const channel = MethodChannel('com.md3music.md3music/audio_import');
-      return await channel.invokeMethod<String>('pickFolderPath');
-    } catch (e) {
-      _log('[LibraryProvider] pick folder path failed: $e');
-      return null;
-    }
   }
 
   /// 移除排除目录。

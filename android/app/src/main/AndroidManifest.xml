@@ -108,6 +108,12 @@
             android:foregroundServiceType="mediaPlayback"
             android:stopWithTask="false"
             android:exported="false" />
+        <!-- 独立任务移除监听：系统划掉任务时直接停止该服务并销毁应用进程。
+             不改动播放服务自身的 stopWithTask，避免影响正常暂停和通知生命周期。 -->
+        <service
+            android:name=".TaskRemovalService"
+            android:stopWithTask="true"
+            android:exported="false" />
         <!-- 线控耳机媒体键接收器：进程被杀死时仍可被 MEDIA_BUTTON 广播拉起，
              通过启动 AudioPlaybackService 完成「唤醒播放」。
              有活跃媒体3会话时按键由媒体3会话回调处理。 -->

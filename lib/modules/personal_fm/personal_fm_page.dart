@@ -22,17 +22,8 @@ import 'personal_fm_page_preferences.dart';
 /// 竖屏 hero 里封面的尺寸上限（按可用宽度收缩前的封顶）。
 const double _kHeroCoverMax = 320.0;
 
-/// 横屏两栏时封面按**视口高度**取的比例与下限。
-///
-/// 两栏后卡片只占左列宽度，封面不再受整页宽度约束；反过来必须受高度约束，否则
-/// 封面沿用竖屏的 320 会把卡片的曲名与动作行顶出屏幕。
-///
-/// 0.36 的来源：卡片横排后的高度 = 内衬 48 + 封面 + 缝 24 + 动作行 64，而 420 高
-/// 的横屏视口扣掉顶栏 56、正文顶衬 12、引导语与其下缝 44、底衬 16 后只剩 ~292
-/// 可给卡片，于是封面的地板上限约 156 ≈ 0.37 × 420。取 0.36 让动作按钮**落在首屏内**
-/// ——这正是把按钮留在卡片里的前提；再高就要靠滚动才摸得到播放键了。
-/// 更矮的横屏（360 一类）由 [_kLandscapeCoverMin] 兜住可辨识度，差额交给整页
-/// `SingleChildScrollView`；即将播放队列跟在左列卡片下方。
+/// 横屏封面按视口高度收缩，保证歌曲信息和操作按钮在紧凑屏幕上可用。
+/// 较矮的窗口交由整页滚动处理。
 const double _kLandscapeCoverHeightFraction = 0.36;
 const double _kLandscapeCoverMin = 120.0;
 
@@ -43,10 +34,6 @@ const double _kLandscapeCoverMin = 120.0;
 /// 曲名与动作按钮压成一条竖不起来的窄缝。
 const double _kLandscapeHeroMinTextWidth = 160.0;
 
-/// 横屏两栏的左右配比：左列卡片内部横排（封面 + 文字 + 动作按钮），右列只放
-/// 推荐选项卡片；即将播放队列放在左列 FM 卡片下方。
-const int _kTwoPaneLeftFlex = 7;
-const int _kTwoPaneRightFlex = 5;
 
 /// 私人 FM 独立页面。
 ///
@@ -506,6 +493,9 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
     final sideGutter = (constraints.maxWidth - ContentWidth.resolveWidth(
         context, constraints.maxWidth)) / 2;
 
+    final wideLandscape = constraints.maxWidth >= 600 &&
+        MediaQuery.orientationOf(context) == Orientation.landscape;
+
     return Scaffold(
       appBar: ScrollAwareAppBar(
         title: '私人 FM',
@@ -524,7 +514,13 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
             AppSpacing.lg,
             AppSpacing.lg + MediaQuery.paddingOf(context).bottom,
           ),
-          child: Column(
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: wideLandscape ? 900 : double.infinity,
+              ),
+              child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
@@ -543,88 +539,43 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
                   currentTrack,
                   sideTracks,
                   isPlaying,
-                  twoPane:
-                      constraints.maxWidth >= 600 &&
-                      MediaQuery.orientationOf(context) ==
-                          Orientation.landscape,
+                  wideLandscape: wideLandscape,
                 ),
               const Gap(AppSpacing.lg),
             ],
+              ),
+            ),
           ),
         ),
       ),
     );
   }
 
-  /// 登录后的推荐主体：竖屏单栏，横屏两栏。
-  ///
-  /// 横屏左列是完整的「正在播」卡片与即将播放，右列是推荐选项卡片；
-  /// 两列顶部对齐，队列与 FM 卡片等宽。竖屏仍按 FM → 推荐选项 → 队列排列。
-  ///
-  /// **动作按钮留在卡片里**（[wide] 横排，而不是把它们搬去右列）：红心 / 不喜欢 /
-  /// 播放控制的就是左列那首歌，和歌名封面同属一个语义块；单独搬走会让卡片变成
-  /// 一张只能看的图，操作和对象分处两栏也要眼睛先做配对。
-  ///
-  /// 横屏且局部可用宽度足够才分栏；窄面板回退单栏，避免按整屏方向硬塞两列。
+  /// 三行依次展示歌曲、推荐设置和队列；横屏歌曲卡片采用紧凑横排。
   Widget _buildRecommendationBody(
     ColorScheme cs,
     TextTheme textTheme,
     KugouSongDetail? currentTrack,
     List<KugouSongDetail> sideTracks,
     bool isPlaying, {
-    required bool twoPane,
+    required bool wideLandscape,
   }) {
-    if (!twoPane) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildTvTransportKeys(
-            currentTrack: currentTrack,
-            isPlaying: isPlaying,
-            child: _buildHeroCard(cs, textTheme, currentTrack, isPlaying),
-          ),
-          const Gap(AppSpacing.lg),
-          _buildControls(cs, textTheme),
-          const Gap(AppSpacing.lg),
-          _buildUpcomingQueue(cs, textTheme, sideTracks),
-        ],
-      );
-    }
-
-    return Row(
+    return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // ── 左列：完整「正在播」卡片（内部横排，动作按钮仍在卡内） ──
-        // tv: 左右键切歌 / OK 播放暂停的包装与竖屏同位——动作按钮仍在卡片内，
-        // 落点就还在这一层（见 [_buildTvTransportKeys]）。
-        Expanded(
-          flex: _kTwoPaneLeftFlex,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildTvTransportKeys(
-                currentTrack: currentTrack,
-                isPlaying: isPlaying,
-                child: _buildHeroCard(
-                  cs,
-                  textTheme,
-                  currentTrack,
-                  isPlaying,
-                  wide: true,
-                ),
-              ),
-              if (sideTracks.isNotEmpty) ...[
-                const Gap(AppSpacing.lg),
-                _buildUpcomingQueue(cs, textTheme, sideTracks),
-              ],
-            ],
+        _buildTvTransportKeys(
+          currentTrack: currentTrack,
+          isPlaying: isPlaying,
+          child: _buildHeroCard(
+            cs, textTheme, currentTrack, isPlaying, wide: wideLandscape,
           ),
         ),
         const Gap(AppSpacing.lg),
-        Expanded(
-          flex: _kTwoPaneRightFlex,
-          child: _buildControls(cs, textTheme),
-        ),
+        _buildControls(cs, textTheme),
+        if (sideTracks.isNotEmpty) ...[
+          const Gap(AppSpacing.lg),
+          _buildUpcomingQueue(cs, textTheme, sideTracks),
+        ],
       ],
     );
   }
@@ -802,7 +753,7 @@ class _PersonalFmPageState extends State<PersonalFmPage> {
 
   /// 「正在播」卡片：封面 + 曲名 + 歌手 + 信息 pills + 动作按钮行。
   ///
-  /// [wide] 为 true（横屏两栏的左列）时卡片**内部**改横排：封面与文字块并排、
+  /// [wide] 为 true（横屏三行布局）时卡片**内部**改横排：封面与文字块并排、
   /// 动作行整宽垫底。竖排的卡片高度 = 封面 + 曲名 + pills + 动作行，横屏视口
   /// 只有 360~420 高，封面稍有规模动作行就被顶出首屏——而动作按钮属于这首歌，
   /// 不能搬去右列。横排把高度从「封面 + 全部文字」压成「封面与文字取大 + 动作行」，

@@ -586,6 +586,40 @@ public final class MediaMetadataCompat implements Parcelable {
    */
   @RequiresApi(21)
   public Object getMediaMetadata() {
+    // ==== MD3Music fork（CarWith·逐键 Builder 绕 Parcel 往返，2026-11）====
+    // 现状路径是 writeToParcel → createFromParcel 往返。实测（v18 系列同一根因链）：
+    // 往返会把 400x400 封面压成 1x1 —— framework MediaMetadata 的 Parcel 读回对大
+    // bitmap 做降采样保护，CarWith 主机拿到的就是糊掉的 1x1。连着车机时改为逐键
+    // 拷贝进 MediaMetadata.Builder（对象直接进 bundle，不经压缩）；断开时保持
+    // 现有 Parcel 路径逐字节不变（vivo 原子随身听依赖其 1x1 剥离的既有语义链）。
+    if (com.ryanheise.just_audio.AudioPlayer.sCarWithConnected) {
+      try {
+        android.media.MediaMetadata.Builder fwkBuilder = new android.media.MediaMetadata.Builder();
+        for (String key : mBundle.keySet()) {
+          Object value = mBundle.get(key);
+          if (value == null) {
+            continue;
+          }
+          if (value instanceof Bitmap) {
+            fwkBuilder.putBitmap(key, (Bitmap) value);
+          } else if (value instanceof CharSequence) {
+            fwkBuilder.putText(key, (CharSequence) value);
+          } else if (value instanceof android.media.Rating) {
+            fwkBuilder.putRating(key, (android.media.Rating) value);
+          } else if (value instanceof Long) {
+            fwkBuilder.putLong(key, (Long) value);
+          }
+        }
+        // 不写 mMetadataFwk 缓存：缓存属于「本次转换时连接态」的产物，跨连接态复用
+        // 会让断开后仍返回连着时构建的那份（每次 metadata 更新都是新建的 compat
+        // 实例，正常路径下缓存本不会跨态；这里不缓存是最省心的口径）。
+        return fwkBuilder.build();
+      } catch (Throwable t) {
+        // 逐键拷贝失败（极端类型不匹配等）回退下面的既有 Parcel 路径：宁可得 1x1
+        // 封面，也不能让整次 metadata 下发抛异常中断（车机侧什么都收不到）。
+        android.util.Log.w("MediaMetadata", "carwith per-key build failed, fall back", t);
+      }
+    }
     if (mMetadataFwk == null) {
       Parcel p = Parcel.obtain();
       try {

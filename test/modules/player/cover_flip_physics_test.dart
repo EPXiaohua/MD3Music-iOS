@@ -87,8 +87,7 @@ void main() {
     });
 
     test('峰值在交接点两侧逼近（旧层 t→0.5⁻、新层 t→0.5⁺）', () {
-      // easeIn/easeOut 是渐近曲线，峰值只在 t→0.5 极限处达到
-      // （coverFlipOldBlur(0.49)=24×easeIn(0.98)≈23.20，实测值）。
+      // easeIn/easeOut 是渐近曲线，峰值只在 t→0.5 极限处达到。
       // 钉「逼近且不超过峰值」而非「等于峰值」。
       expect(coverFlipOldBlur(0.49), greaterThan(kCoverFlipBlurSigma * 0.95));
       expect(coverFlipNewBlur(0.51), greaterThan(kCoverFlipBlurSigma * 0.95));
@@ -106,6 +105,71 @@ void main() {
         final t = i / 50;
         expect(coverFlipOldBlur(t), greaterThanOrEqualTo(0));
         expect(coverFlipNewBlur(t), greaterThanOrEqualTo(0));
+      }
+    });
+  });
+
+  group('快照叠层 alpha', () {
+    test('端点：sigma 0→α 0，峰值→α 1', () {
+      expect(coverFlipBlurAlpha(0), 0);
+      expect(coverFlipBlurAlpha(kCoverFlipBlurEpsilon / 2), 0);
+      expect(coverFlipBlurAlpha(kCoverFlipBlurSigma), closeTo(1.0, 1e-9));
+    });
+
+    test('√ 曲线：中段快于线性（清晰残影更早被吞掉），但单调', () {
+      final half = kCoverFlipBlurSigma / 2;
+      // α(σmax/2)=√0.5≈0.707 > 0.5：观感「变化剧烈」的来源。
+      expect(coverFlipBlurAlpha(half), greaterThan(0.5));
+      expect(coverFlipBlurAlpha(half), closeTo(0.7071, 1e-3));
+      double prev = -1;
+      for (var i = 0; i <= 100; i++) {
+        final a = coverFlipBlurAlpha(i * 0.4);
+        expect(a, greaterThanOrEqualTo(prev));
+        expect(a, lessThanOrEqualTo(1.0));
+        prev = a;
+      }
+    });
+  });
+
+  group('量化阶梯', () {
+    test('≤epsilon 归零（不挂滤镜）', () {
+      expect(coverFlipQuantizeSigma(0), 0);
+      expect(coverFlipQuantizeSigma(kCoverFlipBlurEpsilon), 0);
+      expect(coverFlipQuantizeSigma(-1), 0);
+    });
+
+    test('取不小于它的最近档，且单调不减', () {
+      // 阶梯 = [8, 17, 26, 34]（σmax=34 的四等分）。
+      expect(coverFlipQuantizeSigma(0.5), 8);
+      expect(coverFlipQuantizeSigma(8), 8);
+      expect(coverFlipQuantizeSigma(8.1), 17);
+      expect(coverFlipQuantizeSigma(17), 17);
+      expect(coverFlipQuantizeSigma(17.5), 26);
+      expect(coverFlipQuantizeSigma(26), 26);
+      expect(coverFlipQuantizeSigma(26.5), 34);
+      expect(coverFlipQuantizeSigma(34), 34);
+      double prev = -1;
+      for (var i = 1; i <= 100; i++) {
+        final q = coverFlipQuantizeSigma(i * 0.3);
+        expect(q, greaterThanOrEqualTo(prev));
+        prev = q;
+      }
+    });
+
+    test('超峰值钳到峰值、唯一取值不超过阶梯大小', () {
+      expect(coverFlipQuantizeSigma(100), kCoverFlipBlurSigma);
+      final values = <double>{};
+      for (var i = 0; i <= 50; i++) {
+        // 旧层前半程的连续 sigma 全部量化后，取值集合就是阶梯
+        values.add(coverFlipQuantizeSigma(coverFlipOldBlur(i / 100)));
+      }
+      expect(values.length, lessThanOrEqualTo(kCoverFlipBlurLadder.length + 1));
+      for (final v in values) {
+        expect(
+          v == 0 || kCoverFlipBlurLadder.contains(v),
+          isTrue,
+          reason: '量化值必须落在阶梯上（$v）',
+        );
       }
     });
   });

@@ -95,6 +95,40 @@ import java.util.concurrent.atomic.AtomicReference;
   }
 
   /**
+   * MD3Music fork v67：legacy browse 搜索（车机/第三方桥接按关键词取候选列表）。
+   *
+   * <p>默认实现（基类 {@code MediaBrowserServiceCompat.onSearch}）会置
+   * {@code RESULT_FLAG_ON_SEARCH_NOT_IMPLEMENTED} 并 sendResult(null)，客户端拿到的是
+   * 错误而不是「0 条结果」。这里转给 App 注入的 SearchProvider。
+   *
+   * <p>两个必须遵守的约定（见 {@code performSearch}）：
+   *
+   * <ul>
+   *   <li>提供方必须在返回前 {@code detach()} 或 {@code sendResult()}，否则基类同步抛
+   *       IllegalStateException；
+   *   <li>空结果必须回 {@code emptyList()}，回 {@code null} 会被转成 RESULT_ERROR。
+   * </ul>
+   *
+   * <p>提供方缺席或抛错时兜底回空列表：宁可让客户端看到「0 条结果」，也不要让它看到
+   * 「搜索未实现」——后者会促使桥接端关闭搜索入口。
+   */
+  @Override
+  public void onSearch(
+      @Nullable String query, @Nullable Bundle extras, Result<List<MediaItem>> result) {
+    MediaSessionService.SearchProvider provider = MediaSessionService.searchProvider;
+    if (provider != null) {
+      try {
+        if (provider.onSearch(query, extras, result)) {
+          return;
+        }
+      } catch (Throwable t) {
+        Log.w(TAG, "search provider failed", t);
+      }
+    }
+    result.sendResult(Collections.<MediaItem>emptyList());
+  }
+
+  /**
    * MD3Music fork v39：带分页参数的子节点查询。
    *
    * <p>原生默认实现（见基类注释）会把 options 丢掉、只回调两参版本——vivo 原子随身听

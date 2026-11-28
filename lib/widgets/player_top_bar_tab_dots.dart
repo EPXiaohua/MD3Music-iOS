@@ -24,6 +24,13 @@ import 'player_tab_strip.dart';
 /// 初值与 `SettingsRepository.getTopBarTabDots()` 的默认值保持一致。
 final ValueNotifier<bool> kTopBarTabDotsEnabled = ValueNotifier<bool>(false);
 
+/// 顶栏中段拖动区的高度（= 收起键 / 窗口三键的命中区高度）。
+///
+/// 顶栏在 `Column` 里拿到的是 unconstrained 纵向约束，拖动区与三键都必须
+/// 用固定高度，不能 `SizedBox.expand`（会撑成 Infinity）。播放页顶栏在
+/// Windows 上纵向内衬为 0，因此这个高度同时也是按钮贴住窗口上沿的保证。
+const double kPlayerTopBarDragZoneHeight = 48.0;
+
 /// 顶栏中段该放什么：宽屏、以及「顶栏页签圆点」关闭时都是空 Spacer。
 ///
 /// 两版宿主此前各写一遍这段判断（`!wide && kTopBarTabDotsEnabled.value`），
@@ -32,14 +39,40 @@ final ValueNotifier<bool> kTopBarTabDotsEnabled = ValueNotifier<bool>(false);
 /// [strip] 走懒构造：不显示圆点时连 `PlayerTabStrip` 对象都不必造。
 /// 返回值可能是 `Expanded` 或 `Spacer`，两者都必须作为顶栏 `Row` 的**直接子项**
 /// 出现（ParentData 组件不能隔着别的 RenderObjectWidget）。
+///
+/// [onWindowDrag] 仅 Windows 桌面传：把「窗口拖动」限定在中段空白区，而不是裹住
+/// 整条顶栏 —— 否则从收起键 / 尾部胶囊 / 窗口三键上起手的按压会被原生
+/// `HTCAPTION` 拖动抢走（最大化时尤其明显：拖动会把窗口还原，按钮却收不到点击）。
 Widget playerTopBarTabMiddle({
   required bool wide,
   required int segmentCount,
   required Widget Function() strip,
+  GestureDragStartCallback? onWindowDrag,
 }) {
-  if (wide || !kTopBarTabDotsEnabled.value) return const Spacer();
+  final useSpacer = wide || !kTopBarTabDotsEnabled.value;
+  if (useSpacer) {
+    if (onWindowDrag == null) return const Spacer();
+    // 空拖动区必须 opaque：SizedBox 本身不进命中路径，默认行为会丢手势。
+    //
+    // **高度必须给定值**，不能用 `SizedBox.expand`：顶栏在 Column 里拿到的
+    // 纵向约束是 unconstrained（0..∞），expand 会撑成 Infinity，整页布局报
+    // 「infinite size」并停摆。48 与同一行的 IconButton / 窗口三键一致。
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onPanStart: onWindowDrag,
+        child: const SizedBox(height: kPlayerTopBarDragZoneHeight),
+      ),
+    );
+  }
+  final dots = PlayerTopBarTabDots(segmentCount: segmentCount, strip: strip());
+  if (onWindowDrag == null) return Expanded(child: dots);
   return Expanded(
-    child: PlayerTopBarTabDots(segmentCount: segmentCount, strip: strip()),
+    child: GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onPanStart: onWindowDrag,
+      child: dots,
+    ),
   );
 }
 

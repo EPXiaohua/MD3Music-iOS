@@ -168,6 +168,120 @@ Uint8List normalizeGain(Uint8List input, int currentMaxAmplitude,
   return output;
 }
 
+// ===================== WAV 头 / 多声道处理（Windows 采集） =====================
+
+/// WAV（RIFF/WAVE）`fmt ` 块里的关键参数。
+class WavFormatInfo {
+  const WavFormatInfo({required this.sampleRate, required this.channels});
+
+  final int sampleRate;
+  final int channels;
+}
+
+/// 解析 WAV 头的 `fmt ` 块，读出真实采样率与声道数。
+///
+/// **为什么必须读头而不是用请求值**：Windows MediaFoundation 采集不做重采样，
+/// `SetCurrentMediaType` 只接受设备原生格式；页面按候选表逐个试，
+/// 真正生效的那组参数只有落盘 WAV 头能确认。读不到就返回 null，调用方按
+/// 纯 PCM（请求值）处理。
+WavFormatInfo? parseWavInfo(Uint8List bytes) {
+  if (bytes.length < 12) return null;
+  // 'RIFF'
+  if (bytes[0] != 0x52 ||
+      bytes[1] != 0x49 ||
+      bytes[2] != 0x46 ||
+      bytes[3] != 0x46) {
+    return null;
+  }
+  // 'WAVE'
+  if (bytes[8] != 0x57 ||
+      bytes[9] != 0x41 ||
+      bytes[10] != 0x56 ||
+      bytes[11] != 0x45) {
+    return null;
+  }
+  var offset = 12;
+  while (offset + 8 <= bytes.length) {
+    final chunkId = String.fromCharCodes(bytes, offset, offset + 4);
+    final size = bytes[offset + 4] |
+        (bytes[offset + 5] << 8) |
+        (bytes[offset + 6] << 16) |
+        (bytes[offset + 7] << 24);
+    if (size < 0) return null;
+    final bodyStart = offset + 8;
+    if (chunkId == 'fmt ' && bodyStart + 16 <= bytes.length) {
+      final channels = bytes[bodyStart + 2] | (bytes[bodyStart + 3] << 8);
+      final sampleRate = bytes[bodyStart + 4] |
+          (bytes[bodyStart + 5] << 8) |
+          (bytes[bodyStart + 6] << 16) |
+          (bytes[bodyStart + 7] << 24);
+      if (channels <= 0 || sampleRate <= 0) return null;
+      return WavFormatInfo(sampleRate: sampleRate, channels: channels);
+    }
+    // chunk 按 2 字节对齐（WAV 规范）
+    offset = bodyStart + size + (size & 1);
+  }
+  return null;
+}
+
+/// 多声道 PCM16 → 单声道（各声道取算术平均）。
+///
+/// 本地 Rust 前处理只取首通道采样（`pcm.rs::parse_wav`），立体声麦克风会丢掉
+/// 一半内容且平均响度偏低；Dart 兜底链路同理需要先下混。
+Uint8List downmixToMono(Uint8List pcm, int channels) {
+  if (channels <= 1) return pcm;
+  final frameBytes = 2 * channels;
+  final frames = pcm.length ~/ frameBytes;
+  final output = Uint8List(frames * 2);
+  for (var frame = 0; frame < frames; frame++) {
+    var sum = 0;
+    for (var channel = 0; channel < channels; channel++) {
+      final index = frame * frameBytes + channel * 2;
+      sum += (pcm[index] | (pcm[index + 1] << 8)).toSigned(16);
+    }
+    final average = (sum / channels).round().clamp(-32768, 32767).toInt();
+    output[frame * 2] = average & 0xFF;
+    output[frame * 2 + 1] = (average >> 8) & 0xFF;
+  }
+  return output;
+}
+
+/// Windows 采集格式候选表（采样率 / 声道数）。
+///
+/// MediaFoundation 只接受设备原生格式，`record_windows` 不做重采样，
+/// 因此按「Windows 麦克风最常见的原生格式」从高到低试，首个成功即用。
+const List<({int sampleRate, int channels})> kWindowsCaptureFormats = [
+  (sampleRate: 48000, channels: 1),
+  (sampleRate: 48000, channels: 2),
+  (sampleRate: 44100, channels: 1),
+  (sampleRate: 44100, channels: 2),
+  (sampleRate: 16000, channels: 1),
+];
+
+/// 把录音启动异常翻成用户能照做的中文指引。
+///
+/// Windows 上两类高频失败：
+/// - `0x80070005`（E_ACCESSDENIED）：系统隐私设置禁止桌面应用访问麦克风；
+/// - `0xC00D36FA` / `0xC00D36E6`：设备被独占、已拔出或 MediaFoundation 未就绪。
+String describeRecordingStartError(Object? error, {required bool windows}) {
+  final text = error?.toString() ?? '';
+  final lower = text.toLowerCase();
+  final denied = lower.contains('0x80070005') ||
+      lower.contains('access is denied') ||
+      lower.contains('access denied');
+  if (denied) {
+    return '麦克风被系统禁止访问：设置 → 隐私和安全性 → 麦克风，打开「允许桌面应用访问麦克风」后重试';
+  }
+  final unavailable = lower.contains('0xc00d36fa') ||
+      lower.contains('0xc00d36e6') ||
+      lower.contains('0xc00d36b4');
+  if (unavailable) {
+    return '麦克风不可用（被其他程序占用或已拔出），请释放设备后重试';
+  }
+  if (!windows) return '录音启动失败: $text';
+  return '录音启动失败: $text';
+}
+
 // ===================== 识别结果解析 =====================
 
 /// 从识别响应中判断是否包含有效歌曲数据。

@@ -87,11 +87,15 @@ class KrcParser {
             final stripped = line.replaceAll(_wordTagRegex, '').trim();
             if (stripped.isNotEmpty) {
               final lastLine = lines.last;
-              lines[lines.length - 1] = LyricLine(
-                startTime: lastLine.startTime,
-                duration: lastLine.duration,
+              // text 与 words 必须同源：只拼 text 不补 words 时，换行计划按
+              // words 计算、绘制也只覆盖 words 的部分，真机上表现为该行只
+              // 显示前半句（居中/对唱时更明显）。
+              final extraWords = _parseWords(line, lastLine.startTime);
+              lines[lines.length - 1] = lastLine.copyWith(
                 text: '${lastLine.text}$stripped',
-                words: lastLine.words,
+                words: extraWords.isEmpty
+                    ? lastLine.words
+                    : <LyricWord>[...lastLine.words, ...extraWords],
               );
             }
           }

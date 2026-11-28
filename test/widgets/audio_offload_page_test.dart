@@ -137,7 +137,7 @@ void main() {
   String? decoderProbeError;
   bool decoderAllSoftware = false;
 
-  setUp(() {
+  setUp(() async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
     probeCalls = 0;
     decoderProbeCalls = 0;
@@ -171,6 +171,8 @@ void main() {
       }
       return null;
     });
+    await AudioOffloadService.instance.setSwipeExitEnabled(false);
+    await AudioOffloadService.instance.refresh();
   });
 
   tearDown(() {
@@ -414,9 +416,10 @@ void main() {
     await unmount(tester);
   });
 
-  testWidgets('点击重新探测会同时重跑解码器枚举与 offload 协商',
+  testWidgets('开启硬解后点击重新探测会同时重跑两个数据源',
       (WidgetTester tester) async {
     await AudioOffloadService.instance.reloadAllCapabilities();
+    await AudioOffloadService.instance.setEnabled(true);
     await mount(tester);
 
     final int beforeOffload = probeCalls;
@@ -432,6 +435,7 @@ void main() {
     expect(find.text('重新探测'), findsOneWidget);
 
     await unmount(tester);
+    await AudioOffloadService.instance.setEnabled(false);
   });
 
   testWidgets('开关关闭时状态卡显示软解', (WidgetTester tester) async {
@@ -441,6 +445,10 @@ void main() {
     final SwitchListTile tile =
         tester.widget<SwitchListTile>(find.byType(SwitchListTile));
     expect(tile.value, isFalse);
+    final probeButton = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, '重新探测'),
+    );
+    expect(probeButton.onPressed, isNull);
     expect(find.text('已关（软解）'), findsOneWidget);
 
     await unmount(tester);

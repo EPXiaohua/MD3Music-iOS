@@ -835,6 +835,309 @@ void main() {
     });
   });
 
+  // 回归：「隐藏歌词作者信息」开启后开头没有间奏点。
+  //
+  // 根因：开头制作名单行（`[00:02]作词：…`）被 LyricCreditFilter 整块移除后，
+  // 原本充当 gap 锚点的行不复存在，首行起点直接落到 intro 之后（如 12s），
+  // 而间奏检测只比较「相邻行」的间隔 → 开头这段空档没有锚点，节奏点消失。
+  //
+  // 修复：视图侧补「首行之前」的头部间奏槽位，窗口 [0, 首行起点 - 250)，
+  // 占位落在首行之前（圆点在首行上方，首行保持居中并向其顶边收起）。
+  group('AppleLyricsView 间奏点：首行之前的头部间奏', () {
+    const step = Duration(milliseconds: 16);
+
+    Future<void> pumpFrames(WidgetTester tester, int n) async {
+      for (int i = 0; i < n; i++) {
+        await tester.pump(step);
+      }
+    }
+
+    Future<void> mount(
+      WidgetTester tester,
+      ValueNotifier<Duration> pos,
+      List<LyricLine> lines,
+    ) async {
+      tester.view.physicalSize = const Size(800, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              height: 600,
+              child: AppleLyricsView(
+                lines: lines,
+                currentTimeMs: 0,
+                positionListenable: pos,
+                isPlaying: true,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('首行起点在 intro 之后（过滤掉名单行）：开头显示间奏点，首行唱到即收起',
+        (tester) async {
+      // 过滤后的行：首行 12000ms（名单行已移除），行 0 → 行 1 间隔另有一处间奏
+      final lines = <LyricLine>[
+        LyricLine(startTime: 12000, duration: 2000, text: 'Line 1'),
+        LyricLine(startTime: 30000, duration: 2000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 2000));
+      addTearDown(pos.dispose);
+      await mount(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      await pumpFrames(tester, 60);
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '首行之前（0 ~ 11750ms）应显示间奏点；'
+              '旧实现只比较相邻行间隔，开头空档无锚点 → 圆点缺失');
+      expect(state.interludeExpandProgressForTest, greaterThan(0.99),
+          reason: '间奏占位应完全展开');
+      expect(state.interludeAnchorIndexForTest, -1,
+          reason: '头部间奏的占位应在首行之前（anchor = -1）：'
+              '圆点出现在第一行上方，而不是被推到第一行下面');
+      expect(state.interludeOffsetBeforeForTest(0), greaterThan(0),
+          reason: '首行必须也让位一个占位高度，否则圆点会画到首行下面'
+              '（普通行间间奏的 anchor 之后才让位，首行偏移为 0）');
+      // 焦点槽位属于间奏占位：首行按「尚未唱到的下行」渲染（暗态 + 模糊），
+      // 否则首行会在圆点下方保持高亮清晰，看起来像"已经开唱"。
+      expect(state.focusLineIndexForTest, -1,
+          reason: '头部间奏期间没有歌词行处于焦点（圆点占据焦点槽位）');
+      expect(state.blurLevelForTest(0), greaterThan(0),
+          reason: '首行必须参与模糊（旧实现把它当作当前行豁免 → 圆点旁的首行不模糊）');
+      // 圆点必须落在「当前行位置」偏好（LyricLayout.alignPosition，测试视口
+      // 800×600 且默认 platform 为 android → 0.35）上，而不是高出半行。
+      final double alignY = 600 * LyricPreferences.instance.alignPosition;
+      final double placeholderH =
+          state.interludePlaceholderHeightForTest as double;
+      final double targetDuringIntro = state.scrollTargetForTest as double;
+      expect(targetDuringIntro + placeholderH / 2, closeTo(alignY, 0.5),
+          reason: '头部间奏期间滚动目标应对准占位行：圆点中心 = 当前行位置'
+              '（旧实现对准首行居中 → 圆点被顶到焦点上方半行以上）');
+
+      // 首行唱到（12000ms）：头部间奏窗口已结束（11750ms），圆点应清除
+      pos.value = const Duration(milliseconds: 12500);
+      await pumpFrames(tester, 80);
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '首行开始演唱后头部间奏不应残留');
+      expect(state.interludeExpandProgressForTest, 0);
+      // 间奏结束后焦点回到首行：它重新作为当前行（清晰 + 豁免模糊）
+      expect(state.focusLineIndexForTest, 0);
+      expect(state.blurLevelForTest(0), 0,
+          reason: '首行成为当前行后不再参与模糊');
+      // 首行接管焦点后位置与间奏期间一致（占位行高 = 单行歌词行高）→ 无跳位
+      expect(state.scrollTargetForTest as double,
+          closeTo(targetDuringIntro, 0.5),
+          reason: '占位收起、首行接管焦点时滚动目标不应跳变');
+    });
+
+    testWidgets('首行起点未超阈值：不产生头部间奏点（不误报）', (tester) async {
+      final lines = <LyricLine>[
+        LyricLine(startTime: 1000, duration: 1000, text: 'Line 1'),
+        LyricLine(startTime: 2000, duration: 1000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 500));
+      addTearDown(pos.dispose);
+      await mount(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      await pumpFrames(tester, 30);
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '首行 1s 起唱、相邻行间隔 0ms，无任何间奏窗口');
+    });
+
+    testWidgets('歌曲中间的间奏点同样对准「当前行位置」（不再偏上）', (tester) async {
+      // 行 0 结束 1000ms、行 1 起始 30000ms → 间奏窗口 [1000, 29750)
+      final lines = <LyricLine>[
+        LyricLine(startTime: 0, duration: 1000, text: 'Line 1'),
+        LyricLine(startTime: 30000, duration: 1000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 2000));
+      addTearDown(pos.dispose);
+      await mount(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      await pumpFrames(tester, 60);
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '前置条件：处于间奏窗口内');
+      final double alignY = 600 * LyricPreferences.instance.alignPosition;
+      final double ph = state.interludePlaceholderHeightForTest as double;
+      final double slotTop = state.interludeSlotTopForTest(0) as double;
+      expect((state.scrollTargetForTest as double) + slotTop + ph / 2,
+          closeTo(alignY, 0.5),
+          reason: '行间间奏的滚动目标也应对准占位行：圆点中心 = 当前行位置'
+              '（旧实现按歌词行居中 → 占位行被顶到焦点上方，圆点偏上）');
+    });
+  });
+
+  // 回归：省电模式（eco）下 AM 歌词节奏点「最后收起」卡顿。
+  //
+  // 根因一（台阶卡顿，用例 1 直接护栏——曾实测该用例在旧的 30fps 累加器下失败）：
+  // 间奏点时钟被「累加帧 dt、满 33ms 才推进一次」降频，而 eco 驱动按名义 16ms
+  // 步进，`16 × 2 = 32ms` 不足 33.3ms 阈值 → 实际每 3 帧才推进一次（20fps）：
+  // 收起 750ms 只剩 15 个缩放台阶，逐帧表现为"冻结-冻结-跳一大步"。
+  //
+  // 根因二（收尾瞬灭）：帧时钟被名义步长拖慢后系统性落后播放时钟，落后超过
+  // 消失段时长（750ms）时 isInExitPhase 仍为 false，旧实现据此判定"用户跳转
+  // 离开"立即 clear → 圆点没有缩小过程直接消失。该分支由
+  // renderers/interlude_dots_test.dart 的 snapToExitPhase 组做确定性护栏
+  // （可直接构造落后量，端到端里落后量受测试驱动步进影响、难以稳定复现）；
+  // 本组用例 2/3 守护端到端语义：自然结束要播完消失动画，seek 离开仍要立即
+  // 清除，两者不得被对方放宽。
+  group('AppleLyricsView 节奏点收起（省电模式卡顿回归）', () {
+    const step = Duration(milliseconds: 16);
+
+    Future<void> pumpFrames(WidgetTester tester, int n) async {
+      for (int i = 0; i < n; i++) {
+        await tester.pump(step);
+      }
+    }
+
+    Future<void> mountEco(
+      WidgetTester tester,
+      ValueNotifier<Duration> pos,
+      List<LyricLine> lines,
+    ) async {
+      SharedPreferences.setMockInitialValues({'lyric_eco_mode': true});
+      await LyricPreferences.instance.setEcoMode(true);
+      addTearDown(() => LyricPreferences.instance.reset());
+      tester.view.physicalSize = const Size(800, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              height: 600,
+              child: AppleLyricsView(
+                lines: lines,
+                currentTimeMs: 0,
+                positionListenable: pos,
+                isPlaying: true,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('eco 锁定态下间奏点时钟逐帧推进（无冻结帧、无大台阶）',
+        (tester) async {
+      // 行 0 结束 1000ms、行 1 起始 11000ms → 间奏窗口 [1000, 10750)，时长 9750ms
+      final lines = <LyricLine>[
+        LyricLine(startTime: 0, duration: 1000, text: 'Line 1'),
+        LyricLine(startTime: 11000, duration: 1000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 5000));
+      addTearDown(pos.dispose);
+      await mountEco(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      // 先推进到占位完全展开：此后 _updateInterlude 只在权威时间变化时运行，
+      // 时钟只由帧 tick 推进，台阶可被干净观测。
+      await pumpFrames(tester, 60);
+      expect(state.ecoDriverIsTimerForTest, isTrue,
+          reason: '前置条件：驱动源必须是 eco 限帧 Timer（名义 16ms 步长）');
+      expect(state.interludeDotsActiveForTest, isTrue);
+      expect(state.interludeExpandProgressForTest, greaterThan(0.99));
+
+      int advancing = 0;
+      double maxDelta = 0;
+      double prev = state.interludeDotsAnimationMsForTest as double;
+      for (int i = 0; i < 9; i++) {
+        await tester.pump(step);
+        final double now = state.interludeDotsAnimationMsForTest as double;
+        final double delta = now - prev;
+        if (delta > 0) advancing++;
+        if (delta > maxDelta) maxDelta = delta;
+        prev = now;
+      }
+      // 旧实现（3 帧一推进）：advancing≈3、maxDelta=48 → 两条断言都失败。
+      expect(
+        advancing,
+        greaterThanOrEqualTo(7),
+        reason: '间奏点时钟应逐帧推进；出现冻结帧即 30fps 降频在 eco 16ms '
+            '步长下退化为 20fps 的台阶卡顿',
+      );
+      expect(maxDelta, lessThan(25.0),
+          reason: '单次推进 $maxDelta ms 过大（冻结后一次性跳一大步）');
+    });
+
+    testWidgets('自然跨过窗口终点：圆点走完消失动画并在占位归零后清除',
+        (tester) async {
+      // 间奏窗口 [1000, 7000) → 时长 6000ms，消失段起点 = 6000-750 = 5250ms。
+      final lines = <LyricLine>[
+        LyricLine(startTime: 0, duration: 1000, text: 'Line 1'),
+        LyricLine(startTime: 7000, duration: 1000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 1000));
+      addTearDown(pos.dispose);
+      await mountEco(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      // 激活间奏后，把权威时间推到窗口后段（>1000ms 滞后 → 触发一次性硬对齐，
+      // 圆点落到消失段内），再以 positionStream 粒度（200ms）连续跨过终点。
+      pos.value = const Duration(milliseconds: 6400);
+      await tester.pump(step);
+      expect(state.interludeDotsActiveForTest, isTrue);
+      expect(state.interludeDotsInExitPhaseForTest, isTrue);
+
+      pos.value = const Duration(milliseconds: 6900);
+      await tester.pump(step);
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '仍在窗口 [1000,7000) 内');
+
+      // 连续推进跨过终点（200ms 步长 = 非 seek）→ 自然结束：不得立即清除
+      pos.value = const Duration(milliseconds: 7100);
+      await tester.pump(step);
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '自然结束应保留消失动画，与占位收起同步播完');
+      expect(
+        state.interludeDotsAnimationMsForTest as double,
+        greaterThanOrEqualTo(5250),
+        reason: '时钟不得后退，也不得被拽回窗口前',
+      );
+
+      // 消失动画走完 + 占位收起归零后圆点才被释放
+      await pumpFrames(tester, 120);
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '占位完全收起后间奏点应清除（不得长期悬空）');
+      expect(state.interludeExpandProgressForTest, 0);
+    });
+
+    testWidgets('seek 大跳离开间奏：仍立即清除（不得被自然结束分支放宽）',
+        (tester) async {
+      final lines = <LyricLine>[
+        LyricLine(startTime: 0, duration: 1000, text: 'Line 1'),
+        LyricLine(startTime: 7000, duration: 1000, text: 'Line 2'),
+      ];
+      final pos = ValueNotifier<Duration>(const Duration(milliseconds: 2000));
+      addTearDown(pos.dispose);
+      await mountEco(tester, pos, lines);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      await pumpFrames(tester, 10);
+      expect(state.interludeDotsActiveForTest, isTrue);
+
+      // 时间一次跳变 >500ms（seek / 点击其他行）离开间奏窗口
+      pos.value = const Duration(milliseconds: 20000);
+      await tester.pump(step);
+
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '跳转离开必须立即清除，否则满尺寸圆点悬浮在已切换的歌词上');
+      await pumpFrames(tester, 80);
+      expect(state.interludeExpandProgressForTest, 0);
+    });
+  });
+
   group('AppleLyricsView 副行过长换行：行距预留自适应', () {
     testWidgets('长翻译副行按换行后的视觉行数预留，短副行仍为单行', (tester) async {
       SharedPreferences.setMockInitialValues({});

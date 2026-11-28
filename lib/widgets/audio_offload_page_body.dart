@@ -242,7 +242,7 @@ class _AudioOffloadPageBodyState extends State<AudioOffloadPageBody> {
             runSpacing: AppSpacing.sm,
             children: <Widget>[
               FilledButton.tonalIcon(
-                onPressed: _probeBusy ? null : _reprobe,
+                onPressed: _probeBusy || !_svc.userEnabled ? null : _reprobe,
                 icon: _probeBusy
                     ? const SizedBox(
                         width: 16,

@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -38,9 +39,23 @@ class MediaNotificationService {
   static void Function()? onNext;
   static void Function()? onTogglePlayPause;
   static void Function(int)? onSeekTo;
+
   /// Windows SMTC 循环（Repeat）按钮：系统算好目标循环模式后回传
   /// （'off' / 'one' / 'all'），App 直接精确设定而非自行循环切换。
   static void Function(String)? onSetLoopMode;
+
+  /// Windows SMTC 随机（Shuffle）按钮：系统把目标态算好后回传。
+  ///
+  /// 与 [onSetLoopMode] 同一套路数（系统给目标值，App 服从），差别是随机
+  /// 只有两个状态，故直接传 bool。
+  static void Function(bool)? onSetShuffle;
+
+  /// Windows SMTC 倍速按钮：回传系统请求的目标倍速（double）。
+  ///
+  /// 只来自 `ISystemMediaTransportControls2::PlaybackRateChangeRequested`；
+  /// 老系统拿不到该接口时永远不会触发。
+  static void Function(double)? onSetPlaybackSpeed;
+
   /// 媒体键快进/快退（TV 遥控器）；由 desktop_lyric_service.registerNativeCallbacks 装配。
   static void Function()? onSeekForward;
   static void Function()? onSeekBack;
@@ -69,12 +84,31 @@ class MediaNotificationService {
   static void Function()? onWidgetFmOpenLogin;
   // 屏幕亮灭（FloatingLyricService SCREEN_OFF/ON 广播转发）
   static void Function(bool on)? onScreenStateChanged;
+
   /// 锁屏歌词卡片里的「投屏 / 队列」按钮动作（参数为 `openCast` / `openQueue`）。
   /// 原生锁屏 Activity 只负责拉起 App 并回传动作字符串，目标面板由
   /// `LockScreenActionService` 在 Navigator 就绪后打开。
   static void Function(String)? onWidgetAction;
   // MD3Music fork v21：车机卡片点入（投屏屏判据由原生侧把控），直达全屏歌词
   static void Function()? onOpenCardLyric;
+
+  /// MD3Music fork v66：车机语音点歌。原生把 framework
+  /// `MediaController.TransportControls.playFromSearch()` 的 query 转来
+  /// （media3 1.4.1 的 `MediaSession.Callback` 没有该回调，只能经 legacy stub 钩子到达）。
+  static void Function(String query)? onPlayFromSearch;
+
+  /// MD3Music fork v67：legacy browse 搜索（`MediaBrowserCompat.search`）。
+  ///
+  /// 返回值即原生侧收到的候选列表：**必须返回列表**，空列表表示「0 条结果」。
+  /// 返回 null 会被原生兜底成空列表，但不要让这条契约依赖兜底。
+  static Future<List<Map<String, Object?>>> Function(String query)?
+  onBrowseSearch;
+
+  /// MD3Music fork v67：桥接端点回候选条目（payload 含 hash/albumId/albumAudioId）。
+  static void Function(Map<String, Object?> payload)? onSearchResultPlay;
+
+  /// MD3Music fork v67：候选条目已失效（进程重启 / TTL 过期 / 无引擎）。
+  static void Function()? onSearchResultExpired;
   static final MediaCommandAckRouter _mediaCommandAckRouter =
       MediaCommandAckRouter();
 
@@ -104,7 +138,9 @@ class MediaNotificationService {
   /// 未就绪时只置 pending，这里在根导航就绪后主动取一次。
   static Future<bool> consumePendingOpenCardLyric() async {
     try {
-      final r = await _channel.invokeMethod<bool>('consumePendingOpenCardLyric');
+      final r = await _channel.invokeMethod<bool>(
+        'consumePendingOpenCardLyric',
+      );
       return r ?? false;
     } catch (_) {
       return false;
@@ -148,19 +184,34 @@ class MediaNotificationService {
           final mode = call.arguments as String?;
           if (mode != null) onSetLoopMode?.call(mode);
           break;
+        // Windows SMTC 随机按钮（ISystemMediaTransportControls2）：系统把目标
+        // 态算好后以 bool 回传，App 直接设定而非自行取反。
+        case 'setShuffle':
+          final shuffle = call.arguments;
+          if (shuffle is bool) onSetShuffle?.call(shuffle);
+          break;
+        // Windows SMTC 倍速按钮：回传目标倍速，夹取由 setSpeed 自己负责。
+        case 'setPlaybackSpeed':
+          final rate = call.arguments;
+          if (rate is num) onSetPlaybackSpeed?.call(rate.toDouble());
+          break;
         case 'openCardLyricView':
           // MD3Music fork v30：回调未装配（首帧前送达）时不清 pending——
           // 由 _AppView postFrame 的消费兜底接住；装配后才投递并清零。
           // 否则车机冷启动的点击会被静默丢弃（v29 的"投递即清"过激）。
-          debugPrint('[CardLyricLink] Dart case openCardLyricView, '
-              'handlerMounted=${onOpenCardLyric != null}');
+          debugPrint(
+            '[CardLyricLink] Dart case openCardLyricView, '
+            'handlerMounted=${onOpenCardLyric != null}',
+          );
           if (onOpenCardLyric != null) {
             onOpenCardLyric!();
             // v33：显式 dynamic——catchError 的返回形态与 Future<dynamic?>
             // 匹配，防止日后改成强类型时 catcher 在 zone 抛 TypeError。
-            unawaited(_channel
-                .invokeMethod<dynamic>('consumePendingOpenCardLyric')
-                .catchError((Object _) {}));
+            unawaited(
+              _channel
+                  .invokeMethod<dynamic>('consumePendingOpenCardLyric')
+                  .catchError((Object _) {}),
+            );
           }
           break;
         // MD3Music fork v40：原子随身听列表项点播——岛按 media id 回播，原生经
@@ -168,13 +219,65 @@ class MediaNotificationService {
         case 'vivoMixPlay':
           final args = call.arguments as Map<dynamic, dynamic>?;
           final mediaId = args?['mediaId'] as String?;
-          if (mediaId != null && mediaId.isNotEmpty) onVivoMixPlay?.call(mediaId);
+          if (mediaId != null && mediaId.isNotEmpty)
+            onVivoMixPlay?.call(mediaId);
           break;
         // MD3Music fork v45：原子随身听循环模式切换（mode 1=列表/2=单曲/3=随机）。
         case 'vivoMixPlayMode':
           final args = call.arguments as Map<dynamic, dynamic>?;
           final mode = args?['mode'] as int?;
           if (mode != null) onVivoMixPlayMode?.call(mode);
+          break;
+        // MD3Music fork v64：原子随身听 ❤️ 收藏（岛 setRating/HeartRating 的目标态）。
+        case 'vivoMixRating':
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final favorite = args?['favorite'] as bool?;
+          if (favorite != null) onVivoMixRating?.call(favorite);
+          break;
+        // MD3Music fork v66：车机语音点歌——原生把 playFromSearch 的 query 转来。
+        // 暖启动直投不带 commandId，直接执行；带 commandId 时走 AckRouter 去重。
+        // 注意 ack 语义是「已受理」而非「已播出」：真正的搜索/起播是异步的，
+        // 原生不重试（playFromSearch 也没有标准失败回调）。
+        case 'playFromSearch':
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final query = args?['query'] as String?;
+          if (query == null || query.isEmpty) return false;
+          final callback = onPlayFromSearch;
+          if (callback == null) return false;
+          final commandId = _commandIdFromArguments(call.arguments);
+          if (commandId == null) {
+            callback(query);
+            return true;
+          }
+          return _mediaCommandAckRouter.dispatch(
+            commandId,
+            () => callback(query),
+          );
+        // MD3Music fork v67：legacy 搜索——返回值即原生侧收到的候选列表。
+        // 任何失败都必须回空列表（原生据此回 emptyList，桥接端看到的是「0 条结果」
+        // 而不是错误，不会因此关闭搜索入口）。
+        case 'browseSearch':
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final query = args?['query'] as String?;
+          final handler = onBrowseSearch;
+          if (query == null || query.isEmpty || handler == null) {
+            return <Map<String, Object?>>[];
+          }
+          try {
+            return await handler(query);
+          } catch (e) {
+            debugPrint('[VoiceSearch] browseSearch 失败: $e');
+            return <Map<String, Object?>>[];
+          }
+        // MD3Music fork v67：桥接端点回候选条目。
+        case 'searchResultPlay':
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          if (args != null && args.isNotEmpty) {
+            onSearchResultPlay?.call(Map<String, Object?>.from(args));
+          }
+          break;
+        case 'searchItemExpired':
+          onSearchResultExpired?.call();
           break;
         case 'toggleDesktopLyric':
           onToggleDesktopLyric?.call();
@@ -244,6 +347,9 @@ class MediaNotificationService {
     bool isFavorited = false,
     String loopMode = 'off',
     bool shuffleEnabled = false,
+    String album = '',
+    String albumArtist = '',
+    double playbackRate = 1.0,
   }) async {
     try {
       await _channel.invokeMethod('updateNotification', {
@@ -259,6 +365,34 @@ class MediaNotificationService {
         'isFavorited': isFavorited,
         'loopMode': loopMode,
         'shuffleEnabled': shuffleEnabled,
+        // 专辑 / 专辑歌手：Windows 侧发布到 SMTC 的 AlbumTitle / AlbumArtist，
+        // 是第三方任务栏歌词工具（TaskbarLyrics、AF Media Bar）的歌曲身份
+        // 与歌词匹配维度之一。Android 侧现有实现忽略这两个字段。
+        'album': album,
+        'albumArtist': albumArtist,
+        // 实际播放倍速：SMTC 不发布 PlaybackRate 时，外部工具一律按 1.0x
+        // 外推时间轴，1.25x/1.5x 播放会让歌词持续漂移。
+        'playbackRate': playbackRate,
+      });
+    } catch (_) {}
+  }
+
+  /// Windows 专用的每秒位置推进轻量路径。
+  ///
+  /// 只更新 SMTC 时间轴与播放状态，不重发元数据/封面。若每秒走全量
+  /// [updateNotification]，原生 `DisplayUpdater.Update()` 会让系统重建媒体
+  /// 卡片，播控中心封面每秒闪烁一次。Android 侧无此方法调用（30s 一次全量），
+  /// MissingPluginException 已被吞掉，无副作用。
+  static Future<void> updateNotificationPosition({
+    required Duration position,
+    required Duration duration,
+    required bool isPlaying,
+  }) async {
+    try {
+      await _channel.invokeMethod('updateNotificationPosition', {
+        'position': position.inMilliseconds,
+        'duration': duration.inMilliseconds,
+        'isPlaying': isPlaying,
       });
     } catch (_) {}
   }
@@ -346,6 +480,10 @@ class MediaNotificationService {
   /// MD3Music fork v45：原子随身听循环模式切换回调（mode 1=列表/2=单曲/3=随机）。
   static void Function(int mode)? onVivoMixPlayMode;
 
+  /// MD3Music fork v64：原子随身听 ❤️ 收藏回调（岛 setRating/HeartRating 目标态）。
+  /// true=收藏，false=取消收藏；由 VivoMixSync 按目标态落地，不做 toggle 猜测。
+  static void Function(bool favorite)? onVivoMixRating;
+
   // 桌面歌词（悬浮窗）相关
   static Future<bool> hasOverlayPermission() async {
     try {
@@ -364,7 +502,9 @@ class MediaNotificationService {
   /// false 处理（此时 window 必然显示不了，恢复无人可推）。
   static Future<bool> isFloatingLyricWindowRunning() async {
     try {
-      final r = await _channel.invokeMethod<bool>('isFloatingLyricWindowRunning');
+      final r = await _channel.invokeMethod<bool>(
+        'isFloatingLyricWindowRunning',
+      );
       return r ?? false;
     } catch (_) {
       return false;
@@ -444,10 +584,39 @@ class MediaNotificationService {
     } catch (_) {}
   }
 
+  // CarWith 车机投屏逐句歌词：走与蓝牙歌词同一条 floating_lyric 通道，
+  // 原生 MainActivity 把它转成 AudioPlaybackService 的 ACTION_UPDATE_CAR_LYRIC。
+  // enabled=false 且 lyric 为空串 = 「歌词收掉」（规格 §九 第 5 条：关开关时
+  // 车机不停在最后一句）。原生侧对空串做清空处理；通道异常静默吞掉，
+  // 与 updateBluetoothLyric 同款（非 Android 环境没有该通道，不能让推词链路炸穿）。
+  static Future<void> updateCarWithLyricLine(bool enabled, String lyric) async {
+    try {
+      await _channel.invokeMethod('updateCarWithLyricLine', {
+        'enabled': enabled,
+        'lyric': lyric,
+      });
+    } catch (_) {}
+  }
+
   // LyricInfo 歌词转发：把整首歌词（LRC/ELRC JSON）写入 MediaSession extras，
   // 供 ColorOS 桌面歌词 / LyricInfo 模块等第三方系统读取。
   // 传入空字符串表示移除 lyricInfo（切歌/功能关闭时调用）。
   static Future<void> updateLyricInfo(
+    String jsonString, {
+    String songId = '',
+    int sessionGeneration = 0,
+    bool hasTranslation = false,
+  }) async {
+    await tryUpdateLyricInfo(
+      jsonString,
+      songId: songId,
+      sessionGeneration: sessionGeneration,
+      hasTranslation: hasTranslation,
+    );
+  }
+
+  /// 返回 MethodChannel 是否成功交付给原生端；失败时由调用方保留重试机会。
+  static Future<bool> tryUpdateLyricInfo(
     String jsonString, {
     String songId = '',
     int sessionGeneration = 0,
@@ -460,7 +629,10 @@ class MediaNotificationService {
         'sessionGeneration': sessionGeneration,
         'hasTranslation': hasTranslation,
       });
-    } catch (_) {}
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   static Future<void> removeLyricInfo({

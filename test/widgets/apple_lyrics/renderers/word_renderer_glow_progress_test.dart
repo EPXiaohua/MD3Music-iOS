@@ -36,6 +36,12 @@ void main() {
     await LyricPreferences.instance.load();
     await LyricPreferences.instance.setUseGlowEffect(true);
     await LyricPreferences.instance.setFillMode(mode);
+    // 固定「未播歌词透明度」= 0.8：当前行未播字的暗端 alpha 恒为
+    // unplayedOpacity × 0.5 = 0.4（2026-11-13 起与下方未播行同值，不再随
+    // factor 放大到 unplayedOpacity）。本用例的像素度量（纯白阈值 200、左右
+    // 能量比）就是按 0.4/1.0 这组 alpha 标定的，钉住它才能继续衡量"辉光是否
+    // 跟随进度推进"，而不受偏好映射变化影响。
+    await LyricPreferences.instance.setUnplayedOpacity(0.8);
     addTearDown(() => LyricPreferences.instance.reset());
 
     // 单字时长 4000ms：字内进度有充足时间展开

@@ -632,6 +632,7 @@ void main() {
         probedAt: DateTime.now(),
       );
       SharedPreferences.setMockInitialValues(<String, Object>{
+        AudioOffloadService.keyEnabled: true,
         AudioDecoderCapabilityStore.keyJson: jsonEncode(cached.toMap()),
         AudioDecoderCapabilityStore.keyDevice: 'dev-test',
       });

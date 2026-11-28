@@ -29,6 +29,16 @@ class LocalLyricLoader {
   /// 若头部区域内未发现歌词标签，则按"无内嵌歌词"处理，回退到同名歌词文件。
   static const int _maxEmbeddedReadBytes = 16 * 1024 * 1024;
 
+  /// 优先使用扫描阶段缓存的歌词（如 SAF `content://`），再按普通本地路径读取。
+  static Future<String?> loadForSongAsync({
+    required String? localPath,
+    String? cachedLyrics,
+  }) async {
+    if (cachedLyrics != null && cachedLyrics.isNotEmpty) return cachedLyrics;
+    if (localPath == null || localPath.isEmpty) return null;
+    return loadForAudioAsync(localPath);
+  }
+
   /// 加载本地歌曲歌词：先内嵌，无内嵌时查找同目录同名歌词文件。
   ///
   /// 兼容 file:// URI 与裸绝对路径。返回歌词文本，无则 null。
@@ -55,8 +65,16 @@ class LocalLyricLoader {
 
     final active = _activeAsyncRead;
     if (active != null) {
-      // 同一首歌复用解析任务；快速切到其他歌曲时不再额外启动 isolate。
-      if (_activeAsyncReadPath != path) return null;
+      // 同一首歌复用解析任务；不同歌曲等当前 isolate 结束后串行启动，避免并发
+      // 解析占用内存。旧逻辑在路径不同时直接返回 null，快速切歌就会丢掉新歌歌词。
+      if (_activeAsyncReadPath != path) {
+        try {
+          await active.timeout(const Duration(seconds: 5));
+        } catch (_) {
+          return null;
+        }
+        return loadForAudioAsync(path);
+      }
       try {
         return await active.timeout(const Duration(seconds: 5));
       } catch (_) {

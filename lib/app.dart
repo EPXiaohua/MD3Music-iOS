@@ -24,9 +24,12 @@ import 'core/layout/tv_shell.dart';
 import 'core/layout/ui_density.dart';
 import 'core/remote/tv_exit_confirm_dialog.dart';
 import 'core/remote/tv_focus_highlight.dart';
+import 'core/remote/tv_ime_guard.dart';
+import 'core/remote/tv_ime_proxy_bridge.dart';
 import 'core/remote/tv_key_repeat.dart';
 // tv: 播放页返回键兜底（焦点丢回路由 FocusScope 时页内拦截器收不到按键）。
 import 'core/remote/tv_player_back_focus.dart';
+import 'core/services/car_with_service.dart';
 import 'core/services/diagnostic_logger.dart';
 import 'core/services/external_media_intent_service.dart';
 import 'core/services/fm_widget_sync.dart';
@@ -35,6 +38,7 @@ import 'core/services/lyricon_provider_service.dart';
 import 'core/services/media_notification_service.dart';
 import 'core/services/music_haptics_service.dart';
 import 'core/services/vivo_mix_sync.dart';
+import 'core/services/voice_search_bridge.dart';
 import 'core/services/startup_auto_play.dart';
 import 'core/services/windows_fullscreen.dart';
 import 'core/services/windows_taskbar_sync.dart';
@@ -72,7 +76,6 @@ import 'widgets/player_top_bar_actions.dart';
 import 'widgets/player_top_bar_tab_dots.dart';
 import 'modules/charts/charts_page.dart';
 import 'modules/ip/ip_page.dart';
-import 'modules/recognition/pip_recognition_controller.dart';
 import 'modules/user/user_center_page.dart';
 import 'modules/user/favorites_page.dart';
 import 'modules/brush/brush_page.dart';
@@ -106,6 +109,7 @@ import 'modules/onboarding/user_agreement_page.dart';
 import 'modules/personal_fm/personal_fm_page.dart';
 import 'modules/audiobook/audiobook_page.dart';
 import 'modules/recognition/song_recognition_page.dart';
+import 'modules/recognition/pip_recognition_controller.dart';
 import 'modules/scene/scene_page.dart';
 import 'modules/channel/channel_page.dart';
 import 'modules/sheet/sheet_square_page.dart';
@@ -134,7 +138,6 @@ import 'providers/car_mode_provider.dart';
 import 'providers/listen_together_provider.dart';
 import 'services/kugou_server.dart';
 import 'widgets/dlna_casting_overlay.dart';
-import 'core/widgets/local_server_down_banner.dart';
 
 /// 形态交棒取证日志的生效档（debug + profile）。
 ///
@@ -215,8 +218,8 @@ class MyApp extends StatelessWidget {
   /// 主题模式的启动播种值：null = 从未持久化，保持 ThemeProvider 初值 ThemeMode.system。
   final ThemeMode? initialThemeMode;
 
-  /// 可选扩展：额外注册的 Provider 列表（默认无，由私有构建注入，
-  /// 用于注册私有功能 Provider）。
+  /// 可选扩展：额外注册的 Provider 列表（默认无，由宿主注入，
+  /// 用于注册额外的功能 Provider）。
   final List<SingleChildWidget>? extraProviders;
 
   const MyApp({
@@ -338,9 +341,14 @@ class MyApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => SongMatchProvider()),
         // 车机模式（常驻播放器面板的开关 / 宽度 / 停靠位置）
         ChangeNotifierProvider(create: (_) => CarModeProvider()),
+        // 小米 CarWith（车机连接态 + 跟随车机深浅色 + 车机投屏歌词）。
+        // **必须用 .value**：CarWithService 是进程级单例，服务自身在
+        // `start()` 里负责生命周期；用默认构造会在 MultiProvider 销毁时
+        // 把单例 dispose 掉，之后所有 notifyListeners 直接抛异常。
+        ChangeNotifierProvider.value(value: CarWithService.instance),
         // 一起听（众乐房）：广场列表 + 房间会话（心跳/轮询/播放同步）
         ChangeNotifierProvider(create: (_) => ListenTogetherProvider()),
-        // 可选扩展：私有构建注入的额外 Provider（默认无）
+        // 可选扩展：宿主注入的额外 Provider（默认无）
         ...?extraProviders,
       ],
       // Windows 键鼠快捷键（空格播放/暂停、F 播放页、Esc 返回、侧键前进后退）。
@@ -438,10 +446,6 @@ class _AppViewState extends State<_AppView> {
       // 并主动拉取一次冷启动期间原生侧积压的待处理音频
       // ignore: discarded_futures
       ExternalMediaIntentService.instance.start();
-      // 悬浮窗识曲：打开应用时若有未消费的识别结果（10 分钟内），
-      // 自动打开识曲页展示
-      // ignore: discarded_futures
-      PipRecognitionController.instance.openPendingResultPageIfAny();
       // MD3Music fork v21 车机卡片：点系统媒体卡片直达全屏歌词。冷启动残留
       // （引擎未就绪时原生只置 pending）在本帧根导航就绪后拉取一次。
       MediaNotificationService.onOpenCardLyric = _openFullPlayerOnLyrics;
@@ -506,6 +510,14 @@ class _AppViewState extends State<_AppView> {
       favorites: context.read<FavoritesProvider>(),
       library: context.read<LibraryProvider>(),
     );
+    // MD3Music fork v66：车机语音点歌（playFromSearch / legacy browse 搜索）。
+    VoiceSearchBridge.instance.attach(
+      player: context.read<PlayerProvider>(),
+    );
+    // 悬浮窗识曲：打开应用时若有未消费的识别结果（10 分钟内），
+    // 自动打开识曲页展示
+    // ignore: discarded_futures
+    PipRecognitionController.instance.openPendingResultPageIfAny();
   }
 
   /// MD3Music fork v21 车机卡片：直达全屏歌词页。预置「歌词页」为初始 tab——
@@ -555,16 +567,11 @@ class _AppViewState extends State<_AppView> {
   // v29/v30 的面板抑制/看门狗/force 一族（_suppressPanelForCardLyrics、
   // _watchPanelReturn、_releasePanelForCardLyrics 及两个字段）整体退场。
 
-  /// 根据 ShortcutConfigProvider 当前配置，整体替换桌面快捷方式列表
-  /// （Android App Shortcut / iOS Quick Actions）。
+  /// 根据 ShortcutConfigProvider 当前配置，整体替换 Android 桌面快捷方式列表。
   /// type 统一为 `action_open_<tabId>`，由 main.dart handleShortcut 路由到对应页。
   void _applyDesktopShortcuts() {
     final config = context.read<ShortcutConfigProvider>();
     const quickActions = QuickActions();
-    // iconResource：Android 按 drawable 资源名查找；iOS 走
-    // UIApplicationShortcutIcon(templateImageName:)，按 Assets.xcassets 的
-    // imageset 名查找（两端资源同名：ic_shortcut_*，iOS 侧在 Runner 资源里）。
-    // 传错名字会导致图标静默缺失（仅显示文字）。
     quickActions.setShortcutItems([
       for (final s in config.visibleShortcuts)
         ShortcutItem(
@@ -703,18 +710,24 @@ class _AppViewState extends State<_AppView> {
   /// 优先用比例自适应（按屏宽取约 5%、封顶 [kTvOverscanInset]）而不是固定
   /// 48dp 恢复。焦点特效溢出由 Dpad.wrap 的 scrollPadding(64) 兜底。
   Widget _tvContentScope(BuildContext context, Widget? child) {
-    return Builder(
-      builder: (mqContext) {
-        final mq = MediaQuery.of(mqContext);
-        return MediaQuery(
-          data: mq.copyWith(
-            textScaler: mq.textScaler.clamp(
-              minScaleFactor: kTvMinTextScale,
-              maxScaleFactor: kMaxSystemTextScale,
+    // tv: 输入法会话桥（见 TvImeProxyBridge）：本层常驻 MaterialApp.builder
+    // 子树，把「输入框是否持焦」(kTextInputFocused) 转发给原生代理 View
+    // (TvImeProxyView)，让低内存 Android TV（config_preventImeStartupUnlessText
+    // Editor=true，Flutter #177360）肯给本窗口绑定输入法会话——否则遥控器按键
+    // 一个都到不了软键盘，无法选字。非 TV 构建整体不编入。
+    return TvImeProxyBridge(
+      child: Builder(
+        builder: (mqContext) {
+          final mq = MediaQuery.of(mqContext);
+          return MediaQuery(
+            data: mq.copyWith(
+              textScaler: mq.textScaler.clamp(
+                minScaleFactor: kTvMinTextScale,
+                maxScaleFactor: kMaxSystemTextScale,
+              ),
             ),
-          ),
-          child: Stack(
-            children: [
+            child: Stack(
+              children: [
               // tv: 滚动不产生 FocusManager 通知——播放列表切歌后的「自动滚到
               // 当前曲」等程序化 animateTo 在红框 Ticker 静音后不会被跟随，红框
               // 会滞留旧位置（焦点与页面元素错位）。统一接住滚动通知唤醒红框；
@@ -741,10 +754,17 @@ class _AppViewState extends State<_AppView> {
                   onBack: _handleTvBack,
                 )(
                   context,
-                  // tv: 方向键连发层（见 TvKeyRepeatLayer）：必须包在 Dpad 之内、
-                  // Navigator 之外——本层 Focus 节点是全部焦点节点的祖先，且位于
-                  // Dpad 的 Shortcuts 之下（按键先经本层，才到 dpad 遍历）。
-                  TvKeyRepeatLayer(child: child ?? const SizedBox.shrink()),
+                  // tv: 输入法保活守卫（见 TvImeGuard）：包在 Dpad 之内、
+                  // TvKeyRepeatLayer 之外。按键沿 primaryFocus 向上冒泡时本层
+                  // 先于 dpad 根部 Shortcuts 拿到方向键，输入框持焦时把四方向
+                  // 键就地吃掉——防止 dpad「单行输入框上下键=移出字段」的逃逸
+                  // 把 TextField 挤失焦、连带收起系统输入法（TV 键盘"一按就
+                  // 没"的直接触发层；Flutter #177360 同族）。退出输入框靠 BACK。
+                  TvImeGuard(
+                    child: TvKeyRepeatLayer(
+                      child: child ?? const SizedBox.shrink(),
+                    ),
+                  ),
                 ),
               ),
               // 焦点红框叠在最上层（IgnorePointer，不拦按键）。
@@ -753,6 +773,7 @@ class _AppViewState extends State<_AppView> {
           ),
         );
       },
+    ),
     );
   }
 
@@ -831,12 +852,31 @@ class _AppViewState extends State<_AppView> {
     MediaNotificationService.onOpenCardLyric = null;
     // v40：原子随身听列表同步一并解绑（去抖 Timer、provider 监听、点播回调）。
     VivoMixSync.instance.dispose();
+    // v66：语音点歌回调一并摘除（旧 State 的闭包不得滞留）。
+    VoiceSearchBridge.instance.dispose();
     _shortcutConfig?.removeListener(_applyDesktopShortcuts);
     _playerProvider?.removeListener(_onPlayerChanged);
     _backgroundThemeProvider?.removeListener(_onBackgroundChanged);
     kPredictiveBackEnabled.removeListener(_onPredictiveBackChanged);
     WindowsTaskbarSync.instance.detach();
     super.dispose();
+  }
+
+  /// 实际喂给 MaterialApp 的主题档：CarWith 覆盖值优先于用户选的档位。
+  ///
+  /// **取值必须在 build 里 watch**：`themeOverride` 由 2 秒心跳 / 回前台在连接态
+  /// 翻转时更新，不订阅就只是「当场读一次」——车机切深/浅色时这里不会重建，
+  /// 主题永远不动。
+  /// 覆盖值为 null（没勾「跟随CarWith」/ 勾了但没连车机）时回到用户自己选的档，
+  /// 上游行为逐字不变。
+  /// provider 由上面 MyApp 的 MultiProvider 注册，本 widget 在其子树内，
+  /// 故 watch 成立（与本方法下方取 ThemeProvider 的写法同源）。
+  ThemeMode _effectiveThemeMode(
+    BuildContext context,
+    ThemeProvider themeProvider,
+  ) {
+    final carWith = context.watch<CarWithService>();
+    return carWith.themeOverride ?? themeProvider.themeMode;
   }
 
   @override
@@ -879,7 +919,7 @@ class _AppViewState extends State<_AppView> {
         ),
         themeProvider,
       ),
-      themeMode: themeProvider.themeMode,
+      themeMode: _effectiveThemeMode(context, themeProvider),
       // 封面取色驱动的主题切换（切歌 → 封面主色 → ThemeProvider → 这里）在
       // 视频观感里明显慢于封面滑动：封面先滑到位、标题随后、背景色最后收敛。
       // MaterialApp 内建 AnimatedTheme 的默认 200ms 太快，拉长到 520ms 后
@@ -1164,6 +1204,12 @@ class _SystemUiUpdaterState extends State<_SystemUiUpdater>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // 冷启动先种一次手机系统深浅色：CarWithService 的 themeOverride 要
+    // 「车机报深色 **或** 手机系统报深色」之一成立，而它自己无从知道手机侧的值，
+    // 只能由本观察者喂进来。不种的话首帧到第一次系统回调之间那几秒，
+    // 车机连着且车机是浅色时覆盖值会一直按 light 处理（值本身是对的，
+    // 但心跳首轮读数与它比对齐会慢一轮）。updateSystemDark 内部按值去重。
+    CarWithService.instance.updateSystemDark(_platformIsDark());
   }
 
   @override
@@ -1179,10 +1225,33 @@ class _SystemUiUpdaterState extends State<_SystemUiUpdater>
   }
 
   @override
+  void didChangePlatformBrightness() {
+    // 系统深浅色翻转（用户手动切、或跟随时间自动切）→ 喂给 CarWithService。
+    // 它只在「勾了跟随CarWith 且正连着车机」时才参与 themeOverride，
+    // 没连车机时这条链一个通知也不发，上游行为逐字不变。
+    CarWithService.instance.updateSystemDark(_platformIsDark());
+  }
+
+  /// 手机系统当前是否深色。
+  ///
+  /// 走 `platformDispatcher` 而不是 `Theme.of(context).platformBrightness`：
+  /// 本方法要在 initState 里播种一次，而 initState 阶段还不该依赖 inherited
+  /// widget（那时订阅关系没建好）。dispatcher 是普通 getter，不依赖上下文，
+  /// 读到的就是系统当前值；测试环境（TestWidgetsFlutterBinding）默认 light，
+  /// 不会抛。
+  bool _platformIsDark() =>
+      WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+      Brightness.dark;
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // 当应用从后台恢复或从其他页面返回时，恢复系统 UI
     if (state == AppLifecycleState.resumed) {
       _updateSystemUi();
+      // 回前台补一轮连接态读数：心跳只在「勾着且本平台可读」时存在，
+      // 进程被挂起期间车机可能已经连上/断开/换了深浅色，这里当场对齐一次，
+      // 不等下一次心跳（否则用户会看到主题滞后两三秒才翻）。
+      CarWithService.instance.refreshNow();
     }
   }
 
@@ -1407,7 +1476,9 @@ class _MainLayoutState extends State<_MainLayout>
         page = const DiscoverPage();
         break;
       case 'coverflow':
-        page = const CoverFlowPage();
+        page = CoverFlowPage(
+          onBack: () => unawaited(_dispatchBack(allowExitAtRoot: false)),
+        );
         break;
       case 'library':
         page = const LibraryPage();
@@ -1580,8 +1651,8 @@ class _MainLayoutState extends State<_MainLayout>
         return NavigationDestination(
           icon: _AnimatedTabIcon(
             selected: isSelected,
-            outlinedIcon: Icons.dynamic_feed_outlined,
-            filledIcon: Icons.dynamic_feed,
+            outlinedIcon: Icons.podcasts_outlined,
+            filledIcon: Icons.podcasts,
           ),
           label: tab.label,
         );
@@ -1722,8 +1793,8 @@ class _MainLayoutState extends State<_MainLayout>
         );
       case 'channel':
         return NavigationRailDestination(
-          icon: const Icon(Icons.dynamic_feed_outlined),
-          selectedIcon: const Icon(Icons.dynamic_feed),
+          icon: const Icon(Icons.podcasts_outlined),
+          selectedIcon: const Icon(Icons.podcasts),
           label: label,
         );
       case 'sheet':
@@ -1853,8 +1924,8 @@ class _MainLayoutState extends State<_MainLayout>
         );
       case 'channel':
         return NavigationDrawerDestination(
-          icon: const Icon(Icons.dynamic_feed_outlined),
-          selectedIcon: const Icon(Icons.dynamic_feed),
+          icon: const Icon(Icons.podcasts_outlined),
+          selectedIcon: const Icon(Icons.podcasts),
           // 公开版偏好：侧栏（NavigationRail）也不显示文字，仅图标
           label: const Text(''),
         );
@@ -2505,7 +2576,9 @@ class _MainLayoutState extends State<_MainLayout>
         page = const DiscoverPage();
         break;
       case 'coverflow':
-        page = const CoverFlowPage();
+        page = CoverFlowPage(
+          onBack: () => unawaited(_dispatchBack(allowExitAtRoot: false)),
+        );
         break;
       case 'library':
         page = const LibraryPage();
@@ -2567,24 +2640,6 @@ class _MainLayoutState extends State<_MainLayout>
       return TwoPanePage(child: hosted);
     }
     return hosted;
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 当系统即将销毁应用进程时（包含后台划掉 / 系统回收），Flutter 会先收到 detached。
-    // 此时同步触发 API 服务器关停：若进程随之被 kill 也无副作用；若进程仍存活则释放端口。
-    if (state == AppLifecycleState.detached) {
-      // iOS 跳过显式 stop：iOS scene 生命周期的后台时序里，detached 可能在
-      // 进程仍存活时误触发——此时停掉本地服务器，回前台后所有请求连接被拒
-      // 且无恢复路径，正是「锁屏回来服务器停摆」的来源之一。进程真被 kill
-      // 时服务器线程与监听 socket 随进程销毁，无需温和关停；端口随机分配，
-      // 也不存在下次启动冲突。仅 Android 保留关停（其 detached 只在真销毁时到）。
-      if (!Platform.isIOS) {
-        // 同步触发即可，Dart 端很快；不 await，避免阻塞 framework 销毁流程
-        // ignore: discarded_futures
-        KugouApiServer.stop();
-      }
-    }
   }
 
   /// 词幕连接失败（原生侧重试耗尽 → connect_failed）回调：弹窗提示用户。
@@ -2885,12 +2940,7 @@ class _MainLayoutState extends State<_MainLayout>
                   selectedIndex: _selectedIndex,
                   railDestinations: railDestinations,
                   pageBuilder: _buildPageForTab,
-                  header: ValueListenableBuilder<bool>(
-                    valueListenable: KugouApiClient.localServerAvailable,
-                    builder: (context, available, _) => available
-                        ? const SizedBox.shrink()
-                        : LocalServerDownBanner(onRetry: KugouApiServer.start),
-                  ),
+                  header: const SizedBox.shrink(),
                   onDestinationSelected: (index) {
                     if (isFullPlayerOnTop) return;
                     setState(() {
@@ -3484,18 +3534,11 @@ class _MainLayoutState extends State<_MainLayout>
     bool immersive,
   ) {
     // tv: 迷你播放器已移入顶部第一层（tv_shell.dart），底部常驻条与悬浮
-    // 宿主整套退场；本地服务器启动失败横幅保留（诊断信息不丢）。
+    // 宿主整套退场；本地 API 故障只写后台诊断日志并自动重试。
     if (kTvBuild) {
       return Column(
         children: [
-          // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
-          // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
-          ValueListenableBuilder<bool>(
-            valueListenable: KugouApiClient.localServerAvailable,
-            builder: (context, available, _) => available
-                ? const SizedBox.shrink()
-                : LocalServerDownBanner(onRetry: KugouApiServer.start),
-          ),
+          // 本地 API 异常只记后台日志，由服务层自动重试。
           Expanded(
             child: ResponsiveShell(
               key: _responsiveShellKey,
@@ -3522,14 +3565,7 @@ class _MainLayoutState extends State<_MainLayout>
       tabId: _currentTabId(visibleTabs),
       child: Column(
         children: [
-          // 本地 API 服务器启动失败提示：在线内容全部不可用，但页面本身仍能渲染
-          // 成空列表/转圈，用户无从判断原因。这里把状态显式摆到所有 tab 顶部。
-          ValueListenableBuilder<bool>(
-            valueListenable: KugouApiClient.localServerAvailable,
-            builder: (context, available, _) => available
-                ? const SizedBox.shrink()
-                : LocalServerDownBanner(onRetry: KugouApiServer.start),
-          ),
+          // 本地 API 异常只记后台日志，由服务层自动重试。
           Expanded(
             child: ResponsiveShell(
               key: _responsiveShellKey,

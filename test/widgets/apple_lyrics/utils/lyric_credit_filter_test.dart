@@ -152,6 +152,94 @@ void main() {
     });
   });
 
+  group('在线歌词头部信息块（第一行「作者 - 歌名」）', () {
+    setUp(() => LyricPreferences.instance.setHideLyricCredits(true));
+
+    test('标准在线格式：首行作者-歌名 + 名单行整块移除', () {
+      final lines = [
+        _line('周杰伦 - 晴天', start: 0),
+        _line('作词：周杰伦', start: 10),
+        _line('作曲：周杰伦', start: 20),
+        _line('故事的小黄花', start: 100),
+      ];
+      final filtered = LyricCreditFilter.filterLines(lines);
+      expect(filtered.map((l) => l.text), ['故事的小黄花']);
+      // 保留原行对象引用（时间戳/逐字数据不动）
+      expect(identical(filtered[0], lines[3]), isTrue);
+    });
+
+    test('头部块中不在默认正则名单内的「x：xxx」键也被移除', () {
+      final lines = [
+        _line('周杰伦 - 晴天', start: 0),
+        _line('采样：XXX', start: 10),
+        _line('故事的小黄花', start: 100),
+      ];
+      expect(
+        LyricCreditFilter.filterLines(lines).map((l) => l.text),
+        ['故事的小黄花'],
+      );
+    });
+
+    test('无名单块时不误删含连字符的首行（守卫）', () {
+      final lines = [_line('重来 - 倒带', start: 0), _line('爱过的人', start: 100)];
+      expect(identical(LyricCreditFilter.filterLines(lines), lines), isTrue);
+    });
+
+    test('首行作者-歌名但下一行是正常歌词 → 不删首行（守卫）', () {
+      final lines = [
+        _line('周杰伦 - 晴天', start: 0),
+        _line('故事的小黄花', start: 100),
+      ];
+      expect(identical(LyricCreditFilter.filterLines(lines), lines), isTrue);
+    });
+
+    test('歌词中段出现「歌手 - 歌名」形态行不被误删（仅头部生效）', () {
+      final lines = [
+        _line('作词：林夕', start: 0),
+        _line('第一句', start: 100),
+        _line('副歌 - 重复一遍', start: 200),
+      ];
+      expect(
+        LyricCreditFilter.filterLines(lines).map((l) => l.text),
+        ['第一句', '副歌 - 重复一遍'],
+      );
+    });
+
+    test('行级 isFilteredLine 不含头部块规则（需列表上下文）', () {
+      expect(LyricCreditFilter.isFilteredLine('周杰伦 - 晴天'), isFalse);
+    });
+  });
+
+  group('无开关规则入口（供辉光判定等复用）', () {
+    test('matchesCreditText 不看开关：命中名单行', () {
+      expect(LyricCreditFilter.enabled, isFalse, reason: '前置：开关默认关闭');
+      for (final text in <String>[
+        '作词：林夕',
+        'Lyrics by: John',
+        '【某某工作室】',
+        '未经著作权人许可，不得翻唱',
+      ]) {
+        expect(LyricCreditFilter.matchesCreditText(text), isTrue,
+            reason: '「$text」应命中名单规则（与开关无关）');
+        expect(LyricCreditFilter.isFilteredLine(text), isFalse,
+            reason: '显示口径仍需开关门控');
+      }
+    });
+
+    test('matchesCreditText 不误伤正常歌词', () {
+      for (final text in <String>['月亮代表我的心', '他说：我们走吧', 'I love you']) {
+        expect(LyricCreditFilter.matchesCreditText(text), isFalse,
+            reason: '「$text」是正常歌词');
+      }
+    });
+
+    test('matchesArtistTitleForm 只认「作者 - 歌名」形态', () {
+      expect(LyricCreditFilter.matchesArtistTitleForm('周杰伦 - 晴天'), isTrue);
+      expect(LyricCreditFilter.matchesArtistTitleForm('月亮代表我的心'), isFalse);
+      expect(LyricCreditFilter.matchesArtistTitleForm(''), isFalse);
+    });
+  });
+
   group('自定义正则', () {
     test('自定义 pattern 覆盖默认规则', () async {
       await LyricPreferences.instance.setHideLyricCredits(true);

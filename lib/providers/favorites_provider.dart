@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../data/models/song.dart';
@@ -29,6 +31,10 @@ class FavoritesProvider extends ChangeNotifier {
     await _syncFavoritesFromKugou();
     _isLoading = false;
     notifyListeners();
+    // MD3Music fork v65b：登录/退出/换账号后云端整表可能仍为空（attach 时未登录的
+    // 冷启动场景，loadCloudFavoriteSongs 返回 const [] 且不写缓存）。这里顺带拉一次
+    // ——收藏树（原子随身听）与「我喜欢」选择器共用同一份整表缓存，命中即零网络。
+    unawaited(loadCloudFavoriteSongs());
   }
 
   bool isFavorite(String songId) => _favoriteIds.contains(songId);
@@ -74,13 +80,42 @@ class FavoritesProvider extends ChangeNotifier {
 
   List<Song>? _cloudFavoriteSongs;
 
+  /// 失效前的一份云端整表快照（MD3Music fork v65）。
+  ///
+  /// 红心增删会 invalidate 有效缓存并后台重拉；重拉完成前若桥接视图直接回退到
+  /// [_favorites]，原子随身听「收藏列表」会瞬间只剩 App 内点过红心的那几首
+  /// （v65 前的真机现象：整表只有 1 首）。保留上一份结果直到新数据到达，视图才稳定。
+  List<Song>? _lastCloudFavoriteSongs;
+
+  /// 桥接视图（原子随身听收藏树）的云端整表上限。
+  ///
+  /// 岛每页 50 条、界面深度远小于此值；上限只用于兜住超大收藏单（几千首）一次
+  /// 序列化过 MethodChannel 时把主线程拖住，正常收藏量（几十~几百）不受影响。
+  static const int _cloudFavoriteCap = 1000;
+
   /// 云端「我喜欢」歌单的完整歌曲列表（点歌/加歌选择器用）。
   ///
   /// [_syncFavoritesFromKugou] 只同步收藏 **id 集合**，[_favorites] 只含
   /// App 内点红心的歌——直接用它会让「我喜欢」来源只显示本地红心的几首。
   /// 这里按需拉取云端整表（listid 分页接口，与收藏页同口径）并缓存，
   /// 会话内复用；红心增删后下次进入选择器前可置空缓存重新拉取。
-  Future<List<Song>> loadCloudFavoriteSongs() async {
+  Future<List<Song>> loadCloudFavoriteSongs() {
+    final cached = _cloudFavoriteSongs;
+    if (cached != null) return Future<List<Song>>.value(cached);
+    final inFlight = _cloudLoadInFlight;
+    if (inFlight != null) return inFlight;
+    final future = _fetchCloudFavoriteSongs();
+    _cloudLoadInFlight = future;
+    unawaited(future.whenComplete(() {
+      if (identical(_cloudLoadInFlight, future)) _cloudLoadInFlight = null;
+    }));
+    return future;
+  }
+
+  /// 正在进行的云端整表请求（连续红心增删只发一次，避免旧结果覆盖新结果）。
+  Future<List<Song>>? _cloudLoadInFlight;
+
+  Future<List<Song>> _fetchCloudFavoriteSongs() async {
     if (_cloudFavoriteSongs != null) return _cloudFavoriteSongs!;
     final playlist = await _getMyFavoritePlaylist();
     if (playlist == null) return const [];
@@ -113,8 +148,59 @@ class FavoritesProvider extends ChangeNotifier {
     return songs;
   }
 
-  /// 红心变动后使云端整表缓存失效（下次加载选择器时重新拉取）。
-  void invalidateCloudFavoriteSongs() => _cloudFavoriteSongs = null;
+  /// 红心变动后使云端整表缓存失效。
+  ///
+  /// MD3Music fork v65：失效时把旧结果搬进 [_lastCloudFavoriteSongs] 继续供
+  /// [favoritesForBridge] 使用，并后台重拉一次——红心增删已经改变云端歌单，
+  /// 桥接列表必须跟着刷新，否则取消收藏后岛上还留着那首歌。
+  void invalidateCloudFavoriteSongs() {
+    final current = _cloudFavoriteSongs;
+    if (current != null) _lastCloudFavoriteSongs = current;
+    _cloudFavoriteSongs = null;
+    unawaited(loadCloudFavoriteSongs().catchError((_) => const <Song>[]));
+  }
+
+  /// 取消收藏后立即从云端快照里摘掉该歌（重拉完成前桥上不再残留）。
+  void _dropFromCloudSnapshot(String songId) {
+    final cur = _cloudFavoriteSongs;
+    if (cur != null && cur.any((s) => s.id == songId)) {
+      _cloudFavoriteSongs =
+          cur.where((s) => s.id != songId).toList(growable: false);
+    }
+    final last = _lastCloudFavoriteSongs;
+    if (last != null && last.any((s) => s.id == songId)) {
+      _lastCloudFavoriteSongs =
+          last.where((s) => s.id != songId).toList(growable: false);
+    }
+  }
+
+  /// 原子随身听（vivomusicmix）「收藏列表」树的数据源：云端「我喜欢」整表
+  /// + App 内红心歌曲，按 [Song.id] 去重合并。
+  ///
+  /// [_favorites] 只装 App 内点过红心的歌（云端收藏同步只喂 [_favoriteIds]），
+  /// 直接推它就会表现为岛上收藏列表只有很少几首（真机 21 首只显示 1 首）。
+  /// 本地新收藏排在最前，刚点红心的歌立刻可见；云端整表按服务端顺序跟在后面。
+  List<Song> get favoritesForBridge {
+    final cloud = _cloudFavoriteSongs ?? _lastCloudFavoriteSongs;
+    final local = _favorites;
+    if (cloud == null || cloud.isEmpty) return local;
+    final seen = <String>{};
+    final out = <Song>[];
+    for (final song in local) {
+      if (song.id.isEmpty) continue;
+      if (seen.add(song.id)) out.add(song);
+    }
+    var cloudAdded = 0;
+    for (final song in cloud) {
+      if (cloudAdded >= _cloudFavoriteCap) break;
+      if (song.id.isEmpty) continue;
+      if (seen.add(song.id)) {
+        out.add(song);
+        cloudAdded++;
+      }
+    }
+    return out;
+  }
 
   /// 「我喜欢」歌单记录 fileid 映射（歌曲 hash → 歌单记录 fileid）。
   ///
@@ -268,6 +354,7 @@ class FavoritesProvider extends ChangeNotifier {
       await _repository.removeFavorite(song.id);
       _favoriteRecordFileIds.remove(song.id);
       invalidateCloudFavoriteSongs();
+      _dropFromCloudSnapshot(song.id);
     } else {
       _favoriteIds.add(song.id);
       _favorites.insert(0, song);

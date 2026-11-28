@@ -11,6 +11,22 @@ class PlayerProviderBackedControl implements McpPlayerControl {
 
   final PlayerProvider _player;
 
+  /// 控制命令的兜底超时。PlayerProvider 的 pause/resume/next 等内部有
+  /// 「await 平台 ready」的分支：冷启动恢复播放卡住时会陷入 15s 一轮的
+  /// 加载重试风暴（Windows 实测），这些 await 无限挂起会把 MCP HTTP 请求
+  /// 一起拖死、殃及后续所有工具调用。用户意图（乐观态、取消在途请求）在
+  /// 命令开头已同步下发，风暴期间超时返回不改变意图本身——实际状态由
+  /// md3_get_player_state 如实查询。
+  static const Duration _controlTimeout = Duration(seconds: 5);
+
+  /// 带超时转发；超时静默成功（意图已下发），防风暴拖垮传输层。
+  static Future<void> _withControlTimeout(
+    Future<void> Function() command, {
+      Duration timeout = _controlTimeout,
+    }) async {
+    await command().timeout(timeout, onTimeout: () {});
+  }
+
   @override
   McpPlayerSnapshot snapshot() {
     final song = _player.currentSong;
@@ -45,30 +61,34 @@ class PlayerProviderBackedControl implements McpPlayerControl {
   }
 
   @override
-  Future<void> resume() => _player.resume();
+  Future<void> resume() => _withControlTimeout(() => _player.resume());
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() => _withControlTimeout(() => _player.pause());
 
   @override
-  Future<void> next() => _player.next();
+  Future<void> next() => _withControlTimeout(() => _player.next());
 
   @override
-  Future<void> previous() => _player.previous();
+  Future<void> previous() => _withControlTimeout(() => _player.previous());
 
   @override
-  Future<void> seek(Duration position) => _player.seek(position);
+  Future<void> seek(Duration position) =>
+      _withControlTimeout(() => _player.seek(position));
 
   @override
-  Future<void> setVolume(double volume) =>
-      _player.setVolume(volume.clamp(0.0, 1.0));
+  Future<void> setVolume(double volume) => _withControlTimeout(
+      () => _player.setVolume(volume.clamp(0.0, 1.0)));
 
+  // playSong / playOnlinePlaylist 不套超时：工具层对它们本来就是 unawaited
+  // 触发（长链路立即返回），不阻塞 HTTP；这里 await 的是入队/落盘等快操作。
   @override
   Future<void> playSong(Song song) =>
       song.isOnline ? _player.playOnlineSong(song) : _player.playSong(song);
 
   @override
-  Future<void> enqueue(Song song) => _player.insertAfterCurrent(<Song>[song]);
+  Future<void> enqueue(Song song) =>
+      _withControlTimeout(() => _player.insertAfterCurrent(<Song>[song]));
 
   @override
   Future<void> setLoopMode(String mode) {
@@ -77,24 +97,27 @@ class PlayerProviderBackedControl implements McpPlayerControl {
       'all' => AppLoopMode.all,
       _ => AppLoopMode.off,
     };
-    return _player.setLoopMode(m);
+    return _withControlTimeout(() => _player.setLoopMode(m));
   }
 
   @override
-  Future<void> setShuffle(bool enabled) => _player.setShuffle(enabled);
+  Future<void> setShuffle(bool enabled) =>
+      _withControlTimeout(() => _player.setShuffle(enabled));
 
   @override
-  Future<void> playAt(int index) => _player.playSongAt(index);
+  Future<void> playAt(int index) =>
+      _withControlTimeout(() => _player.playSongAt(index));
 
   @override
-  Future<void> removeFromQueue(int index) => _player.removeFromPlaylist(index);
+  Future<void> removeFromQueue(int index) =>
+      _withControlTimeout(() => _player.removeFromPlaylist(index));
 
   @override
   Future<void> reorderQueue(int from, int to) =>
-      _player.reorderPlaylist(from, to);
+      _withControlTimeout(() => _player.reorderPlaylist(from, to));
 
   @override
-  Future<void> clearQueue() => _player.clearPlaylist();
+  Future<void> clearQueue() => _withControlTimeout(_player.clearPlaylist);
 
   @override
   Future<void> playOnlinePlaylist(List<Song> songs, int startIndex) =>

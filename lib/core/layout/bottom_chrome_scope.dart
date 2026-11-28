@@ -28,6 +28,8 @@ library;
 
 import 'package:flutter/widgets.dart';
 
+import 'bottom_chrome_dimens.dart';
+
 /// 坞位状态 + 逐帧进度源的**一次性读数**（见 [BottomChromeScope] 的分工说明）。
 typedef BottomChromeState = ({
   Animation<double>? animation,
@@ -99,6 +101,25 @@ class BottomChromeScope extends InheritedWidget {
       animation: scope?.collapseProgress,
       hasBottomChrome: scope?.hasBottomChrome ?? false,
     );
+  }
+
+  /// 滚动内容需要避让的底部固定栏高度（播放条 + 仍在场的导航栏）。
+  ///
+  /// 在导航栏仍占据屏幕底部时，详情内容可能位于 Navigator 的 body 里，不能
+  /// 只依赖 Scaffold 的底栏布局自动缩小视口；此处按播放条 76dp、导航栏最大
+  /// 高度及系统手势区合并计算。使用 [collapseStateOf] 快照，避免订阅导航栏
+  /// 收起动画而令整页随每帧重建。
+  static double playerContentBottomInsetOf(
+    BuildContext context, {
+    required bool hasPlayer,
+  }) {
+    if (!hasPlayer) return 0.0;
+    final state = collapseStateOf(context);
+    final navigationInset = state.hasBottomChrome
+        ? BottomChromeDimens.navBarWithLabelHeight +
+              MediaQuery.viewPaddingOf(context).bottom
+        : 0.0;
+    return BottomChromeDimens.discReservedBottom + navigationInset;
   }
 
   @override

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -364,6 +365,10 @@ class KugouPlaylistBrief {
     // list_create_listid 是原歌单 listid（不可用）。两者通常不同；
     // 但部分场景下 server 只返回 listid，所以 listCreateListid 兜底用 listid。
     final listid = _str(json['listid'] ?? '');
+    // 收藏专辑的 musiclib_id / list_create_listid 指向具体发行版本；
+    // specialid 在本地缓存中可能是收藏编号，不能当作专辑编号。
+    final isCollectedAlbum =
+        _parseInt(json['type'] ?? 0) == 1 && _parseInt(json['source'] ?? 0) == 2;
     return KugouPlaylistBrief(
       id: _str(
         json['specialid'] ?? json['id'] ?? json['global_collection_id'] ?? '',
@@ -385,7 +390,12 @@ class KugouPlaylistBrief {
       ),
       globalCollectionId: _strNull(json['global_collection_id'] ?? json['gid']),
       numericId: _strNull(
-        json['specialid'] ?? json['albumid'] ?? json['album_id'],
+        isCollectedAlbum
+            ? json['musiclib_id'] ??
+                  json['albumid'] ??
+                  json['album_id'] ??
+                  json['list_create_listid']
+            : json['specialid'] ?? json['albumid'] ?? json['album_id'],
       ),
       listId: listid,
       listCreateUserid: _strNull(json['list_create_userid']),
@@ -476,14 +486,17 @@ class KugouSongDetail {
   /// 创建副本并覆盖指定字段（用于补全 albumName 等缺失字段）
   KugouSongDetail copyWith({
     String? albumName,
+    String? albumId,
+    String? artistId,
     String? artworkUri,
     String? curMark,
+    String? albumAudioId,
   }) {
     return KugouSongDetail(
       hash: hash,
-      albumId: albumId,
+      albumId: albumId ?? this.albumId,
       albumName: albumName ?? this.albumName,
-      artistId: artistId,
+      artistId: artistId ?? this.artistId,
       artistName: artistName,
       songName: songName,
       duration: duration,
@@ -492,7 +505,7 @@ class KugouSongDetail {
       hash320: hash320,
       hash128: hash128,
       lyrics: lyrics,
-      albumAudioId: albumAudioId,
+      albumAudioId: albumAudioId ?? this.albumAudioId,
       artworkUri: artworkUri ?? this.artworkUri,
       fileName: fileName,
       privilege: privilege,
@@ -666,6 +679,7 @@ class KugouSongDetail {
         json2['album_id'] ??
             json2['AlbumID'] ??
             json2['albumid'] ??
+            json2['ori_album_id'] ??
             json2['album_info']?['id'] ??
             json2['base']?['album_id'],
       ),
@@ -747,14 +761,18 @@ class KugouSongDetail {
             json2['trans_param']?['ogg_128_hash'],
       ),
       lyrics: _strNull(json2['lyrics'] ?? json2['Lyrics'] ?? json2['Lyric']),
+      // 候选链只收 MixSongID/album_audio_id 同域键。禁止把 `Audioid`/`audio_id`
+      // 当兜底：/audio（kmr）响应里的 audio_id 与 MixSongID 是不同 ID 域，
+      // 误用时 /song/url 的 album_audio_id 参数会解析到无关音源
+      // （issue #216：按 hash 播《野心家》实播 48 分钟口播）。
+      // 正确 ID 由调用方（如 MCP getSongDetail）用同 hash 搜索候选补齐。
+      // 同类隐患：KugouComment.mixSongId 的 audio_id 兜底（评论域，暂不改）。
       albumAudioId: _strNull(
         json2['album_audio_id'] ??
             json2['AlbumAudioID'] ??
             json2['MixSongID'] ??
             json2['mixsongid'] ??
-            json2['add_mixsongid'] ??
-            json2['Audioid'] ??
-            json2['audio_id'],
+            json2['add_mixsongid'],
       ),
       artworkUri: _resolveArtworkUri(
         json2['sizable_cover'] ??
@@ -788,10 +806,7 @@ class KugouSongDetail {
   }
 
   Song toSong() {
-    // 清理 title：API 的 filename/songname 常返回 "歌手 - 歌曲名" 格式，
-    // 去掉前缀，只保留纯歌曲名（subtitle 已单独显示歌手和专辑）。
-    // 只用 " - "（空格-破折号-空格）作为分隔符，避免误剥含有连字符的歌名
-    // （如 "白菊 -shiragiku-"）。与 EchoMusic processSongTitle 实现一致。
+    // 仅删除与接口歌手字段匹配的前缀，保留歌名中的 " - "（如版本后缀）。
     var cleanTitle = songName;
     // 歌手名兜底：当 API 未返回歌手字段时，从 "歌手 - 歌曲名" 格式的
     // 文件名中提取歌手。与 EchoMusic song.ts 实现一致。
@@ -800,10 +815,10 @@ class KugouSongDetail {
         songName.contains(' - ')) {
       resolvedArtist = songName.split(' - ')[0];
     }
-    if (cleanTitle.contains(' - ')) {
-      final parts = cleanTitle.split(' - ');
-      if (parts.length > 1) {
-        final rest = parts.sublist(1).join(' - ');
+    if (artistName != null && artistName!.trim().isNotEmpty) {
+      final prefix = '${artistName!} - ';
+      if (cleanTitle.startsWith(prefix)) {
+        final rest = cleanTitle.substring(prefix.length);
         if (rest.trim().isNotEmpty) {
           cleanTitle = rest;
         }
@@ -1603,7 +1618,7 @@ class KugouArtistVideos {
     } catch (e) {
       // 真机定位上游字段名用，不能静默吞掉
       // ignore: avoid_print
-      print('[ArtistMvDebug] parse error: $e, raw: $json');
+      debugPrint('[ArtistMvDebug] parse error: $e, raw: $json');
       rethrow;
     }
   }
@@ -2454,7 +2469,7 @@ class KugouUserVipDetail {
                 // 概念版VIP: product_type 为 "svip"
                 final pt = b['product_type']?.toString() ?? '';
                 final isConcept = pt == 'svip';
-                print(
+                debugPrint(
                   '[VIP_DEBUG] product_type=$pt isConcept=$isConcept end_time=$t',
                 );
                 if (isConcept) {

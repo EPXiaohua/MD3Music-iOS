@@ -81,6 +81,7 @@ void main() {
     svc.usbOrDirectPcmActive = () => false;
     svc.crossfadeEnabled = () => false;
     svc.rebuildRequester = null;
+    await svc.setSwipeExitEnabled(false);
     await svc.setEnabled(false);
     pushed.clear();
   }
@@ -105,6 +106,20 @@ void main() {
     // 持久化键契约：下一次启动要能恢复
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.getBool(AudioOffloadService.keyEnabled), isTrue);
+  });
+
+  test('划掉退出开启时硬解立即让路，关闭后恢复', () async {
+    await svc.setEnabled(true);
+    expect(svc.effective, isTrue);
+
+    await svc.setSwipeExitEnabled(true);
+    expect(svc.effective, isFalse);
+    expect(svc.yieldReason, '划掉后台自动退出已开启');
+    expect(pushed.last, isFalse);
+
+    await svc.setSwipeExitEnabled(false);
+    expect(svc.effective, isTrue);
+    expect(pushed.last, isTrue);
   });
 
   test('冲突条件命中：让路原因为中文文案，且立即下发关闭', () async {

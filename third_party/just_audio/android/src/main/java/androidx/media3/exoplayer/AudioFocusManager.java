@@ -287,6 +287,20 @@ public final class AudioFocusManager {
    */
   public @PlayerCommand int updateAudioFocus(
       boolean playWhenReady, @Player.State int playbackState) {
+    // MD3Music fork: 忽略模式（「允许与其他应用同时播放音频」）——彻底退出焦点
+    // 体系：不申请、不持有、不响应。此前 ignore 只跳过了内置响应（不 duck/暂停/
+    // abandon），但切歌（setMediaItem 的 IDLE 态 abandon + play 的 request GAIN）
+    // 仍会向系统发焦点请求，把 B 站等其它持有者踢成 LOSS 并暂停（issue #229，
+    // HarmonyOS 真机 logcat：abandon → request req=1 → removeFocus → 对方 -1）。
+    // 主动权在我们：入口拦截后共存模式下永远不发生 request，其它 app 不受影响。
+    // 若切模式前已持焦点，此处补一次 abandon 干净退出；状态置 NOT_REQUESTED，
+    // 后续 release/abandonAudioFocusIfHeld 均为空操作。拔耳机 becomingNoisy、
+    // 车机/蓝牙 MediaSession 路由不依赖音频焦点，均不受影响。
+    if (ignoreAudioFocus) {
+      abandonAudioFocusIfHeld();
+      setAudioFocusState(AUDIO_FOCUS_STATE_NOT_REQUESTED);
+      return PLAYER_COMMAND_PLAY_WHEN_READY;
+    }
     if (!shouldHandleAudioFocus(playbackState)) {
       abandonAudioFocusIfHeld();
       setAudioFocusState(AUDIO_FOCUS_STATE_NOT_REQUESTED);

@@ -4,17 +4,24 @@ import '../core/theme/app_dimens.dart';
 import '../providers/player_provider.dart';
 import 'player_seek_bar.dart';
 
-/// 时间行提示的显示模型：只看「缓冲中」与「音频过渡中」两条。
+/// 时间行提示的显示模型：只看「缓冲中」「音频过渡中」「伴唱加载中」「伴唱中」四条。
 ///
 /// 纯逻辑收在这里（同 `PlaybackStatusFeedbackState` 的做法），判定矩阵可以不碰
 /// Provider / 音频服务直接单测。
 class PlaybackHintState {
-  const PlaybackHintState._({required this.buffering, required this.fading});
+  const PlaybackHintState._({
+    required this.buffering,
+    required this.fading,
+    required this.accompanying,
+    required this.accompanyLoading,
+  });
 
   factory PlaybackHintState.resolve({
     required bool streamBuffering,
     required bool hasError,
     required bool crossfading,
+    bool accompanying = false,
+    bool accompanyLoading = false,
   }) {
     return PlaybackHintState._(
       // 只看「音频数据到没到位」，刻意不看 isPlaying：拖动进度条后播放器是被
@@ -23,6 +30,10 @@ class PlaybackHintState {
       // `PlayerProvider.isStreamBuffering` 从处理态上排除。
       buffering: streamBuffering && !hasError,
       fading: crossfading,
+      // 加载阶段与「伴唱中」互斥：同一时刻只显示一条伴唱相关提示，
+      // 否则会出现「伴唱加载中 + 伴唱中」并列的矛盾文案。
+      accompanyLoading: accompanyLoading,
+      accompanying: accompanying && !accompanyLoading,
     );
   }
 
@@ -32,25 +43,35 @@ class PlaybackHintState {
   /// 交叉淡化（「音频过渡」）进行中。
   final bool fading;
 
-  bool get visible => buffering || fading;
+  /// 伴唱模式开启中（伴奏轨与原曲并行播放）。
+  final bool accompanying;
+
+  /// 伴唱正在加载（匹配伴奏 / 解析地址 / 装载音频轨）。
+  final bool accompanyLoading;
+
+  bool get visible =>
+      buffering || fading || accompanying || accompanyLoading;
 }
 
-/// 播放页进度条时间行中央的两条瞬时状态提示。
+/// 播放页进度条时间行中央的瞬时状态提示。
 ///
 /// - 「缓冲中」：音频流正在准备数据（解析地址 / 装载 / 缓冲，
 ///   `PlayerProvider.isStreamBuffering`），或已下发播放命令但平台迟迟没出声
 ///   （`PlayerProvider.isWaitingForAudioStart`，桌面端起播/定位延迟的兜底口径）。
 /// - 「音频过渡中」：交叉淡化（crossfade / AutoMix 的淡入斜坡）正在进行。
+/// - 「伴唱加载中」：点击伴唱后匹配伴奏 / 解析地址 / 装载伴唱轨的阶段。
+/// - 「伴唱中」：伴唱已就绪并出声。
 ///
-/// 两者可同时出现：各包一层圆角矩形，作为一组整体居中于左右两个时间数字之间。
+/// 这些提示可同时出现：各包一层圆角矩形，作为一组整体居中于左右两个时间数字之间。
 /// 位置与几何由调用点交给 [PlayerSeekBar.labelRowHints]，本文件只负责"显示什么、
 /// 长什么样"。
 ///
 /// 返回 null 表示当前没有提示 —— 调用点据此**不传**插槽，时间行保持改动前的
 /// 14dp 定高形态（有无提示不改变进度条总高，页面 chrome 不会上下抖）。
 ///
-/// 前置条件：调用点必须把 [PlayerProvider.crossfadeActiveNotifier] 并入自己
-/// 触发重建的 Listenable（进度条那一段），否则淡化起止不会重算；
+/// 前置条件：调用点必须把 [PlayerProvider.crossfadeActiveNotifier]、
+/// [PlayerProvider.accompanyActiveNotifier]、[PlayerProvider.accompanyLoadingNotifier]
+/// 并入自己触发重建的 Listenable（进度条那一段），否则起止不会重算；
 /// 「缓冲中」跟随 provider 的低频通知与位置节拍刷新，无需额外接线。
 Widget? playerHintPillsFor(PlayerProvider player, {required bool amStyle}) {
   // 「缓冲中」= 平台在装数据 **或** 已下发播放命令但迟迟没出声。
@@ -64,12 +85,14 @@ Widget? playerHintPillsFor(PlayerProvider player, {required bool amStyle}) {
     // 有错误在展示时不报「缓冲中」：上方 PlaybackStatusFeedback 的错误条才是当时的真话。
     hasError: player.resolveErrorForDisplay != null,
     crossfading: player.crossfadeActiveNotifier.value,
+    accompanying: player.accompanyActiveNotifier.value,
+    accompanyLoading: player.accompanyLoadingNotifier.value,
   );
   if (!state.visible) return null;
   return PlaybackHintPills(state: state, amStyle: amStyle);
 }
 
-/// 提示胶囊组：1~2 枚圆角矩形并排（`mainAxisSize: min`），由宿主居中。
+/// 提示胶囊组：1~3 枚圆角矩形并排（`mainAxisSize: min`），由宿主居中。
 class PlaybackHintPills extends StatelessWidget {
   const PlaybackHintPills({
     super.key,
@@ -83,6 +106,12 @@ class PlaybackHintPills extends StatelessWidget {
   /// 「音频过渡中」文案。
   static const String transitionLabel = '音频过渡中';
 
+  /// 「伴唱加载中」文案。
+  static const String accompanyLoadingLabel = '伴唱加载中';
+
+  /// 「伴唱中」文案。
+  static const String accompanyingLabel = '伴唱中';
+
   final PlaybackHintState state;
 
   /// AM 深色皮肤：与 `DockSkin.am` / `PlaybackStatusFeedback(amStyle: true)`
@@ -94,6 +123,8 @@ class PlaybackHintPills extends StatelessWidget {
     final labels = <String>[
       if (state.buffering) bufferingLabel,
       if (state.fading) transitionLabel,
+      if (state.accompanyLoading) accompanyLoadingLabel,
+      if (state.accompanying) accompanyingLabel,
     ];
     if (labels.isEmpty) return const SizedBox.shrink();
     return Row(

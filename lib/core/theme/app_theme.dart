@@ -1,28 +1,36 @@
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 
-import '../widgets/app_background.dart';
+import '../../providers/theme_provider.dart';
 
-/// 仅在路由过渡中遮住旧页面；静止后交给 MaterialApp.builder 的唯一全局壁纸。
-/// 保持节点挂载，避免动画两端切换背景子树导致页面重新挂载。
-Widget _transitionBackground(
-  Animation<double> animation,
+bool _usesWallpaper(BuildContext context) =>
+    context.watch<ThemeProvider?>()?.useBackgroundImage ??
+    (Theme.of(context).scaffoldBackgroundColor == Colors.transparent);
+
+/// 壁纸只由 MaterialApp.builder 绘制，转场不再临时叠加局部背景。
+/// 与单栏详情路由相同：避让被覆盖的旧页面，返回结束后再显示，防止串影。
+Widget _wallpaperSafeTransition(
+  BuildContext context,
+  PageRoute<dynamic> route,
   Animation<double> secondaryAnimation,
-) => AnimatedBuilder(
-  animation: Listenable.merge([animation, secondaryAnimation]),
-  builder: (context, child) => Opacity(
-    opacity: animation.value < 1 || secondaryAnimation.isAnimating ? 1 : 0,
+  Widget child,
+) {
+  final wallpaper = _usesWallpaper(context);
+  if (!wallpaper) return child;
+  return AnimatedBuilder(
+    animation: secondaryAnimation,
     child: child,
-  ),
-  child: const AppBackground(),
-);
+    builder: (context, content) => Offstage(
+      // 预测性返回仍允许框架预览上一页，不干预系统手势。
+      offstage: secondaryAnimation.status != AnimationStatus.dismissed &&
+          !route.popGestureInProgress,
+      child: content,
+    ),
+  );
+}
 
-/// 路由过渡：M3 FadeForwards 动效 + 过渡期背景遮罩。
-///
-/// 启用全局背景图时页面背景透明，路由过渡中新旧页面内容会叠加重叠。
-/// 转场时给每个 MaterialPageRoute 的 child 内嵌 [AppBackground]，
-/// 遮住下层旧页面；静止后停止绘制，避免嵌套路由把同一壁纸叠加多次。
 class _BgSafeFadeForwardsBuilder extends PageTransitionsBuilder {
   const _BgSafeFadeForwardsBuilder();
 
@@ -33,35 +41,15 @@ class _BgSafeFadeForwardsBuilder extends PageTransitionsBuilder {
     Animation<double> animation,
     Animation<double> secondaryAnimation,
     Widget child,
-  ) {
-    // 背景只在过渡期作为页面底层，随 FadeForwards 一起滑动/淡入。
-    final withBg = Stack(
-      fit: StackFit.expand,
-      children: [
-        _transitionBackground(animation, secondaryAnimation),
-        child,
-      ],
-    );
-    // FadeForwards 基础动效：新页面右侧滑入 + 淡入（无白色屏障层）
-    return FadeForwardsPageTransitionsBuilder().buildTransitions(
-      route,
-      context,
-      animation,
-      secondaryAnimation,
-      withBg,
-    );
-  }
+  ) => _wallpaperSafeTransition(
+    context, route, secondaryAnimation,
+    const FadeForwardsPageTransitionsBuilder().buildTransitions(
+      route, context, animation, secondaryAnimation, child,
+    ),
+  );
 }
 
-/// 路由过渡：Android 预测性返回（共享元素）动效 + 页面自带背景。
-///
-/// 背景内嵌策略与 [_BgSafeFadeForwardsBuilder] 完全一致，仅把基础动效换成
-/// material_ui 的 [PredictiveBackPageTransitionsBuilder]：系统返回手势期间
-/// 实时预览上一页，松手完成、拖回边缘取消；非手势 pop（按钮 / 三键 /
-/// 不支持的机型）自动回退 FadeForwards。
-/// 对 [PopScope.canPop] == false、首页路由、过渡中的路由，框架
-/// （Route.popGestureEnabled）不会启动预测动画，天然落回各页现有返回逻辑
-/// （播放页收起动画、双击返回退出等），无需在此处理。
+/// 保留 Android 的预测性返回，普通返回同样共享唯一全局壁纸。
 class BgSafePredictiveBackBuilder extends PageTransitionsBuilder {
   const BgSafePredictiveBackBuilder();
 
@@ -72,21 +60,33 @@ class BgSafePredictiveBackBuilder extends PageTransitionsBuilder {
     Animation<double> animation,
     Animation<double> secondaryAnimation,
     Widget child,
+  ) => _wallpaperSafeTransition(
+    context, route, secondaryAnimation,
+    const PredictiveBackPageTransitionsBuilder().buildTransitions(
+      route, context, animation, secondaryAnimation, child,
+    ),
+  );
+}
+
+/// 桌面壁纸模式不走会绘制实色遮罩的 Zoom 转场；非壁纸模式保持原样。
+class _BgSafeDesktopBuilder extends PageTransitionsBuilder {
+  const _BgSafeDesktopBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
   ) {
-    // 背景仅在过渡期入场（与 FadeForwards 版同策略）。
-    final withBg = Stack(
-      fit: StackFit.expand,
-      children: [
-        _transitionBackground(animation, secondaryAnimation),
-        child,
-      ],
-    );
-    return const PredictiveBackPageTransitionsBuilder().buildTransitions(
-      route,
-      context,
-      animation,
-      secondaryAnimation,
-      withBg,
+    if (!_usesWallpaper(context)) {
+      return const ZoomPageTransitionsBuilder().buildTransitions(
+        route, context, animation, secondaryAnimation, child,
+      );
+    }
+    return const _BgSafeFadeForwardsBuilder().buildTransitions(
+      route, context, animation, secondaryAnimation, child,
     );
   }
 }
@@ -251,14 +251,15 @@ class AppTheme {
       useMaterial3: true,
       colorScheme: colorScheme,
       brightness: brightness,
-      // 全局路由过渡：Android 用 FadeForwards（滑动 + 淡入）+ 过渡期间
-      // 背景遮罩（避免透明页面过渡重叠，完成后再露出背景图）。
+      // 壁纸模式共享全局背景，避免转场临时背景交接时闪色。
       // 其余平台（iOS/macOS）保留系统默认 Cupertino 过渡。
       pageTransitionsTheme: PageTransitionsTheme(
         builders: {
           TargetPlatform.android: predictiveBack
               ? const BgSafePredictiveBackBuilder()
               : const _BgSafeFadeForwardsBuilder(),
+          TargetPlatform.windows: const _BgSafeDesktopBuilder(),
+          TargetPlatform.linux: const _BgSafeDesktopBuilder(),
         },
       ),
       // fontFamily 为 null 时，Flutter 会走系统字体链（Android 上是 Roboto +

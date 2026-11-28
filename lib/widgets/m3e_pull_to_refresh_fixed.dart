@@ -1,4 +1,7 @@
+import 'dart:async';
 import 'dart:math' as math;
+import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:motor/motor.dart';
@@ -140,6 +143,17 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
 
   bool _isAnimating = false;
 
+  // 鼠标滚轮路径（Windows）支持：pointerScroll 在边界处不派发任何滚动
+  // 通知，且其通知 dragDetails 恒为 null，通知链无法感知滚轮下拉。
+  // 详见 _handlePointerSignal 与 W8 专题。
+  // 初始为 true：列表默认停在顶部，静止时没有任何滚动通知可以更新它；
+  // 后续由通知链按 metrics.extentBefore 持续纠偏。
+  bool _isAtTop = true;
+  Timer? _wheelIdleTimer;
+  // 滚轮停止滚动后判定"松手"的空闲时长。参照 coverflow 滚轮 120ms
+  // 判停惯例，下拉动作节奏更慢故取 200ms。
+  static const Duration _wheelIdleDuration = Duration(milliseconds: 200);
+
   double get _effectiveTriggerDistance =>
       widget.triggerDistance ?? widget.style?.triggerDistance ?? 80.0;
 
@@ -197,6 +211,7 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
   @override
   void dispose() {
     widget.controller?.detach();
+    _wheelIdleTimer?.cancel();
     _motionCtrl.dispose();
     super.dispose();
   }
@@ -221,10 +236,16 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
         widget.notificationPredicate ?? _defaultNotificationPredicate;
     if (!predicate(notification)) return;
 
+    // 任意通知都顺带维护"是否在列表顶部"——滚轮路径没有通知可依赖，
+    // 需要由通知链反向喂状态供 _handlePointerSignal 使用。
+    _isAtTop = notification.metrics.extentBefore == 0;
+
     if (_isRefreshing) return;
     if (notification is ScrollStartNotification) {
       if (notification.metrics.extentBefore == 0 &&
           notification.dragDetails != null) {
+        // 真实拖拽（触摸/触控板）开始：接管手势，取消滚轮空闲判停。
+        _wheelIdleTimer?.cancel();
         _isDragging = true;
         _hasTriggeredHaptic = false;
       }
@@ -261,6 +282,53 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
       _isDragging = false;
       _onDragEnd();
     }
+  }
+
+  /// 鼠标滚轮支持（Windows 桌面端，参照 W8 专题）。
+  ///
+  /// 滚轮是 `PointerSignalEvent`，不走拖拽手势竞技场；且 Flutter 的
+  /// `ScrollPosition.pointerScroll` 会把目标位置 clamp 到 min/maxScrollExtent，
+  /// 在列表顶部向上滚轮时**一条滚动通知都不派发**（派发的通知 dragDetails
+  /// 也恒为 null），通知链无法感知——触控板（PointerPanZoom 拖拽路径）正常、
+  /// 鼠标滚轮拉不出指示器即由此而来。因此必须在通知链之外直接拦截滚轮：
+  ///
+  /// - 滚轮向下（dy < 0，往回拉）且列表在顶部：视作下拉拖拽，复用
+  ///   [_updateDragDistance] 累积距离（指示器/形变/触感与拖拽路径一致），
+  ///   并重置空闲 Timer，停轮 200ms 后按是否达阈值走触发/回弹。
+  /// - 滚轮向上（dy > 0）不拦截，真实滚动仍由 Scrollable 处理；距离缩短
+  ///   由既有 ScrollUpdate/ScrollEnd 分支自然衔接。
+  /// - Shift+滚轮按 W8 规则让位横向轴（PlayerTabPager 等）。
+  /// - `PointerScrollEvent` 仅鼠标滚轮产生（触控板走 PointerPanZoom），
+  ///   两条路径不会叠加触发。
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    // Shift+滚轮让位横向轴（与 Scrollable._pointerSignalEventDelta 同口径）。
+    if (HardwareKeyboard.instance.logicalKeysPressed
+        .contains(LogicalKeyboardKey.shiftLeft) ||
+        HardwareKeyboard.instance.logicalKeysPressed
+            .contains(LogicalKeyboardKey.shiftRight)) {
+      return;
+    }
+    if (_isRefreshing) return;
+    if (!_isAtTop) return;
+
+    final double dy = event.scrollDelta.dy;
+    if (dy < 0) {
+      // 滚轮向下 = 往回拉 = 下拉方向。
+      _wheelIdleTimer?.cancel();
+      _isDragging = true;
+      _hasTriggeredHaptic = false;
+      _updateDragDistance(
+        _rawDistancePulled + (-dy) * _effectiveDragResistance,
+      );
+      _wheelIdleTimer = Timer(_wheelIdleDuration, () {
+        if (_isDragging && !_isRefreshing) {
+          _isDragging = false;
+          _onDragEnd();
+        }
+      });
+    }
+    // dy > 0（滚轮向上）：不拦截，交给 Scrollable 正常滚动列表。
   }
 
   double _calculateVerticalOffset(double distancePulled) {
@@ -414,33 +482,39 @@ class _M3EPullToRefreshIndicatorState extends State<M3EPullToRefreshIndicator>
         _handleScrollNotification(notification);
         return false;
       },
-      child: Column(
-        children: [
-          if (widget.edgeOffset > 0) SizedBox(height: widget.edgeOffset),
-          if (headerHeight > 0.5)
-            SizedBox(
-              height: headerHeight,
-              width: double.infinity,
-              child: ClipRect(
-                child: Center(
-                  child: OverflowBox(
-                    minWidth: 0.0,
-                    maxWidth: double.infinity,
-                    minHeight: 0.0,
-                    maxHeight: double.infinity,
-                    child: Opacity(
-                      opacity: visualProgress,
-                      child: Transform.scale(
-                        scale: 0.6 + (0.4 * visualProgress),
-                        child: containerWidget,
+      // W8：滚轮是 PointerSignalEvent，须在最外层 Listener 拦截；
+      // behavior 必须 opaque，否则间隙（无绘制内容）处事件整个丢失。
+      child: Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerSignal: _handlePointerSignal,
+        child: Column(
+          children: [
+            if (widget.edgeOffset > 0) SizedBox(height: widget.edgeOffset),
+            if (headerHeight > 0.5)
+              SizedBox(
+                height: headerHeight,
+                width: double.infinity,
+                child: ClipRect(
+                  child: Center(
+                    child: OverflowBox(
+                      minWidth: 0.0,
+                      maxWidth: double.infinity,
+                      minHeight: 0.0,
+                      maxHeight: double.infinity,
+                      child: Opacity(
+                        opacity: visualProgress,
+                        child: Transform.scale(
+                          scale: 0.6 + (0.4 * visualProgress),
+                          child: containerWidget,
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
-          Expanded(child: widget.child),
-        ],
+            Expanded(child: widget.child),
+          ],
+        ),
       ),
     );
   }

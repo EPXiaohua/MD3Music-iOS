@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import '../../data/models/song.dart';
 import '../../core/build_flags.dart';
 import '../../core/layout/adaptive_navigator.dart';
+import '../../core/utils/app_toast.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/utils/app_text_context_menu.dart';
 import '../../core/utils/entry_transition_gate.dart';
@@ -56,6 +57,9 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
   int _audioPage = 1;
   bool _hasMoreAudio = false;
   bool _loadingMore = false;
+  /// 全章节自动加载是否中途失败（某页请求失败时为 true，
+  /// footer 显示重试入口，续传从 _audioPage + 1 继续）。
+  bool _loadAllIncomplete = false;
 
   // 排序（默认按章节原始顺序正序：第 1 集在最上面）
   _SortBy _sortBy = _SortBy.time;
@@ -183,9 +187,12 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
 
   /// 自动加载全部章节：循环请求后续页并追加，直到 hasMore=false 或页面销毁。
   /// 期间 _loadingMore 置位，滚动触发的 _loadMoreAudios 会被 guard 拦截，避免并发。
+  /// 某页请求失败（provider 返回 null 不前进页码）时置 [_loadAllIncomplete]，
+  /// footer 显示重试入口，不再静默停在部分数据。
   Future<void> _loadAllAudios() async {
     if (!mounted) return;
     if (!_hasMoreAudio) {
+      _loadAllIncomplete = false;
       return;
     }
     if (_loadingMore) return;
@@ -209,13 +216,23 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
         _invalidateDisplaySongs();
         // 请求失败时 provider 不更新页码（_audioPage 未前进），停止避免死循环。
         // 注意：必须在同步之后判断，否则首次循环 _audioPage 恒等于 prevPage 会误 break。
-        if (_audioPage == prevPage) break;
+        if (_audioPage == prevPage) {
+          // 中途失败：标记不完整，footer 提供重试续传（保持 _hasMoreAudio=true）
+          setState(() => _loadAllIncomplete = true);
+          break;
+        }
       }
     } finally {
       if (mounted) {
         setState(() => _loadingMore = false);
       }
     }
+  }
+
+  /// 「章节未加载完整」重试：从断点页继续自动加载。
+  Future<void> _retryLoadAll() async {
+    setState(() => _loadAllIncomplete = false);
+    await _loadAllAudios();
   }
 
   /// 滚动到底时加载下一页章节，追加到现有列表（自动翻页）。
@@ -242,9 +259,11 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
 
   /// 将章节列表转换为 Song 列表：仅展示可播放（免费/限免）章节，
   /// 付费章节（列表接口 fail_process 非 0，模型 canPlay=false）直接隐藏不显示。
+  /// 按 id 去重：防御分页追加时服务端重复返回同一章节。
   List<Song> _buildSongs(List<KugouLongAudioAudio> audios) {
+    final seen = <String>{};
     final list = audios
-        .where((a) => a.canPlay)
+        .where((a) => a.canPlay && seen.add(a.id))
         .map(
           (a) => Song(
             id: a.id,
@@ -309,11 +328,16 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
             s.artist.toLowerCase().contains(q);
       }).toList();
     }
+    // 预建 id→下标 map：「章节顺序」排序用原列表位置做键，避免 O(N²)。
+    final rank = <String, int>{
+      for (var i = 0; i < _songs.length; i++) _songs[i].id: i,
+    };
+    int indexRank(Song song) => rank[song.id] ?? _songs.length;
     list.sort((a, b) {
       int cmp;
       switch (_sortBy) {
         case _SortBy.time:
-          cmp = _songs.indexOf(a).compareTo(_songs.indexOf(b));
+          cmp = indexRank(a).compareTo(indexRank(b));
           break;
         case _SortBy.title:
           cmp = a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
@@ -339,15 +363,27 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
   /// 可播放章节（当前显示列表均为免费/限免章节，付费章节已被 _buildSongs 过滤）。
   List<Song> get _playableSongs => _displaySongs;
 
+  /// 章节仍在自动加载（或上次加载中断未完成）时给出轻提示，
+  /// 避免用户误把已载子集当成完整章节列表。
+  void _warnIfLoadingIncomplete() {
+    if (_loadingMore) {
+      showToast('章节仍在加载，播放列表以后续加载为准');
+    } else if (_loadAllIncomplete) {
+      showToast('章节未加载完整，可在列表底部重试');
+    }
+  }
+
   void _playAll() {
     final songs = _playableSongs;
     if (songs.isEmpty) return;
+    _warnIfLoadingIncomplete();
     context.read<PlayerProvider>().playOnlinePlaylist(songs, 0);
   }
 
   void _playShuffle() {
     final songs = _playableSongs;
     if (songs.isEmpty) return;
+    _warnIfLoadingIncomplete();
     final shuffled = List<Song>.from(songs)..shuffle();
     context.read<PlayerProvider>().playOnlinePlaylist(shuffled, 0);
   }
@@ -579,10 +615,10 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
                             childCount: displaySongs.length,
                           ),
                         ),
-                        // 加载更多 footer（滚动到底自动翻页）
+                        // 加载更多 footer（滚动到底自动翻页 / 不完整重试）
                         if (_audios.isNotEmpty)
                           SliverToBoxAdapter(
-                            child: _buildLoadMoreFooter(),
+                            child: _buildLoadMoreFooter(cs, tt),
                           ),
                     ],
                   ),
@@ -925,8 +961,35 @@ class _AudiobookAlbumDetailPageState extends State<AudiobookAlbumDetailPage> {
     );
   }
 
-  /// 加载更多 footer：仅加载中转圈（滚动到底自动翻页用）。
-  Widget _buildLoadMoreFooter() {
+  /// 加载更多 footer：加载中转圈 / 不完整时显示重试入口
+  /// （滚动到底自动翻页 + 全量加载中断点续传）。
+  Widget _buildLoadMoreFooter(ColorScheme cs, TextTheme tt) {
+    if (_loadAllIncomplete && !_loadingMore) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.cloud_off_outlined,
+              size: 16,
+              color: cs.onSurfaceVariant,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                '章节未加载完整',
+                style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+              ),
+            ),
+            TextButton(
+              onPressed: _retryLoadAll,
+              child: const Text('重试'),
+            ),
+          ],
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 14),
       child: Center(

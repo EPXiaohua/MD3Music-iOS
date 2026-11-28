@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
@@ -43,14 +41,12 @@ class GithubReleaseClient implements ReleaseSource {
             ),
           );
 
-  /// 检测目标：Android 走上游安卓仓库，iOS 走移植仓库（各自发布各自的包：
-  /// APK / 未签名 IPA）。换仓库只改这里的分支。
-  static String get owner => Platform.isIOS ? 'EPXiaohua' : 'zzyoxml';
-  static String get repo => Platform.isIOS ? 'MD3Music-iOS' : 'md3Music';
+  /// 检测目标（唯一来源；换仓库只改这两行）
+  static const String owner = 'zzyoxml';
+  static const String repo = 'md3Music';
 
   /// GitHub 要求 User-Agent 非空，显式声明产品标识避免被拒。
-  static String get userAgent =>
-      Platform.isIOS ? 'MD3Music-iOS' : 'MD3Music-Android';
+  static const String userAgent = 'MD3Music';
 
   static final Uri apiLatestUri = Uri.parse(
     'https://api.github.com/repos/$owner/$repo/releases/latest',

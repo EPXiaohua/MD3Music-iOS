@@ -1,3 +1,4 @@
+import '../../core/build_flags.dart';
 import '../../core/theme/app_dimens.dart';
 import '../../core/layout/page_layout.dart';
 import '../../main.dart' show requestPermissions;
@@ -84,7 +85,8 @@ class UserAgreementPage extends StatefulWidget {
 
 class _UserAgreementPageState extends State<UserAgreementPage>
     with CarModePanelSuppressor<UserAgreementPage> {
-  bool _agreed = false;
+  // 默认勾选：协议页只在首启/复看时出现，默认勾上省去一次手动点击。
+  bool _agreed = true;
 
   /// SharedPreferences key：标记用户已同意协议。
   /// 设置后下次冷启动不再展示。
@@ -104,7 +106,9 @@ class _UserAgreementPageState extends State<UserAgreementPage>
   }
 
   Future<void> _onAgree() async {
-    if (!_agreed) return;
+    // 按下确认即视为同意：TV 遥控器在勾选框上按 OK 会取消勾选，
+    // 若因此禁用按钮，焦点就再也落不到「下一步」（禁用按钮不可聚焦）。
+    if (!_agreed) setState(() => _agreed = true);
     // 持久化同意标记
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -288,7 +292,10 @@ class _UserAgreementPageState extends State<UserAgreementPage>
                           SizedBox(
                             width: double.infinity,
                             child: FilledButton(
-                              onPressed: _agreed ? _onAgree : null,
+                              // TV：主动作拿首焦点，避免首停点落在勾选框上
+                              autofocus: kTvBuild,
+                              // 始终可点：按下即自动勾选并同意协议
+                              onPressed: _onAgree,
                               style: FilledButton.styleFrom(
                                 padding:
                                     const EdgeInsets.symmetric(vertical: 14,

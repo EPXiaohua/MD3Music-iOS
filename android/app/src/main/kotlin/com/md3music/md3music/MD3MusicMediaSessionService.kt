@@ -27,7 +27,18 @@ import com.ryanheise.just_audio.AudioPlayer
  */
 @OptIn(UnstableApi::class)
 @SuppressLint("UnsafeOptInUsageError")
-class MD3MusicMediaSessionService : MediaSessionService() {
+class MD3MusicMediaSessionService : MediaSessionService(), AudioPlayer.ActiveMediaSessionHost {
+
+    private var vivoBootstrapSession: VivoBootstrapSession? = null
+
+    override fun onActiveMediaSessionChanged(session: MediaSession?) {
+        vivoBootstrapSession?.follow(session)
+        // 冷绑定 token 留给已经连接的原子组件，但不再参与宿主的通知竞争。
+        if (session != null) {
+            vivoBootstrapSession?.session?.let { if (isSessionAdded(it)) removeSession(it) }
+        }
+    }
+
 
     /** 连车唤醒：外部 bind 且无活跃会话时自动拉起+续播（咪咕式），默认开 */
     private var autoWakeEnabled = true
@@ -37,6 +48,8 @@ class MD3MusicMediaSessionService : MediaSessionService() {
     private var lastCarWakeAt = -15_000L
 
     override fun onCreate() {
+        // 「划掉后台自动退出」：独立 stopWithTask 服务监听系统任务移除。
+        SwipeExitPolicy.startTaskRemovalService(applicationContext)
         // 所有机型都安装本 App 的媒体通知 Provider：底层仍是 media3 默认实现，额外做两件事
         // —— 统一设单色小图标（所有机型保留）；仅 Flyme 系把歌词写进媒体通知的 tickerText。
         // 必须在 onCreate() 返回前设置（fork 源码 MediaSessionService:594 的约束）。
@@ -51,7 +64,8 @@ class MD3MusicMediaSessionService : MediaSessionService() {
         // 岛在能力位放行后会经 MediaBrowserServiceCompat 绑定来取列表（真机实证：
         // external bind action=android.media.browse.MediaBrowserService），而我们
         // legacy stub 的默认实现是 sendResult(null)（恒空）——这里注入真实内容：
-        // 当前播放列表 / 收藏列表 / 下载列表（分页键 vivomusicmix_key_media_page）。
+        // 当前播放列表 / 云端收藏 / 本地音乐（岛面板标签为「播放列表 / 收藏 /
+        // 下载列表」，分页键 vivomusicmix_key_media_page）。
         // 数据由 Dart 主动推送（VivoMixLibrary 内存快照），不在 binder 回调里回拉。
         setLegacyBrowseChildrenProvider { parentId, options ->
             VivoMixLibrary.buildChildren(parentId, options)
@@ -68,27 +82,54 @@ class MD3MusicMediaSessionService : MediaSessionService() {
         val hookAppContext = applicationContext
         vivoMixPlayHook =
             androidx.media3.session.MediaSessionService.PlayFromMediaIdHook { mediaId ->
-                if (mediaId.isNullOrEmpty()) {
-                    false
-                } else {
-                    // v41：当前播放树的 mediaId 是 `title|artist` 口径（与岛高亮
-                    // 匹配一致），不带来源前缀——含 '|' 的也一并拦截；其余按前缀。
-                    val starts = mediaId.startsWith(VivoMixLibrary.SOURCE_CURRENT + ":") ||
-                        mediaId.startsWith(VivoMixLibrary.SOURCE_FAVORITE + ":") ||
-                        mediaId.startsWith(VivoMixLibrary.SOURCE_LOCAL + ":") ||
-                        mediaId.contains('|')
-                    if (starts) {
+                when {
+                    mediaId.isNullOrEmpty() -> false
+                    // v67：legacy 搜索候选回播。mediaId 形如 `md3srch:<序号>`（不透明，
+                    // 桥接端只应原样回传）。查不到（进程重启 / TTL 过期）也**必须消费**：
+                    // 默认实现会把 md3srch: 当 mediaId 塞进 ExoPlayer，播不出且污染
+                    // media3 时间线；失效提示交给 Dart 侧 toast。
+                    mediaId.startsWith(BrowseSearchRegistry.MEDIA_ID_PREFIX) -> {
+                        val payload = BrowseSearchRegistry.payloadOf(mediaId)
                         val intent = Intent(hookAppContext, AudioPlaybackService::class.java)
-                            .setAction(AudioPlaybackService.ACTION_VIVO_MIX_PLAY)
-                            .putExtra(AudioPlaybackService.EXTRA_VIVO_MIX_MEDIA_ID, mediaId)
+                            .setAction(AudioPlaybackService.ACTION_SEARCH_ITEM_PLAY)
+                        if (payload != null) {
+                            intent.putExtra(
+                                AudioPlaybackService.EXTRA_SEARCH_ITEM_PAYLOAD,
+                                payloadToBundle(payload),
+                            )
+                        } else {
+                            intent.putExtra(
+                                AudioPlaybackService.EXTRA_SEARCH_ITEM_EXPIRED,
+                                true,
+                            )
+                        }
                         try {
                             hookAppContext.startService(intent)
                         } catch (t: Throwable) {
-                            Log.w("CarAutoResume", "vivo mix play forward failed", t)
+                            Log.w("CarAutoResume", "search item play forward failed", t)
                         }
                         true
-                    } else {
-                        false
+                    }
+                    else -> {
+                        // v41：当前播放树的 mediaId 是 `title|artist` 口径（与岛高亮
+                        // 匹配一致），不带来源前缀——含 '|' 的也一并拦截；其余按前缀。
+                        val starts = mediaId.startsWith(VivoMixLibrary.SOURCE_CURRENT + ":") ||
+                            mediaId.startsWith(VivoMixLibrary.SOURCE_FAVORITE + ":") ||
+                            mediaId.startsWith(VivoMixLibrary.SOURCE_LOCAL + ":") ||
+                            mediaId.contains('|')
+                        if (starts) {
+                            val intent = Intent(hookAppContext, AudioPlaybackService::class.java)
+                                .setAction(AudioPlaybackService.ACTION_VIVO_MIX_PLAY)
+                                .putExtra(AudioPlaybackService.EXTRA_VIVO_MIX_MEDIA_ID, mediaId)
+                            try {
+                                hookAppContext.startService(intent)
+                            } catch (t: Throwable) {
+                                Log.w("CarAutoResume", "vivo mix play forward failed", t)
+                            }
+                            true
+                        } else {
+                            false
+                        }
                     }
                 }
             }
@@ -101,6 +142,59 @@ class MD3MusicMediaSessionService : MediaSessionService() {
         // 这里把静态字段同步接上。
         androidx.media3.session.MediaSessionService.playFromMediaIdHook =
             vivoMixPlayHook
+        // MD3Music fork v66：车机语音点歌。framework
+        // MediaController.TransportControls.playFromSearch() 在 media3 1.4.1 只能经
+        // legacy stub 到达（MediaSession.Callback 根本没有该方法），这里接管为
+        // 「转交 AudioPlaybackService → Dart 按关键词搜索并起播」。
+        // query 为空（框架语义是"随便播点音乐"）不接管，交回默认实现。
+        androidx.media3.session.MediaSessionService.playFromSearchHook =
+            androidx.media3.session.MediaSessionService.PlayFromSearchHook { query, extras ->
+                if (query.isNullOrBlank()) {
+                    false
+                } else {
+                    Log.i(
+                        "CarAutoResume",
+                        "playFromSearch q=$query extras=${extras?.keySet()?.joinToString(",")}",
+                    )
+                    val intent = Intent(hookAppContext, AudioPlaybackService::class.java)
+                        .setAction(AudioPlaybackService.ACTION_PLAY_FROM_SEARCH)
+                        .putExtra(AudioPlaybackService.EXTRA_SEARCH_QUERY, query)
+                    try {
+                        hookAppContext.startService(intent)
+                        true
+                    } catch (t: Throwable) {
+                        Log.w("CarAutoResume", "playFromSearch forward failed", t)
+                        false
+                    }
+                }
+            }
+        // MD3Music fork v67：legacy browse 搜索（MediaBrowserCompat.search）——
+        // 返回候选列表给桥接端自绘。必须同步 detach（由 registry 内的 register 完成），
+        // 否则基类 performSearch 断言崩溃；结果由 AudioPlaybackService 在 Dart 回包后
+        // 负责结算，超时 8s 兜底回空列表。
+        androidx.media3.session.MediaSessionService.searchProvider =
+            androidx.media3.session.MediaSessionService.SearchProvider { query, _, result ->
+                if (query.isNullOrBlank()) {
+                    false
+                } else {
+                    Log.i("CarAutoResume", "browseSearch q=$query")
+                    val requestId = BrowseSearchRegistry.newRequestId()
+                    BrowseSearchRegistry.register(requestId, result)
+                    val intent = Intent(hookAppContext, AudioPlaybackService::class.java)
+                        .setAction(AudioPlaybackService.ACTION_BROWSE_SEARCH)
+                        .putExtra(AudioPlaybackService.EXTRA_SEARCH_QUERY, query)
+                        .putExtra(AudioPlaybackService.EXTRA_SEARCH_REQUEST_ID, requestId)
+                    try {
+                        hookAppContext.startService(intent)
+                        true
+                    } catch (t: Throwable) {
+                        Log.w("CarAutoResume", "browse search forward failed", t)
+                        // 已 detach，必须自行结算，否则桥接端永久等待。
+                        BrowseSearchRegistry.settleEmpty(requestId)
+                        true
+                    }
+                }
+            }
         // MD3Music fork v48：列表内容变化通知——Dart 推新快照后通知已订阅的岛端
         // 刷新（melodist 参考实现同款；不通知则岛一直显示推送前的旧列表/空列表）。
         // notifyLegacyChildrenChanged 内部投主线程，任意线程调用安全。
@@ -120,8 +214,13 @@ class MD3MusicMediaSessionService : MediaSessionService() {
         // 包名后，可把唤醒判据收紧成车机端包名白名单（bind 早于投屏的时序
         // 风险也随之消除）。每连接方一行，量级可忽略。
         Log.i("CarAutoResume", "onGetSession controller=${info.packageName}")
-        // 返回 fork 当前活跃的媒体3会话；未初始化时拒绝连接
-        return AudioPlayer.getActiveMediaSession()
+        AudioPlayer.getActiveMediaSession()?.let { return it }
+        // vivo 首次 bind 可能早于 Dart 创建/激活播放器；返回 null 会让原子组件
+        // 永久握不到 token。仅 vivo/iQOO 补待机会话，不在 bind 时启动引擎或播放。
+        if (!AudioPlayer.isShadowPlaybackMirrorEnabled()) return null
+        return (vivoBootstrapSession ?: VivoBootstrapSession(applicationContext).also {
+            vivoBootstrapSession = it
+        }).session
     }
 
     /**
@@ -365,6 +464,8 @@ class MD3MusicMediaSessionService : MediaSessionService() {
 
     override fun onDestroy() {
         AudioPlayer.setMediaSessionServiceHost(null)
+        vivoBootstrapSession?.release()
+        vivoBootstrapSession = null
         // v58：playFromMediaIdHook **不按 identity 清理**——钩子内部只捕获
         // applicationContext（进程级），滞留无泄漏语义；且 island 及系统级 stub
         // 在服务销毁后仍会经 stub 走点播链，清掉即"hook null"漏命令。服务重建
@@ -373,9 +474,63 @@ class MD3MusicMediaSessionService : MediaSessionService() {
         if (VivoMixLibrary.childrenChangedNotifier != null) {
             VivoMixLibrary.childrenChangedNotifier = null
         }
+        // v67：把未结算的 legacy 搜索回包收口（回空列表）。不清会留下 Handler 回调
+        // 持有已死服务的 Result；桥接端也永远等不到 onSearchResult。
+        BrowseSearchRegistry.clearPending()
         super.onDestroy()
     }
 
+    /** v67：把 Dart 回传的搜索结果 payload 转成 Bundle（只支持基本类型）。 */
+    private fun payloadToBundle(payload: Map<String, Any?>): Bundle {
+        val bundle = Bundle()
+        for ((key, value) in payload) {
+            when (value) {
+                is String -> bundle.putString(key, value)
+                is Int -> bundle.putInt(key, value)
+                is Long -> bundle.putLong(key, value)
+                is Double -> bundle.putDouble(key, value)
+                is Boolean -> bundle.putBoolean(key, value)
+                else -> Unit
+            }
+        }
+        return bundle
+    }
+
     // 阶段1 暂时不接管自定义通知的停止语义；播放停止时 media3 默认会取消 now playing 通知
-    // 并让本服务退回后台，无需额外处理。onTaskRemoved 使用默认实现。
+    // 并让本服务退回后台，无需额外处理。
+
+    /**
+     * 车机以「清理任务」收场时（部分机型的下电流程就是清任务），若正在播先暂停。
+     *
+     * 与下电广播正交：广播是"告知要断电"，清任务是"把界面/任务收掉"，
+     * 两条路径都可能发生，任一条漏掉都会出现"车都锁了喇叭还在响"。
+     *
+     * 受同一个开关约束（settings_car_mode_power_off_pause，默认关闭）：
+     * 手机端「上划清后台仍继续播」是既有体验，不得因为本功能被顺带改掉。
+     * 只暂停不 stopSelf —— 是否收服务交回 media3 默认实现。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (AudioPlaybackService.isNowPlaying &&
+            AudioPlaybackService.isCarPowerOffPauseEnabled(applicationContext)
+        ) {
+            RingLog.i("CarPower", "onTaskRemoved: pause before task cleanup")
+            // 落盘留证：清任务路径同样可能紧接断电，环形缓冲随进程灭失不可依赖
+            CarPowerLogFile.write(
+                applicationContext,
+                "onTaskRemoved: pause before task cleanup"
+            )
+            AudioPlaybackService.dispatchUiAction(
+                applicationContext,
+                AudioPlaybackService.ACTION_PAUSE
+            )
+        }
+        // 「划掉后台自动退出」（所有手机）：onTaskRemoved 及时投递时立即销毁；
+        // 未投递或延迟时由独立 stopWithTask 服务的 onDestroy 兜底。
+        if (SwipeExitPolicy.shouldSwipeExit(applicationContext)) {
+            RingLog.i("SwipeExit", "onTaskRemoved entered")
+            SwipeExitPolicy.executeExit(applicationContext)
+            return
+        }
+        super.onTaskRemoved(rootIntent)
+    }
 }

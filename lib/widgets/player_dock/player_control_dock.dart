@@ -170,6 +170,10 @@ class _PlayerControlDockState extends State<PlayerControlDock> {
       // 「音频过渡中」提示：交叉淡化起止只改这一个 notifier
       //（见 widgets/playback_hint_pills.dart）
       player.crossfadeActiveNotifier,
+      // 「伴唱中」提示：伴唱开关只改这一个 notifier
+      player.accompanyActiveNotifier,
+      // 「伴唱加载中」提示：加载阶段只改这一个 notifier
+      player.accompanyLoadingNotifier,
       if (!amStyle) kSeekBarWaveEnabled,
     ];
     return ListenableBuilder(
@@ -289,7 +293,7 @@ class _PlayerControlDockState extends State<PlayerControlDock> {
   /// S / M 档：「尺（含同行音质徽章）」＋「传输」（若宿主把传输簇放进带里）。
   ///
   /// 宽屏常驻档传 `transport: null` —— 传输簇在左栏曲名正下方，带里只剩尺；
-  /// 音量也不在带里（更多菜单 / 独立控制页）。
+  /// 音量也不在带里（「播放与输出」面板 / 独立控制页）。
   ///
   /// 外衬上下各 2：页签条回到带的下方单独占一行后，800×360 的内容区掉到 146，
   /// 低于计划「5 行歌词 ≥ 150」的验收硬线；带内留白（行距 8→4、外衬 4→2）把它抵回来。
