@@ -1453,10 +1453,13 @@ class DesktopLyricService {
   /// 熄屏且未开锁屏歌词时悬浮窗不可见，tick 纯耗电——必须真的停表，
   /// 而不是在 [_onTick] 里早退：早退省不掉定时器对 CPU 的周期性唤醒（§10.4.6）。
   /// CarWith 例外：字显示在车机上，手机熄屏时逐行定时器也要跑（规格 §一 铁律），
-  /// 与锁屏歌词同款处理。
+  /// 与锁屏歌词同款处理。iOS PiP 悬浮歌词同理：系统 PiP 窗口在熄屏时常显。
   bool _tickNeeded() =>
       _shouldTick() &&
-      (_screenOn || _lockScreenLyricEnabled || _carWithLyricEnabled);
+      (_screenOn ||
+          _lockScreenLyricEnabled ||
+          _carWithLyricEnabled ||
+          _pipActive);
 
   /// 根据开关与屏幕状态启停定时器（250ms tick：逐行歌词足够检测切行）
   void _updateTicker() {
@@ -1875,6 +1878,12 @@ class DesktopLyricService {
     if (_lastPushedPosMs == null || (posMs - _lastPushedPosMs!).abs() > 500) {
       _lastPushedPosMs = posMs;
       _pushProgress(pos, dur);
+    }
+
+    // iOS PiP 悬浮歌词：行/占位变化推送 + 进度校准。放在 _lines.isEmpty
+    // 早退之前——切歌清空行列表后 PiP 条才能及时切到占位文案。
+    if (_pipActive) {
+      _pipTick(_lines.isEmpty ? -1 : _findLineIndex(posMs));
     }
 
     // Find current line

@@ -44,6 +44,7 @@ int kSpectrumVisualOffsetMs = 580;
 ///
 /// **双平台原生采集**（同一套通道协议，`com.md3music.md3music/spectrum`）：
 /// - Android：Kotlin [SpectrumPlugin] 从 PCM 截取或 `Visualizer` 取 FFT；
+/// - iOS：AudioEqualizer 的 EQ tap（MTAudioProcessingTap）截 PCM 算 FFT；
 /// - Windows：runner 的 `SpectrumCapture` 用 WASAPI 环回采集输出音频后自己算
 ///   FFT（进程环回优先，老系统回落系统混音），帧形状与 Android 逐字段一致。
 ///
@@ -57,16 +58,23 @@ int kSpectrumVisualOffsetMs = 580;
 class SpectrumService with WidgetsBindingObserver {
   SpectrumService._()
     : _isAndroid = isAndroidPlatform,
-      _isWindows = isWindowsDesktop;
+      _isWindows = isWindowsDesktop,
+      _isIos = isIOSPlatform;
   @visibleForTesting
-  SpectrumService.forTesting({required bool isAndroid, bool isWindows = false})
-    : _isAndroid = isAndroid,
-      _isWindows = isWindows;
+  SpectrumService.forTesting({
+    required bool isAndroid,
+    bool isWindows = false,
+    bool isIos = false,
+  }) : _isAndroid = isAndroid,
+       _isWindows = isWindows,
+       _isIos = isIos;
   final bool _isAndroid;
   final bool _isWindows;
+  final bool _isIos;
 
-  /// 是否存在原生采集通路（Android PCM/Visualizer 或 Windows WASAPI 环回）。
-  bool get _hasNativeCapture => _isAndroid || _isWindows;
+  /// 是否存在原生采集通路
+  /// （Android PCM/Visualizer、Windows WASAPI 环回、iOS EQ tap PCM 截取）。
+  bool get _hasNativeCapture => _isAndroid || _isWindows || _isIos;
   static final SpectrumService instance = SpectrumService._();
 
   static const String _channelName = 'com.md3music.md3music/spectrum';
@@ -379,6 +387,11 @@ class SpectrumService with WidgetsBindingObserver {
       if (last == null ||
           DateTime.now().difference(last) >=
               const Duration(milliseconds: 1500)) {
+        // iOS 不降级：MTAudioProcessingTap 自 iOS 6 起全版本支持，不存在
+        // "设备不支持"的场景。播放失败/缓冲/暂停期间没有 PCM 流经 tap，
+        // FFT 自然不到达——此时频谱保持静止即可；旧逻辑在 1.5s 无数据时
+        // 误降级模拟并弹"设备不支持"，网络差导致播放失败时必然触发。
+        if (_isIos) return;
         DiagnosticLogger.instance.warning(
           '[Spectrum] FFT stream stalled, use simulated fallback',
         );
@@ -594,10 +607,11 @@ class SpectrumService with WidgetsBindingObserver {
     // Timer（视觉偏移默认 580ms ≈ 常驻约 25 个定时器）。震动自持采集
     // （频谱显示关闭 / App 内 / 始终档）时视觉流通常无人监听，这是主要省电点。
     if (!_controller.hasListener) return;
-    // 视觉偏移只补偿 Android 的链路延迟：PCM 在写进输出缓冲那一刻就被截取，
-    // 比「听到的」早一整个缓冲深度。Windows 是**环回采集实际输出**，帧本来就
-    // 与听到的同相（仅差采集周期的十几毫秒），再套 580ms 只会让柱体明显滞后。
-    final offsetMs = _isAndroid ? kSpectrumVisualOffsetMs : 0;
+    // 视觉偏移补偿「采集点早于听感」的链路延迟：Android PCM 在写进输出缓冲
+    // 那一刻被截取，iOS EQ tap 同样在输出前截 PCM——都比「听到的」早一整个
+    // 缓冲深度。Windows 是**环回采集实际输出**，帧本来就与听到的同相（仅差
+    // 采集周期的十几毫秒），再套 580ms 只会让柱体明显滞后。
+    final offsetMs = (_isAndroid || _isIos) ? kSpectrumVisualOffsetMs : 0;
     if (offsetMs <= 0) {
       if (!_controller.isClosed) _controller.add(bands);
       return;

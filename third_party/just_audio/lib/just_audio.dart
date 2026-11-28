@@ -2094,8 +2094,12 @@ class AudioPlayer {
         await platform.dispose(DisposeRequest());
       } finally {
         _id = null;
-        // MD3Music fork: 取消焦点事件订阅（id 失效）
-        await _audioFocusSubscription?.cancel();
+        // MD3Music fork: 取消焦点事件订阅（id 失效）。iOS 原生 disposePlayer
+        // 会先注销 focus_events channel，此处 cancel 必然 MissingPluginException
+        // （无害竞态），吞掉即可。
+        try {
+          await _audioFocusSubscription?.cancel();
+        } catch (_) {}
         _audioFocusSubscription = null;
       }
     }
